@@ -1,0 +1,58 @@
+@"github.com/xulang-org/game"
+
+#errors
+
+struct PackedNode {
+    parent_index int
+    name string
+    local Transform2D
+    visible bool
+    process_mode int
+}
+// Immutable in-memory scene resource. Instances own independent node storage.
+// This resource records node data, not application behavior or GPU attachments.
+pub struct PackedScene { nodes []PackedNode }
+pub fn pack_scene(tree &SceneTree, root int) PackedScene {
+    tree.editable(root) or >>
+    ids := tree.subtree(root) or >>
+    if ids.len > 4096 { >> errors.new("game: packed scene exceeds 4096 nodes") }
+    $nodes := []PackedNode{}
+    for i in 0:ids.len {
+        index := tree.editable(ids[i]) or >>
+        $parent_index := -1
+        if i > 0 {
+            parent := tree.node_id(tree.slots[index].parent)
+            for j in 0:i { if ids[j] == parent { parent_index = j } }
+        }
+        nodes.push(PackedNode{parent_index: parent_index, name: tree.slots[index].name + "",
+            local: tree.slots[index].local, visible: tree.slots[index].visible,
+            process_mode: tree.slots[index].process_mode})
+    }
+    << PackedScene{nodes: nodes}
+}
+pub fn (scene &PackedScene) node_count() int { << scene.nodes.len }
+// Preflight all expected failure conditions before attaching the first node.
+pub fn (scene &PackedScene) instantiate(tree $&SceneTree, parent int, name string) int {
+    parent_index := tree.editable(parent) or >>
+    tree.check_name(parent_index, &name, -1) or >>
+    $live := 0
+    for slot in tree.slots { if slot.alive { live = live + 1 } }
+    if scene.nodes.len == 0 || scene.nodes.len > tree.capacity - live {
+        >> errors.new("game: insufficient capacity for packed scene")
+    }
+    $ids := []int{}
+    for i in 0:scene.nodes.len {
+        $node_parent := parent
+        $node_name := name + ""
+        if i > 0 {
+            node_parent = ids[scene.nodes[i].parent_index]
+            node_name = scene.nodes[i].name + ""
+        }
+        id := tree.add_child(node_parent, node_name) or >>
+        tree.set_transform(id, scene.nodes[i].local) or >>
+        tree.set_visible(id, scene.nodes[i].visible) or >>
+        tree.set_process_mode(id, scene.nodes[i].process_mode) or >>
+        ids.push(id)
+    }
+    << ids[0]
+}

@@ -1,0 +1,41 @@
+@"github.com/xulang-org/game"
+
+#math
+#errors
+
+pub struct FrameStep {
+    pub steps int
+    pub fixed_delta f64
+    pub alpha f64
+    pub dropped_seconds f64
+}
+pub struct Clock {
+    fixed_delta f64
+    max_steps int
+    max_frame_delta f64
+    accumulator f64
+}
+
+// max_steps limits catch-up after stalls; excess whole ticks are discarded.
+pub fn new_clock(ticks_per_second int, max_steps int) Clock {
+    if ticks_per_second < 1 || ticks_per_second > 1000 || max_steps < 1 || max_steps > 100 {
+        >> errors.new("game: invalid fixed clock configuration")
+    }
+    << Clock{fixed_delta: 1.0 / f64(ticks_per_second), max_steps: max_steps,
+        max_frame_delta: 0.25, accumulator: 0.0}
+}
+pub fn (clock $&Clock) reset() { clock.accumulator = 0.0 }
+pub fn (clock $&Clock) advance(delta_seconds f64) FrameStep {
+    if !finite(delta_seconds) || delta_seconds < 0.0 {
+        >> errors.new("game: frame delta must be finite and nonnegative")
+    }
+    accepted := math.min(delta_seconds, clock.max_frame_delta)
+    clock.accumulator = clock.accumulator + accepted
+    available := int(math.floor(clock.accumulator / clock.fixed_delta + 0.000000001))
+    $steps := available
+    if steps > clock.max_steps { steps = clock.max_steps }
+    clock.accumulator = math.max(0.0, clock.accumulator - f64(available) * clock.fixed_delta)
+    << FrameStep{steps: steps, fixed_delta: clock.fixed_delta,
+        alpha: math.min(clock.accumulator / clock.fixed_delta, 0.999999999),
+        dropped_seconds: delta_seconds - accepted + f64(available - steps) * clock.fixed_delta}
+}
