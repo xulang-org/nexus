@@ -4,7 +4,7 @@
 遵守 Xu 的 [仓库规范](https://github.com/xulang-org/xulang-org/blob/main/.github/REPOSITORY_RULES.md)
 和 [Xu 代码规范](https://github.com/xulang-org/xu/blob/dev/.github/XU_CODING_STANDARDS.md)。
 
-当前产品模块版本是根 `xu.xun` 的 `0.1.0`；示例是独立的消费模块。
+产品模块版本以根 `xu.xun` 为准；示例是独立的消费模块。
 同一批更改只更新一次受影响模块版本；`xu:` 记录实际选择和验收的 SDK。
 日常开发在 `dev` 或其任务分支上完成。提交和推送须有用户明确指示。
 

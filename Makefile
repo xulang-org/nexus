@@ -25,7 +25,7 @@ smoke: native
 	$(XU) build examples/headless/main.xu -o build/headless
 	./build/headless
 	$(XU) build examples/arena/main.xu -o build/arena
-	./build/arena --frames 120 --autoplay --capture build/arena.png
+	./build/arena --width 1280 --height 640 --frames 120 --autoplay --capture build/arena.png
 
 gpu-smoke: native
 	mkdir -p build

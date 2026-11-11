@@ -26,7 +26,9 @@
     X(SDL_SetRenderVSync) X(SDL_SetRenderDrawBlendMode) X(SDL_SetRenderDrawColor) \
     X(SDL_RenderClear) X(SDL_RenderGeometry) X(SDL_RenderPresent) X(SDL_GetRenderOutputSize) \
     X(SDL_PollEvent) X(SDL_RenderReadPixels) X(SDL_ReadSurfacePixel) X(SDL_DestroySurface) X(SDL_SavePNG) \
-    X(SDL_CreateTexture) X(SDL_UpdateTexture) X(SDL_DestroyTexture) X(SDL_SetTextureBlendMode) X(SDL_SetTextureScaleMode)
+    X(SDL_CreateTexture) X(SDL_UpdateTexture) X(SDL_DestroyTexture) X(SDL_SetTextureBlendMode) X(SDL_SetTextureScaleMode) \
+    X(SDL_CreateTextureFromSurface) X(SDL_LoadPNG_IO) X(SDL_IOFromFile) X(SDL_GetIOSize) \
+    X(SDL_ReadIO) X(SDL_CloseIO) X(SDL_IOFromConstMem) X(SDL_SetRenderClipRect)
 #define DECLARE(name) static __typeof__(name) *p_##name;
 SDL_FUNCTIONS(DECLARE)
 
@@ -45,6 +47,8 @@ typedef struct {
     xu_int owner;
     uint64_t generation;
     int pixels;
+    int width;
+    int height;
 } Texture;
 static Renderer renderers[MAX_RENDERERS];
 static Texture textures[MAX_TEXTURES];
@@ -200,10 +204,26 @@ xu_int API(begin)(xu_int handle, xu_int color) {
     Renderer *r = lookup(handle);
     if (!r) return -1;
     if (r->recording) return fail("frame already active");
-    if (!p_SDL_SetRenderDrawColor(r->renderer, (Uint8)(color >> 24), (Uint8)(color >> 16),
+    if (!p_SDL_SetRenderClipRect(r->renderer, NULL) ||
+        !p_SDL_SetRenderDrawColor(r->renderer, (Uint8)(color >> 24), (Uint8)(color >> 16),
         (Uint8)(color >> 8), (Uint8)color) || !p_SDL_RenderClear(r->renderer)) return sdl_fail();
     r->recording = true; r->frame_vertices = 0;
     return 0;
+}
+xu_int API(clip)(xu_int handle, xu_int x, xu_int y, xu_int width, xu_int height) {
+    Renderer *r = lookup(handle);
+    if (!r) return -1;
+    if (!r->recording) return fail("begin a frame before setting its clip");
+    if (x < 0 || y < 0 || width < 1 || height < 1 || x > 16384 || y > 16384 || width > 16384 || height > 16384)
+        return fail("GPU clip rectangle outside output limits");
+    SDL_Rect rectangle = {(int)x, (int)y, (int)width, (int)height};
+    return p_SDL_SetRenderClipRect(r->renderer, &rectangle) ? 0 : sdl_fail();
+}
+xu_int API(reset_clip)(xu_int handle) {
+    Renderer *r = lookup(handle);
+    if (!r) return -1;
+    if (!r->recording) return fail("begin a frame before clearing its clip");
+    return p_SDL_SetRenderClipRect(r->renderer, NULL) ? 0 : sdl_fail();
 }
 // Fixed-point positions (1/1024 pixel), packed RGBA8. Never retain Xu storage.
 xu_int API(triangles)(xu_int handle, xu_int texture_handle, const xu_i64_span *words) {
@@ -249,15 +269,32 @@ xu_int API(triangles)(xu_int handle, xu_int texture_handle, const xu_i64_span *w
     r->frame_vertices += count;
     return count / 3;
 }
+static int texture_slot(Renderer *r, xu_int width, xu_int height) {
+    if (width < 1 || width > 4096 || height < 1 || height > 4096 || width * height > 4194304)
+        return (int)fail("texture exceeds dimension or pixel limits");
+    if (width * height > 16777216 - r->texture_pixels) return fail("renderer texture budget exceeds 64 MiB");
+    for (int i = 0; i < MAX_TEXTURES; ++i) if (!textures[i].texture) return i;
+    return (int)fail("texture capacity exceeded");
+}
+// Takes ownership of texture, including on a failed sampler/blend setup.
+static xu_int register_texture(Renderer *r, xu_int handle, int slot, SDL_Texture *texture, int width, int height, xu_int linear) {
+    if (!texture) return sdl_fail();
+    if (!p_SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND) ||
+        !p_SDL_SetTextureScaleMode(texture, linear ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST)) {
+        sdl_fail(); p_SDL_DestroyTexture(texture); return -1;
+    }
+    Texture *t = &textures[slot];
+    t->texture = texture; t->owner = handle; t->pixels = width * height; ++t->generation;
+    t->width = width; t->height = height;
+    r->texture_pixels += t->pixels;
+    return (xu_int)(t->generation * MAX_TEXTURES + (unsigned)slot + 1);
+}
 xu_int API(texture_new)(xu_int handle, xu_int width, xu_int height, const xu_i64_span *pixels, xu_int linear) {
     Renderer *r = lookup(handle);
     if (!r) return -1;
-    if (width < 1 || width > 4096 || height < 1 || height > 4096 || width * height > 4194304 ||
-        !pixels || pixels->len != width * height || !pixels->data) return fail("invalid texture dimensions or RGBA span");
-    if (width * height > 16777216 - r->texture_pixels) return fail("renderer texture budget exceeds 64 MiB");
-    int slot = -1;
-    for (int i = 0; i < MAX_TEXTURES; ++i) if (!textures[i].texture) { slot = i; break; }
-    if (slot < 0) return fail("texture capacity exceeded");
+    int slot = texture_slot(r, width, height);
+    if (slot < 0) return -1;
+    if (!pixels || pixels->len != width * height || !pixels->data) return fail("invalid RGBA pixel span");
     Uint8 *bytes = malloc((size_t)(width * height * 4));
     if (!bytes) return fail("texture staging allocation failed");
     for (xu_int i = 0; i < pixels->len; ++i) {
@@ -267,15 +304,60 @@ xu_int API(texture_new)(xu_int handle, xu_int width, xu_int height, const xu_i64
         bytes[i * 4 + 2] = (Uint8)(color >> 8); bytes[i * 4 + 3] = (Uint8)color;
     }
     SDL_Texture *texture = p_SDL_CreateTexture(r->renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, (int)width, (int)height);
-    bool ok = texture && p_SDL_UpdateTexture(texture, NULL, bytes, (int)width * 4) &&
-        p_SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND) &&
-        p_SDL_SetTextureScaleMode(texture, linear ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
+    bool ok = texture && p_SDL_UpdateTexture(texture, NULL, bytes, (int)width * 4);
     free(bytes);
     if (!ok) { sdl_fail(); if (texture) p_SDL_DestroyTexture(texture); return -1; }
-    Texture *t = &textures[slot];
-    t->texture = texture; t->owner = handle; t->pixels = (int)(width * height); ++t->generation;
-    r->texture_pixels += t->pixels;
-    return (xu_int)(t->generation * MAX_TEXTURES + (unsigned)slot + 1);
+    return register_texture(r, handle, slot, texture, (int)width, (int)height, linear);
+}
+static uint32_t png_word(const Uint8 *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+xu_int API(texture_png)(xu_int handle, const xu_i64_span *path, xu_int linear) {
+    Renderer *r = lookup(handle);
+    char filename[4096];
+    if (!r || !copy_text(path, filename, sizeof(filename))) return -1;
+    SDL_IOStream *file = p_SDL_IOFromFile(filename, "rb");
+    if (!file) return sdl_fail();
+    Sint64 size = p_SDL_GetIOSize(file);
+    if (size < 0) { sdl_fail(); p_SDL_CloseIO(file); return -1; }
+    if (size < 33 || size > 32 * 1024 * 1024) {
+        p_SDL_CloseIO(file); return fail("PNG file must be in 33 bytes...32 MiB");
+    }
+    Uint8 *bytes = malloc((size_t)size);
+    if (!bytes) { p_SDL_CloseIO(file); return fail("PNG input allocation failed"); }
+    size_t read = p_SDL_ReadIO(file, bytes, (size_t)size);
+    bool closed = p_SDL_CloseIO(file);
+    if (read != (size_t)size) { free(bytes); return fail("could not read complete PNG file"); }
+    if (!closed) { free(bytes); return sdl_fail(); }
+    // Decode an immutable, bounded byte snapshot. Validate IHDR dimensions first,
+    // so a small compressed file cannot request an unbounded decoded surface.
+    if (memcmp(bytes, "\x89PNG\r\n\x1a\n", 8) || png_word(bytes + 8) != 13 || memcmp(bytes + 12, "IHDR", 4)) {
+        free(bytes); return fail("invalid PNG signature or IHDR");
+    }
+    uint32_t width = png_word(bytes + 16), height = png_word(bytes + 20);
+    int slot = texture_slot(r, width, height);
+    if (slot < 0) { free(bytes); return -1; }
+    SDL_IOStream *memory = p_SDL_IOFromConstMem(bytes, (size_t)size);
+    if (!memory) { free(bytes); return sdl_fail(); }
+    SDL_Surface *surface = p_SDL_LoadPNG_IO(memory, true);
+    free(bytes);
+    if (!surface) return sdl_fail();
+    if (surface->w != (int)width || surface->h != (int)height) {
+        p_SDL_DestroySurface(surface); return fail("PNG decoded dimensions differ from IHDR");
+    }
+    SDL_Texture *texture = p_SDL_CreateTextureFromSurface(r->renderer, surface);
+    if (!texture) { sdl_fail(); p_SDL_DestroySurface(surface); return -1; }
+    p_SDL_DestroySurface(surface);
+    return register_texture(r, handle, slot, texture, (int)width, (int)height, linear);
+}
+xu_int API(texture_size)(xu_int handle, xu_int texture_handle, xu_int axis) {
+    if (!lookup(handle)) return -1;
+    if (texture_handle <= 0) return fail("closed texture");
+    uint64_t value = (uint64_t)texture_handle - 1;
+    Texture *t = &textures[value % MAX_TEXTURES];
+    if (!t->texture || t->generation != value / MAX_TEXTURES || t->owner != handle)
+        return fail("stale texture or texture belongs to a different renderer");
+    return axis == 0 ? t->width : t->height;
 }
 xu_int API(texture_close)(xu_int handle, xu_int texture_handle) {
     if (!library_ready || !main_thread()) return -1;

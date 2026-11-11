@@ -1,7 +1,7 @@
 # Xu Game
 
-独立的 Xu 2D 游戏引擎库，模块为 `github.com/xulang-org/game`，当前版本 `0.1.0`。
-场景树、可复用场景、变换、输入、时钟、碰撞、画布和精灵逻辑使用 Xu。
+独立的 Xu 2D 游戏引擎库，模块为 `github.com/xulang-org/game`，当前开发版本 `0.1.1-dev.1`。
+场景树、可复用场景、变换、相机、图集动画、输入、时钟、碰撞、画布和精灵逻辑使用 Xu。
 GPU 平台接入是一个 C ABI 薄桥接，调用 SDL 3.4+ 的 GPU 渲染器。
 
 参考 Godot 的 [Node / SceneTree](https://docs.godotengine.org/en/stable/tutorials/scripting/scene_tree.html)
@@ -23,7 +23,7 @@ Xu 侧使用组合与显式生命周期通知，不依赖类继承。它是可�
 后端来自 [SDL GPU](https://wiki.libsdl.org/SDL3/CategoryGPU)。设备选择方式见
 [SDL_CreateGPUDevice](https://wiki.libsdl.org/SDL3/SDL_CreateGPUDevice)。
 当前渲染功能包括彩色三角形、带仿射变换的四边形、RGBA GPU 纹理、纹理图集区域、
-最近邻/线性采样、透明混合、有序批次提交、垂直同步和显式像素回读 / PNG 截图。
+PNG 文件上传、最近邻/线性采样、透明混合、GPU 裁剪、有序批次提交、垂直同步和显式像素回读 / PNG 截图。
 顶点变换在 Xu 侧完成；光栅化、纹理采样和混合在 GPU 执行。
 
 ## 运行
@@ -41,7 +41,8 @@ make demo
 ```
 
 示例：WASD / 方向键移动，Space 暂停，Esc 退出。避开墙体收集六颗金色宝石。
-右上角方块显示进度。它使用场景实例、固定 60 Hz 更新、连续碰撞、GPU 画布与纹理精灵。
+右上角方块显示进度。它使用场景实例、固定 60 Hz 更新、连续碰撞、GPU 画布与四帧 PNG 精灵动画。
+改变窗口比例时按设计尺寸等比缩放并留黑边；暂停会同时冻结角色、图集动画和宝石旋转。
 
 ```sh
 # 编译两个示例，运行无窗口模拟和有界 GPU 示例，保存实际 GPU 输出
@@ -54,6 +55,9 @@ make smoke
 
 # 自动输入仅用于有界示例，可重复运行
 ./build/arena --frames 120 --autoplay --capture build/arena.png
+
+# 宽窗口保持 960×640 的设计比例；可加载自备的四帧横向 PNG 图集
+./build/arena --width 1280 --height 640 --texture examples/arena/assets/player.png
 ```
 
 可通过 `XU=/path/to/xu make demo` 选择其他产品编译器；本版实际验收 SDK 为 0.11.4。
@@ -109,6 +113,8 @@ fn main() int { << run() or (err) { eprintln(err.msg())
 | 场景树 | `SceneTree` 独占节点存储；节点 ID 仅对原树有效，释放复用后旧 ID 失效 |
 | 节点路径 | `find_node` 支持相对路径、绝对路径、`.`、`..`；同级节点名称唯一 |
 | 变换 | `Transform2D` 为二维仿射矩阵；角度为弧度，坐标 +Y 向下 |
+| 相机 | `Camera2D` 保持设计宽高比；提供位置、旋转、缩放、视口及屏幕/世界坐标互转 |
+| 图集动画 | `AtlasAnimation` 定义行列、帧范围、帧率和循环；`SpriteAnimator` 管理暂停、跳帧与单次完成通知 |
 | 生命周期 | `take_ready()` 返回一次性的子节点先于父节点通知；由应用分派 Xu 行为 |
 | 更新 | `process_order()` 按场景先序给出可更新节点，遵循继承与暂停模式 |
 | 删除 | `queue_free` 标记整个子树，立即停用；帧末 `flush_free` 释放并返回子先父后的旧 ID |
@@ -117,6 +123,31 @@ fn main() int { << run() or (err) { eprintln(err.msg())
 | 时钟 | `Clock.advance` 返回固定步数、插值权重及丢弃时间；限制补帧，避免无限追赶 |
 | 碰撞 | 静态轴对齐矩形的连续扫掠与滑动；初始穿透明确报错，不提供刚体求解 |
 | 纹理 | `Texture2D` 是独占 GPU 资源，RGBA8 输入同步复制；renderer 关闭会释放其纹理 |
+
+### 相机和 PNG 动画
+
+```xu
+camera := game.new_camera_2d(960.0, 640.0) or >>
+view := camera.view_transform(f64(width), f64(height)) or >>
+viewport := camera.viewport(f64(width), f64(height)) or >>
+$atlas := renderer.texture_png("assets/player.png", false) or >>
+clip := game.new_atlas_animation(4, 1, 0, 4, 8.0, true) or >>
+$animator := game.new_sprite_animator(clip) or >>
+```
+
+在固定更新中调用 `animator.advance(delta_seconds)`，绘制前将 `animator.region()` 赋给
+`Sprite2D.region`。`renderer.begin()` 后使用 `renderer.clip_rect(viewport)` 限制世界绘制，
+随后用 `view` 录制场景。需要在黑边区域绘制其他内容时调用 `renderer.reset_clip()`。
+每次 `begin()` 自动重置裁剪；传入的小数裁剪边界向外取整到完整像素。
+
+`camera.position` 是视口中心对应的世界位置，`zoom` 越大物体越大，角度使用弧度。
+`screen_to_world` 和 `world_to_screen` 的屏幕单位与输出尺寸一致。
+黑边中的点也会映射到世界坐标；拾取前用 `viewport.contains(point)` 排除它们。
+
+图集帧号为从零开始的绝对行优先索引。动画暂停不累计时间；`play()` 在完成后从头播放，
+`seek_frame()` 重设帧内时间但保持播放/暂停状态。非循环片段的最后一帧显示一个完整帧间隔，
+随后 `advance().finished` 只触发一次；`is_finished()` 保留完成状态。
+单次 `advance` 的时间范围为 0...3600 秒，跳过大量帧通过算术处理，不逐帧循环。
 
 核心对象由调用方在同一线程更新。GPU 对象的创建、事件、绘制、关闭和析构必须在应用主线程。
 当前事件轮询仅支持一个活动窗口。`InputMap.begin_frame()` 在事件处理前调用；
@@ -130,12 +161,14 @@ fn main() int { << run() or (err) { eprintln(err.msg())
 容量：每树最多 65,536 节点，单个场景资源最多 4,096 节点；最多 128 个动作 / 512 个键；
 每帧最多 393,216 顶点。纹理单边最多 4,096、单纹理最多 4,194,304 像素，
 每 renderer 的 RGBA 纹理总预算 64 MiB；原生桥接最多 1,024 个活动纹理。
+PNG 输入文件最多 32 MiB，先检查签名和 IHDR 尺寸，再从不可变字节副本解码；
+文件、尺寸、解码或 GPU 上传失败都会抛错。解码表面和文件副本不会在返回后保留。
 
 ## 本机验收
 
 按 Xu 项目约定，`tests/` 与生成物保留本机且被 Git 忽略。
-本机可运行 `make test`（变换、节点、场景实例、输入、时钟、连续碰撞）和
-`make gpu-smoke`（GPU 绘制、纹理采样、像素回读、生命周期）。
+本机可运行 `make test`（变换、节点、场景实例、输入、时钟、连续碰撞、相机和动画）和
+`make gpu-smoke`（GPU 绘制、PNG 上传、图集帧、透明采样、裁剪、像素回读和生命周期）。
 这些目标需要本机测试目录；源码消费者可以运行上面的 `make check` / `make smoke`。
 使用普通 Xu 程序执行回归，因为 Xu 0.11.4 的 `xu test` 尚不支持原生模块链接。
 

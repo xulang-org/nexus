@@ -11,10 +11,14 @@ struct Options {
     backend int
     capture string
     autoplay bool
+    width int
+    height int
+    texture string
 }
 fn options() Options {
     args := os.args()
-    $out := Options{frames: 0, backend: gpu.AUTO, capture: "", autoplay: false}
+    $out := Options{frames: 0, backend: gpu.AUTO, capture: "", autoplay: false, width: 960, height: 640,
+        texture: "examples/arena/assets/player.png"}
     $i := 1
     while i < args.len {
         if args[i] == "--autoplay" { out.autoplay = true
@@ -26,6 +30,13 @@ fn options() Options {
             out.frames = strconv.atoi(&args[value_index]) or >>
             if out.frames < 1 || out.frames > 1000000 { >> errors.new("frames must be in 1...1000000") }
         } else if args[i] == "--capture" { out.capture = args[i + 1] + ""
+        } else if args[i] == "--texture" { out.texture = args[i + 1] + ""
+        } else if args[i] == "--width" {
+            out.width = strconv.atoi(&args[value_index]) or >>
+            if out.width < 160 || out.width > 4096 { >> errors.new("width must be in 160...4096") }
+        } else if args[i] == "--height" {
+            out.height = strconv.atoi(&args[value_index]) or >>
+            if out.height < 160 || out.height > 4096 { >> errors.new("height must be in 160...4096") }
         } else if args[i] == "--backend" {
             name := args[i + 1]
             if name == "auto" { out.backend = gpu.AUTO
@@ -53,24 +64,6 @@ fn make_input() game.InputMap {
     input.bind("quit", gpu.KEY_ESCAPE) or >>
     << input
 }
-fn player_pixels() []int {
-    body_color := gpu.rgba(96, 230, 192, 255) or >>
-    shadow_color := gpu.rgba(40, 150, 140, 255) or >>
-    eye_color := gpu.rgba(14, 30, 40, 255) or >>
-    $pixels := []int{}
-    for y in 0:16 {
-        for x in 0:16 {
-            $color := 0
-            if x >= 2 && x <= 13 && y >= 2 && y <= 13 {
-                color = body_color
-                if y >= 11 { color = shadow_color }
-                if (x == 5 || x == 10) && (y == 6 || y == 7) { color = eye_color }
-            }
-            pixels.push(color)
-        }
-    }
-    << pixels
-}
 struct Gem {
     node int
     position game.Vec2
@@ -78,7 +71,8 @@ struct Gem {
 }
 fn run() int {
     config := options() or >>
-    $renderer := gpu.open("Xu Game | WASD / Arrows: move | Space: pause | Esc: exit", 960, 640, config.backend) or >>
+    $renderer := gpu.open("Xu Game | WASD / Arrows: move | Space: pause | Esc: exit",
+        config.width, config.height, config.backend) or >>
     backend := renderer.backend() or >>
     println("Rendering on " + gpu.backend_name(backend))
     $tree := game.new_scene_tree("World", 128) or >>
@@ -86,6 +80,7 @@ fn run() int {
     level := tree.add_child(tree.root(), "Level") or >>
     player := tree.add_child(level, "Player") or >>
     $position := game.vec2(110.0, 310.0)
+    camera := game.new_camera_2d(960.0, 640.0) or >>
     tree.set_position(player, position) or >>
     solids := [game.rect2(32.0, 112.0, 896.0, 16.0), game.rect2(32.0, 576.0, 896.0, 16.0),
         game.rect2(32.0, 128.0, 16.0, 448.0), game.rect2(912.0, 128.0, 16.0, 448.0),
@@ -115,14 +110,17 @@ fn run() int {
     grid := gpu.rgba(25, 35, 52, 255) or >>
     accent := gpu.rgba(96, 230, 192, 255) or >>
     muted := gpu.rgba(42, 56, 78, 255) or >>
-    pixels := player_pixels() or >>
-    $texture := renderer.texture_rgba(16, 16, &pixels, false) or >>
-    sprite := gpu.Sprite2D{node: player, bounds: game.rect2(0.0, 0.0, 28.0, 28.0),
+    letterbox := gpu.rgba(7, 10, 17, 255) or >>
+    $texture := renderer.texture_png(config.texture + "", false) or >>
+    clip := game.new_atlas_animation(4, 1, 0, 4, 8.0, true) or >>
+    $animator := game.new_sprite_animator(clip) or >>
+    $sprite := gpu.Sprite2D{node: player, bounds: game.rect2(0.0, 0.0, 28.0, 28.0),
         region: game.rect2(0.0, 0.0, 1.0, 1.0), tint: white}
     $input := make_input() or >>
     $clock := game.new_clock(60, 8) or >>
     $frame_number := 0
     $score := 0
+    $animation_time := 0.0
     $quit := false
     $last_time := now_ns()
     $batch := gpu.new_batch()
@@ -152,6 +150,8 @@ fn run() int {
         ticks := clock.advance(elapsed) or >>
         if tree.can_process(player) or >> {
             for step in 0:ticks.steps {
+                animation_time = animation_time + ticks.fixed_delta
+                animator.advance(ticks.fixed_delta) or >>
                 direction := input.vector("left", "right", "up", "down") or >>
                 movement := direction.scaled(240.0 * ticks.fixed_delta)
                 result := game.move_and_slide(game.rect2(position.x, position.y, 28.0, 28.0), movement, &solids) or >>
@@ -171,7 +171,7 @@ fn run() int {
         }
         for gem in gems {
             if !gem.collected {
-                transform := game.transform_2d(gem.position, f64(frame_number) * 0.02, game.vec2(1.0, 1.0))
+                transform := game.transform_2d(gem.position, animation_time * 1.2, game.vec2(1.0, 1.0))
                 tree.set_transform(gem.node, transform) or >>
             }
         }
@@ -180,26 +180,30 @@ fn run() int {
         height := renderer.height() or >>
         if width < 1 || height < 1 { sleep_ns(10000000)
             -> }
-        camera := game.transform_2d(game.vec2(0.0, 0.0), 0.0, game.vec2(f64(width) / 960.0, f64(height) / 640.0))
+        view := camera.view_transform(f64(width), f64(height)) or >>
+        viewport := camera.viewport(f64(width), f64(height)) or >>
         batch.clear()
         sprite_batch.clear()
-        for x in 0:29 { batch.quad(game.rect2(48.0 + f64(x) * 30.0, 128.0, 1.0, 448.0), camera, grid) or >> }
-        for y in 0:15 { batch.quad(game.rect2(48.0, 128.0 + f64(y) * 30.0, 864.0, 1.0), camera, grid) or >> }
+        batch.quad(game.rect2(0.0, 0.0, 960.0, 640.0), view, background) or >>
+        for x in 0:29 { batch.quad(game.rect2(48.0 + f64(x) * 30.0, 128.0, 1.0, 448.0), view, grid) or >> }
+        for y in 0:15 { batch.quad(game.rect2(48.0, 128.0 + f64(y) * 30.0, 864.0, 1.0), view, grid) or >> }
         // A compact progress display. Keyboard instructions remain in the title bar.
-        batch.quad(game.rect2(48.0, 44.0, 8.0, 36.0), camera, accent) or >>
+        batch.quad(game.rect2(48.0, 44.0, 8.0, 36.0), view, accent) or >>
         for i in 0:gems.len {
             $color := muted
             if i < score { color = gold }
-            batch.quad(game.rect2(696.0 + f64(i) * 38.0, 48.0, 26.0, 26.0), camera, color) or >>
+            batch.quad(game.rect2(696.0 + f64(i) * 38.0, 48.0, 26.0, 26.0), view, color) or >>
         }
         if tree.paused {
-            batch.quad(game.rect2(80.0, 48.0, 8.0, 26.0), camera, gold) or >>
-            batch.quad(game.rect2(96.0, 48.0, 8.0, 26.0), camera, gold) or >>
-        } else { batch.triangle(camera.point(game.vec2(80.0, 48.0)), camera.point(game.vec2(80.0, 74.0)),
-            camera.point(game.vec2(100.0, 61.0)), accent) or >> }
-        canvas.record(&tree, camera, $&batch) or >>
-        sprite.record(&tree, camera, $&sprite_batch) or >>
-        renderer.begin(background) or >>
+            batch.quad(game.rect2(80.0, 48.0, 8.0, 26.0), view, gold) or >>
+            batch.quad(game.rect2(96.0, 48.0, 8.0, 26.0), view, gold) or >>
+        } else { batch.triangle(view.point(game.vec2(80.0, 48.0)), view.point(game.vec2(80.0, 74.0)),
+            view.point(game.vec2(100.0, 61.0)), accent) or >> }
+        canvas.record(&tree, view, $&batch) or >>
+        sprite.region = animator.region() or >>
+        sprite.record(&tree, view, $&sprite_batch) or >>
+        renderer.begin(letterbox) or >>
+        renderer.clip_rect(viewport) or >>
         renderer.submit(&batch) or >>
         renderer.submit_texture(&sprite_batch, &texture) or >>
         if config.capture.len > 0 && frame_number + 1 == config.frames { renderer.capture(config.capture + "") or >> }
