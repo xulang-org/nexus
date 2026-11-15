@@ -1,0 +1,83 @@
+@"github.com/xulang-org/game/resources/canvas"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#errors
+
+pub const MAX_VERTICES_2D = 393216
+
+pub struct Vertex2D { pub point fm.Vec2
+    pub color int
+    pub uv fm.Vec2 }
+pub struct Batch2D { vertices []Vertex2D
+    count int }
+pub fn new_batch() Batch2D { << Batch2D{vertices: []Vertex2D{}, count: 0} }
+// Retain recorder storage and overwrite the previous frame's logical prefix.
+pub fn (batch $&Batch2D) clear() { batch.count = 0 }
+pub fn (batch &Batch2D) vertex_count() int { << batch.count }
+pub fn (batch &Batch2D) triangle_count() int { << batch.count / 3 }
+fn valid_point(point fm.Vec2) bool {
+    << fm.finite(point.x) && fm.finite(point.y) && point.x >= -1000000.0 && point.x <= 1000000.0 &&
+        point.y >= -1000000.0 && point.y <= 1000000.0
+}
+fn (batch $&Batch2D) vertex(point fm.Vec2, color int, u f64, v f64) {
+    value := Vertex2D{point: point, color: color, uv: fm.vec2(u,v)}
+    if batch.count < batch.vertices.len { batch.vertices[batch.count] = value
+    } else { batch.vertices.push(value) }
+    batch.count = batch.count + 1
+}
+pub fn (batch $&Batch2D) triangle(a fm.Vec2, b fm.Vec2, c fm.Vec2, color int) int {
+    if batch.vertex_count() > MAX_VERTICES_2D - 3 || color < 0 || color > 4294967295 ||
+        !valid_point(a) || !valid_point(b) || !valid_point(c) {
+        >> errors.new("game canvas: triangle outside batch or coordinate limits")
+    }
+    batch.vertex(a, color, 0.0, 0.0)
+    batch.vertex(b, color, 0.0, 0.0)
+    batch.vertex(c, color, 0.0, 0.0)
+    << 0
+}
+pub fn (batch $&Batch2D) triangle_uv(a fm.Vec2, b fm.Vec2, c fm.Vec2,
+    ca int, cb int, cc int, uva fm.Vec2, uvb fm.Vec2, uvc fm.Vec2) int {
+    if batch.vertex_count() > MAX_VERTICES_2D - 3 ||
+        ca < 0 || ca > 4294967295 || cb < 0 || cb > 4294967295 || cc < 0 || cc > 4294967295 ||
+        !valid_point(a) || !valid_point(b) || !valid_point(c) ||
+        !fm.finite(uva.x) || !fm.finite(uva.y) || !fm.finite(uvb.x) || !fm.finite(uvb.y) ||
+        !fm.finite(uvc.x) || !fm.finite(uvc.y) {
+        >> errors.new("game canvas: textured triangle outside batch or coordinate limits")
+    }
+    batch.vertex(a, ca, uva.x, uva.y)
+    batch.vertex(b, cb, uvb.x, uvb.y)
+    batch.vertex(c, cc, uvc.x, uvc.y)
+    << 0
+}
+// Geometry is transformed in Xu, then submitted as one ordered triangle batch.
+pub fn (batch $&Batch2D) quad(bounds fm.Rect2, transform fm.Transform2D, color int) int {
+    << batch.quad_region(bounds, transform, color, fm.rect2(0.0, 0.0, 1.0, 1.0)) or >>
+}
+// Normalized UV rectangle supports texture atlases; tint is straight RGBA8.
+pub fn (batch $&Batch2D) quad_region(bounds fm.Rect2, transform fm.Transform2D, color int, uv fm.Rect2) int {
+    if !bounds.valid() || !transform.is_finite() { >> errors.new("game canvas: invalid quad") }
+    if !uv.valid() || uv.position.x < 0.0 || uv.position.y < 0.0 ||
+        uv.position.x + uv.size.x > 1.0 || uv.position.y + uv.size.y > 1.0 {
+        >> errors.new("game canvas: UV region outside texture")
+    }
+    a := transform.point(bounds.position)
+    b := transform.point(bounds.position.add(fm.vec2(bounds.size.x, 0.0)))
+    c := transform.point(bounds.position.add(bounds.size))
+    d := transform.point(bounds.position.add(fm.vec2(0.0, bounds.size.y)))
+    if batch.vertex_count() > MAX_VERTICES_2D - 6 || color < 0 || color > 4294967295 ||
+        !valid_point(a) || !valid_point(b) || !valid_point(c) || !valid_point(d) {
+        >> errors.new("game canvas: quad outside batch or coordinate limits")
+    }
+    batch.vertex(a, color, uv.position.x, uv.position.y)
+    batch.vertex(b, color, uv.position.x + uv.size.x, uv.position.y)
+    batch.vertex(c, color, uv.position.x + uv.size.x, uv.position.y + uv.size.y)
+    batch.vertex(a, color, uv.position.x, uv.position.y)
+    batch.vertex(c, color, uv.position.x + uv.size.x, uv.position.y + uv.size.y)
+    batch.vertex(d, color, uv.position.x, uv.position.y + uv.size.y)
+    << 0
+}
+
+pub fn (batch &Batch2D) vertex_at(index int) Vertex2D {
+    if index < 0 || index >= batch.count { >> errors.new("game canvas: vertex index outside batch") }
+    << batch.vertices[index]
+}

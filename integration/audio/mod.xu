@@ -1,0 +1,115 @@
+@"github.com/xulang-org/game/integration/audio"
+
+game #"github.com/xulang-org/game/scene"
+fm #"github.com/xulang-org/game/foundation/math"
+mix #"github.com/xulang-org/game/audio/mixer"
+#errors
+
+struct Binding { node int
+    voice int }
+// Node playback bindings, always used with the same tree and mixer. Clips belong
+// to the mixer; this adapter owns routing, not device resources.
+pub struct SceneAudio { bindings []Binding }
+pub fn new_scene_audio() SceneAudio { << SceneAudio{bindings: []Binding{}} }
+fn (scene &SceneAudio) find(node int) int {
+    for i in 0:scene.bindings.len { if scene.bindings[i].node == node { << i } }
+    << -1
+}
+fn (scene &SceneAudio) editable_binding(tree &game.SceneTree, node int) int {
+    info := tree.node_info(node) or >>
+    index := scene.find(node)
+    if info.queued_free || (index < 0 && scene.bindings.len >= mix.MAX_VOICES) { >> errors.new("game scene audio: invalid node or binding capacity") }
+    << index
+}
+fn (scene $&SceneAudio) bind_voice(tree &game.SceneTree, mixer $&mix.Mixer, node int, index int, voice int) int {
+    if index >= 0 {
+        old := scene.bindings[index].voice
+        if mixer.is_voice(old) { mixer.stop(old) or >> }
+        scene.bindings[index].voice = voice
+    } else { scene.bindings.push(Binding{node: node, voice: voice}) }
+    mixer.pause_voice(voice, !(tree.can_process(node) or >>)) or >>
+    << voice
+}
+pub fn (scene $&SceneAudio) play(tree &game.SceneTree, mixer $&mix.Mixer, node int, clip int, bus int, volume f64, pan f64, looping bool) int {
+    index := scene.editable_binding(tree, node) or >>
+    // Create first, so a rejected replacement leaves the previous voice intact.
+    voice := mixer.play(clip, bus, volume, pan, looping) or >>
+    << scene.bind_voice(tree, mixer, node, index, voice) or >>
+}
+pub fn (scene $&SceneAudio) play_stream(tree &game.SceneTree, mixer $&mix.Mixer, node int, source int, bus int, volume f64, pan f64) int {
+    index := scene.editable_binding(tree, node) or >>
+    voice := mixer.play_stream(source, bus, volume, pan) or >>
+    << scene.bind_voice(tree, mixer, node, index, voice) or >>
+}
+pub fn (scene $&SceneAudio) detach(mixer $&mix.Mixer, node int) int {
+    index := scene.find(node)
+    if index < 0 { << 0 }
+    voice := scene.bindings[index].voice
+    if mixer.is_voice(voice) { mixer.stop(voice) or >> }
+    $next := []Binding{}
+    for i in 0:scene.bindings.len { if i != index { next.push(scene.bindings[i]) } }
+    scene.bindings = next
+    << 1
+}
+// Call before mixing. Pause/process mode controls unqueued source time;
+// deletion and stale generations detach without touching a reused voice.
+pub fn (scene $&SceneAudio) sync(tree &game.SceneTree, mixer $&mix.Mixer) int {
+    $next := []Binding{}
+    $removed := 0
+    for binding in scene.bindings {
+        $keep := tree.is_alive(binding.node) && mixer.is_voice(binding.voice)
+        if keep {
+            info := tree.node_info(binding.node) or >>
+            keep = !info.queued_free && (mixer.is_playing(binding.voice) or >>)
+        }
+        if keep {
+            mixer.pause_voice(binding.voice, !(tree.can_process(binding.node) or >>)) or >>
+            next.push(binding)
+        } else {
+            if mixer.is_voice(binding.voice) { mixer.stop(binding.voice) or >> }
+            removed = removed + 1
+        }
+    }
+    scene.bindings = next
+    << removed
+}
+pub fn (scene &SceneAudio) binding_count() int { << scene.bindings.len }
+
+// Explicitly refresh a spatial binding before sync/pump. Listener orientation
+// comes from its world X axis, so nested listener transforms affect balance.
+pub fn spatial_2d_parameters(tree &game.SceneTree, node int, listener int, maximum f64) mix.Spatial {
+    source_info := tree.node_info(node) or >>
+    listener_info := tree.node_info(listener) or >>
+    if source_info.kind != game.NODE_2D || listener_info.kind != game.NODE_2D || source_info.queued_free || listener_info.queued_free {
+        >> errors.new("game scene audio: invalid 2D spatial binding/listener")
+    }
+    source := tree.global_transform(node) or >>
+    receiver := tree.global_transform(listener) or >>
+    << mix.spatial_2d(fm.vec2(source.tx, source.ty), fm.vec2(receiver.tx, receiver.ty), fm.vec2(receiver.a, receiver.b), maximum) or >>
+}
+pub fn spatial_3d_parameters(tree &game.SceneTree, node int, listener int, maximum f64) mix.Spatial {
+    source_info := tree.node_info(node) or >>
+    listener_info := tree.node_info(listener) or >>
+    if source_info.kind != game.NODE_3D || listener_info.kind != game.NODE_3D || source_info.queued_free || listener_info.queued_free {
+        >> errors.new("game scene audio: invalid 3D spatial binding/listener")
+    }
+    source := tree.global_transform_3d(node) or >>
+    receiver := tree.global_transform_3d(listener) or >>
+    << mix.spatial_3d(source.c3.xyz(), receiver.c3.xyz(), receiver.c0.xyz(), maximum) or >>
+}
+pub fn (scene &SceneAudio) spatial_2d(tree &game.SceneTree, mixer $&mix.Mixer, node int, listener int, maximum f64, volume f64) mix.Spatial {
+    index := scene.find(node)
+    if index < 0 || !fm.finite(volume) || volume < 0.0 || volume > 4.0 { >> errors.new("game scene audio: invalid spatial binding/volume") }
+    spatial := spatial_2d_parameters(tree, node, listener, maximum) or >>
+    mixer.set_volume(scene.bindings[index].voice, volume * spatial.volume) or >>
+    mixer.set_pan(scene.bindings[index].voice, spatial.pan) or >>
+    << spatial
+}
+pub fn (scene &SceneAudio) spatial_3d(tree &game.SceneTree, mixer $&mix.Mixer, node int, listener int, maximum f64, volume f64) mix.Spatial {
+    index := scene.find(node)
+    if index < 0 || !fm.finite(volume) || volume < 0.0 || volume > 4.0 { >> errors.new("game scene audio: invalid spatial binding/volume") }
+    spatial := spatial_3d_parameters(tree, node, listener, maximum) or >>
+    mixer.set_volume(scene.bindings[index].voice, volume * spatial.volume) or >>
+    mixer.set_pan(scene.bindings[index].voice, spatial.pan) or >>
+    << spatial
+}

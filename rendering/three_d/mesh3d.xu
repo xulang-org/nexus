@@ -1,0 +1,154 @@
+@"github.com/xulang-org/game/rendering/three_d"
+
+#gpu
+#encoding/binary
+#errors
+fm #"github.com/xulang-org/game/foundation/math"
+meshes #"github.com/xulang-org/game/resources/mesh"
+
+pub struct Mesh3D {
+    vertices []gpu.Buffer
+    indices []gpu.Buffer
+    soft_blobs []gpu.SoftBlob
+    has_gpu bool
+    device_id int
+    count int
+    normals bool
+    uvs bool
+    tangents bool
+    bounds fm.Aabb3
+    closed bool
+}
+fn zero_bytes(count int) []u8 {
+    $bytes := []u8{}
+    for i in 0:count { bytes.push(u8(0)) }
+    << bytes
+}
+fn put_scalar(bytes $&[]u8, offset int, value f64) int {
+    word := scalar_word(value) or >>
+    << binary.little_endian().put_u32_bytes(bytes,offset,word) or >>
+}
+pub fn (device &Device3D) upload(mesh &meshes.MeshData3D) Mesh3D {
+    device.alive() or >>
+    if device.active { >> errors.new("game 3D: upload meshes outside a frame") }
+    authored_bounds := mesh.bounds() or >>
+    uploaded_bounds := quantized_bounds(authored_bounds) or >>
+    size := mesh.vertices.len*64+mesh.indices.len*4
+    if device.is_gpu() {
+        dev := device.gpu_device() or >>
+        stats := dev.stats() or >>
+        if stats.buffer_count>=1024 || size>67108864-stats.buffer_bytes { >> errors.new("game 3D: mesh capacity or 64 MiB budget exceeded") }
+    } else if size>67108864 {
+        >> errors.new("game 3D: mesh capacity or 64 MiB budget exceeded")
+    }
+    $vertices := zero_bytes(mesh.vertices.len*64)
+    $indices := zero_bytes(mesh.indices.len*4)
+    $normals := true
+    $uvs := true
+    $tangents := true
+    for i in 0:mesh.vertices.len {
+        vertex := &mesh.vertices[i]
+        if vertex.normal.dot(vertex.normal)==0.0 { normals=false }
+        if !vertex.has_uv { uvs=false }
+        if !vertex.has_tangent { tangents=false }
+        values := [vertex.position.x,vertex.position.y,vertex.position.z,
+            f64((vertex.color >> 24) & 255)/255.0,f64((vertex.color >> 16) & 255)/255.0,
+            f64((vertex.color >> 8) & 255)/255.0,f64(vertex.color & 255)/255.0,
+            vertex.normal.x,vertex.normal.y,vertex.normal.z,vertex.uv.x,vertex.uv.y,
+            vertex.tangent.x,vertex.tangent.y,vertex.tangent.z,vertex.tangent.w]
+        for j in 0:16 { put_scalar($&vertices,i*64+j*4,values[j]) or >> }
+    }
+    for i in 0:mesh.indices.len { binary.little_endian().put_u32_bytes($&indices,i*4,mesh.indices[i]) or >> }
+    if !device.is_gpu() {
+        $sb_v := gpu.soft_blob_create(device.device_id,&vertices) or >>
+        $sb_i := gpu.soft_blob_create(device.device_id,&indices) or >>
+        << Mesh3D{vertices: []gpu.Buffer{},indices: []gpu.Buffer{},soft_blobs: [sb_v,sb_i],
+            has_gpu: false,device_id: device.device_id,
+            count: mesh.indices.len,normals: normals,uvs: uvs,tangents: tangents,bounds: uploaded_bounds,closed: false}
+    }
+    dev := device.gpu_device() or >>
+    $vb := dev.buffer(vertices.len,gpu.BUFFER_VERTEX) or >>
+    $ib := dev.buffer(indices.len,gpu.BUFFER_INDEX) or >>
+    $v_upload := dev.upload(&vb,0,&vertices) or >>
+    v_upload.close() or >>
+    $i_upload := dev.upload(&ib,0,&indices) or >>
+    i_upload.close() or >>
+    << Mesh3D{vertices: [vb],indices: [ib],soft_blobs: []gpu.SoftBlob{},has_gpu: true,device_id: 0,
+        count: mesh.indices.len,normals: normals,uvs: uvs,tangents: tangents,bounds: uploaded_bounds,closed: false}
+}
+fn close_soft_blob(blob $&gpu.SoftBlob) string { blob.close() or(err){ << err.msg() }
+    << "" }
+pub fn (mesh $&Mesh3D) close() int {
+    if mesh.closed { << 0 }
+    $first := ""
+    $second := ""
+    if mesh.vertices.len>0 { first = close_buffer($&mesh.vertices[0]) }
+    if mesh.indices.len>0 { second = close_buffer($&mesh.indices[0]) }
+    for i in 0:mesh.soft_blobs.len {
+        err := close_soft_blob($&mesh.soft_blobs[i])
+        if first.len==0 && err.len>0 { first = err }
+    }
+    mesh.vertices = []gpu.Buffer{}
+    mesh.indices = []gpu.Buffer{}
+    mesh.soft_blobs = []gpu.SoftBlob{}
+    mesh.closed = true
+    if first.len>0 { >> errors.new(first) }
+    if second.len>0 { >> errors.new(second) }
+    << 0
+}
+fn close_buffer(buffer $&gpu.Buffer) string { buffer.close() or(err){ << err.msg() }
+    << "" }
+fn (mesh $&Mesh3D) drop() { mesh.close() or(err){ << } }
+fn matrix_words(matrix fm.Mat4) []int {
+    if !matrix.is_finite() { >> errors.new("game 3D: non-finite model-view-projection") }
+    $words := []int{}
+    for column in [matrix.c0,matrix.c1,matrix.c2,matrix.c3] {
+        for value in [column.x,column.y,column.z,column.w] { words.push(scalar_word(value) or >>) }
+    }
+    << words
+}
+fn word_bytes(words &[]int) []u8 {
+    $bytes := zero_bytes(words.len*4)
+    for i in 0:words.len { binary.little_endian().put_u32_bytes($&bytes,i*4,words[i]) or >> }
+    << bytes
+}
+pub fn (device $&Device3D) draw(mesh &Mesh3D, model_view_projection fm.Mat4) int {
+    << device.draw_reference(mesh.reference(),model_view_projection) or >>
+}
+fn (device $&Device3D) record_draw(mesh MeshRef3D, matrices &[]int, parameters &[]int, illumination &[]int, maps &[]TextureRef3D,shadow &ShadowBinding3D,shadow_index int) int {
+    device.drawing() or >>
+    // All weak resources and scalar bytes are checked before the first binding.
+    device.reference().validate_mesh(mesh,false) or >>
+    dev := device.gpu_device() or >>
+    dev_ref := dev.reference()
+    for texture in maps {
+        if texture.present { dev_ref.validate_texture(texture.image) or >>
+            dev_ref.validate_sampler(texture.sampler) or >> }
+    }
+    if shadow.present { dev_ref.validate_texture(shadow.image) or >> }
+    vertex := word_bytes(matrices) or >>
+    fragment := word_bytes(parameters) or >>
+    lights := word_bytes(illumination) or >>
+    shadow_values := shadow_words(shadow,shadow_index) or >>
+    shadow_bytes := word_bytes(&shadow_values) or >>
+    if parameters[11]==0 {
+        if parameters[12]==3212836864 { device.passes[0].pipeline(&device.pipelines[2]) or >>
+        } else { device.passes[0].pipeline(&device.pipelines[1]) or >> }
+    } else { device.passes[0].pipeline(&device.pipelines[0]) or >> }
+    device.passes[0].vertex_buffer_ref(0,mesh.vertices,0) or >>
+    device.passes[0].index_buffer_ref(mesh.indices,0,gpu.INDEX32) or >>
+    for i in 0:5 {
+        texture := maps[i]
+        if texture.present { device.passes[0].sampler_ref(gpu.FRAGMENT,i,texture.image,texture.sampler) or >>
+        } else { device.passes[0].sampler(gpu.FRAGMENT,i,&device.whites[0],&device.white_samplers[0]) or >> }
+    }
+    if shadow.present { device.passes[0].sampler_ref(gpu.FRAGMENT,5,shadow.image,device.white_samplers[0].reference()) or >>
+    } else { device.passes[0].sampler(gpu.FRAGMENT,5,&device.whites[0],&device.white_samplers[0]) or >> }
+    device.passes[0].uniform(gpu.VERTEX,0,&vertex) or >>
+    device.passes[0].uniform(gpu.FRAGMENT,0,&fragment) or >>
+    device.passes[0].uniform(gpu.FRAGMENT,1,&lights) or >>
+    device.passes[0].uniform(gpu.FRAGMENT,2,&shadow_bytes) or >>
+    device.passes[0].draw_indexed(mesh.count,0,0,1,0) or >>
+    device.draw_count += 1
+    << mesh.count/3
+}

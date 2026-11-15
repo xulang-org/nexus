@@ -1,0 +1,173 @@
+@"github.com/xulang-org/game/integration/scene_script"
+
+resource #"github.com/xulang-org/game/resources/scene"
+node_files #"github.com/xulang-org/game/integration/scene"
+game #"github.com/xulang-org/game/scene"
+bc #"github.com/xulang-org/game/script/bytecode"
+host #"github.com/xulang-org/game/script/host"
+snapshot #"github.com/xulang-org/game/internal/file_snapshot"
+#crypto/sha256
+#path/filepath
+#errors
+
+struct Bindings { manager host.SceneScripts
+    ids []int
+    root int }
+pub struct ScriptScene {
+    document resource.Document
+    packed game.PackedScene
+    bytes map[string]string
+    binding Bindings
+    base_directory string
+    closed bool
+}
+fn empty_bindings() Bindings {
+    manager := host.new_scene_scripts(1) or >>
+    << Bindings{manager: manager, ids: []int{}, root: 0}
+}
+pub fn load(path string) ScriptScene {
+    document := node_files.load(path + "") or >>
+    directory := filepath.dir(&path)
+    << prepare(document, directory) or >>
+}
+pub fn load_scripts(path string) ScriptScene {
+    document := node_files.load(path + "") or >>
+    directory := filepath.dir(&path)
+    << prepare_scripts(document, directory) or >>
+}
+pub fn prepare(document resource.Document, base_directory string) ScriptScene {
+    if document.surface_count() > 0 || document.audio_count() > 0 || document.light_count() > 0 { >> errors.new("game scene script: other attachments require explicit prepare_scripts and service composition") }
+    << prepare_scripts(document, base_directory) or >>
+}
+pub fn prepare_scripts(document resource.Document, base_directory string) ScriptScene {
+    if document.script_count() < 1 { >> errors.new("game scene script: document has no scripts") }
+    directory := filepath.abs(&base_directory) or >>
+    packed := node_files.to_packed_nodes(&document) or >>
+    $bytes := map[string]string{}
+    for i in 0:document.resource_count() {
+        reference := document.resource(i) or >>
+        if reference.kind != "xu_bytecode" { -> }
+        path := filepath.join([directory + "", reference.path + ""])
+        raw := snapshot.read(path, bc.MAX_BYTES) or >>
+        hash := sha256.sum256(raw + "")
+        if hash != reference.content_hash { >> errors.new("game scene script: bytecode content hash mismatch") }
+        if !bytes.has(hash + "") { bc.decode(&raw) or >>
+            bytes[hash] = raw }
+    }
+    binding := empty_bindings() or >>
+    << ScriptScene{document: document, packed: packed, bytes: bytes, binding: binding, base_directory: directory, closed: false}
+}
+fn (set &ScriptScene) check() int {
+    if set.closed || set.document.script_count() < 1 { >> errors.new("game scene script: closed or uninitialized script scene") }
+    << 0
+}
+fn (set &ScriptScene) bound_index(index int) int {
+    set.check() or >>
+    if index < 0 || index >= set.binding.ids.len { >> errors.new("game scene script: script scene is not bound or index is invalid") }
+    << set.binding.ids[index]
+}
+pub fn (set &ScriptScene) script_count() int { << set.document.script_count() }
+pub fn (set &ScriptScene) bytecode_count() int { << set.bytes.len() }
+fn (set &ScriptScene) resource_index(uid &string) int {
+    for i in 0:set.document.resource_count() {
+        reference := set.document.resource(i) or >>
+        if reference.uid == *uid && reference.kind == "xu_bytecode" { << i }
+    }
+    >> errors.new("game scene script: unknown bytecode resource")
+}
+fn (set &ScriptScene) bindings(tree &game.SceneTree, root int) Bindings {
+    set.check() or >>
+    nodes := node_files.matching_nodes(&set.document, tree, root) or >>
+    $manager := host.new_scene_scripts(host.MAX_SCRIPTS) or >>
+    $ids := []int{}
+    $by_node := map[int]int{}
+    for i in 0:set.document.script_count() {
+        attachment := set.document.script(i) or >>
+        uid := attachment.resource_uid + ""
+        reference := set.document.resource(set.resource_index(&uid) or >>) or >>
+        raw := set.bytes[reference.content_hash + ""]
+        program := bc.decode(&raw) or >>
+        id := manager.attach(tree, nodes[attachment.node], program) or >>
+        for field in attachment.initial { manager.set_state(tree, id, field.id, field.value) or >> }
+        by_node[attachment.node] = id
+        ids.push(id)
+    }
+    for i in 0:set.document.script_connection_count() {
+        route := set.document.script_connection(i) or >>
+        manager.connect_ids(tree, by_node[route.source], route.signal, by_node[route.target], route.handler) or >>
+    }
+    << Bindings{manager: manager, ids: ids, root: root}
+}
+pub fn (set $&ScriptScene) bind(tree &game.SceneTree, root int) int {
+    if set.binding.ids.len > 0 { >> errors.new("game scene script: script scene already bound; prepare an independent instance") }
+    binding := set.bindings(tree, root) or >>
+    set.binding = binding
+    << set.document.script_count()
+}
+pub fn (set $&ScriptScene) instantiate(tree $&game.SceneTree, parent int, name string) int {
+    set.check() or >>
+    if set.binding.ids.len > 0 { >> errors.new("game scene script: script scene already bound") }
+    $temporary := game.new_scene_tree("Staging", set.document.node_count() + 1) or >>
+    container := temporary.root()
+    candidate := set.packed.instantiate($&temporary, container, "Candidate") or >>
+    set.bindings(&temporary, candidate) or >>
+    root := set.packed.instantiate(tree, parent, name) or >>
+    set.bind(tree, root) or >>
+    << root
+}
+pub fn (set &ScriptScene) state(index int, field int) f64 {
+    id := set.bound_index(index) or >>
+    << set.binding.manager.state(id, field) or >>
+}
+pub fn (set &ScriptScene) epoch(index int) int {
+    id := set.bound_index(index) or >>
+    << set.binding.manager.epoch(id) or >>
+}
+pub fn (set &ScriptScene) calls(index int) int {
+    id := set.bound_index(index) or >>
+    << set.binding.manager.calls(id) or >>
+}
+pub fn (set &ScriptScene) connection_count() int { << set.binding.manager.connection_count() }
+fn process(binding $&Bindings, tree &game.SceneTree, id int, delta f64, axis f64) f64 {
+    manager := $&binding.manager
+    << manager.physics_process(tree, id, delta, axis) or >>
+}
+pub fn (set $&ScriptScene) physics_process(tree &game.SceneTree, index int, delta f64, axis f64) f64 {
+    id := set.bound_index(index) or >>
+    << process($&set.binding, tree, id, delta, axis) or >>
+}
+fn dispatch(binding $&Bindings, tree &game.SceneTree, limit int) host.DispatchReport {
+    manager := $&binding.manager
+    << manager.dispatch(tree, limit) or >>
+}
+pub fn (set $&ScriptScene) dispatch(tree &game.SceneTree, limit int) host.DispatchReport {
+    set.bound_index(0) or >>
+    << dispatch($&set.binding, tree, limit) or >>
+}
+pub fn (set &ScriptScene) capture(tree &game.SceneTree) resource.Document {
+    set.bound_index(0) or >>
+    node_files.matching_nodes(&set.document, tree, set.binding.root) or >>
+    nodes := node_files.capture_nodes(tree, set.binding.root) or >>
+    $references := []resource.ResourceReference{}
+    for i in 0:set.document.resource_count() { references.push(set.document.resource(i) or >>) }
+    << resource.with_references(&set.document, &nodes, references) or >>
+}
+pub fn (set &ScriptScene) save(path string, tree &game.SceneTree) int {
+    document := set.capture(tree) or >>
+    for i in 0:document.resource_count() {
+        reference := document.resource(i) or >>
+        if reference.kind != "xu_bytecode" { -> }
+        source := filepath.join([set.base_directory + "", reference.path + ""])
+        raw := snapshot.read(source, bc.MAX_BYTES) or >>
+        if sha256.sum256(raw) != reference.content_hash { >> errors.new("game scene script: accepted bytecode revision is unavailable on disk") }
+    }
+    << node_files.save_rebased(path, &document, set.base_directory + "") or >>
+}
+pub fn (set $&ScriptScene) close() int {
+    if set.closed { << 0 }
+    binding := empty_bindings() or >>
+    set.binding = binding
+    set.bytes = map[string]string{}
+    set.closed = true
+    << 0
+}

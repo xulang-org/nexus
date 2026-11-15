@@ -1,0 +1,131 @@
+@main
+
+light_data #"github.com/xulang-org/game/resources/lighting"
+
+#gpu
+
+gpu_info #"github.com/xulang-org/game/platform/gpu"
+
+#window
+window_events #window/events
+mesh_shaders #"github.com/xulang-org/game/assets/shaders/three_d"
+
+meshes #"github.com/xulang-org/game/resources/mesh"
+
+timing #"github.com/xulang-org/game/timing"
+controls #"github.com/xulang-org/game/input"
+ren #"github.com/xulang-org/game/rendering/three_d"
+scene_render #"github.com/xulang-org/game/integration/rendering/three_d"
+colors #"github.com/xulang-org/game/foundation/color"
+input_bridge #"github.com/xulang-org/game/integration/input"
+images #"github.com/xulang-org/game/assets/image"
+image_render #"github.com/xulang-org/game/integration/image_render/three_d"
+fm #"github.com/xulang-org/game/foundation/math"
+game #"github.com/xulang-org/game/scene"
+#os
+#strconv
+#errors
+#math
+
+fn run() int {
+    args := os.args()
+    $frames := 0
+    $capture := ""
+    $shaders := "build/mesh-shaders"
+    $i := 1
+    while i < args.len {
+        if i + 1 >= args.len { >> errors.new("missing option value") }
+        value := args[i + 1] + ""
+        if args[i] == "--frames" { frames = strconv.atoi(&value) or >>
+            if frames < 1 || frames > 1000000 { >> errors.new("invalid frame count") }
+        } else if args[i] == "--shaders" { shaders = value
+        } else if args[i] == "--capture" { capture = value
+        } else { >> errors.new("unknown option") }
+        i = i + 2
+    }
+    if capture.len > 0 && frames == 0 { >> errors.new("capture requires bounded frames") }
+    mesh_program_0 := mesh_shaders.load_mesh(shaders + "") or >>
+    $device := ren.open_3d("Xu textures | left: sRGB nearest | center: sRGB linear | right: linear data | Space: pause | arrows: orbit", 1100, 720, gpu.AUTO, &mesh_program_0) or >>
+    println("Texture GPU backend: " + gpu_info.backend_name(device.backend() or >>))
+    white := colors.rgba8(255, 255, 255, 255) or >>
+    source := meshes.sphere_mesh_3d(1.0, 64, 32, white) or >>
+    $sphere := device.upload(&source) or >>
+    $tree := game.new_scene_tree_3d("Textures", 16) or >>
+    $scene := scene_render.new_scene_3d(&device) or >>
+    zero := fm.vec3(0.0, 0.0, 0.0)
+    image := images.load_png("examples/textures3d/assets/uv-grid.png") or >>
+    $nearest := image_render.upload_image_3d(&device, &image, true, false, true) or >>
+    $linear := image_render.upload_image_3d(&device, &image, true, true, true) or >>
+    $linear_data := image_render.upload_image_3d(&device, &image, false, true, true) or >>
+    base := ren.material_3d(fm.vec3(1.0, 1.0, 1.0), 0.0, 0.7, zero) or >>
+    materials := [base.with_base_texture(&nearest) or >>, base.with_base_texture(&linear) or >>, base.with_base_texture(&linear_data) or >>]
+    $nodes := []int{}
+    for column in 0:3 {
+        node := tree.add_child_3d(tree.root(), "Textured sphere " + str(column)) or >>
+        nodes.push(node)
+        tree.set_position_3d(node, fm.vec3((f64(column) - 1.0) * 2.6, 0.0, 0.0)) or >>
+        scene.attach_mesh(&tree, node, &sphere) or >>
+        scene.set_material(&tree, node, materials[column]) or >>
+    }
+    $input := controls.new_input_map()
+    input.bind("left", window_events.KEY_LEFT) or >>
+    input.bind("right", window_events.KEY_RIGHT) or >>
+    input.bind("pause", window_events.KEY_SPACE) or >>
+    input.bind("quit", window_events.KEY_ESCAPE) or >>
+    $angle := 0.0
+    $orbit := 0.0
+    $paused := false
+    $frame := 0
+    $quit := false
+    $last := now_ns()
+    $clock := timing.new_clock(60, 8) or >>
+    projection := game.new_camera_3d()
+    background := colors.rgba8(12, 18, 29, 255) or >>
+    while !quit && (frames == 0 || frame < frames) {
+        input.begin_frame()
+        window.pump() or >>
+        for poll in 0:256 { event := device.poll() or >>
+            if event.kind == window_events.EVENT_NONE { <- }
+            if event.kind == window_events.EVENT_CLOSE_REQUESTED { quit = true }
+            input_bridge.apply_window_input($&input, &event) or >> }
+        if input.just_pressed("quit") or >> { quit = true }
+        if quit { <- }
+        if input.just_pressed("pause") or >> { paused = !paused }
+        now := now_ns()
+        $delta := f64(now - last) / 1000000000.0
+        last = now
+        if frames > 0 { delta = 1.0 / 60.0 }
+        ticks := clock.advance(delta) or >>
+        for tick in 0:ticks.steps {
+            if !paused { angle = angle + ticks.fixed_delta * 0.35 }
+            orbit = orbit + (input.axis("left", "right") or >>) * ticks.fixed_delta * 0.4
+        }
+        for column in 0:3 {
+            world := fm.translation_3d(fm.vec3((f64(column) - 1.0) * 2.6, 0.0, 0.0)).multiply(fm.rotation_y(angle))
+            tree.set_transform_3d(nodes[column], world) or >>
+        }
+        eye := fm.vec3(math.sin(orbit) * 9.5, 1.2, math.cos(orbit) * 9.5)
+        view := game.look_at_3d(eye, zero, fm.vec3(0.0, 1.0, 0.0)) or >>
+        width := device.width() or >>
+        height := device.height() or >>
+        if width < 1 || height < 1 { sleep_ns(10000000)
+            -> }
+        vp := (game.perspective_3d(projection.vertical_fov, f64(width) / f64(height), projection.near, projection.far) or >>).multiply(view)
+        lighting := light_data.environment(fm.vec3(0.1, 0.1, 0.1), eye, 1.0, [light_data.directional(fm.vec3(-0.3, 0.7, 1.0), fm.vec3(3.0, 3.0, 3.0)) or >>]) or >>
+        device.begin(background) or >>
+        draws := scene.draw_lit($&device, &tree, vp, &lighting) or >>
+        assert((draws.instances+draws.culled_instances) == 3 && (draws.triangles+draws.culled_triangles) == source.triangle_count() * 3)
+        if capture.len > 0 && frame + 1 == frames { device.capture(capture + "") or >> }
+        device.present() or >>
+        frame = frame + 1
+    }
+    nearest.close() or >>
+    linear.close() or >>
+    linear_data.close() or >>
+    sphere.close() or >>
+    device.close() or >>
+    println("Finished " + str(frame) + " texture frames; 3 shared sphere instances, nearest/linear and sRGB/linear-data comparison")
+    << 0
+}
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

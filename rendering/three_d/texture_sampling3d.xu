@@ -1,0 +1,92 @@
+@"github.com/xulang-org/game/rendering/three_d"
+
+#gpu
+layout #gpu/layout
+#errors
+
+pub const MIP_NONE = 0
+pub const MIP_NEAREST = 1
+pub const MIP_LINEAR = 2
+
+// Immutable-at-upload sampler description, not a separate GPU resource owner.
+// min_linear and mag_linear select texel filtering; mip_filter selects levels.
+// MIP_LINEAR + min_linear enables trilinear minification. There is no LOD bias
+// or anisotropy contract yet. The default value is nearest/clamp with one level.
+pub struct TextureSampling3D {
+    pub min_linear bool
+    pub mag_linear bool
+    pub repeat_u bool
+    pub repeat_v bool
+    pub mip_filter int
+}
+pub fn (sampling &TextureSampling3D) validate() int {
+    if sampling.mip_filter < MIP_NONE || sampling.mip_filter > MIP_LINEAR {
+        >> errors.new("game GPU: invalid mip filter")
+    }
+    << 0
+}
+pub fn (device &Device3D) texture_rgba_sampled(width int, height int, pixels &[]int,
+    srgb bool, sampling TextureSampling3D) Texture3D {
+    sampling.validate() or >>
+    // Image limits are engine policy; mip/block arithmetic belongs to Xu.
+    if width < 1 || height < 1 || width > 4096 || height > 4096 || width * height > 4194304 || pixels.len != width * height {
+        >> errors.new("game GPU: invalid 3D texture dimensions or pixels")
+    }
+    $format := layout.RGBA8_UNORM
+    if srgb { format = layout.RGBA8_SRGB }
+    $levels := 1
+    if sampling.mip_filter != MIP_NONE { levels = 0 }
+    storage := layout.texture_2d(format, width, height, levels, 1, 1) or >>
+    device.alive() or >>
+    if device.active { >> errors.new("game 3D: upload textures outside a frame") }
+    if device.is_gpu() {
+        dev := device.gpu_device() or >>
+        stats := dev.stats() or >>
+        $internal_bytes := device.target_width*device.target_height*8+4
+        if device.render_scale==2 { internal_bytes=device.target_width*device.target_height*36+4 }
+        if stats.texture_count>=513+device.targets.len || storage.total_bytes()>67108864-(stats.texture_bytes-internal_bytes) {
+            >> errors.new("game 3D: texture capacity or full-chain 64 MiB budget exceeded")
+        }
+    } else if storage.total_bytes()>67108864 {
+        >> errors.new("game 3D: texture capacity or full-chain 64 MiB budget exceeded")
+    }
+    $bytes := zero_bytes(pixels.len*4)
+    for i in 0:pixels.len {
+        color := pixels[i]
+        if color<0 || color>4294967295 { >> errors.new("game 3D: invalid RGBA pixel") }
+        for channel in 0:4 { bytes[i*4+channel]=u8((color >> (24-channel*8)) & 255) }
+    }
+    if !device.is_gpu() {
+        blob := gpu.soft_blob_create(device.device_id,&bytes) or >>
+        << Texture3D{images: []gpu.Texture{},samplers: []gpu.Sampler{},soft_blobs: [blob],has_gpu: false,device_id: device.device_id,
+            soft_levels: storage.level_count(),soft_bytes: storage.total_bytes(),
+            linear: sampling.min_linear || sampling.mag_linear,repeat: sampling.repeat_u || sampling.repeat_v,
+            srgb: srgb,closed: false,width: width,height: height}
+    }
+    dev := device.gpu_device() or >>
+    $usage := gpu.TEXTURE_SAMPLED
+    if storage.level_count()>1 { usage=usage | gpu.TEXTURE_COLOR_TARGET }
+    $image := dev.texture_2d(gpu.Texture2DDesc{format: format,width: width,height: height,
+        levels: storage.level_count(),usage: usage}) or >>
+    $upload := dev.upload_texture(&image,0,&bytes) or >>
+    upload.close() or >>
+    if storage.level_count()>1 { $mips := dev.generate_mips(&image) or >>
+        mips.close() or >> }
+    $desc := gpu.sampler_defaults()
+    desc.min_filter = gpu.NEAREST
+    desc.mag_filter = gpu.NEAREST
+    desc.mip_filter = gpu.NEAREST
+    // A zero LOD clamp makes Metal choose mag_filter during minification.
+    // The texture's allocated mip range already bounds one-level images.
+    if storage.level_count()>1 { desc.max_lod=f64(storage.level_count()-1) }
+    if sampling.min_linear { desc.min_filter=gpu.LINEAR }
+    if sampling.mag_linear { desc.mag_filter=gpu.LINEAR }
+    if sampling.mip_filter==MIP_LINEAR { desc.mip_filter=gpu.LINEAR }
+    if sampling.repeat_u { desc.address_u=gpu.REPEAT }
+    if sampling.repeat_v { desc.address_v=gpu.REPEAT }
+    sampler := dev.sampler(desc) or >>
+    << Texture3D{images: [image],samplers: [sampler],soft_blobs: []gpu.SoftBlob{},has_gpu: true,device_id: 0,
+        soft_levels: storage.level_count(),soft_bytes: storage.total_bytes(),
+        linear: sampling.min_linear || sampling.mag_linear,repeat: sampling.repeat_u || sampling.repeat_v,
+        srgb: srgb,closed: false,width: width,height: height}
+}

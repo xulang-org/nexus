@@ -1,0 +1,62 @@
+@"github.com/xulang-org/game/formats/scene"
+
+resource #"github.com/xulang-org/game/resources/scene"
+#encoding/json
+#strconv
+#strings
+#errors
+
+fn type_name(kind int) string {
+    if kind == resource.NODE_GROUP { << "Node" }
+    if kind == resource.NODE_2D { << "Node2D" }
+    << "Node3D"
+}
+fn process_name(mode int) string {
+    if mode == resource.PROCESS_INHERIT { << "inherit" }
+    if mode == resource.PROCESS_PAUSABLE { << "pausable" }
+    if mode == resource.PROCESS_ALWAYS { << "always" }
+    if mode == resource.PROCESS_WHEN_PAUSED { << "when_paused" }
+    << "disabled"
+}
+fn transform(node &resource.NodeData) []f64 {
+    if node.kind == resource.NODE_2D {
+        t := node.local
+        << [t.a, t.b, t.c, t.d, t.tx, t.ty]
+    }
+    m := node.local_3d
+    << [m.c0.x, m.c0.y, m.c0.z, m.c0.w, m.c1.x, m.c1.y, m.c1.z, m.c1.w,
+        m.c2.x, m.c2.y, m.c2.z, m.c2.w, m.c3.x, m.c3.y, m.c3.z, m.c3.w]
+}
+pub fn encode(document &resource.Document) string {
+    if document.node_count() < 1 { >> errors.new("game scene: cannot encode an empty document") }
+    $out := strings.new_byte_builder(4096)
+    out.write_str("{\"format\":\"" + FORMAT + "\",\"version\":" + str(VERSION) + ",\"nodes\":[\n")
+    for i in 0:document.node_count() {
+        if i > 0 { out.write_str(",\n") }
+        node := document.describe_node(i) or >>
+        name := node.name + ""
+        out.write_str("{\"parent\":" + str(node.parent) + ",\"name\":" + json.quote(&name) + ",\"type\":\"" + type_name(node.kind) +
+            "\",\"visible\":" + str(node.visible) + ",\"process\":\"" + process_name(node.process_mode) + "\"")
+        if node.kind != resource.NODE_GROUP {
+            out.write_str(",\"transform\":[")
+            values := transform(&node)
+            for j in 0:values.len {
+                if j > 0 { out.write_str(",") }
+                // SDK shortest round-trippable decimal; str(f64) loses precision.
+                decimal := strconv.format_float(values[j], 103, -1) or >>
+                out.write_str(decimal)
+            }
+            out.write_str("]")
+        }
+        out.write_str("}")
+    }
+    out.write_str("\n]")
+    out.write_str(encode_surfaces(document) or >>)
+    out.write_str(encode_audio(document) or >>)
+    out.write_str(encode_scripts(document) or >>)
+    out.write_str(encode_lights(document) or >>)
+    out.write_str("}\n")
+    raw := out.to_string()
+    if raw.len > MAX_BYTES { >> errors.new("game scene: encoded file exceeds byte limit") }
+    << raw
+}

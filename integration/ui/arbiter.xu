@@ -1,0 +1,216 @@
+@"github.com/xulang-org/game/integration/ui"
+
+#errors
+#ui
+#ui/layout
+wev #window/events
+
+pub const ROUTE_NONE = 0
+pub const ROUTE_UI = 1
+pub const ROUTE_GAME = 2
+
+pub struct RouteDecision {
+    pub to_ui bool
+    pub to_game bool
+    pub owner int
+    pub ui_event ui.InputEvent
+    pub text string
+}
+
+struct TouchOwner {
+    device_id int
+    touch_id int
+    owner int
+}
+
+// Arbitrates window events between registered HUD hit regions, modal/text-focus
+// guards, active pointer/touch captures, and underlying game handlers.
+pub struct HudRouter {
+    rects []layout.Rect
+    modal_open bool
+    text_focused bool
+    hovering_ui bool
+    mouse_owner int
+    touches []TouchOwner
+}
+
+pub fn is_text_input(ev &wev.Event) bool {
+    << ev.kind == wev.EVENT_TEXT_INPUT && ev.text.len > 0
+}
+
+pub fn text_input_of(ev &wev.Event) string {
+    if ev.kind == wev.EVENT_TEXT_INPUT { << ev.text + "" }
+    << ""
+}
+
+pub fn new_hud_router() HudRouter {
+    << HudRouter{
+        rects: []layout.Rect{},
+        modal_open: false,
+        text_focused: false,
+        hovering_ui: false,
+        mouse_owner: ROUTE_NONE,
+        touches: []TouchOwner{}
+    }
+}
+
+pub fn (r $&HudRouter) begin_frame() {
+    r.rects = []layout.Rect{}
+}
+
+pub fn (r $&HudRouter) add_rect(rect &layout.Rect) int {
+    clean := layout.intersect(rect, rect) or >>
+    if clean.width > 0.0 && clean.height > 0.0 {
+        r.rects.push(clean)
+    }
+    << 0
+}
+
+pub fn (r $&HudRouter) set_modal(open bool) {
+    r.modal_open = open
+}
+
+pub fn (r $&HudRouter) set_text_focused(focused bool) {
+    r.text_focused = focused
+}
+
+pub fn (r &HudRouter) is_modal() bool { << r.modal_open }
+pub fn (r &HudRouter) is_text_focused() bool { << r.text_focused }
+pub fn (r &HudRouter) mouse_capture() int { << r.mouse_owner }
+pub fn (r &HudRouter) active_touch_count() int { << r.touches.len }
+
+pub fn (r &HudRouter) hit_ui(x f64, y f64) bool {
+    for i in 0:r.rects.len {
+        if r.rects[i].contains(x, y) { << true }
+    }
+    << false
+}
+
+fn (r &HudRouter) find_touch_owner(device_id int, touch_id int) int {
+    for i in 0:r.touches.len {
+        t := r.touches[i]
+        if t.device_id == device_id && t.touch_id == touch_id { << t.owner }
+    }
+    << ROUTE_NONE
+}
+
+fn (r $&HudRouter) set_touch_owner(device_id int, touch_id int, owner int) {
+    for i in 0:r.touches.len {
+        if r.touches[i].device_id == device_id && r.touches[i].touch_id == touch_id {
+            r.touches[i].owner = owner
+            <<
+        }
+    }
+    r.touches.push(TouchOwner{device_id: device_id, touch_id: touch_id, owner: owner})
+}
+
+fn (r $&HudRouter) take_touch_owner(device_id int, touch_id int) int {
+    $out := []TouchOwner{}
+    $found := ROUTE_NONE
+    for i in 0:r.touches.len {
+        t := r.touches[i]
+        if found == ROUTE_NONE && t.device_id == device_id && t.touch_id == touch_id {
+            found = t.owner
+        } else {
+            out.push(t)
+        }
+    }
+    r.touches = out
+    << found
+}
+
+fn decision_for_owner(owner int, ui_ev ui.InputEvent, txt string) RouteDecision {
+    << RouteDecision{
+        to_ui: owner == ROUTE_UI,
+        to_game: owner == ROUTE_GAME,
+        owner: owner,
+        ui_event: ui_ev,
+        text: txt
+    }
+}
+
+fn (r &HudRouter) hit_or_modal(x f64, y f64) int {
+    if r.modal_open || r.hit_ui(x, y) { << ROUTE_UI }
+    << ROUTE_GAME
+}
+
+// Translates `ev` via `bridge` and returns UI vs game delivery flags.
+pub fn (r $&HudRouter) route_event(bridge $&InputBridge, ev &wev.Event) RouteDecision {
+    ui_ev := bridge.translate(ev)
+    txt := text_input_of(ev)
+    k := ev.kind
+
+    if k == wev.EVENT_FOCUS_LOST || k == wev.EVENT_INPUT_RESET {
+        r.mouse_owner = ROUTE_NONE
+        r.hovering_ui = false
+        r.touches = []TouchOwner{}
+        << RouteDecision{to_ui: true, to_game: true, owner: ROUTE_NONE, ui_event: ui_ev, text: ""}
+    }
+
+    if k == wev.EVENT_POINTER_DOWN {
+        if r.mouse_owner == ROUTE_NONE {
+            r.mouse_owner = r.hit_or_modal(ev.x, ev.y)
+        }
+        << decision_for_owner(r.mouse_owner, ui_ev, "")
+    }
+
+    if k == wev.EVENT_POINTER_MOVE {
+        if r.mouse_owner != ROUTE_NONE {
+            << decision_for_owner(r.mouse_owner, ui_ev, "")
+        }
+        if r.modal_open || r.hit_ui(ev.x, ev.y) {
+            r.hovering_ui = true
+            << decision_for_owner(ROUTE_UI, ui_ev, "")
+        }
+        if r.hovering_ui {
+            r.hovering_ui = false
+            << RouteDecision{to_ui: true, to_game: true, owner: ROUTE_GAME, ui_event: ui_ev, text: ""}
+        }
+        << decision_for_owner(ROUTE_GAME, ui_ev, "")
+    }
+
+    if k == wev.EVENT_POINTER_UP {
+        $owner := r.mouse_owner
+        if owner == ROUTE_NONE { owner = r.hit_or_modal(ev.x, ev.y) }
+        if ui_ev.buttons == 0 {
+            r.mouse_owner = ROUTE_NONE
+            r.hovering_ui = r.hit_ui(ev.x, ev.y)
+        }
+        << decision_for_owner(owner, ui_ev, "")
+    }
+
+    if k == wev.EVENT_WHEEL {
+        if r.mouse_owner != ROUTE_NONE {
+            << decision_for_owner(r.mouse_owner, ui_ev, "")
+        }
+        << decision_for_owner(r.hit_or_modal(ev.x, ev.y), ui_ev, "")
+    }
+
+    if k == wev.EVENT_TOUCH_DOWN {
+        owner := r.hit_or_modal(ev.x, ev.y)
+        r.set_touch_owner(ev.device_id, ev.touch_id, owner)
+        << decision_for_owner(owner, ui_ev, "")
+    }
+
+    if k == wev.EVENT_TOUCH_MOVE {
+        $owner := r.find_touch_owner(ev.device_id, ev.touch_id)
+        if owner == ROUTE_NONE { owner = r.hit_or_modal(ev.x, ev.y) }
+        << decision_for_owner(owner, ui_ev, "")
+    }
+
+    if k == wev.EVENT_TOUCH_UP || k == wev.EVENT_TOUCH_CANCEL {
+        $owner := r.take_touch_owner(ev.device_id, ev.touch_id)
+        if owner == ROUTE_NONE { owner = r.hit_or_modal(ev.x, ev.y) }
+        << decision_for_owner(owner, ui_ev, "")
+    }
+
+    if k == wev.EVENT_KEY_DOWN || k == wev.EVENT_KEY_UP ||
+       k == wev.EVENT_TEXT_INPUT || k == wev.EVENT_TEXT_EDITING {
+        if r.text_focused || r.modal_open {
+            << decision_for_owner(ROUTE_UI, ui_ev, txt)
+        }
+        << decision_for_owner(ROUTE_GAME, ui_ev, txt)
+    }
+
+    << RouteDecision{to_ui: false, to_game: true, owner: ROUTE_NONE, ui_event: ui_ev, text: ""}
+}

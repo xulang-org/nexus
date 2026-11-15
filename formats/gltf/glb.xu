@@ -1,0 +1,190 @@
+@"github.com/xulang-org/game/formats/gltf"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#encoding/json
+#encoding/binary
+#crypto/sha256
+#errors
+
+pub const MAX_GLB_BYTES = 16777216
+const MAX_JSON_BYTES = 524288
+const MAX_BIN_BYTES = 8388608
+const MAX_ASSET_NODES = 1024
+const MAX_PRIMITIVES = 1024
+const MAX_ASSET_VERTICES = 262144
+const MAX_ASSET_INDICES = 1048575
+
+struct GlbMesh { first int
+    count int }
+struct GlbPrimitive {
+    first_vertex int
+    vertex_count int
+    first_index int
+    index_count int
+    normals bool
+    uvs bool
+    tangents bool
+    material int
+}
+struct GlbNode {
+    parent int
+    mesh int
+    local fm.Mat4
+    name string
+    depth int
+    selected bool
+    skin int
+    translation fm.Vec3
+    rotation fm.Vec4
+    scale fm.Vec3
+    matrix bool
+}
+// Static geometry descriptions. No filesystem, SceneTree, renderer or GPU.
+pub struct GlbGeometry {
+    source_hash string
+    resolved_hash string
+    materials []MaterialDescription
+    textures []TextureDescription
+    samplers []SamplerDescription
+    images []EmbeddedImage
+    meshes []GlbMesh
+    primitives []GlbPrimitive
+    positions []fm.Vec3
+    normals []fm.Vec3
+    tangents []fm.Vec4
+    uvs []fm.Vec2
+    colors []int
+    indices []int
+    nodes []GlbNode
+    order []int
+    joints []JointWeights
+    skins []SkinDescription
+    animations []AnimationDescription
+}
+fn empty_geometry(source_hash string) GlbGeometry {
+    fingerprint := source_hash+""
+    << GlbGeometry{source_hash: source_hash, resolved_hash: fingerprint, materials: []MaterialDescription{}, textures: []TextureDescription{}, samplers: []SamplerDescription{}, images: []EmbeddedImage{}, meshes: []GlbMesh{}, primitives: []GlbPrimitive{},
+        positions: []fm.Vec3{}, normals: []fm.Vec3{}, tangents: []fm.Vec4{}, uvs: []fm.Vec2{}, colors: []int{},
+        indices: []int{}, nodes: []GlbNode{}, order: []int{}, joints: []JointWeights{}, skins: []SkinDescription{}, animations: []AnimationDescription{}}
+}
+fn header_word(raw &string, offset int) int {
+    if offset < 0 || offset > raw.len - 4 { >> errors.new("game GLB: truncated header") }
+    bytes := [raw[offset] & 255, raw[offset + 1] & 255, raw[offset + 2] & 255, raw[offset + 3] & 255]
+    << binary.little_endian().get_u32(&bytes, 0) or >>
+}
+pub fn decode_glb_geometry(raw &string) GlbGeometry {
+    if raw.len < 28 || raw.len > MAX_GLB_BYTES { >> errors.new("game GLB: file size outside profile") }
+    magic := header_word(raw, 0) or >>
+    version := header_word(raw, 4) or >>
+    length := header_word(raw, 8) or >>
+    if magic != 1179937895 || version != 2 || length != raw.len { >> errors.new("game GLB: invalid magic/version/length") }
+    $offset := 12
+    $json_text := ""
+    $binary_bytes := []int{}
+    $chunks := 0
+    $seen_json := false
+    $seen_bin := false
+    while offset < raw.len {
+        if offset > raw.len - 8 { >> errors.new("game GLB: truncated chunk header") }
+        size := header_word(raw, offset) or >>
+        kind := header_word(raw, offset + 4) or >>
+        offset = offset + 8
+        if size % 4 != 0 || size > raw.len - offset { >> errors.new("game GLB: unaligned or truncated chunk") }
+        if kind == 1313821514 {
+            if chunks != 0 || seen_json || size < 4 || size > MAX_JSON_BYTES { >> errors.new("game GLB: invalid JSON chunk") }
+            json_text = raw[offset:offset + size] + ""
+            seen_json = true
+        } else if kind == 5130562 {
+            if chunks != 1 || !seen_json || seen_bin || size < 1 || size > MAX_BIN_BYTES { >> errors.new("game GLB: invalid BIN chunk") }
+            for i in offset:offset + size { binary_bytes.push(raw[i] & 255) }
+            seen_bin = true
+        } else if chunks == 0 { >> errors.new("game GLB: first chunk must be JSON") }
+        // Unknown trailing chunk types are skipped, as required by GLB 2.0.
+        offset = offset + size
+        chunks = chunks + 1
+    }
+    if !seen_json || !seen_bin { >> errors.new("game GLB: profile requires JSON and embedded BIN chunks") }
+    doc := json.parse_max(&json_text, MAX_JSON_BYTES)
+    if !doc.ok() { >> errors.new("game GLB JSON: " + doc.error()) }
+    if doc.kinds.len > 32768 { >> errors.new("game GLB: JSON node budget exceeded") }
+    root := object(&doc, doc.root(), "glTF root") or >>
+    allowed := ["asset", "buffers", "bufferViews", "accessors", "meshes", "nodes", "scenes", "scene", "extensionsUsed", "extensionsRequired", "materials", "textures", "samplers", "images", "skins", "animations"]
+    fields(&doc, root, &allowed) or >>
+    // fields() rejects extensions on schema objects, including unused objects.
+    // Arbitrary extras metadata is not interpreted as glTF schema.
+    for key in ["extensionsUsed", "extensionsRequired"] {
+        value := doc.get(root, key)
+        if value >= 0 {
+            for item in list(&doc, value, 0, 2) or >> {
+                name := doc.as_string(item) or >>
+                if name!="KHR_texture_transform" && name!="KHR_materials_unlit" { >> errors.new("game GLB: unsupported extension "+name) }
+            }
+        }
+    }
+    asset := required(&doc, root, "asset") or >>
+    asset_fields := ["version", "minVersion", "generator", "copyright"]
+    fields(&doc, asset, &asset_fields) or >>
+    asset_version := text(&doc, asset, "version", "") or >>
+    minimum := text(&doc, asset, "minVersion", "2.0") or >>
+    if asset_version != "2.0" || minimum != "2.0" { >> errors.new("game GLB: only glTF asset version 2.0 is supported") }
+    buffers := array_property(&doc, root, "buffers", 1, 1) or >>
+    buffer_fields := ["byteLength", "name"]
+    fields(&doc, buffers[0], &buffer_fields) or >>
+    buffer_length := integer(&doc, buffers[0], "byteLength", -1, 1, MAX_BIN_BYTES) or >>
+    if buffer_length < 1 || buffer_length > binary_bytes.len || binary_bytes.len - buffer_length > 3 {
+        >> errors.new("game GLB: invalid embedded buffer length")
+    }
+    for i in buffer_length:binary_bytes.len { if binary_bytes[i] != 0 { >> errors.new("game GLB: BIN padding must be zero") } }
+    $parser := new_glb_parser(doc, binary_bytes, buffer_length)
+    parser.read_views(root) or >>
+    parser.read_accessors(root) or >>
+    source_hash := sha256.sum256(*raw + "")
+    $geometry := empty_geometry(source_hash)
+    parser.read_material_data(root, $&geometry) or >>
+    parser.read_meshes(root, $&geometry) or >>
+    read_nodes(&parser.doc, root, $&geometry) or >>
+    parser.read_skins(root,$&geometry) or >>
+    parser.read_animations(root,$&geometry) or >>
+    << geometry
+}
+pub fn (asset &GlbGeometry) content_hash() string { << asset.resolved_hash + "" }
+pub fn (asset &GlbGeometry) mesh_count() int { << asset.meshes.len }
+pub fn (asset &GlbGeometry) primitive_count() int { << asset.primitives.len }
+pub fn (asset &GlbGeometry) node_count() int { << asset.nodes.len }
+fn (asset &GlbGeometry) primitive(index int) GlbPrimitive {
+    if index < 0 || index >= asset.primitives.len { >> errors.new("game GLB: primitive index out of range") }
+    << asset.primitives[index]
+}
+pub fn (asset &GlbGeometry) vertex_count(primitive int) int { item := asset.primitive(primitive) or >>
+    << item.vertex_count }
+pub fn (asset &GlbGeometry) index_count(primitive int) int { item := asset.primitive(primitive) or >>
+    << item.index_count }
+fn (asset &GlbGeometry) vertex_index(primitive int, index int) int {
+    item := asset.primitive(primitive) or >>
+    if index < 0 || index >= item.vertex_count { >> errors.new("game GLB: vertex index out of range") }
+    << item.first_vertex + index
+}
+pub fn (asset &GlbGeometry) position(primitive int, index int) fm.Vec3 { at := asset.vertex_index(primitive, index) or >>
+    << asset.positions[at] }
+pub fn (asset &GlbGeometry) normal(primitive int, index int) fm.Vec3 { at := asset.vertex_index(primitive, index) or >>
+    if !asset.primitives[primitive].normals { >> errors.new("game GLB: primitive has no normals") }
+    << asset.normals[at] }
+pub fn (asset &GlbGeometry) uv(primitive int, index int) fm.Vec2 { at := asset.vertex_index(primitive, index) or >>
+    if !asset.primitives[primitive].uvs { >> errors.new("game GLB: primitive has no UVs") }
+    << asset.uvs[at] }
+pub fn (asset &GlbGeometry) tangent(primitive int, index int) fm.Vec4 { at := asset.vertex_index(primitive, index) or >>
+    if !asset.primitives[primitive].tangents { >> errors.new("game GLB: primitive has no tangents") }
+    << asset.tangents[at] }
+pub fn (asset &GlbGeometry) has_tangents(primitive int) bool { item := asset.primitive(primitive) or >>
+    << item.tangents }
+pub fn (asset &GlbGeometry) color(primitive int, index int) int { at := asset.vertex_index(primitive, index) or >>
+    << asset.colors[at] }
+pub fn (asset &GlbGeometry) has_normals(primitive int) bool { item := asset.primitive(primitive) or >>
+    << item.normals }
+pub fn (asset &GlbGeometry) has_uvs(primitive int) bool { item := asset.primitive(primitive) or >>
+    << item.uvs }
+pub fn (asset &GlbGeometry) index(primitive int, index int) int {
+    item := asset.primitive(primitive) or >>
+    if index < 0 || index >= item.index_count { >> errors.new("game GLB: index offset out of range") }
+    << asset.indices[item.first_index + index]
+}

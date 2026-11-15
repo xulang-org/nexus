@@ -1,0 +1,152 @@
+@"github.com/xulang-org/game/integration/input"
+
+controls #"github.com/xulang-org/game/input"
+fm #"github.com/xulang-org/game/foundation/math"
+events #window/events
+#math
+#errors
+
+pub const BUTTON_HOLD = 0
+pub const BUTTON_TAP = 1
+struct Capture { active bool
+    device int
+    finger int }
+struct TouchButton { center fm.Vec2
+    radius f64
+    source int
+    mode int
+    capture Capture
+    inside bool }
+pub struct TouchControls {
+    pub center fm.Vec2
+    pub radius f64
+    pub offset fm.Vec2
+    deadzone f64
+    first_source int
+    home_center fm.Vec2
+    floating bool
+    activation_area fm.Rect2
+    stick Capture
+    buttons []TouchButton
+}
+fn idle_capture() Capture { << Capture{active: false, device: 0, finger: 0} }
+fn matches(capture &Capture, event &events.Event) bool {
+    << capture.active && capture.device == event.device_id && capture.finger == event.touch_id
+}
+pub fn new_touch_controls(center fm.Vec2, radius f64, deadzone f64, first_source int) TouchControls {
+    if !fm.finite(center.x) || !fm.finite(center.y) || !fm.finite(radius) || radius <= 0.0 ||
+        !fm.finite(deadzone) || deadzone < 0.0 || deadzone >= 1.0 || first_source < 0 || first_source > controls.MAX_SOURCES - 4 {
+        >> errors.new("game: invalid virtual stick")
+    }
+    << TouchControls{center: center, radius: radius, offset: fm.vec2(0.0, 0.0), deadzone: deadzone,
+        first_source: first_source, home_center: center, floating: false,
+        activation_area: fm.rect2(center.x - radius, center.y - radius, radius * 2.0, radius * 2.0),
+        stick: idle_capture(), buttons: []TouchButton{}}
+}
+// Configure before input starts. A press anywhere in this area creates the
+// stick at that finger; capture continues outside the area until up/cancel.
+pub fn (touch $&TouchControls) enable_floating(area fm.Rect2) int {
+    if !area.valid() || touch.stick.active { >> errors.new("game: invalid or active floating stick configuration") }
+    touch.home_center = touch.center
+    touch.activation_area = area
+    touch.floating = true
+    << 0
+}
+// Stick source order is left, right, up, down. Reserve disjoint source IDs for controls.
+pub fn (touch $&TouchControls) add_button(center fm.Vec2, radius f64, source int, mode int) int {
+    if touch.buttons.len >= 16 || !fm.finite(center.x) || !fm.finite(center.y) || !fm.finite(radius) || radius <= 0.0 ||
+        source < 0 || source >= controls.MAX_SOURCES || (source >= touch.first_source && source < touch.first_source + 4) ||
+        (mode != BUTTON_HOLD && mode != BUTTON_TAP) {
+        >> errors.new("game: invalid touch button")
+    }
+    for button in touch.buttons { if button.source == source { >> errors.new("game: duplicate touch source") } }
+    touch.buttons.push(TouchButton{center: center, radius: radius, source: source, mode: mode,
+        capture: idle_capture(), inside: false})
+    << touch.buttons.len - 1
+}
+pub fn (touch &TouchControls) button_down(index int) bool {
+    if index < 0 || index >= touch.buttons.len { >> errors.new("game: unknown touch button") }
+    button := &touch.buttons[index]
+    << button.capture.active && (button.mode == BUTTON_HOLD || button.inside)
+}
+pub fn (touch $&TouchControls) cancel(input $&controls.InputMap) int {
+    touch.stick = idle_capture()
+    if touch.floating { touch.center = touch.home_center }
+    touch.offset = fm.vec2(0.0, 0.0)
+    for i in 0:4 { input.feed_source(touch.first_source + i, 0.0) or >> }
+    for i in 0:touch.buttons.len {
+        touch.buttons[i].capture = idle_capture()
+        touch.buttons[i].inside = false
+        input.feed_source(touch.buttons[i].source, 0.0) or >>
+    }
+    << 0
+}
+fn (touch $&TouchControls) move_stick(input $&controls.InputMap, point fm.Vec2) int {
+    delta := point.sub(touch.center).scaled(1.0 / touch.radius)
+    length := delta.length()
+    $direction := fm.vec2(0.0, 0.0)
+    touch.offset = delta
+    if length > 1.0 {
+        touch.offset = delta.scaled(1.0 / length)
+        if touch.floating { touch.center = point.sub(touch.offset.scaled(touch.radius)) }
+    }
+    if length > touch.deadzone {
+        strength := (math.min(length, 1.0) - touch.deadzone) / (1.0 - touch.deadzone)
+        direction = delta.scaled(strength / length)
+    }
+    input.feed_source(touch.first_source, math.max(0.0, -direction.x)) or >>
+    input.feed_source(touch.first_source + 1, math.max(0.0, direction.x)) or >>
+    input.feed_source(touch.first_source + 2, math.max(0.0, -direction.y)) or >>
+    input.feed_source(touch.first_source + 3, math.max(0.0, direction.y)) or >>
+    << 0
+}
+pub fn (touch $&TouchControls) apply(input $&controls.InputMap, event &events.Event) int {
+    apply_window_input(input, event) or >>
+    if event.kind == events.EVENT_INPUT_RESET || event.kind == events.EVENT_FOCUS_LOST ||
+        event.kind == events.EVENT_CLOSE_REQUESTED || event.kind == events.EVENT_RESIZED {
+        << touch.cancel(input) or >>
+    }
+    if event.kind < events.EVENT_TOUCH_DOWN || event.kind > events.EVENT_TOUCH_CANCEL { << 0 }
+    if !fm.finite(event.x) || !fm.finite(event.y) { >> errors.new("game: invalid touch position") }
+    point := fm.vec2(event.x, event.y)
+    if event.kind == events.EVENT_TOUCH_DOWN {
+        if matches(&touch.stick, event) { << 0 }
+        for button in touch.buttons { if matches(&button.capture, event) { << 0 } }
+        // Buttons have hit-test priority, and an existing capture cannot be stolen.
+        for i in 0:touch.buttons.len {
+            if !touch.buttons[i].capture.active && point.sub(touch.buttons[i].center).length() <= touch.buttons[i].radius {
+                touch.buttons[i].capture = Capture{active: true, device: event.device_id, finger: event.touch_id}
+                touch.buttons[i].inside = true
+                if touch.buttons[i].mode == BUTTON_HOLD { input.feed_source(touch.buttons[i].source, 1.0) or >> }
+                << 0
+            }
+        }
+        $hit := point.sub(touch.center).length() <= touch.radius
+        if touch.floating { hit = touch.activation_area.contains(point) }
+        if !touch.stick.active && hit {
+            touch.stick = Capture{active: true, device: event.device_id, finger: event.touch_id}
+            if touch.floating { touch.center = point }
+            touch.move_stick(input, point) or >>
+        }
+        << 0
+    }
+    if matches(&touch.stick, event) {
+        if event.kind == events.EVENT_TOUCH_MOVE { << touch.move_stick(input, point) or >> }
+        touch.stick = idle_capture()
+        if touch.floating { touch.center = touch.home_center }
+        << touch.move_stick(input, touch.center) or >>
+    }
+    for i in 0:touch.buttons.len {
+        if !matches(&touch.buttons[i].capture, event) { -> }
+        touch.buttons[i].inside = point.sub(touch.buttons[i].center).length() <= touch.buttons[i].radius
+        if event.kind == events.EVENT_TOUCH_MOVE { << 0 }
+        if touch.buttons[i].mode == BUTTON_TAP && touch.buttons[i].inside && event.kind == events.EVENT_TOUCH_UP {
+            input.feed_source(touch.buttons[i].source, 1.0) or >>
+        }
+        input.feed_source(touch.buttons[i].source, 0.0) or >>
+        touch.buttons[i].capture = idle_capture()
+        touch.buttons[i].inside = false
+        << 0
+    }
+    << 0
+}

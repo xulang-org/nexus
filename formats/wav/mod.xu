@@ -1,0 +1,71 @@
+@"github.com/xulang-org/game/formats/wav"
+
+pcm #"github.com/xulang-org/game/resources/audio"
+#errors
+#math
+
+pub const MAX_BYTES = 33554432
+fn byte_value(raw &string, offset int) int { << raw[offset] & 255 }
+fn read16(raw &string, offset int) int { << byte_value(raw, offset) | (byte_value(raw, offset + 1) << 8) }
+fn read32(raw &string, offset int) int { << read16(raw, offset) | (read16(raw, offset + 2) << 16) }
+fn tag(raw &string, offset int, name string) bool {
+    for i in 0:4 { if raw[offset + i] != name[i] { << false } }
+    << true
+}
+// Decode any aligned block using a validated layout. Static and stream loaders
+// share this normalization; format code never reads a file or knows the mixer.
+pub fn decode_samples(layout &Layout, raw &string) []int {
+    layout.validate() or >>
+    alignment := layout.alignment
+    if alignment == 0 { >> errors.new("game WAV: zero alignment") }
+    step := layout.bits / 8
+    if step == 0 { >> errors.new("game WAV: zero sample width") }
+    if raw.len < alignment || raw.len > MAX_BYTES || raw.len % alignment != 0 || raw.len / step > pcm.MAX_SAMPLES {
+        >> errors.new("game WAV: invalid PCM block extent")
+    }
+    format := layout.encoding
+    bits := layout.bits
+    $samples := []int{}
+    for i in 0:raw.len / step {
+        at := i * step
+        $sample := 0
+        if format == 3 {
+            word := read32(raw, at)
+            if ((word >> 23) & 255) == 255 { >> errors.new("game WAV: non-finite float sample") }
+            value := math.float32_from_bits(word)
+            if value < -1.0 || value > 1.0 { >> errors.new("game WAV: float sample outside -1...1") }
+            sample = int(math.round_to_even(value * 32768.0))
+            if sample > 32767 { sample = 32767 }
+        } else if bits == 8 { sample = (byte_value(raw, at) - 128) * 256
+        } else if bits == 16 { sample = read16(raw, at)
+            if sample >= 32768 { sample = sample - 65536 }
+        } else if bits == 24 {
+            sample = read16(raw, at) | (byte_value(raw, at + 2) << 16)
+            if sample >= 8388608 { sample = sample - 16777216 }
+            sample = sample >> 8
+        } else {
+            sample = read32(raw, at)
+            if sample >= 2147483648 { sample = sample - 4294967296 }
+            sample = sample >> 16
+        }
+        samples.push(sample)
+    }
+    << samples
+}
+pub fn decode(raw &string) pcm.Clip {
+    if raw.len < 44 || raw.len > MAX_BYTES { >> errors.new("game WAV: file outside byte limits") }
+    container := raw[0:12] + ""
+    $parser := begin_layout(&container, raw.len) or >>
+    while !parser.done() {
+        position := parser.position()
+        if raw.len - position < 8 { >> errors.new("game WAV: truncated chunk header") }
+        header := raw[position:position + 8] + ""
+        count := parser.format_bytes(&header) or >>
+        payload := raw[position + 8:position + 8 + count] + ""
+        parser.accept(&header, &payload) or >>
+    }
+    layout := parser.finish() or >>
+    raw_pcm := raw[layout.offset:layout.offset + layout.bytes] + ""
+    samples := decode_samples(&layout, &raw_pcm) or >>
+    << pcm.pcm16(layout.rate, layout.channels, samples) or >>
+}

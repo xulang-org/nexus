@@ -1,0 +1,81 @@
+@"github.com/xulang-org/game/formats/scene"
+
+resource #"github.com/xulang-org/game/resources/scene"
+light_data #"github.com/xulang-org/game/resources/lighting"
+fm #"github.com/xulang-org/game/foundation/math"
+#encoding/json
+#strconv
+#strings
+#errors
+
+fn light_vector(doc &json.Doc, object int, name string) fm.Vec3 {
+    values := vector(doc,doc.get(object,name),3) or >>
+    << fm.vec3(values[0],values[1],values[2])
+}
+fn decode_lights(doc &json.Doc, root int) []resource.LightAttachment {
+    rows := rows_min(doc,doc.get(root,"lights"),0,resource.MAX_SCENE_LIGHTS) or >>
+    $result := []resource.LightAttachment{}
+    for at in rows {
+        if !doc.is_dict(at) || !doc.has(at,"type") { >> errors.new("game scene: expected light object with a type") }
+        kind := doc.as_string(doc.get(at,"type")) or >>
+        $names := ["node","type","radiance"]
+        if kind=="directional" { names.push("direction")
+        } else if kind=="point" || kind=="spot" {
+            names.push("position")
+            names.push("radius")
+            if kind=="spot" { names.push("direction")
+                names.push("inner_cosine")
+                names.push("outer_cosine") }
+        } else { >> errors.new("game scene: unsupported light type") }
+        fields(doc,at,&names) or >>
+        index := doc.as_int(doc.get(at,"node")) or >>
+        radiance := light_vector(doc,at,"radiance") or >>
+        $source := light_data.Light3D{}
+        if kind=="directional" {
+            source=light_data.directional(light_vector(doc,at,"direction") or >>,radiance) or >>
+        } else {
+            position := light_vector(doc,at,"position") or >>
+            radius := doc.as_f64(doc.get(at,"radius")) or >>
+            if kind=="point" { source=light_data.point(position,radiance,radius) or >>
+            } else {
+                direction := light_vector(doc,at,"direction") or >>
+                inner := doc.as_f64(doc.get(at,"inner_cosine")) or >>
+                outer := doc.as_f64(doc.get(at,"outer_cosine")) or >>
+                source=light_data.spot_cosines(position,direction,radiance,radius,inner,outer) or >>
+            }
+        }
+        result.push(resource.LightAttachment{node: index,source: source})
+    }
+    << result
+}
+fn light_decimal(value f64) string { << strconv.format_float(value,103,-1) or >> }
+fn light_vec(value fm.Vec3) string {
+    x := light_decimal(value.x) or >>
+    y := light_decimal(value.y) or >>
+    z := light_decimal(value.z) or >>
+    << "["+x+","+y+","+z+"]"
+}
+fn encode_lights(document &resource.Document) string {
+    $out := strings.new_byte_builder(1024)
+    out.write_str(",\"lights\":[\n")
+    for i in 0:document.light_count() {
+        if i>0 { out.write_str(",\n") }
+        attachment := document.light(i) or >>
+        source := attachment.source
+        source.validate() or >>
+        $kind := "directional"
+        if source.kind()==light_data.POINT { kind="point" }
+        if source.kind()==light_data.SPOT { kind="spot" }
+        out.write_str("{\"node\":"+str(attachment.node)+",\"type\":\""+kind+"\",\"radiance\":"+(light_vec(source.radiance()) or >>))
+        if source.kind()!=light_data.DIRECTIONAL {
+            out.write_str(",\"position\":"+(light_vec(source.position()) or >>)+",\"radius\":"+(light_decimal(source.radius()) or >>))
+        }
+        if source.kind()!=light_data.POINT { out.write_str(",\"direction\":"+(light_vec(source.direction()) or >>)) }
+        if source.kind()==light_data.SPOT {
+            out.write_str(",\"inner_cosine\":"+(light_decimal(source.inner_cosine()) or >>)+",\"outer_cosine\":"+(light_decimal(source.outer_cosine()) or >>))
+        }
+        out.write_str("}")
+    }
+    out.write_str("\n]")
+    << out.to_string()
+}

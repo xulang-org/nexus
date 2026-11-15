@@ -1,0 +1,34 @@
+@"github.com/xulang-org/game/integration/rendering/three_d"
+
+game #"github.com/xulang-org/game/scene"
+ren #"github.com/xulang-org/game/rendering/three_d"
+policy #"github.com/xulang-org/game/resources/shadow"
+#errors
+
+pub fn cascade_camera(camera &game.Camera3D,aspect f64) policy.CascadeCamera3D {
+    view := game.look_at_3d(camera.position,camera.target,camera.up) or >>
+    projection := game.perspective_3d(camera.vertical_fov,aspect,camera.near,camera.far) or >>
+    << policy.cascade_camera(view,projection) or >>
+}
+pub fn cascade_node_camera(camera &game.CameraNode3D,tree &game.SceneTree,aspect f64) policy.CascadeCamera3D {
+    info := tree.node_info(camera.node) or >>
+    if info.queued_free { >> errors.new("game shadow: cascade camera queued for deletion") }
+    view := (tree.global_transform_3d(camera.node) or >>).affine_inverse() or >>
+    projection := game.perspective_3d(camera.vertical_fov,aspect,camera.near,camera.far) or >>
+    << policy.cascade_camera(view,projection) or >>
+}
+
+// Shadow coverage is independent of the main camera's frustum. Hidden, queued
+// or removed nodes do not cast; selected LOD and weak resource checks are shared.
+pub fn (scene &Scene3D) shadow_casters(tree &game.SceneTree) []ren.ShadowCaster3D {
+    order := tree.subtree(tree.root()) or >>
+    $casters := []ren.ShadowCaster3D{}
+    for node in order {
+        if !scene.meshes.has(node) || !(tree.is_visible(node) or >>) { -> }
+        mesh := scene.selected_mesh(node) or >>
+        scene.owner.validate_mesh(mesh,false) or >>
+        world := tree.global_transform_3d(node) or >>
+        casters.push(ren.ShadowCaster3D{mesh: mesh,world: world})
+    }
+    << casters
+}

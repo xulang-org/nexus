@@ -1,0 +1,34 @@
+@"github.com/xulang-org/game/resources/shadow"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#errors
+
+// Canonical finite reverse-Z perspective and an affine world-to-view matrix.
+// Scene cameras are adapted by integration; this package has no scene import.
+pub struct CascadeCamera3D {
+    view fm.Mat4
+    world fm.Mat4
+    projection fm.Mat4
+    near f64
+    far f64
+    fx f64
+    fy f64
+}
+pub fn cascade_camera(view fm.Mat4,projection fm.Mat4) CascadeCamera3D {
+    p := projection
+    if !view.is_affine() || !p.is_finite() || p.c0.x<=0.0 || p.c1.y<=0.0 || p.c2.z<=0.0 || p.c3.z<=0.0 ||
+        p.c0.y!=0.0 || p.c0.z!=0.0 || p.c0.w!=0.0 || p.c1.x!=0.0 || p.c1.z!=0.0 || p.c1.w!=0.0 ||
+        p.c2.x!=0.0 || p.c2.y!=0.0 || p.c2.w!= -1.0 || p.c3.x!=0.0 || p.c3.y!=0.0 || p.c3.w!=0.0 {
+        >> errors.new("game shadow: cascades require affine view and canonical reverse-Z perspective")
+    }
+    near := p.c3.z/(1.0+p.c2.z)
+    far := p.c3.z/p.c2.z
+    if near<0.0001 || far>1000000.0 || far-near<near*0.000001 { >> errors.new("game shadow: invalid cascade camera near/far") }
+    if !p.multiply(view).is_finite() { >> errors.new("game shadow: cascade camera view-projection overflow") }
+    world := view.affine_inverse() or >>
+    << CascadeCamera3D{view: view,world: world,projection: projection,near: near,far: far,fx: p.c0.x,fy: p.c1.y}
+}
+pub fn (camera &CascadeCamera3D) view_projection() fm.Mat4 { << camera.projection.multiply(camera.view) }
+fn (camera &CascadeCamera3D) depth_plane() fm.Vec4 {
+    << fm.vec4(-camera.view.c0.z,-camera.view.c1.z,-camera.view.c2.z,-camera.view.c3.z)
+}

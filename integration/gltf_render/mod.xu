@@ -1,0 +1,80 @@
+@"github.com/xulang-org/game/integration/gltf_render"
+
+meshes #"github.com/xulang-org/game/resources/mesh"
+gltf #"github.com/xulang-org/game/formats/gltf"
+ren #"github.com/xulang-org/game/rendering/three_d"
+scene_render #"github.com/xulang-org/game/integration/rendering/three_d"
+assets #"github.com/xulang-org/game/assets/gltf"
+game #"github.com/xulang-org/game/scene"
+#errors
+
+// Owns one GPU mesh per source primitive; multiple scene instances share them.
+pub struct GlbUnlit3D {
+    source_hash string
+    meshes []ren.Mesh3D
+    closed bool
+}
+pub fn upload_primitive(device &ren.Device3D, asset &gltf.GlbGeometry, primitive int) ren.Mesh3D {
+    vertices := asset.vertex_count(primitive) or >>
+    indices := asset.index_count(primitive) or >>
+    $data := meshes.new_mesh_data_3d()
+    normals := asset.has_normals(primitive) or >>
+    uvs := asset.has_uvs(primitive) or >>
+    tangents := asset.has_tangents(primitive) or >>
+    for i in 0:vertices {
+        position := asset.position(primitive, i) or >>
+        color := asset.color(primitive, i) or >>
+        if tangents {
+            data.vertex_tangent(position, color, asset.normal(primitive, i) or >>, asset.uv(primitive, i) or >>, asset.tangent(primitive, i) or >>) or >>
+        } else if normals && uvs {
+            data.vertex_lit_uv(position, color, asset.normal(primitive, i) or >>, asset.uv(primitive, i) or >>) or >>
+        } else if normals { data.vertex_lit(position, color, asset.normal(primitive, i) or >>) or >>
+        } else if uvs { data.vertex_uv(position, color, asset.uv(primitive, i) or >>) or >>
+        } else { data.vertex(position, color) or >> }
+    }
+    for i in 0:indices / 3 {
+        a := asset.index(primitive, i * 3) or >>
+        b := asset.index(primitive, i * 3 + 1) or >>
+        c := asset.index(primitive, i * 3 + 2) or >>
+        data.triangle(a, b, c) or >>
+    }
+    << device.upload(&data) or >>
+}
+pub fn upload_unlit(device &ren.Device3D, asset &gltf.GlbGeometry) GlbUnlit3D {
+    if asset.skin_count()>0 { >> errors.new("game GPU: skinned GLB requires upload_animated and explicit pose sampling") }
+    if asset.primitive_count() < 1 { >> errors.new("game GPU: GLB has no drawable primitives") }
+    $meshes := []ren.Mesh3D{}
+    for i in 0:asset.primitive_count() { meshes.push(upload_primitive(device, asset, i) or >>) }
+    << GlbUnlit3D{source_hash: asset.content_hash(), meshes: meshes, closed: false}
+}
+pub fn (model $&GlbUnlit3D) close() int {
+    if model.closed { << 0 }
+    if model.meshes.len == 0 { model.closed = true
+        << 0 }
+    first_mesh := $&model.meshes[0]
+    first := first_mesh.close() or >>
+    for i in 1:model.meshes.len { mesh := $&model.meshes[i]
+        mesh.close() or >> }
+    model.closed = true
+    << first
+}
+// The array owns its Mesh3D elements, whose drop hooks release GPU storage.
+pub fn (model &GlbUnlit3D) bind(scene $&scene_render.Scene3D, tree &game.SceneTree, instance &assets.GlbInstance) int {
+    if model.closed || model.source_hash != instance.content_hash() {
+        >> errors.new("game GPU: closed GLB model or mismatched source asset")
+    }
+    $added := 0
+    for i in 0:instance.primitive_count() {
+        node := instance.primitive_node(i) or >>
+        primitive := instance.primitive_index(i) or >>
+        if primitive < 0 || primitive >= model.meshes.len { >> errors.new("game GPU: GLB primitive outside uploaded model") }
+        added = added + (scene.check_mesh_binding(tree, node, &model.meshes[primitive]) or >>)
+    }
+    if added > scene.remaining_bindings() { >> errors.new("game GPU: GLB binding budget exceeded") }
+    for i in 0:instance.primitive_count() {
+        node := instance.primitive_node(i) or >>
+        primitive := instance.primitive_index(i) or >>
+        scene.attach_mesh(tree, node, &model.meshes[primitive]) or >>
+    }
+    << instance.primitive_count()
+}

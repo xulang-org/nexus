@@ -1,0 +1,170 @@
+@"github.com/xulang-org/game/integration/gltf_render"
+
+ren #"github.com/xulang-org/game/rendering/three_d"
+scene_render #"github.com/xulang-org/game/integration/rendering/three_d"
+assets #"github.com/xulang-org/game/assets/gltf"
+gltf #"github.com/xulang-org/game/formats/gltf"
+image_loader #"github.com/xulang-org/game/assets/image"
+image_render #"github.com/xulang-org/game/integration/image_render/three_d"
+game #"github.com/xulang-org/game/scene"
+images #"github.com/xulang-org/game/resources/image"
+#errors
+
+// Owning meshes/images, shared material values, one source fingerprint. Images
+// are shared per (source image, resolved sampling state, color space), not slot.
+pub struct GlbModel3D {
+    source_hash string
+    meshes []ren.Mesh3D
+    textures []ren.Texture3D
+    materials []ren.Material3D
+    primitive_materials []int
+    closed bool
+}
+fn texture_key(asset &gltf.GlbGeometry, index int, srgb bool) string {
+    texture := asset.texture(index) or >>
+    sampler := asset.texture_sampler(index) or >>
+    $space := 0
+    if srgb { space = 1 }
+    << str(texture.image) + "/" + str(sampler.min_filter) + "/" + str(sampler.mag_filter) + "/" + str(sampler.wrap_u) + "/" + str(sampler.wrap_v) + "/" + str(space)
+}
+fn sampling_3d(sampler gltf.SamplerDescription) ren.TextureSampling3D {
+    $mip := ren.MIP_NONE
+    if sampler.min_filter == 9984 || sampler.min_filter == 9985 { mip = ren.MIP_NEAREST }
+    if sampler.min_filter == 9986 || sampler.min_filter == 9987 { mip = ren.MIP_LINEAR }
+    << ren.TextureSampling3D{min_linear: sampler.min_filter == 9729 || sampler.min_filter == 9985 || sampler.min_filter == 9987,
+        mag_linear: sampler.mag_filter == 9729, repeat_u: sampler.wrap_u == 10497, repeat_v: sampler.wrap_v == 10497, mip_filter: mip}
+}
+fn plan_texture(asset &gltf.GlbGeometry, cache $&map[string]int, index int, srgb bool) int {
+    if index < 0 { << 0 }
+    key := texture_key(asset, index, srgb) or >>
+    if !cache.has(key + "") { cache[key] = -1 }
+    << 0
+}
+fn material_description(asset &gltf.GlbGeometry, index int) gltf.MaterialDescription {
+    if index < 0 { << gltf.default_material() }
+    << asset.material(index) or >>
+}
+pub fn upload_model(device &ren.Device3D, asset &gltf.GlbGeometry) GlbModel3D {
+    if asset.skin_count()>0 { >> errors.new("game GPU: skinned GLB requires upload_animated and explicit pose sampling") }
+    << upload_material_model(device,asset) or >>
+}
+fn upload_material_model(device &ren.Device3D,asset &gltf.GlbGeometry) GlbModel3D {
+    device.backend() or >>
+    if asset.primitive_count() < 1 { >> errors.new("game GPU: GLB has no primitives") }
+    $primitive_materials := []int{}
+    // Capability checks precede PNG decoding and every GPU resource allocation.
+    for i in 0:asset.primitive_count() {
+        material_index := asset.primitive_material(i) or >>
+        description := material_description(asset, material_index) or >>
+        if !(asset.has_normals(i) or >>) { >> errors.new("game GPU: PBR GLB requires authored normals") }
+        if (description.base_texture >= 0 || description.metallic_roughness_texture >= 0 || description.normal_texture >= 0 ||
+            description.occlusion_texture >= 0 || description.emission_texture >= 0) && !(asset.has_uvs(i) or >>) {
+            >> errors.new("game GPU: PBR GLB maps require TEXCOORD_0")
+        }
+        if description.normal_texture >= 0 && !(asset.has_tangents(i) or >>) { >> errors.new("game GPU: PBR GLB normal map requires authored tangents") }
+        primitive_materials.push(material_index + 1)
+    }
+    $cache := map[string]int{}
+    for i in 0:asset.material_count() {
+        description := asset.material(i) or >>
+        plan_texture(asset, $&cache, description.base_texture, true) or >>
+        plan_texture(asset, $&cache, description.emission_texture, true) or >>
+        plan_texture(asset, $&cache, description.metallic_roughness_texture, false) or >>
+        plan_texture(asset, $&cache, description.normal_texture, false) or >>
+        plan_texture(asset, $&cache, description.occlusion_texture, false) or >>
+    }
+    $textures := []ren.Texture3D{}
+    $decoded_pixels := 0
+    for image_index in 0:asset.image_count() {
+        $needed := false
+        for i in 0:asset.texture_count() {
+            texture := asset.texture(i) or >>
+            if texture.image != image_index { -> }
+            for space in [false, true] {
+                key := texture_key(asset, i, space) or >>
+                if cache.has(key) { needed = true }
+            }
+        }
+        if !needed { -> }
+        $limit := 4194304
+        if 8388608 - decoded_pixels < limit { limit = 8388608 - decoded_pixels }
+        if limit < 1 { >> errors.new("game GPU: GLB decoded image budget exceeds 8M pixels") }
+        raw := asset.image_bytes(image_index) or >>
+        image := decode_model_image(asset,image_index,&raw,limit) or >>
+        decoded_pixels = decoded_pixels + image.width * image.height
+        for i in 0:asset.texture_count() {
+            description := asset.texture(i) or >>
+            if description.image != image_index { -> }
+            for space in [false, true] {
+                key := texture_key(asset, i, space) or >>
+                if !cache.has(key + "") { -> }
+                if cache[key + ""] >= 0 { -> }
+                sampling := sampling_3d(asset.texture_sampler(i) or >>)
+                $texture := image_render.upload_image_3d_sampled(device, &image, space, sampling) or >>
+                cache[key] = textures.len
+                textures.push(texture)
+            }
+        }
+    }
+    $materials := []ren.Material3D{}
+    for i in -1:asset.material_count() {
+        description := material_description(asset, i) or >>
+        $roughness := description.roughness
+        if roughness < 0.045 { roughness = 0.045 }
+        initial := ren.material_3d(description.base, description.metallic, roughness, description.emission) or >>
+        $material := initial.with_double_sided(description.double_sided)
+        for role in 0:5 {
+            indices := [description.base_texture, description.metallic_roughness_texture, description.emission_texture, description.normal_texture, description.occlusion_texture]
+            index := indices[role]
+            if index < 0 { -> }
+            key := texture_key(asset, index, role == 0 || role == 2) or >>
+            slot := cache[key]
+            if slot < 0 || slot >= textures.len { >> errors.new("game GPU: unresolved GLB texture variant") }
+            texture := &textures[slot]
+            if role == 0 { material = material.with_base_texture(texture) or >> }
+            // glTF's MR image does not implicitly enable red-channel occlusion.
+            if role == 1 { material = material.with_orm_texture(texture, 0.0) or >> }
+            if role == 2 { material = material.with_emission_texture(texture) or >> }
+            if role == 3 { material = material.with_normal_texture(texture, description.normal_scale) or >> }
+            if role == 4 { material = material.with_occlusion_texture(texture, description.occlusion_strength) or >> }
+        }
+        materials.push(material)
+    }
+    $meshes := []ren.Mesh3D{}
+    for i in 0:asset.primitive_count() { meshes.push(upload_primitive(device, asset, i) or >>) }
+    << GlbModel3D{source_hash: asset.content_hash(), meshes: meshes, textures: textures, materials: materials, primitive_materials: primitive_materials, closed: false}
+}
+fn decode_model_image(asset &gltf.GlbGeometry,index int,raw &[]int,limit int) images.ImageRGBA8 {
+    if (asset.image_mime(index) or >>)=="image/jpeg" { << image_loader.decode_jpeg_bytes(raw,limit) or >> }
+    << image_loader.decode_png_bytes(raw,limit) or >>
+}
+pub fn (model &GlbModel3D) texture_count() int { << model.textures.len }
+pub fn (model &GlbModel3D) material_count() int { << model.materials.len }
+pub fn (model $&GlbModel3D) close() int {
+    if model.closed { << 0 }
+    for i in 0:model.meshes.len { mesh := $&model.meshes[i]
+        mesh.close() or >> }
+    for i in 0:model.textures.len { texture := $&model.textures[i]
+        texture.close() or >> }
+    model.closed = true
+    << 0
+}
+pub fn (model &GlbModel3D) bind(scene $&scene_render.Scene3D, tree &game.SceneTree, instance &assets.GlbInstance) int {
+    if model.closed || model.source_hash != instance.content_hash() { >> errors.new("game GPU: closed GLB model or mismatched source asset") }
+    $added := 0
+    for i in 0:instance.primitive_count() {
+        node := instance.primitive_node(i) or >>
+        primitive := instance.primitive_index(i) or >>
+        if primitive < 0 || primitive >= model.meshes.len { >> errors.new("game GPU: GLB primitive outside model") }
+        material_index := model.primitive_materials[primitive]
+        added = added + (scene.check_surface_binding(tree, node, &model.meshes[primitive], &model.materials[material_index]) or >>)
+    }
+    if added > scene.remaining_bindings() { >> errors.new("game GPU: GLB surface binding budget exceeded") }
+    for i in 0:instance.primitive_count() {
+        node := instance.primitive_node(i) or >>
+        primitive := instance.primitive_index(i) or >>
+        material_index := model.primitive_materials[primitive]
+        scene.attach_surface(tree, node, &model.meshes[primitive], model.materials[material_index]) or >>
+    }
+    << instance.primitive_count()
+}

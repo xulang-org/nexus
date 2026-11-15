@@ -1,0 +1,82 @@
+@"github.com/xulang-org/game/rendering/two_d"
+
+#gpu
+#gpu/layout
+#errors
+canvas #"github.com/xulang-org/game/resources/canvas"
+
+pub struct Texture2D {
+    owner int
+    images []gpu.Texture
+    has_gpu bool
+    soft_pixels []u8
+    linear bool
+    closed bool
+    pub width int
+    pub height int
+}
+pub fn (renderer &Renderer2D) texture_rgba(width int, height int, pixels &[]int, linear bool) Texture2D {
+    renderer.alive() or >>
+    if width < 1 || height < 1 || width > 4096 || height > 4096 || width*height > 4194304 || pixels.len != width*height {
+        >> errors.new("game canvas: invalid texture dimensions or pixels")
+    }
+    if renderer.session.is_gpu() {
+        dev := renderer.session.gpu_device() or >>
+        stats := dev.stats() or >>
+        internal_bytes := renderer.target_width*renderer.target_height*4 + 4
+        if stats.texture_count >= 1026 || width*height*4 > 67108864 - (stats.texture_bytes-internal_bytes) {
+            >> errors.new("game canvas: texture capacity or 64 MiB budget exceeded")
+        }
+    }
+    $bytes := []u8{}
+    for color in pixels {
+        if color < 0 || color > 4294967295 { >> errors.new("game canvas: invalid RGBA pixel") }
+        bytes.push(u8((color >> 24) & 255))
+        bytes.push(u8((color >> 16) & 255))
+        bytes.push(u8((color >> 8) & 255))
+        bytes.push(u8(color & 255))
+    }
+    if renderer.session.is_gpu() {
+        dev := renderer.session.gpu_device() or >>
+        $image := dev.texture_2d(gpu.Texture2DDesc{format: layout.RGBA8_UNORM,width: width,height: height,
+            levels: 1,usage: gpu.TEXTURE_SAMPLED}) or >>
+        $upload := dev.upload_texture(&image,0,&bytes) or >>
+        upload.close() or >>
+        << Texture2D{owner: renderer.owner,images: [image],has_gpu: true,soft_pixels: []u8{},linear: linear,closed: false,width: width,height: height}
+    }
+    << Texture2D{owner: renderer.owner,images: []gpu.Texture{},has_gpu: false,soft_pixels: bytes,linear: linear,closed: false,width: width,height: height}
+}
+pub fn (renderer $&Renderer2D) submit_texture(batch &canvas.Batch2D, texture &Texture2D) int {
+    renderer.recording() or >>
+    if texture.owner != renderer.owner || texture.closed { >> errors.new("game canvas: closed or foreign texture") }
+    count := batch.vertex_count()
+    renderer.check_vertices(count) or >>
+    if renderer.clip_width > 0 && renderer.clip_height > 0 && count > 0 {
+        if renderer.session.is_gpu() {
+            draw_renderer_textured_gpu(renderer, &texture.images[0], texture.linear, batch) or >>
+        } else {
+            cx := renderer.clip_x
+            cy := renderer.clip_y
+            cw := renderer.clip_width
+            ch := renderer.clip_height
+            soft_draw_session_batch($&renderer.session, cx, cy, cw, ch, &texture.soft_pixels,
+                texture.width, texture.height, texture.linear, batch)
+        }
+    }
+    renderer.frame_vertices += count
+    if renderer.session.is_gpu() { renderer.cached = false }
+    << count/3
+}
+pub fn (texture $&Texture2D) close() int {
+    if texture.closed { << 0 }
+    if texture.has_gpu && texture.images.len > 0 {
+        image := $&texture.images[0]
+        image.close() or >>
+    }
+    texture.images = []gpu.Texture{}
+    texture.soft_pixels = []u8{}
+    texture.has_gpu = false
+    texture.closed = true
+    << 0
+}
+fn (texture $&Texture2D) drop() { texture.close() or (err) { << } }

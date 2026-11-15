@@ -1,0 +1,198 @@
+@"github.com/xulang-org/game/rendering/two_d"
+
+#gpu
+#gpu/layout
+#errors
+present #"github.com/xulang-org/game/platform/present"
+
+pub struct TextProgram2D {
+    pub format int
+    pub entrypoint string
+    pub vertex []u8
+    pub fragment []u8
+}
+
+pub fn empty_text_program() TextProgram2D {
+    << TextProgram2D{format: 0, entrypoint: "", vertex: []u8{}, fragment: []u8{}}
+}
+
+fn validate_text_program(program &TextProgram2D, formats int) int {
+    if program.entrypoint.len == 0 || program.vertex.len == 0 || program.fragment.len == 0 {
+        >> errors.new("game canvas: empty text shader program")
+    }
+    if (program.format & formats) == 0 {
+        >> errors.new("game canvas: text shader format unsupported by GPU device")
+    }
+    << 0
+}
+
+fn build_text_pipeline(device &gpu.Device, color_format int, program &TextProgram2D) gpu.GraphicsPipeline {
+    desc := pipeline_description(color_format, gpu.BLEND_PREMULTIPLIED)
+    << build_shader_pipeline(device, program.format, program.entrypoint,
+        &program.vertex, &program.fragment, 1, [16], &desc) or >>
+}
+
+fn validate_mask_bytes(width int, height int, bytes &[]u8) int {
+    if width < 1 || height < 1 || width > 4096 || height > 4096 {
+        >> errors.new("game canvas: R8 mask dimensions must be between 1 and 4096")
+    }
+    if bytes.len != width * height {
+        >> errors.new("game canvas: R8 mask byte count does not match width*height")
+    }
+    << 0
+}
+
+fn clone_u8_slice(bytes &[]u8) []u8 {
+    $out := []u8{}
+    for i in 0:bytes.len {
+        out.push(bytes[i])
+    }
+    << out
+}
+
+fn create_r8_gpu_texture(device &gpu.Device, width int, height int, bytes &[]u8) gpu.Texture {
+    if !device.supports_texture_2d(layout.R8_UNORM, gpu.TEXTURE_SAMPLED) {
+        >> errors.new("game canvas: GPU device does not support R8_UNORM sampled textures")
+    }
+    $image := device.texture_2d(gpu.Texture2DDesc{format: layout.R8_UNORM, width: width, height: height,
+        levels: 1, usage: gpu.TEXTURE_SAMPLED}) or >>
+    $up := device.upload_texture(&image, 0, bytes) or >>
+    up.close() or >>
+    << image
+}
+
+pub struct MaskTexture2D {
+    dev_refs []gpu.DeviceRef
+    images []gpu.Texture
+    has_gpu bool
+    soft_pixels []u8
+    linear bool
+    closed bool
+    width int
+    height int
+    revision int
+}
+
+pub fn mask_texture_r8_device(device &gpu.Device, width int, height int,
+    linear bool, bytes &[]u8, revision int) MaskTexture2D {
+    validate_mask_bytes(width, height, bytes) or >>
+    img := create_r8_gpu_texture(device, width, height, bytes) or >>
+    << MaskTexture2D{
+        dev_refs: [device.reference()],
+        images: [img],
+        has_gpu: true,
+        soft_pixels: []u8{},
+        linear: linear,
+        closed: false,
+        width: width,
+        height: height,
+        revision: revision
+    }
+}
+
+pub fn mask_texture_r8_software(width int, height int,
+    linear bool, bytes &[]u8, revision int) MaskTexture2D {
+    validate_mask_bytes(width, height, bytes) or >>
+    << MaskTexture2D{
+        dev_refs: []gpu.DeviceRef{},
+        images: []gpu.Texture{},
+        has_gpu: false,
+        soft_pixels: clone_u8_slice(bytes),
+        linear: linear,
+        closed: false,
+        width: width,
+        height: height,
+        revision: revision
+    }
+}
+
+pub fn mask_texture_r8_session(session &present.Session, width int, height int,
+    linear bool, bytes &[]u8, revision int) MaskTexture2D {
+    if !session.is_gpu() {
+        << mask_texture_r8_software(width, height, linear, bytes, revision) or >>
+    }
+    dev := session.gpu_device() or >>
+    << mask_texture_r8_device(dev, width, height, linear, bytes, revision) or >>
+}
+
+pub fn (renderer &Renderer2D) mask_texture_r8(width int, height int,
+    linear bool, bytes &[]u8, revision int) MaskTexture2D {
+    renderer.alive() or >>
+    << mask_texture_r8_session(&renderer.session, width, height, linear, bytes, revision) or >>
+}
+
+pub fn (mask $&MaskTexture2D) sync_r8_software(width int, height int,
+    bytes &[]u8, revision int) int {
+    if mask.closed { >> errors.new("game canvas: mask texture is closed") }
+    if mask.has_gpu { >> errors.new("game canvas: GPU mask texture cannot sync in software mode") }
+    if revision > 0 && revision == mask.revision && width == mask.width && height == mask.height {
+        << 0
+    }
+    validate_mask_bytes(width, height, bytes) or >>
+    mask.soft_pixels = clone_u8_slice(bytes)
+    mask.width = width
+    mask.height = height
+    mask.revision = revision
+    << 0
+}
+
+pub fn (mask $&MaskTexture2D) sync_r8_device(device &gpu.Device, width int, height int,
+    bytes &[]u8, revision int) int {
+    if mask.closed { >> errors.new("game canvas: mask texture is closed") }
+    if !mask.has_gpu { >> errors.new("game canvas: software mask texture cannot sync to GPU") }
+    if mask.dev_refs.len == 0 || !mask.dev_refs[0].same(device.reference()) {
+        >> errors.new("game canvas: mask texture belongs to a different GPU device")
+    }
+    if revision > 0 && revision == mask.revision && width == mask.width && height == mask.height {
+        << 0
+    }
+    validate_mask_bytes(width, height, bytes) or >>
+    if width == mask.width && height == mask.height && mask.images.len > 0 {
+        $up := device.upload_texture(&mask.images[0], 0, bytes) or >>
+        up.close() or >>
+    } else {
+        replacement := create_r8_gpu_texture(device, width, height, bytes) or >>
+        if mask.images.len > 0 {
+            old := $&mask.images[0]
+            old.close() or >>
+        }
+        mask.images = [replacement]
+        mask.width = width
+        mask.height = height
+    }
+    mask.revision = revision
+    << 0
+}
+
+pub fn (mask $&MaskTexture2D) sync_r8(renderer &Renderer2D, width int, height int,
+    bytes &[]u8, revision int) int {
+    renderer.alive() or >>
+    if !renderer.session.is_gpu() {
+        << mask.sync_r8_software(width, height, bytes, revision) or >>
+    }
+    dev := renderer.session.gpu_device() or >>
+    << mask.sync_r8_device(dev, width, height, bytes, revision) or >>
+}
+
+pub fn (mask &MaskTexture2D) width_px() int { << mask.width }
+pub fn (mask &MaskTexture2D) height_px() int { << mask.height }
+pub fn (mask &MaskTexture2D) current_revision() int { << mask.revision }
+pub fn (mask &MaskTexture2D) is_gpu() bool { << !mask.closed && mask.has_gpu }
+pub fn (mask &MaskTexture2D) is_linear() bool { << mask.linear }
+
+pub fn (mask $&MaskTexture2D) close() int {
+    if mask.closed { << 0 }
+    mask.closed = true
+    mask.soft_pixels = []u8{}
+    mask.dev_refs = []gpu.DeviceRef{}
+    if mask.images.len > 0 {
+        tex := $&mask.images[0]
+        tex.close() or >>
+        mask.images = []gpu.Texture{}
+    }
+    << 0
+}
+
+fn (mask $&MaskTexture2D) drop() {
+    mask.close() or (err) { << }
+}

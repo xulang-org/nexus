@@ -1,0 +1,48 @@
+@"github.com/xulang-org/game/rendering/two_d"
+
+#gpu
+#errors
+canvas #"github.com/xulang-org/game/resources/canvas"
+fm #"github.com/xulang-org/game/foundation/math"
+present #"github.com/xulang-org/game/platform/present"
+
+fn present_software_session(sess $&present.Session) int {
+    << sess.present_software() or >>
+}
+
+fn acquire_session_frame(sess $&present.Session) gpu.Frame {
+    << sess.acquire_frame() or >>
+}
+
+// Copy the readable offscreen image to the acquired write-only window image.
+// There is no per-frame device-idle wait; the SDK retains submitted resources.
+pub fn (renderer $&Renderer2D) present() int {
+    renderer.recording() or >>
+    if !renderer.session.is_gpu() {
+        present_software_session($&renderer.session) or >>
+        renderer.active = false
+        renderer.cached = true
+        << 0
+    }
+    $batch := canvas.new_batch()
+    batch.quad(fm.rect2(0.0,0.0,1.0,1.0),fm.identity(),4294967295) or >>
+    bytes := vertex_bytes(&batch) or >>
+    uploaded := upload_renderer_pool(renderer, false, &bytes, 6) or >>
+    $frame := acquire_session_frame($&renderer.session) or >>
+    if !frame.has_image() { renderer.active = false
+        << 0 }
+    if frame.format() != renderer.surface_format { >> errors.new("game canvas: surface format changed; recreate renderer") }
+    $pass := frame.begin_render(gpu.DISCARD,gpu.Color{r: 0.0,g: 0.0,b: 0.0,a: 1.0},gpu.no_depth()) or >>
+    sidx := uploaded.slot
+    pass.pipeline(&renderer.copyings[0]) or >>
+    pass.vertex_buffer(0,&renderer.batch_pool.slots[sidx].buffer[0],uploaded.offset) or >>
+    pass.sampler(gpu.FRAGMENT,0,&renderer.targets[0],&renderer.nearests[0]) or >>
+    uniform := viewport_uniform(1,1) or >>
+    pass.uniform(gpu.VERTEX,0,&uniform) or >>
+    pass.draw(6,0,1,0) or >>
+    pass.end() or >>
+    $fence := frame.present() or >>
+    fence.close() or >>
+    renderer.active = false
+    << 0
+}

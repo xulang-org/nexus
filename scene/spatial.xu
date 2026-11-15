@@ -1,0 +1,116 @@
+@"github.com/xulang-org/game/scene"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#errors
+
+struct Spatial2D {
+    local fm.Transform2D
+    free_next int
+}
+struct Spatial3D {
+    local fm.Mat4
+    free_next int
+}
+pub struct Node3D {
+    pub id int
+    pub parent int
+    pub name string
+    pub transform fm.Mat4
+    pub visible bool
+    pub process_mode int
+}
+
+// Pools reuse released entries. A common group consumes no spatial component.
+fn (tree $&SceneTree) allocate_spatial(index int, kind int) {
+    tree.slots[index].kind = kind
+    if kind == NODE_2D {
+        $component := tree.free_2d
+        if component < 0 {
+            component = tree.spatial_2d.len
+            tree.spatial_2d.push(Spatial2D{local: fm.identity(), free_next: -1})
+        } else {
+            tree.free_2d = tree.spatial_2d[component].free_next
+            tree.spatial_2d[component] = Spatial2D{local: fm.identity(), free_next: -1}
+        }
+        tree.slots[index].spatial = component
+    }
+    if kind == NODE_3D {
+        $component := tree.free_3d
+        if component < 0 {
+            component = tree.spatial_3d.len
+            tree.spatial_3d.push(Spatial3D{local: fm.identity_3d(), free_next: -1})
+        } else {
+            tree.free_3d = tree.spatial_3d[component].free_next
+            tree.spatial_3d[component] = Spatial3D{local: fm.identity_3d(), free_next: -1}
+        }
+        tree.slots[index].spatial = component
+    }
+}
+fn (tree $&SceneTree) release_spatial(index int) {
+    kind := tree.slots[index].kind
+    component := tree.slots[index].spatial
+    if kind == NODE_2D {
+        tree.spatial_2d[component].free_next = tree.free_2d
+        tree.free_2d = component
+    }
+    if kind == NODE_3D {
+        tree.spatial_3d[component].free_next = tree.free_3d
+        tree.free_3d = component
+    }
+    tree.slots[index].spatial = -1
+}
+fn (tree &SceneTree) require_spatial(index int, kind int) int {
+    if tree.slots[index].kind != kind { >> errors.new("game: node has the wrong spatial dimension") }
+    << tree.slots[index].spatial
+}
+// Groups are transparent; crossing the other spatial dimension starts a new space.
+fn (tree &SceneTree) inherited_2d(start int) fm.Transform2D {
+    $index := start
+    $result := fm.identity()
+    while index >= 0 {
+        kind := tree.slots[index].kind
+        if kind == NODE_3D { <- }
+        if kind == NODE_2D { result = tree.spatial_2d[tree.slots[index].spatial].local.multiply(result) }
+        index = tree.slots[index].parent
+    }
+    if !result.is_finite() { >> errors.new("game: global 2D transform overflow") }
+    << result
+}
+fn (tree &SceneTree) inherited_3d(start int) fm.Mat4 {
+    $index := start
+    $result := fm.identity_3d()
+    while index >= 0 {
+        kind := tree.slots[index].kind
+        if kind == NODE_2D { <- }
+        if kind == NODE_3D { result = tree.spatial_3d[tree.slots[index].spatial].local.multiply(result) }
+        index = tree.slots[index].parent
+    }
+    if !result.is_affine() { >> errors.new("game: global 3D transform overflow") }
+    << result
+}
+pub fn (tree &SceneTree) node_3d(id int) Node3D {
+    index := tree.index(id) or >>
+    component := tree.require_spatial(index, NODE_3D) or >>
+    << Node3D{id: id, parent: tree.node_id(tree.slots[index].parent), name: tree.slots[index].name + "",
+        transform: tree.spatial_3d[component].local, visible: tree.slots[index].visible,
+        process_mode: tree.slots[index].process_mode}
+}
+pub fn (tree &SceneTree) global_transform_3d(id int) fm.Mat4 {
+    index := tree.index(id) or >>
+    tree.require_spatial(index, NODE_3D) or >>
+    << tree.inherited_3d(index) or >>
+}
+pub fn (tree $&SceneTree) set_transform_3d(id int, value fm.Mat4) int {
+    index := tree.editable(id) or >>
+    component := tree.require_spatial(index, NODE_3D) or >>
+    if !value.is_affine() { >> errors.new("game: 3D node transform must be a finite affine matrix") }
+    tree.spatial_3d[component].local = value
+    << 0
+}
+pub fn (tree $&SceneTree) set_position_3d(id int, position fm.Vec3) int {
+    index := tree.editable(id) or >>
+    component := tree.require_spatial(index, NODE_3D) or >>
+    if !position.is_finite() { >> errors.new("game: 3D position must be finite") }
+    tree.spatial_3d[component].local.c3 = fm.vec4(position.x, position.y, position.z, 1.0)
+    << 0
+}

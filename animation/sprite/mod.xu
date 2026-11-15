@@ -1,0 +1,111 @@
+@"github.com/xulang-org/game/animation/sprite"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#errors
+#math
+
+// An immutable clip of consecutive cells in a uniform texture atlas.
+// Frames are absolute row-major indices, starting at zero.
+pub struct AtlasAnimation {
+    columns int
+    rows int
+    first int
+    count int
+    fps f64
+    looping bool
+}
+pub fn new_atlas_animation(columns int, rows int, first int, count int, fps f64, looping bool) AtlasAnimation {
+    if columns < 1 || columns > 4096 || rows < 1 || rows > 4096 || columns * rows > 65536 ||
+        first < 0 || count < 1 || first >= columns * rows || count > columns * rows - first ||
+        !fm.finite(fps) || fps <= 0.0 || fps > 1000.0 || fps < 0.001 {
+        >> errors.new("game: invalid atlas animation grid, range or frame rate")
+    }
+    << AtlasAnimation{columns: columns, rows: rows, first: first, count: count, fps: fps, looping: looping}
+}
+pub fn (clip &AtlasAnimation) region(frame int) fm.Rect2 {
+    columns := clip.columns
+    rows := clip.rows
+    if columns < 1 { >> errors.new("game: atlas grid has no columns") }
+    if rows < 1 || frame < clip.first || frame - clip.first >= clip.count {
+        >> errors.new("game: frame outside animation clip")
+    }
+    column := frame % columns
+    row := frame / columns
+    left := f64(column) / f64(columns)
+    top := f64(row) / f64(rows)
+    right := f64(column + 1) / f64(columns)
+    bottom := f64(row + 1) / f64(rows)
+    << fm.rect2(left, top, right - left, bottom - top)
+}
+pub struct AnimationStep {
+    pub frame int
+    pub changed bool
+    pub loops int
+    // One-shot completion notification. is_finished() retains the stopped state.
+    pub finished bool
+}
+pub struct SpriteAnimator {
+    clip AtlasAnimation
+    frame_index int
+    remainder f64
+    playing bool
+    completed bool
+}
+pub fn new_sprite_animator(clip AtlasAnimation) SpriteAnimator {
+    if clip.count < 1 || clip.columns < 1 || clip.rows < 1 || !fm.finite(clip.fps) || clip.fps <= 0.0 {
+        >> errors.new("game: animation clip is not initialized")
+    }
+    << SpriteAnimator{clip: clip, frame_index: 0, remainder: 0.0, playing: true, completed: false}
+}
+pub fn (animator &SpriteAnimator) frame() int { << animator.clip.first + animator.frame_index }
+pub fn (animator &SpriteAnimator) region() fm.Rect2 { << animator.clip.region(animator.frame()) or >> }
+pub fn (animator &SpriteAnimator) is_playing() bool { << animator.playing }
+pub fn (animator &SpriteAnimator) is_finished() bool { << animator.completed }
+pub fn (animator $&SpriteAnimator) pause() { animator.playing = false }
+pub fn (animator $&SpriteAnimator) restart() {
+    animator.frame_index = 0
+    animator.remainder = 0.0
+    animator.completed = false
+    animator.playing = true
+}
+pub fn (animator $&SpriteAnimator) play() {
+    if animator.completed { animator.restart() } else { animator.playing = true }
+}
+pub fn (animator $&SpriteAnimator) seek_frame(frame int) int {
+    animator.clip.region(frame) or >>
+    animator.frame_index = frame - animator.clip.first
+    animator.remainder = 0.0
+    animator.completed = false
+    << 0
+}
+// Bounded arithmetic, no loop per skipped frame. Delta is in 0...3600 seconds.
+pub fn (animator $&SpriteAnimator) advance(delta_seconds f64) AnimationStep {
+    if !fm.finite(delta_seconds) || delta_seconds < 0.0 || delta_seconds > 3600.0 {
+        >> errors.new("game: animation delta must be in 0...3600 seconds")
+    }
+    previous := animator.frame()
+    if !animator.playing {
+        << AnimationStep{frame: previous, changed: false, loops: 0, finished: false}
+    }
+    frame_count := animator.clip.count
+    if frame_count < 1 { >> errors.new("game: animation clip is not initialized") }
+    duration := 1.0 / animator.clip.fps
+    elapsed := animator.remainder + delta_seconds
+    ticks := int(math.floor(elapsed / duration + 0.000000001))
+    animator.remainder = math.max(0.0, elapsed - f64(ticks) * duration)
+    total := animator.frame_index + ticks
+    if animator.clip.looping {
+        animator.frame_index = total % frame_count
+        << AnimationStep{frame: animator.frame(), changed: animator.frame() != previous,
+            loops: total / frame_count, finished: false}
+    }
+    if total >= frame_count {
+        animator.frame_index = frame_count - 1
+        animator.remainder = 0.0
+        animator.completed = true
+        animator.playing = false
+        << AnimationStep{frame: animator.frame(), changed: animator.frame() != previous, loops: 0, finished: true}
+    }
+    animator.frame_index = total
+    << AnimationStep{frame: animator.frame(), changed: animator.frame() != previous, loops: 0, finished: false}
+}

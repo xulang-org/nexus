@@ -1,0 +1,134 @@
+@"github.com/xulang-org/game/integration/scene_render"
+
+gltf #"github.com/xulang-org/game/formats/gltf"
+resource #"github.com/xulang-org/game/resources/scene"
+node_files #"github.com/xulang-org/game/integration/scene"
+game #"github.com/xulang-org/game/scene"
+glb #"github.com/xulang-org/game/integration/gltf_render"
+ren #"github.com/xulang-org/game/rendering/three_d"
+scene_render #"github.com/xulang-org/game/integration/rendering/three_d"
+snapshot #"github.com/xulang-org/game/internal/file_snapshot"
+#crypto/sha256
+#path/filepath
+#errors
+
+const MAX_SOURCE_BYTES = 33554432
+// Owns source models; surface bindings are weak. The source document preserves
+// identity/path/revision metadata independently of GPU handles and node IDs.
+pub struct SceneModels3D {
+    document resource.Document
+    packed game.PackedScene
+    models []glb.GlbModel3D
+    resource_models map[string]int
+    closed bool
+    base_directory string
+}
+pub fn prepare(device &ren.Device3D, document resource.Document, base_directory string) SceneModels3D {
+    if document.script_count() > 0 || document.audio_count() > 0 || document.light_count() > 0 { >> errors.new("game scene: other attachments require explicit prepare_surfaces and service binding") }
+    << prepare_surfaces(device, document, base_directory) or >>
+}
+// Explicit partial restoration for a caller composing audio and GPU services.
+pub fn prepare_surfaces(device &ren.Device3D, document resource.Document, base_directory string) SceneModels3D {
+    device.backend() or >>
+    directory := filepath.abs(&base_directory) or >>
+    packed := node_files.to_packed_nodes(&document) or >>
+    $models := []glb.GlbModel3D{}
+    $by_hash := map[string]int{}
+    $resource_models := map[string]int{}
+    $source_bytes := 0
+    for i in 0:document.resource_count() {
+        reference := document.resource(i) or >>
+        if reference.kind != "glb_model" { -> }
+        path := filepath.join([directory + "", reference.path + ""])
+        $limit := 16777216
+        if MAX_SOURCE_BYTES - source_bytes < limit { limit = MAX_SOURCE_BYTES - source_bytes }
+        if limit < 1 { >> errors.new("game scene: GLB source budget exceeds 32 MiB") }
+        raw := snapshot.read(path, limit) or >>
+        source_bytes = source_bytes + raw.len
+        hash := sha256.sum256(raw + "")
+        if hash != reference.content_hash { >> errors.new("game scene: GLB content hash mismatch: " + reference.path) }
+        if !by_hash.has(hash + "") {
+            asset := gltf.decode_glb_geometry(&raw) or >>
+            model := glb.upload_model(device, &asset) or >>
+            by_hash[hash + ""] = models.len
+            models.push(model)
+        }
+        resource_models[reference.uid + ""] = by_hash[hash]
+    }
+    for i in 0:document.surface_count() {
+        surface := document.surface(i) or >>
+        slot := resource_models[surface.resource_uid + ""]
+        model := &models[slot]
+        if surface.primitive >= model.primitive_count() { >> errors.new("game scene: source primitive outside GLB model") }
+    }
+    << SceneModels3D{document: document, packed: packed, models: models, resource_models: resource_models, closed: false, base_directory: directory}
+}
+pub fn load(device &ren.Device3D, path string) SceneModels3D {
+    document := node_files.load(path + "") or >>
+    directory := filepath.dir(&path)
+    << prepare(device, document, directory) or >>
+}
+pub fn (set &SceneModels3D) model_count() int { << set.models.len }
+pub fn (set &SceneModels3D) surface_count() int { << set.document.surface_count() }
+pub fn (set $&SceneModels3D) close() int {
+    if set.closed { << 0 }
+    for i in 0:set.models.len { model := $&set.models[i]
+        model.close() or >> }
+    set.closed = true
+    << 0
+}
+fn (set &SceneModels3D) matching_nodes(tree &game.SceneTree, root int) []int {
+    if set.closed { >> errors.new("game scene: closed model set") }
+    << node_files.matching_nodes(&set.document, tree, root) or >>
+}
+
+fn (set &SceneModels3D) preflight(scene &scene_render.Scene3D, tree &game.SceneTree, root int) []int {
+    ids := set.matching_nodes(tree, root) or >>
+    $added := 0
+    for i in 0:set.document.surface_count() {
+        surface := set.document.surface(i) or >>
+        slot := set.resource_models[surface.resource_uid + ""]
+        model := &set.models[slot]
+        added = added + (model.check_surface_binding(scene, tree, ids[surface.node], surface.primitive) or >>)
+    }
+    if added > scene.remaining_bindings() { >> errors.new("game scene: surface binding capacity exceeded") }
+    << ids
+}
+pub fn (set &SceneModels3D) bind(scene $&scene_render.Scene3D, tree &game.SceneTree, root int) int {
+    ids := set.preflight(scene, tree, root) or >>
+    for i in 0:set.document.surface_count() {
+        surface := set.document.surface(i) or >>
+        slot := set.resource_models[surface.resource_uid + ""]
+        model := &set.models[slot]
+        model.attach_surface(scene, tree, ids[surface.node], surface.primitive) or >>
+    }
+    << set.document.surface_count()
+}
+// Validate every GPU candidate off-tree before PackedScene touches the target.
+pub fn (set &SceneModels3D) instantiate(scene $&scene_render.Scene3D, tree $&game.SceneTree, parent int, name string) int {
+    if set.closed || set.document.surface_count() > scene.remaining_bindings() { >> errors.new("game scene: closed model set or insufficient binding capacity") }
+    $temporary := game.new_scene_tree("Staging", set.document.node_count() + 1) or >>
+    container := temporary.root()
+    candidate := set.packed.instantiate($&temporary, container, "Candidate") or >>
+    set.preflight(scene, &temporary, candidate) or >>
+    root := set.packed.instantiate(tree, parent, name) or >>
+    set.bind(scene, tree, root) or >>
+    << root
+}
+// Preserve declared source metadata and capture current node transforms/flags.
+// Changes to renderer-side materials are not inferred back into the document.
+pub fn (set &SceneModels3D) capture(tree &game.SceneTree, root int) resource.Document {
+    set.matching_nodes(tree, root) or >>
+    nodes := node_files.capture_nodes(tree, root) or >>
+    $references := []resource.ResourceReference{}
+    for i in 0:set.document.resource_count() { references.push(set.document.resource(i) or >>) }
+    << resource.with_references(&set.document, &nodes, references) or >>
+}
+
+// Rebase declarations when moving a scene file. Paths outside the destination
+// directory are rejected before publication; copying assets is a separate step.
+pub fn (set &SceneModels3D) save(path string, tree &game.SceneTree, root int) int {
+    if set.document.script_count() > 0 { >> errors.new("game scene: save script revisions through the script restoration owner") }
+    captured := set.capture(tree, root) or >>
+    << node_files.save_rebased(path, &captured, set.base_directory + "") or >>
+}

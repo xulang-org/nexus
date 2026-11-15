@@ -1,0 +1,98 @@
+@"github.com/xulang-org/game/physics2d"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#math
+#errors
+
+pub struct SweepHit {
+    pub hit bool
+    pub time f64
+    pub normal fm.Vec2
+    pub started_overlapping bool
+}
+struct AxisSweep {
+    entry f64
+    exit f64
+    separated bool
+}
+fn sweep_axis(low f64, high f64, solid_low f64, solid_high f64, motion f64) AxisSweep {
+    if motion == 0.0 {
+        << AxisSweep{entry: -1.0e30, exit: 1.0e30, separated: high <= solid_low || low >= solid_high}
+    }
+    t1 := (solid_low - high) / motion
+    t2 := (solid_high - low) / motion
+    << AxisSweep{entry: math.min(t1, t2), exit: math.max(t1, t2), separated: false}
+}
+// Continuous axis-aligned collision, including thin walls. Initial overlap is
+// reported explicitly; this primitive does not guess a depenetration direction.
+pub fn sweep_rect(body fm.Rect2, motion fm.Vec2, solid fm.Rect2) SweepHit {
+    if !body.valid() || !solid.valid() || !fm.finite(motion.x) || !fm.finite(motion.y) {
+        >> errors.new("game: invalid sweep geometry")
+    }
+    miss := SweepHit{hit: false, time: 1.0, normal: fm.vec2(0.0, 0.0), started_overlapping: false}
+    if body.overlaps(solid) {
+        << SweepHit{hit: true, time: 0.0, normal: fm.vec2(0.0, 0.0), started_overlapping: true}
+    }
+    x := sweep_axis(body.position.x, body.position.x + body.size.x,
+        solid.position.x, solid.position.x + solid.size.x, motion.x)
+    y := sweep_axis(body.position.y, body.position.y + body.size.y,
+        solid.position.y, solid.position.y + solid.size.y, motion.y)
+    if x.separated || y.separated { << miss }
+    entry := math.max(x.entry, y.entry)
+    exit := math.min(x.exit, y.exit)
+    if entry > exit || entry < 0.0 || entry > 1.0 { << miss }
+    $normal := fm.vec2(0.0, 0.0)
+    if x.entry >= y.entry {
+        if motion.x > 0.0 { normal.x = -1.0 } else { normal.x = 1.0 }
+    } else {
+        if motion.y > 0.0 { normal.y = -1.0 } else { normal.y = 1.0 }
+    }
+    << SweepHit{hit: true, time: entry, normal: normal, started_overlapping: false}
+}
+pub struct MotionResult {
+    pub position fm.Vec2
+    pub travelled fm.Vec2
+    pub remainder fm.Vec2
+    pub collisions int
+    pub on_floor bool
+    pub on_wall bool
+}
+// Swept kinematic motion against static rectangles. At most four slide passes;
+// obstacle count is bounded to 4096. Coordinates use +Y down. Overlap is an error.
+pub fn move_and_slide(body fm.Rect2, motion fm.Vec2, solids &[]fm.Rect2) MotionResult {
+    if !body.valid() || !fm.finite(motion.x) || !fm.finite(motion.y) || solids.len > 4096 ||
+        !fm.finite(body.position.x + motion.x) || !fm.finite(body.position.y + motion.y) {
+        >> errors.new("game: invalid kinematic motion")
+    }
+    for solid in solids {
+        if !solid.valid() || body.overlaps(solid) { >> errors.new("game: invalid or initially overlapping collider") }
+    }
+    $bounds := body
+    $remaining := motion
+    $count := 0
+    $floor := false
+    $wall := false
+    for pass in 0:4 {
+        if remaining.dot(remaining) < 0.000000000001 { <- }
+        $nearest := SweepHit{hit: false, time: 1.0, normal: fm.vec2(0.0, 0.0), started_overlapping: false}
+        for solid in solids {
+            hit := sweep_rect(bounds, remaining, solid) or >>
+            if hit.hit && (!nearest.hit || hit.time < nearest.time) { nearest = hit }
+        }
+        if !nearest.hit {
+            bounds.position = bounds.position.add(remaining)
+            remaining = fm.vec2(0.0, 0.0)
+            <-
+        }
+        // A small spatial separation avoids floating point overlap on the next pass.
+        bounds.position = bounds.position.add(remaining.scaled(nearest.time)).add(nearest.normal.scaled(0.000001))
+        remaining = remaining.scaled(1.0 - nearest.time)
+        if nearest.normal.x != 0.0 { remaining.x = 0.0
+            wall = true }
+        if nearest.normal.y != 0.0 { remaining.y = 0.0 }
+        if nearest.normal.y < 0.0 { floor = true }
+        count = count + 1
+    }
+    << MotionResult{position: bounds.position, travelled: bounds.position.sub(body.position),
+        remainder: remaining, collisions: count, on_floor: floor, on_wall: wall}
+}

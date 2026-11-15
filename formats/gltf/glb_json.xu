@@ -1,0 +1,85 @@
+@"github.com/xulang-org/game/formats/gltf"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#encoding/json
+#errors
+
+fn object(doc &json.Doc, node int, label string) int {
+    if node < 0 || !doc.is_dict(node) { >> errors.new("game GLB: expected object: " + label) }
+    << node
+}
+fn required(doc &json.Doc, node int, key string) int {
+    value := doc.get(node, key + "")
+    if value < 0 { >> errors.new("game GLB: missing " + key) }
+    << value
+}
+fn integer(doc &json.Doc, node int, key string, fallback int, minimum int, maximum int) int {
+    value := doc.get(node, key + "")
+    if value < 0 { << fallback }
+    number := doc.as_int(value) or >>
+    if number < minimum || number > maximum { >> errors.new("game GLB: integer outside limits: " + key) }
+    << number
+}
+fn number(doc &json.Doc, node int) f64 {
+    value := doc.as_f64(node) or >>
+    if !fm.finite(value) { >> errors.new("game GLB: non-finite JSON number") }
+    << value
+}
+fn boolean(doc &json.Doc, node int, key string, fallback bool) bool {
+    value := doc.get(node, key)
+    if value < 0 { << fallback }
+    << doc.as_bool(value) or >>
+}
+fn text(doc &json.Doc, node int, key string, fallback string) string {
+    value := doc.get(node, key)
+    if value < 0 { << fallback }
+    << doc.as_string(value) or >>
+}
+fn list(doc &json.Doc, node int, minimum int, maximum int) []int {
+    if node < 0 || !doc.is_list(node) { >> errors.new("game GLB: expected array") }
+    count := doc.count(node)
+    if count < minimum || count > maximum { >> errors.new("game GLB: array outside profile limits") }
+    $items := []int{}
+    for i in 0:count { items.push(doc.at(node, i)) }
+    << items
+}
+fn array_property(doc &json.Doc, node int, key string, minimum int, maximum int) []int {
+    value := required(doc, node, key) or >>
+    << list(doc, value, minimum, maximum) or >>
+}
+fn fields(doc &json.Doc, node int, allowed &[]string) int {
+    empty := []string{}
+    << fields_extensions(doc,node,allowed,&empty) or >>
+}
+fn fields_extensions(doc &json.Doc,node int,allowed &[]string,supported &[]string) int {
+    object(doc, node, "schema object") or >>
+    extension := doc.get(node, "extensions")
+    if extension >= 0 {
+        object(doc, extension, "extensions") or >>
+        for key in doc.dict_keys(extension) {
+            $found := false
+            for name in supported { if name==key { found=true } }
+            if !found { >> errors.new("game GLB: unsupported object extension "+key) }
+        }
+    }
+    keys := doc.dict_keys(node)
+    for key in keys {
+        if key == "extras" || key == "extensions" { -> }
+        $found := false
+        for field in allowed { if key == field { found = true } }
+        if !found { >> errors.new("game GLB: unsupported property: " + key) }
+    }
+    << 0
+}
+fn float_vector(doc &json.Doc, node int, count int) []f64 {
+    items := list(doc, node, count, count) or >>
+    $result := []f64{}
+    for item in items { result.push(number(doc, item) or >>) }
+    << result
+}
+fn property_vec3(doc &json.Doc, node int, key string, fallback fm.Vec3) fm.Vec3 {
+    value := doc.get(node, key)
+    if value < 0 { << fallback }
+    values := float_vector(doc, value, 3) or >>
+    << fm.vec3(values[0], values[1], values[2])
+}

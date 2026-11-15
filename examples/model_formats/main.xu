@@ -1,0 +1,324 @@
+@main
+#gpu
+#window
+window_events #window/events
+#os
+#math
+#strconv
+#strings
+#path/filepath
+#errors
+fm #"github.com/xulang-org/game/foundation/math"
+meshes #"github.com/xulang-org/game/resources/mesh"
+gltf #"github.com/xulang-org/game/formats/gltf"
+mesh_files #"github.com/xulang-org/game/assets/mesh"
+glb_files #"github.com/xulang-org/game/assets/gltf"
+glb #"github.com/xulang-org/game/integration/gltf_render"
+ren #"github.com/xulang-org/game/rendering/three_d"
+scene_render #"github.com/xulang-org/game/integration/rendering/three_d"
+shaders #"github.com/xulang-org/game/assets/shaders/three_d"
+game #"github.com/xulang-org/game/scene"
+lighting #"github.com/xulang-org/game/resources/lighting"
+shadow_data #"github.com/xulang-org/game/resources/shadow"
+fn glb_bounds(asset &gltf.GlbGeometry,instance &glb_files.GlbInstance,tree &game.SceneTree) fm.Aabb3 {
+    $local := []fm.Aabb3{}
+    for p in 0:asset.primitive_count() {
+        $low := asset.position(p,0) or >>
+        $high := low
+        for i in 0:(asset.vertex_count(p) or >>) {
+            v := asset.position(p,i) or >>
+            low=fm.vec3(math.min(low.x,v.x),math.min(low.y,v.y),math.min(low.z,v.z))
+            high=fm.vec3(math.max(high.x,v.x),math.max(high.y,v.y),math.max(high.z,v.z))
+        }
+        local.push(fm.aabb3(low,high) or >>)
+    }
+    if instance.primitive_count()<1 { >> errors.new("model preview: no selected geometry") }
+    $low := fm.vec3(1e300,1e300,1e300)
+    $high := low.scaled(-1.0)
+    for i in 0:instance.primitive_count() {
+        p := instance.primitive_index(i) or >>
+        box := local[p]
+        world := tree.global_transform_3d(instance.primitive_node(i) or >>) or >>
+        for corner in 0:8 {
+            $v := box.minimum
+            if (corner & 1)!=0 { v.x=box.maximum.x }
+            if (corner & 2)!=0 { v.y=box.maximum.y }
+            if (corner & 4)!=0 { v.z=box.maximum.z }
+            point := world.transform(fm.vec4(v.x,v.y,v.z,1.0)).xyz()
+            if !point.is_finite() { >> errors.new("model preview: world bounds overflow") }
+            low=fm.vec3(math.min(low.x,point.x),math.min(low.y,point.y),math.min(low.z,point.z))
+            high=fm.vec3(math.max(high.x,point.x),math.max(high.y,point.y),math.max(high.z,point.z))
+        }
+    }
+    << fm.aabb3(low,high) or >>
+}
+fn preview_camera(distance f64,fov f64,ground bool,angle f64) game.Camera3D {
+    $camera := game.new_camera_3d()
+    camera.position=fm.vec3(math.sin(angle)*distance,0.0,math.cos(angle)*distance)
+    if ground { camera.position.y=0.45 }
+    camera.vertical_fov=fov*0.017453292519943295
+    camera.near=0.1
+    camera.far=100.0
+    << camera
+}
+fn run() int {
+    args := os.args()
+    $path := "examples/model_formats/assets/cube.obj"
+    $frames := 0
+    $capture := ""
+    $shader_path := "build/mesh-shaders"
+    $backend := gpu.AUTO
+    $pbr := false
+    $animation := ""
+    $sample_time := 0.0
+    $loop := false
+    $render_scale := 1
+    $distance := 4.5
+    $fov := 60.0
+    $studio := false
+    $yaw := 0.6
+    $pitch := -0.35
+    $shadows := false
+    $shadow_light := "directional"
+    $cascades := 0
+    $shadow_distance := 15.0
+    $camera_motion := false
+    $ground := false
+    $i := 1
+    while i<args.len {
+        if i+1>=args.len { >> errors.new("missing option value") }
+        value := args[i+1]+""
+        if args[i]=="--model" { path=value
+        } else if args[i]=="--frames" { frames=strconv.atoi(&value) or >>
+            if frames<1 || frames>1000000 { >> errors.new("invalid frame count") }
+        } else if args[i]=="--capture" { capture=value
+        } else if args[i]=="--shaders" { shader_path=value
+        } else if args[i]=="--view" {
+            if value!="geometry" && value!="pbr" { >> errors.new("unknown model view") }
+            pbr=value=="pbr"
+        } else if args[i]=="--render-scale" { render_scale=strconv.atoi(&value) or >>
+            if render_scale!=1 && render_scale!=2 { >> errors.new("render scale requires 1 or 2") }
+        } else if args[i]=="--distance" { distance=strconv.parse_float(&value) or >>
+            if !fm.finite(distance) || distance<2.5 || distance>100.0 { >> errors.new("invalid preview distance") }
+        } else if args[i]=="--fov" { fov=strconv.parse_float(&value) or >>
+            if !fm.finite(fov) || fov<20.0 || fov>90.0 { >> errors.new("invalid preview fov") }
+        } else if args[i]=="--yaw" { yaw=strconv.parse_float(&value) or >>
+            if !fm.finite(yaw) || math.abs(yaw)>6.283185307179586 { >> errors.new("invalid preview yaw") }
+        } else if args[i]=="--pitch" { pitch=strconv.parse_float(&value) or >>
+            if !fm.finite(pitch) || math.abs(pitch)>1.57 { >> errors.new("invalid preview pitch") }
+        } else if args[i]=="--studio" {
+            if value!="true" && value!="false" { >> errors.new("studio requires true or false") }
+            studio=value=="true"
+        } else if args[i]=="--shadows" {
+            if value!="true" && value!="false" { >> errors.new("shadows requires true or false") }
+            shadows=value=="true"
+            if shadows { pbr=true }
+        } else if args[i]=="--ground" {
+            if value!="true" && value!="false" { >> errors.new("ground requires true or false") }
+            ground=value=="true"
+            if ground { pbr=true }
+        } else if args[i]=="--shadow-light" {
+            if value!="directional" && value!="spot" && value!="point" { >> errors.new("shadow-light requires directional, spot or point") }
+            shadow_light=value
+        } else if args[i]=="--cascades" {
+            cascades=strconv.atoi(&value) or >>
+            if cascades!=0 && (cascades<2 || cascades>4) { >> errors.new("cascades requires 0, 2, 3 or 4") }
+        } else if args[i]=="--shadow-distance" {
+            shadow_distance=strconv.parse_float(&value) or >>
+            if !fm.finite(shadow_distance) || shadow_distance<=0.1 || shadow_distance>100.0 { >> errors.new("shadow distance outside camera range") }
+        } else if args[i]=="--camera-motion" {
+            if value!="true" && value!="false" { >> errors.new("camera-motion requires true or false") }
+            camera_motion=value=="true"
+        } else if args[i]=="--animation" { animation=value
+            pbr=true
+        } else if args[i]=="--loop" {
+            if value!="true" && value!="false" { >> errors.new("--loop requires true or false") }
+            loop=value=="true"
+        } else if args[i]=="--time" {
+            sample_time=strconv.parse_float(&value) or >>
+            if !fm.finite(sample_time) || sample_time<0.0 || sample_time>1000000000.0 { >> errors.new("invalid animation sample time") }
+        } else if args[i]=="--backend" {
+            if value=="metal" { backend=gpu.METAL
+            } else if value=="vulkan" { backend=gpu.VULKAN
+            } else if value=="d3d12" { backend=gpu.D3D12
+            } else if value!="auto" { >> errors.new("unknown backend") }
+        } else { >> errors.new("unknown option") }
+        i+=2
+    }
+    if capture.len>0 && frames==0 { >> errors.new("capture requires bounded frames") }
+    if cascades>0 && shadow_light!="directional" { >> errors.new("cascades require a directional shadow light") }
+    if shadows || ground || shadow_light!="directional" || cascades>0 { pbr=true }
+    extension := filepath.ext(&path)
+    kind := strings.to_lower(&extension)
+    if kind!=".glb" && kind!=".obj" && kind!=".stl" { >> errors.new("model preview: unsupported format; expected .glb, .obj or .stl") }
+    if pbr && kind!=".glb" { >> errors.new("PBR model view currently requires GLB") }
+    // Complete import before creating a window/device. Arrays own the variant's
+    // CPU data; the GLB path retains its original hierarchy/instance semantics.
+    $assets := []gltf.GlbGeometry{}
+    $data := []meshes.MeshData3D{}
+    $instances := []glb_files.GlbInstance{}
+    $tree := game.new_scene_tree_3d("ModelFormats",4096) or >>
+    parent := tree.root()
+    $root := 0
+    $bounds := fm.Aabb3{minimum: fm.vec3(0.0,0.0,0.0),maximum: fm.vec3(0.0,0.0,0.0)}
+    $clip := -1
+    if kind==".glb" {
+        assets.push(glb_files.load_glb_geometry(path+"") or >>)
+        if animation.len>0 {
+            for c in 0:assets[0].animation_count() { if (assets[0].animation_name(c) or >>)==animation { clip=c } }
+            if clip<0 { >> errors.new("animation not found: "+animation) }
+        }
+        if assets[0].skin_count()>0 && !pbr { >> errors.new("skinned GLB requires --view pbr") }
+        instance := glb_files.instantiate(&assets[0],$&tree,parent,"Model") or >>
+        root=instance.root
+        bounds=glb_bounds(&assets[0],&instance,&tree) or >>
+        instances.push(instance)
+    } else {
+        data.push(mesh_files.load(path+"") or >>)
+        root=tree.add_child_3d(parent,"Model") or >>
+        bounds=data[0].bounds() or >>
+    }
+    center := bounds.center() or >>
+    size := bounds.maximum.sub(bounds.minimum)
+    extent := math.max(size.x,math.max(size.y,size.z))
+    if extent<=0.0 || !fm.finite(extent) { >> errors.new("model preview: invalid model extent") }
+    fit := fm.scale_3d(fm.vec3(2.0/extent,2.0/extent,2.0/extent)).multiply(fm.translation_3d(center.scaled(-1.0)))
+    program := shaders.load_mesh(shader_path+"") or >>
+    $device := ren.open_3d("Xu model format loading | Esc: exit",800,600,backend,&program) or >>
+    device.set_render_scale(render_scale) or >>
+    $scene := scene_render.new_scene_3d(&device) or >>
+    $models := []glb.GlbUnlit3D{}
+    $players := []glb.GlbAnimated3D{}
+    $owners := []ren.Mesh3D{}
+    $shadow_maps := []ren.ShadowMap3D{}
+    $key_direction := fm.vec3(-0.3,0.8,1.0)
+    if studio { key_direction=fm.vec3(-0.6,0.6,1.0) }
+    $key_source := lighting.directional(key_direction,fm.vec3(3.0,3.0,3.0)) or >>
+    if studio { key_source=lighting.directional(key_direction,fm.vec3(3.0,2.8,2.6)) or >> }
+    $shadow_description := shadow_data.directional(fm.vec3(0.0,-0.1,0.0),key_direction,2.5,8.0,1024) or >>
+    if shadow_light=="spot" {
+        key_source=lighting.spot(key_direction.scaled(4.0),key_direction.scaled(-1.0),fm.vec3(60.0,56.0,52.0),12.0,0.35,0.7) or >>
+        shadow_description=shadow_data.spot(key_source,0.1,1024) or >>
+    }
+    if shadow_light=="point" {
+        key_source=lighting.point(key_direction.scaled(4.0),fm.vec3(60.0,56.0,52.0),12.0) or >>
+        shadow_description=shadow_data.point(key_source,0.1,512) or >>
+    }
+    $cascade_settings := shadow_data.default_cascades()
+    cascade_settings.count=cascades
+    cascade_settings.distance=shadow_distance
+    cascade_settings.caster_padding=4.0
+    if shadows && cascades>0 {
+        lens := preview_camera(distance,fov,ground,0.0)
+        aspect := f64(device.width() or >>)/f64(device.height() or >>)
+        shadow_camera := scene_render.cascade_camera(&lens,aspect) or >>
+        shadow_description=shadow_data.cascaded(key_source,shadow_camera,cascade_settings) or >>
+    }
+    if pbr {
+        player := glb.upload_animated(&device,&assets[0]) or >>
+        players.push(player)
+    } else if kind==".glb" {
+        model := glb.upload_unlit(&device,&assets[0]) or >>
+        model.bind($&scene,&tree,&instances[0]) or >>
+        models.push(model)
+    } else {
+        mesh := device.upload(&data[0]) or >>
+        scene.attach_mesh(&tree,root,&mesh) or >>
+        owners.push(mesh)
+    }
+    if ground {
+        $plane := meshes.new_mesh_data_3d()
+        floor_y := (bounds.minimum.y-center.y)*2.0/extent
+        for p in [fm.vec3(-2.5,floor_y,-2.5),fm.vec3(-2.5,floor_y,2.5),fm.vec3(2.5,floor_y,2.5),fm.vec3(2.5,floor_y,-2.5)] { plane.vertex_lit(p,4294967295,fm.vec3(0.0,1.0,0.0)) or >> }
+        plane.triangle(0,1,2) or >>
+        plane.triangle(0,2,3) or >>
+        floor := device.upload(&plane) or >>
+        node := tree.add_child_3d(parent,"Ground") or >>
+        material := ren.material_3d(fm.vec3(0.3,0.32,0.38),0.0,0.9,fm.vec3(0.0,0.0,0.0)) or >>
+        scene.attach_surface(&tree,node,&floor,material) or >>
+        owners.push(floor)
+    }
+    if shadows {
+        program := shaders.load_shadow(shader_path+"") or >>
+        shadow_map := device.shadow_map(shadow_description,&program) or >>
+        shadow_maps.push(shadow_map)
+    }
+    $frame := 0
+    $quit := false
+    $triangles := 0
+    while !quit && (frames==0 || frame<frames) {
+        window.pump() or >>
+        for poll in 0:256 {
+            event := device.poll() or >>
+            if event.kind==window_events.EVENT_NONE { <- }
+            if event.kind==window_events.EVENT_CLOSE_REQUESTED || (event.kind==window_events.EVENT_KEY_DOWN && event.physical_key==window_events.KEY_ESCAPE) { quit=true }
+        }
+        if quit { <- }
+        width := device.width() or >>
+        height := device.height() or >>
+        if width<1 || height<1 { sleep_ns(10000000)
+            -> }
+        pose := fm.rotation_y(yaw+f64(frame)*0.01).multiply(fm.rotation_x(pitch)).multiply(fit)
+        tree.set_transform_3d(root,pose) or >>
+        if pbr {
+            player := $&players[0]
+            $time := sample_time+f64(frame)/60.0
+            if loop && clip>=0 {
+                duration := assets[0].animation_duration(clip) or >>
+                if duration>0.0 { time=time-math.floor(time/duration)*duration }
+            }
+            player.sample(&device,$&scene,$&tree,&assets[0],&instances[0],clip,time) or >>
+        }
+        $camera_angle := 0.0
+        if camera_motion { camera_angle=f64(frame)*0.005 }
+        lens := preview_camera(distance,fov,ground,camera_angle)
+        aspect := f64(width)/f64(height)
+        view_projection := lens.view_projection(aspect) or >>
+        if shadows && cascades>0 {
+            shadow_camera := scene_render.cascade_camera(&lens,aspect) or >>
+            shadow_description=shadow_data.cascaded(key_source,shadow_camera,cascade_settings) or >>
+        }
+        if shadows {
+            casters := scene.shadow_casters(&tree) or >>
+            shadow_map := $&shadow_maps[0]
+            shadow_map.render(&device,&casters,shadow_description) or >>
+        }
+        device.begin(202515967) or >>
+        if pbr {
+            $lights := [key_source]
+            if studio {
+                lights=[key_source,
+                    lighting.directional(fm.vec3(0.8,0.2,0.4),fm.vec3(0.6,0.75,1.0)) or >>,
+                    lighting.directional(fm.vec3(0.3,0.8,-1.0),fm.vec3(1.5,1.7,2.0)) or >>]
+            }
+            env := lighting.environment(fm.vec3(0.2,0.2,0.2),lens.position,1.0,lights) or >>
+            if shadows {
+                report := scene.draw_lit_shadowed($&device,&tree,view_projection,&env,&shadow_maps[0],0) or >>
+                triangles=report.triangles
+            } else {
+                report := scene.draw_lit($&device,&tree,view_projection,&env) or >>
+                triangles=report.triangles
+            }
+        } else {
+            report := scene.draw($&device,&tree,view_projection) or >>
+            triangles=report.triangles
+        }
+        if capture.len>0 && frame+1==frames { device.capture(capture+"") or >> }
+        device.present() or >>
+        frame+=1
+    }
+    println("Model format="+kind+" bindings="+str(scene.binding_count())+" triangles="+str(triangles)+" frames="+str(frame))
+    if kind==".glb" { println("Animations="+str(assets[0].animation_count())+" skins="+str(assets[0].skin_count())+" selected="+str(clip)) }
+    for j in 0:players.len { player := $&players[j]
+        player.close() or >> }
+    for j in 0:shadow_maps.len { shadow_map := $&shadow_maps[j]
+        shadow_map.close() or >> }
+    for j in 0:models.len { model := $&models[j]
+        model.close() or >> }
+    for j in 0:owners.len { mesh := $&owners[j]
+        mesh.close() or >> }
+    device.close() or >>
+    << 0
+}
+fn main() int { << run() or(err){ eprintln(err.msg())
+    << 1 } }

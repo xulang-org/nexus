@@ -1,0 +1,427 @@
+@"github.com/xulang-org/game/integration/ui"
+
+canvas #"github.com/xulang-org/game/resources/canvas"
+texts #"github.com/xulang-org/game/resources/text"
+fm #"github.com/xulang-org/game/foundation/math"
+present #"github.com/xulang-org/game/platform/present"
+ren2 #"github.com/xulang-org/game/rendering/two_d"
+#ui/draw
+#ui/layout
+widgets #ui/widgets
+font #ui/font
+#errors
+#math
+
+const CHUNK_SDF = 0
+const CHUNK_TEXT = 1
+const CHUNK_BATCH = 2
+const MAX_CLIP_STACK = 64
+const MAX_CLIP_EXTENT = 16384
+
+struct UiTextItem {
+    layout font.TextLayout
+    origin fm.Vec2
+    color int
+}
+
+struct UiClip {
+    active bool
+    rect fm.Rect2
+}
+
+struct UiChunk {
+    kind int
+    clip_idx int
+    sdf canvas.SdfBatch
+    texts []UiTextItem
+    batch canvas.Batch2D
+}
+
+// Ordered SDF + text frame composer backing #ui/widgets on Renderer2D and
+// Overlay2D across Metal/Vulkan GPU, CPU software RGBA8, and headless fallbacks.
+// Glyphs populate the atlas as text is recorded so flushes never emit stale UVs.
+pub struct UiFrame {
+    pub styles widgets.Styles
+    stack font.FontStack
+    atlas font.GlyphAtlas
+    clips []UiClip
+    clip_stack []int
+    chunks []UiChunk
+    begun bool
+    has_text bool
+}
+
+fn default_font_stack() font.FontStack {
+    $stack := font.new_font_stack()
+    stack.ensure_builtin_fallback(99)
+    << stack
+}
+
+pub fn new_ui_frame(styles &widgets.Styles) UiFrame {
+    stack := default_font_stack()
+    atlas := font.default_glyph_atlas() or >>
+    << UiFrame{
+        styles: styles.clone(),
+        stack: stack,
+        atlas: atlas,
+        clips: []UiClip{},
+        clip_stack: []int{},
+        chunks: []UiChunk{},
+        begun: false,
+        has_text: false
+    }
+}
+
+pub fn new_ui_frame_with_atlas(styles &widgets.Styles, init_w int, init_h int, max_w int, max_h int) UiFrame {
+    stack := default_font_stack()
+    atlas := font.new_glyph_atlas(init_w, init_h, max_w, max_h) or >>
+    << UiFrame{
+        styles: styles.clone(),
+        stack: stack,
+        atlas: atlas,
+        clips: []UiClip{},
+        clip_stack: []int{},
+        chunks: []UiChunk{},
+        begun: false,
+        has_text: false
+    }
+}
+
+// Loads a TrueType font face into the front of the frame's font stack and resets
+// the glyph atlas so subsequent frames rasterize against the new face.
+pub fn (frame $&UiFrame) add_ttf_bytes(ttf_bytes &[]u8, face_index int, priority int) int {
+    face := font.parse_ttf(ttf_bytes, face_index, priority) or >>
+    stack := $&frame.stack
+    stack.add_face(face)
+    frame.atlas = font.new_glyph_atlas(frame.atlas.width, frame.atlas.height,
+        frame.atlas.max_width, frame.atlas.max_height) or >>
+    << 0
+}
+
+pub fn (frame $&UiFrame) set_styles(styles &widgets.Styles) {
+    frame.styles = styles.clone()
+}
+
+pub fn (frame &UiFrame) chunk_count() int { << frame.chunks.len }
+pub fn (frame &UiFrame) atlas_revision() int { << frame.atlas.revision }
+pub fn (frame &UiFrame) atlas_width() int { << frame.atlas.width }
+pub fn (frame &UiFrame) atlas_height() int { << frame.atlas.height }
+
+pub fn (frame $&UiFrame) begin() int {
+    frame.chunks = []UiChunk{}
+    frame.clips = [UiClip{active: false, rect: fm.rect2(0.0, 0.0, 0.0, 0.0)}]
+    frame.clip_stack = [0]
+    frame.begun = true
+    frame.has_text = false
+    << 0
+}
+
+fn recording(frame &UiFrame) int {
+    if !frame.begun || frame.clip_stack.len == 0 {
+        >> errors.new("game ui: UiFrame.begin must be called before recording UI")
+    }
+    << 0
+}
+
+fn clamp_clip_rect(r &layout.Rect) fm.Rect2 {
+    max_ext := f64(MAX_CLIP_EXTENT)
+    $x0 := math.max(0.0, math.min(max_ext, r.x))
+    $y0 := math.max(0.0, math.min(max_ext, r.y))
+    $x1 := math.max(x0, math.min(max_ext, r.x + r.width))
+    $y1 := math.max(y0, math.min(max_ext, r.y + r.height))
+    << fm.rect2(x0, y0, x1 - x0, y1 - y0)
+}
+
+fn intersect_clip(a fm.Rect2, b fm.Rect2) fm.Rect2 {
+    x0 := math.max(a.position.x, b.position.x)
+    y0 := math.max(a.position.y, b.position.y)
+    x1 := math.min(a.position.x + a.size.x, b.position.x + b.size.x)
+    y1 := math.min(a.position.y + a.size.y, b.position.y + b.size.y)
+    << fm.rect2(x0, y0, math.max(0.0, x1 - x0), math.max(0.0, y1 - y0))
+}
+
+pub fn (frame $&UiFrame) push_clip(bounds &layout.Rect) int {
+    recording(frame) or >>
+    if math.is_nan(bounds.x) || math.is_inf(bounds.x) ||
+       math.is_nan(bounds.y) || math.is_inf(bounds.y) ||
+       math.is_nan(bounds.width) || math.is_inf(bounds.width) || bounds.width < 0.0 ||
+       math.is_nan(bounds.height) || math.is_inf(bounds.height) || bounds.height < 0.0 {
+        >> errors.new("game ui: invalid clip rectangle")
+    }
+    if frame.clip_stack.len >= MAX_CLIP_STACK {
+        >> errors.new("game ui: clip stack overflow")
+    }
+    $rect := clamp_clip_rect(bounds)
+    parent := frame.clips[frame.clip_stack[frame.clip_stack.len - 1]]
+    if parent.active { rect = intersect_clip(parent.rect, rect) }
+    idx := frame.clips.len
+    frame.clips.push(UiClip{active: true, rect: rect})
+    frame.clip_stack.push(idx)
+    << 0
+}
+
+pub fn (frame $&UiFrame) pop_clip() int {
+    recording(frame) or >>
+    if frame.clip_stack.len <= 1 {
+        >> errors.new("game ui: clip stack underflow")
+    }
+    frame.clip_stack = frame.clip_stack[0:frame.clip_stack.len - 1]
+    << 0
+}
+
+fn current_clip_idx(frame &UiFrame) int {
+    << frame.clip_stack[frame.clip_stack.len - 1]
+}
+
+fn ensure_sdf_chunk(frame $&UiFrame) int {
+    clip_idx := current_clip_idx(frame)
+    n := frame.chunks.len
+    if n > 0 {
+        last := n - 1
+        c := &frame.chunks[last]
+        if c.kind == CHUNK_SDF && c.clip_idx == clip_idx && c.sdf.rect_count() < canvas.MAX_SDF_RECTS_2D {
+            << last
+        }
+    }
+    frame.chunks.push(UiChunk{kind: CHUNK_SDF, clip_idx: clip_idx,
+        sdf: canvas.new_sdf_batch(), texts: []UiTextItem{}, batch: canvas.new_batch()})
+    << n
+}
+
+fn ensure_text_chunk(frame $&UiFrame) int {
+    clip_idx := current_clip_idx(frame)
+    n := frame.chunks.len
+    if n > 0 {
+        last := n - 1
+        c := &frame.chunks[last]
+        if c.kind == CHUNK_TEXT && c.clip_idx == clip_idx {
+            << last
+        }
+    }
+    frame.chunks.push(UiChunk{kind: CHUNK_TEXT, clip_idx: clip_idx,
+        sdf: canvas.new_sdf_batch(), texts: []UiTextItem{}, batch: canvas.new_batch()})
+    << n
+}
+
+fn ensure_batch_chunk(frame $&UiFrame, need_verts int) int {
+    clip_idx := current_clip_idx(frame)
+    n := frame.chunks.len
+    if n > 0 {
+        last := n - 1
+        c := &frame.chunks[last]
+        if c.kind == CHUNK_BATCH && c.clip_idx == clip_idx &&
+           c.batch.vertex_count() <= canvas.MAX_VERTICES_2D - need_verts {
+            << last
+        }
+    }
+    frame.chunks.push(UiChunk{kind: CHUNK_BATCH, clip_idx: clip_idx,
+        sdf: canvas.new_sdf_batch(), texts: []UiTextItem{}, batch: canvas.new_batch()})
+    << n
+}
+
+pub fn (frame $&UiFrame) record_triangle(a fm.Vec2, b fm.Vec2, c fm.Vec2, color int) int {
+    recording(frame) or >>
+    if (color & 255) == 0 { << 0 }
+    idx := ensure_batch_chunk(frame, 3)
+    batch := $&frame.chunks[idx].batch
+    << batch.triangle(a, b, c, color) or >>
+}
+
+pub fn (frame $&UiFrame) record_quad(a fm.Vec2, b fm.Vec2, c fm.Vec2, d fm.Vec2, color int) int {
+    recording(frame) or >>
+    if (color & 255) == 0 { << 0 }
+    idx := ensure_batch_chunk(frame, 6)
+    batch := $&frame.chunks[idx].batch
+    batch.triangle(a, b, c, color) or >>
+    << batch.triangle(a, c, d, color) or >>
+}
+
+pub fn (frame $&UiFrame) record_sdf_rect(bounds fm.Rect2, radius f64,
+    fill_color int, border_width f64, border_color int) int {
+    recording(frame) or >>
+    if bounds.size.x <= 0.0 || bounds.size.y <= 0.0 { << 0 }
+    if (fill_color & 255) == 0 && (border_width <= 0.0 || (border_color & 255) == 0) { << 0 }
+    idx := ensure_sdf_chunk(frame)
+    sdf := $&frame.chunks[idx].sdf
+    << sdf.rounded_rect(bounds, radius, fill_color, border_width, border_color) or >>
+}
+
+pub fn (frame $&UiFrame) record_sdf_circle(center fm.Vec2, radius f64,
+    fill_color int, border_width f64, border_color int) int {
+    recording(frame) or >>
+    if radius <= 0.0 { << 0 }
+    if (fill_color & 255) == 0 && (border_width <= 0.0 || (border_color & 255) == 0) { << 0 }
+    idx := ensure_sdf_chunk(frame)
+    sdf := $&frame.chunks[idx].sdf
+    << sdf.circle(center, radius, fill_color, border_width, border_color) or >>
+}
+
+pub fn (frame $&UiFrame) record_text_layout(ly font.TextLayout, origin fm.Vec2, color draw.Color) int {
+    recording(frame) or >>
+    if ly.glyph_count() == 0 || (color.value() & 255) == 0 { << 0 }
+    px_q := font.quantize_px_size(ly.size) or >>
+    q_size := f64(px_q) / 4.0
+    $missing := []font.ResolvedGlyph{}
+    $bmps := []font.GlyphBitmap{}
+    for gi in 0:ly.glyph_count() {
+        g := ly.glyph_at(gi)
+        if g.is_newline { -> }
+        if frame.atlas.entry_index(g.font_id, g.glyph_id, ly.size) < 0 {
+            rg := font.ResolvedGlyph{face_index: g.face_index, font_id: g.font_id, glyph_id: g.glyph_id}
+            bmp := frame.stack.rasterize(rg, q_size) or >>
+            missing.push(rg)
+            bmps.push(bmp)
+        }
+    }
+    if missing.len > 0 {
+        atlas := $&frame.atlas
+        for mi in 0:missing.len {
+            atlas.insert_bitmap(missing[mi], ly.size, &bmps[mi]) or >>
+        }
+    }
+    idx := ensure_text_chunk(frame)
+    items := $&frame.chunks[idx].texts
+    items.push(UiTextItem{layout: ly, origin: origin, color: color.value()})
+    frame.has_text = true
+    << 0
+}
+
+pub fn (frame &UiFrame) measure_text(text &string, size f64) font.TextLayout {
+    opts := font.default_options(size)
+    << font.layout_text(&frame.stack, text, &opts) or >>
+}
+
+pub fn (frame $&UiFrame) draw_panel(bounds &layout.Rect, radius f64,
+    fill draw.Color, border draw.Color, border_width f64) int {
+    recording(frame) or >>
+    if bounds.width <= 0.0 || bounds.height <= 0.0 { << 0 }
+    r := math.max(0.0, math.min(radius, math.min(bounds.width, bounds.height) * 0.5))
+    << frame.record_sdf_rect(fm.rect2(bounds.x, bounds.y, bounds.width, bounds.height),
+        r, fill.value(), border_width, border.value()) or >>
+}
+
+pub fn (frame $&UiFrame) draw_label(bounds &layout.Rect, text &string, color draw.Color,
+    size f64, align_x f64, align_y f64) int {
+    recording(frame) or >>
+    if text.len == 0 || (color.value() & 255) == 0 { << 0 }
+    opts := font.default_options(size)
+    ly := font.layout_text(&frame.stack, text, &opts) or >>
+    tx := bounds.x + (bounds.width - ly.metrics.width) * align_x
+    ty := bounds.y + (bounds.height - ly.metrics.height) * align_y
+    << frame.record_text_layout(ly, fm.vec2(tx, ty), color) or >>
+}
+
+pub fn (frame $&UiFrame) draw_label_wrapped(bounds &layout.Rect, text &string, color draw.Color,
+    size f64, align int) int {
+    recording(frame) or >>
+    if text.len == 0 || bounds.width <= 0.0 || (color.value() & 255) == 0 { << 0 }
+    opts := font.wrapped_options(size, bounds.width, align)
+    ly := font.layout_text(&frame.stack, text, &opts) or >>
+    << frame.record_text_layout(ly, fm.vec2(bounds.x, bounds.y), color) or >>
+}
+
+// Allocates a MaskTexture2D sized for the current atlas on a Renderer2D.
+pub fn (frame &UiFrame) create_mask_2d(renderer &ren2.Renderer2D) ren2.MaskTexture2D {
+    << renderer.mask_texture_r8(frame.atlas.width, frame.atlas.height, true,
+        &frame.atlas.pixels, frame.atlas.revision) or >>
+}
+
+fn validate_flush(frame &UiFrame) int {
+    recording(frame) or >>
+    if frame.clip_stack.len != 1 {
+        >> errors.new("game ui: unbalanced push_clip/pop_clip before flush")
+    }
+    << 0
+}
+
+fn build_frame_text_batches(frame &UiFrame) []canvas.Batch2D {
+    $batches := []canvas.Batch2D{}
+    if !frame.has_text { << batches }
+    for ci in 0:frame.chunks.len {
+        if frame.chunks[ci].kind == CHUNK_TEXT {
+            $b := canvas.new_batch()
+            items := &frame.chunks[ci].texts
+            for ii in 0:items.len {
+                item := &items[ii]
+                texts.append_cached_quads($&b, &item.layout, &frame.atlas,
+                    item.origin, fm.identity(), item.color) or >>
+            }
+            batches.push(b)
+        }
+    }
+    << batches
+}
+
+// Syncs the glyph mask if needed and submits all recorded SDF, path, and text
+// chunks to Renderer2D in exact painter and clip order.
+pub fn (frame $&UiFrame) flush_2d(renderer $&ren2.Renderer2D, mask $&ren2.MaskTexture2D) int {
+    validate_flush(frame) or >>
+    text_batches := build_frame_text_batches(frame) or >>
+    if frame.has_text && (mask.current_revision() != frame.atlas.revision ||
+       mask.width_px() != frame.atlas.width || mask.height_px() != frame.atlas.height) {
+        mask.sync_r8(renderer, frame.atlas.width, frame.atlas.height, &frame.atlas.pixels, frame.atlas.revision) or >>
+    }
+    $active_clip := 0
+    $text_idx := 0
+    for i in 0:frame.chunks.len {
+        chunk := &frame.chunks[i]
+        if chunk.clip_idx != active_clip {
+            clip := frame.clips[chunk.clip_idx]
+            if clip.active { renderer.clip_rect(clip.rect) or >> }
+            else { renderer.reset_clip() or >> }
+            active_clip = chunk.clip_idx
+        }
+        if chunk.kind == CHUNK_SDF {
+            renderer.submit_sdf(&chunk.sdf) or >>
+        } else if chunk.kind == CHUNK_BATCH {
+            if chunk.batch.vertex_count() > 0 {
+                renderer.submit(&chunk.batch) or >>
+            }
+        } else {
+            tb := &text_batches[text_idx]
+            text_idx = text_idx + 1
+            if tb.vertex_count() > 0 {
+                renderer.submit_text(tb, mask) or >>
+            }
+        }
+    }
+    if active_clip != 0 { renderer.reset_clip() or >> }
+    << 0
+}
+
+// Syncs Overlay2D's R8 text mask if needed and submits all recorded SDF, path,
+// and text chunks to Overlay2D for GPU or CPU software compositing.
+pub fn (frame $&UiFrame) flush_overlay(session &present.Session, overlay $&ren2.Overlay2D) int {
+    validate_flush(frame) or >>
+    text_batches := build_frame_text_batches(frame) or >>
+    if frame.has_text {
+        overlay.sync_text_mask(session, frame.atlas.width, frame.atlas.height, true,
+            &frame.atlas.pixels, frame.atlas.revision) or >>
+    }
+    $active_clip := 0
+    $text_idx := 0
+    for i in 0:frame.chunks.len {
+        chunk := &frame.chunks[i]
+        if chunk.clip_idx != active_clip {
+            clip := frame.clips[chunk.clip_idx]
+            if clip.active { overlay.clip_rect(clip.rect) or >> }
+            else { overlay.reset_clip() or >> }
+            active_clip = chunk.clip_idx
+        }
+        if chunk.kind == CHUNK_SDF {
+            overlay.submit_sdf(&chunk.sdf) or >>
+        } else if chunk.kind == CHUNK_BATCH {
+            if chunk.batch.vertex_count() > 0 {
+                overlay.submit(&chunk.batch) or >>
+            }
+        } else {
+            tb := &text_batches[text_idx]
+            text_idx = text_idx + 1
+            if tb.vertex_count() > 0 {
+                overlay.submit_text(tb) or >>
+            }
+        }
+    }
+    if active_clip != 0 { overlay.reset_clip() or >> }
+    << 0
+}

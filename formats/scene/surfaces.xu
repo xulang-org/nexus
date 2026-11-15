@@ -1,0 +1,61 @@
+@"github.com/xulang-org/game/formats/scene"
+
+resource #"github.com/xulang-org/game/resources/scene"
+#encoding/json
+#strings
+#errors
+
+fn rows_min(doc &json.Doc, node int, minimum int, limit int) []int {
+    if node < 0 || !doc.is_list(node) || doc.count(node) < minimum || doc.count(node) > limit { >> errors.new("game scene: resource/surface array outside limits") }
+    $result := []int{}
+    for i in 0:doc.count(node) { result.push(doc.at(node, i)) }
+    << result
+}
+fn decode_attachments(doc &json.Doc, root int, document &resource.Document) resource.Document {
+    resource_nodes := rows_min(doc, doc.get(root, "resources"), 0, resource.MAX_RESOURCES) or >>
+    resource_fields := ["uid", "type", "path", "sha256"]
+    $references := []resource.ResourceReference{}
+    for node in resource_nodes {
+        fields(doc, node, &resource_fields) or >>
+        uid := doc.as_string(doc.get(node, "uid")) or >>
+        kind := doc.as_string(doc.get(node, "type")) or >>
+        path := doc.as_string(doc.get(node, "path")) or >>
+        hash := doc.as_string(doc.get(node, "sha256")) or >>
+        references.push(resource.ResourceReference{uid: uid, kind: kind, path: path, content_hash: hash})
+    }
+    surface_nodes := rows_min(doc, doc.get(root, "surfaces"), 0, resource.MAX_SURFACES) or >>
+    surface_fields := ["node", "resource", "primitive"]
+    $surfaces := []resource.Surface{}
+    for node in surface_nodes {
+        fields(doc, node, &surface_fields) or >>
+        index := doc.as_int(doc.get(node, "node")) or >>
+        uid := doc.as_string(doc.get(node, "resource")) or >>
+        primitive := doc.as_int(doc.get(node, "primitive")) or >>
+        surfaces.push(resource.Surface{node: index, resource_uid: uid, primitive: primitive})
+    }
+    buses := decode_buses(doc, root, 0) or >>
+    emitters := decode_emitters(doc, root, 0) or >>
+    << decode_scripts(doc, root, document, references, surfaces, buses, emitters) or >>
+}
+fn encode_surfaces(document &resource.Document) string {
+    $out := strings.new_byte_builder(1024)
+    out.write_str(",\"resources\":[\n")
+    for i in 0:document.resource_count() {
+        if i > 0 { out.write_str(",\n") }
+        reference := document.resource(i) or >>
+        uid := reference.uid + ""
+        kind := reference.kind + ""
+        path := reference.path + ""
+        hash := reference.content_hash + ""
+        out.write_str("{\"uid\":" + json.quote(&uid) + ",\"type\":" + json.quote(&kind) + ",\"path\":" + json.quote(&path) + ",\"sha256\":" + json.quote(&hash) + "}")
+    }
+    out.write_str("\n],\"surfaces\":[\n")
+    for i in 0:document.surface_count() {
+        if i > 0 { out.write_str(",\n") }
+        surface := document.surface(i) or >>
+        uid := surface.resource_uid + ""
+        out.write_str("{\"node\":" + str(surface.node) + ",\"resource\":" + json.quote(&uid) + ",\"primitive\":" + str(surface.primitive) + "}")
+    }
+    out.write_str("\n]")
+    << out.to_string()
+}
