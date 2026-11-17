@@ -43,8 +43,8 @@ pub fn (scene &Scene3D) check_mesh_binding(tree &game.SceneTree, node int, mesh 
     info := tree.node_info(node) or >>
     if info.kind != game.NODE_3D || info.queued_free { >> errors.new("game GPU: mesh requires an editable Node3D") }
     if scene.materials.has(node) {
-        material := scene.materials[node]
-        scene.owner.validate_material(mesh.reference(), &material) or >>
+        material := &scene.materials[node]
+        scene.owner.validate_material(mesh.reference(), material) or >>
     } else { scene.owner.validate_mesh(mesh.reference(), false) or >> }
     if !scene.meshes.has(node) {
         if scene.count >= game.MAX_NODES { >> errors.new("game GPU: scene binding limit reached; prune retired nodes") }
@@ -68,27 +68,16 @@ pub fn (scene $&Scene3D) detach_mesh(node int) int {
 // Clear freed/queued bindings; GPU resources are owned independently and survive.
 pub fn (scene $&Scene3D) prune(tree &game.SceneTree) int {
     order := tree.subtree(tree.root()) or >>
-    $next := map[int]ren.MeshRef3D{}
-    $next_materials := map[int]ren.Material3D{}
-    $next_lods := map[int]MeshLods3D{}
-    $next_levels := map[int]int{}
-    $kept := 0
+    $drop := []int{}
     for node in order {
         if !scene.meshes.has(node) { -> }
-        mesh := scene.meshes[node]
         info := tree.node_info(node) or >>
-        if !info.queued_free { next[node] = mesh
-            if scene.materials.has(node) { next_materials[node] = scene.materials[node] }
-            if scene.lods.has(node) { next_lods[node]=copy_lods(&scene.lods[node]) or >>
-                next_levels[node]=scene.lod_levels[node] }
-            kept = kept + 1 }
+        if info.queued_free { drop.push(node) }
     }
-    removed := scene.count - kept
-    scene.meshes = next
-    scene.materials = next_materials
-    scene.lods=next_lods
-    scene.lod_levels=next_levels
-    scene.count = kept
+    $removed := 0
+    for i in 0:drop.len {
+        removed = removed + (scene.detach_mesh(drop[i]) or >>)
+    }
     << removed
 }
 // Draw inside Device3D.begin/present. Hidden and queued nodes emit no draws.
