@@ -1,0 +1,231 @@
+@main
+
+game #"github.com/xulang-org/game"
+xacp #"github.com/xulang-org/game/xacp"
+#os
+#strings
+#strconv
+#time
+#errors
+
+fn send_request(fd int, body string) int {
+    frame := "XACP/1\n" + str(body.len) + "\n" + body
+    $offset := 0
+    while offset < frame.len {
+        $end := offset + 512
+        if end > frame.len { end = frame.len }
+        n := os.socket_write(fd, frame[offset:end]) or >>
+        if n <= 0 { >> errors.new("send_request: socket write error") }
+        offset += n
+    }
+    << 0
+}
+
+struct TestReader {
+    fd int
+    remainder string
+}
+
+fn (r $&TestReader) read_line() string {
+    while true {
+        idx := strings.index_byte(&r.remainder, 10)
+        if idx >= 0 {
+            line := r.remainder[0:idx]
+            r.remainder = r.remainder[idx + 1:r.remainder.len]
+            if line.len > 0 && line[line.len - 1] == 13 {
+                << line[0:line.len - 1]
+            }
+            << line
+        }
+        chunk := os.socket_read(r.fd, 4096) or >>
+        if chunk.len == 0 { >> errors.new("EOF") }
+        r.remainder = r.remainder + chunk
+    }
+}
+
+fn (r $&TestReader) read_bytes(count int) string {
+    while r.remainder.len < count {
+        chunk := os.socket_read(r.fd, 4096) or >>
+        if chunk.len == 0 { >> errors.new("EOF") }
+        r.remainder = r.remainder + chunk
+    }
+    body := r.remainder[0:count]
+    r.remainder = r.remainder[count:r.remainder.len]
+    << body
+}
+
+fn (r $&TestReader) read_frame() string {
+    magic := r.read_line() or >>
+    if magic != "XACP/1" { >> errors.new("bad magic: " + magic) }
+    len_line := r.read_line() or >>
+    length := strconv.atoi(&len_line) or >>
+    body := r.read_bytes(length) or >>
+    << body
+}
+
+fn run_tests() int {
+    println("=== Xu Game XACP Integration Test Suite ===")
+
+    $tree := game.new_scene_tree("World", 128) or >>
+    level := tree.add_child(tree.root(), "Level") or >>
+    player := tree.add_child(level, "Player") or >>
+    tree.set_position(player, game.vec2(100.0, 200.0)) or >>
+    gem := tree.add_child(level, "Gem0") or >>
+    tree.set_position(gem, game.vec2(300.0, 400.0)) or >>
+
+    $input := game.new_input_map()
+    input.bind("up", xacp.KEY_W) or >>
+    input.bind("left", xacp.KEY_A) or >>
+
+    port := 19876
+    $ctrl := xacp.attach_tcp(port)
+    time.sleep(50000000) // 50ms wait for listener
+
+    client := os.socket(2, 1, 0) or >>
+    os.connect4(client, 127, 0, 0, 1, port) or >>
+    $reader := TestReader{fd: client, remainder: ""}
+
+    // Test 1: xacp.hello
+    hello_req := "id: !i 1\nop: xacp.hello\nargs:\n  ver: !ver 1.0.0\n  nonce: \"test-game-nonce\"\n"
+    send_request(client, hello_req) or >>
+    hello_res := reader.read_frame() or >>
+    assert(strings.contains(&hello_res, "ok: !b true"))
+    assert(strings.contains(&hello_res, "test-game-nonce"))
+    assert(strings.contains(&hello_res, "target: \"game\""))
+    println("  [OK] xacp.hello capability handshake and target negotiation")
+
+    // Test 2: proc.status
+    status_req := "id: !i 2\nop: proc.status\nargs: {}\n"
+    send_request(client, status_req) or >>
+    status_res := reader.read_frame() or >>
+    assert(strings.contains(&status_res, "ok: !b true"))
+    assert(strings.contains(&status_res, "state: \"OPEN\""))
+    println("  [OK] proc.status process status query")
+
+    // Test 3: ui.tree
+    tree_req := "id: !i 3\nop: ui.tree\nargs:\n  win: !i 1\n"
+    send_request(client, tree_req) or >>
+    $polled := false
+    for i in 0:100 {
+        if ctrl.poll($&tree, $&input) {
+            polled = true
+            <-
+        }
+        time.sleep(1000000)
+    }
+    assert(polled)
+    tree_res := reader.read_frame() or >>
+    assert(strings.contains(&tree_res, "ok: !b true"))
+    assert(strings.contains(&tree_res, "World"))
+    assert(strings.contains(&tree_res, "Player"))
+    assert(strings.contains(&tree_res, "Gem0"))
+    assert(strings.contains(&tree_res, "total: !i 4"))
+    println("  [OK] ui.tree scene hierarchy inspection and serialization")
+
+    // Test 4: ui.input
+    is_up := input.pressed("up") or >>
+    assert(!is_up)
+    input_req := "id: !i 4\nop: ui.input\nargs:\n  win: !i 1\n  steps: [{ev: key_down, key: !i 119}]\n"
+    send_request(client, input_req) or >>
+    polled = false
+    for i in 0:100 {
+        if ctrl.poll($&tree, $&input) {
+            polled = true
+            <-
+        }
+        time.sleep(1000000)
+    }
+    assert(polled)
+    input_res := reader.read_frame() or >>
+    assert(strings.contains(&input_res, "ok: !b true"))
+    is_up_now := input.pressed("up") or >>
+    assert(is_up_now)
+    println("  [OK] ui.input virtual keyboard injection into game input map")
+
+    // Test 5: ui.act (pause)
+    assert(!tree.paused)
+    act_req := "id: !i 5\nop: ui.act\nargs:\n  win: !i 1\n  node: !i 1\n  act: pause\n"
+    send_request(client, act_req) or >>
+    polled = false
+    for i in 0:100 {
+        if ctrl.poll($&tree, $&input) {
+            polled = true
+            <-
+        }
+        time.sleep(1000000)
+    }
+    assert(polled)
+    act_res := reader.read_frame() or >>
+    assert(strings.contains(&act_res, "ok: !b true"))
+    assert(tree.paused)
+    println("  [OK] ui.act pause control action")
+
+    // Test 6: game.step
+    step_req := "id: !i 6\nop: game.step\nargs:\n  frames: !i 5\n"
+    send_request(client, step_req) or >>
+    polled = false
+    for i in 0:100 {
+        if ctrl.poll($&tree, $&input) {
+            polled = true
+            <-
+        }
+        time.sleep(1000000)
+    }
+    assert(polled)
+    step_res := reader.read_frame() or >>
+    assert(strings.contains(&step_res, "ok: !b true"))
+    assert(ctrl.steps_remaining == 5)
+    assert(ctrl.consume_step())
+    assert(ctrl.steps_remaining == 4)
+    println("  [OK] game.step frame-by-frame advance control")
+
+    // Test 7: game.state
+    state_req := "id: !i 7\nop: game.state\nargs: {}\n"
+    send_request(client, state_req) or >>
+    polled = false
+    for i in 0:100 {
+        if ctrl.poll($&tree, $&input) {
+            polled = true
+            <-
+        }
+        time.sleep(1000000)
+    }
+    assert(polled)
+    state_res := reader.read_frame() or >>
+    assert(strings.contains(&state_res, "node_count: !i 4"))
+    assert(strings.contains(&state_res, "paused: !b true"))
+    println("  [OK] game.state internal metrics query")
+
+    // Test 8: ui.screenshot
+    shot_req := "id: !i 8\nop: ui.screenshot\nargs:\n  win: !i 1\n  mode: file\n"
+    send_request(client, shot_req) or >>
+    polled = false
+    for i in 0:100 {
+        if ctrl.poll($&tree, $&input) {
+            polled = true
+            <-
+        }
+        time.sleep(1000000)
+    }
+    assert(polled)
+    assert(ctrl.screenshot_requested())
+    // Fulfill screenshot with test file
+    ctrl.fulfill_screenshot(960, 640, "tests/xu.xun")
+    shot_res := reader.read_frame() or >>
+    assert(strings.contains(&shot_res, "ok: !b true"))
+    assert(strings.contains(&shot_res, "pixel_width: !i 960"))
+    println("  [OK] ui.screenshot rendering lifecycle synchronization")
+
+    os.socket_close(client) or >>
+    ctrl.close()
+
+    println("=== ALL XACP GAME TESTS PASSED! ===")
+    << 0
+}
+
+fn main() int {
+    << run_tests() or (err) {
+        eprintln("test failed: " + err.msg())
+        << 1
+    }
+}

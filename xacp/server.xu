@@ -1,0 +1,228 @@
+@"github.com/xulang-org/game/xacp"
+
+game #"github.com/xulang-org/game"
+#encoding/xun
+#os
+#strconv
+#strings
+#errors
+#time
+
+struct FrameReader {
+    fd int
+    remainder string
+}
+
+fn new_frame_reader(fd int) FrameReader {
+    << FrameReader{fd: fd, remainder: ""}
+}
+
+fn (r $&FrameReader) read_line() string {
+    while true {
+        idx := strings.index_byte(&r.remainder, 10)
+        if idx >= 0 {
+            line := r.remainder[0:idx]
+            r.remainder = r.remainder[idx + 1:r.remainder.len]
+            if line.len > 0 && line[line.len - 1] == 13 {
+                << line[0:line.len - 1]
+            }
+            << line
+        }
+        chunk := os.socket_read(r.fd, 4096) or >>
+        if chunk.len == 0 {
+            >> errors.new("EOF")
+        }
+        r.remainder = r.remainder + chunk
+    }
+}
+
+fn (r $&FrameReader) read_bytes(count int) string {
+    while r.remainder.len < count {
+        chunk := os.socket_read(r.fd, 4096) or >>
+        if chunk.len == 0 {
+            >> errors.new("EOF")
+        }
+        r.remainder = r.remainder + chunk
+    }
+    body := r.remainder[0:count]
+    r.remainder = r.remainder[count:r.remainder.len]
+    << body
+}
+
+fn (r $&FrameReader) read_frame() string {
+    magic := r.read_line() or >>
+    if magic != "XACP/1" {
+        >> errors.new("invalid XACP/1 magic line: " + magic)
+    }
+    len_line := r.read_line() or >>
+    length := strconv.atoi(&len_line) or >>
+    if length <= 0 || length > 1048576 {
+        >> errors.new("invalid XACP/1 frame length")
+    }
+    body := r.read_bytes(length) or >>
+    << body
+}
+
+fn write_frame(fd int, body string) int {
+    header := "XACP/1\n" + str(body.len) + "\n"
+    full := header + body
+    $offset := 0
+    while offset < full.len {
+        $chunk_end := offset + 1024
+        if chunk_end > full.len { chunk_end = full.len }
+        n := os.socket_write(fd, full[offset:chunk_end]) or >>
+        if n <= 0 { >> errors.new("xacp: socket write error") }
+        offset += n
+    }
+    << 0
+}
+
+fn run_peer_session(peer int, jobs chan GameJob) int {
+    $reader := new_frame_reader(peer)
+    expected_token := os.getenv("XU_XACP_TOKEN")
+    $perms := 31
+    $perm_label := "development"
+
+    while true {
+        body := reader.read_frame() or (err) {
+            << 0
+        }
+        doc := xun.parse(&body)
+        if !doc.ok() {
+            err_frame := "id: !i 0\nok: !b false\nerror:\n  code: frame_error\n  msg: \"invalid XUN body\"\n"
+            write_frame(peer, err_frame) or (err) { << 0 }
+            ->
+        }
+        root := doc.root()
+        req_id := doc.as_int(doc.get(root, "id"))
+        req_op := doc.text(doc.get(root, "op"))
+        req_args := doc.get(root, "args")
+
+        if req_op == "xacp.hello" {
+            nonce := doc.text(doc.get(req_args, "nonce"))
+            token_node := doc.get(req_args, "token")
+            $client_token := ""
+            if token_node >= 0 { client_token = doc.text(token_node) }
+
+            if expected_token.len > 0 {
+                if client_token != expected_token {
+                    err_frame := "id: !i " + str(req_id) + "\nok: !b false\nerror:\n  code: auth_failed\n  msg: \"invalid token\"\n"
+                    write_frame(peer, err_frame) or (err) { << 0 }
+                    << 0
+                }
+                perms = 31
+                perm_label = "development"
+            }
+
+            hello_res := "id: !i " + str(req_id) + "\n" +
+                "ok: !b true\n" +
+                "data:\n" +
+                "  ver: !ver 1.0.0\n" +
+                "  nonce: \"" + nonce + "\"\n" +
+                "  permissions: !i " + str(perms) + "\n" +
+                "  permission_label: \"" + perm_label + "\"\n" +
+                "  target: \"game\"\n" +
+                "  engine: \"github.com/xulang-org/game\"\n"
+            write_frame(peer, hello_res) or (err) { << 0 }
+            ->
+        }
+
+        if req_op == "proc.status" {
+            status_res := "id: !i " + str(req_id) + "\n" +
+                "ok: !b true\n" +
+                "data:\n" +
+                "  pid: !i " + str(os.getpid()) + "\n" +
+                "  state: \"OPEN\"\n"
+            write_frame(peer, status_res) or (err) { << 0 }
+            ->
+        }
+
+        reply_chan := chan GameReply{cap: 1}
+        jobs <- GameJob{
+            id: req_id,
+            op: req_op + "",
+            body: body + "",
+            permissions: perms,
+            reply: reply_chan
+        }
+
+        reply := <-reply_chan
+        if reply.ok {
+            res := "id: !i " + str(req_id) + "\n" +
+                "ok: !b true\n" +
+                "data:\n" +
+                reply.data
+            write_frame(peer, res) or (err) { << 0 }
+        } else {
+            res := "id: !i " + str(req_id) + "\n" +
+                "ok: !b false\n" +
+                "error:\n" +
+                "  code: " + reply.err_code + "\n" +
+                "  msg: \"" + reply.err_msg + "\"\n"
+            write_frame(peer, res) or (err) { << 0 }
+        }
+    }
+    << 0
+}
+
+fn tcp_server_worker(port int, jobs chan GameJob, done chan int) int {
+    listener := os.socket(2, 1, 0) or (err) {
+        done <- 1
+        << 1
+    }
+    os.bind4(listener, 127, 0, 0, 1, port) or (err) {
+        os.socket_close(listener) or (ce) { << 1 }
+        done <- 1
+        << 1
+    }
+    os.listen(listener, 8) or (err) {
+        os.socket_close(listener) or (ce) { << 1 }
+        done <- 1
+        << 1
+    }
+
+    while true {
+        peer := os.accept(listener) or (err) {
+            os.socket_close(listener) or (ce) { << 1 }
+            done <- 1
+            << 1
+        }
+        _ := run_peer_session(peer, jobs)
+        os.socket_close(peer) or (ce) { << 1 }
+    }
+    << 0
+}
+
+pub fn attach_tcp(port int) GameControl {
+    jobs := chan GameJob{cap: 1}
+    done := chan int{cap: 1}
+    dummy_reply := chan GameReply{cap: 1}
+    dummy_job := GameJob{id: 0, op: "", body: "", permissions: 0, reply: dummy_reply}
+    xu tcp_server_worker(port, jobs, done)
+    << GameControl{
+        jobs: jobs,
+        done: done,
+        active: true,
+        paused: false,
+        steps_remaining: 0,
+        port: port,
+        has_screenshot_job: false,
+        screenshot_job: dummy_job
+    }
+}
+
+pub fn (ctrl $&GameControl) poll(tree $&game.SceneTree, input $&game.InputMap) bool {
+    if !ctrl.active { << false }
+    select {
+        job := <-ctrl.jobs {
+            reply := ctrl.dispatch_job(&job, tree, input)
+            if reply.err_code == "deferred" {
+                << true
+            }
+            job.reply <- reply
+            << true
+        }
+        else {}
+    }
+    << false
+}

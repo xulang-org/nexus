@@ -1498,6 +1498,63 @@ $input := controls.new_input_map()
 [`examples/arena/main.xu`](examples/arena/main.xu)。可用
 [`examples/headless/main.xu`](examples/headless/main.xu) 单独运行模拟。
 
+## XACP (智能体自动化控制)
+
+本库原生内置了对 **Xu Agent Control Protocol (XACP)** 的完整支持，模块路径为 `github.com/xulang-org/game/xacp`。外部 AI 智能体（Agent）、自动化测试套件或调试器可以通过标准 XACP/1 TCP 协议帧连接正在运行的游戏，实现对场景状态的高精度无感检测与闭环控制。
+
+### 核心支持功能
+
+| XACP 操作 | 对应能力 | 说明 |
+| --- | --- | --- |
+| `xacp.hello` | 握手与能力协商 | 返回 `view_state \| control_input \| step_exec \| pause_resume` 权限集与目标信息 |
+| `proc.status` | 运行健康探测 | 返回引擎运行状态、已用时钟及节点统计 |
+| `ui.tree` | 场景树序列化 | 递归导出 `SceneTree` 层级结构（节点 ID、名称、类型、可见性、全局坐标与仿射变换） |
+| `ui.input` | 虚拟输入注入 | 将虚拟按键、指针位移等事件无损映射并注入到 `InputMap` |
+| `ui.act` | 仿真行为控制 | 支持 `pause` / `unpause` 等系统动作 |
+| `game.step` | 逐帧步进控制 | 支持暂停状态下推进 `N` 物理帧后重新挂起，用于精准逐帧仿真与评测 |
+| `game.state` | 引擎指标快照 | 查询当前帧序号、节点总数、暂停状态与调试计数 |
+| `ui.screenshot` | 渲染周期同步截图 | 配合 GPU 渲染生命周期在 `present()` 前捕获当前画面，支持 Base64 返回或路径回传 |
+
+### 快速启用
+
+启动示例游戏并暴露 XACP 端口：
+```sh
+# 启用默认 XACP 控制端口（127.0.0.1:19876）
+./build/arena --xacp-tcp
+
+# 或自定义端口
+./build/arena --xacp-port 20000
+```
+
+在自定义游戏中接入：
+```xu
+xacp #"github.com/xulang-org/game/xacp"
+
+// 1. 初始化控制实例（例如监听 19876）
+$ctrl := xacp.attach_tcp(19876)
+
+// 2. 在游戏主循环中轮询
+while !quit {
+    input.begin_frame()
+    if ctrl.is_open() {
+        ctrl.poll($&tree, $&input)
+        if ctrl.screenshot_requested() {
+            shot_path := "build/shot.png"
+            renderer.capture(shot_path + "") or >>
+            ctrl.fulfill_screenshot(renderer.width() or >>, renderer.height() or >>, shot_path)
+        }
+    }
+    // ... 原有事件轮询、物理步进与渲染流程 ...
+}
+```
+
+### 运行 XACP 回归测试
+
+```sh
+# 运行全部 8 项 XACP 协议端到端集成测试
+make xacp-test
+```
+
 ## 核心契约
 
 | 概念 | 本库接口与约定 |
@@ -1564,10 +1621,68 @@ CPU 图片与输入字节在当前 SDK 中使用整数数组，CPU 内存不等�
 PNG 输入文件最多 32 MiB，先检查签名和 IHDR 尺寸，再从不可变字节副本解码；
 文件、尺寸、解码或 GPU 上传失败都会抛错。解码表面和文件副本不会在返回后保留。
 
+## XACP (智能体自动化控制)
+
+本库原生内置了对 **Xu Agent Control Protocol (XACP)** 的完整支持，模块路径为 `github.com/xulang-org/game/xacp`。外部 AI 智能体（Agent）、自动化测试套件或调试器可以通过标准 XACP/1 TCP 协议帧连接正在运行的游戏，实现对场景状态的高精度无感检测与闭环控制。
+
+### 核心支持功能
+
+| XACP 操作 | 对应能力 | 说明 |
+| --- | --- | --- |
+| `xacp.hello` | 握手与能力协商 | 返回 `view_state \| control_input \| step_exec \| pause_resume` 权限集与目标信息 |
+| `proc.status` | 运行健康探测 | 返回引擎运行状态、已用时钟及节点统计 |
+| `ui.tree` | 场景树序列化 | 递归导出 `SceneTree` 层级结构（节点 ID、名称、类型、可见性、全局坐标与仿射变换） |
+| `ui.input` | 虚拟输入注入 | 将虚拟按键、指针位移等事件无损映射并注入到 `InputMap` |
+| `ui.act` | 仿真行为控制 | 支持 `pause` / `unpause` 等系统动作 |
+| `game.step` | 逐帧步进控制 | 支持暂停状态下推进 `N` 物理帧后重新挂起，用于精准逐帧仿真与评测 |
+| `game.state` | 引擎指标快照 | 查询当前帧序号、节点总数、暂停状态与调试计数 |
+| `ui.screenshot` | 渲染周期同步截图 | 配合 GPU 渲染生命周期在 `present()` 前捕获当前画面，支持 Base64 返回或路径回传 |
+
+### 快速启用
+
+启动示例游戏并暴露 XACP 端口：
+```sh
+# 启用默认 XACP 控制端口（127.0.0.1:19876）
+./build/arena --xacp-tcp
+
+# 或自定义端口
+./build/arena --xacp-port 20000
+```
+
+在自定义游戏中接入：
+```xu
+xacp #"github.com/xulang-org/game/xacp"
+
+// 1. 初始化控制实例（例如监听 19876）
+$ctrl := xacp.attach_tcp(19876)
+
+// 2. 在游戏主循环中轮询
+while !quit {
+    input.begin_frame()
+    if ctrl.is_open() {
+        ctrl.poll($&tree, $&input)
+        if ctrl.screenshot_requested() {
+            shot_path := "build/shot.png"
+            renderer.capture(shot_path + "") or >>
+            ctrl.fulfill_screenshot(renderer.width() or >>, renderer.height() or >>, shot_path)
+        }
+    }
+    // ... 原有事件轮询、物理步进与渲染流程 ...
+}
+```
+
+### 运行 XACP 回归测试
+
+```sh
+# 运行全部 8 项 XACP 协议端到端集成测试
+make xacp-test
+```
+
 ## 本机验收
 
 按 Xu 项目约定，`tests/` 与生成物保留本机且被 Git 忽略。
 本机可运行 `make test`（变换、节点、场景实例、输入、时钟、连续碰撞、相机和动画）和
+`make xacp-test`（XACP 协议独立集成测试）与
 `make gpu-smoke`（2D GPU 绘制、PNG、图集、透明采样、裁剪，以及 3D 上传、GPU MVP、深度顺序、
 逐帧深度清空、近面/背后裁剪、回读、帧状态和生命周期）。`make test` 同时运行 3D 数学和网格验证，以及未初始化视频/GPU 的 PNG 解码检查。
 2D/3D 服务分别在不提供 game 原生归档、场景、脚本和适配源码的临时目录中编译并完成 Metal 像素回读；

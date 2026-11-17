@@ -23,6 +23,7 @@ timing #"github.com/xulang-org/game/timing"
 controls #"github.com/xulang-org/game/input"
 fm #"github.com/xulang-org/game/foundation/math"
 game #"github.com/xulang-org/game/scene"
+xacp #"github.com/xulang-org/game/xacp"
 #os
 #strconv
 #errors
@@ -36,19 +37,26 @@ struct Options {
     width int
     height int
     texture string
+    xacp_port int
 }
 fn options() Options {
     args := os.args()
     $out := Options{frames: 0, backend: gpu.AUTO, capture: "", shaders: "build/canvas-shaders", autoplay: false, width: 960, height: 640,
-        texture: "examples/arena/assets/player.png"}
+        texture: "examples/arena/assets/player.png", xacp_port: 0}
     $i := 1
     while i < args.len {
         if args[i] == "--autoplay" { out.autoplay = true
             i = i + 1
             -> }
+        if args[i] == "--xacp-tcp" {
+            out.xacp_port = 19876
+            i = i + 1
+            -> }
         if i + 1 >= args.len { >> errors.new("missing option value") }
         value_index := i + 1
-        if args[i] == "--frames" {
+        if args[i] == "--xacp-port" {
+            out.xacp_port = strconv.atoi(&args[value_index]) or >>
+        } else if args[i] == "--frames" {
             out.frames = strconv.atoi(&args[value_index]) or >>
             if out.frames < 1 || out.frames > 1000000 { >> errors.new("frames must be in 1...1000000") }
         } else if args[i] == "--shaders" { out.shaders = args[value_index] + ""
@@ -148,10 +156,26 @@ fn run() int {
     $animation_time := 0.0
     $quit := false
     $last_time := now_ns()
+<<<<<<< HEAD
     $batch := ren_data.new_batch()
     $sprite_batch := ren_data.new_batch()
+
+    $ctrl := xacp.GameControl{jobs: chan xacp.GameJob{cap: 1}, done: chan int{cap: 1}, active: false, paused: false, steps_remaining: 0, port: 0, has_screenshot_job: false, screenshot_job: xacp.GameJob{id: 0, op: "", body: "", permissions: 0, reply: chan xacp.GameReply{cap: 1}}}
+    if config.xacp_port > 0 {
+        ctrl = xacp.attach_tcp(config.xacp_port)
+        println("XACP control listening on 127.0.0.1:" + str(config.xacp_port))
+    }
+
     while !quit && (config.frames == 0 || frame_number < config.frames) {
         input.begin_frame()
+        if ctrl.is_open() {
+            ctrl.poll($&tree, $&input)
+            if ctrl.screenshot_requested() {
+                shot_path := "build/arena_xacp.png"
+                renderer.capture(shot_path + "") or >>
+                ctrl.fulfill_screenshot(renderer.width() or >>, renderer.height() or >>, shot_path)
+            }
+        }
         window.pump() or >>
         for event_index in 0:256 {
             event := renderer.poll() or >>

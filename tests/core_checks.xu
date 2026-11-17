@@ -1,0 +1,203 @@
+@main
+
+game #"github.com/xulang-org/game"
+#math
+
+fn test_math2d() int {
+    v1 := game.vec2(3.0, 4.0)
+    assert(v1.length() == 5.0)
+
+    v2 := game.vec2(1.0, 2.0)
+    v_add := v1.add(v2)
+    assert(v_add.x == 4.0 && v_add.y == 6.0)
+
+    v_sub := v1.sub(v2)
+    assert(v_sub.x == 2.0 && v_sub.y == 2.0)
+
+    v_norm := v1.normalized()
+    assert(math.abs(v_norm.length() - 1.0) < 0.00001)
+
+    r1 := game.rect2(0.0, 0.0, 10.0, 10.0)
+    assert(r1.contains(game.vec2(5.0, 5.0)))
+    assert(!r1.contains(game.vec2(15.0, 5.0)))
+
+    r2 := game.rect2(5.0, 5.0, 10.0, 10.0)
+    assert(r1.overlaps(r2))
+
+    r3 := game.rect2(20.0, 20.0, 10.0, 10.0)
+    assert(!r1.overlaps(r3))
+
+    t_ident := game.identity()
+    p := t_ident.point(game.vec2(10.0, 20.0))
+    assert(p.x == 10.0 && p.y == 20.0)
+
+    t_trans := game.transform_2d(game.vec2(100.0, 200.0), 0.0, game.vec2(1.0, 1.0))
+    p_trans := t_trans.point(game.vec2(5.0, 10.0))
+    assert(math.abs(p_trans.x - 105.0) < 0.00001 && math.abs(p_trans.y - 210.0) < 0.00001)
+
+    t_inv := t_trans.inverse() or >>
+    p_orig := t_inv.point(p_trans)
+    assert(math.abs(p_orig.x - 5.0) < 0.00001 && math.abs(p_orig.y - 10.0) < 0.00001)
+
+    println("  [OK] math2d: vectors, rects, transforms, inverse")
+    << 0
+}
+
+fn test_scene_tree() int {
+    $tree := game.new_scene_tree("RootWorld", 64) or >>
+    root := tree.root()
+    assert(tree.is_alive(root))
+
+    child1 := tree.add_child(root, "Player") or >>
+    assert(tree.is_alive(child1))
+    tree.set_position(child1, game.vec2(50.0, 50.0)) or >>
+
+    child2 := tree.add_child(child1, "Weapon") or >>
+    tree.set_position(child2, game.vec2(10.0, 0.0)) or >>
+
+    // Check find_child
+    found_child := tree.find_child(root, "Player") or >>
+    assert(found_child == child1)
+
+    // Check find_node with relative paths
+    found_w := tree.find_node(root, "Player/Weapon") or >>
+    assert(found_w == child2)
+
+    found_up := tree.find_node(child2, "..") or >>
+    assert(found_up == child1)
+
+    // Check global transform propagation
+    gt := tree.global_transform(child2) or >>
+    assert(gt.tx == 60.0 && gt.ty == 50.0)
+
+    // Check ready notifications
+    ready := tree.take_ready() or >>
+    assert(ready.len == 3)
+    // Child before parent, root last in postorder
+    assert(ready[0] == child2 && ready[1] == child1 && ready[2] == root)
+
+    // Check process order
+    po := tree.process_order() or >>
+    assert(po.len == 3) // root, player, weapon
+
+    // Check queue_free and flush_free
+    tree.queue_free(child1) or >>
+    freed := tree.flush_free() or >>
+    assert(freed.len == 2) // child2, child1
+    assert(!tree.is_alive(child1))
+    assert(!tree.is_alive(child2))
+
+    println("  [OK] scene_tree: hierarchy, paths, transforms, lifecycle, free")
+    << 0
+}
+
+fn test_packed_scene() int {
+    $src_tree := game.new_scene_tree("Source", 32) or >>
+    root := src_tree.root()
+    body := src_tree.add_child(root, "Body") or >>
+    src_tree.set_position(body, game.vec2(12.0, 34.0)) or >>
+    head := src_tree.add_child(body, "Head") or >>
+    src_tree.set_position(head, game.vec2(0.0, -10.0)) or >>
+
+    packed := game.pack_scene(&src_tree, body) or >>
+    assert(packed.node_count() == 2)
+
+    $dst_tree := game.new_scene_tree("Destination", 32) or >>
+    dst_root := dst_tree.root()
+    inst := packed.instantiate($&dst_tree, dst_root, "Instance1") or >>
+    assert(dst_tree.is_alive(inst))
+
+    inst_head := dst_tree.find_node(inst, "Head") or >>
+    assert(dst_tree.is_alive(inst_head))
+
+    gt := dst_tree.global_transform(inst_head) or >>
+    assert(gt.tx == 12.0 && gt.ty == 24.0)
+
+    println("  [OK] packed_scene: packing, instantiation, transform preservation")
+    << 0
+}
+
+fn test_input_map() int {
+    $input := game.new_input_map()
+    input.bind("move_left", 4) or >>  // KEY_A = 4
+    input.bind("move_right", 7) or >> // KEY_D = 7
+
+    input.begin_frame()
+    assert(!input.pressed("move_left"))
+    assert(!input.just_pressed("move_left"))
+
+    input.feed_key(4, true) or >>
+    assert(input.pressed("move_left"))
+    assert(input.just_pressed("move_left"))
+
+    // Second frame: still held
+    input.begin_frame()
+    assert(input.pressed("move_left"))
+    assert(!input.just_pressed("move_left"))
+
+    // Release
+    input.feed_key(4, false) or >>
+    assert(!input.pressed("move_left"))
+    assert(input.just_released("move_left"))
+
+    // Axis
+    input.begin_frame()
+    input.feed_key(7, true) or >> // move_right
+    ax := input.axis("move_left", "move_right")
+    assert(ax == 1.0)
+
+    println("  [OK] input: bindings, edge states, frame transitions, axis")
+    << 0
+}
+
+fn test_clock() int {
+    $clock := game.new_clock(60, 8) or >>
+    step1 := clock.advance(1.0 / 60.0) or >>
+    assert(step1.steps == 1)
+    assert(math.abs(step1.fixed_delta - (1.0 / 60.0)) < 0.0001)
+
+    // Accumulating 2 frames
+    step2 := clock.advance(2.0 / 60.0) or >>
+    assert(step2.steps == 2)
+
+    println("  [OK] clock: fixed rate stepping, accumulation")
+    << 0
+}
+
+fn test_physics2d() int {
+    body := game.rect2(10.0, 10.0, 20.0, 20.0)
+    solid := game.rect2(50.0, 10.0, 20.0, 20.0)
+
+    // Moving towards solid
+    hit := game.sweep_rect(body, game.vec2(60.0, 0.0), solid)
+    assert(hit.hit)
+    assert(hit.time >= 0.33 && hit.time <= 0.34)
+    assert(hit.normal.x == -1.0 && hit.normal.y == 0.0)
+
+    // Move and slide
+    solids := [solid]
+    result := game.move_and_slide(body, game.vec2(60.0, 0.0), &solids) or >>
+    assert(math.abs(result.position.x - 30.0) < 0.001 && math.abs(result.position.y - 10.0) < 0.001)
+
+    println("  [OK] physics2d: sweep collision, hit normal, sliding movement")
+    << 0
+}
+
+fn run_all() int {
+    println("=== Xu Game Core Test Suite ===")
+    test_math2d() or >>
+    test_scene_tree() or >>
+    test_packed_scene() or >>
+    test_input_map() or >>
+    test_clock() or >>
+    test_physics2d() or >>
+    println("=== ALL CORE TESTS PASSED! ===")
+    << 0
+}
+
+fn main() int {
+    << run_all() or (err) {
+        eprintln("TEST FAILED: " + err.msg())
+        << 1
+    }
+}

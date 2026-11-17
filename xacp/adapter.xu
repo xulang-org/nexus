@@ -1,0 +1,301 @@
+@"github.com/xulang-org/game/xacp"
+
+game #"github.com/xulang-org/game"
+#encoding/xun
+#encoding/base64
+#os
+#strconv
+#strings
+#errors
+
+pub const KEY_A = 4
+pub const KEY_D = 7
+pub const KEY_S = 22
+pub const KEY_W = 26
+pub const KEY_ESCAPE = 41
+pub const KEY_SPACE = 44
+pub const KEY_RIGHT = 79
+pub const KEY_LEFT = 80
+pub const KEY_DOWN = 81
+pub const KEY_UP = 82
+
+fn serialize_float(v f64) string {
+    text := strconv.format_float(v, 103, -1) or (err) { << "0.0" }
+    << text
+}
+
+fn map_key_code(key_node int, scan_node int, d &xun.Doc) int {
+    if scan_node >= 0 {
+        code := d.as_int(scan_node)
+        if code > 0 { << code }
+    }
+    if key_node >= 0 {
+        k := d.as_int(key_node)
+        if k == 119 || k == 87 { << KEY_W } // 'w' or 'W'
+        if k == 97 || k == 65 { << KEY_A }   // 'a' or 'A'
+        if k == 115 || k == 83 { << KEY_S } // 's' or 'S'
+        if k == 100 || k == 68 { << KEY_D } // 'd' or 'D'
+        if k == 32 { << KEY_SPACE }         // Space
+        if k == 27 { << KEY_ESCAPE }        // Esc
+        if k >= 0 && k < 512 { << k }
+    }
+    << 0
+}
+
+pub fn (ctrl $&GameControl) dispatch_job(job &GameJob, tree $&game.SceneTree, input $&game.InputMap) GameReply {
+    doc := xun.parse(&job.body)
+    if !doc.ok() {
+        << GameReply{ok: false, err_code: "frame_error", err_msg: "failed to parse XUN body", data: ""}
+    }
+    root := doc.root()
+    args := doc.get(root, "args")
+
+    if job.op == "ui.tree" {
+        $tree_data := ctrl.handle_tree(&*tree, &doc, args) or (err) {
+            << GameReply{ok: false, err_code: "adapter_error", err_msg: err.msg(), data: ""}
+        }
+        << GameReply{ok: true, err_code: "", err_msg: "", data: tree_data}
+    }
+
+    if job.op == "ui.screenshot" {
+        // Screenshot needs rendering sync, so we defer it to fulfill_screenshot
+        ctrl.has_screenshot_job = true
+        ctrl.screenshot_job = GameJob{
+            id: job.id,
+            op: job.op + "",
+            body: job.body + "",
+            permissions: job.permissions,
+            reply: job.reply
+        }
+        // Return dummy reply indicating queued
+        << GameReply{ok: true, err_code: "deferred", err_msg: "", data: ""}
+    }
+
+    if job.op == "ui.input" {
+        ctrl.handle_input(input, &doc, args) or (err) {
+            << GameReply{ok: false, err_code: "adapter_error", err_msg: err.msg(), data: ""}
+        }
+        << GameReply{ok: true, err_code: "", err_msg: "", data: "  actions: []\n"}
+    }
+
+    if job.op == "ui.act" {
+        ctrl.handle_act(tree, &doc, args) or (err) {
+            << GameReply{ok: false, err_code: "adapter_error", err_msg: err.msg(), data: ""}
+        }
+        << GameReply{ok: true, err_code: "", err_msg: "", data: "  actions: []\n"}
+    }
+
+    if job.op == "game.step" {
+        $frames := 1
+        fn_node := doc.get(args, "frames")
+        if fn_node >= 0 {
+            frames = doc.as_int(fn_node)
+            if frames <= 0 { frames = 1 }
+        }
+        ctrl.steps_remaining = frames
+        $paused_str := "false"
+        if tree.paused { paused_str = "true" }
+        res := "  frames: !i " + str(frames) + "\n  paused: !b " + paused_str + "\n"
+        << GameReply{ok: true, err_code: "", err_msg: "", data: res}
+    }
+
+    if job.op == "game.state" {
+        $paused_str := "false"
+        if tree.paused { paused_str = "true" }
+        all_nodes := tree.subtree(tree.root()) or (err) {
+            << GameReply{ok: false, err_code: "adapter_error", err_msg: err.msg(), data: ""}
+        }
+        res := "  paused: !b " + paused_str + "\n" +
+            "  node_count: !i " + str(all_nodes.len) + "\n" +
+            "  root_id: !i " + str(tree.root()) + "\n" +
+            "  steps_remaining: !i " + str(ctrl.steps_remaining) + "\n" +
+            "  canvas_width: !i 960\n" +
+            "  canvas_height: !i 640\n"
+        << GameReply{ok: true, err_code: "", err_msg: "", data: res}
+    }
+
+    << GameReply{ok: false, err_code: "not_implemented", err_msg: "unsupported game operation: " + job.op, data: ""}
+}
+
+fn (ctrl &GameControl) handle_tree(tree &game.SceneTree, doc &xun.Doc, args int) string {
+    $start := 0
+    start_node := doc.get(args, "start")
+    if start_node >= 0 {
+        start = doc.as_int(start_node)
+        if start < 0 { start = 0 }
+    }
+
+    $max_rows := 512
+    max_node := doc.get(args, "max_table_rows")
+    if max_node >= 0 {
+        max_rows = doc.as_int(max_node)
+        if max_rows <= 0 || max_rows > 1024 { max_rows = 512 }
+    }
+
+    node_ids := tree.subtree(tree.root()) or >>
+    total := node_ids.len
+
+    $count := total - start
+    if count < 0 { count = 0 }
+    if count > max_rows { count = max_rows }
+
+    next_start := start + count
+    $truncated := "false"
+    if next_start < total { truncated = "true" }
+
+    $out := strings.builder()
+    out.write_string(&"  redacted: !b false\n")
+    out.write_string(&"  win: !i 1\n  generation: !i 1\n")
+    out.write_string(&"  start: !i ")
+    out.write_string(&str(start))
+    out.write_string(&"\n  count: !i ")
+    out.write_string(&str(count))
+    out.write_string(&"\n  total: !i ")
+    out.write_string(&str(total))
+    out.write_string(&"\n  truncated: !b ")
+    out.write_string(&truncated)
+    out.write_string(&"\n  next_start: !i ")
+    out.write_string(&str(next_start))
+    out.write_string(&"\n")
+
+    if count == 0 {
+        out.write_string(&"  nodes: []\n")
+    } else {
+        out.write_string(&"  nodes:\n")
+        w_px := 960.0
+        h_px := 640.0
+
+        for i in start:start + count {
+            nid := node_ids[i]
+            nd := tree.node(nid) or >>
+            tf := tree.global_transform(nid) or >>
+            is_vis := tree.is_visible(nid)
+            $vis_str := "false"
+            if is_vis { vis_str = "true" }
+            can_proc := tree.can_process(nid)
+            $proc_str := "false"
+            if can_proc { proc_str = "true" }
+
+            $nw := 32.0
+            $nh := 32.0
+            if nid == tree.root() {
+                nw = w_px
+                nh = h_px
+            }
+
+            out.write_string(&"    - id: !i ")
+            out.write_string(&str(nid))
+            out.write_string(&"\n      kind: !i 1\n      parent: !i ")
+            out.write_string(&str(nd.parent))
+            out.write_string(&"\n      x: !f ")
+            out.write_string(&serialize_float(tf.tx))
+            out.write_string(&"\n      y: !f ")
+            out.write_string(&serialize_float(tf.ty))
+            out.write_string(&"\n      width: !f ")
+            out.write_string(&serialize_float(nw))
+            out.write_string(&"\n      height: !f ")
+            out.write_string(&serialize_float(nh))
+            out.write_string(&"\n      visible: !b ")
+            out.write_string(&vis_str)
+            out.write_string(&"\n      enabled: !b ")
+            out.write_string(&proc_str)
+            out.write_string(&"\n      focusable: !b false\n      focused: !b false\n      text: \"")
+            out.write_string(&nd.name)
+            out.write_string(&"\"\n")
+        }
+    }
+    << out.text()
+}
+
+pub fn (ctrl $&GameControl) fulfill_screenshot(w int, h int, path string) int {
+    if !ctrl.has_screenshot_job { << 0 }
+    ctrl.has_screenshot_job = false
+
+    doc := xun.parse(&ctrl.screenshot_job.body)
+    $mode := "inline_b64"
+    if doc.ok() {
+        args := doc.get(doc.root(), "args")
+        mode_node := doc.get(args, "mode")
+        if mode_node >= 0 {
+            m := doc.text(mode_node)
+            if m == "file" { mode = "file" }
+        }
+    }
+
+    if mode == "file" {
+        content := os.read(path + "") or (err) {
+            ctrl.screenshot_job.reply <- GameReply{ok: false, err_code: "file_unavailable", err_msg: err.msg(), data: ""}
+            << 0
+        }
+        res := "  redacted: !b false\n" +
+            "  width: !f " + serialize_float(f64(w)) + "\n" +
+            "  height: !f " + serialize_float(f64(h)) + "\n" +
+            "  pixel_width: !i " + str(w) + "\n" +
+            "  pixel_height: !i " + str(h) + "\n" +
+            "  mime: \"image/png\"\n" +
+            "  bytes: !i " + str(content.len) + "\n" +
+            "  mode: \"file\"\n" +
+            "  path: \"" + path + "\"\n" +
+            "  dir_hint: \"build\"\n"
+        ctrl.screenshot_job.reply <- GameReply{ok: true, err_code: "", err_msg: "", data: res}
+        << 0
+    }
+
+    content := os.read(path) or (err) {
+        ctrl.screenshot_job.reply <- GameReply{ok: false, err_code: "file_unavailable", err_msg: err.msg(), data: ""}
+        << 0
+    }
+    content_len := content.len
+    b64 := base64.encode_to_string(content)
+    res := "  redacted: !b false\n" +
+        "  width: !f " + serialize_float(f64(w)) + "\n" +
+        "  height: !f " + serialize_float(f64(h)) + "\n" +
+        "  pixel_width: !i " + str(w) + "\n" +
+        "  pixel_height: !i " + str(h) + "\n" +
+        "  mime: \"image/png\"\n" +
+        "  bytes: !i " + str(content_len) + "\n" +
+        "  mode: \"inline_b64\"\n" +
+        "  data: \"" + b64 + "\"\n"
+    ctrl.screenshot_job.reply <- GameReply{ok: true, err_code: "", err_msg: "", data: res}
+    << 0
+}
+
+pub fn (ctrl $&GameControl) reject_screenshot(reason string) int {
+    if !ctrl.has_screenshot_job { << 0 }
+    ctrl.has_screenshot_job = false
+    ctrl.screenshot_job.reply <- GameReply{ok: false, err_code: "adapter_error", err_msg: reason, data: ""}
+    << 0
+}
+
+fn (ctrl &GameControl) handle_input(input $&game.InputMap, doc &xun.Doc, args int) int {
+    steps := doc.get(args, "steps")
+    if steps < 0 { << 0 }
+    step_count := doc.count(steps)
+    for i in 0:step_count {
+        step := doc.at(steps, i)
+        ev_node := doc.get(step, "ev")
+        if ev_node < 0 { -> }
+        ev := doc.text(ev_node)
+        key_node := doc.get(step, "key")
+        scan_node := doc.get(step, "scan")
+        code := map_key_code(key_node, scan_node, &*doc)
+        if code > 0 {
+            if ev == "key_down" {
+                input.feed_key(code, true) or >>
+            } else if ev == "key_up" {
+                input.feed_key(code, false) or >>
+            }
+        }
+    }
+    << 0
+}
+
+fn (ctrl &GameControl) handle_act(tree $&game.SceneTree, doc &xun.Doc, args int) int {
+    act_node := doc.get(args, "act")
+    if act_node < 0 { << 0 }
+    act := doc.text(act_node)
+    if act == "pause" {
+        tree.paused = !tree.paused
+    }
+    << 0
+}

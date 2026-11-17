@@ -2,7 +2,12 @@ XU ?= xu
 PYTHON ?= python3
 export XU
 
-.PHONY: lighting-demo-test demo-lighting lighting-core-test lighting-gpu-test gpu-failure-test present-fallback-test text-2d-test ui-hud-test demo-ui-hud mesh-shaders canvas-shaders native-image window-input-smoke gpu-surface-smoke sdk gpu-compute-smoke native-probe gpu-offscreen-smoke gpu-transfer-smoke check-core test-core mesh-core-test audio-core-test audio-device-test native native-audio audio-fixtures audio-test audio-smoke demo-audio demo-audio-stream demo-audio-seek check layers test demo demo2d demo3d demo-glb demo-script demo-materials demo-textures3d demo-mipmaps3d demo-material-maps demo-normal-maps demo-generated-tangents demo-glb-materials smoke gpu-smoke gpu3d-smoke image-fixtures glb-fixtures script-tool script-fixtures script-live-smoke glb-material-fixtures scene-fixtures demo-scene-file scene-asset-fixtures demo-scene-assets scene-audio-fixtures demo-scene-audio demo-scene-av scene-script-assets scene-script-fixtures demo-scene-scripts
+.PHONY: xacp-test lighting-demo-test demo-lighting lighting-core-test lighting-gpu-test gpu-failure-test present-fallback-test text-2d-test ui-hud-test demo-ui-hud mesh-shaders canvas-shaders native-image window-input-smoke gpu-surface-smoke sdk gpu-compute-smoke native-probe gpu-offscreen-smoke gpu-transfer-smoke check-core test-core mesh-core-test audio-core-test audio-device-test native native-audio audio-fixtures audio-test audio-smoke demo-audio demo-audio-stream demo-audio-seek check layers test demo demo2d demo3d demo-glb demo-script demo-materials demo-textures3d demo-mipmaps3d demo-material-maps demo-normal-maps demo-generated-tangents demo-glb-materials smoke gpu-smoke gpu3d-smoke image-fixtures glb-fixtures script-tool script-fixtures script-live-smoke glb-material-fixtures scene-fixtures demo-scene-file scene-asset-fixtures demo-scene-assets scene-audio-fixtures demo-scene-audio demo-scene-av scene-script-assets scene-script-fixtures demo-scene-scripts
+xacp-test: sdk
+	mkdir -p build
+	$(XU) build tests/xacp_checks.xu -o build/xacp-tests
+	./build/xacp-tests
+
 native: native-audio native-image
 
 native-image: sdk
@@ -117,6 +122,8 @@ test-core: shadow-core-test gltf-animation-test mesh-format-core-test lod-core-t
 	$(PYTHON) tests/script_scene_builder_checks.py
 	$(XU) build tests/core_checks.xu -o build/core-tests
 	./build/core-tests
+	$(XU) build tests/xacp_checks.xu -o build/xacp-tests
+	./build/xacp-tests
 	$(XU) build tests/glb_checks.xu -o build/glb-tests
 	./build/glb-tests
 	$(XU) build tests/glb_material_checks.xu -o build/glb-material-tests
