@@ -58,7 +58,7 @@ def audit(units: list[Unit], policy: dict) -> tuple[list[str], dict[str, set[str
         top = Path(unit.path).parts[0]
         if top in policy.get('reserved_roots', {}):
             errors.append(f'{unit.path}: reserved root: {policy["reserved_roots"][top]}')
-        directory = str(Path(unit.path).parent)
+        directory = Path(unit.path).parent.as_posix()
         local = '' if directory == '.' else directory
         application = application_rule(unit.path, policy)
         if application:

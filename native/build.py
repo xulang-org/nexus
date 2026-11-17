@@ -60,7 +60,7 @@ def main():
     parser.add_argument('--target', choices=('ios-arm64', 'android-arm64'), help='add a Phone slice while preserving host slices')
     args = parser.parse_args()
     systems = {'Darwin': 'macos', 'Linux': 'linux', 'Windows': 'windows'}
-    machines = {'arm64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'x64', 'AMD64': 'x64'}
+    machines = {'arm64': 'arm64', 'ARM64': 'arm64', 'aarch64': 'arm64', 'x86_64': 'x64', 'AMD64': 'x64'}
     try:
         target = systems[platform.system()] + '-' + machines[platform.machine()]
     except KeyError:
