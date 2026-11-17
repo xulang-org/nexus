@@ -1,0 +1,639 @@
+@"github.com/xulang-org/game/rendering/three_d"
+
+#gpu
+fm #"github.com/xulang-org/game/foundation/math"
+light_data #"github.com/xulang-org/game/resources/lighting"
+#errors
+#math
+
+struct SoftVertex3D {
+    cx f64
+    cy f64
+    cz f64
+    cw f64
+    r f64
+    g f64
+    b f64
+    a f64
+    wx f64
+    wy f64
+    wz f64
+    nx f64
+    ny f64
+    nz f64
+    u f64
+    v f64
+    tx f64
+    ty f64
+    tz f64
+    bx f64
+    by f64
+    bz f64
+}
+
+fn soft_clamp01(v f64) f64 {
+    if v < 0.0 { << 0.0 }
+    if v > 1.0 { << 1.0 }
+    << v
+}
+
+fn soft_to_u8(v f64) u8 {
+    n := int(math.round(soft_clamp01(v) * 255.0))
+    if n < 0 { << u8(0) }
+    if n > 255 { << u8(255) }
+    << u8(n)
+}
+
+fn soft_resize_and_clear(device $&Device3D, background int) int {
+    sw := device.target_width * device.render_scale
+    sh := device.target_height * device.render_scale
+    target_size(sw, sh) or >>
+    rgba := rgba_color(background) or >>
+    rb := soft_to_u8(rgba.r)
+    gb := soft_to_u8(rgba.g)
+    bb := soft_to_u8(rgba.b)
+    ab := soft_to_u8(rgba.a)
+    total := sw * sh
+    pbytes := total * 4
+    if device.soft_pixels.len != pbytes || device.soft_depth.len != total {
+        $next_p := []u8{}
+        $next_d := []f64{}
+        for i in 0:total {
+            next_p.push(rb)
+            next_p.push(gb)
+            next_p.push(bb)
+            next_p.push(ab)
+            next_d.push(0.0)
+        }
+        device.soft_pixels = next_p
+        device.soft_depth = next_d
+        << 0
+    }
+    for i in 0:total {
+        off := i * 4
+        device.soft_pixels[off] = rb
+        device.soft_pixels[off + 1] = gb
+        device.soft_pixels[off + 2] = bb
+        device.soft_pixels[off + 3] = ab
+        device.soft_depth[i] = 0.0
+    }
+    << 0
+}
+
+fn soft_resolve_pixels(src &[]u8, width int, height int, scale int) []u8 {
+    total := width * height
+    $out := []u8{}
+    if scale == 1 {
+        for i in 0:(total * 4) { out.push(src[i]) }
+        << out
+    }
+    sw := width * 2
+    for y in 0:height {
+        y0 := y * 2
+        y1 := y0 + 1
+        for x in 0:width {
+            x0 := x * 2
+            x1 := x0 + 1
+            o00 := (y0 * sw + x0) * 4
+            o10 := (y0 * sw + x1) * 4
+            o01 := (y1 * sw + x0) * 4
+            o11 := (y1 * sw + x1) * 4
+            for ch in 0:4 {
+                sum := int(src[o00 + ch]) + int(src[o10 + ch]) + int(src[o01 + ch]) + int(src[o11 + ch])
+                out.push(u8((sum + 2) / 4))
+            }
+        }
+    }
+    << out
+}
+
+fn soft_resampled(src &[]u8, src_w int, src_h int, dst_w int, dst_h int) []u8 {
+    if src_w < 1 || src_h < 1 || dst_w < 1 || dst_h < 1 { << []u8{} }
+    count := dst_w * dst_h * 4
+    $out := []u8{}
+    if src_w == dst_w && src_h == dst_h {
+        if src.len < count { >> errors.new("game 3D: software color buffer size mismatch") }
+        for i in 0:count { out.push(src[i]) }
+        << out
+    }
+    if src.len < src_w * src_h * 4 { >> errors.new("game 3D: software color buffer size mismatch") }
+    if dst_h <= 0 { << out }
+    if dst_w <= 0 { << out }
+    for dy in 0:dst_h {
+        $sy := (dy * src_h) / dst_h
+        if sy >= src_h { sy = src_h - 1 }
+        for dx in 0:dst_w {
+            $sx := (dx * src_w) / dst_w
+            if sx >= src_w { sx = src_w - 1 }
+            so := (sy * src_w + sx) * 4
+            out.push(src[so])
+            out.push(src[so + 1])
+            out.push(src[so + 2])
+            out.push(src[so + 3])
+        }
+    }
+    << out
+}
+
+fn soft_transform_vertex(data gpu.SoftBlobRef, index int, mvp &fm.Mat4, model &fm.Mat4, normals &fm.Mat4, lit bool) SoftVertex3D {
+    base := index * 64
+    px := data.read_f32(base) or >>
+    py := data.read_f32(base + 4) or >>
+    pz := data.read_f32(base + 8) or >>
+    cr := data.read_f32(base + 12) or >>
+    cg := data.read_f32(base + 16) or >>
+    cb := data.read_f32(base + 20) or >>
+    ca := data.read_f32(base + 24) or >>
+    nx := data.read_f32(base + 28) or >>
+    ny := data.read_f32(base + 32) or >>
+    nz := data.read_f32(base + 36) or >>
+    u := data.read_f32(base + 40) or >>
+    v := data.read_f32(base + 44) or >>
+    tx := data.read_f32(base + 48) or >>
+    ty := data.read_f32(base + 52) or >>
+    tz := data.read_f32(base + 56) or >>
+    tw := data.read_f32(base + 60) or >>
+    clip := mvp.transform(fm.vec4(px, py, pz, 1.0))
+    $wx := 0.0
+    $wy := 0.0
+    $wz := 0.0
+    $wnx := 0.0
+    $wny := 0.0
+    $wnz := 0.0
+    $wtx := 0.0
+    $wty := 0.0
+    $wtz := 0.0
+    $wbx := 0.0
+    $wby := 0.0
+    $wbz := 0.0
+    if lit {
+        wp := model.transform(fm.vec4(px, py, pz, 1.0))
+        wx = wp.x
+        wy = wp.y
+        wz = wp.z
+        wn := normals.transform(fm.vec4(nx, ny, nz, 0.0))
+        wnx = wn.x
+        wny = wn.y
+        wnz = wn.z
+        wt := model.transform(fm.vec4(tx, ty, tz, 0.0))
+        wtx = wt.x
+        wty = wt.y
+        wtz = wt.z
+        b_local := fm.vec3(nx, ny, nz).cross(fm.vec3(tx, ty, tz)).scaled(tw)
+        wb := model.transform(fm.vec4(b_local.x, b_local.y, b_local.z, 0.0))
+        wbx = wb.x
+        wby = wb.y
+        wbz = wb.z
+    }
+    << SoftVertex3D{cx: clip.x, cy: clip.y, cz: clip.z, cw: clip.w,
+        r: cr, g: cg, b: cb, a: ca,
+        wx: wx, wy: wy, wz: wz, nx: wnx, ny: wny, nz: wnz, u: u, v: v,
+        tx: wtx, ty: wty, tz: wtz, bx: wbx, by: wby, bz: wbz}
+}
+
+fn soft_plane_distance(v &SoftVertex3D, plane int) f64 {
+    if plane == 0 { << v.cw - v.cz }
+    if plane == 1 { << v.cz }
+    if plane == 2 { << v.cx + v.cw }
+    if plane == 3 { << v.cw - v.cx }
+    if plane == 4 { << v.cy + v.cw }
+    << v.cw - v.cy
+}
+
+fn clone_soft_vertex(a &SoftVertex3D) SoftVertex3D {
+    << SoftVertex3D{
+        cx: a.cx, cy: a.cy, cz: a.cz, cw: a.cw,
+        r: a.r, g: a.g, b: a.b, a: a.a,
+        wx: a.wx, wy: a.wy, wz: a.wz, nx: a.nx, ny: a.ny, nz: a.nz,
+        u: a.u, v: a.v, tx: a.tx, ty: a.ty, tz: a.tz, bx: a.bx, by: a.by, bz: a.bz}
+}
+
+fn soft_lerp_vertex(a &SoftVertex3D, b &SoftVertex3D, t f64) SoftVertex3D {
+    s := 1.0 - t
+    << SoftVertex3D{
+        cx: a.cx * s + b.cx * t, cy: a.cy * s + b.cy * t, cz: a.cz * s + b.cz * t, cw: a.cw * s + b.cw * t,
+        r: a.r * s + b.r * t, g: a.g * s + b.g * t, b: a.b * s + b.b * t, a: a.a * s + b.a * t,
+        wx: a.wx * s + b.wx * t, wy: a.wy * s + b.wy * t, wz: a.wz * s + b.wz * t,
+        nx: a.nx * s + b.nx * t, ny: a.ny * s + b.ny * t, nz: a.nz * s + b.nz * t,
+        u: a.u * s + b.u * t, v: a.v * s + b.v * t,
+        tx: a.tx * s + b.tx * t, ty: a.ty * s + b.ty * t, tz: a.tz * s + b.tz * t,
+        bx: a.bx * s + b.bx * t, by: a.by * s + b.by * t, bz: a.bz * s + b.bz * t}
+}
+
+fn soft_clip_plane(poly &[]SoftVertex3D, plane int) []SoftVertex3D {
+    $out := []SoftVertex3D{}
+    n := poly.len
+    if n < 3 { << out }
+    for i in 0:n {
+        $next := i + 1
+        if next == n { next = 0 }
+        va := &poly[i]
+        vb := &poly[next]
+        da := soft_plane_distance(va, plane)
+        db := soft_plane_distance(vb, plane)
+        ina := da >= 0.0
+        inb := db >= 0.0
+        if ina && inb {
+            out.push(clone_soft_vertex(vb))
+        } else if ina && !inb {
+            denom := da - db
+            $t := 0.0
+            if math.abs(denom) > 1e-18 { t = da / denom }
+            out.push(soft_lerp_vertex(va, vb, t))
+        } else if !ina && inb {
+            denom := da - db
+            $t := 0.0
+            if math.abs(denom) > 1e-18 { t = da / denom }
+            out.push(soft_lerp_vertex(va, vb, t))
+            out.push(clone_soft_vertex(vb))
+        }
+    }
+    << out
+}
+
+fn soft_srgb_to_linear(c f64) f64 {
+    if c <= 0.04045 { << c / 12.92 }
+    << math.pow_f64((c + 0.055) / 1.055, 2.4)
+}
+
+fn soft_linear_to_srgb(c f64) f64 {
+    if c <= 0.0031308 { << 12.92 * c }
+    << 1.055 * math.pow_f64(c, 1.0 / 2.4) - 0.055
+}
+
+fn soft_wrap_uv(t f64, repeat bool) f64 {
+    if repeat {
+        w := t - math.floor(t)
+        if w < 0.0 { << w + 1.0 }
+        << w
+    }
+    << soft_clamp01(t)
+}
+
+fn soft_read_texel(tex &TextureRef3D, x int, y int) fm.Vec4 {
+    if !tex.present { << fm.vec4(1.0, 1.0, 1.0, 1.0) }
+    w := tex.width
+    h := tex.height
+    if w <= 0 { << fm.vec4(1.0, 1.0, 1.0, 1.0) }
+    if h <= 0 { << fm.vec4(1.0, 1.0, 1.0, 1.0) }
+    $cx := x
+    $cy := y
+    if tex.repeat {
+        cx = cx % w
+        if cx < 0 { cx = cx + w }
+        cy = cy % h
+        if cy < 0 { cy = cy + h }
+    } else {
+        if cx < 0 { cx = 0 }
+        if cx >= w { cx = w - 1 }
+        if cy < 0 { cy = 0 }
+        if cy >= h { cy = h - 1 }
+    }
+    packed := tex.soft_pixels.read_rgba8(cy * w + cx) or >>
+    $r := f64((packed >> 24) & 255) / 255.0
+    $g := f64((packed >> 16) & 255) / 255.0
+    $b := f64((packed >> 8) & 255) / 255.0
+    a := f64(packed & 255) / 255.0
+    if tex.srgb {
+        r = soft_srgb_to_linear(r)
+        g = soft_srgb_to_linear(g)
+        b = soft_srgb_to_linear(b)
+    }
+    << fm.vec4(r, g, b, a)
+}
+
+fn soft_sample_texture(tex &TextureRef3D, u f64, v f64) fm.Vec4 {
+    if !tex.present || tex.width < 1 || tex.height < 1 { << fm.vec4(1.0, 1.0, 1.0, 1.0) }
+    wu := soft_wrap_uv(u, tex.repeat)
+    wv := soft_wrap_uv(v, tex.repeat)
+    if !tex.linear {
+        $ix := int(math.floor(wu * f64(tex.width)))
+        $iy := int(math.floor(wv * f64(tex.height)))
+        if ix >= tex.width { ix = tex.width - 1 }
+        if iy >= tex.height { iy = tex.height - 1 }
+        << soft_read_texel(tex, ix, iy) or >>
+    }
+    fx := wu * f64(tex.width) - 0.5
+    fy := wv * f64(tex.height) - 0.5
+    x0 := int(math.floor(fx))
+    y0 := int(math.floor(fy))
+    tx := fx - f64(x0)
+    ty := fy - f64(y0)
+    c00 := soft_read_texel(tex, x0, y0) or >>
+    c10 := soft_read_texel(tex, x0 + 1, y0) or >>
+    c01 := soft_read_texel(tex, x0, y0 + 1) or >>
+    c11 := soft_read_texel(tex, x0 + 1, y0 + 1) or >>
+    w00 := (1.0 - tx) * (1.0 - ty)
+    w10 := tx * (1.0 - ty)
+    w01 := (1.0 - tx) * ty
+    w11 := tx * ty
+    << fm.vec4(
+        c00.x * w00 + c10.x * w10 + c01.x * w01 + c11.x * w11,
+        c00.y * w00 + c10.y * w10 + c01.y * w01 + c11.y * w11,
+        c00.z * w00 + c10.z * w10 + c01.z * w01 + c11.z * w11,
+        c00.w * w00 + c10.w * w10 + c01.w * w01 + c11.w * w11)
+}
+
+fn soft_unit_safe(v fm.Vec3) fm.Vec3 {
+    ax := math.abs(v.x)
+    ay := math.abs(v.y)
+    az := math.abs(v.z)
+    largest := math.max(ax, math.max(ay, az))
+    if !fm.finite(largest) || largest == 0.0 { << fm.vec3(0.0, 0.0, 0.0) }
+    scaled := v.scaled(1.0 / largest)
+    d := scaled.dot(scaled)
+    if d <= 0.0 { << fm.vec3(0.0, 0.0, 0.0) }
+    << scaled.scaled(1.0 / math.sqrt(d))
+}
+
+fn soft_normal_map_dir(normal fm.Vec3, tangent fm.Vec3, bitangent fm.Vec3, texel fm.Vec3, scale f64) fm.Vec3 {
+    n := soft_unit_safe(normal)
+    if scale == 0.0 { << n }
+    t0 := soft_unit_safe(tangent)
+    t := soft_unit_safe(t0.sub(n.scaled(n.dot(t0))))
+    $b := soft_unit_safe(n.cross(t))
+    if b.dot(soft_unit_safe(bitangent)) < 0.0 { b = b.scaled(-1.0) }
+    mx := (texel.x * 2.0 - 1.0) * scale
+    my := (texel.y * 2.0 - 1.0) * scale
+    mz := texel.z * 2.0 - 1.0
+    m := soft_unit_safe(fm.vec3(mx, my, mz))
+    res := soft_unit_safe(t.scaled(m.x).add(b.scaled(m.y)).add(n.scaled(m.z)))
+    if res.dot(res) == 0.0 { << n }
+    << res
+}
+
+fn soft_material_direct(base fm.Vec3, metallic f64, roughness f64, normal fm.Vec3, position fm.Vec3, eye fm.Vec3, light fm.Vec3, radiance fm.Vec3) fm.Vec3 {
+    n := soft_unit_safe(normal)
+    v := soft_unit_safe(eye.sub(position))
+    l := soft_unit_safe(light)
+    h := soft_unit_safe(v.add(l))
+    nv := math.max(n.dot(v), 0.0001)
+    nl := math.max(n.dot(l), 0.0)
+    nh := math.max(n.dot(h), 0.0)
+    vh := soft_clamp01(v.dot(h))
+    alpha := roughness * roughness
+    a2 := alpha * alpha
+    denom := (nh * a2 - nh) * nh + 1.0
+    dist := a2 / (3.14159265359 * math.max(denom * denom, 0.000000000001))
+    vis := 0.5 / math.max(nl * math.sqrt(nv * nv * (1.0 - a2) + a2) + nv * math.sqrt(nl * nl * (1.0 - a2) + a2), 0.000001)
+    f0 := fm.vec3(0.04 + (base.x - 0.04) * metallic, 0.04 + (base.y - 0.04) * metallic, 0.04 + (base.z - 0.04) * metallic)
+    factor := math.pow(1.0 - vh, 5)
+    fr := f0.x + (1.0 - f0.x) * factor
+    fg := f0.y + (1.0 - f0.y) * factor
+    fb := f0.z + (1.0 - f0.z) * factor
+    inv_pi := 1.0 / 3.14159265359
+    diff_scale := (1.0 - metallic) * inv_pi
+    spec := dist * vis
+    rx := ((1.0 - fr) * diff_scale * base.x + spec * fr) * radiance.x * nl
+    ry := ((1.0 - fg) * diff_scale * base.y + spec * fg) * radiance.y * nl
+    rz := ((1.0 - fb) * diff_scale * base.z + spec * fb) * radiance.z * nl
+    << fm.vec3(rx, ry, rz)
+}
+
+fn soft_source_contribution(base fm.Vec3, metallic f64, roughness f64, normal fm.Vec3, position fm.Vec3, eye fm.Vec3, source &light_data.Light3D) fm.Vec3 {
+    $lvec := source.direction()
+    $atten := 1.0
+    if source.kind() != light_data.DIRECTIONAL {
+        delta := source.position().sub(position)
+        dist2 := delta.dot(delta)
+        radius := source.radius()
+        radius2 := radius * radius
+        if dist2 < 0.000000000001 || dist2 >= radius2 { << fm.vec3(0.0, 0.0, 0.0) }
+        lvec = delta.scaled(1.0 / math.sqrt(dist2))
+        rel2 := dist2 / radius2
+        edge := math.max(0.0, 1.0 - rel2 * rel2)
+        atten = edge * edge / math.max(dist2, 0.0001)
+        if source.kind() == light_data.SPOT {
+            cos_val := source.direction().dot(lvec.scaled(-1.0))
+            inner := source.inner_cosine()
+            outer := source.outer_cosine()
+            t := soft_clamp01((cos_val - outer) / math.max(inner - outer, 0.000001))
+            atten = atten * t * t * (3.0 - 2.0 * t)
+        }
+    }
+    rad := source.radiance().scaled(atten)
+    << soft_material_direct(base, metallic, roughness, normal, position, eye, lvec, rad)
+}
+
+fn soft_shade_lit(material &Material3D, lighting &light_data.Environment3D, orientation f64, is_ccw_ndc bool,
+    vcolor fm.Vec4, wpos fm.Vec3, wnorm fm.Vec3, uv fm.Vec2, wtangent fm.Vec3, wbitan fm.Vec3) fm.Vec4 {
+    $base := fm.vec3(material.base.x * vcolor.x, material.base.y * vcolor.y, material.base.z * vcolor.z)
+    if material.has_base_texture() {
+        tex := soft_sample_texture(&material.texture, uv.x, uv.y) or >>
+        base = fm.vec3(base.x * tex.x, base.y * tex.y, base.z * tex.z)
+    }
+    $orm := fm.vec3(1.0, 1.0, 1.0)
+    if material.has_orm_texture() {
+        torm := soft_sample_texture(&material.orm_texture, uv.x, uv.y) or >>
+        orm = fm.vec3(torm.x, torm.y, torm.z)
+    }
+    $ao_strength := material.occlusion_strength
+    if material.has_occlusion_texture() {
+        tocc := soft_sample_texture(&material.occlusion_texture, uv.x, uv.y) or >>
+        orm = fm.vec3(tocc.x, orm.y, orm.z)
+        ao_strength = material.occlusion_texture_strength
+    }
+    $emission := material.emission
+    if material.has_emission_texture() {
+        temit := soft_sample_texture(&material.emission_texture, uv.x, uv.y) or >>
+        emission = fm.vec3(emission.x * temit.x, emission.y * temit.y, emission.z * temit.z)
+    }
+    $shading_normal := wnorm
+    if material.has_normal_texture() {
+        tnorm := soft_sample_texture(&material.normal_texture, uv.x, uv.y) or >>
+        shading_normal = soft_normal_map_dir(wnorm, wtangent, wbitan, fm.vec3(tnorm.x, tnorm.y, tnorm.z), material.normal_scale)
+    }
+    $surface_front := is_ccw_ndc
+    if orientation < 0.0 { surface_front = !surface_front }
+    if material.surface_mode == 1 && !surface_front {
+        shading_normal = shading_normal.scaled(-1.0)
+    }
+    metallic := material.metallic * orm.z
+    roughness := math.max(0.045, material.roughness * orm.y)
+    occlusion := 1.0 + ao_strength * (orm.x - 1.0)
+    ambient := lighting.ambient()
+    eye := lighting.eye()
+    $linear := fm.vec3(ambient.x * occlusion * base.x * (1.0 - metallic) + emission.x,
+        ambient.y * occlusion * base.y * (1.0 - metallic) + emission.y,
+        ambient.z * occlusion * base.z * (1.0 - metallic) + emission.z)
+    sc := lighting.source_count()
+    for li in 0:sc {
+        if li >= light_data.MAX_LIGHTS { <- }
+        src := lighting.source(li) or (err) { <- }
+        contrib := soft_source_contribution(base, metallic, roughness, shading_normal, wpos, eye, &src)
+        linear = linear.add(contrib)
+    }
+    exp := lighting.exposure()
+    ex := math.max(linear.x * exp, 0.0)
+    ey := math.max(linear.y * exp, 0.0)
+    ez := math.max(linear.z * exp, 0.0)
+    mx := ex / (1.0 + ex)
+    my := ey / (1.0 + ey)
+    mz := ez / (1.0 + ez)
+    << fm.vec4(soft_linear_to_srgb(mx), soft_linear_to_srgb(my), soft_linear_to_srgb(mz), 1.0)
+}
+
+fn soft_edge_top_left(ax f64, ay f64, bx f64, by f64) bool {
+    dx := bx - ax
+    dy := by - ay
+    << dy < 0.0 || (dy == 0.0 && dx > 0.0)
+}
+
+fn soft_edge_eval(ax f64, ay f64, bx f64, by f64, px f64, py f64) f64 {
+    << (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+}
+
+fn soft_rasterize_triangle(device $&Device3D, width int, height int,
+    a0 &SoftVertex3D, a1 &SoftVertex3D, a2 &SoftVertex3D,
+    lit bool, cull_mode int, orientation f64, material &Material3D, lighting &light_data.Environment3D) int {
+    // cull_mode: 0 = none, 1 = cull back CCW (front if ndc_area > 0), 2 = cull back CW (front if ndc_area < 0)
+    if a0.cw <= 1e-9 || a1.cw <= 1e-9 || a2.cw <= 1e-9 { << 0 }
+    iw0 := 1.0 / a0.cw
+    iw1 := 1.0 / a1.cw
+    iw2 := 1.0 / a2.cw
+    sx0 := (a0.cx * iw0 * 0.5 + 0.5) * f64(width)
+    sy0 := (0.5 - a0.cy * iw0 * 0.5) * f64(height)
+    sz0 := a0.cz * iw0
+    sx1 := (a1.cx * iw1 * 0.5 + 0.5) * f64(width)
+    sy1 := (0.5 - a1.cy * iw1 * 0.5) * f64(height)
+    sz1 := a1.cz * iw1
+    sx2 := (a2.cx * iw2 * 0.5 + 0.5) * f64(width)
+    sy2 := (0.5 - a2.cy * iw2 * 0.5) * f64(height)
+    sz2 := a2.cz * iw2
+    area := soft_edge_eval(sx0, sy0, sx1, sy1, sx2, sy2)
+    if math.abs(area) < 1e-9 { << 0 }
+    is_ccw_ndc := area < 0.0
+    if cull_mode == 1 && !is_ccw_ndc { << 0 }
+    if cull_mode == 2 && is_ccw_ndc { << 0 }
+    // Ensure positive screen winding (v0 -> v1 -> v2) for uniform edge tests.
+    v0 := clone_soft_vertex(a0)
+    $v1 := clone_soft_vertex(a1)
+    $v2 := clone_soft_vertex(a2)
+    px0 := sx0
+    py0 := sy0
+    pz0 := sz0
+    piw0 := iw0
+    $px1 := sx1
+    $py1 := sy1
+    $pz1 := sz1
+    $piw1 := iw1
+    $px2 := sx2
+    $py2 := sy2
+    $pz2 := sz2
+    $piw2 := iw2
+    $pos_area := area
+    if area < 0.0 {
+        v1 = clone_soft_vertex(a2)
+        v2 = clone_soft_vertex(a1)
+        px1 = sx2
+        py1 = sy2
+        pz1 = sz2
+        piw1 = iw2
+        px2 = sx1
+        py2 = sy1
+        pz2 = sz1
+        piw2 = iw1
+        pos_area = 0.0 - area
+    }
+    inv_area := 1.0 / pos_area
+    tl01 := soft_edge_top_left(px0, py0, px1, py1)
+    tl12 := soft_edge_top_left(px1, py1, px2, py2)
+    tl20 := soft_edge_top_left(px2, py2, px0, py0)
+    $min_x := int(math.floor(math.min(px0, math.min(px1, px2))))
+    $max_x := int(math.ceil(math.max(px0, math.max(px1, px2)))) - 1
+    $min_y := int(math.floor(math.min(py0, math.min(py1, py2))))
+    $max_y := int(math.ceil(math.max(py0, math.max(py1, py2)))) - 1
+    if min_x < 0 { min_x = 0 }
+    if min_y < 0 { min_y = 0 }
+    if max_x >= width { max_x = width - 1 }
+    if max_y >= height { max_y = height - 1 }
+    if min_x > max_x || min_y > max_y { << 0 }
+    for py in min_y:(max_y + 1) {
+        cy := f64(py) + 0.5
+        for px in min_x:(max_x + 1) {
+            cx := f64(px) + 0.5
+            e12 := soft_edge_eval(px1, py1, px2, py2, cx, cy)
+            if e12 < 0.0 || (e12 == 0.0 && !tl12) { -> }
+            e20 := soft_edge_eval(px2, py2, px0, py0, cx, cy)
+            if e20 < 0.0 || (e20 == 0.0 && !tl20) { -> }
+            e01 := soft_edge_eval(px0, py0, px1, py1, cx, cy)
+            if e01 < 0.0 || (e01 == 0.0 && !tl01) { -> }
+            l0 := e12 * inv_area
+            l1 := e20 * inv_area
+            l2 := e01 * inv_area
+            z := l0 * pz0 + l1 * pz1 + l2 * pz2
+            didx := py * width + px
+            if z <= device.soft_depth[didx] { -> }
+            interp_iw := l0 * piw0 + l1 * piw1 + l2 * piw2
+            if interp_iw <= 1e-18 { -> }
+            w_corr := 1.0 / interp_iw
+            k0 := l0 * piw0 * w_corr
+            k1 := l1 * piw1 * w_corr
+            k2 := l2 * piw2 * w_corr
+            vcolor := fm.vec4(
+                v0.r * k0 + v1.r * k1 + v2.r * k2,
+                v0.g * k0 + v1.g * k1 + v2.g * k2,
+                v0.b * k0 + v1.b * k1 + v2.b * k2,
+                v0.a * k0 + v1.a * k1 + v2.a * k2)
+            $out := vcolor
+            if lit {
+                wpos := fm.vec3(
+                    v0.wx * k0 + v1.wx * k1 + v2.wx * k2,
+                    v0.wy * k0 + v1.wy * k1 + v2.wy * k2,
+                    v0.wz * k0 + v1.wz * k1 + v2.wz * k2)
+                wnorm := fm.vec3(
+                    v0.nx * k0 + v1.nx * k1 + v2.nx * k2,
+                    v0.ny * k0 + v1.ny * k1 + v2.ny * k2,
+                    v0.nz * k0 + v1.nz * k1 + v2.nz * k2)
+                uv := fm.vec2(
+                    v0.u * k0 + v1.u * k1 + v2.u * k2,
+                    v0.v * k0 + v1.v * k1 + v2.v * k2)
+                wtan := fm.vec3(
+                    v0.tx * k0 + v1.tx * k1 + v2.tx * k2,
+                    v0.ty * k0 + v1.ty * k1 + v2.ty * k2,
+                    v0.tz * k0 + v1.tz * k1 + v2.tz * k2)
+                wbit := fm.vec3(
+                    v0.bx * k0 + v1.bx * k1 + v2.bx * k2,
+                    v0.by * k0 + v1.by * k1 + v2.by * k2,
+                    v0.bz * k0 + v1.bz * k1 + v2.bz * k2)
+                shaded := soft_shade_lit(material, lighting, orientation, is_ccw_ndc, vcolor, wpos, wnorm, uv, wtan, wbit) or >>
+                out = shaded
+            }
+            device.soft_depth[didx] = z
+            pidx := didx * 4
+            device.soft_pixels[pidx] = soft_to_u8(out.x)
+            device.soft_pixels[pidx + 1] = soft_to_u8(out.y)
+            device.soft_pixels[pidx + 2] = soft_to_u8(out.z)
+            device.soft_pixels[pidx + 3] = soft_to_u8(out.w)
+        }
+    }
+    << 0
+}
+
+fn soft_draw_triangles(device $&Device3D, width int, height int,
+    mesh &MeshRef3D, mvp &fm.Mat4, model &fm.Mat4, normals &fm.Mat4,
+    lit bool, cull_mode int, orientation f64, material &Material3D, lighting &light_data.Environment3D) int {
+    tri_count := mesh.count / 3
+    for ti in 0:tri_count {
+        ioff := ti * 12
+        i0 := mesh.soft_indices.read_u32(ioff) or >>
+        i1 := mesh.soft_indices.read_u32(ioff + 4) or >>
+        i2 := mesh.soft_indices.read_u32(ioff + 8) or >>
+        va := soft_transform_vertex(mesh.soft_vertices, i0, mvp, model, normals, lit) or >>
+        vb := soft_transform_vertex(mesh.soft_vertices, i1, mvp, model, normals, lit) or >>
+        vc := soft_transform_vertex(mesh.soft_vertices, i2, mvp, model, normals, lit) or >>
+        $poly := [va, vb, vc]
+        for plane in 0:6 {
+            poly = soft_clip_plane(&poly, plane)
+            if poly.len < 3 { <- }
+        }
+        if poly.len < 3 { -> }
+        p0 := poly[0]
+        for k in 1:(poly.len - 1) {
+            p1 := poly[k]
+            p2 := poly[k + 1]
+            soft_rasterize_triangle(device, width, height, &p0, &p1, &p2, lit, cull_mode, orientation, material, lighting) or >>
+        }
+    }
+    << tri_count
+}

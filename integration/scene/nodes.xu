@@ -1,0 +1,85 @@
+@"github.com/xulang-org/game/integration/scene"
+
+game #"github.com/xulang-org/game/scene"
+resource #"github.com/xulang-org/game/resources/scene"
+#errors
+
+// Captures only nodes, not renderer/audio/script/light attachments or transient IDs.
+pub fn capture_nodes(tree &game.SceneTree, root int) resource.Document {
+    ids := tree.subtree(root) or >>
+    if ids.len > resource.MAX_NODES { >> errors.new("game scene: capture exceeds 4096 nodes") }
+    $indices := map[int]int{}
+    $nodes := []resource.NodeData{}
+    for i in 0:ids.len {
+        info := tree.node_info(ids[i]) or >>
+        if info.queued_free { >> errors.new("game scene: cannot capture nodes queued for deletion") }
+        $parent := -1
+        if i > 0 {
+            if !indices.has(info.parent) { >> errors.new("game scene: missing capture parent") }
+            parent = indices[info.parent]
+        }
+        $node := resource.node(parent, info.name + "", info.kind)
+        node.visible = info.visible
+        node.process_mode = info.process_mode
+        if info.kind == game.NODE_2D {
+            value := tree.node(ids[i]) or >>
+            t := value.transform
+            node.local = t
+        }
+        if info.kind == game.NODE_3D { node.local_3d = (tree.node_3d(ids[i]) or >>).transform }
+        indices[ids[i]] = i
+        nodes.push(node)
+    }
+    << resource.make_document(nodes) or >>
+}
+// Stage in a private tree, then reuse PackedScene's naming/capacity preflight.
+// Cache the returned immutable PackedScene when making many instances.
+pub fn to_packed(document &resource.Document) game.PackedScene {
+    if document.script_count() > 0 || document.surface_count() > 0 || document.audio_count() > 0 || document.light_count() > 0 { >> errors.new("game scene: document has attachments; use explicit to_packed_nodes and service binding") }
+    << to_packed_nodes(document) or >>
+}
+// Explicit node-only conversion; caller is responsible for restoring attachments.
+pub fn to_packed_nodes(document &resource.Document) game.PackedScene {
+    if document.node_count() < 1 { >> errors.new("game scene: cannot instantiate an empty document") }
+    $staging := game.new_scene_tree("Staging", document.node_count() + 1) or >>
+    container := staging.root()
+    $ids := []int{}
+    for i in 0:document.node_count() {
+        node := document.describe_node(i) or >>
+        $owner := container
+        if i > 0 { owner = ids[node.parent] }
+        $id := 0
+        if node.kind == resource.NODE_GROUP { id = staging.add_group(owner, node.name + "") or >> }
+        if node.kind == resource.NODE_2D {
+            id = staging.add_child(owner, node.name + "") or >>
+            t := node.local
+            staging.set_transform(id, t) or >>
+        }
+        if node.kind == resource.NODE_3D {
+            id = staging.add_child_3d(owner, node.name + "") or >>
+            staging.set_transform_3d(id, node.local_3d) or >>
+        }
+        staging.set_visible(id, node.visible) or >>
+        staging.set_process_mode(id, node.process_mode) or >>
+        ids.push(id)
+    }
+    << game.pack_scene(&staging, ids[0]) or >>
+}
+pub fn instantiate(document &resource.Document, tree $&game.SceneTree, parent int, name string) int {
+    packed := to_packed(document) or >>
+    << packed.instantiate(tree, parent, name) or >>
+}
+
+// Compare declared preorder without freezing mutable transforms/visibility.
+pub fn matching_nodes(document &resource.Document, tree &game.SceneTree, root int) []int {
+    ids := tree.subtree(root) or >>
+    if ids.len != document.node_count() { >> errors.new("game scene: instance node count differs from document") }
+    for i in 0:ids.len {
+        expected := document.describe_node(i) or >>
+        actual := tree.node_info(ids[i]) or >>
+        if actual.queued_free || actual.kind != expected.kind || (i > 0 && (actual.name != expected.name || actual.parent != ids[expected.parent])) {
+            >> errors.new("game scene: instance topology differs from document")
+        }
+    }
+    << ids
+}

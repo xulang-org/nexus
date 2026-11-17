@@ -1,0 +1,225 @@
+@"github.com/xulang-org/game/rendering/three_d"
+
+#gpu
+#gpu/layout
+#errors
+fm #"github.com/xulang-org/game/foundation/math"
+policy #"github.com/xulang-org/game/resources/shadow"
+lights #"github.com/xulang-org/game/resources/lighting"
+
+pub struct ShadowProgram3D { pub format int
+    pub entrypoint string
+    pub vertex []u8
+    pub fragment []u8 }
+pub struct ShadowCaster3D { pub mesh MeshRef3D
+    pub world fm.Mat4 }
+pub struct ShadowMap3D {
+    owner DeviceRef3D
+    images []gpu.Texture
+    pipelines []gpu.GraphicsPipeline
+    has_gpu bool
+    description policy.ShadowDescription3D
+    front int
+    ready bool
+    closed bool
+}
+pub struct ShadowBinding3D {
+    image gpu.TextureRef
+    description policy.ShadowDescription3D
+    source int
+    present bool
+    has_gpu bool
+}
+pub fn no_shadow_binding() ShadowBinding3D {
+    << ShadowBinding3D{image: gpu.TextureRef{},description: policy.default_directional(),source: -1,present: false,has_gpu: false}
+}
+fn shadow_columns(description &policy.ShadowDescription3D) int {
+    if description.kind()==lights.POINT { << 3 }
+    if description.cascade_count()>0 { << 2 }
+    << 1
+}
+pub fn (device &Device3D) shadow_map(description policy.ShadowDescription3D,program &ShadowProgram3D) ShadowMap3D {
+    device.alive() or >>
+    if device.active { >> errors.new("game shadow: create maps outside a frame") }
+    description.validate() or >>
+    shadow_description_words(&description,0) or >>
+    for face in 0:description.face_count() { matrix_words(description.view_projection(face) or >>) or >> }
+    size := description.resolution()
+    columns := shadow_columns(&description)
+    width := size*columns
+    height := size*((description.face_count()+columns-1)/columns)
+    if !device.is_gpu() {
+        if width*height*16>67108864 { >> errors.new("game shadow: shared 512-texture / 64 MiB budget exceeded") }
+        << ShadowMap3D{owner: device.reference(),images: []gpu.Texture{},pipelines: []gpu.GraphicsPipeline{},has_gpu: false,
+            description: description,front: 0,ready: false,closed: false}
+    }
+    dev := device.gpu_device() or >>
+    stats := dev.stats() or >>
+    $internal := device.target_width*device.target_height*8+4
+    if device.render_scale==2 { internal=device.target_width*device.target_height*36+4 }
+    if stats.texture_count>509+device.targets.len || width*height*16>67108864-(stats.texture_bytes-internal) { >> errors.new("game shadow: shared 512-texture / 64 MiB budget exceeded") }
+    if !(dev.supports_texture_2d(layout.R32_FLOAT,gpu.TEXTURE_COLOR_TARGET | gpu.TEXTURE_SAMPLED) or >>) { >> errors.new("game shadow: sampled R32_FLOAT color targets unavailable") }
+    $images := []gpu.Texture{}
+    for i in 0:2 {
+        image := dev.texture_2d(gpu.Texture2DDesc{format: layout.R32_FLOAT,width: width,height: height,levels: 1,usage: gpu.TEXTURE_COLOR_TARGET | gpu.TEXTURE_SAMPLED}) or >>
+        images.push(image)
+        depth := new_depth(dev,width,height) or >>
+        images.push(depth)
+    }
+    vd := gpu.ShaderDesc{stage: gpu.VERTEX,format: program.format,entrypoint: program.entrypoint+"",samplers: 0,uniform_sizes: [64]}
+    fd := gpu.ShaderDesc{stage: gpu.FRAGMENT,format: program.format,entrypoint: program.entrypoint+"",samplers: 0,uniform_sizes: []int{}}
+    $vs := dev.shader(&vd,&program.vertex) or >>
+    $fs := dev.shader(&fd,&program.fragment) or >>
+    $desc := gpu.pipeline_defaults(layout.R32_FLOAT)
+    desc.depth_format=layout.DEPTH32_FLOAT
+    desc.depth_compare=gpu.GREATER
+    desc.depth_write=true
+    desc.vertex_buffers=[gpu.VertexBufferLayout{slot: 0,stride: 64,rate: gpu.PER_VERTEX}]
+    desc.attributes=[gpu.VertexAttribute{location: 0,slot: 0,format: gpu.FLOAT3,offset: 0}]
+    pipeline := dev.graphics_pipeline(&vs,&fs,&desc) or >>
+    vs.close() or >>
+    fs.close() or >>
+    << ShadowMap3D{owner: device.reference(),images: images,pipelines: [pipeline],has_gpu: true,description: description,front: 0,ready: false,closed: false}
+}
+// All visible casters, including those outside the main camera, are supplied
+// explicitly. Double buffering publishes only a successfully submitted map.
+pub fn (shadow $&ShadowMap3D) render(device &Device3D,casters &[]ShadowCaster3D,description policy.ShadowDescription3D) int {
+    device.alive() or >>
+    if device.active || shadow.closed || !shadow.owner.matches(device) { >> errors.new("game shadow: closed/foreign map or active main frame") }
+    description.validate() or >>
+    if description.resolution()!=shadow.description.resolution() || description.face_count()!=shadow.description.face_count() || casters.len>16384 { >> errors.new("game shadow: fixed map layout/resolution or caster budget exceeded") }
+    shadow_description_words(&description,0) or >>
+    for caster in casters {
+        shadow.owner.validate_mesh(caster.mesh,false) or >>
+        if !caster.world.is_affine() { >> errors.new("game shadow: caster world must be finite affine") }
+    }
+    // Preflight ALL views, even for an empty update, before any GPU recording.
+    $transforms := []int{}
+    for face in 0:description.face_count() {
+        vp := description.view_projection(face) or >>
+        matrix_words(vp) or >>
+        for caster in casters {
+            words := matrix_words(vp.multiply(caster.world)) or >>
+            for value in words { transforms.push(value) }
+        }
+    }
+    if !shadow.has_gpu {
+        $soft_tris := 0
+        for i in 0:casters.len { soft_tris += casters[i].mesh.count/3 }
+        shadow.description=description
+        shadow.ready=true
+        << soft_tris
+    }
+    $back := 2
+    if shadow.ready { back=2-shadow.front }
+    image := back
+    depth := back+1
+    dev := device.gpu_device() or >>
+    $encoder := dev.command_encoder() or >>
+    color := gpu.ColorAttachment{view: shadow.images[image].view(0) or >>,load: gpu.CLEAR,store: gpu.STORE,clear: gpu.Color{r: 0.0,g: 0.0,b: 0.0,a: 1.0}}
+    attachment := gpu.depth_attachment(&shadow.images[depth],gpu.CLEAR,gpu.STORE,0.0)
+    $pass := encoder.begin_render(color,attachment) or >>
+    pass.pipeline(&shadow.pipelines[0]) or >>
+    $triangles := 0
+    size := description.resolution()
+    columns := shadow_columns(&description)
+    for face in 0:description.face_count() {
+        pass.viewport((face%columns)*size,(face/columns)*size,size,size) or >>
+        pass.scissor((face%columns)*size,(face/columns)*size,size,size) or >>
+        for i in 0:casters.len {
+            mesh := casters[i].mesh
+            $values := []int{}
+            for j in 0:16 { values.push(transforms[(face*casters.len+i)*16+j]) }
+            bytes := word_bytes(&values) or >>
+            pass.vertex_buffer_ref(0,mesh.vertices,0) or >>
+            pass.index_buffer_ref(mesh.indices,0,gpu.INDEX32) or >>
+            pass.uniform(gpu.VERTEX,0,&bytes) or >>
+            pass.draw_indexed(mesh.count,0,0,1,0) or >>
+            triangles+=mesh.count/3
+        }
+    }
+    pass.end() or >>
+    $fence := encoder.submit() or >>
+    fence.close() or >>
+    shadow.front=back
+    shadow.description=description
+    shadow.ready=true
+    << triangles
+}
+pub fn (shadow &ShadowMap3D) binding(lighting &lights.Environment3D,source int) ShadowBinding3D {
+    if shadow.closed || !shadow.ready { >> errors.new("game shadow: render a live map before binding") }
+    lighting.validate() or >>
+    light := lighting.source(source) or >>
+    if !(shadow.description.matches_source(&light) or >>) { >> errors.new("game shadow: bound source must match rendered projection") }
+    if !shadow.has_gpu {
+        << ShadowBinding3D{image: gpu.TextureRef{},description: shadow.description,source: source,present: true,has_gpu: false}
+    }
+    front := shadow.front
+    reference := shadow.images[front].reference()
+    reference.validate() or >>
+    << ShadowBinding3D{image: reference,description: shadow.description,source: source,present: true,has_gpu: true}
+}
+fn shadow_words(binding &ShadowBinding3D,index int) []int {
+    if !binding.present { $empty := []int{}
+        for i in 0:104 { empty.push(0) }
+        << empty }
+    << shadow_description_words(&binding.description,index) or >>
+}
+fn shadow_description_words(description &policy.ShadowDescription3D,index int) []int {
+    $words := []int{}
+    for i in 0:4 {
+        if description.kind()!=lights.POINT && (i==0 || i<description.cascade_count()) {
+            matrix := matrix_words(description.view_projection(i) or >>) or >>
+            for value in matrix { words.push(value) }
+        } else { for j in 0:16 { words.push(0) } }
+    }
+    reference := description.receiver_reference()
+    $mode := 1.0
+    if description.kind()==lights.SPOT { mode=2.0 }
+    if description.kind()==lights.POINT { mode=3.0 }
+    if description.cascade_count()>0 { mode=4.0 }
+    for value in [reference.x,reference.y,reference.z,description.constant_bias(),1.0/f64(description.resolution()),description.slope_bias(),f64(index),mode] { words.push(scalar_word(value) or >>) }
+    depth := description.depth_coefficients() or >>
+    columns := shadow_columns(description)
+    rows := (description.face_count()+columns-1)/columns
+    for value in [depth.x,depth.y,f64(columns),f64(rows)] { words.push(scalar_word(value) or >>) }
+    camera := description.cascade_depth_plane()
+    for value in [camera.x,camera.y,camera.z,camera.w] { words.push(scalar_word(value) or >>) }
+    for i in 0:4 {
+        $range := fm.vec4(0.0,0.0,0.0,0.0)
+        if i<description.cascade_count() { range=description.cascade_parameters(i) or >> }
+        for value in [range.x,range.y,range.z,range.w] { words.push(scalar_word(value) or >>) }
+    }
+    limits := description.cascade_limits()
+    for value in [limits.x,limits.y,limits.z,limits.w] { words.push(scalar_word(value) or >>) }
+    gradients := description.cascade_gradient_scales()
+    for value in [gradients.x,gradients.y,gradients.z,gradients.w] { words.push(scalar_word(value) or >>) }
+    << words
+}
+pub fn (binding &ShadowBinding3D) validate_camera(view_projection fm.Mat4) int {
+    if binding.present && !binding.description.matches_camera(view_projection) { >> errors.new("game shadow: cascades belong to a different camera; refresh before drawing") }
+    << 0
+}
+pub fn (shadow $&ShadowMap3D) close() int {
+    if shadow.closed { << 0 }
+    $first := ""
+    for i in 0:shadow.images.len { texture := $&shadow.images[i]
+        error := close_texture(texture)
+        if first.len==0 { first=error } }
+    if shadow.pipelines.len>0 {
+        pipeline := $&shadow.pipelines[0]
+        pipeline_error := close_shadow_pipeline(pipeline)
+        if first.len==0 { first=pipeline_error }
+    }
+    shadow.images = []gpu.Texture{}
+    shadow.pipelines = []gpu.GraphicsPipeline{}
+    shadow.closed=true
+    shadow.ready=false
+    if first.len>0 { >> errors.new(first) }
+    << 0
+}
+fn (shadow $&ShadowMap3D) drop() { shadow.close() or(err){ << } }
+fn close_shadow_pipeline(pipeline $&gpu.GraphicsPipeline) string {
+    pipeline.close() or(err){ << err.msg() }
+    << ""
+}

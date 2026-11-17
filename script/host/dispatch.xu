@@ -1,0 +1,96 @@
+@"github.com/xulang-org/game/script/host"
+
+game #"github.com/xulang-org/game/scene"
+#errors
+
+pub const DEFAULT_DISPATCH_LIMIT = 64
+pub const MAX_DISPATCH_LIMIT = 128
+pub const MAX_MANAGED_DELIVERIES = 4096
+struct ManagedSignal {
+    connection int
+    source int
+    target int
+    handler int
+    value f64
+    epoch int
+    call int
+}
+pub struct DispatchReport {
+    pub collected int
+    pub attempted int
+    pub delivered int
+    pub rejected int
+    pub dropped int
+    pub remaining int
+    pub deferred_events int
+    pub first_error string
+}
+// A manager has at most 32 global routes and each source outbox has at most
+// 128 events, so an empty-queue collection cannot exceed 4096 deliveries.
+fn (scripts $&SceneScripts) collect_managed() int {
+    $total := 0
+    for route in scripts.routes {
+        index := scripts.index(route.source) or >>
+        total = total + scripts.slots[index].script.pending_signals()
+    }
+    if total > MAX_MANAGED_DELIVERIES { >> errors.new("XuScript: managed signal queue limit exceeded") }
+    for i in 0:scripts.slots.len {
+        if !scripts.slots[i].active { -> }
+        source := scripts.binding_id(i)
+        machine := $&scripts.slots[i].script.machine
+        events := machine.drain_signals() or >>
+        for event in events {
+            for j in 0:scripts.routes.len {
+                route := scripts.routes[j]
+                if route.source != source || route.signal != event.id { -> }
+                scripts.queue.push(ManagedSignal{connection: route.id, source: source, target: route.target,
+                    handler: route.handler, value: event.value, epoch: event.epoch, call: event.call})
+            }
+        }
+    }
+    << scripts.queue.len
+}
+fn receive_managed(behavior $&NodeScript, tree &game.SceneTree, handler int, value f64) string {
+    behavior.receive_signal(tree, handler, value) or (err) { << err.msg() }
+    << ""
+}
+// One bounded dispatch phase. Existing queued snapshots are processed first;
+// only an empty queue collects new events. Emissions from handlers remain in
+// their outboxes until a later invocation, even if this phase finishes early.
+// Each attempt is consumed once, including failed/stale deliveries.
+pub fn (scripts $&SceneScripts) dispatch(tree &game.SceneTree, limit int) DispatchReport {
+    if scripts.slots.len < 1 || limit < 1 || limit > MAX_DISPATCH_LIMIT { >> errors.new("XuScript: invalid dispatch manager/limit") }
+    scripts.prune(tree)
+    $report := DispatchReport{collected: 0, attempted: 0, delivered: 0, rejected: 0, dropped: 0,
+        remaining: 0, deferred_events: 0, first_error: ""}
+    if scripts.cursor == scripts.queue.len {
+        scripts.queue = []ManagedSignal{}
+        scripts.cursor = 0
+        report.collected = scripts.collect_managed() or >>
+    }
+    while scripts.cursor < scripts.queue.len && report.attempted < limit {
+        event := scripts.queue[scripts.cursor]
+        scripts.cursor = scripts.cursor + 1
+        report.attempted = report.attempted + 1
+        if !scripts.active_id(event.source) || !scripts.active_id(event.target) { report.dropped = report.dropped + 1
+            -> }
+        target := scripts.index(event.target) or >>
+        if !scripts.slots[target].script.machine.has_handler(event.handler) { report.dropped = report.dropped + 1
+            -> }
+        behavior := $&scripts.slots[target].script
+        message := receive_managed(behavior, tree, event.handler, event.value)
+        if message.len > 0 {
+            report.rejected = report.rejected + 1
+            if report.first_error.len == 0 {
+                report.first_error = "XuScript route " + str(event.connection) + " from attachment " + str(event.source) +
+                    " epoch " + str(event.epoch) + " call " + str(event.call) + " to attachment " + str(event.target) +
+                    " handler " + str(event.handler) + ": " + message
+            }
+        } else { report.delivered = report.delivered + 1 }
+    }
+    report.remaining = scripts.queue.len - scripts.cursor
+    report.deferred_events = scripts.pending_signals()
+    if report.remaining == 0 { scripts.queue = []ManagedSignal{}
+        scripts.cursor = 0 }
+    << report
+}

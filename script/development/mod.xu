@@ -1,0 +1,67 @@
+@"github.com/xulang-org/game/script/development"
+
+game #"github.com/xulang-org/game/scene"
+host #"github.com/xulang-org/game/script/host"
+bc #"github.com/xulang-org/game/script/bytecode"
+files #"github.com/xulang-org/game/internal/file_snapshot"
+#crypto/sha256
+
+const CANDIDATE = 3
+struct Observation { status int
+    raw string
+    digest string
+    message string }
+// Development-only local file polling. Runtime host/VM packages do not import
+// this package or require a filesystem/compiler to execute and reload modules.
+pub struct DevelopmentFile { path string
+    accepted string
+    observed string
+    last_error string }
+pub fn development_file(path string, initial &string) DevelopmentFile {
+    digest := sha256.sum256(*initial + "")
+    << DevelopmentFile{path: path, accepted: digest + "", observed: digest, last_error: ""}
+}
+pub fn (file &DevelopmentFile) has_error() bool { << file.last_error.len > 0 }
+fn (file $&DevelopmentFile) rejection(epoch int, message string) host.ReloadNotice {
+    if file.last_error == message { << host.ReloadNotice{status: host.UNCHANGED, epoch: epoch, message: ""} }
+    file.last_error = message + ""
+    << host.ReloadNotice{status: host.REJECTED, epoch: epoch, message: message}
+}
+fn (file $&DevelopmentFile) observe() Observation {
+    raw := files.read(file.path + "", bc.MAX_BYTES) or (err) {
+        << Observation{status: host.REJECTED, raw: "", digest: "", message: err.msg()} }
+    digest := sha256.sum256(raw + "")
+    if digest == file.accepted { file.last_error = ""
+        << Observation{status: host.UNCHANGED, raw: "", digest: "", message: ""} }
+    if digest == file.observed { << Observation{status: host.UNCHANGED, raw: "", digest: "", message: ""} }
+    file.observed = digest + ""
+    << Observation{status: CANDIDATE, raw: raw, digest: digest, message: ""}
+}
+fn (file $&DevelopmentFile) accept(epoch int, digest string, changed int) host.ReloadNotice {
+    file.accepted = digest
+    file.last_error = ""
+    $status := host.UNCHANGED
+    if changed > 0 { status = host.ACTIVATED }
+    << host.ReloadNotice{status: status, epoch: epoch, message: ""}
+}
+// Both entry points run between synchronous callbacks on the owner thread.
+pub fn (file $&DevelopmentFile) poll(tree &game.SceneTree, script $&host.NodeScript) host.ReloadNotice {
+    epoch := script.epoch()
+    draft := file.observe()
+    if draft.status == host.REJECTED { << file.rejection(epoch, draft.message + "") }
+    if draft.status != CANDIDATE { << host.ReloadNotice{status: host.UNCHANGED, epoch: epoch, message: ""} }
+    candidate := bc.decode(&draft.raw) or (err) { << file.rejection(epoch, err.msg()) }
+    changed := script.reload(tree, candidate) or (err) { << file.rejection(epoch, err.msg()) }
+    << file.accept(script.epoch(), draft.digest + "", changed)
+}
+pub fn (file $&DevelopmentFile) poll_scene(tree &game.SceneTree, scripts $&host.SceneScripts, id int) host.ReloadNotice {
+    scripts.prune(tree)
+    epoch := scripts.epoch(id) or (err) { << file.rejection(0, err.msg()) }
+    draft := file.observe()
+    if draft.status == host.REJECTED { << file.rejection(epoch, draft.message + "") }
+    if draft.status != CANDIDATE { << host.ReloadNotice{status: host.UNCHANGED, epoch: epoch, message: ""} }
+    candidate := bc.decode(&draft.raw) or (err) { << file.rejection(epoch, err.msg()) }
+    changed := scripts.reload(tree, id, candidate) or (err) { << file.rejection(epoch, err.msg()) }
+    next_epoch := scripts.epoch(id) or (err) { << file.rejection(0, err.msg()) }
+    << file.accept(next_epoch, draft.digest + "", changed)
+}

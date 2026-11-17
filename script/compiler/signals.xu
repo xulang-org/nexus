@@ -1,0 +1,48 @@
+@"github.com/xulang-org/game/script/compiler"
+
+bc #"github.com/xulang-org/game/script/bytecode"
+#xu/ast
+#encoding/json
+#errors
+
+// Signals are a bounded host capability, not general string values or calls.
+fn signal_schema(doc &json.Doc, root int) []bc.Signal {
+    $signals := []bc.Signal{}
+    if !doc.has(root, "signals") { << signals }
+    list := doc.get(root, "signals")
+    if !doc.is_list(list) || doc.count(list) > bc.MAX_SIGNALS { >> errors.new("XuScript: invalid signal schema") }
+    keys := ["id", "name"]
+    for i in 0:doc.count(list) {
+        node := doc.at(list, i)
+        schema_shape(doc, node, &keys) or >>
+        id := doc.as_int(doc.get(node, "id")) or >>
+        name := doc.as_string(doc.get(node, "name")) or >>
+        if id < 1 || id > 2147483647 || !bc.identifier(&name) { >> errors.new("XuScript: invalid signal ID/name") }
+        for signal in signals {
+            if signal.id == id || signal.name == name { >> errors.new("XuScript: duplicate signal schema") }
+        }
+        signals.push(bc.Signal{id: id, name: name})
+    }
+    << signals
+}
+fn (compiler $&Compiler) signal_statement(node int) int {
+    call := compiler.syntax(node)
+    if call.kind != ast.NK_CALL || call.sval != "emit_signal" || call.b >= 0 || call.a < 0 {
+        >> errors.new(compiler.error(node, "statement is outside the scalar script profile; expected emit_signal(name, value)"))
+    }
+    name := compiler.syntax(call.a)
+    if name.kind != ast.NK_STR || name.next < 0 {
+        >> errors.new(compiler.error(node, "emit_signal needs a literal signal name and one f64 value"))
+    }
+    value_node := name.next
+    if compiler.parser.nodes[value_node].next >= 0 {
+        >> errors.new(compiler.error(node, "emit_signal needs exactly two arguments"))
+    }
+    $index := -1
+    for i in 0:compiler.signals.len { if compiler.signals[i].name == name.sval { index = i } }
+    if index < 0 { >> errors.new(compiler.error(node, "signal name is not declared in schema")) }
+    value := compiler.expr(value_node) or >>
+    compiler.require_kind(value, bc.F64, node) or >>
+    compiler.emit(bc.EMIT_SIGNAL, index, value, 0, node) or >>
+    << 0
+}

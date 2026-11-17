@@ -1,0 +1,201 @@
+@"github.com/xulang-org/game/audio/mixer"
+
+pcm #"github.com/xulang-org/game/resources/audio"
+#crypto/sha256
+#errors
+
+pub const MAX_STREAMS = 8
+pub const MAX_STREAM_CAPACITY_FRAMES = 65536
+pub const MAX_STREAM_BUFFER_SAMPLES = 524288
+pub const MAX_FEED_FRAMES = 4096
+struct PcmStream {
+    generation int
+    open bool
+    rate int
+    channels int
+    capacity int
+    read_frame int
+    write_frame int
+    eof bool
+    consumer int
+    position int
+    digest string
+    samples []int
+}
+fn empty_stream(generation int) PcmStream {
+    << PcmStream{generation: generation, open: false, rate: 0, channels: 0, capacity: 0,
+        read_frame: 0, write_frame: 0, eof: false, consumer: 0, position: 0, digest: "", samples: []int{}}
+}
+pub struct StreamInfo { pub sample_rate int
+    pub channels int
+    pub capacity_frames int
+    pub buffered_frames int
+    pub room_frames int
+    pub written_frames int
+    pub consumed_frames int
+    pub eof bool
+    pub consumer_voice int
+    pub position_frames f64 }
+pub fn (mixer &Mixer) is_stream(id int) bool {
+    if id <= 0 { << false }
+    slot := (id - 1) % MAX_STREAMS
+    << slot < mixer.streams.len && mixer.streams[slot].open && mixer.streams[slot].generation == (id - 1) / MAX_STREAMS
+}
+fn (mixer &Mixer) stream_index(id int) int {
+    if !mixer.is_stream(id) { >> errors.new("game mixer: stale or invalid stream") }
+    << (id - 1) % MAX_STREAMS
+}
+pub fn (mixer $&Mixer) open_stream(rate int, channels int, capacity_frames int) int {
+    mixer.valid() or >>
+    if rate < 8000 || rate > 192000 || channels < 1 || channels > 2 || capacity_frames < 2 || capacity_frames > MAX_STREAM_CAPACITY_FRAMES ||
+        capacity_frames * channels > MAX_STREAM_BUFFER_SAMPLES - mixer.stream_samples { >> errors.new("game mixer: invalid stream format or buffer budget") }
+    for i in 0:mixer.streams.len {
+        if !mixer.streams[i].open {
+            generation := mixer.streams[i].generation + 1
+            if generation > 1000000000 { >> errors.new("game mixer: stream generation exhausted") }
+            $samples := []int{}
+            for j in 0:capacity_frames * channels { samples.push(0) }
+            mixer.streams[i] = PcmStream{generation: generation, open: true, rate: rate, channels: channels, capacity: capacity_frames,
+                read_frame: 0, write_frame: 0, eof: false, consumer: 0, position: 0, digest: "", samples: samples}
+            mixer.stream_samples = mixer.stream_samples + capacity_frames * channels
+            mixer.revision = mixer.revision + 1
+            << generation * MAX_STREAMS + i + 1
+        }
+    }
+    >> errors.new("game mixer: stream capacity exceeded")
+}
+pub fn (mixer &Mixer) stream_info(id int) StreamInfo {
+    index := mixer.stream_index(id) or >>
+    source := &mixer.streams[index]
+    buffered := source.write_frame - source.read_frame
+    rate := mixer.rate
+    if rate == 0 { >> errors.new("game mixer: zero mixer rate") }
+    << StreamInfo{sample_rate: source.rate, channels: source.channels, capacity_frames: source.capacity,
+        buffered_frames: buffered, room_frames: source.capacity - buffered, written_frames: source.write_frame,
+        consumed_frames: source.read_frame, eof: source.eof, consumer_voice: source.consumer, position_frames: f64(source.position) / f64(rate)}
+}
+pub fn (mixer $&Mixer) feed_stream(id int, samples &[]int, finished bool) int {
+    index := mixer.stream_index(id) or >>
+    source := $&mixer.streams[index]
+    channels := source.channels
+    if channels == 0 { >> errors.new("game mixer: zero stream channels") }
+    frames := samples.len / channels
+    if source.eof || samples.len % channels != 0 || frames > MAX_FEED_FRAMES ||
+        frames > source.capacity - (source.write_frame - source.read_frame) || (frames == 0 && !finished) || source.write_frame > 1000000000000 - frames {
+        >> errors.new("game mixer: invalid stream feed, EOF or full buffer")
+    }
+    $digest := "EOF"
+    if frames > 0 { digest = pcm.fingerprint_pcm16(source.rate, channels, samples) or >> }
+    next_digest := sha256.sum256(source.digest + ":" + digest + ":" + str(flag(finished)))
+    capacity := source.capacity
+    if capacity == 0 { >> errors.new("game mixer: zero stream capacity") }
+    // All validation precedes writes; a rejected block preserves the ring/state.
+    for frame in 0:frames {
+        slot := (source.write_frame + frame) % capacity
+        for channel in 0:channels { source.samples[slot * channels + channel] = samples[frame * channels + channel] }
+    }
+    source.write_frame = source.write_frame + frames
+    source.eof = finished
+    source.digest = next_digest
+    mixer.revision = mixer.revision + 1
+    << frames
+}
+pub fn (mixer $&Mixer) play_stream(id int, bus int, volume f64, pan f64) int {
+    index := mixer.stream_index(id) or >>
+    consumer := mixer.streams[index].consumer
+    if mixer.is_voice(consumer) && (mixer.is_playing(consumer) or >>) { >> errors.new("game mixer: stream already has a consumer") }
+    phase := mixer.streams[index].read_frame * mixer.rate
+    voice := mixer.allocate(-id - 1, bus, volume, pan, false, phase) or >>
+    mixer.streams[index].consumer = voice
+    mixer.streams[index].position = phase
+    << voice
+}
+pub fn (mixer $&Mixer) close_stream(id int) int {
+    index := mixer.stream_index(id) or >>
+    consumer := mixer.streams[index].consumer
+    if mixer.is_voice(consumer) { mixer.stop(consumer) or >> }
+    mixer.stream_samples = mixer.stream_samples - mixer.streams[index].capacity * mixer.streams[index].channels
+    generation := mixer.streams[index].generation
+    mixer.streams[index] = empty_stream(generation)
+    mixer.revision = mixer.revision + 1
+    << 0
+}
+fn (mixer &Mixer) stream_sample(index int, frame int, channel int) int {
+    source := &mixer.streams[index]
+    capacity := source.capacity
+    if capacity == 0 { >> errors.new("game mixer: closed stream buffer") }
+    if frame < source.read_frame || frame >= source.write_frame || channel < 0 || channel >= source.channels {
+        >> errors.new("game mixer: sample outside buffered stream")
+    }
+    << source.samples[(frame % capacity) * source.channels + channel]
+}
+
+struct SourceInfo { rate int
+    channels int
+    frames int
+    streaming bool
+    eof bool }
+fn (mixer &Mixer) source_info(source int) SourceInfo {
+    if source >= 0 {
+        clip := &mixer.clips[source]
+        << SourceInfo{rate: clip.sample_rate(), channels: clip.channel_count(), frames: clip.frame_count(), streaming: false, eof: true}
+    }
+    index := mixer.stream_index(-source - 1) or >>
+    stream := &mixer.streams[index]
+    << SourceInfo{rate: stream.rate, channels: stream.channels, frames: stream.write_frame, streaming: true, eof: stream.eof}
+}
+fn (mixer &Mixer) source_sample(source int, frame int, channel int) int {
+    if source >= 0 { << mixer.clips[source].sample(frame, channel) or >> }
+    index := mixer.stream_index(-source - 1) or >>
+    << mixer.stream_sample(index, frame, channel) or >>
+}
+fn (mixer $&Mixer) consume_streams() {
+    rate := mixer.rate
+    if rate == 0 { << }
+    for i in 0:mixer.streams.len {
+        consumer := mixer.streams[i].consumer
+        if !mixer.streams[i].open || !mixer.is_voice(consumer) { -> }
+        slot := (consumer - 1) % MAX_VOICES
+        mixer.streams[i].position = mixer.voices[slot].phase
+        consumed := mixer.voices[slot].phase / rate
+        $head := consumed
+        if head > mixer.streams[i].write_frame { head = mixer.streams[i].write_frame }
+        if head > mixer.streams[i].read_frame { mixer.streams[i].read_frame = head }
+    }
+}
+
+fn wrap_phase(phase int, period int) int { if period == 0 { << phase }
+    << phase % period }
+
+// Replace a source window without changing its generation or consumer handle.
+// This is a producer operation: data/format validation precedes every mutation.
+// An empty non-final window is allowed for asynchronous producers, unlike feed.
+pub fn (mixer $&Mixer) reset_stream(id int, samples &[]int, finished bool, resume bool) int {
+    index := mixer.stream_index(id) or >>
+    channels := mixer.streams[index].channels
+    if channels == 0 { >> errors.new("game mixer: zero stream channels") }
+    frames := samples.len / channels
+    if samples.len % channels != 0 || frames > MAX_FEED_FRAMES || frames > mixer.streams[index].capacity {
+        >> errors.new("game mixer: invalid replacement stream window")
+    }
+    consumer := mixer.streams[index].consumer
+    live := mixer.is_voice(consumer)
+    if resume && !live { >> errors.new("game mixer: restarting a stream requires a live consumer") }
+    $digest := "EMPTY"
+    if frames > 0 { digest = pcm.fingerprint_pcm16(mixer.streams[index].rate, channels, samples) or >> }
+    next_digest := sha256.sum256(mixer.streams[index].digest + ":reset:" + digest + ":" + str(flag(finished)))
+    source := $&mixer.streams[index]
+    for i in 0:samples.len { source.samples[i] = samples[i] }
+    source.position = 0
+    source.read_frame = 0
+    source.write_frame = frames
+    source.eof = finished
+    source.digest = next_digest
+    if live {
+        slot := (consumer - 1) % MAX_VOICES
+        voice := $&mixer.voices[slot]
+        reset_transport(voice, 0, resume, finished && frames == 0)
+    }
+    mixer.revision = mixer.revision + 1
+    << frames
+}

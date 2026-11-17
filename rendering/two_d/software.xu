@@ -1,0 +1,334 @@
+@"github.com/xulang-org/game/rendering/two_d"
+
+fm #"github.com/xulang-org/game/foundation/math"
+canvas #"github.com/xulang-org/game/resources/canvas"
+#math
+
+fn clamp_i(value int, lo int, hi int) int {
+    if value < lo { << lo }
+    if value > hi { << hi }
+    << value
+}
+
+fn clamp_f(value f64, lo f64, hi f64) f64 {
+    if value < lo { << lo }
+    if value > hi { << hi }
+    << value
+}
+
+fn max_f(a f64, b f64) f64 {
+    if a > b { << a }
+    << b
+}
+
+fn min_f(a f64, b f64) f64 {
+    if a < b { << a }
+    << b
+}
+
+fn smoothstep_f(edge0 f64, edge1 f64, x f64) f64 {
+    if edge1 <= edge0 {
+        if x < edge0 { << 0.0 }
+        << 1.0
+    }
+    t := clamp_f((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    << t * t * (3.0 - 2.0 * t)
+}
+
+fn u8_to_norm(b u8) f64 {
+    << f64(int(b)) / 255.0
+}
+
+fn byte_u8(value f64) u8 {
+    n := int(clamp_f(value, 0.0, 1.0) * 255.0 + 0.5)
+    << u8(clamp_i(n, 0, 255))
+}
+
+fn blend_premultiplied_pixel(pixels $&[]u8, idx int, sr f64, sg f64, sb f64, sa f64) {
+    if sa <= 0.0 { << }
+    inv_a := 1.0 - clamp_f(sa, 0.0, 1.0)
+    dr := u8_to_norm(pixels[idx])
+    dg := u8_to_norm(pixels[idx + 1])
+    db := u8_to_norm(pixels[idx + 2])
+    da := u8_to_norm(pixels[idx + 3])
+    pixels[idx] = byte_u8(sr + dr * inv_a)
+    pixels[idx + 1] = byte_u8(sg + dg * inv_a)
+    pixels[idx + 2] = byte_u8(sb + db * inv_a)
+    pixels[idx + 3] = byte_u8(sa + da * inv_a)
+}
+
+fn blend_straight_pixel(pixels $&[]u8, idx int, sr f64, sg f64, sb f64, sa f64) {
+    a := clamp_f(sa, 0.0, 1.0)
+    if a <= 0.0 { << }
+    blend_premultiplied_pixel(pixels, idx, sr * a, sg * a, sb * a, a)
+}
+
+fn read_texel_f(tex &[]u8, width int, height int, x int, y int) []f64 {
+    tx := clamp_i(x, 0, width - 1)
+    ty := clamp_i(y, 0, height - 1)
+    base := (ty * width + tx) * 4
+    << [u8_to_norm(tex[base]),
+        u8_to_norm(tex[base + 1]),
+        u8_to_norm(tex[base + 2]),
+        u8_to_norm(tex[base + 3])]
+}
+
+fn sample_texture_f(tex &[]u8, tex_w int, tex_h int, linear bool, u f64, v f64) []f64 {
+    if tex_w <= 0 || tex_h <= 0 || tex.len != tex_w * tex_h * 4 {
+        << [1.0, 1.0, 1.0, 1.0]
+    }
+    cu := clamp_f(u, 0.0, 1.0)
+    cv := clamp_f(v, 0.0, 1.0)
+    if !linear {
+        tx := clamp_i(int(math.floor(cu * f64(tex_w))), 0, tex_w - 1)
+        ty := clamp_i(int(math.floor(cv * f64(tex_h))), 0, tex_h - 1)
+        << read_texel_f(tex, tex_w, tex_h, tx, ty)
+    }
+    fx := cu * f64(tex_w) - 0.5
+    fy := cv * f64(tex_h) - 0.5
+    x0 := int(math.floor(fx))
+    y0 := int(math.floor(fy))
+    tx := fx - f64(x0)
+    ty := fy - f64(y0)
+    c00 := read_texel_f(tex, tex_w, tex_h, x0, y0)
+    c10 := read_texel_f(tex, tex_w, tex_h, x0 + 1, y0)
+    c01 := read_texel_f(tex, tex_w, tex_h, x0, y0 + 1)
+    c11 := read_texel_f(tex, tex_w, tex_h, x0 + 1, y0 + 1)
+    $out := [0.0, 0.0, 0.0, 0.0]
+    for i in 0:4 {
+        top := c00[i] + (c10[i] - c00[i]) * tx
+        bot := c01[i] + (c11[i] - c01[i]) * tx
+        out[i] = top + (bot - top) * ty
+    }
+    << out
+}
+
+fn edge_fn(ax f64, ay f64, bx f64, by f64, px f64, py f64) f64 {
+    << (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+}
+
+fn read_mask_texel_f(tex &[]u8, width int, height int, x int, y int) f64 {
+    if width <= 0 || height <= 0 || tex.len != width * height { << 0.0 }
+    cx := clamp_i(x, 0, width - 1)
+    cy := clamp_i(y, 0, height - 1)
+    << u8_to_norm(tex[cy * width + cx])
+}
+
+fn sample_mask_f(tex &[]u8, tex_w int, tex_h int, linear bool, u f64, v f64) f64 {
+    if tex_w <= 0 || tex_h <= 0 || tex.len != tex_w * tex_h { << 0.0 }
+    uc := clamp_f(u, 0.0, 1.0)
+    vc := clamp_f(v, 0.0, 1.0)
+    if !linear {
+        ix := clamp_i(int(math.floor(uc * f64(tex_w))), 0, tex_w - 1)
+        iy := clamp_i(int(math.floor(vc * f64(tex_h))), 0, tex_h - 1)
+        << read_mask_texel_f(tex, tex_w, tex_h, ix, iy)
+    }
+    fx := uc * f64(tex_w) - 0.5
+    fy := vc * f64(tex_h) - 0.5
+    x0 := int(math.floor(fx))
+    y0 := int(math.floor(fy))
+    tx := fx - f64(x0)
+    ty := fy - f64(y0)
+    c00 := read_mask_texel_f(tex, tex_w, tex_h, x0, y0)
+    c10 := read_mask_texel_f(tex, tex_w, tex_h, x0 + 1, y0)
+    c01 := read_mask_texel_f(tex, tex_w, tex_h, x0, y0 + 1)
+    c11 := read_mask_texel_f(tex, tex_w, tex_h, x0 + 1, y0 + 1)
+    top := c00 + (c10 - c00) * tx
+    bot := c01 + (c11 - c01) * tx
+    << top + (bot - top) * ty
+}
+
+fn is_top_left_edge(ax f64, ay f64, bx f64, by f64) bool {
+    dy := by - ay
+    dx := bx - ax
+    << dy < 0.0 || (dy == 0.0 && dx > 0.0)
+}
+
+fn soft_draw_triangle_mode(pixels $&[]u8, width int, height int,
+    min_x int, min_y int, max_x int, max_y int,
+    tex &[]u8, tex_w int, tex_h int, linear bool, is_mask bool,
+    v0 canvas.Vertex2D, v1 canvas.Vertex2D, v2 canvas.Vertex2D) {
+    $a := v0
+    $b := v1
+    $c := v2
+    $area := edge_fn(a.point.x, a.point.y, b.point.x, b.point.y, c.point.x, c.point.y)
+    if area == 0.0 { << }
+    if area < 0.0 {
+        tmp := b
+        b = c
+        c = tmp
+        area = -area
+    }
+    tl0 := is_top_left_edge(b.point.x, b.point.y, c.point.x, c.point.y)
+    tl1 := is_top_left_edge(c.point.x, c.point.y, a.point.x, a.point.y)
+    tl2 := is_top_left_edge(a.point.x, a.point.y, b.point.x, b.point.y)
+
+    bx0 := clamp_i(int(math.floor(min_f(a.point.x, min_f(b.point.x, c.point.x)))), min_x, max_x)
+    by0 := clamp_i(int(math.floor(min_f(a.point.y, min_f(b.point.y, c.point.y)))), min_y, max_y)
+    bx1 := clamp_i(int(math.ceil(max_f(a.point.x, max_f(b.point.x, c.point.x)))), min_x, max_x)
+    by1 := clamp_i(int(math.ceil(max_f(a.point.y, max_f(b.point.y, c.point.y)))), min_y, max_y)
+    if bx0 >= bx1 || by0 >= by1 { << }
+
+    inv_area := 1.0 / area
+    ar := f64((a.color >> 24) & 255) / 255.0
+    ag := f64((a.color >> 16) & 255) / 255.0
+    ab := f64((a.color >> 8) & 255) / 255.0
+    aa := f64(a.color & 255) / 255.0
+
+    br := f64((b.color >> 24) & 255) / 255.0
+    bg := f64((b.color >> 16) & 255) / 255.0
+    bb := f64((b.color >> 8) & 255) / 255.0
+    ba := f64(b.color & 255) / 255.0
+
+    cr := f64((c.color >> 24) & 255) / 255.0
+    cg := f64((c.color >> 16) & 255) / 255.0
+    cb := f64((c.color >> 8) & 255) / 255.0
+    ca := f64(c.color & 255) / 255.0
+
+    for py in by0:by1 {
+        sy := f64(py) + 0.5
+        for px in bx0:bx1 {
+            sx := f64(px) + 0.5
+            e0 := edge_fn(b.point.x, b.point.y, c.point.x, c.point.y, sx, sy)
+            if e0 < 0.0 || (e0 == 0.0 && !tl0) { -> }
+            e1 := edge_fn(c.point.x, c.point.y, a.point.x, a.point.y, sx, sy)
+            if e1 < 0.0 || (e1 == 0.0 && !tl1) { -> }
+            e2 := edge_fn(a.point.x, a.point.y, b.point.x, b.point.y, sx, sy)
+            if e2 < 0.0 || (e2 == 0.0 && !tl2) { -> }
+
+            w0 := e0 * inv_area
+            w1 := e1 * inv_area
+            w2 := e2 * inv_area
+            u := a.uv.x * w0 + b.uv.x * w1 + c.uv.x * w2
+            v := a.uv.y * w0 + b.uv.y * w1 + c.uv.y * w2
+
+            vr := ar * w0 + br * w1 + cr * w2
+            vg := ag * w0 + bg * w1 + cg * w2
+            vb := ab * w0 + bb * w1 + cb * w2
+            va := aa * w0 + ba * w1 + ca * w2
+
+            idx := (py * width + px) * 4
+            if is_mask {
+                cov := sample_mask_f(tex, tex_w, tex_h, linear, u, v)
+                out_a := va * cov
+                blend_premultiplied_pixel(pixels, idx,
+                    vr * out_a, vg * out_a, vb * out_a, out_a)
+            } else {
+                texel := sample_texture_f(tex, tex_w, tex_h, linear, u, v)
+                blend_straight_pixel(pixels, idx,
+                    vr * texel[0], vg * texel[1], vb * texel[2], va * texel[3])
+            }
+        }
+    }
+}
+
+fn soft_draw_batch_mode(pixels $&[]u8, width int, height int,
+    clip_x int, clip_y int, clip_w int, clip_h int,
+    tex &[]u8, tex_w int, tex_h int, linear bool, is_mask bool, batch &canvas.Batch2D) {
+    if pixels.len != width * height * 4 || width <= 0 || height <= 0 { << }
+    min_x := clamp_i(clip_x, 0, width)
+    min_y := clamp_i(clip_y, 0, height)
+    max_x := clamp_i(clip_x + clip_w, 0, width)
+    max_y := clamp_i(clip_y + clip_h, 0, height)
+    if min_x >= max_x || min_y >= max_y { << }
+
+    tri_count := batch.triangle_count()
+    for t in 0:tri_count {
+        base := t * 3
+        v0 := batch.vertex_at(base) or (err) { << }
+        v1 := batch.vertex_at(base + 1) or (err) { << }
+        v2 := batch.vertex_at(base + 2) or (err) { << }
+        soft_draw_triangle_mode(pixels, width, height, min_x, min_y, max_x, max_y,
+            tex, tex_w, tex_h, linear, is_mask, v0, v1, v2)
+    }
+}
+
+fn soft_draw_batch(pixels $&[]u8, width int, height int,
+    clip_x int, clip_y int, clip_w int, clip_h int,
+    tex &[]u8, tex_w int, tex_h int, linear bool, batch &canvas.Batch2D) {
+    soft_draw_batch_mode(pixels, width, height, clip_x, clip_y, clip_w, clip_h,
+        tex, tex_w, tex_h, linear, false, batch)
+}
+
+fn soft_draw_mask_batch(pixels $&[]u8, width int, height int,
+    clip_x int, clip_y int, clip_w int, clip_h int,
+    mask &[]u8, tex_w int, tex_h int, linear bool, batch &canvas.Batch2D) {
+    soft_draw_batch_mode(pixels, width, height, clip_x, clip_y, clip_w, clip_h,
+        mask, tex_w, tex_h, linear, true, batch)
+}
+
+fn unpack_premul(color int) []f64 {
+    a := f64(color & 255) / 255.0
+    r := (f64((color >> 24) & 255) / 255.0) * a
+    g := (f64((color >> 16) & 255) / 255.0) * a
+    b := (f64((color >> 8) & 255) / 255.0) * a
+    << [r, g, b, a]
+}
+
+fn soft_draw_sdf_rect(pixels $&[]u8, width int, height int,
+    min_x int, min_y int, max_x int, max_y int, rect canvas.SdfRect) {
+    bw := rect.bounds.size.x
+    bh := rect.bounds.size.y
+    if bw <= 0.0 || bh <= 0.0 { << }
+    half_w := bw * 0.5
+    half_h := bh * 0.5
+    cx := rect.bounds.position.x + half_w
+    cy := rect.bounds.position.y + half_h
+    r := clamp_f(rect.radius, 0.0, min_f(half_w, half_h))
+    border_w := max_f(rect.border_width, 0.0)
+
+    bx0 := clamp_i(int(math.floor(rect.bounds.position.x - 1.0)), min_x, max_x)
+    by0 := clamp_i(int(math.floor(rect.bounds.position.y - 1.0)), min_y, max_y)
+    bx1 := clamp_i(int(math.ceil(rect.bounds.position.x + bw + 1.0)), min_x, max_x)
+    by1 := clamp_i(int(math.ceil(rect.bounds.position.y + bh + 1.0)), min_y, max_y)
+    if bx0 >= bx1 || by0 >= by1 { << }
+
+    fill_p := unpack_premul(rect.fill_color)
+    border_p := unpack_premul(rect.border_color)
+    has_border := border_w > 0.0 && half_w > 0.0 && half_h > 0.0
+
+    for py in by0:by1 {
+        ly := f64(py) + 0.5 - cy
+        aqy := math.abs(ly) - half_h + r
+        for px in bx0:bx1 {
+            lx := f64(px) + 0.5 - cx
+            aqx := math.abs(lx) - half_w + r
+            mx := max_f(aqx, 0.0)
+            my := max_f(aqy, 0.0)
+            d := math.sqrt(mx * mx + my * my) + min_f(max_f(aqx, aqy), 0.0) - r
+            outer_cov := 1.0 - smoothstep_f(-0.5, 0.5, d)
+            if outer_cov <= 0.0 { -> }
+
+            $cr := fill_p[0]
+            $cg := fill_p[1]
+            $cb := fill_p[2]
+            $ca := fill_p[3]
+            if has_border {
+                inner_t := smoothstep_f(-border_w - 0.5, -border_w + 0.5, d)
+                cr = fill_p[0] + (border_p[0] - fill_p[0]) * inner_t
+                cg = fill_p[1] + (border_p[1] - fill_p[1]) * inner_t
+                cb = fill_p[2] + (border_p[2] - fill_p[2]) * inner_t
+                ca = fill_p[3] + (border_p[3] - fill_p[3]) * inner_t
+            }
+            idx := (py * width + px) * 4
+            blend_premultiplied_pixel(pixels, idx,
+                cr * outer_cov, cg * outer_cov, cb * outer_cov, ca * outer_cov)
+        }
+    }
+}
+
+fn soft_draw_sdf_batch(pixels $&[]u8, width int, height int,
+    clip_x int, clip_y int, clip_w int, clip_h int, batch &canvas.SdfBatch) {
+    if pixels.len != width * height * 4 || width <= 0 || height <= 0 { << }
+    min_x := clamp_i(clip_x, 0, width)
+    min_y := clamp_i(clip_y, 0, height)
+    max_x := clamp_i(clip_x + clip_w, 0, width)
+    max_y := clamp_i(clip_y + clip_h, 0, height)
+    if min_x >= max_x || min_y >= max_y { << }
+
+    count := batch.rect_count()
+    for i in 0:count {
+        rect := batch.rect_at(i) or (err) { << }
+        soft_draw_sdf_rect(pixels, width, height, min_x, min_y, max_x, max_y, rect)
+    }
+}

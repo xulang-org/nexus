@@ -1,0 +1,800 @@
+@"github.com/xulang-org/game/integration/ui"
+
+fm #"github.com/xulang-org/game/foundation/math"
+draw #ui/draw
+font #ui/font
+layout #ui/layout
+#errors
+#math
+#strings
+
+const XDF_MAGIC_LE = 826688600 // "XDF1"
+const XDF_HEADER_LEN = 32
+const XDF_OP_BACKGROUND = 1
+const XDF_OP_COLOR = 2
+const XDF_OP_FILL = 3
+const XDF_OP_STROKE = 4
+const XDF_OP_WIDTH = 5
+const XDF_OP_SAVE = 6
+const XDF_OP_RESTORE = 7
+const XDF_OP_ORIGIN = 8
+const XDF_OP_TRANSLATE = 9
+const XDF_OP_ROTATE = 10
+const XDF_OP_SCALE = 11
+const XDF_OP_CLIP_RECT = 12
+const XDF_OP_RECT = 13
+const XDF_OP_RECT_LINE = 14
+const XDF_OP_FILL_RECT = 15
+const XDF_OP_STROKE_RECT = 16
+const XDF_OP_LINE = 17
+const XDF_OP_TEXT = 18
+const XDF_OP_CIRCLE = 19
+const XDF_OP_ELLIPSE = 20
+const XDF_OP_TRIANGLE = 21
+const XDF_OP_IMAGE = 22
+const XDF_OP_TEXT_LAYOUT = 23
+const XDF_OP_PATH = 24
+const XDF_OP_DISPLAY_LIST = 25
+
+const XUP_MOVE = 1
+const XUP_LINE = 2
+const XUP_QUAD = 3
+const XUP_CUBIC = 4
+const XUP_CLOSE = 5
+
+const MAX_XDF_SAVE_DEPTH = 256
+const MAX_XDF_PATH_DASHS = 32
+const MAX_XDF_PATH_SEGS = 32768
+
+struct XdfState {
+    a f64
+    b f64
+    c f64
+    d f64
+    tx f64
+    ty f64
+    fill_color int
+    stroke_color int
+    stroke_width f64
+    clip_depth int
+}
+
+fn default_xdf_state() XdfState {
+    << XdfState{
+        a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 0.0, ty: 0.0,
+        fill_color: 255, stroke_color: 255, stroke_width: 1.0,
+        clip_depth: 0
+    }
+}
+
+fn clone_xdf_state(s &XdfState) XdfState {
+    << XdfState{
+        a: s.a, b: s.b, c: s.c, d: s.d, tx: s.tx, ty: s.ty,
+        fill_color: s.fill_color, stroke_color: s.stroke_color,
+        stroke_width: s.stroke_width, clip_depth: s.clip_depth
+    }
+}
+
+fn xdf_u16(s &string, off int) int {
+    << (int(s[off]) & 255) | ((int(s[off + 1]) & 255) << 8)
+}
+
+fn xdf_u32(s &string, off int) int {
+    b0 := int(s[off]) & 255
+    b1 := int(s[off + 1]) & 255
+    b2 := int(s[off + 2]) & 255
+    b3 := int(s[off + 3]) & 255
+    << b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+fn xdf_u64(s &string, off int) int {
+    $acc := 0
+    for i in 0:8 {
+        acc = acc | ((int(s[off + i]) & 255) << (i * 8))
+    }
+    << acc
+}
+
+fn xdf_f64(s &string, off int) f64 {
+    v := math.float64_from_bits(xdf_u64(s, off))
+    if math.is_nan(v) || math.is_inf(v) {
+        >> errors.new("game ui: non-finite float in XDF1 payload")
+    }
+    << v
+}
+
+fn xdf_slice_string(s &string, off int, n int) string {
+    if n <= 0 { << "" }
+    $sb := strings.new_byte_builder(n)
+    for i in 0:n {
+        sb.write_byte(int(s[off + i]) & 255)
+    }
+    << sb.to_string()
+}
+
+fn xdf_color_from_u32(packed int) draw.Color {
+    << draw.rgba((packed >> 24) & 255, (packed >> 16) & 255, (packed >> 8) & 255, packed & 255)
+}
+
+fn xdf_point(s &XdfState, x f64, y f64) fm.Vec2 {
+    << fm.vec2(s.a * x + s.c * y + s.tx, s.b * x + s.d * y + s.ty)
+}
+
+fn xdf_read_point(s &XdfState, xdf &string, off int) fm.Vec2 {
+    px := xdf_f64(xdf, off) or >>
+    py := xdf_f64(xdf, off + 8) or >>
+    << xdf_point(s, px, py)
+}
+
+fn xdf_read_rect(xdf &string, off int) layout.Rect {
+    rx := xdf_f64(xdf, off) or >>
+    ry := xdf_f64(xdf, off + 8) or >>
+    rw := xdf_f64(xdf, off + 16) or >>
+    rh := xdf_f64(xdf, off + 24) or >>
+    << layout.Rect{x: rx, y: ry, width: rw, height: rh}
+}
+
+fn xdf_scale(s &XdfState) f64 {
+    sx := math.hypot(s.a, s.b)
+    sy := math.hypot(s.c, s.d)
+    << 0.5 * (sx + sy)
+}
+
+fn xdf_is_axis_aligned(s &XdfState) bool {
+    << math.abs(s.b) < 0.000001 && math.abs(s.c) < 0.000001 && s.a > 0.0 && s.d > 0.0
+}
+
+fn emit_quad_transformed(frame $&UiFrame, s &XdfState, x f64, y f64, w f64, h f64, color int) int {
+    if w <= 0.0 || h <= 0.0 || (color & 255) == 0 { << 0 }
+    if xdf_is_axis_aligned(s) {
+        px := s.a * x + s.tx
+        py := s.d * y + s.ty
+        pw := s.a * w
+        ph := s.d * h
+        << frame.record_sdf_rect(fm.rect2(px, py, pw, ph), 0.0, color, 0.0, 0) or >>
+    }
+    p0 := xdf_point(s, x, y)
+    p1 := xdf_point(s, x + w, y)
+    p2 := xdf_point(s, x + w, y + h)
+    p3 := xdf_point(s, x, y + h)
+    << frame.record_quad(p0, p1, p2, p3, color) or >>
+}
+
+fn emit_thick_segment(frame $&UiFrame, p0 fm.Vec2, p1 fm.Vec2, width f64, color int, square_caps bool) int {
+    if width <= 0.0 || (color & 255) == 0 { << 0 }
+    hw := width * 0.5
+    dx := p1.x - p0.x
+    dy := p1.y - p0.y
+    seg_len := math.hypot(dx, dy)
+    if seg_len < 0.000001 {
+        << frame.record_quad(
+            fm.vec2(p0.x - hw, p0.y - hw),
+            fm.vec2(p0.x + hw, p0.y - hw),
+            fm.vec2(p0.x + hw, p0.y + hw),
+            fm.vec2(p0.x - hw, p0.y + hw),
+            color
+        ) or >>
+    }
+    ux := dx / seg_len
+    uy := dy / seg_len
+    nx := -uy * hw
+    ny := ux * hw
+    $a := p0
+    $b := p1
+    if square_caps {
+        a = fm.vec2(p0.x - ux * hw, p0.y - uy * hw)
+        b = fm.vec2(p1.x + ux * hw, p1.y + uy * hw)
+    }
+    << frame.record_quad(
+        fm.vec2(a.x - nx, a.y - ny),
+        fm.vec2(b.x - nx, b.y - ny),
+        fm.vec2(b.x + nx, b.y + ny),
+        fm.vec2(a.x + nx, a.y + ny),
+        color
+    ) or >>
+}
+
+fn emit_join_cap(frame $&UiFrame, p fm.Vec2, half_w f64, color int) int {
+    if half_w <= 0.25 || (color & 255) == 0 { << 0 }
+    sides := 8
+    step := (2.0 * math.pi()) / f64(sides)
+    for i in 0:sides {
+        a0 := f64(i) * step
+        a1 := f64(i + 1) * step
+        q0 := fm.vec2(p.x + math.cos(a0) * half_w, p.y + math.sin(a0) * half_w)
+        q1 := fm.vec2(p.x + math.cos(a1) * half_w, p.y + math.sin(a1) * half_w)
+        frame.record_triangle(p, q0, q1, color) or >>
+    }
+    << 0
+}
+
+fn emit_polyline_stroke(frame $&UiFrame, pts &[]fm.Vec2, closed bool, width f64, color int, cap_style int) int {
+    if pts.len < 2 || width <= 0.0 || (color & 255) == 0 { << 0 }
+    square_caps := cap_style == 2
+    n := pts.len
+    $seg_count := n - 1
+    if closed { seg_count = n }
+    for i in 0:seg_count {
+        p0 := pts[i]
+        p1 := pts[(i + 1) % n]
+        emit_thick_segment(frame, p0, p1, width, color, square_caps && !closed && seg_count == 1) or >>
+        if i > 0 || closed {
+            emit_join_cap(frame, p0, width * 0.5, color) or >>
+        }
+    }
+    if cap_style == 1 && !closed {
+        emit_join_cap(frame, pts[0], width * 0.5, color) or >>
+        emit_join_cap(frame, pts[n - 1], width * 0.5, color) or >>
+    }
+    << 0
+}
+
+fn emit_stroke_rect_transformed(frame $&UiFrame, s &XdfState, x f64, y f64, w f64, h f64, width f64, color int) int {
+    if w < 0.0 || h < 0.0 || width <= 0.0 || (color & 255) == 0 { << 0 }
+    scaled_w := math.max(0.5, width * xdf_scale(s))
+    hw := scaled_w * 0.5
+    p0 := xdf_point(s, x, y)
+    p1 := xdf_point(s, x + w, y)
+    p2 := xdf_point(s, x + w, y + h)
+    p3 := xdf_point(s, x, y + h)
+    pts := [p0, p1, p2, p3]
+    // Extend axis-aligned edges by half width cleanly so box corners stay sharp.
+    if xdf_is_axis_aligned(s) {
+        x0 := p0.x
+        y0 := p0.y
+        x1 := p2.x
+        y1 := p2.y
+        frame.record_quad(fm.vec2(x0 - hw, y0 - hw), fm.vec2(x1 + hw, y0 - hw),
+            fm.vec2(x1 + hw, y0 + hw), fm.vec2(x0 - hw, y0 + hw), color) or >>
+        frame.record_quad(fm.vec2(x0 - hw, y1 - hw), fm.vec2(x1 + hw, y1 - hw),
+            fm.vec2(x1 + hw, y1 + hw), fm.vec2(x0 - hw, y1 + hw), color) or >>
+        frame.record_quad(fm.vec2(x0 - hw, y0 + hw), fm.vec2(x0 + hw, y0 + hw),
+            fm.vec2(x0 + hw, y1 - hw), fm.vec2(x0 - hw, y1 - hw), color) or >>
+        << frame.record_quad(fm.vec2(x1 - hw, y0 + hw), fm.vec2(x1 + hw, y0 + hw),
+            fm.vec2(x1 + hw, y1 - hw), fm.vec2(x1 - hw, y1 - hw), color) or >>
+    }
+    << emit_polyline_stroke(frame, &pts, true, scaled_w, color, 0) or >>
+}
+
+fn emit_ellipse_transformed(frame $&UiFrame, s &XdfState, cx f64, cy f64, rx f64, ry f64, color int) int {
+    if rx <= 0.0 || ry <= 0.0 || (color & 255) == 0 { << 0 }
+    if xdf_is_axis_aligned(s) && math.abs(s.a * rx - s.d * ry) < 0.001 {
+        center := xdf_point(s, cx, cy)
+        << frame.record_sdf_circle(center, s.a * rx, color, 0.0, 0) or >>
+    }
+    max_r := math.max(rx, ry) * xdf_scale(s)
+    $steps := int(math.ceil(max_r * 0.75))
+    if steps < 20 { steps = 20 }
+    if steps > 96 { steps = 96 }
+    center := xdf_point(s, cx, cy)
+    $prev := xdf_point(s, cx + rx, cy)
+    step_ang := (2.0 * math.pi()) / f64(steps)
+    for i in 1:(steps + 1) {
+        ang := f64(i) * step_ang
+        cur := xdf_point(s, cx + math.cos(ang) * rx, cy + math.sin(ang) * ry)
+        frame.record_triangle(center, prev, cur, color) or >>
+        prev = cur
+    }
+    << 0
+}
+
+fn polygon_signed_area(pts &[]fm.Vec2) f64 {
+    n := pts.len
+    $area := 0.0
+    for i in 0:n {
+        p := pts[i]
+        q := pts[(i + 1) % n]
+        area = area + (p.x * q.y - q.x * p.y)
+    }
+    << area * 0.5
+}
+
+fn cross2(o fm.Vec2, a fm.Vec2, b fm.Vec2) f64 {
+    << (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+}
+
+fn point_in_tri(p fm.Vec2, a fm.Vec2, b fm.Vec2, c fm.Vec2) bool {
+    c1 := cross2(a, b, p)
+    c2 := cross2(b, c, p)
+    c3 := cross2(c, a, p)
+    has_neg := (c1 < -0.000001) || (c2 < -0.000001) || (c3 < -0.000001)
+    has_pos := (c1 > 0.000001) || (c2 > 0.000001) || (c3 > 0.000001)
+    << !(has_neg && has_pos)
+}
+
+fn clean_polygon_pts(pts &[]fm.Vec2) []fm.Vec2 {
+    $out := []fm.Vec2{}
+    for i in 0:pts.len {
+        p := pts[i]
+        if out.len == 0 {
+            out.push(p)
+        } else {
+            last := out[out.len - 1]
+            if math.hypot(p.x - last.x, p.y - last.y) > 0.001 {
+                out.push(p)
+            }
+        }
+    }
+    if out.len >= 2 {
+        first := out[0]
+        last := out[out.len - 1]
+        if math.hypot(first.x - last.x, first.y - last.y) <= 0.001 {
+            out = out[0:out.len - 1]
+        }
+    }
+    << out
+}
+
+fn emit_polygon_fill(frame $&UiFrame, raw_pts &[]fm.Vec2, color int) int {
+    if (color & 255) == 0 { << 0 }
+    $poly := clean_polygon_pts(raw_pts)
+    if poly.len < 3 { << 0 }
+    // Orient CCW so ear-clipping convexity checks have consistent sign.
+    if polygon_signed_area(&poly) < 0.0 {
+        $rev := []fm.Vec2{}
+        $k := poly.len - 1
+        while k >= 0 {
+            rev.push(poly[k])
+            k = k - 1
+        }
+        poly = rev
+    }
+    $idx := []int{}
+    for i in 0:poly.len { idx.push(i) }
+    $guard := idx.len * idx.len + 16
+    while idx.len > 3 && guard > 0 {
+        guard = guard - 1
+        $clipped := false
+        m := idx.len
+        for i in 0:m {
+            prev := poly[idx[(i + m - 1) % m]]
+            curr := poly[idx[i]]
+            next := poly[idx[(i + 1) % m]]
+            if cross2(prev, curr, next) <= 0.000001 { -> }
+            $contains := false
+            for j in 0:m {
+                if j == i || j == ((i + m - 1) % m) || j == ((i + 1) % m) { -> }
+                if point_in_tri(poly[idx[j]], prev, curr, next) {
+                    contains = true
+                    <-
+                }
+            }
+            if !contains {
+                frame.record_triangle(prev, curr, next, color) or >>
+                // Remove i while preserving order.
+                for r in i:(m - 1) { idx[r] = idx[r + 1] }
+                idx = idx[0:idx.len - 1]
+                clipped = true
+                <-
+            }
+        }
+        if !clipped { <- }
+    }
+    if idx.len == 3 {
+        frame.record_triangle(poly[idx[0]], poly[idx[1]], poly[idx[2]], color) or >>
+    } else if idx.len > 3 {
+        // Fallback triangle fan if self-intersecting polygon stalls ear clipping.
+        p0 := poly[idx[0]]
+        for i in 1:(idx.len - 1) {
+            frame.record_triangle(p0, poly[idx[i]], poly[idx[i + 1]], color) or >>
+        }
+    }
+    << 0
+}
+
+fn emit_dashed_polyline(frame $&UiFrame, pts &[]fm.Vec2, closed bool, dashes &[]f64,
+    phase f64, width f64, color int, cap_style int) int {
+    if pts.len < 2 || dashes.len == 0 || (dashes.len % 2) != 0 {
+        << emit_polyline_stroke(frame, pts, closed, width, color, cap_style) or >>
+    }
+    $pat_len := 0.0
+    for d in dashes { pat_len = pat_len + d }
+    if pat_len <= 0.000001 {
+        << emit_polyline_stroke(frame, pts, closed, width, color, cap_style) or >>
+    }
+
+    $start_phase := math.mod(phase, pat_len)
+    if start_phase < 0.0 { start_phase = start_phase + pat_len }
+    $dash_idx := 0
+    $rem := dashes[0]
+    while start_phase > rem {
+        start_phase = start_phase - rem
+        dash_idx = (dash_idx + 1) % dashes.len
+        rem = dashes[dash_idx]
+    }
+    rem = rem - start_phase
+    $draw_on := (dash_idx % 2) == 0
+
+    $cur_run := []fm.Vec2{}
+    if draw_on { cur_run.push(pts[0]) }
+
+    $edge_count := pts.len - 1
+    if closed { edge_count = pts.len }
+    for ei in 0:edge_count {
+        a := pts[ei]
+        b := pts[(ei + 1) % pts.len]
+        dx := b.x - a.x
+        dy := b.y - a.y
+        total_len := math.hypot(dx, dy)
+        if total_len <= 0.000001 { -> }
+        $traveled := 0.0
+        while traveled < total_len - 0.000001 {
+            step := math.min(rem, total_len - traveled)
+            traveled = traveled + step
+            t := traveled / total_len
+            pt := fm.vec2(a.x + dx * t, a.y + dy * t)
+            if draw_on {
+                if cur_run.len == 0 { cur_run.push(a) }
+                cur_run.push(pt)
+            }
+            rem = rem - step
+            if rem <= 0.000001 {
+                if draw_on && cur_run.len >= 2 {
+                    emit_polyline_stroke(frame, &cur_run, false, width, color, cap_style) or >>
+                }
+                cur_run = []fm.Vec2{}
+                dash_idx = (dash_idx + 1) % dashes.len
+                rem = dashes[dash_idx]
+                draw_on = (dash_idx % 2) == 0
+                if draw_on { cur_run.push(pt) }
+            }
+        }
+    }
+    if draw_on && cur_run.len >= 2 {
+        emit_polyline_stroke(frame, &cur_run, false, width, color, cap_style) or >>
+    }
+    << 0
+}
+
+fn emit_xdf_path(frame $&UiFrame, s &XdfState, xdf &string, payload_off int, payload_len int) int {
+    if payload_len < 48 { >> errors.new("game ui: truncated XDF_PATH payload") }
+    flags := xdf_u32(xdf, payload_off)
+    color := xdf_u32(xdf, payload_off + 4)
+    count := xdf_u32(xdf, payload_off + 8)
+    dashes_n := xdf_u32(xdf, payload_off + 12)
+    if dashes_n > MAX_XDF_PATH_DASHS || (dashes_n % 2) != 0 || count > MAX_XDF_PATH_SEGS {
+        >> errors.new("game ui: invalid XDF_PATH header")
+    }
+    header_bytes := 48 + dashes_n * 8
+    if payload_len < header_bytes { >> errors.new("game ui: truncated XDF_PATH dashes") }
+    width := xdf_f64(xdf, payload_off + 16) or >>
+    _ := xdf_f64(xdf, payload_off + 24) or >>
+    phase := xdf_f64(xdf, payload_off + 32) or >>
+    tol := xdf_f64(xdf, payload_off + 40) or >>
+    $dash_lens := []f64{}
+    for i in 0:dashes_n {
+        dl := xdf_f64(xdf, payload_off + 48 + i * 8) or >>
+        dash_lens.push(dl)
+    }
+
+    is_stroke := (flags & 1) != 0
+    cap_style := (flags >> 2) & 3
+    $eff_tol := tol
+    if !is_stroke || eff_tol < 0.05 { eff_tol = 0.4 }
+
+    $all_pts := []fm.Vec2{}
+    $starts := []int{}
+    $counts := []int{}
+    $closeds := []bool{}
+    $cur_start := 0
+    $has_cur := false
+    $cur := fm.vec2(0.0, 0.0)
+    $start := fm.vec2(0.0, 0.0)
+
+    $cursor := payload_off + header_bytes
+    end_off := payload_off + payload_len
+    for _seg in 0:count {
+        if end_off - cursor < 4 { >> errors.new("game ui: truncated XDF_PATH verb") }
+        verb := xdf_u32(xdf, cursor)
+        cursor = cursor + 4
+        if verb == XUP_MOVE {
+            if end_off - cursor < 16 { >> errors.new("game ui: truncated XUP_MOVE") }
+            if has_cur && all_pts.len > cur_start {
+                starts.push(cur_start)
+                counts.push(all_pts.len - cur_start)
+                closeds.push(false)
+            }
+            cur_start = all_pts.len
+            p := xdf_read_point(s, xdf, cursor) or >>
+            all_pts.push(p)
+            has_cur = true
+            cur = p
+            start = p
+            cursor = cursor + 16
+        } else if verb == XUP_LINE {
+            if end_off - cursor < 16 { >> errors.new("game ui: truncated XUP_LINE") }
+            p := xdf_read_point(s, xdf, cursor) or >>
+            all_pts.push(p)
+            cur = p
+            cursor = cursor + 16
+        } else if verb == XUP_QUAD {
+            if end_off - cursor < 32 { >> errors.new("game ui: truncated XUP_QUAD") }
+            c := xdf_read_point(s, xdf, cursor) or >>
+            p := xdf_read_point(s, xdf, cursor + 16) or >>
+            chord := math.hypot(c.x - cur.x, c.y - cur.y) + math.hypot(p.x - c.x, p.y - c.y)
+            $steps := int(math.ceil(chord / math.max(1.0, eff_tol * 4.0)))
+            if steps < 2 { steps = 2 }
+            if steps > 64 { steps = 64 }
+            for k in 1:(steps + 1) {
+                t := f64(k) / f64(steps)
+                u := 1.0 - t
+                qx := u * u * cur.x + 2.0 * u * t * c.x + t * t * p.x
+                qy := u * u * cur.y + 2.0 * u * t * c.y + t * t * p.y
+                all_pts.push(fm.vec2(qx, qy))
+            }
+            cur = p
+            cursor = cursor + 32
+        } else if verb == XUP_CUBIC {
+            if end_off - cursor < 48 { >> errors.new("game ui: truncated XUP_CUBIC") }
+            c1 := xdf_read_point(s, xdf, cursor) or >>
+            c2 := xdf_read_point(s, xdf, cursor + 16) or >>
+            p := xdf_read_point(s, xdf, cursor + 32) or >>
+            chord := math.hypot(c1.x - cur.x, c1.y - cur.y) + math.hypot(c2.x - c1.x, c2.y - c1.y) + math.hypot(p.x - c2.x, p.y - c2.y)
+            $steps := int(math.ceil(chord / math.max(1.0, eff_tol * 4.0)))
+            if steps < 4 { steps = 4 }
+            if steps > 64 { steps = 64 }
+            for k in 1:(steps + 1) {
+                t := f64(k) / f64(steps)
+                u := 1.0 - t
+                u2 := u * u
+                t2 := t * t
+                cx := u2 * u * cur.x + 3.0 * u2 * t * c1.x + 3.0 * u * t2 * c2.x + t2 * t * p.x
+                cy := u2 * u * cur.y + 3.0 * u2 * t * c1.y + 3.0 * u * t2 * c2.y + t2 * t * p.y
+                all_pts.push(fm.vec2(cx, cy))
+            }
+            cur = p
+            cursor = cursor + 48
+        } else if verb == XUP_CLOSE {
+            if all_pts.len > cur_start {
+                starts.push(cur_start)
+                counts.push(all_pts.len - cur_start)
+                closeds.push(true)
+            }
+            cur_start = all_pts.len
+            has_cur = false
+            cur = start
+        } else {
+            >> errors.new("game ui: invalid XDF_PATH verb")
+        }
+    }
+    if has_cur && all_pts.len > cur_start {
+        starts.push(cur_start)
+        counts.push(all_pts.len - cur_start)
+        closeds.push(false)
+    }
+
+    if is_stroke {
+        scaled_w := math.max(0.5, width * xdf_scale(s))
+        scaled_phase := phase * xdf_scale(s)
+        $scaled_dashes := []f64{}
+        for d in dash_lens { scaled_dashes.push(d * xdf_scale(s)) }
+        for ci in 0:starts.len {
+            s0 := starts[ci]
+            c0 := counts[ci]
+            $cpts := []fm.Vec2{}
+            for k in 0:c0 {
+                cpts.push(all_pts[s0 + k])
+            }
+            if scaled_dashes.len > 0 {
+                emit_dashed_polyline(frame, &cpts, closeds[ci], &scaled_dashes, scaled_phase,
+                    scaled_w, color, cap_style) or >>
+            } else {
+                emit_polyline_stroke(frame, &cpts, closeds[ci], scaled_w, color, cap_style) or >>
+            }
+        }
+        << 0
+    }
+
+    for ci in 0:starts.len {
+        s0 := starts[ci]
+        c0 := counts[ci]
+        $cpts := []fm.Vec2{}
+        for k in 0:c0 {
+            cpts.push(all_pts[s0 + k])
+        }
+        emit_polygon_fill(frame, &cpts, color) or >>
+    }
+    << 0
+}
+
+fn push_transformed_clip(frame $&UiFrame, s $&XdfState, x f64, y f64, w f64, h f64) int {
+    p0 := xdf_point(s, x, y)
+    p1 := xdf_point(s, x + w, y)
+    p2 := xdf_point(s, x + w, y + h)
+    p3 := xdf_point(s, x, y + h)
+    min_x := math.min(math.min(p0.x, p1.x), math.min(p2.x, p3.x))
+    min_y := math.min(math.min(p0.y, p1.y), math.min(p2.y, p3.y))
+    max_x := math.max(math.max(p0.x, p1.x), math.max(p2.x, p3.x))
+    max_y := math.max(math.max(p0.y, p1.y), math.max(p2.y, p3.y))
+    rect := layout.Rect{
+        x: min_x, y: min_y,
+        width: math.max(0.0, max_x - min_x),
+        height: math.max(0.0, max_y - min_y)
+    }
+    frame.push_clip(&rect) or >>
+    s.clip_depth = s.clip_depth + 1
+    << 0
+}
+
+// Replays a sealed XDF1 binary buffer produced by #ui/draw Frame.export_xdf()
+// onto a UiFrame inside viewport, preserving transforms, clips, paths and text.
+pub fn (frame $&UiFrame) replay_xdf(xdf &string, viewport &layout.Rect) int {
+    recording(frame) or >>
+    if xdf.len < XDF_HEADER_LEN { >> errors.new("game ui: XDF1 buffer shorter than 32-byte header") }
+    if xdf_u32(xdf, 0) != XDF_MAGIC_LE { >> errors.new("game ui: invalid XDF1 magic") }
+    version := xdf_u32(xdf, 4)
+    if version != 1 && version != 2 { >> errors.new("game ui: unsupported XDF1 version") }
+    total_bytes := xdf_u32(xdf, 8)
+    cmd_count := xdf_u32(xdf, 12)
+    if total_bytes != xdf.len || total_bytes < XDF_HEADER_LEN {
+        >> errors.new("game ui: corrupt XDF1 total length")
+    }
+
+    frame.push_clip(viewport) or >>
+    $state := default_xdf_state()
+    $stack := []XdfState{}
+    $off := XDF_HEADER_LEN
+    $seen := 0
+
+    while off < total_bytes {
+        if total_bytes - off < 8 { >> errors.new("game ui: truncated XDF1 command header") }
+        op := xdf_u16(xdf, off)
+        reserved := xdf_u16(xdf, off + 2)
+        size := xdf_u32(xdf, off + 4)
+        if reserved != 0 || size < 8 || size > total_bytes - off {
+            >> errors.new("game ui: invalid XDF1 command record")
+        }
+        p := off + 8
+        plen := size - 8
+
+        if op == XDF_OP_BACKGROUND {
+            if plen != 4 { >> errors.new("game ui: invalid XDF_BACKGROUND") }
+            col := xdf_u32(xdf, p)
+            frame.record_sdf_rect(fm.rect2(viewport.x, viewport.y, viewport.width, viewport.height),
+                0.0, col, 0.0, 0) or >>
+        } else if op == XDF_OP_COLOR {
+            if plen != 4 { >> errors.new("game ui: invalid XDF_COLOR") }
+            c := xdf_u32(xdf, p)
+            state.fill_color = c
+            state.stroke_color = c
+        } else if op == XDF_OP_FILL {
+            if plen != 4 { >> errors.new("game ui: invalid XDF_FILL") }
+            state.fill_color = xdf_u32(xdf, p)
+        } else if op == XDF_OP_STROKE {
+            if plen != 4 { >> errors.new("game ui: invalid XDF_STROKE") }
+            state.stroke_color = xdf_u32(xdf, p)
+        } else if op == XDF_OP_WIDTH {
+            if plen != 8 { >> errors.new("game ui: invalid XDF_WIDTH") }
+            sw := xdf_f64(xdf, p) or >>
+            state.stroke_width = sw
+        } else if op == XDF_OP_SAVE {
+            if plen != 0 || stack.len >= MAX_XDF_SAVE_DEPTH { >> errors.new("game ui: invalid XDF_SAVE") }
+            stack.push(clone_xdf_state(&state))
+        } else if op == XDF_OP_RESTORE {
+            if plen != 0 || stack.len == 0 { >> errors.new("game ui: unbalanced XDF_RESTORE") }
+            prev := stack[stack.len - 1]
+            stack = stack[0:stack.len - 1]
+            while state.clip_depth > prev.clip_depth {
+                frame.pop_clip() or >>
+                state.clip_depth = state.clip_depth - 1
+            }
+            state = prev
+        } else if op == XDF_OP_ORIGIN {
+            if plen != 0 { >> errors.new("game ui: invalid XDF_ORIGIN") }
+            state.a = 1.0
+            state.b = 0.0
+            state.c = 0.0
+            state.d = 1.0
+            state.tx = 0.0
+            state.ty = 0.0
+        } else if op == XDF_OP_TRANSLATE {
+            if plen != 16 { >> errors.new("game ui: invalid XDF_TRANSLATE") }
+            dx := xdf_f64(xdf, p) or >>
+            dy := xdf_f64(xdf, p + 8) or >>
+            state.tx = state.tx + state.a * dx + state.c * dy
+            state.ty = state.ty + state.b * dx + state.d * dy
+        } else if op == XDF_OP_ROTATE {
+            if plen != 8 { >> errors.new("game ui: invalid XDF_ROTATE") }
+            deg := xdf_f64(xdf, p) or >>
+            rad := deg * 0.017453292519943295
+            cs := math.cos(rad)
+            sn := math.sin(rad)
+            pa := state.a
+            pb := state.b
+            pc := state.c
+            pd := state.d
+            state.a = pa * cs + pc * sn
+            state.b = pb * cs + pd * sn
+            state.c = pc * cs - pa * sn
+            state.d = pd * cs - pb * sn
+        } else if op == XDF_OP_SCALE {
+            if plen != 16 { >> errors.new("game ui: invalid XDF_SCALE") }
+            sx := xdf_f64(xdf, p) or >>
+            sy := xdf_f64(xdf, p + 8) or >>
+            state.a = state.a * sx
+            state.b = state.b * sx
+            state.c = state.c * sy
+            state.d = state.d * sy
+        } else if op == XDF_OP_CLIP_RECT {
+            if plen != 32 { >> errors.new("game ui: invalid XDF_CLIP_RECT") }
+            rr := xdf_read_rect(xdf, p) or >>
+            push_transformed_clip(frame, $&state, rr.x, rr.y, rr.width, rr.height) or >>
+        } else if op == XDF_OP_RECT {
+            if plen != 32 { >> errors.new("game ui: invalid XDF_RECT") }
+            rr := xdf_read_rect(xdf, p) or >>
+            emit_quad_transformed(frame, &state, rr.x, rr.y, rr.width, rr.height, state.fill_color) or >>
+        } else if op == XDF_OP_RECT_LINE {
+            if plen != 32 { >> errors.new("game ui: invalid XDF_RECT_LINE") }
+            rr := xdf_read_rect(xdf, p) or >>
+            emit_stroke_rect_transformed(frame, &state, rr.x, rr.y, rr.width, rr.height,
+                state.stroke_width, state.stroke_color) or >>
+        } else if op == XDF_OP_FILL_RECT {
+            if plen != 36 { >> errors.new("game ui: invalid XDF_FILL_RECT") }
+            rr := xdf_read_rect(xdf, p) or >>
+            emit_quad_transformed(frame, &state, rr.x, rr.y, rr.width, rr.height, xdf_u32(xdf, p + 32)) or >>
+        } else if op == XDF_OP_STROKE_RECT {
+            if plen != 44 { >> errors.new("game ui: invalid XDF_STROKE_RECT") }
+            rr := xdf_read_rect(xdf, p) or >>
+            sw := xdf_f64(xdf, p + 32) or >>
+            emit_stroke_rect_transformed(frame, &state, rr.x, rr.y, rr.width, rr.height,
+                sw, xdf_u32(xdf, p + 40)) or >>
+        } else if op == XDF_OP_LINE {
+            if plen != 44 { >> errors.new("game ui: invalid XDF_LINE") }
+            p0 := xdf_read_point(&state, xdf, p) or >>
+            p1 := xdf_read_point(&state, xdf, p + 16) or >>
+            raw_lw := xdf_f64(xdf, p + 32) or >>
+            lw := math.max(0.5, raw_lw * xdf_scale(&state))
+            emit_thick_segment(frame, p0, p1, lw, xdf_u32(xdf, p + 40), false) or >>
+        } else if op == XDF_OP_TEXT {
+            if plen < 28 { >> errors.new("game ui: invalid XDF_TEXT") }
+            pos := xdf_read_point(&state, xdf, p) or >>
+            raw_sz := xdf_f64(xdf, p + 16) or >>
+            size_px := raw_sz * xdf_scale(&state)
+            col := xdf_color_from_u32(xdf_u32(xdf, p + 24))
+            txt := xdf_slice_string(xdf, p + 28, plen - 28)
+            if txt.len > 0 && size_px > 0.0 && (col.value() & 255) > 0 {
+                opts := font.default_options(size_px)
+                ly := font.layout_text(&frame.stack, &txt, &opts) or >>
+                frame.record_text_layout(ly, pos, col) or >>
+            }
+        } else if op == XDF_OP_CIRCLE {
+            if plen != 24 { >> errors.new("game ui: invalid XDF_CIRCLE") }
+            cx := xdf_f64(xdf, p) or >>
+            cy := xdf_f64(xdf, p + 8) or >>
+            r := xdf_f64(xdf, p + 16) or >>
+            emit_ellipse_transformed(frame, &state, cx, cy, r, r, state.fill_color) or >>
+        } else if op == XDF_OP_ELLIPSE {
+            if plen != 32 { >> errors.new("game ui: invalid XDF_ELLIPSE") }
+            ex := xdf_f64(xdf, p) or >>
+            ey := xdf_f64(xdf, p + 8) or >>
+            ew := xdf_f64(xdf, p + 16) or >>
+            eh := xdf_f64(xdf, p + 24) or >>
+            rx := ew * 0.5
+            ry := eh * 0.5
+            emit_ellipse_transformed(frame, &state, ex + rx, ey + ry,
+                rx, ry, state.fill_color) or >>
+        } else if op == XDF_OP_TRIANGLE {
+            if plen != 48 { >> errors.new("game ui: invalid XDF_TRIANGLE") }
+            t0 := xdf_read_point(&state, xdf, p) or >>
+            t1 := xdf_read_point(&state, xdf, p + 16) or >>
+            t2 := xdf_read_point(&state, xdf, p + 32) or >>
+            if (state.fill_color & 255) > 0 {
+                frame.record_triangle(t0, t1, t2, state.fill_color) or >>
+            }
+        } else if op == XDF_OP_PATH {
+            emit_xdf_path(frame, &state, xdf, p, plen) or >>
+        } else if op == XDF_OP_IMAGE || op == XDF_OP_TEXT_LAYOUT || op == XDF_OP_DISPLAY_LIST {
+            >> errors.new("game ui: host-owned resource opcodes require the in-process UI host")
+        } else {
+            >> errors.new("game ui: unsupported XDF1 opcode " + str(op))
+        }
+
+        off = off + size
+        seen = seen + 1
+    }
+
+    if seen != cmd_count { >> errors.new("game ui: XDF1 command count mismatch") }
+    if stack.len != 0 || state.clip_depth != 0 { >> errors.new("game ui: unbalanced XDF1 state stack") }
+    frame.pop_clip() or >>
+    << 0
+}

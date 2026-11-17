@@ -1,0 +1,82 @@
+@"github.com/xulang-org/game/integration/rendering/three_d"
+
+light_data #"github.com/xulang-org/game/resources/lighting"
+
+fm #"github.com/xulang-org/game/foundation/math"
+game #"github.com/xulang-org/game/scene"
+#errors
+ren #"github.com/xulang-org/game/rendering/three_d"
+
+pub fn (scene $&Scene3D) set_material(tree &game.SceneTree, node int, material ren.Material3D) int {
+    info := tree.node_info(node) or >>
+    if info.queued_free || info.kind != game.NODE_3D { >> errors.new("game GPU: material requires an editable Node3D") }
+    if !scene.meshes.has(node) { >> errors.new("game GPU: attach a mesh before its material") }
+    scene.owner.validate_material(scene.meshes[node], &material) or >>
+    if scene.lods.has(node) {
+        binding := &scene.lods[node]
+        for mesh in binding.meshes { scene.owner.validate_material(mesh,&material) or >> }
+    }
+    scene.materials[node] = material
+    << 0
+}
+pub fn (scene $&Scene3D) clear_material(node int) int {
+    if !scene.materials.has(node) { << 0 }
+    materials := $&scene.materials
+    materials.delete(node)
+    << 1
+}
+// Material-bound meshes use world-space normals; others retain the unlit path.
+pub fn (scene &Scene3D) draw_lit(device $&ren.Device3D, tree &game.SceneTree, view_projection fm.Mat4, lighting &light_data.Environment3D) SceneDraw3D {
+    empty := ren.no_shadow_binding()
+    << scene.draw_lit_with_shadow(device,tree,view_projection,lighting,&empty) or >>
+}
+pub fn (scene &Scene3D) draw_lit_shadowed(device $&ren.Device3D,tree &game.SceneTree,view_projection fm.Mat4,
+    lighting &light_data.Environment3D,shadow &ren.ShadowMap3D,source int) SceneDraw3D {
+    binding := shadow.binding(lighting,source) or >>
+    binding.validate_camera(view_projection) or >>
+    << scene.draw_lit_with_shadow(device,tree,view_projection,lighting,&binding) or >>
+}
+fn (scene &Scene3D) draw_lit_with_shadow(device $&ren.Device3D,tree &game.SceneTree,view_projection fm.Mat4,
+    lighting &light_data.Environment3D,shadow &ren.ShadowBinding3D) SceneDraw3D {
+    if !scene.owner.matches(device) { >> errors.new("game GPU: scene belongs to another device") }
+    device.validate_recording() or >>
+    lighting.validate() or >>
+    if !view_projection.is_finite() { >> errors.new("game GPU: invalid scene view-projection") }
+    order := tree.subtree(tree.root()) or >>
+    $instances := 0
+    $triangles := 0
+    $culled_instances := 0
+    $culled_triangles := 0
+    $lod_instances := 0
+    $lod_triangles_saved := 0
+    for node in order {
+        if !scene.meshes.has(node) { -> }
+        if !(tree.is_visible(node) or >>) { -> }
+        mesh := scene.selected_mesh(node) or >>
+        world := tree.global_transform_3d(node) or >>
+        $count := 0
+        if scene.materials.has(node) {
+            material := scene.materials[node]
+            if !(scene.owner.material_in_view(mesh,world,view_projection,&material) or >>) {
+                culled_instances+=1
+                culled_triangles+=mesh.triangle_count()
+                ->
+            }
+            count = device.draw_material_shadowed_reference(mesh, world, view_projection, &material, lighting,shadow) or >>
+        } else {
+            mvp := view_projection.multiply(world)
+            if !(scene.owner.mesh_in_view(mesh,mvp) or >>) {
+                culled_instances+=1
+                culled_triangles+=mesh.triangle_count()
+                ->
+            }
+            count = device.draw_reference(mesh,mvp) or >>
+        }
+        instances = instances + 1
+        triangles = triangles + count
+        if (scene.lod_level(node) or >>)>0 { lod_instances+=1
+            lod_triangles_saved+=scene.meshes[node].triangle_count()-count }
+    }
+    << SceneDraw3D{instances: instances,triangles: triangles,culled_instances: culled_instances,culled_triangles: culled_triangles,
+        lod_instances: lod_instances,lod_triangles_saved: lod_triangles_saved}
+}

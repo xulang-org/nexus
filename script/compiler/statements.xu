@@ -1,0 +1,104 @@
+@"github.com/xulang-org/game/script/compiler"
+
+bc #"github.com/xulang-org/game/script/bytecode"
+#xu/ast
+#errors
+
+fn (compiler $&Compiler) block(head int) int {
+    if compiler.depth >= 64 { >> errors.new(compiler.error(head, "statement nesting limit")) }
+    compiler.depth = compiler.depth + 1
+    first_local := compiler.locals.len
+    $node := head
+    while node >= 0 { compiler.statement(node) or >>
+        node = compiler.parser.nodes[node].next }
+    for i in first_local:compiler.locals.len { compiler.locals[i].active = false }
+    compiler.depth = compiler.depth - 1
+    << 0
+}
+fn (compiler $&Compiler) statement(node int) int {
+    statement := compiler.syntax(node)
+    kind := statement.kind
+    if kind == ast.NK_LET {
+        name := statement.sval + ""
+        if name == "self" || name == "emit_signal" || compiler.local_index(&name) >= 0 {
+            >> errors.new(compiler.error(node, "duplicate/shadowed local variable or reserved signal intrinsic")) }
+        value := compiler.expr(statement.a) or >>
+        type := compiler.registers[value]
+        if statement.b >= 0 {
+            declared := compiler.parser.nodes[statement.b].kind
+            if (declared != ast.NT_F64 || type != bc.F64) && (declared != ast.NT_BOOL || type != bc.BOOL) {
+                >> errors.new(compiler.error(node, "declared local type differs from expression"))
+            }
+        }
+        // A declaration gets its own register: immutable aliases must not change
+        // when a mutable source local is later assigned.
+        register := compiler.allocate(type, node) or >>
+        compiler.emit(bc.MOVE, register, value, 0, node) or >>
+        compiler.locals.push(Local{name: name, register: register, mutable: statement.ival == 1, active: true})
+    } else if kind == ast.NK_ASSIGN {
+        compiler.assignment(node) or >>
+    } else if kind == ast.NK_RETURN {
+        value := compiler.expr(statement.a) or >>
+        compiler.require_kind(value, bc.F64, node) or >>
+        compiler.emit(bc.RETURN, 0, value, 0, node) or >>
+    } else if kind == ast.NK_IF {
+        $branch := statement.a
+        $exits := []int{}
+        while branch >= 0 {
+            condition := compiler.parser.nodes[branch].a
+            $test := -1
+            if condition >= 0 {
+                value := compiler.expr(condition) or >>
+                compiler.require_kind(value, bc.BOOL, node) or >>
+                test = compiler.emit(bc.BRANCH_FALSE, 0, value, 0, branch) or >>
+            }
+            compiler.block(compiler.parser.nodes[branch].b) or >>
+            exits.push(compiler.emit(bc.JUMP, 0, 0, 0, branch) or >>)
+            if test >= 0 { compiler.code[test].dst = compiler.code.len }
+            branch = compiler.parser.nodes[branch].next
+        }
+        for target_index in exits { compiler.code[target_index].dst = compiler.code.len }
+    } else if kind == ast.NK_WHILE {
+        start := compiler.code.len
+        condition := compiler.expr(statement.a) or >>
+        compiler.require_kind(condition, bc.BOOL, node) or >>
+        test := compiler.emit(bc.BRANCH_FALSE, 0, condition, 0, node) or >>
+        compiler.block(statement.c) or >>
+        compiler.emit(bc.JUMP, start, 0, 0, node) or >>
+        compiler.code[test].dst = compiler.code.len
+    } else if kind == ast.NK_EXPR_STMT {
+        compiler.signal_statement(statement.a) or >>
+    } else { >> errors.new(compiler.error(node, "statement is outside the scalar script profile")) }
+    << 0
+}
+fn (compiler $&Compiler) assignment(node int) int {
+    statement := compiler.syntax(node)
+    target := compiler.syntax(statement.a)
+    $local := -1
+    $field := -1
+    $type := bc.F64
+    if target.kind == ast.NK_IDENT {
+        local = compiler.local_index(&target.sval)
+        if local < 0 || !compiler.locals[local].mutable { >> errors.new(compiler.error(node, "assignment requires a mutable local")) }
+        type = compiler.registers[compiler.locals[local].register]
+    } else if target.kind == ast.NK_FIELD { field = compiler.field_index(statement.a) or >>
+    } else { >> errors.new(compiler.error(node, "assignment target is unsupported")) }
+    $value := compiler.expr(statement.b) or >>
+    compiler.require_kind(value, type, node) or >>
+    if statement.ival != ast.AS_ASSIGN {
+        compiler.require_kind(value, bc.F64, node) or >>
+        previous := compiler.expr(statement.a) or >>
+        $op := 0
+        if statement.ival == ast.AS_ADD { op = bc.ADD
+        } else if statement.ival == ast.AS_SUB { op = bc.SUBTRACT
+        } else if statement.ival == ast.AS_MUL { op = bc.MULTIPLY
+        } else if statement.ival == ast.AS_DIV { op = bc.DIVIDE
+        } else { >> errors.new(compiler.error(node, "compound assignment operator is unsupported")) }
+        result := compiler.allocate(bc.F64, node) or >>
+        compiler.emit(op, result, previous, value, node) or >>
+        value = result
+    }
+    if local >= 0 { compiler.emit(bc.MOVE, compiler.locals[local].register, value, 0, node) or >>
+    } else { compiler.emit(bc.STORE_FIELD, field, value, 0, node) or >> }
+    << 0
+}

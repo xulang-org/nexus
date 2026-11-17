@@ -1,0 +1,234 @@
+@"github.com/xulang-org/game/integration/scene_audio"
+
+resource #"github.com/xulang-org/game/resources/scene"
+node_files #"github.com/xulang-org/game/integration/scene"
+game #"github.com/xulang-org/game/scene"
+scene_audio #"github.com/xulang-org/game/integration/audio"
+mix #"github.com/xulang-org/game/audio/mixer"
+audio #"github.com/xulang-org/game/audio"
+wav #"github.com/xulang-org/game/formats/wav"
+snapshot #"github.com/xulang-org/game/internal/file_snapshot"
+#crypto/sha256
+#path/filepath
+#errors
+
+const MAX_SOURCE_BYTES = 67108864
+// One isolated audio world with a private mixer. Device output is supplied by
+// the caller; no native device or queue is touched while loading a candidate.
+pub struct AudioScene {
+    pub tree game.SceneTree
+    root_node int
+    nodes []int
+    document resource.Document
+    mixer mix.Mixer
+    clips map[string]int
+    voices []int
+    base_directory string
+    closed bool
+}
+pub fn load(path string, sample_rate int) AudioScene {
+    document := node_files.load(path + "") or >>
+    if document.script_count() > 0 || document.surface_count() > 0 || document.light_count() > 0 { >> errors.new("game scene audio: other attachments require explicit load_audio and service binding") }
+    directory := filepath.dir(&path)
+    << prepare_audio(document, directory, sample_rate) or >>
+}
+// Explicit partial restore for an application composing audio and GPU services.
+pub fn load_audio(path string, sample_rate int) AudioScene {
+    document := node_files.load(path + "") or >>
+    directory := filepath.dir(&path)
+    << prepare_audio(document, directory, sample_rate) or >>
+}
+pub fn prepare_audio(document resource.Document, base_directory string, sample_rate int) AudioScene {
+    directory := filepath.abs(&base_directory) or >>
+    $mixer := mix.new_mixer(sample_rate, mix.MAX_VOICES) or >>
+    $clips := map[string]int{}
+    $by_hash := map[string]int{}
+    $source_bytes := 0
+    for i in 0:document.resource_count() {
+        reference := document.resource(i) or >>
+        if reference.kind != "wav_clip" { -> }
+        path := filepath.join([directory + "", reference.path + ""])
+        $limit := wav.MAX_BYTES
+        if MAX_SOURCE_BYTES - source_bytes < limit { limit = MAX_SOURCE_BYTES - source_bytes }
+        if limit < 1 { >> errors.new("game scene audio: WAV source budget exceeds 64 MiB") }
+        raw := snapshot.read(path, limit) or >>
+        source_bytes = source_bytes + raw.len
+        hash := sha256.sum256(raw + "")
+        if hash != reference.content_hash { >> errors.new("game scene audio: WAV content hash mismatch") }
+        if !by_hash.has(hash + "") {
+            clip := wav.decode(&raw) or >>
+            slot := mixer.add_clip(clip) or >>
+            by_hash[hash + ""] = slot
+        }
+        clips[reference.uid + ""] = by_hash[hash]
+    }
+    for i in 0:document.audio_bus_count() {
+        bus := document.audio_bus(i) or >>
+        if i > 0 { mixer.add_bus(bus.parent, bus.name + "", bus.volume) or >>
+        } else { mixer.set_bus_volume(0, bus.volume) or >> }
+        mixer.mute_bus(i, bus.muted) or >>
+        mixer.pause_bus(i, bus.paused) or >>
+    }
+    packed := node_files.to_packed_nodes(&document) or >>
+    $tree := game.new_scene_tree_3d("World", document.node_count() + 1) or >>
+    parent := tree.root()
+    description := document.describe_node(0) or >>
+    root := packed.instantiate($&tree, parent, description.name + "") or >>
+    nodes := node_files.matching_nodes(&document, &tree, root) or >>
+    $voices := []int{}
+    for i in 0:document.audio_count() { voices.push(0) }
+    $world := AudioScene{tree: tree, root_node: root, nodes: nodes, document: document, mixer: mixer,
+        clips: clips, voices: voices, base_directory: directory, closed: false}
+    for i in 0:world.document.audio_count() {
+        if (world.document.audio_emitter(i) or >>).autoplay { world.play(i) or >> }
+    }
+    world.sync() or >>
+    << world
+}
+fn (world &AudioScene) check() int {
+    if world.closed || world.nodes.len == 0 { >> errors.new("game scene audio: closed or uninitialized world") }
+    << 0
+}
+pub fn (world &AudioScene) root() int { << world.root_node }
+pub fn (world &AudioScene) node(index int) int {
+    world.check() or >>
+    if index < 0 || index >= world.nodes.len { >> errors.new("game scene audio: node index outside document") }
+    << world.nodes[index]
+}
+pub fn (world &AudioScene) clip_count() int { << world.mixer.clip_count() }
+pub fn (world &AudioScene) bus_count() int { << world.mixer.bus_count() }
+pub fn (world &AudioScene) sample_rate() int { << world.mixer.sample_rate() }
+pub fn (world &AudioScene) base_directory() string { << world.base_directory + "" }
+fn (world &AudioScene) parameters(emitter &resource.AudioEmitter) mix.Spatial {
+    if emitter.spatial == "2d" { << scene_audio.spatial_2d_parameters(&world.tree, world.nodes[emitter.node], world.nodes[emitter.listener], emitter.max_distance) or >> }
+    if emitter.spatial == "3d" { << scene_audio.spatial_3d_parameters(&world.tree, world.nodes[emitter.node], world.nodes[emitter.listener], emitter.max_distance) or >> }
+    info := world.tree.node_info(world.nodes[emitter.node]) or >>
+    if info.queued_free { >> errors.new("game scene audio: emitter queued for deletion") }
+    << mix.Spatial{volume: 1.0, pan: emitter.pan}
+}
+pub fn (world $&AudioScene) play(index int) int {
+    world.check() or >>
+    emitter := world.document.audio_emitter(index) or >>
+    parameters := world.parameters(&emitter) or >>
+    old := world.voices[index]
+    if world.mixer.is_voice(old) && (world.mixer.is_playing(old) or >>) { mixer := $&world.mixer
+        mixer.restart_voice(old) or >>
+        << old }
+    clip := world.clips[emitter.resource_uid + ""]
+    node := world.nodes[emitter.node]
+    paused := !(world.tree.can_process(node) or >>)
+    mixer := $&world.mixer
+    voice := mixer.play(clip, emitter.bus, emitter.volume * parameters.volume, parameters.pan, emitter.looping) or >>
+    mixer.pause_voice(voice, paused) or >>
+    world.voices[index] = voice
+    << voice
+}
+pub fn (world &AudioScene) is_playing(index int) bool {
+    world.check() or >>
+    world.document.audio_emitter(index) or >>
+    voice := world.voices[index]
+    << world.mixer.is_voice(voice) && (world.mixer.is_playing(voice) or >>)
+}
+pub fn (world &AudioScene) position_frames(index int) f64 {
+    world.check() or >>
+    world.document.audio_emitter(index) or >>
+    << world.mixer.position_frames(world.voices[index]) or >>
+}
+pub fn (world $&AudioScene) stop(index int) int {
+    world.check() or >>
+    world.document.audio_emitter(index) or >>
+    voice := world.voices[index]
+    if world.mixer.is_voice(voice) { mixer := $&world.mixer
+        mixer.stop(voice) or >> }
+    << 0
+}
+// Compute every active source's spatial controls before changing mixer state.
+pub fn (world $&AudioScene) sync() int {
+    world.check() or >>
+    $parameters := []mix.Spatial{}
+    $gains := []f64{}
+    $stop := []bool{}
+    $paused := []bool{}
+    $active := []bool{}
+    $voices := []int{}
+    for i in 0:world.document.audio_count() {
+        emitter := world.document.audio_emitter(i) or >>
+        $cancel := !world.tree.is_alive(world.nodes[emitter.node])
+        if !cancel { cancel = (world.tree.node_info(world.nodes[emitter.node]) or >>).queued_free }
+        if emitter.listener >= 0 {
+            if !world.tree.is_alive(world.nodes[emitter.listener]) { cancel = true
+            } else if (world.tree.node_info(world.nodes[emitter.listener]) or >>).queued_free { cancel = true }
+        }
+        playing := world.is_playing(i) or >>
+        $spatial := mix.Spatial{volume: 0.0, pan: 0.0}
+        $pause := false
+        if !cancel && playing { spatial = world.parameters(&emitter) or >>
+            pause = !(world.tree.can_process(world.nodes[emitter.node]) or >>) }
+        parameters.push(spatial)
+        gains.push(emitter.volume * spatial.volume)
+        stop.push(cancel)
+        paused.push(pause)
+        active.push(playing)
+        voices.push(world.voices[i])
+    }
+    $removed := 0
+    mixer := $&world.mixer
+    for i in 0:voices.len {
+        if !active[i] { -> }
+        if stop[i] { mixer.stop(voices[i]) or >>
+            removed = removed + 1
+        } else {
+            mixer.set_volume(voices[i], gains[i]) or >>
+            mixer.set_pan(voices[i], parameters[i].pan) or >>
+            mixer.pause_voice(voices[i], paused[i]) or >>
+        }
+    }
+    << removed
+}
+
+pub fn (world $&AudioScene) render(frames int) []int {
+    world.sync() or >>
+    mixer := $&world.mixer
+    << mixer.render(frames) or >>
+}
+pub fn (world $&AudioScene) pump(output &audio.Output, target_frames int, block_frames int) audio.PumpReport {
+    world.sync() or >>
+    << audio.pump(output, $&world.mixer, target_frames, block_frames) or >>
+}
+// Runtime bus controls leave the authored startup declarations unchanged.
+pub fn (world $&AudioScene) set_bus_volume(bus int, volume f64) int {
+    world.check() or >>
+    mixer := $&world.mixer
+    << mixer.set_bus_volume(bus, volume) or >>
+}
+pub fn (world $&AudioScene) mute_bus(bus int, muted bool) int {
+    world.check() or >>
+    mixer := $&world.mixer
+    << mixer.mute_bus(bus, muted) or >>
+}
+pub fn (world $&AudioScene) pause_bus(bus int, paused bool) int {
+    world.check() or >>
+    mixer := $&world.mixer
+    << mixer.pause_bus(bus, paused) or >>
+}
+pub fn (world &AudioScene) capture() resource.Document {
+    world.check() or >>
+    node_files.matching_nodes(&world.document, &world.tree, world.root_node) or >>
+    nodes := node_files.capture_nodes(&world.tree, world.root_node) or >>
+    $references := []resource.ResourceReference{}
+    for i in 0:world.document.resource_count() { references.push(world.document.resource(i) or >>) }
+    << resource.with_references(&world.document, &nodes, references) or >>
+}
+pub fn (world &AudioScene) save(path string) int {
+    if world.document.script_count() > 0 { >> errors.new("game scene audio: save script revisions through the script restoration owner") }
+    document := world.capture() or >>
+    << node_files.save_rebased(path, &document, world.base_directory + "") or >>
+}
+pub fn (world $&AudioScene) close() int {
+    if world.closed || world.nodes.len == 0 { world.closed = true
+        << 0 }
+    empty := mix.new_mixer(world.mixer.sample_rate(), 1) or >>
+    world.mixer = empty
+    world.closed = true
+    << 0
+}

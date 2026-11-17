@@ -1,0 +1,282 @@
+@"github.com/xulang-org/game/integration/ui"
+
+#errors
+#ui
+wev #window/events
+
+// Bridges portable #window/events queues (mouse, touch, wheel, keyboard, and
+// focus/input resets) into #ui.InputEvent values bound to a widget canvas identity.
+pub struct InputBridge {
+    identity ui.CanvasEvent
+    last_x f64
+    last_y f64
+    buttons int
+    modifiers int
+    has_touch bool
+    active_touch_id int
+}
+
+pub fn new_input_bridge(window_id int, canvas_id int, generation int) InputBridge {
+    if window_id <= 0 || canvas_id <= 0 || generation <= 0 {
+        >> errors.new("game ui: window_id, canvas_id, and generation must be positive")
+    }
+    << InputBridge{
+        identity: ui.CanvasEvent{window_id: window_id, canvas_id: canvas_id, generation: generation},
+        last_x: 0.0,
+        last_y: 0.0,
+        buttons: 0,
+        modifiers: 0,
+        has_touch: false,
+        active_touch_id: 0
+    }
+}
+
+pub fn default_input_bridge() InputBridge {
+    << InputBridge{
+        identity: ui.CanvasEvent{window_id: 1, canvas_id: 1, generation: 1},
+        last_x: 0.0,
+        last_y: 0.0,
+        buttons: 0,
+        modifiers: 0,
+        has_touch: false,
+        active_touch_id: 0
+    }
+}
+
+pub fn (bridge &InputBridge) canvas_identity() ui.CanvasEvent {
+    << bridge.identity
+}
+
+pub fn is_ui_input(event &ui.InputEvent) bool {
+    << ui.is_input_event(event.kind)
+}
+
+fn empty_ui_input(identity &ui.CanvasEvent) ui.InputEvent {
+    << ui.InputEvent{
+        kind: 0,
+        window_id: identity.window_id,
+        canvas_id: identity.canvas_id,
+        generation: identity.generation,
+        x: 0.0, y: 0.0, dx: 0.0, dy: 0.0,
+        button: 0, buttons: 0, modifiers: 0,
+        key: 0, scan: 0, repeat: 0, click_count: 0, time_ns: 0
+    }
+}
+
+fn map_button(win_button int) int {
+    if win_button == wev.BUTTON_LEFT { << ui.BUTTON_LEFT }
+    if win_button == wev.BUTTON_RIGHT { << ui.BUTTON_RIGHT }
+    if win_button == wev.BUTTON_MIDDLE { << ui.BUTTON_MIDDLE }
+    << 0
+}
+
+fn button_mask(ui_button int) int {
+    if ui_button <= 0 || ui_button > 3 { << 0 }
+    << 1 << (ui_button - 1)
+}
+
+fn map_buttons_mask(win_mask int) int {
+    $out := 0
+    if (win_mask & 1) != 0 { out = out | button_mask(ui.BUTTON_LEFT) }
+    if (win_mask & 2) != 0 { out = out | button_mask(ui.BUTTON_MIDDLE) }
+    if (win_mask & 4) != 0 { out = out | button_mask(ui.BUTTON_RIGHT) }
+    << out
+}
+
+fn map_modifiers(win_mods int) int {
+    $out := 0
+    if (win_mods & wev.MOD_SHIFT) != 0 { out = out | ui.MOD_SHIFT }
+    if (win_mods & wev.MOD_CTRL) != 0 { out = out | ui.MOD_CONTROL }
+    if (win_mods & wev.MOD_ALT) != 0 { out = out | ui.MOD_ALT }
+    if (win_mods & wev.MOD_META) != 0 { out = out | ui.MOD_META }
+    << out
+}
+
+fn map_physical_key(k int) int {
+    if k >= wev.KEY_A && k <= wev.KEY_Z { << 65 + (k - wev.KEY_A) }
+    if k >= wev.KEY_1 && k <= wev.KEY_9 { << 49 + (k - wev.KEY_1) }
+    if k == wev.KEY_0 { << 48 }
+    if k == wev.KEY_SPACE { << 32 }
+    if k == wev.KEY_ENTER { << ui.KEY_ENTER }
+    if k == wev.KEY_ESCAPE { << ui.KEY_ESCAPE }
+    if k == wev.KEY_BACKSPACE { << ui.KEY_BACKSPACE }
+    if k == wev.KEY_TAB { << ui.KEY_TAB }
+    if k == wev.KEY_MINUS { << 45 }
+    if k == wev.KEY_EQUALS { << 61 }
+    if k == wev.KEY_LEFT_BRACKET { << 91 }
+    if k == wev.KEY_RIGHT_BRACKET { << 93 }
+    if k == wev.KEY_BACKSLASH { << 92 }
+    if k == wev.KEY_SEMICOLON { << 59 }
+    if k == wev.KEY_APOSTROPHE { << 39 }
+    if k == wev.KEY_GRAVE { << 96 }
+    if k == wev.KEY_COMMA { << 44 }
+    if k == wev.KEY_PERIOD { << 46 }
+    if k == wev.KEY_SLASH { << 47 }
+    if k == wev.KEY_CAPS_LOCK { << ui.KEY_CAPS_LOCK }
+    if k >= wev.KEY_F1 && k <= wev.KEY_F12 { << ui.KEY_F1 + (k - wev.KEY_F1) }
+    if k == wev.KEY_INSERT { << ui.KEY_INSERT }
+    if k == wev.KEY_HOME { << ui.KEY_HOME }
+    if k == wev.KEY_PAGE_UP { << ui.KEY_PAGE_UP }
+    if k == wev.KEY_DELETE { << ui.KEY_DELETE }
+    if k == wev.KEY_END { << ui.KEY_END }
+    if k == wev.KEY_PAGE_DOWN { << ui.KEY_PAGE_DOWN }
+    if k == wev.KEY_RIGHT { << ui.KEY_RIGHT }
+    if k == wev.KEY_LEFT { << ui.KEY_LEFT }
+    if k == wev.KEY_DOWN { << ui.KEY_DOWN }
+    if k == wev.KEY_UP { << ui.KEY_UP }
+    if k == wev.KEY_LEFT_SHIFT || k == wev.KEY_RIGHT_SHIFT { << ui.KEY_SHIFT }
+    if k == wev.KEY_LEFT_CTRL || k == wev.KEY_RIGHT_CTRL { << ui.KEY_CONTROL }
+    if k == wev.KEY_LEFT_ALT || k == wev.KEY_RIGHT_ALT { << ui.KEY_ALT }
+    if k == wev.KEY_LEFT_META || k == wev.KEY_RIGHT_META { << ui.KEY_META }
+    << 0
+}
+
+fn non_neg_ns(ns int) int {
+    if ns < 0 { << 0 }
+    << ns
+}
+
+fn clamp_clicks(clicks int) int {
+    if clicks < 0 { << 0 }
+    << clicks
+}
+
+fn key_event(bridge &InputBridge, kind int, ev &wev.Event, mods int) ui.InputEvent {
+    $out := empty_ui_input(&bridge.identity)
+    $rep := 0
+    if ev.repeated { rep = 1 }
+    $mapped := map_physical_key(ev.physical_key)
+    if mapped == 0 && ev.logical_key > 0 && ev.logical_key <= 1114111 {
+        mapped = ev.logical_key
+    }
+    out.kind = kind
+    out.x = bridge.last_x
+    out.y = bridge.last_y
+    out.buttons = bridge.buttons
+    out.modifiers = mods
+    out.key = mapped
+    out.scan = ev.physical_key & 65535
+    out.repeat = rep
+    out.time_ns = non_neg_ns(ev.timestamp_ns)
+    << out
+}
+
+fn touch_event(bridge $&InputBridge, ev &wev.Event) ui.InputEvent {
+    $out := empty_ui_input(&bridge.identity)
+    stamp := non_neg_ns(ev.timestamp_ns)
+    if ev.kind == wev.EVENT_TOUCH_DOWN {
+        // Track only the first finger as the primary widget pointer so secondary
+        // touches do not steal an active button click or slider drag.
+        if bridge.has_touch { << out }
+        bridge.has_touch = true
+        bridge.active_touch_id = ev.touch_id
+        bridge.last_x = ev.x
+        bridge.last_y = ev.y
+        bridge.buttons = bridge.buttons | button_mask(ui.BUTTON_LEFT)
+        out.kind = ui.EV_POINTER_DOWN
+        out.x = ev.x
+        out.y = ev.y
+        out.button = ui.BUTTON_LEFT
+        out.buttons = bridge.buttons
+        out.modifiers = bridge.modifiers
+        out.click_count = 1
+        out.time_ns = stamp
+        << out
+    }
+    if !bridge.has_touch || ev.touch_id != bridge.active_touch_id { << out }
+    bridge.last_x = ev.x
+    bridge.last_y = ev.y
+    out.x = ev.x
+    out.y = ev.y
+    out.dx = ev.dx
+    out.dy = ev.dy
+    out.modifiers = bridge.modifiers
+    out.time_ns = stamp
+    if ev.kind == wev.EVENT_TOUCH_MOVE {
+        out.kind = ui.EV_POINTER_MOVE
+        out.buttons = bridge.buttons
+        << out
+    }
+    bridge.has_touch = false
+    bridge.buttons = bridge.buttons & (7 ^ button_mask(ui.BUTTON_LEFT))
+    out.buttons = bridge.buttons
+    if ev.kind == wev.EVENT_TOUCH_UP {
+        out.kind = ui.EV_POINTER_UP
+        out.button = ui.BUTTON_LEFT
+        out.click_count = 1
+        << out
+    }
+    out.kind = ui.EV_POINTER_CANCEL
+    << out
+}
+
+// Translates a single #window/events.Event into #ui.InputEvent. Non-input window
+// events produce kind == 0; check ui_bridge.is_ui_input(&mapped) before dispatch.
+pub fn (bridge $&InputBridge) translate(ev &wev.Event) ui.InputEvent {
+    $out := empty_ui_input(&bridge.identity)
+    mods := map_modifiers(ev.modifiers)
+    bridge.modifiers = mods
+    stamp := non_neg_ns(ev.timestamp_ns)
+    if ev.kind == wev.EVENT_FOCUS_LOST || ev.kind == wev.EVENT_INPUT_RESET {
+        bridge.buttons = 0
+        bridge.has_touch = false
+        out.kind = ui.EV_POINTER_CANCEL
+        out.x = bridge.last_x
+        out.y = bridge.last_y
+        out.time_ns = stamp
+        << out
+    }
+    if ev.kind == wev.EVENT_POINTER_MOVE {
+        bridge.last_x = ev.x
+        bridge.last_y = ev.y
+        bridge.buttons = map_buttons_mask(ev.buttons)
+        out.kind = ui.EV_POINTER_MOVE
+        out.x = ev.x
+        out.y = ev.y
+        out.dx = ev.dx
+        out.dy = ev.dy
+        out.buttons = bridge.buttons
+        out.modifiers = mods
+        out.time_ns = stamp
+        << out
+    }
+    if ev.kind == wev.EVENT_POINTER_DOWN || ev.kind == wev.EVENT_POINTER_UP {
+        btn := map_button(ev.button)
+        mask := button_mask(btn)
+        bridge.last_x = ev.x
+        bridge.last_y = ev.y
+        if ev.kind == wev.EVENT_POINTER_DOWN {
+            bridge.buttons = map_buttons_mask(ev.buttons) | mask
+            out.kind = ui.EV_POINTER_DOWN
+        } else {
+            bridge.buttons = map_buttons_mask(ev.buttons) & (7 ^ mask)
+            out.kind = ui.EV_POINTER_UP
+        }
+        out.x = ev.x
+        out.y = ev.y
+        out.button = btn
+        out.buttons = bridge.buttons
+        out.modifiers = mods
+        out.click_count = clamp_clicks(ev.clicks)
+        out.time_ns = stamp
+        << out
+    }
+    if ev.kind == wev.EVENT_WHEEL {
+        out.kind = ui.EV_POINTER_SCROLL
+        out.x = bridge.last_x
+        out.y = bridge.last_y
+        out.dx = ev.dx
+        out.dy = ev.dy
+        out.buttons = bridge.buttons
+        out.modifiers = mods
+        out.time_ns = stamp
+        << out
+    }
+    if ev.kind == wev.EVENT_TOUCH_DOWN || ev.kind == wev.EVENT_TOUCH_MOVE ||
+       ev.kind == wev.EVENT_TOUCH_UP || ev.kind == wev.EVENT_TOUCH_CANCEL {
+        << touch_event(bridge, ev)
+    }
+    if ev.kind == wev.EVENT_KEY_DOWN { << key_event(bridge, ui.EV_KEY_DOWN, ev, mods) }
+    if ev.kind == wev.EVENT_KEY_UP { << key_event(bridge, ui.EV_KEY_UP, ev, mods) }
+    << out
+}

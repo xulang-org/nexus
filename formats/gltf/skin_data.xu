@@ -1,0 +1,109 @@
+@"github.com/xulang-org/game/formats/gltf"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#math
+#errors
+
+struct JointWeights { joints []int
+    weights []f64 }
+struct SkinDescription { joints []int
+    inverse_bind []fm.Mat4 }
+fn (parser $&GlbParser) data_accessor(index int,components int) Accessor {
+    if index<0 || index>=parser.accessors.len { >> errors.new("game GLB: invalid animation/skin accessor") }
+    value := parser.accessors[index]
+    view := parser.views[value.view]
+    if value.component!=5126 || value.normalized || value.components!=components || view.target!=0 || view.stride!=0 ||
+        (value.usage!=0 && value.usage!=8) || (view.usage!=0 && view.usage!=8) { >> errors.new("game GLB: incompatible animation/skin accessor") }
+    parser.accessors[index].usage=8
+    parser.views[value.view].usage=8
+    << value
+}
+fn (parser $&GlbParser) read_influences(attributes int,count int) []JointWeights {
+    ji := integer(&parser.doc,attributes,"JOINTS_0",-1,0,parser.accessors.len-1) or >>
+    wi := integer(&parser.doc,attributes,"WEIGHTS_0",-1,0,parser.accessors.len-1) or >>
+    if (ji>=0)!=(wi>=0) { >> errors.new("game GLB: JOINTS_0 and WEIGHTS_0 must occur together") }
+    $joints := absent_accessor()
+    $weights := absent_accessor()
+    if ji>=0 {
+        joints=parser.attribute(ji,4,count) or >>
+        weights=parser.attribute(wi,4,count) or >>
+        if (joints.component!=5121 && joints.component!=5123) || joints.normalized ||
+            (weights.component!=5126 && !weights.normalized) || weights.component==5125 { >> errors.new("game GLB: invalid joint/weight encoding") }
+    }
+    $result := []JointWeights{}
+    for i in 0:count {
+        $js := []int{}
+        $ws := []f64{}
+        $total := 0.0
+        if ji>=0 {
+            for c in 0:4 {
+                js.push(read_integer(&parser.bytes,joints.offset+i*joints.stride+c*joints.size,joints.size) or >>)
+                w := parser.component(weights,i,c) or >>
+                if w<0.0 || w>1.0 { >> errors.new("game GLB: skin weight outside 0...1") }
+                ws.push(w)
+                total+=w
+            }
+            if math.abs(total-1.0)>0.0001 { >> errors.new("game GLB: skin weights must sum to one") }
+            for c in 0:4 { ws[c]=ws[c]/total }
+        }
+        result.push(JointWeights{joints: js,weights: ws})
+    }
+    << result
+}
+fn (parser $&GlbParser) read_skins(root int,asset $&GlbGeometry) int {
+    nodes := optional_array(&parser.doc,root,"skins",128) or >>
+    for node in nodes {
+        allowed := ["joints","inverseBindMatrices","skeleton","name"]
+        fields(&parser.doc,node,&allowed) or >>
+        $js := []int{}
+        $seen := map[int]bool{}
+        for item in array_property(&parser.doc,node,"joints",1,256) or >> {
+            j := parser.doc.as_int(item) or >>
+            if j<0 || j>=asset.nodes.len || seen.has(j) { >> errors.new("game GLB: duplicate or out-of-range skin joint") }
+            seen[j]=true
+            js.push(j)
+        }
+        integer(&parser.doc,node,"skeleton",-1,0,asset.nodes.len-1) or >>
+        index := integer(&parser.doc,node,"inverseBindMatrices",-1,0,parser.accessors.len-1) or >>
+        $matrices := []fm.Mat4{}
+        $accessor := absent_accessor()
+        if index>=0 {
+            accessor=parser.data_accessor(index,16) or >>
+            if accessor.count!=js.len { >> errors.new("game GLB: inverse bind matrix count differs from joints") }
+        }
+        for i in 0:js.len {
+            $matrix := fm.identity_3d()
+            if index>=0 {
+                $v := []f64{}
+                for c in 0:16 { v.push(parser.component(accessor,i,c) or >>) }
+                matrix=fm.Mat4{c0: fm.vec4(v[0],v[1],v[2],v[3]),c1: fm.vec4(v[4],v[5],v[6],v[7]),c2: fm.vec4(v[8],v[9],v[10],v[11]),c3: fm.vec4(v[12],v[13],v[14],v[15])}
+                if !matrix.is_affine() { >> errors.new("game GLB: inverse bind matrix must be affine") }
+                matrix.affine_inverse() or >>
+            }
+            matrices.push(matrix)
+        }
+        asset.skins.push(SkinDescription{joints: js,inverse_bind: matrices})
+    }
+    for node in asset.nodes {
+        if node.skin<0 { -> }
+        if node.skin>=asset.skins.len || node.mesh<0 { >> errors.new("game GLB: invalid skinned node") }
+        skin_index := node.skin
+        mesh_index := node.mesh
+        skin := &asset.skins[skin_index]
+        mesh := &asset.meshes[mesh_index]
+        for p in mesh.first:mesh.first+mesh.count {
+            primitive := &asset.primitives[p]
+            for v in primitive.first_vertex:primitive.first_vertex+primitive.vertex_count {
+                influence := &asset.joints[v]
+                if influence.joints.len!=4 { >> errors.new("game GLB: skinned mesh requires JOINTS_0/WEIGHTS_0") }
+                for j in influence.joints { if j>=skin.joints.len { >> errors.new("game GLB: joint index outside skin palette") } }
+            }
+        }
+    }
+    << 0
+}
+pub fn (asset &GlbGeometry) skin_count() int { << asset.skins.len }
+pub fn (asset &GlbGeometry) node_skin(index int) int {
+    if index<0 || index>=asset.nodes.len { >> errors.new("game GLB: skin node outside asset") }
+    << asset.nodes[index].skin
+}

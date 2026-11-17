@@ -1,0 +1,127 @@
+@"github.com/xulang-org/game/integration/rendering/three_d"
+
+fm #"github.com/xulang-org/game/foundation/math"
+game #"github.com/xulang-org/game/scene"
+ren #"github.com/xulang-org/game/rendering/three_d"
+#errors
+
+// Weak mesh reference. Mesh3D retains ownership; the standard GPU identity is checked
+// on attach/draw. Keep this binding set with the same SceneTree used to attach.
+pub struct Scene3D {
+    owner ren.DeviceRef3D
+    meshes map[int]ren.MeshRef3D
+    materials map[int]ren.Material3D
+    lods map[int]MeshLods3D
+    lod_levels map[int]int
+    count int
+}
+pub struct SceneDraw3D {
+    pub instances int
+    pub triangles int
+    pub culled_instances int
+    pub culled_triangles int
+    pub lod_instances int
+    pub lod_triangles_saved int
+}
+pub fn new_scene_3d(device &ren.Device3D) Scene3D {
+    device.backend() or >>
+    << Scene3D{owner: device.reference(), meshes: map[int]ren.MeshRef3D{}, materials: map[int]ren.Material3D{},
+        lods: map[int]MeshLods3D{},lod_levels: map[int]int{},count: 0}
+}
+// One mesh per node; attaching again replaces that node's weak resource binding.
+// Keys use the full node ID; no dependency on SceneTree's private slot encoding.
+pub fn (scene $&Scene3D) attach_mesh(tree &game.SceneTree, node int, mesh &ren.Mesh3D) int {
+    added := scene.check_mesh_binding(tree, node, mesh) or >>
+    scene.clear_lods(node)
+    scene.count = scene.count + added
+    scene.meshes[node] = mesh.reference()
+    << 0
+}
+// Read-only preflight for importers/tools. Returns 1 for a new binding, 0 for
+// replacement. A caller binding several nodes must also check the total room.
+pub fn (scene &Scene3D) check_mesh_binding(tree &game.SceneTree, node int, mesh &ren.Mesh3D) int {
+    info := tree.node_info(node) or >>
+    if info.kind != game.NODE_3D || info.queued_free { >> errors.new("game GPU: mesh requires an editable Node3D") }
+    if scene.materials.has(node) {
+        material := scene.materials[node]
+        scene.owner.validate_material(mesh.reference(), &material) or >>
+    } else { scene.owner.validate_mesh(mesh.reference(), false) or >> }
+    if !scene.meshes.has(node) {
+        if scene.count >= game.MAX_NODES { >> errors.new("game GPU: scene binding limit reached; prune retired nodes") }
+        << 1
+    }
+    << 0
+}
+pub fn (scene &Scene3D) binding_count() int { << scene.count }
+pub fn (scene &Scene3D) remaining_bindings() int { << game.MAX_NODES - scene.count }
+pub fn (scene $&Scene3D) detach_mesh(node int) int {
+    if node <= 0 { >> errors.new("game GPU: invalid mesh node") }
+    if !scene.meshes.has(node) { << 0 }
+    scene.clear_lods(node)
+    meshes := $&scene.meshes
+    meshes.delete(node)
+    materials := $&scene.materials
+    materials.delete(node)
+    scene.count = scene.count - 1
+    << 1
+}
+// Clear freed/queued bindings; GPU resources are owned independently and survive.
+pub fn (scene $&Scene3D) prune(tree &game.SceneTree) int {
+    order := tree.subtree(tree.root()) or >>
+    $next := map[int]ren.MeshRef3D{}
+    $next_materials := map[int]ren.Material3D{}
+    $next_lods := map[int]MeshLods3D{}
+    $next_levels := map[int]int{}
+    $kept := 0
+    for node in order {
+        if !scene.meshes.has(node) { -> }
+        mesh := scene.meshes[node]
+        info := tree.node_info(node) or >>
+        if !info.queued_free { next[node] = mesh
+            if scene.materials.has(node) { next_materials[node] = scene.materials[node] }
+            if scene.lods.has(node) { next_lods[node]=copy_lods(&scene.lods[node]) or >>
+                next_levels[node]=scene.lod_levels[node] }
+            kept = kept + 1 }
+    }
+    removed := scene.count - kept
+    scene.meshes = next
+    scene.materials = next_materials
+    scene.lods=next_lods
+    scene.lod_levels=next_levels
+    scene.count = kept
+    << removed
+}
+// Draw inside Device3D.begin/present. Hidden and queued nodes emit no draws.
+// Stable scene pre-order decides equal-depth ties. Opaque depth resolves overlap.
+pub fn (scene &Scene3D) draw(device $&ren.Device3D, tree &game.SceneTree, view_projection fm.Mat4) SceneDraw3D {
+    if scene.materials.len() > 0 { >> errors.new("game GPU: material-bound scene requires draw_lit and lighting") }
+    if !scene.owner.matches(device) { >> errors.new("game GPU: scene belongs to another device") }
+    device.validate_recording() or >>
+    if !view_projection.is_finite() { >> errors.new("game GPU: invalid scene view-projection") }
+    order := tree.subtree(tree.root()) or >>
+    $instances := 0
+    $triangles := 0
+    $culled_instances := 0
+    $culled_triangles := 0
+    $lod_instances := 0
+    $lod_triangles_saved := 0
+    for node in order {
+        if !scene.meshes.has(node) { -> }
+        if !(tree.is_visible(node) or >>) { -> }
+        mesh := scene.selected_mesh(node) or >>
+        world := tree.global_transform_3d(node) or >>
+        mvp := view_projection.multiply(world)
+        if !(scene.owner.mesh_in_view(mesh,mvp) or >>) {
+            culled_instances+=1
+            culled_triangles+=mesh.triangle_count()
+            ->
+        }
+        count := device.draw_reference(mesh, mvp) or >>
+        instances = instances + 1
+        triangles = triangles + count
+        if (scene.lod_level(node) or >>)>0 { lod_instances+=1
+            lod_triangles_saved+=scene.meshes[node].triangle_count()-count }
+    }
+    << SceneDraw3D{instances: instances,triangles: triangles,culled_instances: culled_instances,culled_triangles: culled_triangles,
+        lod_instances: lod_instances,lod_triangles_saved: lod_triangles_saved}
+}

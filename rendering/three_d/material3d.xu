@@ -1,0 +1,70 @@
+@"github.com/xulang-org/game/rendering/three_d"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#errors
+light_data #"github.com/xulang-org/game/resources/lighting"
+
+// Linear RGB inputs. Opaque direct-light metallic/roughness model.
+pub struct Material3D {
+    base fm.Vec3
+    metallic f64
+    roughness f64
+    emission fm.Vec3
+    texture TextureRef3D
+    orm_texture TextureRef3D
+    emission_texture TextureRef3D
+    occlusion_strength f64
+    normal_texture TextureRef3D
+    normal_scale f64
+    occlusion_texture TextureRef3D
+    occlusion_texture_strength f64
+    surface_mode int
+}
+fn color_range(color fm.Vec3, maximum f64) bool {
+    << color.is_finite() && color.x >= 0.0 && color.y >= 0.0 && color.z >= 0.0 &&
+        color.x <= maximum && color.y <= maximum && color.z <= maximum
+}
+pub fn material_3d(base fm.Vec3, metallic f64, roughness f64, emission fm.Vec3) Material3D {
+    material := Material3D{base: base, metallic: metallic, roughness: roughness, emission: emission, texture: no_texture(),
+        orm_texture: no_texture(), emission_texture: no_texture(), occlusion_strength: 1.0, normal_texture: no_texture(), normal_scale: 1.0, occlusion_texture: no_texture(), occlusion_texture_strength: 1.0, surface_mode: 0}
+    material.check() or >>
+    << material
+}
+fn (material &Material3D) check() int {
+    if !color_range(material.base, 1.0) || !color_range(material.emission, 16.0) ||
+        !fm.finite(material.metallic) || material.metallic < 0.0 || material.metallic > 1.0 ||
+        !fm.finite(material.roughness) || material.roughness < 0.045 || material.roughness > 1.0 ||
+        !fm.finite(material.occlusion_strength) || material.occlusion_strength < 0.0 || material.occlusion_strength > 1.0 || !fm.finite(material.normal_scale) || material.normal_scale < 0.0 || material.normal_scale > 8.0 || !fm.finite(material.occlusion_texture_strength) || material.occlusion_texture_strength < 0.0 || material.occlusion_texture_strength > 1.0 || material.surface_mode < 0 || material.surface_mode > 1 {
+        >> errors.new("game GPU: invalid linear material color, metallic or roughness")
+    }
+    << 0
+}
+pub fn (material &Material3D) validate() int { << material.check() or >> }
+fn material_words(material &Material3D, orientation f64) []int {
+    material.check() or >>
+    $words := []int{}
+    $texture_mode := 0.0
+    if material.has_base_texture() { texture_mode = texture_mode + 1.0 }
+    if material.has_orm_texture() { texture_mode = texture_mode + 2.0 }
+    if material.has_emission_texture() { texture_mode = texture_mode + 4.0 }
+    if material.has_normal_texture() { texture_mode = texture_mode + 8.0 }
+    if material.has_occlusion_texture() { texture_mode = texture_mode + 16.0 }
+    for value in [material.base.x,material.base.y,material.base.z,material.metallic,
+        material.emission.x,material.emission.y,material.emission.z,material.roughness,
+        texture_mode,material.occlusion_strength,material.normal_scale,f64(material.surface_mode),
+        orientation,material.occlusion_texture_strength,1.0,0.0] { words.push(scalar_word(value) or >>) }
+    << words
+}
+fn lit_matrix_words(world fm.Mat4, view_projection fm.Mat4) []int {
+    inverse := world.affine_inverse() or >>
+    $words := matrix_words(view_projection.multiply(world)) or >>
+    model := matrix_words(world) or >>
+    normals := matrix_words(inverse.transposed()) or >>
+    for word in model { words.push(word) }
+    for word in normals { words.push(word) }
+    << words
+}
+pub fn (device $&Device3D) draw_material(mesh &Mesh3D, world fm.Mat4, view_projection fm.Mat4,
+    material &Material3D, lighting &light_data.Environment3D) int {
+    << device.draw_material_reference(mesh.reference(),world,view_projection,material,lighting) or >>
+}

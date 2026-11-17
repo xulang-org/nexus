@@ -1,0 +1,75 @@
+@"github.com/xulang-org/game/rendering/three_d"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#errors
+
+// Materials own values and weak references, never texture allocations.
+fn (material &Material3D) copy_maps(base TextureRef3D, orm TextureRef3D, emission TextureRef3D, strength f64) Material3D {
+    << Material3D{base: material.base, metallic: material.metallic, roughness: material.roughness,
+        emission: material.emission, texture: base, orm_texture: orm, emission_texture: emission, occlusion_strength: strength, normal_texture: material.normal_texture, normal_scale: material.normal_scale, occlusion_texture: material.occlusion_texture, occlusion_texture_strength: material.occlusion_texture_strength, surface_mode: material.surface_mode}
+}
+pub fn (material &Material3D) has_base_texture() bool { << material.texture.present }
+pub fn (material &Material3D) has_orm_texture() bool { << material.orm_texture.present }
+pub fn (material &Material3D) has_emission_texture() bool { << material.emission_texture.present }
+pub fn (material &Material3D) has_textures() bool {
+    << material.has_base_texture() || material.has_orm_texture() || material.has_emission_texture() || material.has_normal_texture() || material.has_occlusion_texture()
+}
+pub fn (material &Material3D) with_base_texture(texture &Texture3D) Material3D {
+    material.check() or >>
+    texture.is_srgb() or >>
+    << material.copy_maps(texture.reference(), material.orm_texture, material.emission_texture, material.occlusion_strength)
+}
+pub fn (material &Material3D) without_base_texture() Material3D {
+    << material.copy_maps(no_texture(), material.orm_texture, material.emission_texture, material.occlusion_strength)
+}
+// Packed linear data: R=ambient occlusion, G=roughness, B=metallic; alpha ignored.
+// Occlusion strength only attenuates the existing diffuse ambient term.
+pub fn (material &Material3D) with_orm_texture(texture &Texture3D, occlusion_strength f64) Material3D {
+    material.check() or >>
+    if !fm.finite(occlusion_strength) || occlusion_strength < 0.0 || occlusion_strength > 1.0 {
+        >> errors.new("game GPU: occlusion strength must be finite and in 0...1")
+    }
+    if texture.is_srgb() or >> { >> errors.new("game GPU: ORM maps require a linear GPU image") }
+    << material.copy_maps(material.texture, texture.reference(), material.emission_texture, occlusion_strength)
+}
+pub fn (material &Material3D) without_orm_texture() Material3D {
+    << material.copy_maps(material.texture, no_texture(), material.emission_texture, 1.0)
+}
+// Color input uses the image's explicit sRGB/linear format; factor is linear.
+pub fn (material &Material3D) with_emission_texture(texture &Texture3D) Material3D {
+    material.check() or >>
+    texture.is_srgb() or >>
+    << material.copy_maps(material.texture, material.orm_texture, texture.reference(), material.occlusion_strength)
+}
+pub fn (material &Material3D) without_emission_texture() Material3D {
+    << material.copy_maps(material.texture, material.orm_texture, no_texture(), material.occlusion_strength)
+}
+fn (material &Material3D) maps() []TextureRef3D {
+    << [material.texture,material.orm_texture,material.emission_texture,material.normal_texture,material.occlusion_texture]
+}
+pub fn (reference &DeviceRef3D) validate_material(mesh MeshRef3D, material &Material3D) int {
+    material.check() or >>
+    reference.validate_mesh(mesh,true) or >>
+    if material.has_textures() {
+        if !mesh.uvs { >> errors.new("game 3D: material maps require UVs on every vertex") }
+        for texture in material.maps() {
+            if texture.present {
+                if reference.has_gpu {
+                    if !texture.has_gpu { >> errors.new("game 3D: software texture cannot bind to GPU device") }
+                    reference.device.validate_texture(texture.image) or >>
+                    reference.device.validate_sampler(texture.sampler) or >>
+                } else {
+                    if texture.has_gpu { >> errors.new("game 3D: GPU texture cannot bind to software device") }
+                    texture.soft_pixels.validate(reference.device_id) or >>
+                }
+            }
+        }
+        if (material.orm_texture.present && material.orm_texture.srgb) ||
+            (material.occlusion_texture.present && material.occlusion_texture.srgb) ||
+            (material.normal_texture.present && material.normal_texture.srgb) {
+            >> errors.new("game 3D: ORM, occlusion and normal maps require linear images")
+        }
+        if material.has_normal_texture() && !mesh.tangents { >> errors.new("game 3D: normal maps require a complete tangent basis") }
+    }
+    << 0
+}

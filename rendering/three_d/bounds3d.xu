@@ -1,0 +1,60 @@
+@"github.com/xulang-org/game/rendering/three_d"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#math
+#errors
+
+fn rounded(value f64) f64 { word := scalar_word(value) or >>
+    << math.float32_from_bits(word) }
+fn rounded_vec(value fm.Vec3) fm.Vec3 {
+    x := rounded(value.x) or >>
+    y := rounded(value.y) or >>
+    z := rounded(value.z) or >>
+    << fm.vec3(x,y,z)
+}
+fn quantized_bounds(bounds fm.Aabb3) fm.Aabb3 {
+    // IEEE nearest-even conversion is monotonic, so quantizing the extrema
+    // encloses every uploaded position without another pass over vertex bytes.
+    low := rounded_vec(bounds.minimum) or >>
+    high := rounded_vec(bounds.maximum) or >>
+    << fm.aabb3(low,high) or >>
+}
+fn world_bounds(bounds fm.Aabb3, world fm.Mat4) fm.Aabb3 {
+    bounds.validate() or >>
+    if !world.is_affine() { >> errors.new("game 3D: bounds require a finite affine model matrix") }
+    // Use exactly the model coefficients sent to the vertex shader.
+    x := rounded_vec(world.c0.xyz()) or >>
+    y := rounded_vec(world.c1.xyz()) or >>
+    z := rounded_vec(world.c2.xyz()) or >>
+    t := rounded_vec(world.c3.xyz()) or >>
+    $low := t
+    $high := t
+    for axis in 0:3 {
+        $minimum := bounds.minimum.x
+        $maximum := bounds.maximum.x
+        $column := x
+        if axis==1 { minimum=bounds.minimum.y
+            maximum=bounds.maximum.y
+            column=y }
+        if axis==2 { minimum=bounds.minimum.z
+            maximum=bounds.maximum.z
+            column=z }
+        a := column.scaled(minimum)
+        b := column.scaled(maximum)
+        low=low.add(fm.vec3(math.min(a.x,b.x),math.min(a.y,b.y),math.min(a.z,b.z)))
+        high=high.add(fm.vec3(math.max(a.x,b.x),math.max(a.y,b.y),math.max(a.z,b.z)))
+    }
+    // Bound binary32 multiply/add and interpolator rounding, including severe
+    // cancellation and flush-to-zero. This uses absolute terms, not the small
+    // final result. Reflection, rotation, shear and nonuniform scale all work.
+    extent := fm.vec3(math.max(math.abs(bounds.minimum.x),math.abs(bounds.maximum.x)),
+        math.max(math.abs(bounds.minimum.y),math.abs(bounds.maximum.y)),
+        math.max(math.abs(bounds.minimum.z),math.abs(bounds.maximum.z)))
+    error := fm.vec3(math.abs(x.x)*extent.x+math.abs(y.x)*extent.y+math.abs(z.x)*extent.z+math.abs(t.x),
+        math.abs(x.y)*extent.x+math.abs(y.y)*extent.y+math.abs(z.y)*extent.z+math.abs(t.y),
+        math.abs(x.z)*extent.x+math.abs(y.z)*extent.y+math.abs(z.z)*extent.z+math.abs(t.z)).scaled(0.00001)
+    padding := error.add(fm.vec3(1e-36,1e-36,1e-36))
+    << fm.aabb3(low.sub(padding),high.add(padding)) or >>
+}
+pub fn (mesh &MeshRef3D) world_bounds(world fm.Mat4) fm.Aabb3 { << world_bounds(mesh.bounds,world) or >> }
+pub fn (mesh &Mesh3D) world_bounds(world fm.Mat4) fm.Aabb3 { << world_bounds(mesh.bounds,world) or >> }

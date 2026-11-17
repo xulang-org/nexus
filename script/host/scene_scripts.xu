@@ -1,0 +1,177 @@
+@"github.com/xulang-org/game/script/host"
+
+game #"github.com/xulang-org/game/scene"
+bc #"github.com/xulang-org/game/script/bytecode"
+#errors
+
+pub const MAX_SCRIPTS = 32
+const MAX_SCRIPT_GENERATION = 67108862
+struct ScriptSlot {
+    generation int
+    active bool
+    node int
+    script NodeScript
+}
+struct ScriptRoute {
+    id int
+    source int
+    signal int
+    target int
+    handler int
+}
+// Owns at most one script per node. The manager, attachment IDs, and the tree
+// must stay together on the same owner thread for the manager's lifetime.
+pub struct SceneScripts {
+    slots []ScriptSlot
+    routes []ScriptRoute
+    next_connection int
+    queue []ManagedSignal
+    cursor int
+}
+pub fn new_scene_scripts(capacity int) SceneScripts {
+    if capacity < 1 || capacity > MAX_SCRIPTS { >> errors.new("XuScript: invalid script capacity") }
+    $slots := []ScriptSlot{}
+    for i in 0:capacity {
+        slots.push(ScriptSlot{generation: 0, active: false, node: 0, script: empty_script()})
+    }
+    << SceneScripts{slots: slots, routes: []ScriptRoute{}, next_connection: 1, queue: []ManagedSignal{}, cursor: 0}
+}
+fn (scripts &SceneScripts) binding_id(index int) int { << scripts.slots[index].generation * MAX_SCRIPTS + index + 1 }
+fn (scripts &SceneScripts) active_id(id int) bool {
+    if id < 1 { << false }
+    index := (id - 1) % MAX_SCRIPTS
+    << index < scripts.slots.len && scripts.slots[index].active && scripts.slots[index].generation == (id - 1) / MAX_SCRIPTS
+}
+fn (scripts &SceneScripts) index(id int) int {
+    if !scripts.active_id(id) { >> errors.new("XuScript: stale script attachment ID") }
+    << (id - 1) % MAX_SCRIPTS
+}
+fn (scripts $&SceneScripts) release(index int) {
+    scripts.slots[index].active = false
+    scripts.slots[index].node = 0
+    scripts.slots[index].script = empty_script()
+    if scripts.slots[index].generation < MAX_SCRIPT_GENERATION {
+        scripts.slots[index].generation = scripts.slots[index].generation + 1
+    }
+}
+fn (scripts $&SceneScripts) prune_routes() int {
+    $next := []ScriptRoute{}
+    for route in scripts.routes {
+        if !scripts.active_id(route.source) || !scripts.active_id(route.target) { -> }
+        source := (route.source - 1) % MAX_SCRIPTS
+        target := (route.target - 1) % MAX_SCRIPTS
+        if scripts.slots[source].script.machine.has_signal(route.signal) && scripts.slots[target].script.machine.has_handler(route.handler) {
+            next.push(route)
+        }
+    }
+    removed := scripts.routes.len - next.len
+    scripts.routes = next
+    << removed
+}
+pub fn (scripts $&SceneScripts) prune(tree &game.SceneTree) int {
+    $removed := 0
+    for i in 0:scripts.slots.len {
+        if scripts.slots[i].active && !live_node(tree, scripts.slots[i].node) {
+            scripts.release(i)
+            removed = removed + 1
+        }
+    }
+    scripts.prune_routes()
+    << removed
+}
+pub fn (scripts $&SceneScripts) attach(tree &game.SceneTree, node int, program bc.Module) int {
+    if scripts.slots.len < 1 { >> errors.new("XuScript: uninitialized script manager") }
+    info := tree.node_info(node) or >>
+    if info.queued_free { >> errors.new("XuScript: cannot attach to a queued node") }
+    scripts.prune(tree)
+    $free := -1
+    for i in 0:scripts.slots.len {
+        if scripts.slots[i].active && scripts.slots[i].node == node { >> errors.new("XuScript: node already has a script") }
+        if free < 0 && !scripts.slots[i].active && scripts.slots[i].generation < MAX_SCRIPT_GENERATION { free = i }
+    }
+    if free < 0 { >> errors.new("XuScript: script capacity exhausted") }
+    behavior := attach(tree, node, program) or >>
+    scripts.slots[free].script = behavior
+    scripts.slots[free].node = node
+    scripts.slots[free].active = true
+    << scripts.binding_id(free)
+}
+pub fn (scripts $&SceneScripts) detach(id int) int {
+    index := scripts.index(id) or >>
+    scripts.release(index)
+    scripts.prune_routes()
+    << 1
+}
+pub fn (scripts &SceneScripts) epoch(id int) int { index := scripts.index(id) or >>
+    << scripts.slots[index].script.epoch() }
+pub fn (scripts &SceneScripts) calls(id int) int { index := scripts.index(id) or >>
+    << scripts.slots[index].script.calls() }
+pub fn (scripts &SceneScripts) state(id int, field int) f64 { index := scripts.index(id) or >>
+    << scripts.slots[index].script.state(field) or >> }
+pub fn (scripts &SceneScripts) connection_count() int { << scripts.routes.len }
+pub fn (scripts &SceneScripts) pending_signals() int {
+    $count := 0
+    for slot in scripts.slots { if slot.active { count = count + slot.script.pending_signals() } }
+    << count
+}
+pub fn (scripts &SceneScripts) pending_deliveries() int { << scripts.queue.len - scripts.cursor }
+pub fn (scripts $&SceneScripts) physics_process(tree &game.SceneTree, id int, delta f64, axis f64) f64 {
+    scripts.prune(tree)
+    index := scripts.index(id) or >>
+    behavior := $&scripts.slots[index].script
+    << behavior.physics_process(tree, delta, axis) or >>
+}
+pub fn (scripts $&SceneScripts) reload(tree &game.SceneTree, id int, candidate bc.Module) int {
+    scripts.prune(tree)
+    index := scripts.index(id) or >>
+    behavior := $&scripts.slots[index].script
+    changed := behavior.reload(tree, candidate) or >>
+    scripts.prune_routes()
+    << changed
+}
+// Both ends resolve stable IDs before storing a connection. Renames do not
+// change the route; deleting a declaration invalidates it on reload/prune.
+pub fn (scripts $&SceneScripts) connect(tree &game.SceneTree, source int, signal_name string, target int, handler_name string) int {
+    scripts.prune(tree)
+    source_index := scripts.index(source) or >>
+    target_index := scripts.index(target) or >>
+    signal := scripts.slots[source_index].script.machine.signal_id(signal_name) or >>
+    handler := scripts.slots[target_index].script.handler_id(handler_name) or >>
+    << scripts.connect_resolved(source, signal, target, handler) or >>
+}
+fn (scripts $&SceneScripts) connect_resolved(source int, signal int, target int, handler int) int {
+    for route in scripts.routes {
+        if route.source == source && route.signal == signal && route.target == target && route.handler == handler { << route.id }
+    }
+    if scripts.routes.len >= MAX_CONNECTIONS || scripts.next_connection >= 2147483647 {
+        >> errors.new("XuScript: managed connection capacity exhausted")
+    }
+    id := scripts.next_connection
+    scripts.next_connection = id + 1
+    scripts.routes.push(ScriptRoute{id: id, source: source, signal: signal, target: target, handler: handler})
+    << id
+}
+pub fn (scripts $&SceneScripts) disconnect(id int) int {
+    $next := []ScriptRoute{}
+    $removed := 0
+    for route in scripts.routes {
+        if route.id == id { removed = 1 } else { next.push(route) }
+    }
+    scripts.routes = next
+    << removed
+}
+
+pub fn (scripts $&SceneScripts) connect_ids(tree &game.SceneTree, source int, signal int, target int, handler int) int {
+    scripts.prune(tree)
+    source_index := scripts.index(source) or >>
+    target_index := scripts.index(target) or >>
+    if !scripts.slots[source_index].script.machine.has_signal(signal) || !scripts.slots[target_index].script.machine.has_handler(handler) {
+        >> errors.new("XuScript: unknown stable signal/handler ID")
+    }
+    << scripts.connect_resolved(source, signal, target, handler) or >>
+}
+pub fn (scripts $&SceneScripts) set_state(tree &game.SceneTree, id int, field int, value f64) int {
+    index := scripts.index(id) or >>
+    behavior := $&scripts.slots[index].script
+    << behavior.set_state(tree, field, value) or >>
+}

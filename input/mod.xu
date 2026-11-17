@@ -1,0 +1,154 @@
+@"github.com/xulang-org/game/input"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#errors
+
+pub const MAX_KEYS = 512
+pub const MAX_ACTIONS = 128
+pub const MAX_SOURCES = 128
+
+struct Action {
+    name string
+    pressed bool
+    just_pressed bool
+    just_released bool
+    value f64
+}
+struct InputBinding {
+    action int
+    key int
+}
+struct SourceBinding { action int
+    source int }
+pub struct InputMap {
+    keys []bool
+    actions []Action
+    bindings []InputBinding
+    sources []f64
+    source_bindings []SourceBinding
+}
+pub fn new_input_map() InputMap {
+    $keys := []bool{}
+    for i in 0:MAX_KEYS { keys.push(false) }
+    $sources := []f64{}
+    for i in 0:MAX_SOURCES { sources.push(0.0) }
+    << InputMap{keys: keys, actions: []Action{}, bindings: []InputBinding{},
+        sources: sources, source_bindings: []SourceBinding{}}
+}
+fn (input &InputMap) action_index(name &string) int {
+    for i in 0:input.actions.len { if input.actions[i].name == *name { << i } }
+    >> errors.new("game: unknown input action: " + name)
+}
+// Multiple physical keys can hold one action. Bind before processing input.
+pub fn (input $&InputMap) bind(name string, key int) int {
+    if name.len == 0 || name.len > 128 || key < 0 || key >= MAX_KEYS {
+        >> errors.new("game: invalid input binding")
+    }
+    $index := -1
+    for i in 0:input.actions.len { if input.actions[i].name == name { index = i } }
+    if index < 0 {
+        if input.actions.len >= MAX_ACTIONS { >> errors.new("game: input action capacity exceeded") }
+        input.actions.push(Action{name: name, pressed: false,
+            just_pressed: false, just_released: false, value: 0.0})
+        index = input.actions.len - 1
+    }
+    for binding in input.bindings { if binding.action == index && binding.key == key { << 0 } }
+    input.bindings.push(InputBinding{action: index, key: key})
+    if input.keys[key] { input.actions[index].pressed = true
+        input.actions[index].value = 1.0 }
+    << 0
+}
+// Independent analog sources share actions without impersonating keyboard keys.
+pub fn (input $&InputMap) bind_source(name string, source int) int {
+    if name.len == 0 || name.len > 128 || source < 0 || source >= MAX_SOURCES {
+        >> errors.new("game: invalid input source binding")
+    }
+    $index := -1
+    for i in 0:input.actions.len { if input.actions[i].name == name { index = i } }
+    if index < 0 {
+        if input.actions.len >= MAX_ACTIONS { >> errors.new("game: input action capacity exceeded") }
+        input.actions.push(Action{name: name, pressed: false, just_pressed: false, just_released: false, value: 0.0})
+        index = input.actions.len - 1
+    }
+    for binding in input.source_bindings { if binding.action == index && binding.source == source { << 0 } }
+    input.source_bindings.push(SourceBinding{action: index, source: source})
+    input.refresh()
+    << 0
+}
+fn (input $&InputMap) refresh() {
+    for i in 0:input.actions.len {
+        $value := 0.0
+        for binding in input.bindings {
+            if binding.action == i && input.keys[binding.key] { value = 1.0 }
+        }
+        for binding in input.source_bindings {
+            if binding.action == i && input.sources[binding.source] > value { value = input.sources[binding.source] }
+        }
+        previous := input.actions[i].pressed
+        pressed := value > 0.0
+        input.actions[i].value = value
+        input.actions[i].pressed = pressed
+        if pressed && !previous { input.actions[i].just_pressed = true }
+        if !pressed && previous { input.actions[i].just_released = true }
+    }
+}
+pub fn (input $&InputMap) feed_source(source int, strength f64) int {
+    if source < 0 || source >= MAX_SOURCES || !fm.finite(strength) || strength < 0.0 || strength > 1.0 {
+        >> errors.new("game: invalid input source value")
+    }
+    input.sources[source] = strength
+    input.refresh()
+    << 0
+}
+// Edges last one render frame; call before draining the platform event queue.
+pub fn (input $&InputMap) begin_frame() {
+    for i in 0:input.actions.len {
+        input.actions[i].just_pressed = false
+        input.actions[i].just_released = false
+    }
+}
+pub fn (input $&InputMap) feed_key(key int, down bool) int {
+    if key < 0 || key >= MAX_KEYS { >> errors.new("game: key outside input range") }
+    if input.keys[key] == down { << 0 }
+    input.keys[key] = down
+    input.refresh()
+    << 0
+}
+pub fn (input $&InputMap) release_all() {
+    for i in 0:MAX_KEYS { input.keys[i] = false }
+    for i in 0:MAX_SOURCES { input.sources[i] = 0.0 }
+    for i in 0:input.actions.len {
+        if input.actions[i].pressed { input.actions[i].just_released = true }
+        input.actions[i].pressed = false
+        input.actions[i].value = 0.0
+        input.actions[i].just_pressed = false
+    }
+}
+pub fn (input &InputMap) pressed(name string) bool {
+    index := input.action_index(&name) or >>
+    << input.actions[index].pressed
+}
+pub fn (input &InputMap) just_pressed(name string) bool {
+    index := input.action_index(&name) or >>
+    << input.actions[index].just_pressed
+}
+pub fn (input &InputMap) just_released(name string) bool {
+    index := input.action_index(&name) or >>
+    << input.actions[index].just_released
+}
+pub fn (input &InputMap) axis(negative string, positive string) f64 {
+    low := input.value(negative) or >>
+    high := input.value(positive) or >>
+    << high - low
+}
+pub fn (input &InputMap) value(name string) f64 {
+    index := input.action_index(&name) or >>
+    << input.actions[index].value
+}
+pub fn (input &InputMap) vector(left string, right string, up string, down string) fm.Vec2 {
+    x := input.axis(left, right) or >>
+    y := input.axis(up, down) or >>
+    direction := fm.vec2(x, y)
+    if direction.dot(direction) > 1.0 { << direction.normalized() }
+    << direction
+}

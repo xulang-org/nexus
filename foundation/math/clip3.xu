@@ -1,0 +1,48 @@
+@"github.com/xulang-org/game/foundation/math"
+
+#math
+#errors
+
+fn outside_clip_plane(bounds Aabb3, a Vec4, b Vec4, sign f64, relative_error f64, absolute_error f64) bool {
+    plane := vec4(a.x+sign*b.x,a.y+sign*b.y,a.z+sign*b.z,a.w+sign*b.w)
+    if !plane.is_finite() { << false }
+    $support := bounds.minimum
+    if plane.x>=0.0 { support.x=bounds.maximum.x }
+    if plane.y>=0.0 { support.y=bounds.maximum.y }
+    if plane.z>=0.0 { support.z=bounds.maximum.z }
+    maximum := plane.x*support.x+plane.y*support.y+plane.z*support.z+plane.w
+    extent := vec3(math.max(math.abs(bounds.minimum.x),math.abs(bounds.maximum.x)),
+        math.max(math.abs(bounds.minimum.y),math.abs(bounds.maximum.y)),
+        math.max(math.abs(bounds.minimum.z),math.abs(bounds.maximum.z)))
+    // Use both original rows, not their possibly cancelling sum. The caller
+    // supplies arithmetic tolerances appropriate to its numeric representation.
+    magnitude := (math.abs(a.x)+math.abs(b.x))*extent.x+(math.abs(a.y)+math.abs(b.y))*extent.y+
+        (math.abs(a.z)+math.abs(b.z))*extent.z+math.abs(a.w)+math.abs(b.w)
+    margin := magnitude*(relative_error+1e-12)+absolute_error
+    if !finite(maximum) || !finite(margin) { << false }
+    << maximum < -margin
+}
+// Conservative closed clip-volume test: -w <= x,y <= w and 0 <= z <= w.
+// Works directly in homogeneous coordinates, including boxes crossing w=0;
+// no inverse, perspective divide, normalized planes or camera convention.
+// A small f64 rounding floor remains when the supplied tolerances are zero.
+pub fn (bounds Aabb3) intersects_clip(matrix Mat4, relative_error f64, absolute_error f64) bool {
+    bounds.validate() or >>
+    if !matrix.is_finite() || !finite(relative_error) || relative_error<0.0 ||
+        !finite(absolute_error) || absolute_error<0.0 { >> errors.new("game math: invalid clip matrix or arithmetic tolerance") }
+    rows := matrix.transposed()
+    for face in 0:6 {
+        $a := rows.c3
+        $b := rows.c0
+        $sign := 1.0
+        if face==1 { sign = -1.0 }
+        if face==2 || face==3 { b=rows.c1 }
+        if face==3 { sign = -1.0 }
+        if face==4 { a=rows.c2
+            b=vec4(0.0,0.0,0.0,0.0) }
+        if face==5 { b=rows.c2
+            sign = -1.0 }
+        if outside_clip_plane(bounds,a,b,sign,relative_error,absolute_error) { << false }
+    }
+    << true
+}

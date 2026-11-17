@@ -1,0 +1,81 @@
+@"github.com/xulang-org/game/resources/scene"
+
+#strings
+#unicode/utf8
+#errors
+
+pub const MAX_RESOURCES = 32
+pub const MAX_SURFACES = 4096
+// Persistent opaque 128-bit identity, separate from a revision's SHA-256.
+// Paths resolve relative to the scene file; there is no global UID registry yet.
+pub struct ResourceReference { pub uid string
+    pub kind string
+    pub path string
+    pub content_hash string }
+pub struct Surface { pub node int
+    pub resource_uid string
+    pub primitive int }
+pub fn valid_resource_id(value &string) bool {
+    << lower_hex(value, 32) && *value != "00000000000000000000000000000000"
+}
+fn lower_hex(value &string, size int) bool {
+    if value.len != size { << false }
+    for i in 0:value.len { if !(value[i] >= 48 && value[i] <= 57) && !(value[i] >= 97 && value[i] <= 102) { << false } }
+    << true
+}
+fn relative_path(value &string) bool {
+    if value.len < 1 || value.len > 1024 || !utf8.valid(value) { << false }
+    for i in 0:value.len { if value[i] < 32 || value[i] == 127 || value[i] == 58 || value[i] == 92 { << false } }
+    parts := strings.split(value, "/")
+    for part in parts { if part.len == 0 || part == "." || part == ".." { << false } }
+    << true
+}
+pub fn with_attachments(document &Document, references []ResourceReference, surfaces []Surface, buses []AudioBus, emitters []AudioEmitter, scripts []ScriptAttachment, connections []ScriptConnection, lights []LightAttachment) Document {
+    if document.nodes.len < 1 || references.len > MAX_RESOURCES || surfaces.len > MAX_SURFACES {
+        >> errors.new("game scene: attachment counts outside profile")
+    }
+    $by_uid := map[string]int{}
+    $paths := map[string]bool{}
+    $kinds := map[string]string{}
+    for i in 0:references.len {
+        reference := &references[i]
+        uid := reference.uid + ""
+        path := reference.path + ""
+        hash := reference.content_hash + ""
+        if !valid_resource_id(&uid) || !lower_hex(&hash, 64) || !relative_path(&path) || (reference.kind != "glb_model" && reference.kind != "wav_clip" && reference.kind != "xu_bytecode") {
+            >> errors.new("game scene: invalid resource identity/path/hash/kind")
+        }
+        if by_uid.has(uid + "") || paths.has(path + "") { >> errors.new("game scene: duplicate resource identity or path") }
+        kinds[uid + ""] = reference.kind + ""
+        by_uid[uid] = i
+        paths[path] = true
+    }
+    $used := map[string]bool{}
+    $occupied := map[int]bool{}
+    for surface in surfaces {
+        if surface.node < 0 || surface.node >= document.nodes.len || document.nodes[surface.node].kind != NODE_3D ||
+            surface.primitive < 0 || surface.primitive >= 1024 || (!by_uid.has(surface.resource_uid + "") || kinds[surface.resource_uid + ""] != "glb_model") {
+            >> errors.new("game scene: invalid surface node/resource/primitive")
+        }
+        if occupied.has(surface.node) { >> errors.new("game scene: duplicate surface node") }
+        occupied[surface.node] = true
+        used[surface.resource_uid + ""] = true
+    }
+    validate_audio(document, &buses, &emitters, &kinds, $&used) or >>
+    validate_scripts(document, &scripts, &connections, &kinds, $&used) or >>
+    validate_lights(document, &lights) or >>
+    if used.len() != references.len { >> errors.new("game scene: unreferenced resource") }
+    $nodes := []NodeData{}
+    for i in 0:document.node_count() { nodes.push(document.describe_node(i) or >>) }
+    << Document{nodes: nodes, references: references, surfaces: surfaces, buses: buses, emitters: emitters, scripts: scripts, connections: connections, lights: lights}
+}
+pub fn (document &Document) resource_count() int { << document.references.len }
+pub fn (document &Document) surface_count() int { << document.surfaces.len }
+pub fn (document &Document) resource(index int) ResourceReference {
+    if index < 0 || index >= document.references.len { >> errors.new("game scene: resource index outside document") }
+    << document.references[index]
+}
+pub fn (document &Document) surface(index int) Surface {
+    if index < 0 || index >= document.surfaces.len { >> errors.new("game scene: surface index outside document") }
+    << document.surfaces[index]
+}

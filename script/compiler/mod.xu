@@ -1,0 +1,223 @@
+@"github.com/xulang-org/game/script/compiler"
+
+bc #"github.com/xulang-org/game/script/bytecode"
+#xu/ast
+#xu/scanner
+#xu/parser
+#encoding/json
+#crypto/sha256
+#errors
+
+pub const MAX_SOURCE_BYTES = 16384
+struct Local {
+    name string
+    register int
+    mutable bool
+    active bool
+}
+struct Handler { id int
+    name string }
+struct Compiler {
+    parser parser.Parser
+    label string
+    fields []bc.Field
+    signals []bc.Signal
+    handlers []Handler
+    registers []int
+    constants []f64
+    code []bc.Instruction
+    locals []Local
+    depth int
+}
+pub fn compile(source string, metadata string, label string) bc.Module {
+    if source.len > MAX_SOURCE_BYTES || metadata.len > MAX_SOURCE_BYTES { >> errors.new("XuScript: source/schema exceeds 16 KiB") }
+    hash := sha256.sum256(source + string_from_byte(0) + metadata)
+    schema := json.parse_max(&metadata, MAX_SOURCE_BYTES)
+    if !schema.ok() { >> errors.new("XuScript schema: " + schema.error()) }
+    root := schema.root()
+    $schema_keys := ["profile", "module", "class", "fields"]
+    if schema.has(root, "signals") { schema_keys.push("signals") }
+    if schema.has(root, "handlers") { schema_keys.push("handlers") }
+    schema_shape(&schema, root, &schema_keys) or >>
+    profile := schema.as_string(schema.get(root, "profile")) or >>
+    name := schema.as_string(schema.get(root, "module")) or >>
+    class_name := schema.as_string(schema.get(root, "class")) or >>
+    if profile != bc.PROFILE { >> errors.new("XuScript: unsupported source profile") }
+    fields_node := schema.get(root, "fields")
+    if !schema.is_list(fields_node) || schema.count(fields_node) > bc.MAX_FIELDS { >> errors.new("XuScript: invalid field schema") }
+    $fields := []bc.Field{}
+    field_keys := ["id", "name", "type", "default"]
+    for i in 0:schema.count(fields_node) {
+        node := schema.at(fields_node, i)
+        schema_shape(&schema, node, &field_keys) or >>
+        id := schema.as_int(schema.get(node, "id")) or >>
+        field_name := schema.as_string(schema.get(node, "name")) or >>
+        kind := schema.as_string(schema.get(node, "type")) or >>
+        value := schema.as_f64(schema.get(node, "default")) or >>
+        if kind != "f64" || id < 1 || id > 2147483647 || !bc.identifier(&field_name) || !bc.valid_scalar(value) {
+            >> errors.new("XuScript: scalar profile requires unique f64 field IDs/names and finite defaults")
+        }
+        for field in fields { if field.id == id || field.name == field_name { >> errors.new("XuScript: duplicate field schema") } }
+        fields.push(bc.Field{id: id, name: field_name, initial: value})
+    }
+    signals := signal_schema(&schema, root) or >>
+    handlers := handler_schema(&schema, root) or >>
+    $tokens := []ast.Token{}
+    scanner.lex(source, $&tokens, label + "")
+    if tokens.len > 8192 { >> errors.new("XuScript: token budget exceeded") }
+    $parsed := parser.new_parser(tokens)
+    parsed.file_name = label + ""
+    parsed.parse_module()
+    if parsed.nodes.len > 4096 || parsed.imports.len != 0 || parsed.compile_tags.len != 0 || parsed.module_id != name {
+        >> errors.new("XuScript: module mismatch, imports/compile tags or AST budget unsupported")
+    }
+    $compiler := Compiler{parser: parsed, label: label, fields: fields, signals: signals, handlers: handlers, registers: [bc.F64, bc.F64],
+        constants: []f64{}, code: []bc.Instruction{}, locals: []Local{}, depth: 0}
+    $structure := -1
+    $methods := []int{}
+    for declaration in compiler.parser.decls {
+        kind := compiler.parser.nodes[declaration].kind
+        if kind == ast.NK_STRUCT && structure < 0 { structure = declaration
+        } else if kind == ast.NK_FN && methods.len < bc.MAX_FUNCTIONS { methods.push(declaration)
+        } else { >> errors.new(compiler.error(declaration, "profile requires one state struct and at most 17 callbacks")) }
+    }
+    if structure < 0 || methods.len < 1 { >> errors.new("XuScript: missing state struct or physics_process/handler callback") }
+    compiler.check_structure(structure, &class_name) or >>
+    $functions := []bc.Function{}
+    $handler_count := 0
+    for method in methods {
+        compiler.locals = []Local{}
+        compiler.depth = 0
+        id := compiler.check_method(method, &class_name) or >>
+        method_name := compiler.parser.nodes[method].sval + ""
+        for f in functions { if f.name == method_name { >> errors.new(compiler.error(method, "duplicate callback name")) } }
+        $kind := bc.PHYSICS_FUNCTION
+        if id > 0 { kind = bc.SIGNAL_FUNCTION
+            handler_count = handler_count + 1 }
+        entry := compiler.code.len
+        body := compiler.parser.nodes[method].c
+        $last := body
+        if last < 0 { >> errors.new(compiler.error(method, "empty callback")) }
+        while compiler.parser.nodes[last].next >= 0 { last = compiler.parser.nodes[last].next }
+        if compiler.parser.nodes[last].kind != ast.NK_RETURN { >> errors.new(compiler.error(last, "profile requires an explicit final return")) }
+        compiler.block(body) or >>
+        functions.push(bc.Function{id: id, name: method_name, kind: kind, entry: entry, end: compiler.code.len})
+    }
+    if handler_count != compiler.handlers.len { >> errors.new("XuScript: handler declarations differ from schema") }
+    // Xu does not permit partially moving array fields out of Compiler.
+    $out_fields := []bc.Field{}
+    for field in compiler.fields { out_fields.push(bc.Field{id: field.id, name: field.name + "", initial: field.initial}) }
+    $out_registers := []int{}
+    $out_signals := []bc.Signal{}
+    for signal in compiler.signals { out_signals.push(bc.Signal{id: signal.id, name: signal.name + ""}) }
+    for kind in compiler.registers { out_registers.push(kind) }
+    $out_constants := []f64{}
+    for value in compiler.constants { out_constants.push(value) }
+    $out_code := []bc.Instruction{}
+    for instruction in compiler.code { out_code.push(instruction) }
+    << bc.make_module_with_functions(name, class_name, hash, out_fields, out_signals, functions, out_registers, out_constants, out_code) or >>
+}
+fn schema_shape(doc &json.Doc, node int, names &[]string) int {
+    if node < 0 || !doc.is_dict(node) || doc.count(node) != names.len { >> errors.new("XuScript: invalid schema object") }
+    for name in names { if !doc.has(node, name + "") { >> errors.new("XuScript: missing schema property: " + name) } }
+    << 0
+}
+fn (compiler &Compiler) error(index int, message string) string {
+    if index < 0 || index >= compiler.parser.nodes.len { << compiler.label + ": " + message }
+    << compiler.label + ":" + str(compiler.parser.nodes[index].line) + ":" + str(compiler.parser.nodes[index].col) + ": " + message
+}
+fn (compiler &Compiler) syntax(index int) ast.Node {
+    source := &compiler.parser.nodes[index]
+    << ast.Node{kind: source.kind, line: source.line, col: source.col, ival: source.ival,
+        sval: source.sval + "", sval2: source.sval2 + "", a: source.a, b: source.b, c: source.c,
+        d: source.d, e: source.e, next: source.next}
+}
+fn (compiler &Compiler) field_index(node int) int {
+    field := compiler.syntax(node)
+    if field.kind != ast.NK_FIELD || field.a < 0 || compiler.parser.nodes[field.a].kind != ast.NK_IDENT ||
+        compiler.parser.nodes[field.a].sval != "self" { >> errors.new(compiler.error(node, "only self.field access is supported")) }
+    for i in 0:compiler.fields.len { if compiler.fields[i].name == field.sval { << i } }
+    >> errors.new(compiler.error(node, "unknown state field"))
+}
+fn (compiler &Compiler) local_index(name &string) int {
+    $i := compiler.locals.len
+    while i > 0 { i = i - 1
+        if compiler.locals[i].active && compiler.locals[i].name == *name { << i } }
+    << -1
+}
+fn (compiler $&Compiler) allocate(kind int, node int) int {
+    if compiler.registers.len >= bc.MAX_REGISTERS { >> errors.new(compiler.error(node, "register budget exceeded")) }
+    index := compiler.registers.len
+    compiler.registers.push(kind)
+    << index
+}
+fn (compiler $&Compiler) emit(op int, dst int, a int, b int, node int) int {
+    if compiler.code.len >= bc.MAX_CODE { >> errors.new(compiler.error(node, "instruction budget exceeded")) }
+    index := compiler.code.len
+    source := compiler.syntax(node)
+    compiler.code.push(bc.Instruction{op: op, dst: dst, a: a, b: b, line: source.line, col: source.col})
+    << index
+}
+fn (compiler $&Compiler) check_structure(node int, class_name &string) int {
+    declaration := compiler.syntax(node)
+    if declaration.sval != *class_name || declaration.e >= 0 { >> errors.new(compiler.error(node, "state class mismatch or generics unsupported")) }
+    $field := declaration.a
+    $count := 0
+    $seen := map[string]bool{}
+    while field >= 0 {
+        name := compiler.parser.nodes[field].sval + ""
+        kind := compiler.parser.nodes[field].a
+        $found := false
+        for candidate in compiler.fields { if candidate.name == name { found = true } }
+        if kind < 0 || compiler.parser.nodes[kind].kind != ast.NT_F64 || !found || seen.has(name) {
+            >> errors.new(compiler.error(field, "state declarations must match the f64 field schema"))
+        }
+        seen[name] = true
+        count = count + 1
+        field = compiler.parser.nodes[field].next
+    }
+    if count != compiler.fields.len { >> errors.new(compiler.error(node, "state field count differs from schema")) }
+    << 0
+}
+fn (compiler $&Compiler) check_method(node int, class_name &string) int {
+    method := compiler.syntax(node)
+    $id := 0
+    $arguments := 2
+    if method.sval != "physics_process" {
+        arguments = 1
+        for handler in compiler.handlers { if handler.name == method.sval { id = handler.id } }
+        if id == 0 { >> errors.new(compiler.error(node, "callback must be physics_process or a declared handler")) }
+    }
+    if method.d < 0 || method.e >= 0 || method.b < 0 || compiler.parser.nodes[method.b].kind != ast.NT_F64 {
+        >> errors.new(compiler.error(node, "callback requires a state receiver, f64 return and no generics")) }
+    receiver := compiler.syntax(method.d)
+    reference := receiver.a
+    if receiver.sval != "self" || reference < 0 || compiler.parser.nodes[reference].kind != ast.NT_REF ||
+        compiler.parser.nodes[reference].ival != 1 || compiler.parser.nodes[reference].sval.len != 0 {
+        >> errors.new(compiler.error(node, "callback needs self \$&State receiver without lifetime annotations")) }
+    target := compiler.parser.nodes[reference].a
+    if target < 0 || compiler.parser.nodes[target].kind != ast.NT_NAMED || compiler.parser.nodes[target].sval != *class_name ||
+        compiler.parser.nodes[target].a >= 0 {
+        >> errors.new(compiler.error(node, "receiver state class mismatch"))
+    }
+    $parameter := method.a
+    $count := 0
+    while parameter >= 0 {
+        type_node := compiler.parser.nodes[parameter].a
+        name := compiler.parser.nodes[parameter].sval + ""
+        if count >= arguments || type_node < 0 || compiler.parser.nodes[type_node].kind != ast.NT_F64 ||
+            compiler.parser.nodes[parameter].ival != 0 || compiler.parser.nodes[parameter].sval2.len != 0 ||
+            name == "self" || name == "emit_signal" || compiler.local_index(&name) >= 0 {
+            if id > 0 { >> errors.new(compiler.error(parameter, "signal handler requires one distinct immutable f64 argument")) }
+            >> errors.new(compiler.error(parameter, "callback needs two distinct immutable f64 arguments: delta, axis"))
+        }
+        compiler.locals.push(Local{name: name, register: count, mutable: false, active: true})
+        count = count + 1
+        parameter = compiler.parser.nodes[parameter].next
+    }
+    if count != arguments {
+        if id == 0 { >> errors.new(compiler.error(node, "callback requires delta and axis arguments")) }
+        >> errors.new(compiler.error(node, "signal handler requires one immutable f64 argument"))
+    }
+    << id
+}

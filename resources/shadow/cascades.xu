@@ -1,0 +1,150 @@
+@"github.com/xulang-org/game/resources/shadow"
+
+fm #"github.com/xulang-org/game/foundation/math"
+lights #"github.com/xulang-org/game/resources/lighting"
+#math
+#errors
+
+pub struct CascadeSettings3D {
+    pub count int
+    pub resolution int
+    pub distance f64
+    pub split_lambda f64
+    pub blend_fraction f64
+    pub caster_padding f64
+    pub stabilization_step f64
+    pub raster_bias_texels f64
+}
+pub fn default_cascades() CascadeSettings3D {
+    << CascadeSettings3D{count: 4,resolution: 512,distance: 100.0,split_lambda: 0.6,blend_fraction: 0.1,caster_padding: 20.0,stabilization_step: 0.0625,raster_bias_texels: 0.00390625}
+}
+// Fixed, bounded value payload without owning arrays.
+struct CascadePayload3D {
+    count int
+    near f64
+    far f64
+    raster_bias f64
+    camera fm.Mat4
+    depth_plane fm.Vec4
+    m0 fm.Mat4
+    m1 fm.Mat4
+    m2 fm.Mat4
+    m3 fm.Mat4
+    p0 fm.Vec4
+    p1 fm.Vec4
+    p2 fm.Vec4
+    p3 fm.Vec4
+    gradient_scales fm.Vec4
+}
+fn no_cascades() CascadePayload3D {
+    identity := fm.identity_3d()
+    zero := fm.vec4(0.0,0.0,0.0,0.0)
+    << CascadePayload3D{count: 0,near: 0.0,far: 0.0,raster_bias: 0.0,camera: identity,depth_plane: zero,
+        m0: identity,m1: identity,m2: identity,m3: identity,p0: zero,p1: zero,p2: zero,p3: zero,gradient_scales: zero}
+}
+pub fn cascaded(source lights.Light3D,camera CascadeCamera3D,settings CascadeSettings3D) ShadowDescription3D {
+    source.validate() or >>
+    if source.kind()!=lights.DIRECTIONAL || settings.count<2 || settings.count>4 || settings.resolution<128 || settings.resolution>1024 ||
+        (settings.resolution & (settings.resolution-1))!=0 || !fm.finite(settings.distance) || settings.distance<=camera.near ||
+        !fm.finite(settings.split_lambda) || settings.split_lambda<0.0 || settings.split_lambda>1.0 ||
+        !fm.finite(settings.blend_fraction) || settings.blend_fraction<0.0 || settings.blend_fraction>0.3 ||
+        !fm.finite(settings.caster_padding) || settings.caster_padding<0.0 || settings.caster_padding>1000000.0 ||
+        !fm.finite(settings.stabilization_step) || settings.stabilization_step<=0.0 || settings.stabilization_step>1000000.0 ||
+        !fm.finite(settings.raster_bias_texels) || settings.raster_bias_texels<0.0 || settings.raster_bias_texels>0.5 {
+        >> errors.new("game shadow: invalid directional cascade settings")
+    }
+    // Revalidate value input; zero/default camera values are never accepted.
+    cascade_camera(camera.view,camera.projection) or >>
+    far := math.min(camera.far,settings.distance)
+    $splits := [camera.near]
+    for i in 1:settings.count {
+        fraction := f64(i)/f64(settings.count)
+        logarithmic := camera.near*math.pow_f64(far/camera.near,fraction)
+        uniform := camera.near+(far-camera.near)*fraction
+        splits.push(settings.split_lambda*logarithmic+(1.0-settings.split_lambda)*uniform)
+    }
+    splits.push(far)
+    $result := default_directional()
+    result.direction=source.direction()
+    result.resolution=settings.resolution
+    $payload := no_cascades()
+    payload.count=settings.count
+    payload.near=camera.near
+    payload.far=far
+    payload.raster_bias=settings.raster_bias_texels
+    payload.camera=camera.view_projection()
+    payload.depth_plane=camera.depth_plane()
+    $first_depth := 0.0
+    $first_ratio := 0.0
+    for i in 0:settings.count {
+        start := splits[i]
+        end := splits[i+1]
+        if end-start<math.max(1.0,end)*0.000001 { >> errors.new("game shadow: cascade splits too close for GPU depth selection") }
+        $fit_near := start
+        if i>0 { fit_near=start-(start-splits[i-1])*settings.blend_fraction }
+        middle := (fit_near+end)*0.5
+        center := camera.world.transform(fm.vec4(0.0,0.0,-middle,1.0)).xyz()
+        $radius := 0.0
+        for distance in [fit_near,end] { for x in [-1.0,1.0] { for y in [-1.0,1.0] {
+            relative := camera.world.transform(fm.vec4(x*distance/camera.fx,y*distance/camera.fy,middle-distance,0.0)).xyz()
+            radius=math.max(radius,relative.length())
+        } } }
+        // Quantize size, then reserve three texels for center snapping and PCF.
+        radius=math.max(settings.stabilization_step,math.ceil(radius/settings.stabilization_step-0.0000001)*settings.stabilization_step)
+        extent := radius*f64(settings.resolution)/f64(settings.resolution-6)
+        depth := 2.0*(radius+settings.caster_padding)
+        slice := directional(center,source.direction(),extent,depth,settings.resolution) or >>
+        matrix := slice.view_projection(0) or >>
+        if i==0 { first_depth=depth
+            first_ratio=extent/depth
+            result.center=center
+            result.extent=extent
+            result.depth=depth }
+        ratio := (extent/depth)/first_ratio
+        if i==0 { payload.gradient_scales.x=ratio } else if i==1 { payload.gradient_scales.y=ratio } else if i==2 { payload.gradient_scales.z=ratio } else { payload.gradient_scales.w=ratio }
+        parameters := fm.vec4(start,end,end-(end-start)*settings.blend_fraction,first_depth/depth)
+        if i==0 { payload.m0=matrix
+            payload.p0=parameters
+        } else if i==1 { payload.m1=matrix
+            payload.p1=parameters
+        } else if i==2 { payload.m2=matrix
+            payload.p2=parameters
+        } else { payload.m3=matrix
+            payload.p3=parameters }
+    }
+    result.cascades=payload
+    result.validate() or >>
+    << result
+}
+pub fn (description &ShadowDescription3D) cascade_count() int { << description.cascades.count }
+pub fn (description &ShadowDescription3D) cascade_parameters(index int) fm.Vec4 {
+    if index<0 || index>=description.cascades.count { >> errors.new("game shadow: cascade index outside description") }
+    if index==0 { << description.cascades.p0 }
+    if index==1 { << description.cascades.p1 }
+    if index==2 { << description.cascades.p2 }
+    << description.cascades.p3
+}
+fn (description &ShadowDescription3D) cascade_matrix(index int) fm.Mat4 {
+    if index==0 { << description.cascades.m0 }
+    if index==1 { << description.cascades.m1 }
+    if index==2 { << description.cascades.m2 }
+    << description.cascades.m3
+}
+pub fn (description &ShadowDescription3D) cascade_gradient_scales() fm.Vec4 { << description.cascades.gradient_scales }
+pub fn (description &ShadowDescription3D) cascade_depth_plane() fm.Vec4 { << description.cascades.depth_plane }
+pub fn (description &ShadowDescription3D) cascade_limits() fm.Vec4 {
+    << fm.vec4(description.cascades.near,description.cascades.far,f64(description.cascades.count),description.cascades.raster_bias)
+}
+pub fn (description &ShadowDescription3D) matches_camera(view_projection fm.Mat4) bool {
+    if !view_projection.is_finite() { << false }
+    if description.cascade_count()==0 { << true }
+    a := description.cascades.camera
+    b := view_projection
+    for columns in [fm.vec4(a.c0.x-b.c0.x,a.c0.y-b.c0.y,a.c0.z-b.c0.z,a.c0.w-b.c0.w),
+        fm.vec4(a.c1.x-b.c1.x,a.c1.y-b.c1.y,a.c1.z-b.c1.z,a.c1.w-b.c1.w),
+        fm.vec4(a.c2.x-b.c2.x,a.c2.y-b.c2.y,a.c2.z-b.c2.z,a.c2.w-b.c2.w),
+        fm.vec4(a.c3.x-b.c3.x,a.c3.y-b.c3.y,a.c3.z-b.c3.z,a.c3.w-b.c3.w)] {
+        if math.abs(columns.x)>0.000000001 || math.abs(columns.y)>0.000000001 || math.abs(columns.z)>0.000000001 || math.abs(columns.w)>0.000000001 { << false }
+    }
+    << true
+}

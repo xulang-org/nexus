@@ -1,0 +1,369 @@
+@"github.com/xulang-org/game/rendering/three_d"
+
+present #"github.com/xulang-org/game/platform/present"
+#gpu
+#gpu/layout
+#window
+#window/events
+#errors
+
+pub struct ShaderProgram3D {
+    pub format int
+    pub entrypoint string
+    pub vertex []u8
+    pub fragment []u8
+    pub present_vertex []u8
+    pub present_fragment []u8
+}
+// Scene and material policies stay in Xu. All owning GPU objects and window
+// lifecycle are standard resources; weak draw references never own allocations.
+pub struct Device3D {
+    session present.Session
+    targets []gpu.Texture
+    whites []gpu.Texture
+    white_samplers []gpu.Sampler
+    pipelines []gpu.GraphicsPipeline
+    linear_samplers []gpu.Sampler
+    render_scale int
+    encoders []gpu.CommandEncoder
+    passes []gpu.RenderPass
+    target_width int
+    target_height int
+    surface_format int
+    draw_count int
+    lit_draws int
+    light_candidates int
+    selected_lights int
+    device_id int
+    active bool
+    sealed bool
+    closed bool
+    cached bool
+    soft_pixels []u8
+    soft_depth []f64
+    pixels []u8
+}
+fn target_size(width int, height int) int {
+    if width<1 || height<1 || width>4096 || height>4096 || width*height>4194304 {
+        >> errors.new("game 3D: output exceeds 4096 per side / 4M pixels")
+    }
+    << 0
+}
+fn new_color(device &gpu.Device, width int, height int) gpu.Texture {
+    target_size(width,height) or >>
+    << device.texture_2d(gpu.Texture2DDesc{format: layout.RGBA8_UNORM,width: width,height: height,levels: 1,
+        usage: gpu.TEXTURE_COLOR_TARGET | gpu.TEXTURE_SAMPLED}) or >>
+}
+fn new_depth(device &gpu.Device, width int, height int) gpu.Texture {
+    << device.texture_2d(gpu.Texture2DDesc{format: layout.DEPTH32_FLOAT,width: width,height: height,levels: 1,
+        usage: gpu.TEXTURE_DEPTH_TARGET}) or >>
+}
+fn mesh_pipeline() gpu.PipelineDesc {
+    $desc := gpu.pipeline_defaults(layout.RGBA8_UNORM)
+    desc.depth_format = layout.DEPTH32_FLOAT
+    desc.depth_compare = gpu.GREATER
+    desc.depth_write = true
+    desc.vertex_buffers = [gpu.VertexBufferLayout{slot: 0,stride: 64,rate: gpu.PER_VERTEX}]
+    desc.attributes = [gpu.VertexAttribute{location: 0,slot: 0,format: gpu.FLOAT3,offset: 0},
+        gpu.VertexAttribute{location: 1,slot: 0,format: gpu.FLOAT4,offset: 12},
+        gpu.VertexAttribute{location: 2,slot: 0,format: gpu.FLOAT3,offset: 28},
+        gpu.VertexAttribute{location: 3,slot: 0,format: gpu.FLOAT2,offset: 40},
+        gpu.VertexAttribute{location: 4,slot: 0,format: gpu.FLOAT4,offset: 48}]
+    << desc
+}
+fn empty_shader_program_3d() ShaderProgram3D {
+    << ShaderProgram3D{format: 0,entrypoint: "",vertex: []u8{},fragment: []u8{},
+        present_vertex: []u8{},present_fragment: []u8{}}
+}
+
+pub fn open_3d(title string, width int, height int, backend int, program &ShaderProgram3D) Device3D {
+    target_size(width,height) or >>
+    options := window.Options{title: title,width: width,height: height,resizable: true,high_pixel_density: false,hidden: false}
+    << open_3d_window(options,backend,program) or >>
+}
+pub fn open_3d_window(options window.Options, backend int, program &ShaderProgram3D) Device3D {
+    << open_3d_with_policy(options,backend,program,present.POLICY_GPU_ONLY) or >>
+}
+pub fn open_3d_adaptive(title string, width int, height int, backend int, program &ShaderProgram3D) Device3D {
+    target_size(width,height) or >>
+    options := window.Options{title: title,width: width,height: height,resizable: true,high_pixel_density: false,hidden: false}
+    << open_3d_window_adaptive(options,backend,program) or >>
+}
+pub fn open_3d_window_adaptive(options window.Options, backend int, program &ShaderProgram3D) Device3D {
+    target_size(options.width,options.height) or >>
+    $session := present.open_adaptive(options,backend,program.format) or >>
+    sw := session.width
+    sh := session.height
+    << init_3d_session(session,program,sw,sh) or >>
+}
+pub fn open_3d_software(options window.Options) Device3D {
+    prog := empty_shader_program_3d()
+    << open_3d_with_policy(options,0,&prog,present.POLICY_SOFTWARE) or >>
+}
+pub fn open_3d_headless(width int, height int) Device3D {
+    target_size(width,height) or >>
+    $session := present.open_headless(width,height) or >>
+    prog := empty_shader_program_3d()
+    << init_3d_session(session,&prog,width,height) or >>
+}
+
+fn open_3d_with_policy(options window.Options, backend int, program &ShaderProgram3D, policy int) Device3D {
+    target_size(options.width,options.height) or >>
+    $session := present.open_window(options,backend,program.format,policy) or >>
+    sw := session.width
+    sh := session.height
+    << init_3d_session(session,program,sw,sh) or >>
+}
+
+fn init_3d_session(session present.Session, program &ShaderProgram3D, width int, height int) Device3D {
+    $sess := session
+    if !sess.is_gpu() {
+        target_size(width,height) or >>
+        dev_id := gpu.soft_owner_new() or >>
+        $out := Device3D{session: sess,targets: []gpu.Texture{},whites: []gpu.Texture{},white_samplers: []gpu.Sampler{},
+            pipelines: []gpu.GraphicsPipeline{},linear_samplers: []gpu.Sampler{},render_scale: 1,
+            encoders: []gpu.CommandEncoder{},passes: []gpu.RenderPass{},target_width: width,target_height: height,
+            surface_format: 0,draw_count: 0,lit_draws: 0,light_candidates: 0,selected_lights: 0,device_id: dev_id,
+            active: false,sealed: false,closed: false,cached: false,soft_pixels: []u8{},soft_depth: []f64{},pixels: []u8{}}
+        soft_resize_and_clear($&out,255) or >>
+        << out
+    }
+    target_size(sess.width,sess.height) or >>
+    dev := sess.gpu_device() or >>
+    targets := render_targets(dev,sess.width,sess.height,1) or >>
+    $white := dev.texture_2d(gpu.Texture2DDesc{format: layout.RGBA8_UNORM,width: 1,height: 1,levels: 1,usage: gpu.TEXTURE_SAMPLED}) or >>
+    pixel := [u8(255),u8(255),u8(255),u8(255)]
+    $upload := dev.upload_texture(&white,0,&pixel) or >>
+    upload.close() or >>
+    $sampling := gpu.sampler_defaults()
+    sampling.min_filter = gpu.NEAREST
+    sampling.mag_filter = gpu.NEAREST
+    sampling.mip_filter = gpu.NEAREST
+    sampling.max_lod = 0.0
+    $white_sampler := dev.sampler(sampling) or >>
+    sampling.min_filter=gpu.LINEAR
+    sampling.mag_filter=gpu.LINEAR
+    $linear_sampler := dev.sampler(sampling) or >>
+    vs_desc := gpu.ShaderDesc{stage: gpu.VERTEX,format: program.format,entrypoint: program.entrypoint+"",samplers: 0,uniform_sizes: [192]}
+    fs_desc := gpu.ShaderDesc{stage: gpu.FRAGMENT,format: program.format,entrypoint: program.entrypoint+"",samplers: 6,uniform_sizes: [64,lighting_uniform_size(),416]}
+    $vs := dev.shader(&vs_desc,&program.vertex) or >>
+    $fs := dev.shader(&fs_desc,&program.fragment) or >>
+    $desc := mesh_pipeline()
+    $pipeline := dev.graphics_pipeline(&vs,&fs,&desc) or >>
+    desc.cull = gpu.CULL_BACK
+    $ccw := dev.graphics_pipeline(&vs,&fs,&desc) or >>
+    desc.front_face = gpu.CLOCKWISE
+    $cw := dev.graphics_pipeline(&vs,&fs,&desc) or >>
+    vs.close() or >>
+    fs.close() or >>
+    format := sess.swapchain_format()
+    $copying := presentation_pipeline(dev,program,format) or >>
+    $resolving := presentation_pipeline(dev,program,layout.RGBA8_UNORM) or >>
+    sw := sess.width
+    sh := sess.height
+    << Device3D{session: sess,targets: targets,whites: [white],white_samplers: [white_sampler],
+        pipelines: [pipeline,ccw,cw,copying,resolving],linear_samplers: [linear_sampler],render_scale: 1,
+        encoders: []gpu.CommandEncoder{},passes: []gpu.RenderPass{},target_width: sw,target_height: sh,
+        surface_format: format,draw_count: 0,lit_draws: 0,light_candidates: 0,selected_lights: 0,device_id: 0,
+        active: false,sealed: false,closed: false,cached: false,soft_pixels: []u8{},soft_depth: []f64{},pixels: []u8{}}
+}
+// CPU submission counters for the current/last frame, not hardware timings or
+// fragment counts. Only successfully recorded material draws increment them.
+pub struct LightingStats3D { pub draws int
+    pub candidates int
+    pub selected int
+    pub culled int }
+pub fn (device &Device3D) lighting_stats() LightingStats3D {
+    device.alive() or >>
+    << LightingStats3D{draws: device.lit_draws,candidates: device.light_candidates,
+        selected: device.selected_lights,culled: device.light_candidates-device.selected_lights}
+}
+fn (device &Device3D) alive() int {
+    if device.closed { >> errors.new("game 3D: device is closed") }
+    << 0
+}
+fn (device &Device3D) recording() int {
+    device.alive() or >>
+    if !device.active { >> errors.new("game 3D: begin a frame first") }
+    << 0
+}
+// Validate the draw phase independently of its submission budget. Scene
+// culling may traverse any number of offscreen meshes without spending draws.
+pub fn (device &Device3D) validate_recording() int {
+    device.recording() or >>
+    if device.sealed { >> errors.new("game 3D: draw before readback") }
+    << 0
+}
+fn (device &Device3D) drawing() int {
+    device.validate_recording() or >>
+    if device.draw_count>=16384 { >> errors.new("game 3D: frame draw budget exceeded") }
+    << 0
+}
+pub fn (device &Device3D) backend_mode() int {
+    device.alive() or >>
+    << device.session.backend_mode() or >>
+}
+pub fn (device &Device3D) mode_name() string {
+    device.alive() or >>
+    << device.session.mode_name() or >>
+}
+pub fn (device &Device3D) is_gpu() bool { << !device.closed && device.session.is_gpu() }
+pub fn (device &Device3D) is_software() bool { << !device.closed && device.session.is_software() }
+pub fn (device &Device3D) has_display_window() bool { << !device.closed && device.session.has_display_window() }
+pub fn (device &Device3D) swapchain_format() int {
+    device.alive() or >>
+    << device.surface_format
+}
+pub fn (device &Device3D) present_session() &present.Session {
+    device.alive() or >>
+    << &device.session
+}
+pub fn (device &Device3D) gpu_device() &gpu.Device {
+    device.alive() or >>
+    if !device.is_gpu() { >> errors.new("game 3D: gpu_device unavailable in software or headless mode") }
+    << &device.session.devices[0]
+}
+pub fn (device &Device3D) window() &window.Window {
+    device.alive() or >>
+    if device.session.windows.len == 0 {
+        >> errors.new("game 3D: headless device has no window")
+    }
+    << &device.session.windows[0]
+}
+pub fn (device &Device3D) backend() int {
+    device.alive() or >>
+    if !device.is_gpu() { << 0 }
+    dev := device.gpu_device() or >>
+    << dev.backend() or >>
+}
+pub fn (device &Device3D) width() int {
+    device.alive() or >>
+    if !device.session.has_display_window() { << device.target_width }
+    win := device.window() or >>
+    state := win.state() or >>
+    << state.pixel_width
+}
+pub fn (device &Device3D) height() int {
+    device.alive() or >>
+    if !device.session.has_display_window() { << device.target_height }
+    win := device.window() or >>
+    state := win.state() or >>
+    << state.pixel_height
+}
+pub fn (device &Device3D) poll() events.Event {
+    device.alive() or >>
+    << device.session.poll() or >>
+}
+fn sync_software_3d_frame(device $&Device3D, background int) int {
+    sess := $&device.session
+    sess.sync_software_window_size() or >>
+    sw := device.session.width
+    sh := device.session.height
+    target_size(sw * device.render_scale, sh * device.render_scale) or >>
+    device.target_width = sw
+    device.target_height = sh
+    << soft_resize_and_clear(device, background) or >>
+}
+pub fn (device $&Device3D) begin(background int) int {
+    device.alive() or >>
+    if device.active { >> errors.new("game 3D: frame already active") }
+    clear := rgba_color(background) or >>
+    if device.is_gpu() {
+        if device.session.has_display_window() {
+            win := device.window() or >>
+            state := win.state() or >>
+            if state.pixel_width>0 && state.pixel_height>0 && (state.pixel_width!=device.target_width || state.pixel_height!=device.target_height) {
+                // Both allocations must succeed before either live target is replaced.
+                dev := device.gpu_device() or >>
+                targets := render_targets(dev,state.pixel_width,state.pixel_height,device.render_scale) or >>
+                device.targets = targets
+                device.target_width = state.pixel_width
+                device.target_height = state.pixel_height
+            }
+        }
+        dev := device.gpu_device() or >>
+        $encoder := dev.command_encoder() or >>
+        attachment := gpu.ColorAttachment{view: device.targets[0].view(0) or >>,load: gpu.CLEAR,store: gpu.STORE,clear: clear}
+        depth := gpu.depth_attachment(&device.targets[1],gpu.CLEAR,gpu.STORE,0.0)
+        pass := encoder.begin_render(attachment,depth) or >>
+        device.encoders = [encoder]
+        device.passes = [pass]
+    } else {
+        sync_software_3d_frame(device, background) or >>
+    }
+    device.active = true
+    device.sealed = false
+    device.cached = false
+    device.pixels = []u8{}
+    device.draw_count = 0
+    device.lit_draws = 0
+    device.light_candidates = 0
+    device.selected_lights = 0
+    << 0
+}
+fn (device $&Device3D) seal() int {
+    device.recording() or >>
+    if device.sealed { << 0 }
+    if !device.is_gpu() {
+        device.pixels = soft_resolve_pixels(&device.soft_pixels, device.target_width, device.target_height, device.render_scale)
+        device.cached = true
+        device.sealed = true
+        << 0
+    }
+    pass := $&device.passes[0]
+    pass.end() or(err){ device.abandon_frame()
+        >> err }
+    device.resolve_target() or(err){ device.abandon_frame()
+        >> err }
+    encoder := $&device.encoders[0]
+    $fence := encoder.submit() or(err){ device.abandon_frame()
+        >> err }
+    fence.close() or >>
+    device.sealed = true
+    << 0
+}
+fn (device $&Device3D) abandon_frame() {
+    // Submission failure can consume the standard encoder. Preserve the first
+    // error and discard stale wrappers so the next begin can start a new frame.
+    close_encoder($&device.encoders)
+    device.passes = []gpu.RenderPass{}
+    device.encoders = []gpu.CommandEncoder{}
+    device.active = false
+    device.sealed = false
+    device.cached = false
+    device.pixels = []u8{}
+}
+fn close_encoder(encoders $&[]gpu.CommandEncoder) string {
+    if encoders.len>0 { encoder := $&encoders[0]
+        encoder.close() or(err){ << err.msg() } }
+    << "" }
+fn close_session_3d(sess $&present.Session) string { sess.close() or(err){ << err.msg() }
+    << "" }
+pub fn (device $&Device3D) close() int {
+    if device.closed { << 0 }
+    device.closed = true
+    device.active = false
+    device.pixels = []u8{}
+    device.soft_pixels = []u8{}
+    device.soft_depth = []f64{}
+    first := close_encoder($&device.encoders)
+    device.passes = []gpu.RenderPass{}
+    device.encoders = []gpu.CommandEncoder{}
+    device.targets = []gpu.Texture{}
+    device.whites = []gpu.Texture{}
+    device.white_samplers = []gpu.Sampler{}
+    device.pipelines = []gpu.GraphicsPipeline{}
+    device.linear_samplers = []gpu.Sampler{}
+    second := close_session_3d($&device.session)
+    third := close_soft_owner(device.device_id)
+    if first.len>0 { >> errors.new(first) }
+    if second.len>0 { >> errors.new(second) }
+    if third.len>0 { >> errors.new(third) }
+    << 0
+}
+fn close_soft_owner(owner int) string {
+    if owner <= 0 { << "" }
+    gpu.soft_owner_close(owner) or(err){ << err.msg() }
+    << ""
+}
+fn (device $&Device3D) drop() { device.close() or(err){ << } }

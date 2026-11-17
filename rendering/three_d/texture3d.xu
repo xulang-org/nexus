@@ -1,0 +1,117 @@
+@"github.com/xulang-org/game/rendering/three_d"
+
+#gpu
+#errors
+
+pub struct Texture3D {
+    images []gpu.Texture
+    samplers []gpu.Sampler
+    soft_blobs []gpu.SoftBlob
+    has_gpu bool
+    device_id int
+    soft_levels int
+    soft_bytes int
+    linear bool
+    repeat bool
+    srgb bool
+    closed bool
+    pub width int
+    pub height int
+}
+pub struct TextureRef3D {
+    image gpu.TextureRef
+    sampler gpu.SamplerRef
+    soft_pixels gpu.SoftBlobRef
+    present bool
+    srgb bool
+    has_gpu bool
+    device_id int
+    width int
+    height int
+    linear bool
+    repeat bool
+}
+pub fn (device &Device3D) texture_rgba(width int, height int, pixels &[]int, srgb bool, linear bool, repeat bool) Texture3D {
+    sampling := TextureSampling3D{min_linear: linear,mag_linear: linear,repeat_u: repeat,repeat_v: repeat,mip_filter: MIP_NONE}
+    << device.texture_rgba_sampled(width,height,pixels,srgb,sampling) or >>
+}
+pub fn (texture &Texture3D) mip_levels() int {
+    if !texture.has_gpu {
+        if texture.closed || texture.soft_blobs.len==0 { >> errors.new("game 3D: texture is closed") }
+        texture.soft_blobs[0].reference().validate(texture.device_id) or >>
+        << texture.soft_levels
+    }
+    if texture.closed || texture.images.len==0 { >> errors.new("game 3D: texture is closed") }
+    texture.images[0].reference().validate() or >>
+    << texture.images[0].level_count()
+}
+pub fn (texture &Texture3D) storage_bytes() int {
+    if !texture.has_gpu {
+        if texture.closed || texture.soft_blobs.len==0 { >> errors.new("game 3D: texture is closed") }
+        texture.soft_blobs[0].reference().validate(texture.device_id) or >>
+        << texture.soft_bytes
+    }
+    if texture.closed || texture.images.len==0 { >> errors.new("game 3D: texture is closed") }
+    texture.images[0].reference().validate() or >>
+    << texture.images[0].size_bytes()
+}
+pub fn (texture &Texture3D) reference() TextureRef3D {
+    if !texture.has_gpu {
+        if texture.closed || texture.soft_blobs.len==0 {
+            << TextureRef3D{image: gpu.TextureRef{},sampler: gpu.SamplerRef{},soft_pixels: gpu.empty_soft_blob_ref(),
+                present: true,srgb: texture.srgb,has_gpu: false,device_id: texture.device_id,
+                width: texture.width,height: texture.height,linear: texture.linear,repeat: texture.repeat}
+        }
+        << TextureRef3D{image: gpu.TextureRef{},sampler: gpu.SamplerRef{},soft_pixels: texture.soft_blobs[0].reference(),
+            present: true,srgb: texture.srgb,has_gpu: false,device_id: texture.device_id,
+            width: texture.width,height: texture.height,linear: texture.linear,repeat: texture.repeat}
+    }
+    if texture.closed || texture.images.len==0 || texture.samplers.len==0 {
+        << TextureRef3D{image: gpu.TextureRef{},sampler: gpu.SamplerRef{},soft_pixels: gpu.empty_soft_blob_ref(),
+            present: true,srgb: texture.srgb,has_gpu: true,device_id: 0,width: texture.width,height: texture.height,
+            linear: texture.linear,repeat: texture.repeat}
+    }
+    << TextureRef3D{image: texture.images[0].reference(),sampler: texture.samplers[0].reference(),
+        soft_pixels: gpu.empty_soft_blob_ref(),present: true,srgb: texture.srgb,
+        has_gpu: true,device_id: 0,width: texture.width,height: texture.height,
+        linear: texture.linear,repeat: texture.repeat}
+}
+pub fn (texture $&Texture3D) close() int {
+    if texture.closed { << 0 }
+    $first := ""
+    $second := ""
+    if texture.images.len>0 { first = close_texture($&texture.images[0]) }
+    if texture.samplers.len>0 { second = close_sampler($&texture.samplers[0]) }
+    if texture.soft_blobs.len>0 {
+        err := close_soft_blob($&texture.soft_blobs[0])
+        if first.len==0 && err.len>0 { first = err }
+    }
+    texture.images = []gpu.Texture{}
+    texture.samplers = []gpu.Sampler{}
+    texture.soft_blobs = []gpu.SoftBlob{}
+    texture.closed = true
+    if first.len>0 { >> errors.new(first) }
+    if second.len>0 { >> errors.new(second) }
+    << 0
+}
+fn close_texture(texture $&gpu.Texture) string { texture.close() or(err){ << err.msg() }
+    << "" }
+fn close_sampler(sampler $&gpu.Sampler) string { sampler.close() or(err){ << err.msg() }
+    << "" }
+fn (texture $&Texture3D) drop() { texture.close() or(err){ << } }
+pub fn (texture &Texture3D) is_srgb() bool {
+    if !texture.has_gpu {
+        if texture.closed || texture.soft_blobs.len==0 { >> errors.new("game 3D: texture is closed") }
+        texture.soft_blobs[0].reference().validate(texture.device_id) or >>
+        << texture.srgb
+    }
+    if texture.closed || texture.images.len==0 || texture.samplers.len==0 { >> errors.new("game 3D: texture is closed") }
+    texture.images[0].reference().validate() or >>
+    texture.samplers[0].reference().validate() or >>
+    << texture.srgb
+}
+
+fn no_texture() TextureRef3D {
+    << TextureRef3D{image: gpu.TextureRef{},sampler: gpu.SamplerRef{},soft_pixels: gpu.empty_soft_blob_ref(),
+        present: false,srgb: false,has_gpu: false,device_id: 0,width: 0,height: 0,linear: false,repeat: false}
+}

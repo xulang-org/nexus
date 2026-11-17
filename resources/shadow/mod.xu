@@ -1,0 +1,116 @@
+@"github.com/xulang-org/game/resources/shadow"
+
+fm #"github.com/xulang-org/game/foundation/math"
+lights #"github.com/xulang-org/game/resources/lighting"
+#math
+#errors
+
+// A light's orthographic, spot or six-face point shadow; no cameras/GPU.
+pub struct ShadowDescription3D {
+    kind int
+    center fm.Vec3
+    direction fm.Vec3
+    extent f64
+    depth f64
+    near f64
+    outer_cosine f64
+    resolution int
+    bias f64
+    slope f64
+    cascades CascadePayload3D
+}
+pub fn default_directional() ShadowDescription3D {
+    << ShadowDescription3D{kind: lights.DIRECTIONAL,center: fm.vec3(0.0,0.0,0.0),direction: fm.vec3(0.0,1.0,0.0),extent: 4.0,depth: 16.0,near: 0.0,outer_cosine: 0.0,resolution: 512,bias: 0.0003,slope: 0.001,cascades: no_cascades()}
+}
+pub fn directional(center fm.Vec3,toward_light fm.Vec3,half_extent f64,depth f64,resolution int) ShadowDescription3D {
+    unit := toward_light.normalized() or >>
+    result := ShadowDescription3D{kind: lights.DIRECTIONAL,center: center,direction: unit,extent: half_extent,depth: depth,near: 0.0,outer_cosine: 0.0,resolution: resolution,bias: 0.0003,slope: 0.001,cascades: no_cascades()}
+    result.validate() or >>
+    << result
+}
+pub fn (description &ShadowDescription3D) validate() int {
+    if (description.kind!=lights.DIRECTIONAL && description.kind!=lights.SPOT && description.kind!=lights.POINT) ||
+        !description.center.is_finite() || !description.direction.is_finite() ||
+        !fm.finite(description.depth) ||
+        description.resolution<128 || description.resolution>1024 || (description.resolution & (description.resolution-1))!=0 ||
+        !fm.finite(description.bias) || description.bias<0.0 || description.bias>0.05 ||
+        !fm.finite(description.slope) || description.slope<0.0 || description.slope>0.05 {
+        >> errors.new("game shadow: invalid projection, resolution or bias")
+    }
+    if description.kind!=lights.POINT && math.abs(description.direction.dot(description.direction)-1.0)>0.000001 { >> errors.new("game shadow: non-unit projection axis") }
+    if description.kind==lights.DIRECTIONAL {
+        if !fm.finite(description.extent) || description.extent<0.001 || description.extent>1000000.0 || description.depth<0.002 || description.depth>2000000.0 { >> errors.new("game shadow: invalid directional coverage") }
+    } else {
+        if !fm.finite(description.near) || description.near<0.0001 || description.depth>1000000.0 || description.depth-description.near<description.near*0.000001 { >> errors.new("game shadow: invalid punctual near/range") }
+        if description.kind==lights.SPOT && (!fm.finite(description.outer_cosine) || description.outer_cosine<0.001 || description.outer_cosine>=1.0) { >> errors.new("game shadow: unsupported spot cone") }
+        if description.kind==lights.POINT && description.resolution>512 { >> errors.new("game shadow: point face resolution exceeds 512") }
+    }
+    if description.cascade_count()!=0 && (description.kind!=lights.DIRECTIONAL || description.cascade_count()<2 || description.cascade_count()>4) { >> errors.new("game shadow: invalid cascade payload") }
+    << 0
+}
+pub fn (description &ShadowDescription3D) with_bias(constant f64,slope f64) ShadowDescription3D {
+    result := ShadowDescription3D{kind: description.kind,center: description.center,direction: description.direction,extent: description.extent,depth: description.depth,
+        near: description.near,outer_cosine: description.outer_cosine,resolution: description.resolution,bias: constant,slope: slope,cascades: description.cascades}
+    result.validate() or >>
+    << result
+}
+pub fn (description &ShadowDescription3D) resolution() int { << description.resolution }
+pub fn (description &ShadowDescription3D) direction() fm.Vec3 { << description.direction }
+pub fn (description &ShadowDescription3D) constant_bias() f64 { << description.bias }
+pub fn (description &ShadowDescription3D) slope_bias() f64 { << description.slope }
+pub fn (description &ShadowDescription3D) kind() int { << description.kind }
+// Direction for a directional source, position for a punctual source.
+pub fn (description &ShadowDescription3D) receiver_reference() fm.Vec3 {
+    if description.kind!=lights.DIRECTIONAL { << description.center }
+    << description.direction
+}
+pub fn (description &ShadowDescription3D) matches_source(source &lights.Light3D) bool {
+    description.validate() or >>
+    source.validate() or >>
+    if source.kind()!=description.kind { << false }
+    if description.kind!=lights.POINT && source.direction().sub(description.direction).length()>0.000001 { << false }
+    if description.kind!=lights.DIRECTIONAL {
+        if source.position().sub(description.center).length()>0.000001 || source.radius()!=description.depth { << false }
+        if description.kind==lights.SPOT && source.outer_cosine()!=description.outer_cosine { << false }
+    }
+    << true
+}
+// Right-handed, reverse-Z near=1/far=0. Snap light-plane center coordinates
+// to whole texels so small tracking translations do not shift the map grid.
+pub fn (description &ShadowDescription3D) face_count() int {
+    if description.cascade_count()>0 { << description.cascade_count() }
+    if description.kind==lights.POINT { << 6 }
+    << 1
+}
+// Reverse-Z z = x / axial_distance - y for both punctual projections.
+pub fn (description &ShadowDescription3D) depth_coefficients() fm.Vec2 {
+    description.validate() or >>
+    if description.kind==lights.DIRECTIONAL { << fm.vec2(0.0,0.0) }
+    range := description.depth-description.near
+    << fm.vec2(description.near*(description.depth/range),description.near/range)
+}
+pub fn (description &ShadowDescription3D) view_projection(face int) fm.Mat4 {
+    description.validate() or >>
+    if face<0 || face>=description.face_count() { >> errors.new("game shadow: projection face outside description") }
+    if description.cascade_count()>0 { << description.cascade_matrix(face) }
+    if description.kind==lights.POINT { << description.perspective_view_projection(point_face_direction(face) or >>,1.0) or >> }
+    if description.kind==lights.SPOT {
+        cosine := description.outer_cosine
+        << description.perspective_view_projection(description.direction,cosine/math.sqrt(1.0-cosine*cosine)) or >>
+    }
+    back := description.direction
+    $up := fm.vec3(0.0,1.0,0.0)
+    if math.abs(back.y)>0.99 { up=fm.vec3(0.0,0.0,1.0) }
+    right := up.cross(back).normalized() or >>
+    vertical := back.cross(right)
+    texel := 2.0*description.extent/f64(description.resolution)
+    x := math.round_to_even(right.dot(description.center)/texel)*texel
+    y := math.round_to_even(vertical.dot(description.center)/texel)*texel
+    z := back.dot(description.center)
+    e := description.extent
+    d := description.depth
+    result := fm.Mat4{c0: fm.vec4(right.x/e,vertical.x/e,back.x/d,0.0),c1: fm.vec4(right.y/e,vertical.y/e,back.y/d,0.0),
+        c2: fm.vec4(right.z/e,vertical.z/e,back.z/d,0.0),c3: fm.vec4(-x/e,-y/e,0.5-z/d,1.0)}
+    if !result.is_finite() { >> errors.new("game shadow: coverage matrix overflow") }
+    << result
+}

@@ -1,0 +1,89 @@
+@main
+
+audio #"github.com/xulang-org/game/audio"
+mix #"github.com/xulang-org/game/audio/mixer"
+music #"github.com/xulang-org/game/integration/audio_stream"
+#os
+#strconv
+#errors
+
+fn fill(stream $&music.MusicStream, mixer $&mix.Mixer) int {
+    $total := 0
+    for i in 0:4 { frames := stream.refill(mixer, 4096) or >>
+        total = total + frames
+        if frames == 0 { <- } }
+    << total
+}
+fn run() int {
+    args := os.args()
+    $seconds := 5
+    $seek_frame := -1
+    $path := "examples/audio/assets/chime.wav"
+    $i := 1
+    while i < args.len {
+        if i + 1 >= args.len { >> errors.new("missing stream demo option value") }
+        next := i + 1
+        if args[i] == "--seconds" { seconds = strconv.atoi(&args[next]) or >>
+            if seconds < 1 || seconds > 60 { >> errors.new("seconds outside 1...60") }
+        } else if args[i] == "--seek-frame" { seek_frame = strconv.atoi(&args[next]) or >>
+            if seek_frame < 0 { >> errors.new("negative seek frame") }
+        } else if args[i] == "--file" { path = args[next] + ""
+        } else { >> errors.new("unknown stream demo option") }
+        i = i + 2
+    }
+    $mixer := mix.new_mixer(48000, 8) or >>
+    bus := mixer.add_bus(0, "Music", 0.5) or >>
+    $first := music.open($&mixer, path + "", 8192, true) or >>
+    $second := music.open($&mixer, path + "", 8192, true) or >>
+    if seek_frame > first.frame_count() { >> errors.new("seek frame exceeds source duration") }
+    fill($&first, $&mixer) or >>
+    fill($&second, $&mixer) or >>
+    old := mixer.play_stream(first.source_id(), bus, 0.0, -0.7) or >>
+    mixer.fade_volume(old, 0.35, 4800, false) or >>
+    $output := audio.open_output(48000) or >>
+    println("Stream audio driver: " + (output.driver_name() or >>))
+    audio.pump(&output, $&mixer, 2048, 512) or >>
+    output.pause(false) or >>
+    start := now_ns()
+    $switched := false
+    $retired := false
+    $sought := false
+    $restarted := false
+    $underruns := 0
+    while now_ns() - start < seconds * 1000000000 {
+        elapsed := now_ns() - start
+        if seek_frame >= 0 && !sought && elapsed >= seconds * 250000000 {
+            frame := first.seek_frames($&mixer, seek_frame) or >>
+            println("Seeked source to frame " + str(frame) + "; voice=" + str(old))
+            sought = true
+        }
+        if seek_frame >= 0 && !restarted && elapsed >= seconds * 375000000 {
+            first.restart($&mixer) or >>
+            println("Restarted source at frame zero; voice=" + str(old))
+            restarted = true
+        }
+        if !retired {
+            if !(mixer.is_playing(old) or >>) { first.close($&mixer) or >>
+                retired = true
+            } else { fill($&first, $&mixer) or >> }
+        }
+        if !switched && now_ns() - start >= seconds * 500000000 {
+            fresh := mixer.play_stream(second.source_id(), bus, 0.0, 0.7) or >>
+            mixer.crossfade(old, fresh, 12000, 0.35) or >>
+            switched = true
+        }
+        if switched { fill($&second, $&mixer) or >> }
+        report := audio.pump(&output, $&mixer, 2048, 512) or >>
+        underruns = underruns + report.underruns
+        sleep_ns(5000000)
+    }
+    output.pause(true) or >>
+    output.clear() or >>
+    first.close($&mixer) or >>
+    second.close($&mixer) or >>
+    output.close() or >>
+    println("Finished streamed WAV crossfade; source underruns=" + str(underruns))
+    << 0
+}
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

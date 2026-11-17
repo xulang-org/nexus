@@ -1,0 +1,100 @@
+@"github.com/xulang-org/game/script/host"
+
+game #"github.com/xulang-org/game/scene"
+bc #"github.com/xulang-org/game/script/bytecode"
+#errors
+
+pub const MAX_CONNECTIONS = 32
+struct SignalConnection {
+    id int
+    signal int
+    target int
+    handler string
+}
+// A delivery is a connection snapshot, not an automatic method invocation.
+// Recheck is_live immediately before handling if the scene changed after collect.
+pub struct SignalDelivery {
+    pub connection int
+    pub source int
+    pub target int
+    pub signal int
+    pub handler string
+    pub value f64
+    pub epoch int
+    pub call int
+}
+fn live_node(tree &game.SceneTree, node int) bool {
+    info := tree.node_info(node) or (err) { << false }
+    << !info.queued_free
+}
+pub fn (delivery &SignalDelivery) is_live(tree &game.SceneTree) bool {
+    << live_node(tree, delivery.source) && live_node(tree, delivery.target)
+}
+pub fn (script &NodeScript) connection_count() int { << script.connections.len }
+pub fn (script &NodeScript) pending_signals() int { << script.machine.pending_signals() }
+// Stable signal IDs survive schema rename/reorder. Repeating an identical
+// connection is idempotent. IDs are scoped to this NodeScript and never reused.
+pub fn (script $&NodeScript) connect(tree &game.SceneTree, name string, target int, handler string) int {
+    if script.machine.epoch() < 1 || !bc.identifier(&handler) { >> errors.new("XuScript: invalid signal connection/handler") }
+    source_info := tree.node_info(script.node) or >>
+    target_info := tree.node_info(target) or >>
+    if source_info.queued_free || target_info.queued_free { >> errors.new("XuScript: cannot connect queued nodes") }
+    signal := script.machine.signal_id(name) or >>
+    script.prune_connections(tree)
+    for connection in script.connections {
+        if connection.signal == signal && connection.target == target && connection.handler == handler { << connection.id }
+    }
+    if script.connections.len >= MAX_CONNECTIONS || script.next_connection >= 2147483647 {
+        >> errors.new("XuScript: signal connection limit exhausted")
+    }
+    id := script.next_connection
+    script.next_connection = id + 1
+    script.connections.push(SignalConnection{id: id, signal: signal, target: target, handler: handler})
+    << id
+}
+// Returns 1 if removed, 0 if already absent. Previously collected snapshots
+// remain the caller's responsibility; disconnect affects future collections.
+pub fn (script $&NodeScript) disconnect(id int) int {
+    $next := []SignalConnection{}
+    $removed := 0
+    for connection in script.connections {
+        if connection.id == id { removed = 1
+        } else { next.push(SignalConnection{id: connection.id, signal: connection.signal,
+            target: connection.target, handler: connection.handler + ""}) }
+    }
+    script.connections = next
+    << removed
+}
+// Queued/freed nodes and removed signal declarations invalidate connections.
+// Pause/process mode governs callback execution, not already committed events.
+pub fn (script $&NodeScript) prune_connections(tree &game.SceneTree) int {
+    $next := []SignalConnection{}
+    if live_node(tree, script.node) {
+        for connection in script.connections {
+            if script.machine.has_signal(connection.signal) && live_node(tree, connection.target) {
+                next.push(SignalConnection{id: connection.id, signal: connection.signal,
+                    target: connection.target, handler: connection.handler + ""})
+            }
+        }
+    }
+    removed := script.connections.len - next.len
+    script.connections = next
+    << removed
+}
+// Call at the host's update boundary. Events are drained once in emission order,
+// then fanned out in connection order (at most 128 * 32 = 4096 deliveries).
+// Pending old-epoch events retain their IDs/values; removed signals are dropped.
+pub fn (script $&NodeScript) collect_signals(tree &game.SceneTree) []SignalDelivery {
+    script.prune_connections(tree)
+    machine := $&script.machine
+    events := machine.drain_signals() or >>
+    $out := []SignalDelivery{}
+    for event in events {
+        for connection in script.connections {
+            if connection.signal != event.id { -> }
+            out.push(SignalDelivery{connection: connection.id, source: script.node, target: connection.target,
+                signal: event.id, handler: connection.handler + "", value: event.value, epoch: event.epoch, call: event.call})
+        }
+    }
+    << out
+}

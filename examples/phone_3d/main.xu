@@ -1,0 +1,219 @@
+@main
+
+// Mobile 3D scene example powered by Scene3D, PBR lighting, FrameLoop and TouchControls.
+
+#app
+#gpu
+#window
+events #window/events
+#math
+#os
+#strconv
+fm #"github.com/xulang-org/game/foundation/math"
+controls #"github.com/xulang-org/game/input"
+input_bridge #"github.com/xulang-org/game/integration/input"
+frame_loop #"github.com/xulang-org/game/integration/frame"
+scene #"github.com/xulang-org/game/scene"
+meshes #"github.com/xulang-org/game/resources/mesh"
+lights #"github.com/xulang-org/game/resources/lighting"
+ren #"github.com/xulang-org/game/rendering/three_d"
+scene_render #"github.com/xulang-org/game/integration/rendering/three_d"
+shaders #"github.com/xulang-org/game/assets/shaders/three_d"
+gpu_info #"github.com/xulang-org/game/platform/gpu"
+
+fn add_box_face(mesh $&meshes.MeshData3D, center fm.Vec3, u fm.Vec3, v fm.Vec3, n fm.Vec3,
+    hu f64, hv f64, hn f64, color int) int {
+    base := mesh.vertices.len
+    fc := center.add(n.scaled(hn))
+    du := u.scaled(hu)
+    dv := v.scaled(hv)
+    tangent := fm.vec4(u.x, u.y, u.z, 1.0)
+    p0 := fc.sub(du).sub(dv)
+    p1 := fc.add(du).sub(dv)
+    p2 := fc.add(du).add(dv)
+    p3 := fc.sub(du).add(dv)
+    mesh.vertex_tangent(p0, color, n, fm.vec2(0.0, 0.0), tangent) or >>
+    mesh.vertex_tangent(p1, color, n, fm.vec2(1.0, 0.0), tangent) or >>
+    mesh.vertex_tangent(p2, color, n, fm.vec2(1.0, 1.0), tangent) or >>
+    mesh.vertex_tangent(p3, color, n, fm.vec2(0.0, 1.0), tangent) or >>
+    mesh.triangle(base, base + 1, base + 2) or >>
+    mesh.triangle(base, base + 2, base + 3) or >>
+    << 0
+}
+
+fn box_mesh(hx f64, hy f64, hz f64, color int) meshes.MeshData3D {
+    $mesh := meshes.new_mesh_data_3d()
+    c := fm.vec3(0.0, 0.0, 0.0)
+    x := fm.vec3(1.0, 0.0, 0.0)
+    y := fm.vec3(0.0, 1.0, 0.0)
+    z := fm.vec3(0.0, 0.0, 1.0)
+    add_box_face($&mesh, c, x, y, z, hx, hy, hz, color) or >>
+    add_box_face($&mesh, c, x.scaled(-1.0), y, z.scaled(-1.0), hx, hy, hz, color) or >>
+    add_box_face($&mesh, c, z.scaled(-1.0), y, x, hz, hy, hx, color) or >>
+    add_box_face($&mesh, c, z, y, x.scaled(-1.0), hz, hy, hx, color) or >>
+    add_box_face($&mesh, c, x, z.scaled(-1.0), y, hx, hz, hy, color) or >>
+    add_box_face($&mesh, c, x, z, y.scaled(-1.0), hx, hz, hy, color) or >>
+    << mesh
+}
+
+fn new_input() controls.InputMap {
+    $input := controls.new_input_map()
+    names := ["left", "right", "up", "down", "pause", "reset"]
+    keys := [events.KEY_A, events.KEY_D, events.KEY_W, events.KEY_S, events.KEY_SPACE, events.KEY_R]
+    for i in 0:names.len {
+        input.bind_source(names[i] + "", i) or >>
+        input.bind(names[i] + "", keys[i]) or >>
+    }
+    << input
+}
+
+fn touch_layout(width f64, height f64) input_bridge.TouchControls {
+    $touch := input_bridge.new_touch_controls(fm.vec2(width * 0.5, height * 0.5), 72.0, 0.12, 0) or >>
+    touch.enable_floating(fm.rect2(0.0, 0.0, width, height)) or >>
+    touch.add_button(fm.vec2(width - 42.0, 56.0), 32.0, 4, input_bridge.BUTTON_TAP) or >>
+    touch.add_button(fm.vec2(width - 54.0, height - 66.0), 38.0, 5, input_bridge.BUTTON_TAP) or >>
+    << touch
+}
+
+fn run() int {
+    program := shaders.load_mesh(app.resource_path("mesh") or >>) or >>
+    options := window.Options{title: "Xu Phone 3D", width: 390, height: 844,
+        resizable: true, high_pixel_density: true, hidden: false}
+    $device := ren.open_3d_window(options, gpu.AUTO, &program) or >>
+    backend := device.backend() or >>
+
+    $cube_mesh := device.upload(&box_mesh(0.85, 0.85, 0.85, 4294967295) or >>) or >>
+    $floor_mesh := device.upload(&box_mesh(3.6, 0.14, 3.6, 4294967295) or >>) or >>
+    $pillar_mesh := device.upload(&box_mesh(0.28, 1.0, 0.28, 4294967295) or >>) or >>
+    $orb_mesh := device.upload(&meshes.sphere_mesh_3d(0.45, 28, 16, 4294967295) or >>) or >>
+
+    $tree := scene.new_scene_tree_3d("Phone3D", 32)
+    root := tree.root()
+    floor := tree.add_child_3d(root, "Floor") or >>
+    cube := tree.add_child_3d(root, "Monolith") or >>
+    orb := tree.add_child_3d(root, "Orb") or >>
+    $pillars := []int{}
+    offsets := [fm.vec2(-2.2, -2.2), fm.vec2(2.2, -2.2), fm.vec2(-2.2, 2.2), fm.vec2(2.2, 2.2)]
+    for i in 0:offsets.len {
+        pillar := tree.add_child_3d(root, "Pillar" + str(i)) or >>
+        tree.set_transform_3d(pillar, fm.translation_3d(fm.vec3(offsets[i].x, 0.0, offsets[i].y))) or >>
+        pillars.push(pillar)
+    }
+    cam_node := tree.add_child_3d(root, "Camera") or >>
+    camera := scene.new_camera_node_3d(&tree, cam_node) or >>
+
+    $scene3d := scene_render.new_scene_3d(&device) or >>
+    scene3d.attach_surface(&tree, floor, &floor_mesh, ren.material_3d(fm.vec3(0.18, 0.22, 0.28), 0.08, 0.72, fm.vec3(0.0, 0.0, 0.0)) or >>) or >>
+    scene3d.attach_surface(&tree, cube, &cube_mesh, ren.material_3d(fm.vec3(0.16, 0.66, 0.88), 0.20, 0.28, fm.vec3(0.02, 0.06, 0.10)) or >>) or >>
+    scene3d.attach_surface(&tree, orb, &orb_mesh, ren.material_3d(fm.vec3(0.95, 0.74, 0.26), 0.82, 0.22, fm.vec3(0.08, 0.05, 0.01)) or >>) or >>
+    pillar_mat := ren.material_3d(fm.vec3(0.76, 0.42, 0.26), 0.12, 0.45, fm.vec3(0.0, 0.0, 0.0)) or >>
+    for pillar in pillars {
+        scene3d.attach_surface(&tree, pillar, &pillar_mesh, pillar_mat) or >>
+    }
+    tree.set_transform_3d(floor, fm.translation_3d(fm.vec3(0.0, -1.14, 0.0))) or >>
+
+    initial_window := device.window() or >>
+    initial := initial_window.state() or >>
+    $logical_width := f64(initial.width)
+    $logical_height := f64(initial.height)
+    $touch := touch_layout(logical_width, logical_height) or >>
+    $input := new_input() or >>
+    $loop := frame_loop.new_frame_loop(60, 8) or >>
+
+    $yaw := 0.55
+    $pitch := 0.42
+    $orbit_distance := 7.6
+    $sim_time := 0.0
+    $frames := 0
+    sun := lights.directional(fm.vec3(0.55, 0.85, 0.45), fm.vec3(2.8, 2.5, 2.2)) or >>
+
+    println("Phone 3D ready; backend=" + gpu_info.backend_name(backend) + "; size=" +
+        str(initial.pixel_width) + "x" + str(initial.pixel_height) + "; pid=" + str(os.getpid()))
+
+    while app.next_frame() or >> {
+        if loop.begin_frame($&input, $&touch, now_ns(), app.resume_epoch()) or >> {
+            println("Phone 3D resumed; input and clock reset; pid=" + str(os.getpid()))
+        }
+        window.pump() or >>
+        for _i in 0:256 {
+            event := device.poll() or >>
+            if event.kind == events.EVENT_NONE { <- }
+            loop.feed($&input, $&touch, &event) or >>
+        }
+        if !loop.running() {
+            loop.finish_frame(tree.paused) or >>
+            <-
+        }
+        target_window := device.window() or >>
+        state := target_window.state() or >>
+        if state.width < 120 || state.height < 120 || state.pixel_width < 1 || state.pixel_height < 1 {
+            loop.finish_frame(true) or >>
+            ->
+        }
+        if logical_width != f64(state.width) || logical_height != f64(state.height) {
+            logical_width = f64(state.width)
+            logical_height = f64(state.height)
+            loop.reset_touches($&input, $&touch) or >>
+            touch = touch_layout(logical_width, logical_height) or >>
+        }
+        if input.just_pressed("pause") or >> {
+            tree.paused = !tree.paused
+            println("Phone 3D paused=" + str(tree.paused))
+        }
+        if input.just_pressed("reset") or >> {
+            yaw = 0.55
+            pitch = 0.42
+            println("Phone 3D camera reset")
+        }
+        ticks := loop.finish_frame(tree.paused) or >>
+        drag := input.vector("left", "right", "up", "down") or >>
+        yaw = yaw - drag.x * 0.032
+        pitch = math.max(-0.25, math.min(1.15, pitch - drag.y * 0.025))
+        if !tree.paused {
+            sim_time = sim_time + f64(ticks.steps) * ticks.fixed_delta
+        }
+
+        cube_pose := fm.translation_3d(fm.vec3(0.0, 0.20 + 0.14 * math.sin(sim_time * 1.4), 0.0)).multiply(
+            fm.rotation_y(sim_time * 0.85).multiply(fm.rotation_x(sim_time * 0.45)))
+        tree.set_transform_3d(cube, cube_pose) or >>
+        orb_pos := fm.vec3(math.cos(sim_time * 1.15) * 2.1, 0.75 + 0.35 * math.sin(sim_time * 2.0), math.sin(sim_time * 1.15) * 2.1)
+        tree.set_transform_3d(orb, fm.translation_3d(orb_pos).multiply(fm.rotation_y(sim_time * 1.8))) or >>
+
+        eye := fm.vec3(
+            math.sin(yaw) * math.cos(pitch) * orbit_distance,
+            math.sin(pitch) * orbit_distance + 0.8,
+            math.cos(yaw) * math.cos(pitch) * orbit_distance
+        )
+        view_pose := scene.look_at_3d(eye, fm.vec3(0.0, 0.15, 0.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+        tree.set_transform_3d(cam_node, view_pose.affine_inverse() or >>) or >>
+        vp := camera.view_projection(&tree, f64(state.pixel_width) / f64(state.pixel_height)) or >>
+
+        rim := lights.point(orb_pos, fm.vec3(3.2, 2.4, 1.4), 7.5) or >>
+        lighting := lights.environment(fm.vec3(0.10, 0.13, 0.18), eye, 1.0, [sun, rim]) or >>
+
+        $sky := 269422591
+        if tree.paused { sky = 404234239 }
+        device.begin(sky) or >>
+        scene3d.draw_lit($&device, &tree, vp, &lighting) or >>
+        device.present() or >>
+        frames = frames + 1
+        if frames == 1 {
+            println("Phone 3D first frame rendered; yaw=" + (strconv.format_float(yaw, 102, 2) or >>))
+        }
+    }
+
+    cube_mesh.close() or >>
+    floor_mesh.close() or >>
+    pillar_mesh.close() or >>
+    orb_mesh.close() or >>
+    device.close() or >>
+    println("Phone 3D finished; frames=" + str(frames))
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

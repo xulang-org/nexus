@@ -1,0 +1,69 @@
+@"github.com/xulang-org/game/scene"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#errors
+
+struct PackedNode {
+    parent_index int
+    name string
+    local fm.Transform2D
+    local_3d fm.Mat4
+    kind int
+    visible bool
+    process_mode int
+}
+// Immutable in-memory scene resource. Instances own independent node storage.
+// This resource records node data, not application behavior or GPU attachments.
+pub struct PackedScene { nodes []PackedNode }
+pub fn pack_scene(tree &SceneTree, root int) PackedScene {
+    tree.editable(root) or >>
+    ids := tree.subtree(root) or >>
+    if ids.len > 4096 { >> errors.new("game: packed scene exceeds 4096 nodes") }
+    $nodes := []PackedNode{}
+    for i in 0:ids.len {
+        index := tree.editable(ids[i]) or >>
+        $parent_index := -1
+        if i > 0 {
+            parent := tree.node_id(tree.slots[index].parent)
+            for j in 0:i { if ids[j] == parent { parent_index = j } }
+        }
+        kind := tree.slots[index].kind
+        component := tree.slots[index].spatial
+        $local := fm.identity()
+        $local_3d := fm.identity_3d()
+        if kind == NODE_2D { local = tree.spatial_2d[component].local }
+        if kind == NODE_3D { local_3d = tree.spatial_3d[component].local }
+        nodes.push(PackedNode{parent_index: parent_index, name: tree.slots[index].name + "",
+            local: local, local_3d: local_3d, kind: kind, visible: tree.slots[index].visible,
+            process_mode: tree.slots[index].process_mode})
+    }
+    << PackedScene{nodes: nodes}
+}
+pub fn (scene &PackedScene) node_count() int { << scene.nodes.len }
+// Preflight all expected failure conditions before attaching the first node.
+pub fn (scene &PackedScene) instantiate(tree $&SceneTree, parent int, name string) int {
+    parent_index := tree.editable(parent) or >>
+    tree.check_name(parent_index, &name, -1) or >>
+    $live := 0
+    for slot in tree.slots { if slot.alive { live = live + 1 } }
+    if scene.nodes.len == 0 || scene.nodes.len > tree.capacity - live {
+        >> errors.new("game: insufficient capacity for packed scene")
+    }
+    $ids := []int{}
+    for i in 0:scene.nodes.len {
+        $node_parent := parent
+        $node_name := name + ""
+        if i > 0 {
+            node_parent = ids[scene.nodes[i].parent_index]
+            node_name = scene.nodes[i].name + ""
+        }
+        kind := scene.nodes[i].kind
+        id := tree.add_typed_child(node_parent, node_name, kind) or >>
+        if kind == NODE_2D { tree.set_transform(id, scene.nodes[i].local) or >> }
+        if kind == NODE_3D { tree.set_transform_3d(id, scene.nodes[i].local_3d) or >> }
+        tree.set_visible(id, scene.nodes[i].visible) or >>
+        tree.set_process_mode(id, scene.nodes[i].process_mode) or >>
+        ids.push(id)
+    }
+    << ids[0]
+}

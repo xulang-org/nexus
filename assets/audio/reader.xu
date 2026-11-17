@@ -1,0 +1,70 @@
+@"github.com/xulang-org/game/assets/audio"
+
+wav #"github.com/xulang-org/game/formats/wav"
+#os
+#strings
+#errors
+
+pub const MAX_READ_FRAMES = 4096
+// Holds one descriptor; pathname replacement does not switch the open stream.
+// Streamed files must remain immutable while open. Truncation/extent changes fail.
+pub struct WavReader { files []os.File
+    layout wav.Layout
+    closed bool }
+fn read_at(file &os.File, offset int, count int) string {
+    if offset < 0 || count < 0 || count > 32768 { >> errors.new("game WAV stream: invalid read range") }
+    if (file.seek(offset, os.SEEK_SET) or >>) != offset { >> errors.new("game WAV stream: seek failed") }
+    $builder := strings.new_byte_builder(count)
+    $read := 0
+    while read < count {
+        chunk := file.read(count - read) or >>
+        if chunk.len < 1 || chunk.len > count - read { >> errors.new("game WAV stream: truncated source") }
+        read = read + chunk.len
+        builder.write_str(chunk)
+    }
+    << builder.to_string()
+}
+pub fn open_wav_reader(path string) WavReader {
+    file := os.open(path) or >>
+    extent := file.seek(0, os.SEEK_END) or >>
+    header := read_at(&file, 0, 12) or >>
+    $parser := wav.begin_layout(&header, extent) or >>
+    while !parser.done() {
+        position := parser.position()
+        chunk := read_at(&file, position, 8) or >>
+        required := parser.format_bytes(&chunk) or >>
+        payload := read_at(&file, position + 8, required) or >>
+        parser.accept(&chunk, &payload) or >>
+    }
+    layout := parser.finish() or >>
+    << WavReader{files: [file], layout: layout, closed: false}
+}
+pub fn (reader &WavReader) sample_rate() int { << reader.layout.sample_rate() }
+pub fn (reader &WavReader) channel_count() int { << reader.layout.channel_count() }
+pub fn (reader &WavReader) frame_count() int { << reader.layout.frame_count() }
+pub fn (reader &WavReader) read_frames(start int, frames int) []int {
+    if reader.closed || reader.files.len != 1 || start < 0 || frames < 1 || frames > MAX_READ_FRAMES || start > reader.frame_count() || frames > reader.frame_count() - start {
+        >> errors.new("game WAV stream: invalid frame read or closed reader")
+    }
+    reader.validate_source() or >>
+    stride := reader.layout.bytes_per_frame()
+    raw := read_at(&reader.files[0], reader.layout.data_offset() + start * stride, frames * stride) or >>
+    << wav.decode_samples(&reader.layout, &raw) or >>
+}
+pub fn (reader $&WavReader) close() int {
+    if reader.closed || reader.files.len == 0 { reader.closed = true
+        << 0 }
+    file := $&reader.files[0]
+    file.close() or >>
+    reader.closed = true
+    << 0
+}
+
+// Validate an open descriptor even when a caller seeks to EOF without reading.
+pub fn (reader &WavReader) validate_source() int {
+    if reader.closed || reader.files.len != 1 { >> errors.new("game WAV stream: closed or uninitialized reader") }
+    reader.layout.validate() or >>
+    extent := reader.files[0].seek(0, os.SEEK_END) or >>
+    if extent != reader.layout.total_bytes() { >> errors.new("game WAV stream: source extent changed") }
+    << 0
+}

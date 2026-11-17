@@ -1,0 +1,71 @@
+@"github.com/xulang-org/game/integration/audio_stream"
+
+assets #"github.com/xulang-org/game/assets/audio"
+mix #"github.com/xulang-org/game/audio/mixer"
+#errors
+
+// Owns a file descriptor and refers to one mixer-owned PCM ring. Always use
+// with the same mixer; close(mixer) releases both. File I/O stays outside mixing.
+pub struct MusicStream {
+    reader assets.WavReader
+    source int
+    cursor int
+    looping bool
+    closed bool
+    cache []int
+    origin_frame int
+}
+pub fn open(mixer $&mix.Mixer, path string, capacity_frames int, looping bool) MusicStream {
+    reader := assets.open_wav_reader(path) or >>
+    $cache := []int{}
+    if looping && reader.frame_count() <= assets.MAX_READ_FRAMES { cache = reader.read_frames(0, reader.frame_count()) or >> }
+    source := mixer.open_stream(reader.sample_rate(), reader.channel_count(), capacity_frames) or >>
+    << MusicStream{reader: reader, source: source, cursor: 0, looping: looping, closed: false, cache: cache, origin_frame: 0}
+}
+pub fn (stream &MusicStream) source_id() int { << stream.source }
+pub fn (stream &MusicStream) read_position() int { << stream.cursor }
+pub fn (stream $&MusicStream) refill(mixer $&mix.Mixer, maximum_frames int) int {
+    if stream.closed || maximum_frames < 1 || maximum_frames > assets.MAX_READ_FRAMES { >> errors.new("game music: closed stream or invalid refill budget") }
+    info := mixer.stream_info(stream.source) or >>
+    if info.sample_rate != stream.reader.sample_rate() || info.channels != stream.reader.channel_count() { >> errors.new("game music: mismatched mixer stream format") }
+    if info.eof || info.room_frames == 0 { << 0 }
+    $position := stream.cursor
+    total := stream.reader.frame_count()
+    if position == total {
+        if stream.looping { position = 0 } else { << 0 }
+    }
+    $frames := maximum_frames
+    if frames > info.room_frames { frames = info.room_frames }
+    if stream.cache.len == 0 && frames > total - position { frames = total - position }
+    samples := stream.read_window(position, frames) or >>
+    finished := !stream.looping && position + frames == total
+    mixer.feed_stream(stream.source, &samples, finished) or >>
+    // A read/decode/feed failure leaves the logical source cursor unchanged.
+    if stream.cache.len > 0 {
+        if total == 0 { >> errors.new("game music: empty cached loop") }
+        stream.cursor = (position + frames) % total
+    } else { stream.cursor = position + frames }
+    << frames
+}
+pub fn (stream $&MusicStream) close(mixer $&mix.Mixer) int {
+    if stream.closed { << 0 }
+    if mixer.is_stream(stream.source) { mixer.close_stream(stream.source) or >> }
+    reader := $&stream.reader
+    reader.close() or >>
+    stream.cache = []int{}
+    stream.closed = true
+    << 0
+}
+
+fn (stream &MusicStream) read_window(position int, frames int) []int {
+    if stream.cache.len == 0 { << stream.reader.read_frames(position, frames) or >> }
+    total := stream.reader.frame_count()
+    if total == 0 { >> errors.new("game music: empty cached loop") }
+    channels := stream.reader.channel_count()
+    $samples := []int{}
+    for frame in 0:frames {
+        index := (position + frame) % total
+        for channel in 0:channels { samples.push(stream.cache[index * channels + channel]) }
+    }
+    << samples
+}

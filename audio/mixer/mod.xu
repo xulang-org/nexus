@@ -1,0 +1,314 @@
+@"github.com/xulang-org/game/audio/mixer"
+
+pcm #"github.com/xulang-org/game/resources/audio"
+#errors
+#math
+
+pub const MAX_VOICES = 32
+pub const MAX_BUSES = 16
+pub const MAX_CLIPS = 64
+pub const MAX_BANK_SAMPLES = 8388608
+pub const MAX_BLOCK_FRAMES = 4096
+struct Voice {
+    generation int
+    allocated bool
+    playing bool
+    clip int
+    bus int
+    phase int
+    gain int
+    pan int
+    paused bool
+    looping bool
+    fade_start int
+    fade_target int
+    fade_total int
+    fade_position int
+    fade_stop bool
+    fade_hold bool
+}
+struct Bus { parent int
+    gain int
+    muted bool
+    paused bool
+    name string }
+pub struct Mixer {
+    rate int
+    voices []Voice
+    buses []Bus
+    clips []pcm.Clip
+    bank_samples int
+    revision int
+    streams []PcmStream
+    stream_samples int
+}
+// MixBlock is a preview. Only commit after its samples reach the intended sink.
+// Its stamp describes the complete immutable bank and mutable mixer state;
+// another mixer can accept it only when that state is exactly equivalent.
+pub struct MixBlock {
+    pub samples []int
+    stamp string
+    phases []int
+    playing []bool
+    frames int
+    fade_positions []int
+    pub underruns int
+}
+pub fn new_mixer(rate int, capacity int) Mixer {
+    if rate < 8000 || rate > 192000 || capacity < 1 || capacity > MAX_VOICES { >> errors.new("game mixer: invalid sample rate or capacity") }
+    $voices := []Voice{}
+    for i in 0:capacity { voices.push(Voice{generation: 0, allocated: false, playing: false, clip: 0, bus: 0, phase: 0,
+        gain: 1000, pan: 0, paused: false, looping: false, fade_start: 1000, fade_target: 1000, fade_total: 0, fade_position: 0, fade_stop: false, fade_hold: false}) }
+    $streams := []PcmStream{}
+    for i in 0:MAX_STREAMS { streams.push(empty_stream(0)) }
+    << Mixer{rate: rate, voices: voices, buses: [Bus{parent: -1, gain: 1000, muted: false, paused: false, name: "Master"}],
+        clips: []pcm.Clip{}, bank_samples: 0, revision: 0, streams: streams, stream_samples: 0}
+}
+fn control(value f64, minimum f64, maximum f64) int {
+    if math.is_nan(value) || math.is_inf(value) || value < minimum || value > maximum { >> errors.new("game mixer: invalid gain or pan") }
+    << int(math.round_to_even(value * 1000.0))
+}
+fn flag(value bool) int { if value { << 1 }
+    << 0 }
+fn (mixer &Mixer) valid() int {
+    if mixer.rate < 8000 || mixer.rate > 192000 || mixer.voices.len < 1 || mixer.voices.len > MAX_VOICES || mixer.buses.len < 1 {
+        >> errors.new("game mixer: uninitialized mixer")
+    }
+    << 0
+}
+pub fn (mixer &Mixer) sample_rate() int { << mixer.rate }
+pub fn (mixer &Mixer) clip_count() int { << mixer.clips.len }
+pub fn (mixer &Mixer) bank_sample_count() int { << mixer.bank_samples }
+pub fn (mixer &Mixer) bus_count() int { << mixer.buses.len }
+pub fn (mixer $&Mixer) add_clip(clip pcm.Clip) int {
+    mixer.valid() or >>
+    clip.validate() or >>
+    if mixer.clips.len >= MAX_CLIPS || clip.sample_count() > MAX_BANK_SAMPLES - mixer.bank_samples { >> errors.new("game mixer: PCM bank capacity exceeded") }
+    index := mixer.clips.len
+    mixer.bank_samples = mixer.bank_samples + clip.sample_count()
+    mixer.clips.push(clip)
+    mixer.revision = mixer.revision + 1
+    << index
+}
+fn (mixer &Mixer) bus_index(bus int) int {
+    mixer.valid() or >>
+    if bus < 0 || bus >= mixer.buses.len { >> errors.new("game mixer: invalid bus") }
+    << bus
+}
+pub fn (mixer $&Mixer) add_bus(parent int, name string, volume f64) int {
+    mixer.bus_index(parent) or >>
+    gain := control(volume, 0.0, 4.0) or >>
+    if name.len < 1 || name.len > 63 || mixer.buses.len >= MAX_BUSES { >> errors.new("game mixer: invalid bus name or capacity") }
+    for i in 0:mixer.buses.len { if mixer.buses[i].name == name { >> errors.new("game mixer: duplicate bus name") } }
+    index := mixer.buses.len
+    mixer.buses.push(Bus{parent: parent, gain: gain, muted: false, paused: false, name: name})
+    mixer.revision = mixer.revision + 1
+    << index
+}
+pub fn (mixer $&Mixer) set_bus_volume(bus int, volume f64) int {
+    mixer.bus_index(bus) or >>
+    gain := control(volume, 0.0, 4.0) or >>
+    mixer.buses[bus].gain = gain
+    mixer.revision = mixer.revision + 1
+    << 0
+}
+pub fn (mixer $&Mixer) mute_bus(bus int, muted bool) int {
+    mixer.bus_index(bus) or >>
+    mixer.buses[bus].muted = muted
+    mixer.revision = mixer.revision + 1
+    << 0
+}
+pub fn (mixer $&Mixer) pause_bus(bus int, paused bool) int {
+    mixer.bus_index(bus) or >>
+    mixer.buses[bus].paused = paused
+    mixer.revision = mixer.revision + 1
+    << 0
+}
+fn (mixer $&Mixer) allocate(source int, bus int, volume f64, pan f64, looping bool, phase int) int {
+    mixer.bus_index(bus) or >>
+    gain := control(volume, 0.0, 4.0) or >>
+    balance := control(pan, -1.0, 1.0) or >>
+    for i in 0:mixer.voices.len {
+        if !mixer.voices[i].playing {
+            generation := mixer.voices[i].generation + 1
+            if generation > 1000000000 { >> errors.new("game mixer: voice generation exhausted") }
+            mixer.voices[i] = Voice{generation: generation, allocated: true, playing: true, clip: source, bus: bus, phase: phase,
+                gain: gain, pan: balance, paused: false, looping: looping, fade_start: gain, fade_target: gain, fade_total: 0, fade_position: 0, fade_stop: false, fade_hold: false}
+            mixer.revision = mixer.revision + 1
+            << generation * MAX_VOICES + i + 1
+        }
+    }
+    >> errors.new("game mixer: voice capacity exceeded")
+}
+pub fn (mixer $&Mixer) play(clip int, bus int, volume f64, pan f64, looping bool) int {
+    if clip < 0 || clip >= mixer.clips.len { >> errors.new("game mixer: invalid clip") }
+    << mixer.allocate(clip, bus, volume, pan, looping, 0) or >>
+}
+pub fn (mixer &Mixer) is_voice(id int) bool {
+    if id <= 0 { << false }
+    slot := (id - 1) % MAX_VOICES
+    << slot < mixer.voices.len && mixer.voices[slot].allocated && mixer.voices[slot].generation == (id - 1) / MAX_VOICES
+}
+fn (mixer &Mixer) voice_index(id int) int {
+    if !mixer.is_voice(id) { >> errors.new("game mixer: stale or invalid voice") }
+    << (id - 1) % MAX_VOICES
+}
+pub fn (mixer &Mixer) is_playing(id int) bool { index := mixer.voice_index(id) or >>
+    << mixer.voices[index].playing }
+pub fn (mixer &Mixer) position_frames(id int) f64 { index := mixer.voice_index(id) or >>
+    << f64(mixer.voices[index].phase) / f64(mixer.rate) }
+pub fn (mixer $&Mixer) stop(id int) int { index := mixer.voice_index(id) or >>
+    mixer.voices[index].playing = false
+    mixer.revision = mixer.revision + 1
+    << 0 }
+pub fn (mixer $&Mixer) pause_voice(id int, paused bool) int { index := mixer.voice_index(id) or >>
+    mixer.voices[index].paused = paused
+    mixer.revision = mixer.revision + 1
+    << 0 }
+pub fn (mixer $&Mixer) set_volume(id int, volume f64) int {
+    index := mixer.voice_index(id) or >>
+    gain := control(volume, 0.0, 4.0) or >>
+    mixer.voices[index].gain = gain
+    mixer.voices[index].fade_total = 0
+    mixer.voices[index].fade_position = 0
+    mixer.voices[index].fade_stop = false
+    mixer.voices[index].fade_hold = false
+    mixer.revision = mixer.revision + 1
+    << 0
+}
+pub fn (mixer $&Mixer) set_pan(id int, pan f64) int {
+    index := mixer.voice_index(id) or >>
+    balance := control(pan, -1.0, 1.0) or >>
+    mixer.voices[index].pan = balance
+    mixer.revision = mixer.revision + 1
+    << 0
+}
+fn (mixer &Mixer) state_stamp() string {
+    $stamp := str(mixer.rate) + ":" + str(mixer.revision) + ":" + str(mixer.voices.len)
+    for i in 0:mixer.clips.len { stamp = stamp + ":c" + mixer.clips[i].fingerprint() }
+    for i in 0:mixer.streams.len {
+        source := &mixer.streams[i]
+        stamp = stamp + ":s" + str(source.generation) + "," + str(flag(source.open)) + "," + str(source.rate) + "," + str(source.channels) + "," + str(source.capacity) + "," +
+            str(source.read_frame) + "," + str(source.position) + "," + str(source.write_frame) + "," + str(flag(source.eof)) + "," + str(source.consumer) + "," + source.digest
+    }
+    for i in 0:mixer.buses.len {
+        bus := &mixer.buses[i]
+        stamp = stamp + ":b" + str(bus.parent) + "," + str(bus.gain) + "," + str(flag(bus.muted)) + "," + str(flag(bus.paused))
+    }
+    for i in 0:mixer.voices.len {
+        v := &mixer.voices[i]
+        stamp = stamp + ":v" + str(v.generation) + "," + str(flag(v.allocated)) + "," + str(flag(v.playing)) + "," + str(v.clip) + "," + str(v.bus) + "," +
+            str(v.phase) + "," + str(v.gain) + "," + str(v.pan) + "," + str(flag(v.paused)) + "," + str(flag(v.looping)) + "," + str(v.fade_start) + "," + str(v.fade_target) + "," + str(v.fade_total) + "," + str(v.fade_position) + "," + str(flag(v.fade_stop)) + "," + str(flag(v.fade_hold))
+    }
+    << stamp
+}
+struct BusState { gain f64
+    paused bool }
+fn (mixer &Mixer) bus_state(index int) BusState {
+    $current := index
+    $gain := 1.0
+    $paused := false
+    while current >= 0 {
+        bus := &mixer.buses[current]
+        gain = gain * f64(bus.gain) / 1000.0
+        if bus.muted { gain = 0.0 }
+        if bus.paused { paused = true }
+        current = bus.parent
+    }
+    << BusState{gain: gain, paused: paused}
+}
+fn quantize(value f64) int { << int(math.round_to_even(math.max(-32768.0, math.min(32767.0, value)))) }
+pub fn (mixer &Mixer) prepare(frames int) MixBlock {
+    mixer.valid() or >>
+    if frames < 1 || frames > MAX_BLOCK_FRAMES { >> errors.new("game mixer: invalid block frame count") }
+    rate := mixer.rate
+    if rate == 0 { >> errors.new("game mixer: zero output rate") }
+    $left := []f64{}
+    $right := []f64{}
+    for i in 0:frames { left.push(0.0)
+        right.push(0.0) }
+    $phases := []int{}
+    $playing := []bool{}
+    $fade_positions := []int{}
+    $underruns := 0
+    for i in 0:mixer.voices.len {
+        voice := &mixer.voices[i]
+        $phase := voice.phase
+        $active := voice.playing
+        $fade_position := voice.fade_position
+        if active {
+            state := mixer.bus_state(voice.bus)
+            if !voice.paused && !state.paused {
+                source := mixer.source_info(voice.clip) or >>
+                period := source.frames * rate
+                if !source.streaming && period == 0 { >> errors.new("game mixer: empty clip period") }
+                balance_left := 1.0 - math.max(f64(voice.pan) / 1000.0, 0.0)
+                balance_right := 1.0 + math.min(f64(voice.pan) / 1000.0, 0.0)
+                for frame in 0:frames {
+                    if !source.streaming && phase >= period {
+                        if voice.looping { phase = wrap_phase(phase, period)
+                        } else { active = false
+                            <- }
+                    }
+                    at := phase / rate
+                    if source.streaming && at >= source.frames {
+                        if source.eof { active = false } else { underruns = underruns + 1 }
+                        <-
+                    }
+                    weight := f64(phase % rate) / f64(rate)
+                    $next := at + 1
+                    if next >= source.frames {
+                        if source.streaming && !source.eof && weight > 0.0 { underruns = underruns + 1
+                            <- }
+                        if !source.streaming && voice.looping { next = 0 } else { next = at }
+                    }
+                    a := mixer.source_sample(voice.clip, at, 0) or >>
+                    b := mixer.source_sample(voice.clip, next, 0) or >>
+                    l := f64(a) + f64(b - a) * weight
+                    $r := l
+                    if source.channels == 2 {
+                        c := mixer.source_sample(voice.clip, at, 1) or >>
+                        d := mixer.source_sample(voice.clip, next, 1) or >>
+                        r = f64(c) + f64(d - c) * weight
+                    }
+                    if !voice.fade_hold && fade_position < voice.fade_total { fade_position = fade_position + 1 }
+                    gain := state.gain * gain_at(voice, fade_position) / 1000.0
+                    left[frame] = left[frame] + l * gain * balance_left
+                    right[frame] = right[frame] + r * gain * balance_right
+                    phase = phase + source.rate
+                    if voice.fade_stop && voice.fade_total > 0 && fade_position >= voice.fade_total { active = false
+                        <- }
+                }
+                if !source.streaming && voice.looping { phase = wrap_phase(phase, period)
+                } else if source.eof && phase >= period { active = false }
+            }
+        }
+        phases.push(phase)
+        playing.push(active)
+        fade_positions.push(fade_position)
+    }
+    $samples := []int{}
+    for i in 0:frames { samples.push(quantize(left[i]))
+        samples.push(quantize(right[i])) }
+    << MixBlock{samples: samples, stamp: mixer.state_stamp(), phases: phases, playing: playing, frames: frames,
+        fade_positions: fade_positions, underruns: underruns}
+}
+pub fn (block &MixBlock) frame_count() int { << block.frames }
+pub fn (mixer $&Mixer) commit(block &MixBlock) int {
+    mixer.valid() or >>
+    if block.frames < 1 || block.frames > MAX_BLOCK_FRAMES || block.samples.len != block.frames * 2 || block.phases.len != mixer.voices.len ||
+        block.playing.len != mixer.voices.len || block.fade_positions.len != mixer.voices.len || block.stamp != mixer.state_stamp() { >> errors.new("game mixer: stale or foreign mix block") }
+    for i in 0:mixer.voices.len { mixer.voices[i].phase = block.phases[i]
+        mixer.voices[i].playing = block.playing[i]
+        mixer.voices[i].fade_position = block.fade_positions[i] }
+    mixer.consume_streams()
+    mixer.revision = mixer.revision + 1
+    << 0
+}
+pub fn (mixer $&Mixer) render(frames int) []int {
+    block := mixer.prepare(frames) or >>
+    mixer.commit(&block) or >>
+    $samples := []int{}
+    for sample in block.samples { samples.push(sample) }
+    << samples
+}

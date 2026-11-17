@@ -1,0 +1,74 @@
+@"github.com/xulang-org/game/scene"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#math
+#errors
+
+// Engine camera conventions stay separate from reusable vector/matrix algebra.
+// Right-handed, +Y up, metres, camera forward -Z.
+pub fn look_at_3d(eye fm.Vec3, target fm.Vec3, up fm.Vec3) fm.Mat4 {
+    if !eye.is_finite() || !target.is_finite() || !up.is_finite() { >> errors.new("game: invalid camera basis") }
+    back := eye.sub(target).normalized() or >>
+    right := up.cross(back).normalized() or >>
+    vertical := back.cross(right)
+    result := fm.Mat4{c0: fm.vec4(right.x, vertical.x, back.x, 0.0), c1: fm.vec4(right.y, vertical.y, back.y, 0.0),
+        c2: fm.vec4(right.z, vertical.z, back.z, 0.0), c3: fm.vec4(-right.dot(eye), -vertical.dot(eye), -back.dot(eye), 1.0)}
+    if !result.is_finite() { >> errors.new("game: camera basis overflow") }
+    << result
+}
+// Finite reverse-Z perspective: NDC depth near=1, far=0, clear=0, compare GREATER.
+pub fn perspective_3d(vertical_fov f64, aspect f64, near f64, far f64) fm.Mat4 {
+    if !fm.finite(vertical_fov) || !fm.finite(aspect) || !fm.finite(near) || !fm.finite(far) ||
+        vertical_fov < 0.01 || vertical_fov > 3.13 || aspect <= 0.0 || near <= 0.0 || far <= near {
+        >> errors.new("game: invalid perspective frustum")
+    }
+    half := vertical_fov * 0.5
+    sine := math.sin(half)
+    if sine <= 0.0 { >> errors.new("game: invalid perspective angle") }
+    focal := math.cos(half) / sine
+    range := far - near
+    if range <= 0.0 { >> errors.new("game: empty perspective depth range") }
+    result := fm.Mat4{c0: fm.vec4(focal / aspect, 0.0, 0.0, 0.0), c1: fm.vec4(0.0, focal, 0.0, 0.0),
+        c2: fm.vec4(0.0, 0.0, near / range, -1.0), c3: fm.vec4(0.0, 0.0, near * (far / range), 0.0)}
+    if !result.is_finite() { >> errors.new("game: perspective matrix overflow") }
+    << result
+}
+
+pub struct Camera3D {
+    pub position fm.Vec3
+    pub target fm.Vec3
+    pub up fm.Vec3
+    pub vertical_fov f64
+    pub near f64
+    pub far f64
+}
+pub fn new_camera_3d() Camera3D {
+    << Camera3D{position: fm.vec3(0.0, 0.0, 5.0), target: fm.vec3(0.0, 0.0, 0.0), up: fm.vec3(0.0, 1.0, 0.0),
+        vertical_fov: 1.0471975511965976, near: 0.1, far: 1000.0}
+}
+pub fn (camera Camera3D) view_projection(aspect f64) fm.Mat4 {
+    projection := perspective_3d(camera.vertical_fov, aspect, camera.near, camera.far) or >>
+    view := look_at_3d(camera.position, camera.target, camera.up) or >>
+    << projection.multiply(view)
+}
+
+// A camera attachment uses its Node3D's world pose, including parent transforms.
+// GPU resources and scene transforms are not stored in this lens description.
+pub struct CameraNode3D {
+    pub node int
+    pub vertical_fov f64
+    pub near f64
+    pub far f64
+}
+pub fn new_camera_node_3d(tree &SceneTree, node int) CameraNode3D {
+    index := tree.editable(node) or >>
+    tree.require_spatial(index, NODE_3D) or >>
+    << CameraNode3D{node: node, vertical_fov: 1.0471975511965976, near: 0.1, far: 1000.0}
+}
+pub fn (camera CameraNode3D) view_projection(tree &SceneTree, aspect f64) fm.Mat4 {
+    tree.editable(camera.node) or >>
+    world := tree.global_transform_3d(camera.node) or >>
+    view := world.affine_inverse() or >>
+    projection := perspective_3d(camera.vertical_fov, aspect, camera.near, camera.far) or >>
+    << projection.multiply(view)
+}

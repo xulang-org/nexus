@@ -1,0 +1,85 @@
+@"github.com/xulang-org/game/resources/scene"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#errors
+
+pub const MAX_AUDIO_BUSES = 16
+pub const MAX_AUDIO_EMITTERS = 32
+pub struct AudioBus { pub parent int
+    pub name string
+    pub volume f64
+    pub muted bool
+    pub paused bool }
+pub struct AudioEmitter { pub node int
+    pub resource_uid string
+    pub bus int
+    pub volume f64
+    pub pan f64
+    pub looping bool
+    pub autoplay bool
+    pub spatial string
+    pub listener int
+    pub max_distance f64 }
+fn validate_audio(document &Document, buses &[]AudioBus, emitters &[]AudioEmitter, kinds &map[string]string, used $&map[string]bool) int {
+    if emitters.len > MAX_AUDIO_EMITTERS || buses.len > MAX_AUDIO_BUSES ||
+        (emitters.len == 0 && buses.len != 0) || (emitters.len > 0 && buses.len == 0) { >> errors.new("game scene: invalid audio bus/emitter counts") }
+    $names := map[string]bool{}
+    for i in 0:buses.len {
+        bus := &buses[i]
+        name := bus.name + ""
+        if !valid_name(&name) || name.len > 63 || !fm.finite(bus.volume) || bus.volume < 0.0 || bus.volume > 4.0 || names.has(name + "") {
+            >> errors.new("game scene: invalid audio bus name/volume")
+        }
+        if (i == 0 && (bus.parent != -1 || name != "Master")) || (i > 0 && (bus.parent < 0 || bus.parent >= i)) {
+            >> errors.new("game scene: audio buses require Master and preceding parents")
+        }
+        names[name] = true
+    }
+    $occupied := map[int]bool{}
+    for emitter in emitters {
+        uid := emitter.resource_uid + ""
+        if emitter.node < 0 || emitter.node >= document.nodes.len || occupied.has(emitter.node) || !kinds.has(uid + "") || kinds[uid + ""] != "wav_clip" ||
+            emitter.bus < 0 || emitter.bus >= buses.len || !fm.finite(emitter.volume) || emitter.volume < 0.0 || emitter.volume > 4.0 ||
+            !fm.finite(emitter.pan) || emitter.pan < -1.0 || emitter.pan > 1.0 || !fm.finite(emitter.max_distance) {
+            >> errors.new("game scene: invalid audio emitter node/resource/bus/controls")
+        }
+        if emitter.spatial == "none" {
+            if emitter.listener != -1 || emitter.max_distance != 0.0 { >> errors.new("game scene: nonspatial emitter requires no listener/distance") }
+        } else {
+            $kind := NODE_2D
+            if emitter.spatial == "3d" { kind = NODE_3D
+            } else if emitter.spatial != "2d" { >> errors.new("game scene: unsupported spatial audio mode") }
+            if emitter.listener < 0 || emitter.listener >= document.nodes.len || document.nodes[emitter.node].kind != kind || document.nodes[emitter.listener].kind != kind ||
+                emitter.pan != 0.0 || emitter.max_distance <= 0.0 || emitter.max_distance > 1000000000.0 { >> errors.new("game scene: invalid spatial audio dimensions/listener/range/pan") }
+        }
+        occupied[emitter.node] = true
+        used[uid] = true
+    }
+    << 0
+}
+pub fn (document &Document) audio_count() int { << document.emitters.len }
+pub fn (document &Document) audio_bus_count() int { << document.buses.len }
+pub fn (document &Document) audio_bus(index int) AudioBus {
+    if index < 0 || index >= document.buses.len { >> errors.new("game scene: audio bus index outside document") }
+    << document.buses[index]
+}
+pub fn (document &Document) audio_emitter(index int) AudioEmitter {
+    if index < 0 || index >= document.emitters.len { >> errors.new("game scene: audio emitter index outside document") }
+    << document.emitters[index]
+}
+// Preserve authored service declarations when recapturing node values or paths.
+pub fn with_references(document &Document, nodes &Document, references []ResourceReference) Document {
+    $surfaces := []Surface{}
+    $buses := []AudioBus{}
+    $emitters := []AudioEmitter{}
+    for i in 0:document.surface_count() { surfaces.push(document.surface(i) or >>) }
+    for i in 0:document.audio_bus_count() { buses.push(document.audio_bus(i) or >>) }
+    for i in 0:document.audio_count() { emitters.push(document.audio_emitter(i) or >>) }
+    $scripts := []ScriptAttachment{}
+    $connections := []ScriptConnection{}
+    for i in 0:document.script_count() { scripts.push(document.script(i) or >>) }
+    for i in 0:document.script_connection_count() { connections.push(document.script_connection(i) or >>) }
+    $lights := []LightAttachment{}
+    for i in 0:document.light_count() { lights.push(document.light(i) or >>) }
+    << with_attachments(nodes, references, surfaces, buses, emitters, scripts, connections, lights) or >>
+}
