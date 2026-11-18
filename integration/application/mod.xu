@@ -1,0 +1,237 @@
+@"github.com/xulang-org/game/integration/application"
+
+#app
+#window
+events #window/events
+#os
+#strings
+#errors
+controls #"github.com/xulang-org/game/input"
+input_bridge #"github.com/xulang-org/game/integration/input"
+frame_loop #"github.com/xulang-org/game/integration/frame"
+vp #"github.com/xulang-org/game/integration/viewport"
+timing #"github.com/xulang-org/game/timing"
+
+pub struct StepState {
+    pub resumed bool
+    pub running bool
+    pub drawable bool
+    pub layout_changed bool
+    pub back_requested bool
+    pub touch_ended bool
+    pub input_reset_reason int
+    pub viewport vp.Viewport
+    pub events []events.Event
+}
+
+// Shared application runner bridging Phone game host (#app) and desktop
+// execution while keeping scene, audio, and rendering owners in the game.
+pub struct AppHost {
+    loop frame_loop.FrameLoop
+    min_width int
+    min_height int
+    hosted bool
+    alive bool
+    has_viewport bool
+    last_viewport vp.Viewport
+}
+
+pub fn new_app_host(ticks_per_second int, max_steps int, min_width int, min_height int) AppHost {
+    if min_width < 1 || min_height < 1 {
+        >> errors.new("game application: minimum drawable dimensions must be positive")
+    }
+    loop := frame_loop.new_frame_loop(ticks_per_second, max_steps) or >>
+    << AppHost{
+        loop: loop,
+        min_width: min_width,
+        min_height: min_height,
+        hosted: app.is_hosted(),
+        alive: true,
+        has_viewport: false,
+        last_viewport: vp.from_metrics(min_width, min_height, min_width, min_height,
+            0, 0, min_width, min_height) or >>
+    }
+}
+
+pub fn (host &AppHost) is_hosted() bool {
+    << host.hosted
+}
+
+pub fn (host &AppHost) running() bool {
+    << host.loop.running() && host.alive
+}
+
+pub fn (host $&AppHost) enable_back_handling() int {
+    << app.intercept_back(true) or >>
+}
+
+pub fn (host $&AppHost) request_exit() {
+    host.alive = false
+}
+
+pub fn (host $&AppHost) next_frame() bool {
+    if !host.alive { << false }
+    if host.hosted {
+        << app.next_frame() or >>
+    }
+    << true
+}
+
+pub fn (host $&AppHost) begin_step(win &window.Window, input $&controls.InputMap,
+    touch $&input_bridge.TouchControls, timestamp_ns int) StepState {
+    $lp := host.loop
+    resumed := lp.begin_frame(input, touch, timestamp_ns, app.resume_epoch()) or (err) {
+        host.loop = lp
+        >> err
+    }
+    window.pump() or (err) {
+        host.loop = lp
+        >> err
+    }
+    $back_requested := false
+    $touch_ended := false
+    $reset_reason := 0
+    $drained := []events.Event{}
+    for i in 0:events.QUEUE_CAPACITY {
+        ev := win.poll() or (err) {
+            host.loop = lp
+            >> err
+        }
+        if ev.kind == events.EVENT_NONE { <- }
+        lp.feed(input, touch, &ev) or (err) {
+            host.loop = lp
+            >> err
+        }
+        if ev.kind == events.EVENT_CLOSE_REQUESTED {
+            host.alive = false
+        }
+        if ev.kind == events.EVENT_BACK_REQUESTED {
+            back_requested = true
+        }
+        if ev.kind == events.EVENT_TOUCH_UP || ev.kind == events.EVENT_TOUCH_CANCEL {
+            touch_ended = true
+        }
+        if ev.kind == events.EVENT_INPUT_RESET {
+            reset_reason = ev.reset_reason
+        }
+        drained.push(ev)
+    }
+    if !lp.running() {
+        host.loop = lp
+        host.alive = false
+        << StepState{
+            resumed: resumed,
+            running: false,
+            drawable: false,
+            layout_changed: false,
+            back_requested: back_requested,
+            touch_ended: touch_ended,
+            input_reset_reason: reset_reason,
+            viewport: host.last_viewport,
+            events: drained
+        }
+    }
+    state := win.state() or (err) {
+        host.loop = lp
+        >> err
+    }
+    drawable := !state.minimized && state.width >= host.min_width && state.height >= host.min_height &&
+        state.pixel_width >= 1 && state.pixel_height >= 1
+    if !drawable {
+        host.loop = lp
+        << StepState{
+            resumed: resumed,
+            running: true,
+            drawable: false,
+            layout_changed: false,
+            back_requested: back_requested,
+            touch_ended: touch_ended,
+            input_reset_reason: reset_reason,
+            viewport: host.last_viewport,
+            events: drained
+        }
+    }
+    current := vp.from_window(win) or (err) {
+        host.loop = lp
+        >> err
+    }
+    $layout_changed := false
+    if !host.has_viewport || !host.last_viewport.same_geometry(&current) {
+        if host.has_viewport {
+            lp.reset_touches(input, touch) or (err) {
+                host.loop = lp
+                >> err
+            }
+        }
+        host.last_viewport = current
+        host.has_viewport = true
+        layout_changed = true
+    }
+    host.loop = lp
+    << StepState{
+        resumed: resumed,
+        running: true,
+        drawable: true,
+        layout_changed: layout_changed,
+        back_requested: back_requested,
+        touch_ended: touch_ended,
+        input_reset_reason: reset_reason,
+        viewport: current,
+        events: drained
+    }
+}
+
+pub fn (host $&AppHost) finish_step(paused bool) timing.FrameStep {
+    $lp := host.loop
+    step := lp.finish_frame(paused) or (err) {
+        host.loop = lp
+        >> err
+    }
+    host.loop = lp
+    << step
+}
+
+fn validate_relative(relative &string) int {
+    if relative.len == 0 || relative.len > 240 {
+        >> errors.new("game application: invalid relative path")
+    }
+    parts := strings.split(relative, "/")
+    for part in parts {
+        if part.len == 0 || part == "." || part == ".." {
+            >> errors.new("game application: invalid relative path segment")
+        }
+        for i in 0:part.len {
+            c := part[i]
+            if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95 || c == 46) {
+                >> errors.new("game application: invalid path character")
+            }
+        }
+    }
+    << 0
+}
+
+// Resolves read-only resources from the Phone host package when hosted, or from
+// a caller-supplied desktop directory during local development runs.
+pub fn resolve_resource(relative string, desktop_root string) string {
+    if app.is_hosted() || os.getenv("XU_PHONE_RESOURCE_ROOT").len > 0 {
+        << app.resource_path(relative) or >>
+    }
+    validate_relative(&relative) or >>
+    if desktop_root.len == 0 {
+        >> errors.new("game application: desktop resource root is empty")
+    }
+    << desktop_root + "/" + relative
+}
+
+// Resolves writable save/state files from the Phone host data root when hosted,
+// or from a caller-supplied desktop directory during local development runs.
+pub fn resolve_data(relative string, desktop_root string) string {
+    if app.is_hosted() || os.getenv("XU_PHONE_DATA_ROOT").len > 0 {
+        << app.data_path(relative) or >>
+    }
+    validate_relative(&relative) or >>
+    if desktop_root.len == 0 {
+        >> errors.new("game application: desktop data root is empty")
+    }
+    << desktop_root + "/" + relative
+}

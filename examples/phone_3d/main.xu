@@ -1,25 +1,68 @@
 @main
 
-// Mobile 3D scene example powered by Scene3D, PBR lighting, FrameLoop and TouchControls.
+// Mobile 3D scene example powered by AppHost, Viewport safe-area layout,
+// TouchControls + TouchPad (1-finger orbit & 2-finger pinch zoom),
+// Device3D pixel-budget capping, textured PBR materials, and Overlay2D + UiFrame HUD.
 
 #app
 #gpu
 #window
 events #window/events
+#ui/draw
+#ui/layout
+widgets #ui/widgets
 #math
 #os
 #strconv
+#errors
 fm #"github.com/xulang-org/game/foundation/math"
 controls #"github.com/xulang-org/game/input"
 input_bridge #"github.com/xulang-org/game/integration/input"
-frame_loop #"github.com/xulang-org/game/integration/frame"
+app_host #"github.com/xulang-org/game/integration/application"
+vp #"github.com/xulang-org/game/integration/viewport"
+ui_bridge #"github.com/xulang-org/game/integration/ui"
 scene #"github.com/xulang-org/game/scene"
 meshes #"github.com/xulang-org/game/resources/mesh"
 lights #"github.com/xulang-org/game/resources/lighting"
 ren #"github.com/xulang-org/game/rendering/three_d"
+ren2 #"github.com/xulang-org/game/rendering/two_d"
 scene_render #"github.com/xulang-org/game/integration/rendering/three_d"
 shaders #"github.com/xulang-org/game/assets/shaders/three_d"
+shaders2 #"github.com/xulang-org/game/assets/shaders/two_d"
+images #"github.com/xulang-org/game/assets/image"
+image_render3 #"github.com/xulang-org/game/integration/image_render/three_d"
 gpu_info #"github.com/xulang-org/game/platform/gpu"
+
+const MOBILE_MAX_RENDER_PIXELS = 921600
+
+fn parse_max_frames() int {
+    args := os.args()
+    $i := 1
+    while i < args.len {
+        if args[i] == "--frames" && i + 1 < args.len {
+            next := i + 1
+            n := strconv.atoi(&args[next]) or >>
+            if n < 1 || n > 1000000 { >> errors.new("phone_3d: invalid --frames value") }
+            << n
+        }
+        i += 1
+    }
+    << 0
+}
+
+fn mesh_shader_dir() string {
+    if app.is_hosted() || os.getenv("XU_PHONE_RESOURCE_ROOT").len > 0 {
+        << app_host.resolve_resource("mesh", "build") or >>
+    }
+    << "build/mesh-shaders"
+}
+
+fn canvas_shader_dir() string {
+    if app.is_hosted() || os.getenv("XU_PHONE_RESOURCE_ROOT").len > 0 {
+        << app_host.resolve_resource("canvas", "build") or >>
+    }
+    << "build/canvas-shaders"
+}
 
 fn add_box_face(mesh $&meshes.MeshData3D, center fm.Vec3, u fm.Vec3, v fm.Vec3, n fm.Vec3,
     hu f64, hv f64, hn f64, color int) int {
@@ -67,20 +110,118 @@ fn new_input() controls.InputMap {
     << input
 }
 
-fn touch_layout(width f64, height f64) input_bridge.TouchControls {
-    $touch := input_bridge.new_touch_controls(fm.vec2(width * 0.5, height * 0.5), 72.0, 0.12, 0) or >>
-    touch.enable_floating(fm.rect2(0.0, 0.0, width, height)) or >>
-    touch.add_button(fm.vec2(width - 42.0, 56.0), 32.0, 4, input_bridge.BUTTON_TAP) or >>
-    touch.add_button(fm.vec2(width - 54.0, height - 66.0), 38.0, 5, input_bridge.BUTTON_TAP) or >>
+fn ui_scale(view &vp.Viewport) f64 {
+    sr := view.safe_rect
+    << math.max(1.0, math.min(2.8, math.min(sr.size.x, sr.size.y) / 390.0))
+}
+
+fn stick_center(view &vp.Viewport) fm.Vec2 {
+    sr := view.safe_rect
+    s := ui_scale(view)
+    << fm.vec2(sr.position.x + 68.0 * s, sr.position.y + sr.size.y - 72.0 * s)
+}
+
+fn pause_center(view &vp.Viewport) fm.Vec2 {
+    sr := view.safe_rect
+    s := ui_scale(view)
+    << fm.vec2(sr.position.x + sr.size.x - 48.0 * s, sr.position.y + 34.0 * s)
+}
+
+fn reset_center(view &vp.Viewport) fm.Vec2 {
+    sr := view.safe_rect
+    s := ui_scale(view)
+    << fm.vec2(sr.position.x + sr.size.x - 52.0 * s, sr.position.y + sr.size.y - 56.0 * s)
+}
+
+fn touch_layout(view &vp.Viewport) input_bridge.TouchControls {
+    s := ui_scale(view)
+    $touch := input_bridge.new_touch_controls(stick_center(view), 44.0 * s, 0.10, 0) or >>
+    touch.add_button(pause_center(view), 32.0 * s, 4, input_bridge.BUTTON_TAP) or >>
+    touch.add_button(reset_center(view), 36.0 * s, 5, input_bridge.BUTTON_TAP) or >>
     << touch
 }
 
+fn px_rect(r layout.Rect, view &vp.Viewport) layout.Rect {
+    sx := view.density_x()
+    sy := view.density_y()
+    << layout.Rect{x: r.x * sx, y: r.y * sy, width: r.width * sx, height: r.height * sy}
+}
+
+fn record_hud(hud $&ui_bridge.UiFrame, view &vp.Viewport, touch &input_bridge.TouchControls,
+    backend_label &string, rw int, rh int, orbit_distance f64, paused bool, fingers int) int {
+    hud.begin() or >>
+    sr := view.safe_rect
+    s := ui_scale(view)
+    sx := view.density_x()
+    sy := view.density_y()
+    scale := s * math.min(sx, sy)
+
+    card_w := math.min(264.0 * s, math.max(168.0 * s, sr.size.x - 108.0 * s))
+    top_logical := layout.Rect{x: sr.position.x + 12.0 * s, y: sr.position.y + 10.0 * s, width: card_w, height: 50.0 * s}
+    top_px := px_rect(top_logical, view)
+    hud.draw_panel(&top_px, 12.0 * scale, draw.rgba(14, 22, 36, 216), draw.rgba(78, 132, 196, 220), 1.5 * scale) or >>
+
+    $status := "LIVE"
+    if paused { status = "PAUSED" }
+    line1 := "PHONE 3D " + backend_label + " [" + status + "]"
+    dist_txt := strconv.format_float(orbit_distance, 102, 1) or >>
+    line2 := str(rw) + "x" + str(rh) + " px | dist " + dist_txt + " | tch " + str(fingers)
+    r1 := px_rect(layout.Rect{x: top_logical.x + 10.0 * s, y: top_logical.y + 6.0 * s, width: top_logical.width - 16.0 * s, height: 18.0 * s}, view)
+    r2 := px_rect(layout.Rect{x: top_logical.x + 10.0 * s, y: top_logical.y + 26.0 * s, width: top_logical.width - 16.0 * s, height: 18.0 * s}, view)
+    hud.draw_label(&r1, &line1, draw.rgb(232, 242, 255), math.max(10.0, 11.0 * scale), 0.0, 0.5) or >>
+    hud.draw_label(&r2, &line2, draw.rgb(154, 198, 238), math.max(9.0, 10.0 * scale), 0.0, 0.5) or >>
+
+    p_center := pause_center(view)
+    p_rect := px_rect(layout.Rect{x: p_center.x - 36.0 * s, y: p_center.y - 20.0 * s, width: 72.0 * s, height: 40.0 * s}, view)
+    $p_fill := draw.rgba(24, 38, 58, 224)
+    $p_border := draw.rgba(96, 168, 236, 235)
+    if paused {
+        p_fill = draw.rgba(196, 136, 28, 232)
+        p_border = draw.rgba(255, 214, 102, 255)
+    }
+    hud.draw_panel(&p_rect, 20.0 * scale, p_fill, p_border, 1.5 * scale) or >>
+    $p_label := "PAUSE"
+    if paused { p_label = "PLAY" }
+    hud.draw_label(&p_rect, &p_label, draw.rgb(245, 248, 255), math.max(10.0, 11.0 * scale), 0.5, 0.5) or >>
+
+    r_center := reset_center(view)
+    r_rect := px_rect(layout.Rect{x: r_center.x - 40.0 * s, y: r_center.y - 22.0 * s, width: 80.0 * s, height: 44.0 * s}, view)
+    hud.draw_panel(&r_rect, 22.0 * scale, draw.rgba(26, 44, 68, 224), draw.rgba(110, 210, 190, 235), 1.5 * scale) or >>
+    r_label := "RESET"
+    hud.draw_label(&r_rect, &r_label, draw.rgb(220, 252, 244), math.max(10.0, 11.0 * scale), 0.5, 0.5) or >>
+
+    st := touch.center
+    knob := st.add(touch.offset.scaled(touch.radius * 0.62))
+    hud.record_sdf_circle(fm.vec2(st.x * sx, st.y * sy), touch.radius * math.min(sx, sy),
+        draw.rgba(18, 28, 44, 180).value(), 1.5 * scale, draw.rgba(92, 148, 204, 210).value()) or >>
+    hud.record_sdf_circle(fm.vec2(knob.x * sx, knob.y * sy), 16.0 * scale,
+        draw.rgba(86, 214, 196, 235).value(), 0.0, 0) or >>
+    << 0
+}
+
 fn run() int {
-    program := shaders.load_mesh(app.resource_path("mesh") or >>) or >>
+    max_frames := parse_max_frames() or >>
+    program := shaders.load_mesh(mesh_shader_dir() or >>) or >>
+    c_dir := canvas_shader_dir() or >>
+    canvas_prog := shaders2.load_canvas(c_dir + "") or >>
+    sdf_prog := shaders2.load_ui_sdf(c_dir + "") or >>
+    text_prog := shaders2.load_ui_text(c_dir + "") or >>
+
     options := window.Options{title: "Xu Phone 3D", width: 390, height: 844,
         resizable: true, high_pixel_density: true, hidden: false}
-    $device := ren.open_3d_window(options, gpu.AUTO, &program) or >>
+    $device := ren.open_3d_window_adaptive(options, gpu.AUTO, &program) or >>
+    device.set_max_render_pixels(MOBILE_MAX_RENDER_PIXELS) or >>
     backend := device.backend() or >>
+    backend_label := gpu_info.backend_name(backend)
+
+    $overlay := ren2.open_overlay(device.present_session() or >>, &canvas_prog, &sdf_prog) or >>
+    overlay.enable_text(device.present_session() or >>, &text_prog) or >>
+    styles := widgets.dark_styles()
+    $hud := ui_bridge.new_ui_frame(&styles) or >>
+
+    player_png := app_host.resolve_resource("player.png", "examples/arena/assets") or >>
+    image := images.load_png(player_png) or >>
+    $albedo_tex := image_render3.upload_image_3d(&device, &image, true, false, true) or >>
 
     $cube_mesh := device.upload(&box_mesh(0.85, 0.85, 0.85, 4294967295) or >>) or >>
     $floor_mesh := device.upload(&box_mesh(3.6, 0.14, 3.6, 4294967295) or >>) or >>
@@ -104,7 +245,8 @@ fn run() int {
 
     $scene3d := scene_render.new_scene_3d(&device) or >>
     scene3d.attach_surface(&tree, floor, &floor_mesh, ren.material_3d(fm.vec3(0.18, 0.22, 0.28), 0.08, 0.72, fm.vec3(0.0, 0.0, 0.0)) or >>) or >>
-    scene3d.attach_surface(&tree, cube, &cube_mesh, ren.material_3d(fm.vec3(0.16, 0.66, 0.88), 0.20, 0.28, fm.vec3(0.02, 0.06, 0.10)) or >>) or >>
+    cube_mat := (ren.material_3d(fm.vec3(0.86, 0.94, 1.0), 0.18, 0.28, fm.vec3(0.02, 0.06, 0.10)) or >>).with_base_texture(&albedo_tex)
+    scene3d.attach_surface(&tree, cube, &cube_mesh, cube_mat) or >>
     scene3d.attach_surface(&tree, orb, &orb_mesh, ren.material_3d(fm.vec3(0.95, 0.74, 0.26), 0.82, 0.22, fm.vec3(0.08, 0.05, 0.01)) or >>) or >>
     pillar_mat := ren.material_3d(fm.vec3(0.76, 0.42, 0.26), 0.12, 0.45, fm.vec3(0.0, 0.0, 0.0)) or >>
     for pillar in pillars {
@@ -112,13 +254,12 @@ fn run() int {
     }
     tree.set_transform_3d(floor, fm.translation_3d(fm.vec3(0.0, -1.14, 0.0))) or >>
 
-    initial_window := device.window() or >>
-    initial := initial_window.state() or >>
-    $logical_width := f64(initial.width)
-    $logical_height := f64(initial.height)
-    $touch := touch_layout(logical_width, logical_height) or >>
+    $view := vp.from_window(device.window() or >>) or >>
+    $touch := touch_layout(&view) or >>
+    $pad := input_bridge.new_touch_pad()
     $input := new_input() or >>
-    $loop := frame_loop.new_frame_loop(60, 8) or >>
+    $host := app_host.new_app_host(60, 8, 120, 120) or >>
+    host.enable_back_handling() or >>
 
     $yaw := 0.55
     $pitch := 0.42
@@ -127,34 +268,59 @@ fn run() int {
     $frames := 0
     sun := lights.directional(fm.vec3(0.55, 0.85, 0.45), fm.vec3(2.8, 2.5, 2.2)) or >>
 
-    println("Phone 3D ready; backend=" + gpu_info.backend_name(backend) + "; size=" +
-        str(initial.pixel_width) + "x" + str(initial.pixel_height) + "; pid=" + str(os.getpid()))
+    println("Phone 3D ready; backend=" + backend_label + "; size=" +
+        str(view.pixel_width) + "x" + str(view.pixel_height) +
+        "; safe=" + str(int(view.safe_rect.position.x)) + "," + str(int(view.safe_rect.position.y)) + "," +
+        str(int(view.safe_rect.size.x)) + "x" + str(int(view.safe_rect.size.y)) +
+        "; max_pixels=" + str(device.max_render_pixels() or >>) + "; pid=" + str(os.getpid()))
 
-    while app.next_frame() or >> {
-        if loop.begin_frame($&input, $&touch, now_ns(), app.resume_epoch()) or >> {
+    while (max_frames <= 0 || frames < max_frames) && (host.next_frame() or >>) {
+        pad.begin_frame()
+        step := host.begin_step(device.window() or >>, $&input, $&touch, now_ns()) or >>
+        if step.resumed {
+            pad.reset()
             println("Phone 3D resumed; input and clock reset; pid=" + str(os.getpid()))
         }
-        window.pump() or >>
-        for _i in 0:256 {
-            event := device.poll() or >>
-            if event.kind == events.EVENT_NONE { <- }
-            loop.feed($&input, $&touch, &event) or >>
+        if step.input_reset_reason != 0 {
+            pad.reset()
         }
-        if !loop.running() {
-            loop.finish_frame(tree.paused) or >>
+        for ev in step.events {
+            if ev.kind == events.EVENT_TOUCH_DOWN || ev.kind == events.EVENT_TOUCH_MOVE ||
+                ev.kind == events.EVENT_TOUCH_UP || ev.kind == events.EVENT_TOUCH_CANCEL {
+                if !touch.owns_touch(ev.device_id, ev.touch_id) {
+                    pad.apply(&ev) or >>
+                }
+            } else {
+                pad.apply(&ev) or >>
+            }
+        }
+        if !step.running {
+            host.finish_step(tree.paused) or >>
             <-
         }
-        target_window := device.window() or >>
-        state := target_window.state() or >>
-        if state.width < 120 || state.height < 120 || state.pixel_width < 1 || state.pixel_height < 1 {
-            loop.finish_frame(true) or >>
+        if !step.drawable {
+            host.finish_step(true) or >>
             ->
         }
-        if logical_width != f64(state.width) || logical_height != f64(state.height) {
-            logical_width = f64(state.width)
-            logical_height = f64(state.height)
-            loop.reset_touches($&input, $&touch) or >>
-            touch = touch_layout(logical_width, logical_height) or >>
+        if step.layout_changed || !view.same_geometry(&step.viewport) {
+            view = step.viewport
+            touch = touch_layout(&view) or >>
+            pad.reset()
+            println("Phone 3D viewport=" + str(int(view.logical_width)) + "x" + str(int(view.logical_height)) +
+                "; px=" + str(view.pixel_width) + "x" + str(view.pixel_height) +
+                "; safe=" + str(int(view.safe_rect.position.x)) + "," + str(int(view.safe_rect.position.y)) + "," +
+                str(int(view.safe_rect.size.x)) + "x" + str(int(view.safe_rect.size.y)))
+        }
+        if step.back_requested {
+            if !tree.paused {
+                tree.paused = true
+                println("Phone 3D back requested; paused=true")
+            } else {
+                host.request_exit()
+                host.finish_step(true) or >>
+                println("Phone 3D back requested while paused; exiting")
+                <-
+            }
         }
         if input.just_pressed("pause") or >> {
             tree.paused = !tree.paused
@@ -163,12 +329,19 @@ fn run() int {
         if input.just_pressed("reset") or >> {
             yaw = 0.55
             pitch = 0.42
+            orbit_distance = 7.6
             println("Phone 3D camera reset")
         }
-        ticks := loop.finish_frame(tree.paused) or >>
-        drag := input.vector("left", "right", "up", "down") or >>
-        yaw = yaw - drag.x * 0.032
-        pitch = math.max(-0.25, math.min(1.15, pitch - drag.y * 0.025))
+        ticks := host.finish_step(tree.paused) or >>
+        stick_drag := input.vector("left", "right", "up", "down") or >>
+        yaw = yaw - stick_drag.x * 0.032 - pad.drag.x * 0.0085
+        pitch = math.max(-0.25, math.min(1.15, pitch - stick_drag.y * 0.025 + pad.drag.y * 0.007))
+        if pad.pinch_scale != 1.0 && pad.pinch_scale > 0.05 {
+            orbit_distance = math.max(3.2, math.min(16.0, orbit_distance / pad.pinch_scale))
+        }
+        if pad.wheel_delta != 0.0 {
+            orbit_distance = math.max(3.2, math.min(16.0, orbit_distance - pad.wheel_delta * 0.45))
+        }
         if !tree.paused {
             sim_time = sim_time + f64(ticks.steps) * ticks.fixed_delta
         }
@@ -186,7 +359,7 @@ fn run() int {
         )
         view_pose := scene.look_at_3d(eye, fm.vec3(0.0, 0.15, 0.0), fm.vec3(0.0, 1.0, 0.0)) or >>
         tree.set_transform_3d(cam_node, view_pose.affine_inverse() or >>) or >>
-        vp := camera.view_projection(&tree, f64(state.pixel_width) / f64(state.pixel_height)) or >>
+        vp_mat := camera.view_projection(&tree, view.aspect_ratio()) or >>
 
         rim := lights.point(orb_pos, fm.vec3(3.2, 2.4, 1.4), 7.5) or >>
         lighting := lights.environment(fm.vec3(0.10, 0.13, 0.18), eye, 1.0, [sun, rim]) or >>
@@ -194,14 +367,38 @@ fn run() int {
         $sky := 269422591
         if tree.paused { sky = 404234239 }
         device.begin(sky) or >>
-        scene3d.draw_lit($&device, &tree, vp, &lighting) or >>
-        device.present() or >>
+        scene3d.draw_lit($&device, &tree, vp_mat, &lighting) or >>
+
+        rw := device.render_width() or >>
+        rh := device.render_height() or >>
+        record_hud($&hud, &view, &touch, &backend_label, rw, rh, orbit_distance, tree.paused, pad.active_fingers()) or >>
+        overlay.clear() or >>
+        hud.flush_overlay(device.present_session() or >>, $&overlay) or >>
+
+        if device.is_gpu() {
+            $pf := device.begin_present_frame() or >>
+            if pf.has_image() {
+                pw := pf.width()
+                ph := pf.height()
+                overlay.flush_gpu_frame(device.gpu_device() or >>, $&pf, pw, ph, gpu.LOAD, 0) or >>
+            }
+            device.finish_present_frame($&pf) or >>
+        } else {
+            device.software_prepare_present() or >>
+            overlay.flush_software(device.software_pixels_mut() or >>, view.pixel_width, view.pixel_height, false, 0) or >>
+            device.present_software_frame() or >>
+        }
+
         frames = frames + 1
         if frames == 1 {
-            println("Phone 3D first frame rendered; yaw=" + (strconv.format_float(yaw, 102, 2) or >>))
+            println("Phone 3D first frame rendered; render=" + str(rw) + "x" + str(rh) +
+                "; present=" + str(view.pixel_width) + "x" + str(view.pixel_height) +
+                "; yaw=" + (strconv.format_float(yaw, 102, 2) or >>))
         }
     }
 
+    overlay.close() or >>
+    albedo_tex.close() or >>
     cube_mesh.close() or >>
     floor_mesh.close() or >>
     pillar_mesh.close() or >>

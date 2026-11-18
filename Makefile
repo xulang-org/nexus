@@ -41,6 +41,7 @@ check: layers native canvas-shaders mesh-shaders
 	$(XU) check examples/gpu_compute/main.xu
 	$(XU) check examples/arena/main.xu
 	$(XU) check examples/phone_arena
+	$(XU) check examples/phone_3d
 	$(XU) check examples/headless/main.xu
 	$(XU) check examples/two_d/main.xu
 	$(XU) check examples/three_d/main.xu
@@ -137,7 +138,7 @@ test-core: shadow-core-test gltf-animation-test mesh-format-core-test lod-core-t
 	$(XU) build tests/audio_scene_checks.xu -o build/audio-scene-tests
 	./build/audio-scene-tests
 
-test: canvas-memory-test phone-input-test phone-frame-test phone-state-test phone-audio-test jpeg-test test-core native audio-device-test image-fixtures
+test: canvas-memory-test phone-input-test phone-viewport-test phone-pinch-test phone-app-test phone-3d-budget-test phone-frame-test phone-state-test phone-audio-test jpeg-test test-core native audio-device-test image-fixtures
 	$(XU) build tests/scene_audio_checks.xu -o build/scene-audio-tests
 	XU_GAME_SDL_LIBRARY=/nonexistent XU_GAME_SDL_AUDIO_LIBRARY=/nonexistent ./build/scene-audio-tests
 	$(XU) build tests/scene_audio_output_checks.xu -o build/scene-audio-output-tests
@@ -150,11 +151,31 @@ test: canvas-memory-test phone-input-test phone-frame-test phone-state-test phon
 	$(XU) build tests/scene3d_checks.xu -o build/scene3d-tests
 	./build/scene3d-tests
 
-.PHONY: phone-input-test
+.PHONY: phone-input-test phone-viewport-test phone-pinch-test phone-app-test phone-3d-budget-test
 phone-input-test: sdk
 	mkdir -p build
 	$(XU) build tests/phone_input_checks.xu -o build/phone-input-tests
 	./build/phone-input-tests
+
+phone-viewport-test: sdk
+	mkdir -p build
+	$(XU) build tests/phone_viewport_checks.xu -o build/phone-viewport-tests
+	./build/phone-viewport-tests
+
+phone-pinch-test: sdk
+	mkdir -p build
+	$(XU) build tests/phone_pinch_checks.xu -o build/phone-pinch-tests
+	./build/phone-pinch-tests
+
+phone-app-test: sdk
+	mkdir -p build
+	$(XU) build tests/phone_app_checks.xu -o build/phone-app-tests
+	SDL_VIDEODRIVER=dummy ./build/phone-app-tests
+
+phone-3d-budget-test: sdk
+	mkdir -p build
+	$(XU) build tests/phone_3d_budget_checks.xu -o build/phone-3d-budget-tests
+	./build/phone-3d-budget-tests
 
 .PHONY: phone-frame-test phone-state-test phone-audio-test
 phone-frame-test: sdk

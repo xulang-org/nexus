@@ -14,39 +14,39 @@ GLB 已支持受限 TRS 动画采样、CPU 四权重线性蒙皮和相对路径 
 3D 已加入带法线/切线/UV 的金属度/粗糙度直接光材质、基础颜色/ORM/自发光/法线/独立 AO 纹理与 mipmap、单双面渲染、最多 256 个候选方向光/点光/聚光、每网格最多 16 源、场景光源绑定、自发光和曝光。
 3D 可选择 GPU 2× 超采样（四个源像素合成一个输出像素）和方向/聚光/点光 3×3 PCF 阴影及 2–4 级 CSM，图片已接通标准库的受限 baseline JPEG 解码。完整 glTF 材质/纹理、IBL、编辑器、完整脚本类型/绑定/协程、生产更新分发、压缩音频/异步解码与 DSP、刚体求解器、用户材质着色器、GPU 粒子和计算纹理仍待实现。
 
-当前选择 Xu **0.12.4-dev.3 开发 SDK**，用于原生 Phone game 宿主、触摸事件与随包资源。它尚未正式发布；编译器、标准库、native/phone 工具必须来自同一完整 SDK。macOS arm64 / Metal / CoreAudio 已完成回归；iPhone 8 / iOS 16.7.16 已运行原生 Metal 2D、PNG 精灵与场景，物理双指和前后台操作按真机验收单独记录。
+当前对齐 Xu **0.12.5** 并包含原生 Phone game 工具链分支，用于原生 Phone game 宿主、安全区/触摸与多点手势事件、纯 Xu FFI 绑定及随包资源；编译器、标准库、native/phone 工具必须来自同一完整 SDK。macOS arm64 / Metal / CoreAudio 已完成桌面与主机回归；`iPhone 8`（iOS 16.7.16）与 `Sony XQ-BE72`（Android 13）已实机验证 `examples/phone_arena`（Metal+CoreAudio / Vulkan+AAudio、安全区与断点续玩存档）及 `examples/phone_3d`（Metal/Vulkan PBR 贴图场景、像素预算上限 `921600`、`Overlay2D` + `UiFrame` HUD 与触控轨道视角），真机物理双指捏合等手势仍按真机边界单独说明。
 
 
-## Phone 原生 2D 示例
+## Phone 原生 2D / 3D 示例
 
-`examples/phone_arena` 使用现有场景、AABB 碰撞、固定时钟、PNG 图集动画与标准 GPU 渲染，
-不经 WebView。左下区域起手唤出浮动摇杆，右侧闪电按钮按住加速，中间按钮轻点暂停/恢复（横屏时放在右侧）；收集六个金色方块。
-触摸以逻辑窗口坐标输入，渲染按实际像素缩放。浮动摇杆可从左下区域任意位置开始，拖出启动区域仍保持捕获，超出半径后底座跟随；抬手或系统取消后归位。焦点丢失、队列 reset 和尺寸变化释放触摸捕获。
-回到前台时重置输入与时钟，不累计后台模拟时间；共享的 `integration/frame.FrameLoop` 管理这些帧边界，场景和渲染所有者由应用持有。
+`examples/phone_arena`（2D）与 `examples/phone_3d`（3D）均使用场景树、固定时钟与标准 GPU 渲染，经 `--phone-profile game` 原生宿主直出画面，不经 WebView：
+- `integration/viewport` 与 `integration/application`（`AppHost` / `Viewport` / `fit_letterbox`）统一处理 `safe_area()` 屏幕安全区布局、前后台恢复代次、`EVENT_BACK_REQUESTED` 暂停/退出与双端资源/私有存档路径解析。
+- `examples/phone_arena`：左下半屏浮动摇杆 + 右侧加速（Hold）+ 暂停（Tap）收集六枚宝石，结合 `game_image.xulib`、`game_audio.xulib` 与 `arena-v1.json` 原子存档恢复；触摸使用逻辑窗口坐标并按屏幕尺度缩放 HUD 控件，渲染按像素分辨率缩放。
+- `examples/phone_3d`：`AppHost` + `TouchControls` + `TouchPad`（未命中按钮区域由单指拖动控制轨道旋转，双指支持捏合缩放/桌面滚轮），通过 `Device3D.set_max_render_pixels(921600)` 控制移动端 3D 渲染像素预算并保留全分辨率 `Overlay2D` + `UiFrame` HUD 叠加、贴图 PBR 立方体与 `Back` 暂停/退出。
 
 ```sh
-GAME_PHONE_SDK=/path/to/xu-0.12.4-dev.3
+GAME_PHONE_SDK=/path/to/xu-0.12.5-phone
 export XU_ROOT="$GAME_PHONE_SDK" XU_STDLIB_ROOT="$GAME_PHONE_SDK/src"
 python3 tools/build_phone.py --xu "$GAME_PHONE_SDK/bin/xu" \
-  --target ios-arm64 --sdl-source /path/to/SDL-3.4.14 \
+  --example phone_arena --target ios-arm64 --sdl-source /path/to/SDL-3.4.14 \
   --output build/phone-arena-ios --bundle-id org.example.phonearena
 ./build/phone-arena-ios/build.sh
+
+python3 tools/build_phone.py --xu "$GAME_PHONE_SDK/bin/xu" \
+  --example phone_3d --target android-arm64 --sdl-source /path/to/SDL-3.4.14 \
+  --output build/phone-3d-android --bundle-id org.example.phone3d
+./build/phone-3d-android/build.sh
 ```
 
 SDL 必须是锁定提交 `147a8ee32dbf9ac02f3794964490687b6bbda1bc`。
 生成工程携带源码、对象和资源，之后原生构建可离线执行；iOS 安装需要匹配的开发签名与 provisioning。
-Android 使用 `--target android-arm64`，准备 Android SDK/NDK、JDK 和 `glslangValidator`，再执行生成的 `build.sh`。
-原生 PNG 桥接保留 host/iOS/Android 各目标 slice。示例构建脚本在忽略的 build 目录准备 shader 与 PNG，
-生成 `phone.resources` 清单；资源通过标准 `app.resource_path()` 读取。iPhone 已验证应用私有目录中的存档写入、原子替换和冷启动恢复。移动音频、3D、真实双指与旋转/生命周期压力仍待验收。
+Android 准备 Android SDK/NDK、JDK 与 `glslangValidator`，生成 `libmain.so` + `libSDL3.so`（强制 16 KiB ELF 对齐与 `zipalign -P 16` / `apksigner verify`）。
+原生 PNG 与音频桥接均提供 `macos-arm64` / `ios-arm64` / `android-arm64` 三切片。示例构建脚本在忽略的 `build` 目录准备 shader、PNG 与 WAV 清单 `phone.resources`，资源通过 `app_host.resolve_resource` / `app.resource_path()` 读取。
 
-示例使用 `app.data_path("arena-v1.json")` 保存位置、六个宝石的收集状态和暂停状态。
-移动时最多每秒写一次，松手、收集、暂停变化和正常退出会尽早写入；后台被系统终止时，最多可能丢失最近约一秒的移动进度。
-存档先写同目录临时文件再 rename；小型格式损坏的文件保留为 `.rejected-<timestamp>` 并重新开始，读取权限/超出大小上限等文件错误明确返回。
-该机制已验证进程重启，不承诺突然断电时的落盘持久性。横屏把世界放在中间，左右保留触控区域。
+`phone_arena` 使用 `app_host.resolve_data("arena-v1.json", "build")` / `app.data_path("arena-v1.json")` 保存位置、六个宝石收集mask和暂停状态：
+移动时最多每秒写一次，松手、收集、暂停变化和正常退出会立即写入；同目录临时文件 + rename 原子替换；损坏小文件保留为 `.rejected-<timestamp>` 并重置。
 
-`integration/frame` 本身不依赖 Phone、GPU 或 SceneTree：宿主传入单调时间和恢复代数即可使用。
-每帧先 `begin_frame`，通过 `feed` 路由窗口事件，再用 `finish_frame(paused)` 取得固定步进；尺寸变化时调用 `reset_touches` 后重建控件。
-输入、触控、场景和渲染资源保持显式所有者，核心输入/时钟与此组合层都可在没有 SDL 后端的环境测试。
+`integration/frame` 本身不依赖 Phone、GPU 或 SceneTree：宿主传入单调时间和恢复代数即可使用；`integration/application.AppHost` 在此基础上收口窗口事件流、恢复复位、`safe_area` 与返回键调度。
 
 ## 功能完整性
 
@@ -167,8 +167,8 @@ python3 tools/check_layers.py --graph
 
 | 后端 | 预期系统 | 当前验收 |
 | --- | --- | --- |
-| Metal | macOS | macOS arm64 / SDL 3.4.14，Xu 0.12.4-dev.3 的 2D/3D 绘制、像素回读和资源回收通过 |
-| Vulkan | Linux、支持 Vulkan 的 Windows | SDL GPU 路径已接入；尚未在对应系统运行验收 |
+| Metal | macOS / iOS | macOS arm64 与 iPhone 8 (iOS 16.7.16) Metal 2D/3D、HUD 叠加、像素回读和资源回收通过 |
+| Vulkan | Android / Linux / Windows | Sony XQ-BE72 (Android 13) Vulkan 2D/3D + HUD 实机呈现与事件/Back 暂停通过；Linux/Windows 路径已接入 |
 | D3D12 | Windows | SDL GPU 路径已接入；尚未在对应系统运行验收 |
 
 后端来自 [SDL GPU](https://wiki.libsdl.org/SDL3/CategoryGPU)。设备选择方式见
@@ -182,7 +182,7 @@ PNG 文件上传、最近邻/线性采样、透明混合、GPU 裁剪、有序�
 
 ## 运行
 
-需要 Xu 产品 SDK **0.12.4-dev.3** 开发版、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
+需要 **Xu 0.12.5**（桌面/主机测试使用含 native FFI 修复的 SDK，移动端打包使用 Phone game 工具链分支）、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
 默认通过 `pkg-config sdl3` 查找头文件；Windows 可显式传入包含 `SDL3/SDL.h` 的目录。
 桥接在运行时加载 SDL，不把 SDL 源码或二进制复制进本库。
 

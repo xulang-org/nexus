@@ -1,0 +1,86 @@
+@main
+
+controls #"github.com/xulang-org/game/input"
+bridge #"github.com/xulang-org/game/integration/input"
+fm #"github.com/xulang-org/game/foundation/math"
+events #window/events
+#math
+
+fn touch_ev(kind int, finger int, x f64, y f64) events.Event {
+    $out := events.empty()
+    out.kind = kind
+    out.device_id = 1
+    out.touch_id = finger
+    out.x = x
+    out.y = y
+    << out
+}
+
+fn close(a f64, b f64) bool {
+    << math.abs(a - b) < 0.000001
+}
+
+fn run() int {
+    $input := controls.new_input_map()
+    input.bind_source("pause", 5) or >>
+    $buttons := bridge.new_touch_controls(fm.vec2(40.0, 40.0), 10.0, 0.1, 0) or >>
+    buttons.add_button(fm.vec2(300.0, 60.0), 28.0, 5, bridge.BUTTON_TAP) or >>
+    $pad := bridge.new_touch_pad()
+
+    // Touch hitting button is owned by TouchControls and must not move the camera pad.
+    btn_down := touch_ev(events.EVENT_TOUCH_DOWN, 10, 300.0, 60.0)
+    buttons.apply($&input, &btn_down) or >>
+    assert(buttons.owns_touch(1, 10))
+    btn_move := touch_ev(events.EVENT_TOUCH_MOVE, 10, 310.0, 60.0)
+    buttons.apply($&input, &btn_move) or >>
+    assert(buttons.owns_touch(1, 10))
+    btn_up := touch_ev(events.EVENT_TOUCH_UP, 10, 300.0, 60.0)
+    buttons.apply($&input, &btn_up) or >>
+    assert(!buttons.owns_touch(1, 10))
+    assert(input.just_pressed("pause") or >>)
+    assert(pad.active_fingers() == 0)
+
+    // 1-finger drag orbits cleanly.
+    pad.begin_frame()
+    f1_down := touch_ev(events.EVENT_TOUCH_DOWN, 20, 100.0, 200.0)
+    pad.apply(&f1_down) or >>
+    f1_move := touch_ev(events.EVENT_TOUCH_MOVE, 20, 130.0, 185.0)
+    pad.apply(&f1_move) or >>
+    assert(pad.active_fingers() == 1)
+    assert(close(pad.drag.x, 30.0) && close(pad.drag.y, -15.0) && close(pad.pinch_scale, 1.0))
+
+    // Adding a second finger switches to pinch without injecting single-finger drag jumps.
+    pad.begin_frame()
+    f2_down := touch_ev(events.EVENT_TOUCH_DOWN, 21, 200.0, 185.0)
+    pad.apply(&f2_down) or >>
+    assert(pad.active_fingers() == 2)
+    f2_spread := touch_ev(events.EVENT_TOUCH_MOVE, 21, 270.0, 185.0)
+    pad.apply(&f2_spread) or >>
+    assert(close(pad.drag.x, 0.0) && close(pad.drag.y, 0.0))
+    assert(close(pad.pinch_scale, 2.0))
+
+    // Lifting one finger returns to single-finger drag smoothly.
+    pad.begin_frame()
+    f2_up := touch_ev(events.EVENT_TOUCH_UP, 21, 270.0, 185.0)
+    pad.apply(&f2_up) or >>
+    assert(pad.active_fingers() == 1)
+    f1_drag := touch_ev(events.EVENT_TOUCH_MOVE, 20, 145.0, 185.0)
+    pad.apply(&f1_drag) or >>
+    assert(close(pad.drag.x, 15.0))
+
+    // Safe area or input reset clears all active gestures.
+    $safe_ev := events.empty()
+    safe_ev.kind = events.EVENT_SAFE_AREA_CHANGED
+    pad.apply(&safe_ev) or >>
+    assert(pad.active_fingers() == 0)
+
+    println("phone pinch: button ownership, 1-finger orbit, 2-finger pinch zoom and reset PASS")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}
