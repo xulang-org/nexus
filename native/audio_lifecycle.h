@@ -48,7 +48,7 @@ static bool SDLCALL audio_lifecycle(void *unused, SDL_Event *event) {
     } else if (!atomic_exchange(&audio_dispatch_pending,true)) {
         if (!p_SDL_RunOnMainThread(audio_on_owner,NULL,false)) {
             atomic_store(&audio_dispatch_pending,false);
-            fprintf(stderr,"game audio lifecycle dispatch: %s\n",p_SDL_GetError());
+            fprintf(stderr,"nexus audio lifecycle dispatch: %s\n",p_SDL_GetError());
         }
     }
     return true;
@@ -66,7 +66,7 @@ static void audio_leave(void) {
 }
 static bool is_audio_background(void) { return atomic_load(&audio_background); }
 static bool configure_audio_lifecycle(void) {
-    // Respect an explicit SDL category. The game default mixes with other apps
+    // Respect an explicit SDL category. The nexus default mixes with other apps
     // and follows the silent switch. Playback only: no microphone permission.
     if (!p_SDL_GetHint(SDL_HINT_AUDIO_CATEGORY)) p_SDL_SetHint(SDL_HINT_AUDIO_CATEGORY,"ambient");
     if (!p_SDL_AddEventWatch(audio_lifecycle,NULL)) { sdl_fail(); return false; }

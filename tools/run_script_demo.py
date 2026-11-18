@@ -35,7 +35,7 @@ def main():
     commands = []
     for name in ('player', 'indicator'):
         command = [sys.executable, str(ROOT / 'tools/watch_script.py'),
-                   '--tool', str(ROOT / 'build/xu-game-script'),
+                   '--tool', str(ROOT / 'build/xu-nexus-script'),
                    '--source', str(ROOT / f'examples/script_reload/{name}.xus'),
                    '--schema', str(ROOT / f'examples/script_reload/{name}.schema.json'),
                    '--output', str(ROOT / f'build/{name}.xubc')]

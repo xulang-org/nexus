@@ -15,7 +15,7 @@
 #include <pthread.h>
 #endif
 #endif
-#define API(name) XU_NATIVE_SYMBOL(xu_game_audio_native_##name)
+#define API(name) XU_NATIVE_SYMBOL(xu_nexus_audio_native_##name)
 #define FUNCTIONS(X) \
     X(SDL_SetMainReady) X(SDL_IsMainThread) X(SDL_InitSubSystem) X(SDL_QuitSubSystem) X(SDL_GetError) \
     X(SDL_OpenAudioDeviceStream) X(SDL_DestroyAudioStream) X(SDL_PauseAudioStreamDevice) \
@@ -45,7 +45,7 @@ static bool load_sdl(void) {
 #define FIND(name) (&name)
 #define UNLOAD() ((void)0)
 #else
-    const char *override = getenv("XU_GAME_SDL_AUDIO_LIBRARY");
+    const char *override = getenv("XU_NEXUS_SDL_AUDIO_LIBRARY");
 #ifdef _WIN32
     HMODULE library = LoadLibraryA(override && *override ? override : "SDL3.dll");
 #define FIND(name) GetProcAddress(library, #name)
@@ -65,7 +65,7 @@ static bool load_sdl(void) {
 #define UNLOAD() dlclose(library)
 #endif
 #endif
-    if (!library) { fail("SDL audio runtime not found; set XU_GAME_SDL_AUDIO_LIBRARY"); return false; }
+    if (!library) { fail("SDL audio runtime not found; set XU_NEXUS_SDL_AUDIO_LIBRARY"); return false; }
 #define LOAD(name) p_##name = (__typeof__(name) *)FIND(name); \
     if (!p_##name) { fail("SDL audio is missing " #name); UNLOAD(); return false; }
     FUNCTIONS(LOAD)

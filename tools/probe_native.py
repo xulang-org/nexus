@@ -17,8 +17,8 @@ def main():
     target = root/'build/native-probe'
     target.mkdir(parents=True, exist_ok=True)
     sdk = re.search(r'^xu: !ver (\S+)$', (root/'xu.xun').read_text(), re.MULTILINE).group(1)
-    (target/'xu.xun').write_text('module: example/game_native_probe\nversion: !ver 0.1.0\nxu: !ver '+sdk+'\nnative:\n  game_native_probe: file:./probe.xulib\n')
-    manifest = {'module': 'game_native_probe', 'abi': 'xu-c-2', 'exports': [
+    (target/'xu.xun').write_text('module: example/nexus_native_probe\nversion: !ver 0.1.0\nxu: !ver '+sdk+'\nnative:\n  nexus_native_probe: file:./probe.xulib\n')
+    manifest = {'module': 'nexus_native_probe', 'abi': 'xu-c-2', 'exports': [
         {'name': 'increment', 'params': ['int'], 'ret': 'int'},
         {'name': 'weighted', 'params': ['int'] * 12, 'ret': 'int'},
         {'name': 'total', 'params': ['i64_span'], 'ret': 'int'},
@@ -27,7 +27,7 @@ def main():
         {'name': 'mixed', 'params': ['int', 'i64_span', 'int', 'i64_span_mut', 'int', 'i64_span', 'int', 'i64_span_mut', 'int', 'int'], 'ret': 'int'}]}
     (target/'native.json').write_text(json.dumps(manifest, indent=2)+'\n')
     (target/'probe.c').write_text('''#include "xu_native.h"
-#define API(name) XU_NATIVE_SYMBOL(xu_game_native_probe_##name)
+#define API(name) XU_NATIVE_SYMBOL(xu_nexus_native_probe_##name)
 xu_int API(increment)(xu_int value) { return value + 1; }
 xu_int API(weighted)(xu_int a, xu_int b, xu_int c, xu_int d, xu_int e, xu_int f,
                     xu_int g, xu_int h, xu_int i, xu_int j, xu_int k, xu_int l) {
@@ -55,32 +55,32 @@ xu_int API(mixed)(xu_int a, const xu_i64_span *b, xu_int c, const xu_i64_span_mu
 }
 ''')
     (target/'main.xu').write_text('''@main
-#game_native_probe
+#nexus_native_probe
 struct Holder { pad int
     values []int }
-fn holder_sum(value &Holder) int { << game_native_probe.total(&value.values) }
+fn holder_sum(value &Holder) int { << nexus_native_probe.total(&value.values) }
 fn main() int {
-    assert(game_native_probe.increment(41) == 42)
-    assert(game_native_probe.weighted(1,2,3,4,5,6,7,8,9,10,11,12) == 650)
+    assert(nexus_native_probe.increment(41) == 42)
+    assert(nexus_native_probe.weighted(1,2,3,4,5,6,7,8,9,10,11,12) == 650)
     $values := [1,2,3]
     shared := ~values
-    assert(game_native_probe.total(&values) == 6)
-    assert(game_native_probe.mutate($&values) == 3)
+    assert(nexus_native_probe.total(&values) == 6)
+    assert(nexus_native_probe.mutate($&values) == 3)
     assert(values[0] == 8 && values[2] == 10 && shared[0] == 1 && shared[2] == 3)
     $empty := []int{}
-    assert(game_native_probe.total(&empty) == 0 && game_native_probe.mutate($&empty) == 0)
+    assert(nexus_native_probe.total(&empty) == 0 && nexus_native_probe.mutate($&empty) == 0)
     $holder := Holder{pad: 123456, values: [2,4]}
     assert(holder_sum(&holder) == 6)
     holder_copy := ~holder
-    assert(game_native_probe.mutate($&holder.values) == 2)
+    assert(nexus_native_probe.mutate($&holder.values) == 2)
     assert(holder_sum(&holder) == 20 && holder_sum(&holder_copy) == 6)
     $first := [0]
     $second := [0]
     other := [11,13]
-    assert(game_native_probe.mixed(1,&shared,3,$&first,5,&other,7,$&second,9,10) == 100)
+    assert(nexus_native_probe.mixed(1,&shared,3,$&first,5,&other,7,$&second,9,10) == 100)
     assert(first[0] == 41 && second[0] == 59)
-    game_native_probe.clear($&values)
-    assert(game_native_probe.total(&values) == 0 && game_native_probe.total(&shared) == 6)
+    nexus_native_probe.clear($&values)
+    assert(nexus_native_probe.total(&values) == 0 && nexus_native_probe.total(&shared) == 6)
     println("PASS: native 41 -> 42, twelve scalar arguments, mixed stack/spans, empty arrays, borrowed fields, mutable COW isolation and void result")
     << 0
 }

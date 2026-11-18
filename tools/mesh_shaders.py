@@ -1,4 +1,4 @@
-"""Prepare explicit 3D and presentation shaders without any game native module."""
+"""Prepare explicit 3D and presentation shaders without any nexus native module."""
 import argparse
 from pathlib import Path
 import platform

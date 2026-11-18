@@ -1,10 +1,10 @@
-# Xu Game
+# Nexus Engine
 
-独立的 Xu 游戏引擎库，模块为 `github.com/xulang-org/game`，当前开发版本 `0.1.1-dev.3`。
+Nexus Engine 是独立的 Xu 游戏引擎库，模块为 `github.com/xulang-org/nexus`，当前开发版本 `0.1.1-dev.3`。
 场景树、可复用场景、变换、相机、图集动画、输入、时钟、碰撞、画布和精灵逻辑使用 Xu。
 3D 向量、矩阵、透视相机、网格构建、父子变换、材质参数和场景绘制同样使用 Xu。
 音频资源、重采样、声像、总线混音和节点播放状态也由 Xu 实现；设备提交使用独立音频 C ABI。
-2D/3D 都通过 Xu 标准 `gpu` / `window` 管理设备、资源、绘制、事件和呈现；game 不再维护 GPU 原生桥接。
+2D/3D 都通过 Xu 标准 `gpu` / `window` 管理设备、资源、绘制、事件和呈现；nexus 不再维护 GPU 原生桥接。
 
 参考 Godot 的 [Node / SceneTree](https://docs.godotengine.org/en/stable/tutorials/scripting/scene_tree.html)
 和 [Resource](https://docs.godotengine.org/en/stable/tutorials/scripting/resources.html) 分工。
@@ -21,18 +21,18 @@ GLB 已支持受限 TRS 动画采样、CPU 四权重线性蒙皮和相对路径 
 
 `examples/phone_arena`（2D）与 `examples/phone_3d`（3D）均使用场景树、固定时钟与标准 GPU 渲染，经 `--phone-profile game` 原生宿主直出画面，不经 WebView：
 - `integration/viewport` 与 `integration/application`（`AppHost` / `Viewport` / `fit_letterbox`）统一处理 `safe_area()` 屏幕安全区布局、前后台恢复代次、`EVENT_BACK_REQUESTED` 暂停/退出与双端资源/私有存档路径解析。
-- `examples/phone_arena`：左下半屏浮动摇杆 + 右侧加速（Hold）+ 暂停（Tap）收集六枚宝石，结合 `game_image.xulib`、`game_audio.xulib` 与 `arena-v1.json` 原子存档恢复；触摸使用逻辑窗口坐标并按屏幕尺度缩放 HUD 控件，渲染按像素分辨率缩放。
+- `examples/phone_arena`：左下半屏浮动摇杆 + 右侧加速（Hold）+ 暂停（Tap）收集六枚宝石，结合 `nexus_image.xulib`、`nexus_audio.xulib` 与 `arena-v1.json` 原子存档恢复；触摸使用逻辑窗口坐标并按屏幕尺度缩放 HUD 控件，渲染按像素分辨率缩放。
 - `examples/phone_3d`：`AppHost` + `TouchControls` + `TouchPad`（未命中按钮区域由单指拖动控制轨道旋转，双指支持捏合缩放/桌面滚轮），通过 `Device3D.set_max_render_pixels(921600)` 控制移动端 3D 渲染像素预算并保留全分辨率 `Overlay2D` + `UiFrame` HUD 叠加、贴图 PBR 立方体与 `Back` 暂停/退出。
 
 ```sh
-GAME_PHONE_SDK=/path/to/xu-0.12.5-phone
-export XU_ROOT="$GAME_PHONE_SDK" XU_STDLIB_ROOT="$GAME_PHONE_SDK/src"
-python3 tools/build_phone.py --xu "$GAME_PHONE_SDK/bin/xu" \
+NEXUS_PHONE_SDK=/path/to/xu-0.12.5-phone
+export XU_ROOT="$NEXUS_PHONE_SDK" XU_STDLIB_ROOT="$NEXUS_PHONE_SDK/src"
+python3 tools/build_phone.py --xu "$NEXUS_PHONE_SDK/bin/xu" \
   --example phone_arena --target ios-arm64 --sdl-source /path/to/SDL-3.4.14 \
   --output build/phone-arena-ios --bundle-id org.example.phonearena
 ./build/phone-arena-ios/build.sh
 
-python3 tools/build_phone.py --xu "$GAME_PHONE_SDK/bin/xu" \
+python3 tools/build_phone.py --xu "$NEXUS_PHONE_SDK/bin/xu" \
   --example phone_3d --target android-arm64 --sdl-source /path/to/SDL-3.4.14 \
   --output build/phone-3d-android --bundle-id org.example.phone3d
 ./build/phone-3d-android/build.sh
@@ -124,7 +124,7 @@ Android 准备 Android SDK/NDK、JDK 与 `glslangValidator`，生成 `libmain.so
 | `integration/lighting` | Node3D 光源绑定、世界空间收集与可见性/删除处理，无渲染器或设备依赖 |
 | `resources/canvas` | 纯 CPU 2D 顶点、批次、图集 UV 与容量验证，无 GPU/窗口依赖 |
 | `rendering/two_d` | 标准 GPU/window 上的画布服务、纹理、裁剪和诊断读回；不依赖场景或资产加载 |
-| `rendering/three_d` | 标准 GPU/window 上的 3D 设备、网格、纹理、材质与 Reverse-Z；无 game 原生归档 |
+| `rendering/three_d` | 标准 GPU/window 上的 3D 设备、网格、纹理、材质与 Reverse-Z；无 nexus 原生归档 |
 | `assets/shaders/two_d`、`three_d` | 分别显式加载离线着色器产物；不运行编译器，不互相导入 |
 | `integration/image_render/two_d`、`three_d` | 分别把 CPU 图片上传到对应 GPU 服务；不互相导入 |
 | `integration/rendering/two_d`、`three_d` | 2D 仅录制 CPU 批次；3D 连接场景与网格/材质服务 |
@@ -150,9 +150,9 @@ make layers
 python3 tools/check_layers.py --graph
 ```
 
-场景接口从 `github.com/xulang-org/game/scene` 导入；数学从 `foundation/math` 导入；CPU 2D 批次从 `resources/canvas` 导入，设备分别从 `rendering/two_d` 和 `rendering/three_d` 导入。
+场景接口从 `github.com/xulang-org/nexus/scene` 导入；数学从 `foundation/math` 导入；CPU 2D 批次从 `resources/canvas` 导入，设备分别从 `rendering/two_d` 和 `rendering/three_d` 导入。
 场景绘制和图片上传也按 `two_d` / `three_d` 分包，GLB 上传由 `integration/gltf_render` 连接。
-开发轮询改由 `dev #"github.com/xulang-org/game/script/development"` 创建，使用 `file.poll` 或 `file.poll_scene`；
+开发轮询改由 `dev #"github.com/xulang-org/nexus/script/development"` 创建，使用 `file.poll` 或 `file.poll_scene`；
 运行时直接调用 `NodeScript.reload` / `SceneScripts.reload`，不需要加载开发轮询器。
 整合层目录使用 `integration/`：`runtime/` 保留给语言运行时，场景/服务适配统一放入 `integration/`。
 
@@ -241,9 +241,9 @@ make demo-glb-materials
 完整 SDK 的编译器、标准库和包搜索路径必须一致：
 
 ```sh
-GAME_XU_SDK="$HOME/.xu"  # 或完整的 0.12.4-dev.3 SDK 目录
-XU_ROOT="$GAME_XU_SDK" XU_STDLIB_ROOT="$GAME_XU_SDK/src" \
-XUPATH="$GAME_XU_SDK/src:$GAME_XU_SDK/packages" XU="$GAME_XU_SDK/bin/xu" \
+NEXUS_XU_SDK="$HOME/.xu"  # 或完整的 0.12.4-dev.3 SDK 目录
+XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" \
+XUPATH="$NEXUS_XU_SDK/src:$NEXUS_XU_SDK/packages" XU="$NEXUS_XU_SDK/bin/xu" \
 make native-probe check test gpu-smoke smoke script-live-smoke
 ```
 
@@ -254,7 +254,7 @@ make native-probe check test gpu-smoke smoke script-live-smoke
 `make check test gpu-smoke smoke script-live-smoke` 包含设备与运行中热更新检查；失败直接报告。
 本轮 macOS arm64 使用 `0.12.4-dev.3` 已通过上述完整命令（smoke 含独立标准 GPU 传输），覆盖：Metal 2D/3D 绘制与回读、CoreAudio、资源回收与失败回滚、
 场景保存/新进程恢复，以及真实 GPU 进程内 300 帧脚本热重载（状态和信号连接保留，错误源码/产物拒绝）。
-SDL 动态库不在标准位置时，标准 GPU/window 与 CPU PNG codec 使用 `XU_SDL_LIBRARY`；音频设备仍使用独立的 `XU_GAME_SDL_AUDIO_LIBRARY`。
+SDL 动态库不在标准位置时，标准 GPU/window 与 CPU PNG codec 使用 `XU_SDL_LIBRARY`；音频设备仍使用独立的 `XU_NEXUS_SDL_AUDIO_LIBRARY`。
 3D 着色器通过 `make mesh-shaders` 或 `tools/mesh_shaders.py --backend ... --out-dir ...` 显式准备。
 macOS 使用 MSL 源码（驱动编译），Vulkan 需 glslangValidator，D3D12 需 DXC；运行服务只接收内存数据。
 Linux / Windows 的构建配方与着色器源文件已提供，尚未在对应系统验证。
@@ -266,14 +266,14 @@ Linux / Windows 的构建配方与着色器源文件已提供，尚未在对应�
 PNG 先解码为 `resources/image` 数据，再显式上传；窗口与 GPU 服务不读取资源文件。
 
 ```xu
-ren #"github.com/xulang-org/game/rendering/two_d"
-canvas #"github.com/xulang-org/game/resources/canvas"
-shaders #"github.com/xulang-org/game/assets/shaders/two_d"
-images #"github.com/xulang-org/game/assets/image"
-image_render #"github.com/xulang-org/game/integration/image_render/two_d"
+ren #"github.com/xulang-org/nexus/rendering/two_d"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+shaders #"github.com/xulang-org/nexus/assets/shaders/two_d"
+images #"github.com/xulang-org/nexus/assets/image"
+image_render #"github.com/xulang-org/nexus/integration/image_render/two_d"
 #gpu
-colors #"github.com/xulang-org/game/foundation/color"
-fm #"github.com/xulang-org/game/foundation/math"
+colors #"github.com/xulang-org/nexus/foundation/color"
+fm #"github.com/xulang-org/nexus/foundation/math"
 
 image := images.load_png("examples/arena/assets/player.png") or >>
 program := shaders.load_canvas("build/canvas-shaders") or >>
@@ -324,13 +324,13 @@ Vulkan 产物需 glslangValidator，D3D12 产物需 DXC。实际设备验收目�
 ## 3D 绘制接口
 
 ```xu
-shaders #"github.com/xulang-org/game/assets/shaders/three_d"
-meshes #"github.com/xulang-org/game/resources/mesh"
-fm #"github.com/xulang-org/game/foundation/math"
-colors #"github.com/xulang-org/game/foundation/color"
+shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+fm #"github.com/xulang-org/nexus/foundation/math"
+colors #"github.com/xulang-org/nexus/foundation/color"
 #gpu
-ren #"github.com/xulang-org/game/rendering/three_d"
-game #"github.com/xulang-org/game/scene"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+nexus #"github.com/xulang-org/nexus/scene"
 
 program := shaders.load_mesh("build/mesh-shaders") or >>
 $device := ren.open_3d("My 3D Game", 960, 640, gpu.AUTO, &program) or >>
@@ -341,7 +341,7 @@ data.vertex(fm.vec3(1.0, -1.0, 0.0), red) or >>
 data.vertex(fm.vec3(0.0, 1.0, 0.0), red) or >>
 data.triangle(0, 1, 2) or >>
 $mesh := device.upload(&data) or >>
-camera := game.new_camera_3d()
+camera := nexus.new_camera_3d()
 view := camera.view_projection(1.5) or >>
 device.begin(colors.rgba8(12, 20, 34, 255) or >>) or >>
 device.draw(&mesh, view) or >>
@@ -378,19 +378,19 @@ device.close() or >>
 [`examples/three_d/main.xu`](examples/three_d/main.xu)。
 
 ```xu
-fm #"github.com/xulang-org/game/foundation/math"
-colors #"github.com/xulang-org/game/foundation/color"
-scene_render #"github.com/xulang-org/game/integration/rendering/three_d"
-game #"github.com/xulang-org/game/scene"
+fm #"github.com/xulang-org/nexus/foundation/math"
+colors #"github.com/xulang-org/nexus/foundation/color"
+scene_render #"github.com/xulang-org/nexus/integration/rendering/three_d"
+nexus #"github.com/xulang-org/nexus/scene"
 
-$tree := game.new_scene_tree_3d("World", 64) or >>
+$tree := nexus.new_scene_tree_3d("World", 64) or >>
 root := tree.root()
 pivot := tree.add_child_3d(root, "Pivot") or >>
 object := tree.add_child_3d(pivot, "Object") or >>
 tree.set_transform_3d(pivot, fm.rotation_y(0.5)) or >>
 camera_node := tree.add_child_3d(root, "Camera") or >>
 tree.set_position_3d(camera_node, fm.vec3(0.0, 0.0, 5.0)) or >>
-camera := game.new_camera_node_3d(&tree, camera_node) or >>
+camera := nexus.new_camera_node_3d(&tree, camera_node) or >>
 $scene := scene_render.new_scene_3d(&device) or >>
 scene.attach_mesh(&tree, object, &mesh) or >>
 view := camera.view_projection(&tree, 1.5) or >>
@@ -441,9 +441,9 @@ GLB 几何上传器 `upload` 会保留 NORMAL / TEXCOORD_0，缺少 NORMAL 的 p
 材质入口 `upload_model` 要求每个 primitive 已有 NORMAL，法线贴图还要求显式切线。
 
 ```xu
-light_data #"github.com/xulang-org/game/resources/lighting"
-fm #"github.com/xulang-org/game/foundation/math"
-ren #"github.com/xulang-org/game/rendering/three_d"
+light_data #"github.com/xulang-org/nexus/resources/lighting"
+fm #"github.com/xulang-org/nexus/foundation/math"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
 
 material := ren.material_3d(fm.vec3(0.5, 0.15, 0.05), 0.0, 0.4, fm.vec3(0.0, 0.0, 0.0)) or >>
 source := light_data.directional(fm.vec3(0.5, 1.0, 1.0), fm.vec3(4.0, 4.0, 4.0)) or >>
@@ -485,8 +485,8 @@ make demo-textures3d
 方向键环绕相机，Space 暂停旋转，Esc 退出。最后一项展示显式颜色空间选择的差别，普通颜色 PNG 应使用 sRGB。
 
 ```xu
-images #"github.com/xulang-org/game/assets/image"
-image_render #"github.com/xulang-org/game/integration/image_render/three_d"
+images #"github.com/xulang-org/nexus/assets/image"
+image_render #"github.com/xulang-org/nexus/integration/image_render/three_d"
 
 image := images.load_png("base-color.png") or >>
 // 参数依次为：sRGB、线性过滤、重复寻址；这里使用 sRGB + linear + repeat。
@@ -504,7 +504,7 @@ scene.set_material(&tree, object, textured) or >>
 `vertex_lit_uv(position, color, normal, uv)` 提供带法线/UV 的顶点；`vertex_uv` 只提供 UV，仍用于无光照绘制。
 UV (0,0) 对应图片首行左端，(1,1) 对应末行右端；允许有限的 ±1,000,000 坐标以支持 repeat。
 原 `vertex` / `vertex_lit` 明确标记为无 UV，贴图材质要求每个顶点都有法线和 UV，缺失时拒绝绑定或绘制。
-CPU 顶点为 `resources/mesh.Vertex3D`：f64 向量/UV、RGBA8 和属性存在标志。`Device3D.upload` 校验并通过标准 `encoding/binary` 编码为 position3、color4、normal3、UV2、tangent4，共 16 个 float / 64 字节；索引为 uint32。没有 game 的顶点 word-span ABI。
+CPU 顶点为 `resources/mesh.Vertex3D`：f64 向量/UV、RGBA8 和属性存在标志。`Device3D.upload` 校验并通过标准 `encoding/binary` 编码为 position3、color4、normal3、UV2、tangent4，共 16 个 float / 64 字节；索引为 uint32。没有 nexus 的顶点 word-span ABI。
 
 | 项目 | 当前约定 |
 | --- | --- |
@@ -648,14 +648,14 @@ scene.set_material(&tree, object, mapped) or >>
 原有 `vertex` / `vertex_lit` / `vertex_lit_uv` 保留，带 UV 不代表已有切线。
 `sphere_mesh_3d` 生成与球体 UV 一致的解析切线，包括接缝和极点副本。
 
-CPU 构建统一从 `meshes #"github.com/xulang-org/game/resources/mesh"` 导入，包含 `MeshData3D`、
+CPU 构建统一从 `meshes #"github.com/xulang-org/nexus/resources/mesh"` 导入，包含 `MeshData3D`、
 `Vertex3D`、`new_mesh_data_3d` 和 `sphere_mesh_3d`。渲染包只拥有上传后的 `Mesh3D` 设备资源。
 公开顶点和索引可编辑；`validate()` 检查数量/索引、有限坐标、单位法线/切线、UV/颜色和手性，上传前也会重新校验。
 
 程序网格可显式调用 `mesh.generate_tangents() or >>`，无需手填切线：
 
 ```xu
-meshes #"github.com/xulang-org/game/resources/mesh"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
 
 $source := meshes.new_mesh_data_3d()
 // vertex_lit_uv(...) 填充每个顶点的 position / normal / UV，再添加 triangle(...)。
@@ -719,7 +719,7 @@ Vulkan/D3D12 源码与绑定同步更新，仍需对应平台构建和真机验�
 GLB 继续使用 `assets/gltf` 的层级/材质接口，没有压成单一网格而丢失语义。
 
 ```xu
-mesh_files #"github.com/xulang-org/game/assets/mesh"
+mesh_files #"github.com/xulang-org/nexus/assets/mesh"
 
 data := mesh_files.load("assets/model.obj") or >>
 mesh := device.upload(&data) or >>
@@ -753,7 +753,7 @@ make mesh-format-core-test model-format-gpu-test
 独立校验器仅安装在忽略的测试虚拟环境，不是产品依赖；Vulkan/D3D12 尚无本项真机证据。
 
 OBJ 语义依据 [Wavefront 原始附录](https://raw.githubusercontent.com/mokiat/java-data-front/master/documents/OBJ%20Specification.txt)，STL 布局参考 [Apache Commons Geometry 实现](https://svn.apache.org/repos/infra/websites/production/commons/content/proper/commons-geometry/commons-geometry-io-euclidean/xref/org/apache/commons/geometry/io/euclidean/threed/stl/StlConstants.html)。上述范围是当前实现的子集。
-格式语义和网格预算留在 game；UTF-8、文本数值、二进制浮点和文件基础能力复用 Xu 标准库，本项无需修改 Xu 编译器或标准库。
+格式语义和网格预算留在 nexus；UTF-8、文本数值、二进制浮点和文件基础能力复用 Xu 标准库，本项无需修改 Xu 编译器或标准库。
 
 ## GLB 静态几何导入
 
@@ -762,8 +762,8 @@ OBJ 语义依据 [Wavefront 原始附录](https://raw.githubusercontent.com/moki
 IEEE 位转换复用标准 `math.float32_from_bits`，GLB/WAV 自行检查有限值及领域范围；脚本字面量复用 `math.float64_from_bits`，保留 VM 标量约束。原 `internal/float32` 与 `internal/float64` 已删除，四元数运算仍在引擎数学层。
 
 ```xu
-assets #"github.com/xulang-org/game/assets/gltf"
-glb #"github.com/xulang-org/game/integration/gltf_render"
+assets #"github.com/xulang-org/nexus/assets/gltf"
+glb #"github.com/xulang-org/nexus/integration/gltf_render"
 
 asset := assets.load_glb_geometry("model.glb") or >>
 root := tree.root()
@@ -906,7 +906,7 @@ device.present() or >>
 验收包含 98 张真实 Metal PBR 截图、80 个动画片段、四组各 600 帧连续运行及可见的 walk 姿态变化。
 独立 Python 数值实现核对 326 个姿态、2,847 个蒙皮/世界坐标点及全部节点矩阵；解析/采样在缺少场景、资产、渲染及原生源码的目录以 `--no-opt` / `--release` 通过。
 另覆盖 LINEAR/STEP/三次样条/四元数反号解析解、27 项非法动画/skin/URI、独立场景实例和待删除节点整批失败、缺失/伪 PNG/文件与目录符号链接。完整引擎回归继续验证原有 OBJ/STL、PBR、场景、音频和脚本热更新。
-动画/模型语义留在 game；标准库仍只提供基础数学、数值/字节、文件、PNG、窗口和 GPU 能力，本项没有修改 Xu。
+动画/模型语义留在 nexus；标准库仍只提供基础数学、数值/字节、文件、PNG、窗口和 GPU 能力，本项没有修改 Xu。
 
 ## 细节模型与画质预览
 
@@ -943,7 +943,7 @@ RGB 4:4:4、4:2:0、灰度和奇数尺寸结果与独立 libjpeg/Pillow 比较�
 相机镜头参数和树的暂停/执行状态仍由应用管理。节点捕获入口只捕获节点；其他附件由各服务整合包管理。
 
 ```xu
-files #"github.com/xulang-org/game/integration/scene"
+files #"github.com/xulang-org/nexus/integration/scene"
 
 document := files.capture_nodes(&tree, subtree_root) or >>
 files.save("world.xuscene", &document) or >>
@@ -991,7 +991,7 @@ GLB 来源和表面附件见下节；全局 UID 索引、其他附件、实例�
 所有场景均使用同一版本 1；不会根据附件种类改变协议版本，其他版本明确拒绝。
 
 ```xu
-loader #"github.com/xulang-org/game/integration/scene_render"
+loader #"github.com/xulang-org/nexus/integration/scene_render"
 
 $models := loader.load(&device, "world.xuscene") or >>
 parent := tree.root()
@@ -1060,8 +1060,8 @@ GLB 表面与下节音频附件已实现，脚本附件见下节，镜头附件�
 音频、表面和脚本使用同一格式；编码器始终写全所有顶层数组。
 
 ```xu
-worlds #"github.com/xulang-org/game/integration/scene_audio"
-audio #"github.com/xulang-org/game/audio"
+worlds #"github.com/xulang-org/nexus/integration/scene_audio"
+audio #"github.com/xulang-org/nexus/audio"
 
 $world := worlds.load("audio.xuscene", 48000) or >>
 $output := audio.open_output(world.sample_rate()) or >>
@@ -1125,7 +1125,7 @@ make demo-scene-av
 脚本仍是已有 `xu-scalar-v1` 子集：物理更新和标量信号处理函数、有限 f64 状态；尚无完整对象绑定、协程或通用函数调用。
 
 ```xu
-scripting #"github.com/xulang-org/game/integration/scene_script"
+scripting #"github.com/xulang-org/nexus/integration/scene_script"
 
 $scripts := scripting.load("scripts.xuscene") or >>
 parent := tree.root()
@@ -1190,9 +1190,9 @@ Metal/CoreAudio 示例在第 60 帧接纳已准备候选，保持计数与路由
 只构建音频可用 `make native-audio`，不要求 GPU 归档、着色器编译器或窗口资源。
 
 ```xu
-audio #"github.com/xulang-org/game/audio"
-mix #"github.com/xulang-org/game/audio/mixer"
-assets #"github.com/xulang-org/game/assets/audio"
+audio #"github.com/xulang-org/nexus/audio"
+mix #"github.com/xulang-org/nexus/audio/mixer"
+assets #"github.com/xulang-org/nexus/assets/audio"
 
 clip := assets.load_wav("examples/audio/assets/chime.wav") or >>
 $mixer := mix.new_mixer(48000, 32) or >>
@@ -1208,7 +1208,7 @@ output.pause(false) or >>
 
 示意代码需要持续补队列才能播放；完整循环和退出清理见 [`examples/audio/main.xu`](examples/audio/main.xu)。
 设备默认暂停，显式 `pause(false)` 后消费队列；`close` 和析构关闭其音频流与设备。所有设备调用在拥有者主线程执行。
-音频运行库覆盖路径为 `XU_GAME_SDL_AUDIO_LIBRARY`，与 GPU 的覆盖路径独立。
+音频运行库覆盖路径为 `XU_NEXUS_SDL_AUDIO_LIBRARY`，与 GPU 的覆盖路径独立。
 设备或运行库不可用时明确报错，不自动退回 dummy；测试可显式设置 `SDL_AUDIO_DRIVER=dummy`。
 本机真实验收为 macOS arm64 / SDL 3.4.14 / CoreAudio；dummy 检查仅用于确定性的队列/失败测试。
 Linux/Windows 音频配方已提供，尚未在对应设备验收。
@@ -1252,7 +1252,7 @@ make audio-smoke      # 默认设备运行静态/流式示例；无设备时明�
 默认五秒，可使用 `--seconds 10 --file path/to/music.wav`。示例使用当前线程补充源数据，未实现后台解码任务。
 
 ```xu
-music #"github.com/xulang-org/game/integration/audio_stream"
+music #"github.com/xulang-org/nexus/integration/audio_stream"
 
 $track := music.open($&mixer, "music.wav", 8192, true) or >>
 track.refill($&mixer, 4096) or >>
@@ -1320,10 +1320,10 @@ make demo-script
 
 # 也可独立检查/构建，再在另一终端运行源码轮询器
 make script-tool
-./build/xu-game-script check examples/script_reload/player.xus examples/script_reload/player.schema.json
-./build/xu-game-script build examples/script_reload/player.xus examples/script_reload/player.schema.json build/player.xubc
-./build/xu-game-script build examples/script_reload/indicator.xus examples/script_reload/indicator.schema.json build/indicator.xubc
-python3 tools/watch_script.py --tool build/xu-game-script \
+./build/xu-nexus-script check examples/script_reload/player.xus examples/script_reload/player.schema.json
+./build/xu-nexus-script build examples/script_reload/player.xus examples/script_reload/player.schema.json build/player.xubc
+./build/xu-nexus-script build examples/script_reload/indicator.xus examples/script_reload/indicator.schema.json build/indicator.xubc
+python3 tools/watch_script.py --tool build/xu-nexus-script \
   --source examples/script_reload/player.xus --schema examples/script_reload/player.schema.json \
   --output build/player.xubc
 ```
@@ -1459,7 +1459,7 @@ report := scripts.dispatch(&tree, host.DEFAULT_DISPATCH_LIMIT) or >>
 | 文件监听、通用 GPU/RHI、着色器工具、通用脚本 VM | 优先独立包/工具；需要跨平台与生命周期契约，不能因引擎需要就直接入标准库 |
 | 相机、Reverse-Z、场景、材质、glTF、动画、物理、编辑器、节点脚本与热更新迁移策略 | 游戏引擎负责 |
 
-标准库不得反向依赖本引擎或 SDL。本批只在 `game` 内落地与隔离能力，未修改 Xu 编译器或标准库。
+标准库不得反向依赖本引擎或 SDL。本批只在 `nexus` 内落地与隔离能力，未修改 Xu 编译器或标准库。
 
 ## 场景与服务组合示例
 
@@ -1470,17 +1470,17 @@ module: example/my_game
 version: !ver 0.1.0
 xu: !ver 0.12.4-dev.3
 require:
-  "github.com/xulang-org/game": file:/path/to/game
+  "github.com/xulang-org/nexus": file:/path/to/nexus
 ```
 
 需要 GPU 或音频设备时先在引擎目录运行 `make native`；纯场景和脚本不需要原生归档。
 
 ```xu
-scene #"github.com/xulang-org/game/scene"
-fm #"github.com/xulang-org/game/foundation/math"
-controls #"github.com/xulang-org/game/input"
-timing #"github.com/xulang-org/game/timing"
-physics #"github.com/xulang-org/game/physics2d"
+scene #"github.com/xulang-org/nexus/scene"
+fm #"github.com/xulang-org/nexus/foundation/math"
+controls #"github.com/xulang-org/nexus/input"
+timing #"github.com/xulang-org/nexus/timing"
+physics #"github.com/xulang-org/nexus/physics2d"
 
 $tree := scene.new_scene_tree("World", 128) or >>
 player := tree.add_child(tree.root(), "Player") or >>
@@ -1500,7 +1500,7 @@ $input := controls.new_input_map()
 
 ## XACP (智能体自动化控制)
 
-本库原生内置了对 **Xu Agent Control Protocol (XACP)** 的完整支持，模块路径为 `github.com/xulang-org/game/xacp`。外部 AI 智能体（Agent）、自动化测试套件或调试器可以通过标准 XACP/1 TCP 协议帧连接正在运行的游戏，实现对场景状态的高精度无感检测与闭环控制。
+本库原生内置了对 **Xu Agent Control Protocol (XACP)** 的完整支持，模块路径为 `github.com/xulang-org/nexus/xacp`。外部 AI 智能体（Agent）、自动化测试套件或调试器可以通过标准 XACP/1 TCP 协议帧连接正在运行的游戏，实现对场景状态的高精度无感检测与闭环控制。
 
 ### 核心支持功能
 
@@ -1511,8 +1511,8 @@ $input := controls.new_input_map()
 | `ui.tree` | 场景树序列化 | 递归导出 `SceneTree` 层级结构（节点 ID、名称、类型、可见性、全局坐标与仿射变换） |
 | `ui.input` | 虚拟输入注入 | 将虚拟按键、指针位移等事件无损映射并注入到 `InputMap` |
 | `ui.act` | 仿真行为控制 | 支持 `pause` / `unpause` 等系统动作 |
-| `game.step` | 逐帧步进控制 | 支持暂停状态下推进 `N` 物理帧后重新挂起，用于精准逐帧仿真与评测 |
-| `game.state` | 引擎指标快照 | 查询当前帧序号、节点总数、暂停状态与调试计数 |
+| `nexus.step` | 逐帧步进控制 | 支持暂停状态下推进 `N` 物理帧后重新挂起，用于精准逐帧仿真与评测 |
+| `nexus.state` | 引擎指标快照 | 查询当前帧序号、节点总数、暂停状态与调试计数 |
 | `ui.screenshot` | 渲染周期同步截图 | 配合 GPU 渲染生命周期在 `present()` 前捕获当前画面，支持 Base64 返回或路径回传 |
 
 ### 快速启用
@@ -1528,7 +1528,7 @@ $input := controls.new_input_map()
 
 在自定义游戏中接入：
 ```xu
-xacp #"github.com/xulang-org/game/xacp"
+xacp #"github.com/xulang-org/nexus/xacp"
 
 // 1. 初始化控制实例（例如监听 19876）
 $ctrl := xacp.attach_tcp(19876)
@@ -1576,12 +1576,12 @@ make xacp-test
 ### 相机和 PNG 动画
 
 ```xu
-game #"github.com/xulang-org/game/scene"
-sprite_anim #"github.com/xulang-org/game/animation/sprite"
-images #"github.com/xulang-org/game/assets/image"
-image_render #"github.com/xulang-org/game/integration/image_render/two_d"
+nexus #"github.com/xulang-org/nexus/scene"
+sprite_anim #"github.com/xulang-org/nexus/animation/sprite"
+images #"github.com/xulang-org/nexus/assets/image"
+image_render #"github.com/xulang-org/nexus/integration/image_render/two_d"
 
-camera := game.new_camera_2d(960.0, 640.0) or >>
+camera := nexus.new_camera_2d(960.0, 640.0) or >>
 view := camera.view_transform(f64(width), f64(height)) or >>
 viewport := camera.viewport(f64(width), f64(height)) or >>
 image := images.load_png("assets/player.png") or >>
@@ -1623,7 +1623,7 @@ PNG 输入文件最多 32 MiB，先检查签名和 IHDR 尺寸，再从不可变
 
 ## XACP (智能体自动化控制)
 
-本库原生内置了对 **Xu Agent Control Protocol (XACP)** 的完整支持，模块路径为 `github.com/xulang-org/game/xacp`。外部 AI 智能体（Agent）、自动化测试套件或调试器可以通过标准 XACP/1 TCP 协议帧连接正在运行的游戏，实现对场景状态的高精度无感检测与闭环控制。
+本库原生内置了对 **Xu Agent Control Protocol (XACP)** 的完整支持，模块路径为 `github.com/xulang-org/nexus/xacp`。外部 AI 智能体（Agent）、自动化测试套件或调试器可以通过标准 XACP/1 TCP 协议帧连接正在运行的游戏，实现对场景状态的高精度无感检测与闭环控制。
 
 ### 核心支持功能
 
@@ -1634,8 +1634,8 @@ PNG 输入文件最多 32 MiB，先检查签名和 IHDR 尺寸，再从不可变
 | `ui.tree` | 场景树序列化 | 递归导出 `SceneTree` 层级结构（节点 ID、名称、类型、可见性、全局坐标与仿射变换） |
 | `ui.input` | 虚拟输入注入 | 将虚拟按键、指针位移等事件无损映射并注入到 `InputMap` |
 | `ui.act` | 仿真行为控制 | 支持 `pause` / `unpause` 等系统动作 |
-| `game.step` | 逐帧步进控制 | 支持暂停状态下推进 `N` 物理帧后重新挂起，用于精准逐帧仿真与评测 |
-| `game.state` | 引擎指标快照 | 查询当前帧序号、节点总数、暂停状态与调试计数 |
+| `nexus.step` | 逐帧步进控制 | 支持暂停状态下推进 `N` 物理帧后重新挂起，用于精准逐帧仿真与评测 |
+| `nexus.state` | 引擎指标快照 | 查询当前帧序号、节点总数、暂停状态与调试计数 |
 | `ui.screenshot` | 渲染周期同步截图 | 配合 GPU 渲染生命周期在 `present()` 前捕获当前画面，支持 Base64 返回或路径回传 |
 
 ### 快速启用
@@ -1651,7 +1651,7 @@ PNG 输入文件最多 32 MiB，先检查签名和 IHDR 尺寸，再从不可变
 
 在自定义游戏中接入：
 ```xu
-xacp #"github.com/xulang-org/game/xacp"
+xacp #"github.com/xulang-org/nexus/xacp"
 
 // 1. 初始化控制实例（例如监听 19876）
 $ctrl := xacp.attach_tcp(19876)
@@ -1685,7 +1685,7 @@ make xacp-test
 `make xacp-test`（XACP 协议独立集成测试）与
 `make gpu-smoke`（2D GPU 绘制、PNG、图集、透明采样、裁剪，以及 3D 上传、GPU MVP、深度顺序、
 逐帧深度清空、近面/背后裁剪、回读、帧状态和生命周期）。`make test` 同时运行 3D 数学和网格验证，以及未初始化视频/GPU 的 PNG 解码检查。
-2D/3D 服务分别在不提供 game 原生归档、场景、脚本和适配源码的临时目录中编译并完成 Metal 像素回读；
+2D/3D 服务分别在不提供 nexus 原生归档、场景、脚本和适配源码的临时目录中编译并完成 Metal 像素回读；
 设备和纹理经 12 次窗口自动释放、1,080 张纹理的拥有数组释放检查，验证自动析构释放资源。
 音频另覆盖无 SDL 的 WAV/混音/流式隔离构建、48 MB 稀疏文件首尾读取、100 次缓冲回绕与随机定位、欠载/EOF/错误恢复、淡化/交叉淡化、定位不改变共享输出队列、
 设备独立构建、16 个坏 WAV、播放代次、总线/循环/重采样、节点空间参数，
@@ -1723,11 +1723,11 @@ Linux / Windows 尚未完成构建、窗口输入与真实 GPU 运行验证；�
 `&[]u8` 输入在返回前复制到后端 staging；读回只在完成后写入 exact-size `$&[]u8`，关闭设备统一回收子资源。
 传输采用四字节对齐，所有 owner/borrow 留在应用主线程；无窗口仍可能需要平台视频驱动。
 导入时用同一 SDK 的 `xu-native` 按 `native.xun` 编译源码后端，设备打开时才加载 SDL；无需应用 native 声明或 SDL 开发头文件。
-`make gpu-transfer-smoke` 只编译独立标准库示例，不构建 game 的原生归档或 shader，验证 4,096 字节上传/复制/fence/读回；纯 `gpu/layout` 仍不触发 C 编译。
+`make gpu-transfer-smoke` 只编译独立标准库示例，不构建 nexus 的原生归档或 shader，验证 4,096 字节上传/复制/fence/读回；纯 `gpu/layout` 仍不触发 C 编译。
 
 Texture/Sampler/Shader/Pipeline、CommandEncoder 与离屏 render pass 已在标准 GPU 层实现；缓冲区 ComputePipeline/Pass、读写绑定、uniform 与 dispatch 已补齐，计算采样器/纹理、间接 dispatch 继续实施；标准 `window` 与 SDR Surface/Frame 已实现。
 开发 SDK 阶段的 GPU/浮点批次与缓冲区计算六平台验收均已通过，包括计算 API 编译、源码后端导入与缺库诊断、字节 span 和 O0/O2/O3 的 912 组浮点检查。真实 GPU 设备仍仅验证 macOS arm64 Metal。
-game 的 GPU 原生模块、3D C 桥接、shader C 头生成和旧事件协议均已删除。2D/3D 均使用标准 GPU/window；PBR、相机和资源预算留在引擎。
+nexus 的 GPU 原生模块、3D C 桥接、shader C 头生成和旧事件协议均已删除。2D/3D 均使用标准 GPU/window；PBR、相机和资源预算留在引擎。
 场景、相机、PBR/灯光/阴影策略、批处理、资源导入与应用预算继续属于引擎；窗口和事件也不归 GPU 设备核心所有。
 `gpu/layout` 只描述内存布局，不表示某格式、渲染/存储用途或某个 GPU 后端已通过设备支持查询。
 
@@ -1756,7 +1756,7 @@ XU_ROOT=/path/to/xu-0.12.4-dev.3-sdk XU_STDLIB_ROOT=/path/to/xu-0.12.4-dev.3-sdk
 
 `examples/gpu_compute` 只导入标准库；上传 1,027 个 uint32 值，先计算 `3x+7`，在新的计算 Pass 中计算 `5x+11`，
 下载后与 CPU 的 uint32 参考逐项对照，包含溢出回绕和不完整的末尾工作组。输入、临时缓冲和管线提前关闭后，
-已记录命令仍可完成；fence/readback 关闭后资源归零。该示例也在没有 game 源码/原生归档的临时目录通过，包含空格路径。
+已记录命令仍可完成；fence/readback 关闭后资源归零。该示例也在没有 nexus 源码/原生归档的临时目录通过，包含空格路径。
 
 读缓冲与写目标分开绑定；需要前次结果时结束当前 Pass，不能依赖同一 Pass 内多个 dispatch 的顺序。
 通用计算机制位于 Xu `gpu`，粒子、物理、剔除等应用规则留在引擎。
@@ -1789,7 +1789,7 @@ XU_ROOT=/path/to/xu-0.12.4-dev.3-sdk XU_STDLIB_ROOT=/path/to/xu-0.12.4-dev.3-sdk
 外部窗口、用户事件和全局退出事件留给各自消费者。游戏动作、场景和材质仍留在引擎。
 
 新标准库共用私有 `internal/sdl` 后端；显式运行库路径统一为 `XU_SDL_LIBRARY`，不保留未发布的 GPU 专属旧变量。
-game 不再有 GPU 原生模块；标准 GPU/window 和独立 CPU PNG codec 使用 `XU_SDL_LIBRARY`。隔离验收不提供 game 原生归档。
+nexus 不再有 GPU 原生模块；标准 GPU/window 和独立 CPU PNG codec 使用 `XU_SDL_LIBRARY`。隔离验收不提供 nexus 原生归档。
 2D/3D 已统一到标准按窗口队列；独立构建检查共同泵送与窗口身份、缩放和关闭隔离。
 MSL、GLSL、HLSL 源码与独立 shader 准备工具均已提供；本机真实呈现/视觉验证仅覆盖 macOS arm64 Metal，
 其它平台 SDK 的编译/安装验收不代表 Vulkan/D3D12 GPU 已执行。
@@ -1797,12 +1797,12 @@ MSL、GLSL、HLSL 源码与独立 shader 准备工具均已提供；本机真实
 ## 标准窗口输入与引擎动作示例
 
 ```sh
-GAME_XU_SDK="$HOME/.xu"  # 或完整的 0.12.4-dev.3 SDK 目录
-XU_ROOT="$GAME_XU_SDK" XU_STDLIB_ROOT="$GAME_XU_SDK/src" XUPATH="$GAME_XU_SDK/src" XU="$GAME_XU_SDK/bin/xu" make window-input-smoke
+NEXUS_XU_SDK="$HOME/.xu"  # 或完整的 0.12.4-dev.3 SDK 目录
+XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" XUPATH="$NEXUS_XU_SDK/src" XU="$NEXUS_XU_SDK/bin/xu" make window-input-smoke
 ./build/window-input --frames 600
 ```
 
-`examples/window_input` 使用标准窗口、事件、GPU Surface，只复用 game 的 CPU 动作映射和输入整合，
+`examples/window_input` 使用标准窗口、事件、GPU Surface，只复用 nexus 的 CPU 动作映射和输入整合，
 不构建引擎原生归档、场景或 Shader。W/Space 按住为绿色，松开为蓝色；Escape 请求退出；
 文本与 IME 组合打印到终端。自动 smoke 验证真实 Metal 清屏、呈现和资源归零，不把未实际输入按键的运行当成交互验收。
 
@@ -1814,7 +1814,7 @@ XU_ROOT="$GAME_XU_SDK" XU_STDLIB_ROOT="$GAME_XU_SDK/src" XUPATH="$GAME_XU_SDK/sr
 发出带原因的 INPUT_RESET；消费该事件前丢弃后续自有输入，其他窗口互不影响。关闭请求始终锁存；焦点丢失/重置后，
 没有新按下的重复键不能恢复按住状态。返回文本在后续事件推进、队列复用和窗口关闭后仍然有效。
 
-`integration/input.apply_window_input` 只把物理按键送入 game 的动作映射；重置、失焦、关闭释放所有动作，
+`integration/input.apply_window_input` 只把物理按键送入 nexus 的动作映射；重置、失焦、关闭释放所有动作，
 忽略重复按下/未知键和文本/指针事件；松键不因重复标志而丢弃。纯动作验收在没有 C 编译器、SDL、场景或引擎原生源码的临时目录以 `--no-opt` / `--release` 通过。
 标准窗口/GPU 示例在只复制上述 CPU 包的临时目录通过。2D/3D 均使用标准事件与动作适配，旧全局事件循环已移除。
 
@@ -1835,8 +1835,8 @@ macOS 端到端 OS 交互已补验：W/Space 触发引擎动作并提交绿色 G
 `resources/lighting` 定义纯 CPU 的 `Light3D` 和 `Environment3D`，材质、场景与 GPU 不互相拥有；`rendering/three_d.draw_material` / `Scene3D.draw_lit` 接收 `&Environment3D`。
 
 ```xu
-lights #"github.com/xulang-org/game/resources/lighting"
-light_scene #"github.com/xulang-org/game/integration/lighting"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+light_scene #"github.com/xulang-org/nexus/integration/lighting"
 
 $world := light_scene.new_scene_lights_3d()
 source := lights.point(fm.vec3(0.0, 0.0, 0.0), fm.vec3(12.0, 2.0, 1.0), 8.0) or >>
@@ -1951,7 +1951,7 @@ CSM 默认深度/角度偏置为 0.0003 / 0.001，可通过 `with_bias` 调整�
 预览 `--cascades 0|2|3|4`（默认 0）只允许方向光；`--shadow-distance` 为 0.1...100，默认 15；`--camera-motion true` 绕目标移动相机并逐帧重拟合。纯 CPU 隔离检查覆盖旋转/缩放相机、全部重叠角点与纹素稳定。独立参考使用物理相机射线/斜面交点、解析包围球、实际遮挡矩形、帐篷 PCF 和交界/远端混合，核对 61,440 个像素（7,680 个混合带、864 个远端淡出），最大误差 1 个码值。测试几何先验证边界远离硬件覆盖的亚像素平局，不跳过输出像素。
 Metal 另覆盖斜面自阴影、错误相机与不可编码参数保留旧图、父级相机适配、64 MiB 预算恢复及级联分配/提交故障；扫描人头开关对照、人物/猫/树分别用 4/2/3 级完成移动相机运行。
 
-当前仍缺多灯共享图集/分配器、自动更新调度、透明阴影、阴影场景持久化与 IBL。真实 GPU 证据仅 macOS arm64 Metal，GLSL/HLSL 已同步，Vulkan/D3D12 尚未编译或真机执行。未发布接口统一为 `ShadowDescription3D` / `ShadowMap3D`，无历史门面；六面投影、图集和过滤策略属于 game，通用设备/纹理/viewport/scissor/采样/提交复用 Xu 0.12.4-dev.3 标准库。
+当前仍缺多灯共享图集/分配器、自动更新调度、透明阴影、阴影场景持久化与 IBL。真实 GPU 证据仅 macOS arm64 Metal，GLSL/HLSL 已同步，Vulkan/D3D12 尚未编译或真机执行。未发布接口统一为 `ShadowDescription3D` / `ShadowMap3D`，无历史门面；六面投影、图集和过滤策略属于 nexus，通用设备/纹理/viewport/scissor/采样/提交复用 Xu 0.12.4-dev.3 标准库。
 
 ## 光源场景保存与恢复
 
@@ -1968,8 +1968,8 @@ Metal 另覆盖斜面自阴影、错误相机与不可编码参数保留旧图�
 每个文件最多 256 个光源，包含隐藏节点上的源；运行时环境最多 256 个可见候选源，每个网格筛选后最多 16 源。文件保存不受当前隐藏状态影响，候选或单网格筛选结果超额时明确报错。
 
 ```xu
-light_files #"github.com/xulang-org/game/integration/scene_lighting"
-files #"github.com/xulang-org/game/integration/scene"
+light_files #"github.com/xulang-org/nexus/integration/scene_lighting"
+files #"github.com/xulang-org/nexus/integration/scene"
 
 // 显式捕获节点和当前局部光源，不推断其它服务附件。
 document := light_files.capture_nodes(&world, &tree, light_root) or >>
@@ -2054,7 +2054,7 @@ make frustum-core-test frustum-gpu-test lighting-demo-test
 首次选择按名义阈值决定级别，恰好位于阈值时选择较粗一级。后续远离至 `threshold*(1+h)` 才变粗，靠近至严格小于 `threshold*(1-h)` 才变细。一次相机移动可跨多级；滞回抑制边界抖动，不做几何混合或渐隐。
 
 ```xu
-lod_data #"github.com/xulang-org/game/resources/lod"
+lod_data #"github.com/xulang-org/nexus/resources/lod"
 
 policy := lod_data.distance_lod([12.0, 22.0], 0.1) or >>
 scene.attach_lods(&tree, node, [high.reference(), medium.reference(), low.reference()], &policy) or >>

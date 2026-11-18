@@ -16,7 +16,7 @@ def main():
     parser.add_argument('--target', choices=('ios-arm64', 'android-arm64'), default='ios-arm64')
     parser.add_argument('--sdl-source', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--bundle-id', default='org.xulang.game.probe')
+    parser.add_argument('--bundle-id', default='org.xulang.nexus.probe')
     args = parser.parse_args()
     if args.output.exists():
         raise SystemExit('Output already exists; choose a new project directory')

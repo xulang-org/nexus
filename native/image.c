@@ -10,7 +10,7 @@
 #else
 #include <dlfcn.h>
 #endif
-#define API(name) XU_NATIVE_SYMBOL(xu_game_image_native_##name)
+#define API(name) XU_NATIVE_SYMBOL(xu_nexus_image_native_##name)
 #define FUNCTIONS(X) X(SDL_GetError) X(SDL_IOFromConstMem) X(SDL_LoadPNG_IO) X(SDL_ReadSurfacePixel) X(SDL_DestroySurface)
 #define DECLARE(name) static __typeof__(name) *p_##name;
 FUNCTIONS(DECLARE)

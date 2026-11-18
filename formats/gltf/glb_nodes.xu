@@ -1,6 +1,6 @@
-@"github.com/xulang-org/game/formats/gltf"
+@"github.com/xulang-org/nexus/formats/gltf"
 
-fm #"github.com/xulang-org/game/foundation/math"
+fm #"github.com/xulang-org/nexus/foundation/math"
 #encoding/json
 #math
 #errors
@@ -9,13 +9,13 @@ fn node_transform(doc &json.Doc, node int) fm.Mat4 {
     matrix_node := doc.get(node, "matrix")
     if matrix_node >= 0 {
         if doc.has(node, "translation") || doc.has(node, "rotation") || doc.has(node, "scale") {
-            >> errors.new("game GLB: node matrix and TRS cannot coexist")
+            >> errors.new("nexus GLB: node matrix and TRS cannot coexist")
         }
         values := float_vector(doc, matrix_node, 16) or >>
         result := fm.Mat4{c0: fm.vec4(values[0], values[1], values[2], values[3]),
             c1: fm.vec4(values[4], values[5], values[6], values[7]), c2: fm.vec4(values[8], values[9], values[10], values[11]),
             c3: fm.vec4(values[12], values[13], values[14], values[15])}
-        if !result.is_affine() { >> errors.new("game GLB: node matrix must be finite affine") }
+        if !result.is_affine() { >> errors.new("nexus GLB: node matrix must be finite affine") }
         // glTF matrices must be decomposable into TRS, hence no sheared basis.
         axes := [result.c0.xyz(), result.c1.xyz(), result.c2.xyz()]
         for i in 0:3 {
@@ -25,7 +25,7 @@ fn node_transform(doc &json.Doc, node int) fm.Mat4 {
                 if a.length() == 0.0 || b.length() == 0.0 { -> }
                 an := a.normalized() or >>
                 bn := b.normalized() or >>
-                if math.abs(an.dot(bn)) > 0.00001 { >> errors.new("game GLB: sheared node matrix is not TRS") }
+                if math.abs(an.dot(bn)) > 0.00001 { >> errors.new("nexus GLB: sheared node matrix is not TRS") }
             }
         }
         << result
@@ -37,11 +37,11 @@ fn node_transform(doc &json.Doc, node int) fm.Mat4 {
     if rotation_node >= 0 {
         values := float_vector(doc, rotation_node, 4) or >>
         length := values[0] * values[0] + values[1] * values[1] + values[2] * values[2] + values[3] * values[3]
-        if !fm.finite(length) || math.abs(length - 1.0) > 0.0001 { >> errors.new("game GLB: rotation quaternion must be unit length") }
+        if !fm.finite(length) || math.abs(length - 1.0) > 0.0001 { >> errors.new("nexus GLB: rotation quaternion must be unit length") }
         rotation = fm.quaternion(values[0], values[1], values[2], values[3]).rotation_matrix() or >>
     }
     result := fm.translation_3d(translation).multiply(rotation).multiply(fm.scale_3d(scale))
-    if !result.is_affine() { >> errors.new("game GLB: TRS transform overflow") }
+    if !result.is_affine() { >> errors.new("nexus GLB: TRS transform overflow") }
     << result
 }
 fn read_nodes(doc &json.Doc, root int, asset $&GlbGeometry) int {
@@ -53,7 +53,7 @@ fn read_nodes(doc &json.Doc, root int, asset $&GlbGeometry) int {
         local := node_transform(doc, node) or >>
         for column in [local.c0, local.c1, local.c2, local.c3] {
             if math.abs(column.x) > 1000000000.0 || math.abs(column.y) > 1000000000.0 || math.abs(column.z) > 1000000000.0 {
-                >> errors.new("game GLB: node transform exceeds engine scalar limits")
+                >> errors.new("nexus GLB: node transform exceeds engine scalar limits")
             }
         }
         name := text(doc, node, "name", "") or >>
@@ -80,7 +80,7 @@ fn read_nodes(doc &json.Doc, root int, asset $&GlbGeometry) int {
             for item in items {
                 child := doc.as_int(item) or >>
                 if child < 0 || child >= nodes.len || child == i || asset.nodes[child].parent >= 0 {
-                    >> errors.new("game GLB: invalid child, multiple parents or duplicate edge")
+                    >> errors.new("nexus GLB: invalid child, multiple parents or duplicate edge")
                 }
                 asset.nodes[child].parent = i
                 children.push(child)
@@ -97,13 +97,13 @@ fn read_nodes(doc &json.Doc, root int, asset $&GlbGeometry) int {
         for i in 0:counts[index] {
             child := children[firsts[index] + i]
             depth := asset.nodes[index].depth + 1
-            if depth > 64 { >> errors.new("game GLB: node hierarchy exceeds depth 64") }
+            if depth > 64 { >> errors.new("nexus GLB: node hierarchy exceeds depth 64") }
             asset.nodes[child].depth = depth
             order.push(child)
         }
         cursor = cursor + 1
     }
-    if order.len != nodes.len { >> errors.new("game GLB: cyclic node hierarchy") }
+    if order.len != nodes.len { >> errors.new("nexus GLB: cyclic node hierarchy") }
     scenes := array_property(doc, root, "scenes", 1, 64) or >>
     selected := integer(doc, root, "scene", 0, 0, scenes.len - 1) or >>
     scene_fields := ["nodes", "name"]
@@ -114,7 +114,7 @@ fn read_nodes(doc &json.Doc, root int, asset $&GlbGeometry) int {
         for node in scene_nodes {
             index := doc.as_int(node) or >>
             if index < 0 || index >= asset.nodes.len || asset.nodes[index].parent >= 0 || seen.has(index) {
-                >> errors.new("game GLB: invalid or duplicate scene root")
+                >> errors.new("nexus GLB: invalid or duplicate scene root")
             }
             seen[index] = true
             if i == selected { asset.nodes[index].selected = true }
@@ -128,10 +128,10 @@ fn read_nodes(doc &json.Doc, root int, asset $&GlbGeometry) int {
     << 0
 }
 pub fn (asset &GlbGeometry) node_transform(index int) fm.Mat4 {
-    if index < 0 || index >= asset.nodes.len { >> errors.new("game GLB: node index out of range") }
+    if index < 0 || index >= asset.nodes.len { >> errors.new("nexus GLB: node index out of range") }
     << asset.nodes[index].local
 }
 pub fn (asset &GlbGeometry) node_name(index int) string {
-    if index < 0 || index >= asset.nodes.len { >> errors.new("game GLB: node index out of range") }
+    if index < 0 || index >= asset.nodes.len { >> errors.new("nexus GLB: node index out of range") }
     << asset.nodes[index].name + ""
 }

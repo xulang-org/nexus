@@ -1,6 +1,6 @@
-@"github.com/xulang-org/game/formats/gltf"
+@"github.com/xulang-org/nexus/formats/gltf"
 
-fm #"github.com/xulang-org/game/foundation/math"
+fm #"github.com/xulang-org/nexus/foundation/math"
 #math
 #encoding/json
 #encoding/binary
@@ -49,7 +49,7 @@ fn (parser $&GlbParser) read_views(root int) int {
         stride := integer(&parser.doc, node, "byteStride", 0, 4, 252) or >>
         target := integer(&parser.doc, node, "target", 0, 34962, 34963) or >>
         if buffer != 0 || length < 1 || length > parser.length - offset || (stride != 0 && stride % 4 != 0) {
-            >> errors.new("game GLB: invalid bufferView range or stride")
+            >> errors.new("nexus GLB: invalid bufferView range or stride")
         }
         parser.views.push(BufferView{offset: offset, length: length, stride: stride, target: target, usage: 0, attributes: 0})
     }
@@ -59,7 +59,7 @@ fn component_size(component int) int {
     if component == 5121 { << 1 }
     if component == 5123 { << 2 }
     if component == 5125 || component == 5126 { << 4 }
-    >> errors.new("game GLB: unsupported accessor component type")
+    >> errors.new("nexus GLB: unsupported accessor component type")
 }
 fn component_count(kind &string) int {
     if *kind == "SCALAR" { << 1 }
@@ -67,7 +67,7 @@ fn component_count(kind &string) int {
     if *kind == "VEC3" { << 3 }
     if *kind == "VEC4" { << 4 }
     if *kind == "MAT4" { << 16 }
-    >> errors.new("game GLB: unsupported accessor shape")
+    >> errors.new("nexus GLB: unsupported accessor shape")
 }
 fn accessor_bound(doc &json.Doc, node int, key string, count int) fm.Vec4 {
     value := doc.get(node, key)
@@ -85,27 +85,27 @@ fn (parser $&GlbParser) read_accessors(root int) int {
     for node in nodes {
         fields(&parser.doc, node, &allowed) or >>
         view_index := integer(&parser.doc, node, "bufferView", -1, 0, parser.views.len - 1) or >>
-        if view_index < 0 { >> errors.new("game GLB: accessors require a bufferView; sparse is unsupported") }
+        if view_index < 0 { >> errors.new("nexus GLB: accessors require a bufferView; sparse is unsupported") }
         view := parser.views[view_index]
         offset := integer(&parser.doc, node, "byteOffset", 0, 0, view.length) or >>
         component := integer(&parser.doc, node, "componentType", -1, 5121, 5126) or >>
         size := component_size(component) or >>
-        if size < 1 { >> errors.new("game GLB: invalid component byte size") }
+        if size < 1 { >> errors.new("nexus GLB: invalid component byte size") }
         kind := text(&parser.doc, node, "type", "") or >>
         components := component_count(&kind) or >>
         count := integer(&parser.doc, node, "count", -1, 1, MAX_ASSET_INDICES) or >>
         normalized := boolean(&parser.doc, node, "normalized", false) or >>
-        if normalized && (component == 5125 || component == 5126) { >> errors.new("game GLB: invalid normalized component type") }
+        if normalized && (component == 5125 || component == 5126) { >> errors.new("nexus GLB: invalid normalized component type") }
         element := size * components
         $stride := view.stride
         if stride == 0 { stride = element }
-        if stride < 1 { >> errors.new("game GLB: empty stride") }
+        if stride < 1 { >> errors.new("nexus GLB: empty stride") }
         if count < 1 || offset % size != 0 || (view.offset + offset) % size != 0 || stride < element || stride % size != 0 ||
             element > view.length - offset {
-            >> errors.new("game GLB: accessor alignment or range invalid")
+            >> errors.new("nexus GLB: accessor alignment or range invalid")
         }
-        if count - 1 > (view.length - offset - element) / stride { >> errors.new("game GLB: accessor exceeds bufferView") }
-        if components==16 && (parser.doc.has(node,"min") || parser.doc.has(node,"max")) { >> errors.new("game GLB: matrix accessor bounds unsupported") }
+        if count - 1 > (view.length - offset - element) / stride { >> errors.new("nexus GLB: accessor exceeds bufferView") }
+        if components==16 && (parser.doc.has(node,"min") || parser.doc.has(node,"max")) { >> errors.new("nexus GLB: matrix accessor bounds unsupported") }
         $bound_components := components
         if components==16 { bound_components=4 }
         minimum := accessor_bound(&parser.doc, node, "min", bound_components) or >>
@@ -113,7 +113,7 @@ fn (parser $&GlbParser) read_accessors(root int) int {
         has_min := parser.doc.has(node, "min")
         has_max := parser.doc.has(node, "max")
         if has_min && has_max && (minimum.x > maximum.x || minimum.y > maximum.y || minimum.z > maximum.z || minimum.w > maximum.w) {
-            >> errors.new("game GLB: reversed accessor bounds")
+            >> errors.new("nexus GLB: reversed accessor bounds")
         }
         parser.accessors.push(Accessor{view: view_index, offset: view.offset + offset, stride: stride,
             count: count, component: component, size: size, components: components, normalized: normalized,
@@ -122,29 +122,29 @@ fn (parser $&GlbParser) read_accessors(root int) int {
     << 0
 }
 fn (parser $&GlbParser) attribute(index int, expected int, count int) Accessor {
-    if index < 0 || index >= parser.accessors.len { >> errors.new("game GLB: attribute accessor index invalid") }
+    if index < 0 || index >= parser.accessors.len { >> errors.new("nexus GLB: attribute accessor index invalid") }
     accessor := parser.accessors[index]
     view := parser.views[accessor.view]
     if accessor.components != expected || (count > 0 && accessor.count != count) ||
         accessor.offset % 4 != 0 || (accessor.offset - view.offset) % 4 != 0 || accessor.stride % 4 != 0 || accessor.usage == 2 || view.usage == 2 || view.usage == 4 ||
         (view.target != 0 && view.target != 34962) {
-        >> errors.new("game GLB: incompatible vertex attribute or layout")
+        >> errors.new("nexus GLB: incompatible vertex attribute or layout")
     }
     if accessor.usage == 0 {
         parser.views[accessor.view].attributes = view.attributes + 1
-        if view.attributes > 0 && view.stride == 0 { >> errors.new("game GLB: shared vertex bufferView requires byteStride") }
+        if view.attributes > 0 && view.stride == 0 { >> errors.new("nexus GLB: shared vertex bufferView requires byteStride") }
         parser.accessors[index].usage = 1
         parser.views[accessor.view].usage = 1
     }
     << accessor
 }
 fn (parser $&GlbParser) index_accessor(index int) Accessor {
-    if index < 0 || index >= parser.accessors.len { >> errors.new("game GLB: indices accessor invalid") }
+    if index < 0 || index >= parser.accessors.len { >> errors.new("nexus GLB: indices accessor invalid") }
     accessor := parser.accessors[index]
     view := parser.views[accessor.view]
     if accessor.components != 1 || accessor.component == 5126 || accessor.normalized || view.stride != 0 ||
         accessor.usage == 1 || view.usage == 1 || view.usage == 4 || (view.target != 0 && view.target != 34963) {
-        >> errors.new("game GLB: incompatible index accessor")
+        >> errors.new("nexus GLB: incompatible index accessor")
     }
     parser.accessors[index].usage = 2
     parser.views[accessor.view].usage = 2
@@ -159,7 +159,7 @@ fn (parser &GlbParser) component(accessor Accessor, index int, component int) f6
     offset := accessor.offset + accessor.stride * index + accessor.size * component
     bits := read_integer(&parser.bytes, offset, accessor.size) or >>
     if accessor.component == 5126 {
-        if ((bits >> 23) & 255) == 255 { >> errors.new("game GLB: non-finite input component") }
+        if ((bits >> 23) & 255) == 255 { >> errors.new("nexus GLB: non-finite input component") }
         << math.float32_from_bits(bits)
     }
     if accessor.component == 5121 { << f64(bits) / 255.0 }

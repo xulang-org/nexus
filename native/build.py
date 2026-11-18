@@ -74,10 +74,10 @@ def main():
     else:
         subprocess.run(['pkg-config', '--atleast-version=3.4.0', 'sdl3'], check=True)
         flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', 'sdl3'], text=True))
-    available = [('audio.json','audio.c','game_audio'),('image.json','image.c','game_image')]
-    selected = 'game_audio' if args.only_audio else 'game_image' if args.only_image else None
+    available = [('audio.json','audio.c','nexus_audio'),('image.json','image.c','nexus_image')]
+    selected = 'nexus_audio' if args.only_audio else 'nexus_image' if args.only_image else None
     modules = [entry for entry in available if selected is None or entry[2] == selected]
-    with tempfile.TemporaryDirectory(prefix='xu-game-native-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='xu-nexus-native-') as temporary:
         for manifest, source, name in modules:
             archive = Path(temporary) / (name + '.a')
             package = Path(temporary) / (name + '.xulib')

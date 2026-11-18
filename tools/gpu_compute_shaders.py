@@ -1,4 +1,4 @@
-"""Prepare standalone compute shader artifacts without the game native bridge."""
+"""Prepare standalone compute shader artifacts without the nexus native bridge."""
 import argparse
 from pathlib import Path
 import platform

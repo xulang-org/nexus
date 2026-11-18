@@ -66,7 +66,7 @@ check: layers native canvas-shaders mesh-shaders
 
 script-tool: sdk
 	mkdir -p build
-	$(XU) build cmd/scriptc/main.xu -o build/xu-game-script
+	$(XU) build cmd/scriptc/main.xu -o build/xu-nexus-script
 
 script-fixtures: script-tool
 	$(PYTHON) tests/make_script_fixtures.py
@@ -107,7 +107,7 @@ test-core: shadow-core-test gltf-animation-test mesh-format-core-test lod-core-t
 	$(PYTHON) tests/layer_headless_checks.py
 	$(PYTHON) tests/canvas_isolation.py
 	$(XU) build tests/scene_file_checks.xu -o build/scene-file-tests
-	SDL_VIDEODRIVER=nonexistent XU_GAME_SDL_LIBRARY=/nonexistent/scene-no-sdl ./build/scene-file-tests
+	SDL_VIDEODRIVER=nonexistent XU_NEXUS_SDL_LIBRARY=/nonexistent/scene-no-sdl ./build/scene-file-tests
 	$(PYTHON) tests/scene_process_checks.py
 	$(XU) build tests/scene_resource_checks.xu -o build/scene-resource-tests
 	SDL_VIDEODRIVER=nonexistent ./build/scene-resource-tests
@@ -116,7 +116,7 @@ test-core: shadow-core-test gltf-animation-test mesh-format-core-test lod-core-t
 	$(XU) build tests/scene_script_format_checks.xu -o build/scene-script-format-tests
 	./build/scene-script-format-tests
 	$(XU) build tests/scene_script_checks.xu -o build/scene-script-tests
-	XU_GAME_SDL_LIBRARY=/nonexistent XU_GAME_SDL_AUDIO_LIBRARY=/nonexistent ./build/scene-script-tests
+	XU_NEXUS_SDL_LIBRARY=/nonexistent XU_NEXUS_SDL_AUDIO_LIBRARY=/nonexistent ./build/scene-script-tests
 	$(XU) build tests/script_reload_batch_checks.xu -o build/script-reload-batch-tests
 	./build/script-reload-batch-tests
 	$(PYTHON) tests/scene_script_isolation.py
@@ -140,7 +140,7 @@ test-core: shadow-core-test gltf-animation-test mesh-format-core-test lod-core-t
 
 test: canvas-memory-test phone-input-test phone-viewport-test phone-pinch-test phone-app-test phone-3d-budget-test phone-frame-test phone-state-test phone-audio-test jpeg-test test-core native audio-device-test image-fixtures
 	$(XU) build tests/scene_audio_checks.xu -o build/scene-audio-tests
-	XU_GAME_SDL_LIBRARY=/nonexistent XU_GAME_SDL_AUDIO_LIBRARY=/nonexistent ./build/scene-audio-tests
+	XU_NEXUS_SDL_LIBRARY=/nonexistent XU_NEXUS_SDL_AUDIO_LIBRARY=/nonexistent ./build/scene-audio-tests
 	$(XU) build tests/scene_audio_output_checks.xu -o build/scene-audio-output-tests
 	SDL_AUDIO_DRIVER=dummy ./build/scene-audio-output-tests
 	$(PYTHON) tests/scene_audio_isolation.py
@@ -324,8 +324,8 @@ smoke: mesh-shaders canvas-shaders native script-tool audio-smoke scene-script-a
 	$(XU) build examples/scene_scripts/main.xu -o build/scene-scripts-demo
 	./build/scene-scripts-demo --scene build/scene-scripts/world.xuscene --frames 120 --save build/scene-scripts/saved.xuscene --capture build/scene-scripts.png
 	./build/scene-scripts-demo --scene build/scene-scripts/saved.xuscene --frames 1
-	./build/xu-game-script build examples/script_reload/player.xus examples/script_reload/player.schema.json build/player.xubc
-	./build/xu-game-script build examples/script_reload/indicator.xus examples/script_reload/indicator.schema.json build/indicator.xubc
+	./build/xu-nexus-script build examples/script_reload/player.xus examples/script_reload/player.schema.json build/player.xubc
+	./build/xu-nexus-script build examples/script_reload/indicator.xus examples/script_reload/indicator.schema.json build/indicator.xubc
 	$(XU) build examples/script_reload/main.xu -o build/script-reload
 	./build/script-reload --frames 120 --autoplay --capture build/script-reload.png
 
@@ -445,7 +445,7 @@ demo-audio-seek: native-audio
 	$(XU) build examples/audio_stream/main.xu -o build/audio-stream
 	./build/audio-stream --seconds 5 --seek-frame 12000
 
-# Independent standard GPU consumer; no game native bridge or shader build.
+# Independent standard GPU consumer; no nexus native bridge or shader build.
 gpu-transfer-smoke: sdk
 	mkdir -p build
 	$(XU) build examples/gpu_transfer/main.xu -o build/gpu-transfer

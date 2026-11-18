@@ -1,4 +1,4 @@
-"""Prepare canvas shaders without the game native bridge."""
+"""Prepare canvas shaders without the nexus native bridge."""
 import argparse
 from pathlib import Path
 import platform

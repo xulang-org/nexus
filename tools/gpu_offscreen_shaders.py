@@ -1,4 +1,4 @@
-"""Prepare standalone GPU example shaders without the game native bridge."""
+"""Prepare standalone GPU example shaders without the nexus native bridge."""
 import argparse
 from pathlib import Path
 import platform

@@ -20,4 +20,4 @@
 同步迁移全部示例、工具和验收代码，不为开发中间版本保留兼容门面。通用数学与基础能力独立于引擎服务，
 场景不依赖输入、时钟、物理、音频或渲染；跨系统行为通过 integration 包组合。
 
-2D/3D 渲染必须复用 Xu 标准 gpu/window；CPU 画布录制位于 resources/canvas 与 integration/rendering/two_d，禁止导入 GPU 服务。game 仅保留音频设备和 CPU PNG codec 两个原生模块；禁止重新引入 GPU 原生桥接或重复的窗口事件协议。
+2D/3D 渲染必须复用 Xu 标准 gpu/window；CPU 画布录制位于 resources/canvas 与 integration/rendering/two_d，禁止导入 GPU 服务。nexus 仅保留音频设备和 CPU PNG codec 两个原生模块；禁止重新引入 GPU 原生桥接或重复的窗口事件协议。
