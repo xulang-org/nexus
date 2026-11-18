@@ -2,7 +2,47 @@
 
 #gpu
 #errors
+#math
 
+fn close_textures(textures $&[]gpu.Texture) {
+    for i in 0:textures.len {
+        tex := $&textures[i]
+        tex.close() or (err) { << }
+    }
+}
+fn bounded_render_size(pixel_w int, pixel_h int, max_pixels int, scale int) []int {
+    if pixel_w < 1 || pixel_h < 1 {
+        >> errors.new("game 3D: window pixel dimensions must be positive")
+    }
+    if scale != 1 && scale != 2 {
+        >> errors.new("game 3D: invalid render scale")
+    }
+    if max_pixels < 1 || max_pixels > 4194304 {
+        >> errors.new("game 3D: pixel budget must be between 1 and 4194304")
+    }
+    max_side := 4096 / scale
+    max_base := max_pixels / (scale * scale)
+    if max_base < 1 {
+        >> errors.new("game 3D: pixel budget is too small for render scale")
+    }
+    if pixel_w <= max_side && pixel_h <= max_side && pixel_w <= max_base / pixel_h {
+        << [pixel_w, pixel_h]
+    }
+    s := math.min(math.min(f64(max_side) / f64(pixel_w), f64(max_side) / f64(pixel_h)),
+        math.sqrt(f64(max_base) / (f64(pixel_w) * f64(pixel_h))))
+    $rw := int(math.floor(f64(pixel_w) * s))
+    $rh := int(math.floor(f64(pixel_h) * s))
+    if rw < 1 { rw = 1 }
+    if rh < 1 { rh = 1 }
+    if rw > max_side { rw = max_side }
+    if rh > max_side { rh = max_side }
+    while rw > max_base / rh {
+        if rw >= rh && rw > 1 { rw = rw - 1 }
+        else if rh > 1 { rh = rh - 1 }
+        else { <- }
+    }
+    << [rw, rh]
+}
 fn render_targets(device &gpu.Device,width int,height int,scale int) []gpu.Texture {
     if scale!=1 && scale!=2 { >> errors.new("game 3D: invalid render scale") }
     $targets := []gpu.Texture{}
@@ -14,6 +54,41 @@ fn render_targets(device &gpu.Device,width int,height int,scale int) []gpu.Textu
         targets.push(resolved) }
     << targets
 }
+pub fn (device $&Device3D) set_max_render_pixels(limit int) int {
+    device.alive() or >>
+    if device.active { >> errors.new("game 3D: pixel budget must be set outside a frame") }
+    if limit < 1 || limit > 4194304 {
+        >> errors.new("game 3D: pixel budget must be between 1 and 4194304")
+    }
+    if limit == device.max_render_pixels { << 0 }
+    if device.is_gpu() {
+        $base_w := device.target_width
+        $base_h := device.target_height
+        if device.session.has_display_window() {
+            win := device.window() or >>
+            state := win.state() or >>
+            if state.pixel_width > 0 && state.pixel_height > 0 {
+                base_w = state.pixel_width
+                base_h = state.pixel_height
+            }
+        }
+        desired := bounded_render_size(base_w, base_h, limit, device.render_scale) or >>
+        if desired[0] != device.target_width || desired[1] != device.target_height {
+            dev := device.gpu_device() or >>
+            targets := render_targets(dev, desired[0], desired[1], device.render_scale) or >>
+            close_textures($&device.targets)
+            device.targets = targets
+            device.target_width = desired[0]
+            device.target_height = desired[1]
+        }
+    } else {
+        target_size(device.target_width * device.render_scale, device.target_height * device.render_scale) or >>
+    }
+    device.max_render_pixels = limit
+    device.cached = false
+    device.pixels = []u8{}
+    << 0
+}
 // 2 renders four samples per output pixel, then resolves on the GPU. Window
 // and diagnostic output dimensions stay unchanged. Default 1 preserves pixels.
 pub fn (device $&Device3D) set_render_scale(scale int) int {
@@ -21,9 +96,23 @@ pub fn (device $&Device3D) set_render_scale(scale int) int {
     if device.active || (scale!=1 && scale!=2) { >> errors.new("game 3D: render scale must be 1 or 2 outside a frame") }
     if scale==device.render_scale { << 0 }
     if device.is_gpu() {
+        $base_w := device.target_width
+        $base_h := device.target_height
+        if device.session.has_display_window() {
+            win := device.window() or >>
+            state := win.state() or >>
+            if state.pixel_width > 0 && state.pixel_height > 0 {
+                base_w = state.pixel_width
+                base_h = state.pixel_height
+            }
+        }
+        desired := bounded_render_size(base_w, base_h, device.max_render_pixels, scale) or >>
         dev := device.gpu_device() or >>
-        targets := render_targets(dev,device.target_width,device.target_height,scale) or >>
-        device.targets=targets
+        targets := render_targets(dev, desired[0], desired[1], scale) or >>
+        close_textures($&device.targets)
+        device.targets = targets
+        device.target_width = desired[0]
+        device.target_height = desired[1]
     } else {
         target_size(device.target_width*scale,device.target_height*scale) or >>
     }

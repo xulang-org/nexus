@@ -6,6 +6,7 @@ present #"github.com/xulang-org/game/platform/present"
 #window
 #window/events
 #errors
+#math
 
 pub struct ShaderProgram3D {
     pub format int
@@ -25,6 +26,7 @@ pub struct Device3D {
     pipelines []gpu.GraphicsPipeline
     linear_samplers []gpu.Sampler
     render_scale int
+    max_render_pixels int
     encoders []gpu.CommandEncoder
     passes []gpu.RenderPass
     target_width int
@@ -121,16 +123,16 @@ fn init_3d_session(session present.Session, program &ShaderProgram3D, width int,
         target_size(width,height) or >>
         dev_id := gpu.soft_owner_new() or >>
         $out := Device3D{session: sess,targets: []gpu.Texture{},whites: []gpu.Texture{},white_samplers: []gpu.Sampler{},
-            pipelines: []gpu.GraphicsPipeline{},linear_samplers: []gpu.Sampler{},render_scale: 1,
+            pipelines: []gpu.GraphicsPipeline{},linear_samplers: []gpu.Sampler{},render_scale: 1,max_render_pixels: 4194304,
             encoders: []gpu.CommandEncoder{},passes: []gpu.RenderPass{},target_width: width,target_height: height,
             surface_format: 0,draw_count: 0,lit_draws: 0,light_candidates: 0,selected_lights: 0,device_id: dev_id,
             active: false,sealed: false,closed: false,cached: false,soft_pixels: []u8{},soft_depth: []f64{},pixels: []u8{}}
         soft_resize_and_clear($&out,255) or >>
         << out
     }
-    target_size(sess.width,sess.height) or >>
+    size := bounded_render_size(sess.width,sess.height,4194304,1) or >>
     dev := sess.gpu_device() or >>
-    targets := render_targets(dev,sess.width,sess.height,1) or >>
+    targets := render_targets(dev,size[0],size[1],1) or >>
     $white := dev.texture_2d(gpu.Texture2DDesc{format: layout.RGBA8_UNORM,width: 1,height: 1,levels: 1,usage: gpu.TEXTURE_SAMPLED}) or >>
     pixel := [u8(255),u8(255),u8(255),u8(255)]
     $upload := dev.upload_texture(&white,0,&pixel) or >>
@@ -159,10 +161,10 @@ fn init_3d_session(session present.Session, program &ShaderProgram3D, width int,
     format := sess.swapchain_format()
     $copying := presentation_pipeline(dev,program,format) or >>
     $resolving := presentation_pipeline(dev,program,layout.RGBA8_UNORM) or >>
-    sw := sess.width
-    sh := sess.height
+    sw := size[0]
+    sh := size[1]
     << Device3D{session: sess,targets: targets,whites: [white],white_samplers: [white_sampler],
-        pipelines: [pipeline,ccw,cw,copying,resolving],linear_samplers: [linear_sampler],render_scale: 1,
+        pipelines: [pipeline,ccw,cw,copying,resolving],linear_samplers: [linear_sampler],render_scale: 1,max_render_pixels: 4194304,
         encoders: []gpu.CommandEncoder{},passes: []gpu.RenderPass{},target_width: sw,target_height: sh,
         surface_format: format,draw_count: 0,lit_draws: 0,light_candidates: 0,selected_lights: 0,device_id: 0,
         active: false,sealed: false,closed: false,cached: false,soft_pixels: []u8{},soft_depth: []f64{},pixels: []u8{}}
@@ -250,6 +252,18 @@ pub fn (device &Device3D) height() int {
     state := win.state() or >>
     << state.pixel_height
 }
+pub fn (device &Device3D) render_width() int {
+    device.alive() or >>
+    << device.target_width
+}
+pub fn (device &Device3D) render_height() int {
+    device.alive() or >>
+    << device.target_height
+}
+pub fn (device &Device3D) max_render_pixels() int {
+    device.alive() or >>
+    << device.max_render_pixels
+}
 pub fn (device &Device3D) poll() events.Event {
     device.alive() or >>
     << device.session.poll() or >>
@@ -272,13 +286,17 @@ pub fn (device $&Device3D) begin(background int) int {
         if device.session.has_display_window() {
             win := device.window() or >>
             state := win.state() or >>
-            if state.pixel_width>0 && state.pixel_height>0 && (state.pixel_width!=device.target_width || state.pixel_height!=device.target_height) {
-                // Both allocations must succeed before either live target is replaced.
-                dev := device.gpu_device() or >>
-                targets := render_targets(dev,state.pixel_width,state.pixel_height,device.render_scale) or >>
-                device.targets = targets
-                device.target_width = state.pixel_width
-                device.target_height = state.pixel_height
+            if state.pixel_width>0 && state.pixel_height>0 {
+                desired := bounded_render_size(state.pixel_width,state.pixel_height,device.max_render_pixels,device.render_scale) or >>
+                if desired[0]!=device.target_width || desired[1]!=device.target_height {
+                    // Both allocations must succeed before either live target is replaced.
+                    dev := device.gpu_device() or >>
+                    targets := render_targets(dev,desired[0],desired[1],device.render_scale) or >>
+                    close_textures($&device.targets)
+                    device.targets = targets
+                    device.target_width = desired[0]
+                    device.target_height = desired[1]
+                }
             }
         }
         dev := device.gpu_device() or >>

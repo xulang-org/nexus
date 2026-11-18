@@ -1,0 +1,158 @@
+@"github.com/xulang-org/game/integration/viewport"
+
+fm #"github.com/xulang-org/game/foundation/math"
+#window
+#math
+#errors
+
+// Logical window, pixel framebuffer, and clamped safe-area geometry.
+// Safe-area insets are deducted once in logical points so interactive HUD and
+// virtual controls avoid system notches/bars while rendering can fill the screen.
+pub struct Viewport {
+    pub logical_width f64
+    pub logical_height f64
+    pub pixel_width int
+    pub pixel_height int
+    pub safe_rect fm.Rect2
+}
+
+pub struct Fit2D {
+    pub scale f64
+    pub origin fm.Vec2
+    pub world_size fm.Vec2
+    pub viewport_rect fm.Rect2
+    pub world_to_logical fm.Transform2D
+}
+
+pub fn from_metrics(logical_w int, logical_h int, pixel_w int, pixel_h int,
+    safe_x int, safe_y int, safe_w int, safe_h int) Viewport {
+    if logical_w < 1 || logical_h < 1 || pixel_w < 1 || pixel_h < 1 {
+        >> errors.new("game viewport: logical and pixel dimensions must be positive")
+    }
+    lw := f64(logical_w)
+    lh := f64(logical_h)
+    $sx := math.max(0.0, math.min(lw, f64(safe_x)))
+    $sy := math.max(0.0, math.min(lh, f64(safe_y)))
+    $sw := f64(safe_w)
+    $sh := f64(safe_h)
+    if safe_w <= 0 || safe_h <= 0 {
+        sx = 0.0
+        sy = 0.0
+        sw = lw
+        sh = lh
+    } else {
+        x1 := math.max(sx, math.min(lw, f64(safe_x + safe_w)))
+        y1 := math.max(sy, math.min(lh, f64(safe_y + safe_h)))
+        sw = x1 - sx
+        sh = y1 - sy
+        if sw <= 0.0 || sh <= 0.0 {
+            sx = 0.0
+            sy = 0.0
+            sw = lw
+            sh = lh
+        }
+    }
+    << Viewport{
+        logical_width: lw,
+        logical_height: lh,
+        pixel_width: pixel_w,
+        pixel_height: pixel_h,
+        safe_rect: fm.rect2(sx, sy, sw, sh)
+    }
+}
+
+pub fn from_window(win &window.Window) Viewport {
+    state := win.state() or >>
+    safe := win.safe_area() or >>
+    << from_metrics(state.width, state.height, state.pixel_width, state.pixel_height,
+        safe.x, safe.y, safe.width, safe.height) or >>
+}
+
+pub fn (vp &Viewport) same_geometry(other &Viewport) bool {
+    << vp.logical_width == other.logical_width &&
+        vp.logical_height == other.logical_height &&
+        vp.pixel_width == other.pixel_width &&
+        vp.pixel_height == other.pixel_height &&
+        vp.safe_rect.position.x == other.safe_rect.position.x &&
+        vp.safe_rect.position.y == other.safe_rect.position.y &&
+        vp.safe_rect.size.x == other.safe_rect.size.x &&
+        vp.safe_rect.size.y == other.safe_rect.size.y
+}
+
+pub fn (vp &Viewport) is_landscape() bool {
+    << vp.logical_width > vp.logical_height
+}
+
+pub fn (vp &Viewport) density_x() f64 {
+    << f64(vp.pixel_width) / vp.logical_width
+}
+
+pub fn (vp &Viewport) density_y() f64 {
+    << f64(vp.pixel_height) / vp.logical_height
+}
+
+pub fn (vp &Viewport) density() f64 {
+    << math.max(vp.density_x(), vp.density_y())
+}
+
+pub fn (vp &Viewport) aspect_ratio() f64 {
+    << f64(vp.pixel_width) / f64(vp.pixel_height)
+}
+
+pub fn (vp &Viewport) screen_transform() fm.Transform2D {
+    << fm.transform_2d(fm.vec2(0.0, 0.0), 0.0, fm.vec2(vp.density_x(), vp.density_y()))
+}
+
+pub fn (vp &Viewport) safe_inset_rect(pad_left f64, pad_top f64, pad_right f64, pad_bottom f64) fm.Rect2 {
+    if !fm.finite(pad_left) || !fm.finite(pad_top) || !fm.finite(pad_right) || !fm.finite(pad_bottom) ||
+        pad_left < 0.0 || pad_top < 0.0 || pad_right < 0.0 || pad_bottom < 0.0 {
+        >> errors.new("game viewport: inset padding must be finite and non-negative")
+    }
+    x := vp.safe_rect.position.x + pad_left
+    y := vp.safe_rect.position.y + pad_top
+    w := math.max(0.0, vp.safe_rect.size.x - pad_left - pad_right)
+    h := math.max(0.0, vp.safe_rect.size.y - pad_top - pad_bottom)
+    << fm.rect2(x, y, w, h)
+}
+
+// Fits a logical world size cleanly inside `area` with uniform letterbox scaling
+// and provides exact forward and inverse touch-to-world transforms.
+pub fn fit_letterbox(area fm.Rect2, world_width f64, world_height f64) Fit2D {
+    if !area.valid() || area.size.x <= 0.0 || area.size.y <= 0.0 ||
+        !fm.finite(world_width) || !fm.finite(world_height) || world_width <= 0.0 || world_height <= 0.0 {
+        >> errors.new("game viewport: letterbox requires positive area and world dimensions")
+    }
+    scale := math.min(area.size.x / world_width, area.size.y / world_height)
+    fitted_w := world_width * scale
+    fitted_h := world_height * scale
+    origin := area.position.add(fm.vec2((area.size.x - fitted_w) * 0.5, (area.size.y - fitted_h) * 0.5))
+    << Fit2D{
+        scale: scale,
+        origin: origin,
+        world_size: fm.vec2(world_width, world_height),
+        viewport_rect: fm.rect2(origin.x, origin.y, fitted_w, fitted_h),
+        world_to_logical: fm.transform_2d(origin, 0.0, fm.vec2(scale, scale))
+    }
+}
+
+pub fn (fit &Fit2D) world_to_pixels(vp &Viewport) fm.Transform2D {
+    << vp.screen_transform().multiply(fit.world_to_logical)
+}
+
+pub fn (fit &Fit2D) logical_to_world(point fm.Vec2) fm.Vec2 {
+    if !fm.finite(point.x) || !fm.finite(point.y) {
+        >> errors.new("game viewport: touch coordinates must be finite")
+    }
+    << point.sub(fit.origin).scaled(1.0 / fit.scale)
+}
+
+pub fn (fit &Fit2D) world_to_logical_point(point fm.Vec2) fm.Vec2 {
+    if !fm.finite(point.x) || !fm.finite(point.y) {
+        >> errors.new("game viewport: world coordinates must be finite")
+    }
+    << fit.world_to_logical.point(point)
+}
+
+pub fn (fit &Fit2D) contains_logical(point fm.Vec2) bool {
+    << fit.viewport_rect.contains(point)
+}

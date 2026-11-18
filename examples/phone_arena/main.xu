@@ -7,10 +7,12 @@ events #window/events
 #math
 #os
 #strconv
+#errors
 fm #"github.com/xulang-org/game/foundation/math"
 controls #"github.com/xulang-org/game/input"
 input_bridge #"github.com/xulang-org/game/integration/input"
-frame_loop #"github.com/xulang-org/game/integration/frame"
+app_host #"github.com/xulang-org/game/integration/application"
+vp #"github.com/xulang-org/game/integration/viewport"
 physics #"github.com/xulang-org/game/physics2d"
 scene #"github.com/xulang-org/game/scene"
 canvas #"github.com/xulang-org/game/resources/canvas"
@@ -33,6 +35,28 @@ const MINT = 1625735423
 const MUTED = 708333311
 const WHITE = 4294967295
 
+fn parse_max_frames() int {
+    args := os.args()
+    $i := 1
+    while i < args.len {
+        if args[i] == "--frames" && i + 1 < args.len {
+            next := i + 1
+            n := strconv.atoi(&args[next]) or >>
+            if n < 1 || n > 1000000 { >> errors.new("arena: invalid --frames value") }
+            << n
+        }
+        i += 1
+    }
+    << 0
+}
+
+fn canvas_shader_dir() string {
+    if app.is_hosted() || os.getenv("XU_PHONE_RESOURCE_ROOT").len > 0 {
+        << app_host.resolve_resource("canvas", "build") or >>
+    }
+    << "build/canvas-shaders"
+}
+
 fn new_input() controls.InputMap {
     $input := controls.new_input_map()
     names := ["left", "right", "up", "down", "boost", "pause"]
@@ -43,29 +67,52 @@ fn new_input() controls.InputMap {
     }
     << input
 }
-fn touch_layout(width f64, height f64) input_bridge.TouchControls {
-    $touch := input_bridge.new_touch_controls(fm.vec2(78.0, height - 84.0), 40.0, 0.08, 0) or >>
-    touch.enable_floating(fm.rect2(0.0, height - 176.0, math.min(156.0, width / 2.0 - 30.0), 176.0)) or >>
-    touch.add_button(fm.vec2(width - 74.0, height - 84.0), 48.0, 4, input_bridge.BUTTON_HOLD) or >>
-    touch.add_button(pause_center(width, height), 23.0, 5, input_bridge.BUTTON_TAP) or >>
+
+fn ui_scale(view &vp.Viewport) f64 {
+    sr := view.safe_rect
+    << math.max(1.0, math.min(2.8, math.min(sr.size.x, sr.size.y) / 375.0))
+}
+
+fn boost_center(view &vp.Viewport) fm.Vec2 {
+    sr := view.safe_rect
+    s := ui_scale(view)
+    << fm.vec2(sr.position.x + sr.size.x - 74.0 * s, sr.position.y + sr.size.y - 84.0 * s)
+}
+
+fn pause_center(view &vp.Viewport) fm.Vec2 {
+    sr := view.safe_rect
+    s := ui_scale(view)
+    right := sr.position.x + sr.size.x
+    bottom := sr.position.y + sr.size.y
+    if view.is_landscape() { << fm.vec2(right - 74.0 * s, bottom - 180.0 * s) }
+    << fm.vec2(sr.position.x + sr.size.x * 0.5, bottom - 84.0 * s)
+}
+
+fn touch_layout(view &vp.Viewport) input_bridge.TouchControls {
+    sr := view.safe_rect
+    s := ui_scale(view)
+    sx := sr.position.x
+    bottom := sr.position.y + sr.size.y
+    $touch := input_bridge.new_touch_controls(fm.vec2(sx + 78.0 * s, bottom - 84.0 * s), 40.0 * s, 0.08, 0) or >>
+    zone_w := math.max(96.0 * s, math.min(156.0 * s, sr.size.x * 0.5 - 30.0 * s))
+    touch.enable_floating(fm.rect2(sx, bottom - 176.0 * s, zone_w, 176.0 * s)) or >>
+    touch.add_button(boost_center(view), 48.0 * s, 4, input_bridge.BUTTON_HOLD) or >>
+    touch.add_button(pause_center(view), 23.0 * s, 5, input_bridge.BUTTON_TAP) or >>
     << touch
 }
-// Input/layout units are logical points. Both axes are scaled independently to
-// actual output pixels; world fitting never changes touch hit-test coordinates.
-fn screen_transform(width f64, height f64, pixels_x int, pixels_y int) fm.Transform2D {
-    << fm.transform_2d(fm.vec2(0.0, 0.0), 0.0, fm.vec2(f64(pixels_x) / width, f64(pixels_y) / height))
+
+fn world_fit(view &vp.Viewport) vp.Fit2D {
+    s := ui_scale(view)
+    $area := view.safe_inset_rect(16.0 * s, 64.0 * s, 16.0 * s, 164.0 * s) or >>
+    if view.is_landscape() {
+        area = view.safe_inset_rect(146.0 * s, 16.0 * s, 146.0 * s, 16.0 * s) or >>
+    }
+    if area.size.x < 60.0 || area.size.y < 60.0 {
+        area = fm.rect2(16.0, 20.0, math.max(60.0, view.logical_width - 32.0), math.max(60.0, view.logical_height - 40.0))
+    }
+    << vp.fit_letterbox(area, 360.0, 420.0) or >>
 }
-fn pause_center(width f64, height f64) fm.Vec2 {
-    if width > height { << fm.vec2(width - 74.0, height - 180.0) }
-    << fm.vec2(width / 2.0, height - 84.0)
-}
-fn world_transform(width f64, height f64) fm.Transform2D {
-    $area := fm.rect2(16.0, 76.0, width - 32.0, height - 240.0)
-    if width > height { area = fm.rect2(146.0, 20.0, width - 292.0, height - 40.0) }
-    scale := math.min(area.size.x / 360.0, area.size.y / 420.0)
-    origin := area.position.add(area.size.sub(fm.vec2(360.0, 420.0).scaled(scale)).scaled(0.5))
-    << fm.transform_2d(origin, 0.0, fm.vec2(scale, scale))
-}
+
 fn circle(batch $&canvas.Batch2D, center fm.Vec2, radius f64, view fm.Transform2D, color int) int {
     for i in 0:32 {
         a := f64(i) * 6.283185307179586 / 32.0
@@ -75,47 +122,55 @@ fn circle(batch $&canvas.Batch2D, center fm.Vec2, radius f64, view fm.Transform2
     }
     << 0
 }
-fn draw_controls(batch $&canvas.Batch2D, touch &input_bridge.TouchControls, width f64, height f64,
-    view fm.Transform2D, paused bool, score int) int {
-    batch.quad(fm.rect2(22.0, 25.0, 4.0, 24.0), view, MINT) or >>
+
+fn draw_controls(batch $&canvas.Batch2D, touch &input_bridge.TouchControls, view &vp.Viewport,
+    screen fm.Transform2D, paused bool, score int) int {
+    s := ui_scale(view)
+    top_x := view.safe_rect.position.x
+    top_y := view.safe_rect.position.y
+    batch.quad(fm.rect2(top_x + 22.0 * s, top_y + 18.0 * s, 4.0 * s, 24.0 * s), screen, MINT) or >>
     for i in 0:6 {
         $color := MUTED
         if i < score { color = GOLD }
-        circle(batch, fm.vec2(45.0 + f64(i) * 23.0, 37.0), 6.0, view, color) or >>
+        circle(batch, fm.vec2(top_x + (45.0 + f64(i) * 23.0) * s, top_y + 30.0 * s), 6.0 * s, screen, color) or >>
     }
-    circle(batch, touch.center, touch.radius + 3.0, view, MUTED) or >>
-    circle(batch, touch.center, touch.radius, view, PANEL) or >>
+    circle(batch, touch.center, touch.radius + 3.0 * s, screen, MUTED) or >>
+    circle(batch, touch.center, touch.radius, screen, PANEL) or >>
     knob := touch.center.add(touch.offset.scaled(touch.radius * 0.65))
-    circle(batch, knob, 19.0, view, MINT) or >>
-    boost := fm.vec2(width - 74.0, height - 84.0)
+    circle(batch, knob, 19.0 * s, screen, MINT) or >>
+    boost := boost_center(view)
     $boost_color := MUTED
     if touch.button_down(0) or >> { boost_color = GOLD }
-    circle(batch, boost, 49.0, view, boost_color) or >>
-    circle(batch, boost, 46.0, view, PANEL) or >>
-    batch.triangle(view.point(boost.add(fm.vec2(4.0, -18.0))), view.point(boost.add(fm.vec2(-13.0, 3.0))),
-        view.point(boost.add(fm.vec2(3.0, 3.0))), boost_color) or >>
-    batch.triangle(view.point(boost.add(fm.vec2(-4.0, 18.0))), view.point(boost.add(fm.vec2(13.0, -3.0))),
-        view.point(boost.add(fm.vec2(-3.0, -3.0))), boost_color) or >>
-    pause := pause_center(width, height)
-    circle(batch, pause, 23.0, view, MUTED) or >>
+    circle(batch, boost, 49.0 * s, screen, boost_color) or >>
+    circle(batch, boost, 46.0 * s, screen, PANEL) or >>
+    batch.triangle(screen.point(boost.add(fm.vec2(4.0 * s, -18.0 * s))), screen.point(boost.add(fm.vec2(-13.0 * s, 3.0 * s))),
+        screen.point(boost.add(fm.vec2(3.0 * s, 3.0 * s))), boost_color) or >>
+    batch.triangle(screen.point(boost.add(fm.vec2(-4.0 * s, 18.0 * s))), screen.point(boost.add(fm.vec2(13.0 * s, -3.0 * s))),
+        screen.point(boost.add(fm.vec2(-3.0 * s, -3.0 * s))), boost_color) or >>
+    pause := pause_center(view)
+    circle(batch, pause, 23.0 * s, screen, MUTED) or >>
     if paused {
-        batch.triangle(view.point(pause.add(fm.vec2(-5.0, -9.0))), view.point(pause.add(fm.vec2(-5.0, 9.0))),
-            view.point(pause.add(fm.vec2(9.0, 0.0))), GOLD) or >>
+        batch.triangle(screen.point(pause.add(fm.vec2(-5.0 * s, -9.0 * s))), screen.point(pause.add(fm.vec2(-5.0 * s, 9.0 * s))),
+            screen.point(pause.add(fm.vec2(9.0 * s, 0.0))), GOLD) or >>
     } else {
-        batch.quad(fm.rect2(pause.x - 7.0, pause.y - 8.0, 4.0, 16.0), view, WHITE) or >>
-        batch.quad(fm.rect2(pause.x + 3.0, pause.y - 8.0, 4.0, 16.0), view, WHITE) or >>
+        batch.quad(fm.rect2(pause.x - 7.0 * s, pause.y - 8.0 * s, 4.0 * s, 16.0 * s), screen, WHITE) or >>
+        batch.quad(fm.rect2(pause.x + 3.0 * s, pause.y - 8.0 * s, 4.0 * s, 16.0 * s), screen, WHITE) or >>
     }
     << 0
 }
+
 struct Gem { node int
     position fm.Vec2
     collected bool }
+
 fn run() int {
-    program := shaders.load_canvas(app.resource_path("canvas") or >>) or >>
+    max_frames := parse_max_frames() or >>
+    program := shaders.load_canvas(canvas_shader_dir() or >>) or >>
     options := window.Options{title: "Xu Phone Arena", width: 375, height: 667,
         resizable: true, high_pixel_density: true, hidden: false}
     $renderer := ren.open_2d_window(options, gpu.AUTO, &program) or >>
-    image := images.load_png(app.resource_path("player.png") or >>) or >>
+    player_path := app_host.resolve_resource("player.png", "examples/arena/assets") or >>
+    image := images.load_png(player_path) or >>
     $texture := image_render.upload_image_2d(&renderer, &image, false) or >>
     clip := animation.new_atlas_animation(4, 1, 0, 4, 8.0, true) or >>
     $animator := animation.new_sprite_animator(clip) or >>
@@ -127,14 +182,15 @@ fn run() int {
     solids := [fm.rect2(8.0, 8.0, 344.0, 8.0), fm.rect2(8.0, 404.0, 344.0, 8.0),
         fm.rect2(8.0, 16.0, 8.0, 388.0), fm.rect2(344.0, 16.0, 8.0, 388.0),
         fm.rect2(122.0, 75.0, 14.0, 225.0), fm.rect2(224.0, 140.0, 14.0, 214.0)]
-    save_path := app.data_path("arena-v1.json") or >>
+    save_path := app_host.resolve_data("arena-v1.json", "build") or >>
     $checkpoint := load_checkpoint(save_path + "", &solids) or >>
     position = checkpoint.position
     tree.set_position(player, position) or >>
     tree.paused = checkpoint.paused
     $mixer := mix.new_mixer(48000, 16) or >>
     sfx_bus := mixer.add_bus(0, "SFX", 0.9) or >>
-    chime_clip := mixer.add_clip(audio_assets.load_wav(app.resource_path("chime.wav") or >>) or >>) or >>
+    chime_path := app_host.resolve_resource("chime.wav", "examples/audio/assets") or >>
+    chime_clip := mixer.add_clip(audio_assets.load_wav(chime_path) or >>) or >>
     $output := audio.open_output(48000) or >>
     mixer.pause_bus(sfx_bus, tree.paused) or >>
     if !tree.paused {
@@ -166,59 +222,79 @@ fn run() int {
     }
     $sprite := scene_render.Sprite2D{node: player, bounds: fm.rect2(0.0, 0.0, 22.0, 22.0),
         region: animator.region() or >>, tint: WHITE}
-    initial_window := renderer.window() or >>
-    initial := initial_window.state() or >>
-    $logical_width := f64(initial.width)
-    $logical_height := f64(initial.height)
-    $touch := touch_layout(logical_width, logical_height) or >>
+    $view := vp.from_window(renderer.window() or >>) or >>
+    $touch := touch_layout(&view) or >>
     $input := new_input() or >>
-    $loop := frame_loop.new_frame_loop(60, 8) or >>
+    $host := app_host.new_app_host(60, 8, 320, 260) or >>
+    host.enable_back_handling() or >>
     $animation_time := 0.0
     $frames := 0
     $batch := canvas.new_batch()
     $sprite_batch := canvas.new_batch()
     $overlay := canvas.new_batch()
-    println("Phone arena ready; backend=" + str(renderer.backend() or >>) + "; PNG=" + str(image.width) + "x" + str(image.height))
+    println("Phone arena ready; backend=" + str(renderer.backend() or >>) + "; PNG=" + str(image.width) + "x" + str(image.height) +
+        "; safe=" + str(int(view.safe_rect.position.x)) + "," + str(int(view.safe_rect.position.y)) + "," +
+        str(int(view.safe_rect.size.x)) + "x" + str(int(view.safe_rect.size.y)))
     println("Phone arena restored position=" + (strconv.format_float(position.x, 103, -1) or >>) + "," +
         (strconv.format_float(position.y, 103, -1) or >>) +
         "; collected=" + str(checkpoint.collected) + "; audio=" + output.driver_name() + "; pid=" + str(os.getpid()))
-    while app.next_frame() or >> {
-        if loop.begin_frame($&input, $&touch, now_ns(), app.resume_epoch()) or >> {
+    while (max_frames <= 0 || frames < max_frames) && (host.next_frame() or >>) {
+        step := host.begin_step(renderer.window() or >>, $&input, $&touch, now_ns()) or >>
+        if step.resumed {
             save_now = true
             output.clear() or >>
             mixer.pause_bus(sfx_bus, tree.paused) or >>
             output.pause(tree.paused) or >>
             println("Phone arena resumed; input and clock reset; audio_paused=" + str(tree.paused) + "; pid=" + str(os.getpid()))
         }
-        window.pump() or >>
-        for i in 0:events.QUEUE_CAPACITY {
-            event := renderer.poll() or >>
-            if event.kind == events.EVENT_NONE { <- }
-            loop.feed($&input, $&touch, &event) or >>
-            if event.kind == events.EVENT_INPUT_RESET {
-                println("Phone arena input reset; reason=" + str(event.reset_reason))
-            }
-            if event.kind == events.EVENT_TOUCH_UP || event.kind == events.EVENT_TOUCH_CANCEL { save_now = true }
-            if event.kind == events.EVENT_TOUCH_DOWN || event.kind == events.EVENT_TOUCH_UP || event.kind == events.EVENT_TOUCH_CANCEL {
-                println("touch=" + str(event.kind) + "; finger=" + str(event.touch_id))
+        if step.input_reset_reason != 0 {
+            println("Phone arena input reset; reason=" + str(step.input_reset_reason))
+        }
+        if step.touch_ended { save_now = true }
+        for ev in step.events {
+            if ev.kind == events.EVENT_TOUCH_DOWN || ev.kind == events.EVENT_TOUCH_UP || ev.kind == events.EVENT_TOUCH_CANCEL {
+                println("touch=" + str(ev.kind) + "; finger=" + str(ev.touch_id))
             }
         }
-        if !loop.running() {
+        if !step.running {
             output.pause(true) or >>
             output.clear() or >>
-            loop.finish_frame(tree.paused) or >>
-            <- }
-        target_window := renderer.window() or >>
-        state := target_window.state() or >>
-        if state.width < 320 || state.height < 260 || state.pixel_width < 1 || state.pixel_height < 1 {
-            loop.finish_frame(true) or >>
+            host.finish_step(tree.paused) or >>
+            <-
+        }
+        if !step.drawable {
+            host.finish_step(true) or >>
             ->
         }
-        if logical_width != f64(state.width) || logical_height != f64(state.height) {
-            logical_width = f64(state.width)
-            logical_height = f64(state.height)
-            loop.reset_touches($&input, $&touch) or >>
-            touch = touch_layout(logical_width, logical_height) or >>
+        if step.layout_changed || !view.same_geometry(&step.viewport) {
+            view = step.viewport
+            touch = touch_layout(&view) or >>
+            println("Phone arena viewport=" + str(int(view.logical_width)) + "x" + str(int(view.logical_height)) +
+                "; safe=" + str(int(view.safe_rect.position.x)) + "," + str(int(view.safe_rect.position.y)) + "," +
+                str(int(view.safe_rect.size.x)) + "x" + str(int(view.safe_rect.size.y)))
+        }
+        if step.back_requested {
+            if !tree.paused {
+                tree.paused = true
+                checkpoint.paused = true
+                save_dirty = true
+                save_now = true
+                mixer.pause_bus(sfx_bus, true) or >>
+                output.pause(true) or >>
+                output.clear() or >>
+                println("Phone arena back requested; paused=true")
+            } else {
+                if save_dirty {
+                    save_checkpoint(save_path + "", &checkpoint, &solids) or >>
+                    save_dirty = false
+                }
+                output.pause(true) or >>
+                output.clear() or >>
+                host.request_exit()
+                host.finish_step(true) or >>
+                println("Phone arena back requested while paused; exiting")
+                <-
+            }
         }
         if input.just_pressed("pause") or >> {
             tree.paused = !tree.paused
@@ -236,12 +312,12 @@ fn run() int {
             }
             println("Phone arena paused=" + str(tree.paused))
         }
-        ticks := loop.finish_frame(tree.paused) or >>
+        ticks := host.finish_step(tree.paused) or >>
         if !tree.paused {
             direction := input.vector("left", "right", "up", "down") or >>
             $speed := 110.0
             if input.pressed("boost") or >> { speed = 190.0 }
-            for step in 0:ticks.steps {
+            for _step in 0:ticks.steps {
                 animation_time = animation_time + ticks.fixed_delta
                 if direction.length() > 0.0 { animator.advance(ticks.fixed_delta) or >> }
                 result := physics.move_and_slide(fm.rect2(position.x, position.y, 22.0, 22.0),
@@ -271,18 +347,19 @@ fn run() int {
                 fm.transform_2d(gem.position, animation_time, fm.vec2(1.0, 1.0))) or >> }
         }
         tree.flush_free() or >>
-        pixels := screen_transform(logical_width, logical_height, state.pixel_width, state.pixel_height)
-        view := pixels.multiply(world_transform(logical_width, logical_height))
+        fit := world_fit(&view) or >>
+        pixels := view.screen_transform()
+        world_view := fit.world_to_pixels(&view)
         batch.clear()
         sprite_batch.clear()
         overlay.clear()
-        batch.quad(fm.rect2(0.0, 0.0, 360.0, 420.0), view, PANEL) or >>
-        for i in 0:11 { batch.quad(fm.rect2(16.0 + f64(i) * 30.0, 16.0, 1.0, 388.0), view, GRID) or >> }
-        for i in 0:13 { batch.quad(fm.rect2(16.0, 16.0 + f64(i) * 30.0, 328.0, 1.0), view, GRID) or >> }
-        world_canvas.record(&tree, view, $&batch) or >>
+        batch.quad(fm.rect2(0.0, 0.0, 360.0, 420.0), world_view, PANEL) or >>
+        for i in 0:11 { batch.quad(fm.rect2(16.0 + f64(i) * 30.0, 16.0, 1.0, 388.0), world_view, GRID) or >> }
+        for i in 0:13 { batch.quad(fm.rect2(16.0, 16.0 + f64(i) * 30.0, 328.0, 1.0), world_view, GRID) or >> }
+        world_canvas.record(&tree, world_view, $&batch) or >>
         sprite.region = animator.region() or >>
-        sprite.record(&tree, view, $&sprite_batch) or >>
-        draw_controls($&overlay, &touch, logical_width, logical_height, pixels, tree.paused, score) or >>
+        sprite.record(&tree, world_view, $&sprite_batch) or >>
+        draw_controls($&overlay, &touch, &view, pixels, tree.paused, score) or >>
         renderer.begin(BACKGROUND) or >>
         renderer.submit(&batch) or >>
         renderer.submit_texture(&sprite_batch, &texture) or >>

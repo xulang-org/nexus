@@ -44,9 +44,14 @@ def main():
         prepare(backend, stage/'canvas')
         (stage/'phone.resources').write_text('player.png\nchime.wav\ncanvas/format\ncanvas/canvas.vert.bin\ncanvas/canvas.frag.bin\n')
     else:
+        shutil.copyfile(ROOT/'examples/arena/assets/player.png', stage/'player.png')
+        prepare(backend, stage/'canvas')
         subprocess.run(['python3', str(ROOT/'tools/mesh_shaders.py'), '--backend', backend,
                         '--out-dir', str(stage/'mesh')], check=True)
         (stage/'phone.resources').write_text(
+            'player.png\n'
+            'canvas/format\ncanvas/canvas.vert.bin\ncanvas/canvas.frag.bin\n'
+            'canvas/ui_sdf.vert.bin\ncanvas/ui_sdf.frag.bin\ncanvas/ui_text.frag.bin\n'
             'mesh/format\nmesh/canvas.vert.bin\nmesh/canvas.frag.bin\n'
             'mesh/mesh.vert.bin\nmesh/mesh.frag.bin\nmesh/shadow.vert.bin\nmesh/shadow.frag.bin\n'
         )

@@ -1,0 +1,160 @@
+@"github.com/xulang-org/game/integration/input"
+
+fm #"github.com/xulang-org/game/foundation/math"
+events #window/events
+#math
+#errors
+
+struct FingerSlot {
+    active bool
+    device int
+    finger int
+    pos fm.Vec2
+}
+
+// Tracks 1-finger drag and 2-finger pinch gestures in logical coordinates,
+// with optional desktop left-mouse drag and scroll-wheel support.
+pub struct TouchPad {
+    slots []FingerSlot
+    prev_dist f64
+    has_pair bool
+    mouse_active bool
+    mouse_pos fm.Vec2
+    pub drag fm.Vec2
+    pub pinch_scale f64
+    pub wheel_delta f64
+}
+
+fn empty_slot() FingerSlot {
+    << FingerSlot{active: false, device: 0, finger: 0, pos: fm.vec2(0.0, 0.0)}
+}
+
+pub fn new_touch_pad() TouchPad {
+    << TouchPad{
+        slots: [empty_slot(), empty_slot()],
+        prev_dist: 0.0,
+        has_pair: false,
+        mouse_active: false,
+        mouse_pos: fm.vec2(0.0, 0.0),
+        drag: fm.vec2(0.0, 0.0),
+        pinch_scale: 1.0,
+        wheel_delta: 0.0
+    }
+}
+
+pub fn (pad $&TouchPad) begin_frame() {
+    pad.drag = fm.vec2(0.0, 0.0)
+    pad.pinch_scale = 1.0
+    pad.wheel_delta = 0.0
+}
+
+pub fn (pad $&TouchPad) reset() {
+    pad.slots = [empty_slot(), empty_slot()]
+    pad.prev_dist = 0.0
+    pad.has_pair = false
+    pad.mouse_active = false
+    pad.drag = fm.vec2(0.0, 0.0)
+    pad.pinch_scale = 1.0
+    pad.wheel_delta = 0.0
+}
+
+pub fn (pad &TouchPad) active_fingers() int {
+    $count := 0
+    if pad.slots[0].active { count += 1 }
+    if pad.slots[1].active { count += 1 }
+    << count
+}
+
+fn (pad &TouchPad) find_slot(device_id int, touch_id int) int {
+    for i in 0:2 {
+        if pad.slots[i].active && pad.slots[i].device == device_id && pad.slots[i].finger == touch_id {
+            << i
+        }
+    }
+    << -1
+}
+
+fn (pad $&TouchPad) refresh_pair() {
+    if pad.slots[0].active && pad.slots[1].active {
+        pad.prev_dist = pad.slots[1].pos.sub(pad.slots[0].pos).length()
+        pad.has_pair = pad.prev_dist > 8.0
+    } else {
+        pad.prev_dist = 0.0
+        pad.has_pair = false
+    }
+}
+
+pub fn (pad $&TouchPad) apply(event &events.Event) int {
+    if event.kind == events.EVENT_INPUT_RESET || event.kind == events.EVENT_FOCUS_LOST ||
+        event.kind == events.EVENT_CLOSE_REQUESTED || event.kind == events.EVENT_RESIZED ||
+        event.kind == events.EVENT_SAFE_AREA_CHANGED {
+        pad.reset()
+        << 0
+    }
+    if event.kind == events.EVENT_POINTER_DOWN && event.button == events.BUTTON_LEFT {
+        if !fm.finite(event.x) || !fm.finite(event.y) { >> errors.new("game: invalid pointer position") }
+        pad.mouse_active = true
+        pad.mouse_pos = fm.vec2(event.x, event.y)
+        << 0
+    }
+    if event.kind == events.EVENT_POINTER_UP && event.button == events.BUTTON_LEFT {
+        pad.mouse_active = false
+        << 0
+    }
+    if event.kind == events.EVENT_POINTER_MOVE && pad.mouse_active {
+        if !fm.finite(event.x) || !fm.finite(event.y) { >> errors.new("game: invalid pointer position") }
+        next := fm.vec2(event.x, event.y)
+        pad.drag = pad.drag.add(next.sub(pad.mouse_pos))
+        pad.mouse_pos = next
+        << 0
+    }
+    if event.kind == events.EVENT_WHEEL {
+        if !fm.finite(event.dy) { >> errors.new("game: invalid wheel delta") }
+        pad.wheel_delta = pad.wheel_delta + event.dy
+        << 0
+    }
+    if event.kind < events.EVENT_TOUCH_DOWN || event.kind > events.EVENT_TOUCH_CANCEL {
+        << 0
+    }
+    if !fm.finite(event.x) || !fm.finite(event.y) {
+        >> errors.new("game: invalid touch position")
+    }
+    point := fm.vec2(event.x, event.y)
+    if event.kind == events.EVENT_TOUCH_DOWN {
+        existing := pad.find_slot(event.device_id, event.touch_id)
+        if existing >= 0 {
+            pad.slots[existing].pos = point
+            pad.refresh_pair()
+            << 0
+        }
+        for i in 0:2 {
+            if !pad.slots[i].active {
+                pad.slots[i] = FingerSlot{active: true, device: event.device_id, finger: event.touch_id, pos: point}
+                pad.refresh_pair()
+                << 0
+            }
+        }
+        << 0
+    }
+    idx := pad.find_slot(event.device_id, event.touch_id)
+    if idx < 0 { << 0 }
+    if event.kind == events.EVENT_TOUCH_MOVE {
+        prev := pad.slots[idx].pos
+        pad.slots[idx].pos = point
+        if pad.slots[0].active && pad.slots[1].active {
+            dist := pad.slots[1].pos.sub(pad.slots[0].pos).length()
+            if pad.has_pair && dist > 8.0 && pad.prev_dist > 8.0 {
+                pad.pinch_scale = pad.pinch_scale * (dist / pad.prev_dist)
+                pad.prev_dist = dist
+            } else {
+                pad.refresh_pair()
+            }
+        } else {
+            pad.drag = pad.drag.add(point.sub(prev))
+        }
+        << 0
+    }
+    pad.slots[idx] = empty_slot()
+    pad.refresh_pair()
+    << 0
+}
