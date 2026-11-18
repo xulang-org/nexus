@@ -14,7 +14,7 @@ GLB 已支持受限 TRS 动画采样、CPU 四权重线性蒙皮和相对路径 
 3D 已加入带法线/切线/UV 的金属度/粗糙度直接光材质、基础颜色/ORM/自发光/法线/独立 AO 纹理与 mipmap、单双面渲染、最多 256 个候选方向光/点光/聚光、每网格最多 16 源、场景光源绑定、自发光和曝光。
 3D 可选择 GPU 2× 超采样（四个源像素合成一个输出像素）和方向/聚光/点光 3×3 PCF 阴影及 2–4 级 CSM，图片已接通标准库的受限 baseline JPEG 解码。完整 glTF 材质/纹理、IBL、编辑器、完整脚本类型/绑定/协程、生产更新分发、压缩音频/异步解码与 DSP、刚体求解器、用户材质着色器、GPU 粒子和计算纹理仍待实现。
 
-当前对齐 Xu **0.12.5** 并包含原生 Phone game 工具链分支，用于原生 Phone game 宿主、安全区/触摸与多点手势事件、纯 Xu FFI 绑定及随包资源；编译器、标准库、native/phone 工具必须来自同一完整 SDK。macOS arm64 / Metal / CoreAudio 已完成桌面与主机回归；`iPhone 8`（iOS 16.7.16）与 `Sony XQ-BE72`（Android 13）已实机验证 `examples/phone_arena`（Metal+CoreAudio / Vulkan+AAudio、安全区与断点续玩存档）及 `examples/phone_3d`（Metal/Vulkan PBR 贴图场景、像素预算上限 `921600`、`Overlay2D` + `UiFrame` HUD 与触控轨道视角），真机物理双指捏合等手势仍按真机边界单独说明。
+当前对齐 Xu **0.12.6** 并包含原生 Phone game 工具链分支，用于原生 Phone game 宿主、安全区/触摸与多点手势事件、纯 Xu FFI 绑定及随包资源；编译器、标准库、native/phone 工具必须来自同一完整 SDK。macOS arm64 / Metal / CoreAudio 已完成桌面与主机回归；`iPhone 8`（iOS 16.7.16）与 `Sony XQ-BE72`（Android 13）已实机验证 `examples/phone_arena`（Metal+CoreAudio / Vulkan+AAudio、安全区与断点续玩存档）及 `examples/phone_3d`（Metal/Vulkan PBR 贴图场景、像素预算上限 `921600`、`Overlay2D` + `UiFrame` HUD 与触控轨道视角），真机物理双指捏合等手势仍按真机边界单独说明。
 
 
 ## Phone 原生 2D / 3D 示例
@@ -25,7 +25,7 @@ GLB 已支持受限 TRS 动画采样、CPU 四权重线性蒙皮和相对路径 
 - `examples/phone_3d`：`AppHost` + `TouchControls` + `TouchPad`（未命中按钮区域由单指拖动控制轨道旋转，双指支持捏合缩放/桌面滚轮），通过 `Device3D.set_max_render_pixels(921600)` 控制移动端 3D 渲染像素预算并保留全分辨率 `Overlay2D` + `UiFrame` HUD 叠加、贴图 PBR 立方体与 `Back` 暂停/退出。
 
 ```sh
-NEXUS_PHONE_SDK=/path/to/xu-0.12.5-phone
+NEXUS_PHONE_SDK=/path/to/xu-0.12.6-phone
 export XU_ROOT="$NEXUS_PHONE_SDK" XU_STDLIB_ROOT="$NEXUS_PHONE_SDK/src"
 python3 tools/build_phone.py --xu "$NEXUS_PHONE_SDK/bin/xu" \
   --example phone_arena --target ios-arm64 --sdl-source /path/to/SDL-3.4.14 \
@@ -182,7 +182,7 @@ PNG 文件上传、最近邻/线性采样、透明混合、GPU 裁剪、有序�
 
 ## 运行
 
-需要 **Xu 0.12.5**（桌面/主机测试使用含 native FFI 修复的 SDK，移动端打包使用 Phone game 工具链分支）、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
+需要 **Xu 0.12.6**（桌面/主机测试使用含 native FFI 修复的 SDK，移动端打包使用 Phone game 工具链分支）、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
 默认通过 `pkg-config sdl3` 查找头文件；Windows 可显式传入包含 `SDL3/SDL.h` 的目录。
 桥接在运行时加载 SDL，不把 SDL 源码或二进制复制进本库。
 
@@ -234,14 +234,14 @@ make demo-glb-materials
 ./build/glb-materials --frames 120 --capture build/glb-materials.png
 ```
 
-当前使用完整的 Xu 0.12.4-dev.3 开发 SDK；编译器、标准库、native 工具必须来自同一发行包。
+当前使用完整的 Xu 0.12.6 开发 SDK；编译器、标准库、native 工具必须来自同一发行包。
 `make sdk` 核对实际编译器版本。默认使用 PATH 中的正式版 `xu`；不再依赖开发工作区或混用不同 SDK 的标准库。
 修复内容属于编译器：解析 native 模块、校验归档/目标/ABI、生成 C 调用适配和链接，调用所选 SDK 的配套工具，
 并为资源所有者及资源数组生成自动析构。标准库新增 `gpu/layout` 统一纹理格式、mip 链、行 pitch 与 mip offset 的受检计算，UI 图片上传与引擎 2D/3D 纹理共用；标准 `gpu` 已提供无窗口设备、缓冲区与异步传输、fence/读回、纹理/采样器、Shader/Pipeline 和离屏 render pass，以及 compact `[]u8` 借用 ABI。标准窗口/呈现已补齐，2D/3D 均已迁移标准事件、资源和绘制命令；PBR、场景和游戏预算仍在引擎。
 完整 SDK 的编译器、标准库和包搜索路径必须一致：
 
 ```sh
-NEXUS_XU_SDK="$HOME/.xu"  # 或完整的 0.12.4-dev.3 SDK 目录
+NEXUS_XU_SDK="$HOME/.xu"  # 或完整的 0.12.6 SDK 目录
 XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" \
 XUPATH="$NEXUS_XU_SDK/src:$NEXUS_XU_SDK/packages" XU="$NEXUS_XU_SDK/bin/xu" \
 make native-probe check test gpu-smoke smoke script-live-smoke
@@ -252,7 +252,7 @@ make native-probe check test gpu-smoke smoke script-live-smoke
 `make native-probe` 在无 SDL 的独立模块中验证整数、十二参数、混合参数/数组、空数组、结构体字段借用、
 可写数组 COW 隔离与 void 返回，编译、链接并执行真实 C 调用。
 `make check test gpu-smoke smoke script-live-smoke` 包含设备与运行中热更新检查；失败直接报告。
-本轮 macOS arm64 使用 `0.12.4-dev.3` 已通过上述完整命令（smoke 含独立标准 GPU 传输），覆盖：Metal 2D/3D 绘制与回读、CoreAudio、资源回收与失败回滚、
+本轮 macOS arm64 使用 `0.12.6` 已通过上述完整命令（smoke 含独立标准 GPU 传输），覆盖：Metal 2D/3D 绘制与回读、CoreAudio、资源回收与失败回滚、
 场景保存/新进程恢复，以及真实 GPU 进程内 300 帧脚本热重载（状态和信号连接保留，错误源码/产物拒绝）。
 SDL 动态库不在标准位置时，标准 GPU/window 与 CPU PNG codec 使用 `XU_SDL_LIBRARY`；音频设备仍使用独立的 `XU_NEXUS_SDL_AUDIO_LIBRARY`。
 3D 着色器通过 `make mesh-shaders` 或 `tools/mesh_shaders.py --backend ... --out-dir ...` 显式准备。
@@ -1328,7 +1328,7 @@ python3 tools/watch_script.py --tool build/xu-nexus-script \
   --output build/player.xubc
 ```
 
-首个 profile 为 `xu-scalar-v1`。编译工具直接复用 SDK 0.12.4-dev.3 的 `xu/scanner`、`xu/parser`、公开 AST 常量，
+首个 profile 为 `xu-scalar-v1`。编译工具直接复用 SDK 0.12.6 的 `xu/scanner`、`xu/parser`、公开 AST 常量，
 再做标量 profile 类型/作用域检查与寄存器指令生成，没有复制一套 Xu 解析器。
 SDK 前端在语法错误时会结束进程，因此源码编译由独立子进程执行；游戏只加载、验证并解释编译产物。
 每个开发轮询器每 200 ms 检查一个源码和一个 JSON 元数据文件，读取有界快照，编译超时为 5 秒。
@@ -1468,7 +1468,7 @@ report := scripts.dispatch(&tree, host.DEFAULT_DISPATCH_LIMIT) or >>
 ```yaml
 module: example/my_game
 version: !ver 0.1.0
-xu: !ver 0.12.4-dev.3
+xu: !ver 0.12.6
 require:
   "github.com/xulang-org/nexus": file:/path/to/nexus
 ```
@@ -1719,7 +1719,7 @@ Linux / Windows 尚未完成构建、窗口输入与真实 GPU 运行验证；�
 不把某个后端的 256/512 字节对齐规则或本引擎的 64 MiB/4096 上限写成标准库默认政策。
 2D 复用标准 GPU 的格式与传输校验；3D 上传将其 mip 数量/逻辑字节数与真实设备创建结果核对，不一致则回收新纹理并报错。
 
-本轮 Xu `0.12.4-dev.3` 的可选 `#gpu` 已实现无窗口设备、Buffer、异步上传/GPU 复制/下载、Fence/Readback 与逻辑资源统计。
+本轮 Xu `0.12.6` 的可选 `#gpu` 已实现无窗口设备、Buffer、异步上传/GPU 复制/下载、Fence/Readback 与逻辑资源统计。
 `&[]u8` 输入在返回前复制到后端 staging；读回只在完成后写入 exact-size `$&[]u8`，关闭设备统一回收子资源。
 传输采用四字节对齐，所有 owner/borrow 留在应用主线程；无窗口仍可能需要平台视频驱动。
 导入时用同一 SDK 的 `xu-native` 按 `native.xun` 编译源码后端，设备打开时才加载 SDL；无需应用 native 声明或 SDL 开发头文件。
@@ -1736,7 +1736,7 @@ License: MIT。
 ## 独立标准 GPU 离屏示例
 
 ```sh
-XU_ROOT=/path/to/xu-0.12.4-dev.3-sdk XU_STDLIB_ROOT=/path/to/xu-0.12.4-dev.3-sdk/src XUPATH=/path/to/xu-0.12.4-dev.3-sdk/src XU=/path/to/xu-0.12.4-dev.3-sdk/bin/xu make gpu-offscreen-smoke
+XU_ROOT=/path/to/xu-0.12.6-sdk XU_STDLIB_ROOT=/path/to/xu-0.12.6-sdk/src XUPATH=/path/to/xu-0.12.6-sdk/src XU=/path/to/xu-0.12.6-sdk/bin/xu make gpu-offscreen-smoke
 ```
 
 `examples/gpu_offscreen` 只依赖标准库：创建采样纹理、Shader、图形管线和命令编码器，
@@ -1751,7 +1751,7 @@ macOS 直接使用 MSL，Linux 需 glslangValidator，Windows 需 DXC 预编译 
 ## 独立标准 GPU 计算示例
 
 ```sh
-XU_ROOT=/path/to/xu-0.12.4-dev.3-sdk XU_STDLIB_ROOT=/path/to/xu-0.12.4-dev.3-sdk/src XUPATH=/path/to/xu-0.12.4-dev.3-sdk/src XU=/path/to/xu-0.12.4-dev.3-sdk/bin/xu make gpu-compute-smoke
+XU_ROOT=/path/to/xu-0.12.6-sdk XU_STDLIB_ROOT=/path/to/xu-0.12.6-sdk/src XUPATH=/path/to/xu-0.12.6-sdk/src XU=/path/to/xu-0.12.6-sdk/bin/xu make gpu-compute-smoke
 ```
 
 `examples/gpu_compute` 只导入标准库；上传 1,027 个 uint32 值，先计算 `3x+7`，在新的计算 Pass 中计算 `5x+11`，
@@ -1774,7 +1774,7 @@ Xu `math.float64_bits/from_bits` 保留 binary64 位模式；`float32_bits/from_
 ## 独立标准窗口与 GPU 呈现示例
 
 ```sh
-XU_ROOT=/path/to/xu-0.12.4-dev.3-sdk XU_STDLIB_ROOT=/path/to/xu-0.12.4-dev.3-sdk/src XUPATH=/path/to/xu-0.12.4-dev.3-sdk/src XU=/path/to/xu-0.12.4-dev.3-sdk/bin/xu make gpu-surface-smoke
+XU_ROOT=/path/to/xu-0.12.6-sdk XU_STDLIB_ROOT=/path/to/xu-0.12.6-sdk/src XUPATH=/path/to/xu-0.12.6-sdk/src XU=/path/to/xu-0.12.6-sdk/bin/xu make gpu-surface-smoke
 ./build/gpu-surface --frames 240 --backend auto --shaders build/gpu-surface-shaders
 ```
 
@@ -1797,7 +1797,7 @@ MSL、GLSL、HLSL 源码与独立 shader 准备工具均已提供；本机真实
 ## 标准窗口输入与引擎动作示例
 
 ```sh
-NEXUS_XU_SDK="$HOME/.xu"  # 或完整的 0.12.4-dev.3 SDK 目录
+NEXUS_XU_SDK="$HOME/.xu"  # 或完整的 0.12.6 SDK 目录
 XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" XUPATH="$NEXUS_XU_SDK/src" XU="$NEXUS_XU_SDK/bin/xu" make window-input-smoke
 ./build/window-input --frames 600
 ```
@@ -1951,7 +1951,7 @@ CSM 默认深度/角度偏置为 0.0003 / 0.001，可通过 `with_bias` 调整�
 预览 `--cascades 0|2|3|4`（默认 0）只允许方向光；`--shadow-distance` 为 0.1...100，默认 15；`--camera-motion true` 绕目标移动相机并逐帧重拟合。纯 CPU 隔离检查覆盖旋转/缩放相机、全部重叠角点与纹素稳定。独立参考使用物理相机射线/斜面交点、解析包围球、实际遮挡矩形、帐篷 PCF 和交界/远端混合，核对 61,440 个像素（7,680 个混合带、864 个远端淡出），最大误差 1 个码值。测试几何先验证边界远离硬件覆盖的亚像素平局，不跳过输出像素。
 Metal 另覆盖斜面自阴影、错误相机与不可编码参数保留旧图、父级相机适配、64 MiB 预算恢复及级联分配/提交故障；扫描人头开关对照、人物/猫/树分别用 4/2/3 级完成移动相机运行。
 
-当前仍缺多灯共享图集/分配器、自动更新调度、透明阴影、阴影场景持久化与 IBL。真实 GPU 证据仅 macOS arm64 Metal，GLSL/HLSL 已同步，Vulkan/D3D12 尚未编译或真机执行。未发布接口统一为 `ShadowDescription3D` / `ShadowMap3D`，无历史门面；六面投影、图集和过滤策略属于 nexus，通用设备/纹理/viewport/scissor/采样/提交复用 Xu 0.12.4-dev.3 标准库。
+当前仍缺多灯共享图集/分配器、自动更新调度、透明阴影、阴影场景持久化与 IBL。真实 GPU 证据仅 macOS arm64 Metal，GLSL/HLSL 已同步，Vulkan/D3D12 尚未编译或真机执行。未发布接口统一为 `ShadowDescription3D` / `ShadowMap3D`，无历史门面；六面投影、图集和过滤策略属于 nexus，通用设备/纹理/viewport/scissor/采样/提交复用 Xu 0.12.6 标准库。
 
 ## 光源场景保存与恢复
 
