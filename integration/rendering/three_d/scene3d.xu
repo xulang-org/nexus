@@ -13,6 +13,7 @@ pub struct Scene3D {
     materials map[int]ren.Material3D
     lods map[int]MeshLods3D
     lod_levels map[int]int
+    bound_nodes []int
     count int
 }
 pub struct SceneDraw3D {
@@ -26,7 +27,7 @@ pub struct SceneDraw3D {
 pub fn new_scene_3d(device &ren.Device3D) Scene3D {
     device.backend() or >>
     << Scene3D{owner: device.reference(), meshes: map[int]ren.MeshRef3D{}, materials: map[int]ren.Material3D{},
-        lods: map[int]MeshLods3D{},lod_levels: map[int]int{},count: 0}
+        lods: map[int]MeshLods3D{},lod_levels: map[int]int{},bound_nodes: []int{},count: 0}
 }
 // One mesh per node; attaching again replaces that node's weak resource binding.
 // Keys use the full node ID; no dependency on SceneTree's private slot encoding.
@@ -34,6 +35,7 @@ pub fn (scene $&Scene3D) attach_mesh(tree &nexus.SceneTree, node int, mesh &ren.
     added := scene.check_mesh_binding(tree, node, mesh) or >>
     scene.clear_lods(node)
     scene.count = scene.count + added
+    if added == 1 { scene.bound_nodes.push(node) }
     scene.meshes[node] = mesh.reference()
     << 0
 }
@@ -63,14 +65,28 @@ pub fn (scene $&Scene3D) detach_mesh(node int) int {
     materials := $&scene.materials
     materials.delete(node)
     scene.count = scene.count - 1
+    scene.forget_bound(node)
     << 1
 }
+// The mesh map has no key iteration, so this index is what lets prune find
+// bindings whose node was already freed from the tree.
+fn (scene $&Scene3D) forget_bound(node int) {
+    $kept := []int{}
+    for i in 0:scene.bound_nodes.len {
+        if scene.bound_nodes[i] != node { kept.push(scene.bound_nodes[i]) }
+    }
+    scene.bound_nodes = kept
+}
 // Clear freed/queued bindings; GPU resources are owned independently and survive.
+// A node that was already flushed is gone from the tree, so it is found through
+// the bound node index instead of by walking the live subtree.
 pub fn (scene $&Scene3D) prune(tree &nexus.SceneTree) int {
-    order := tree.subtree(tree.root()) or >>
     $drop := []int{}
-    for node in order {
+    for i in 0:scene.bound_nodes.len {
+        node := scene.bound_nodes[i]
         if !scene.meshes.has(node) { -> }
+        if !tree.is_alive(node) { drop.push(node)
+            -> }
         info := tree.node_info(node) or >>
         if info.queued_free { drop.push(node) }
     }
