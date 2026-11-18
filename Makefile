@@ -172,7 +172,7 @@ phone-app-test: sdk
 	$(XU) build tests/phone_app_checks.xu -o build/phone-app-tests
 	SDL_VIDEODRIVER=dummy ./build/phone-app-tests
 
-phone-3d-budget-test: sdk
+phone-3d-budget-test: sdk mesh-shaders
 	mkdir -p build
 	$(XU) build tests/phone_3d_budget_checks.xu -o build/phone-3d-budget-tests
 	./build/phone-3d-budget-tests
@@ -375,7 +375,7 @@ gpu-smoke: present-fallback-test text-2d-test ui-hud-test shadow-gpu-test render
 	$(XU) build examples/scene_scripts/main.xu -o build/scene-scripts-demo
 	$(PYTHON) tests/scene_script_gpu_checks.py
 
-gpu3d-smoke: lighting-gpu-test mesh-shaders native glb-fixtures glb-material-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
+gpu3d-smoke: lighting-gpu-test mesh-shaders canvas-shaders native glb-fixtures glb-material-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
 	mkdir -p build
 	$(XU) build tests/gpu3d_smoke.xu -o build/gpu3d-smoke
 	./build/gpu3d-smoke
