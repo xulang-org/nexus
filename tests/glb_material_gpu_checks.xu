@@ -1,0 +1,191 @@
+@main
+
+light_data #"github.com/xulang-org/nexus/resources/lighting"
+
+#gpu
+
+gpu_info #"github.com/xulang-org/nexus/platform/gpu"
+
+mesh_shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+
+gltf #"github.com/xulang-org/nexus/formats/gltf"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+fm #"github.com/xulang-org/nexus/foundation/math"
+scene_render #"github.com/xulang-org/nexus/integration/rendering/three_d"
+assets #"github.com/xulang-org/nexus/assets/gltf"
+glb #"github.com/xulang-org/nexus/integration/gltf_render"
+nexus #"github.com/xulang-org/nexus/scene"
+#math
+
+fn channel(pixel int, index int) int {
+    if index == 0 { << pixel / 16777216 % 256 }
+    if index == 1 { << pixel / 65536 % 256 }
+    << pixel / 256 % 256
+}
+fn check(pixel int, red int, green int, blue int) {
+    values := [red, green, blue]
+    for i in 0:3 {
+        if math.abs(f64(channel(pixel, i) - values[i])) > 2.0 { println("Material pixel=" + str(pixel) + " expected=" + str(red) + "," + str(green) + "," + str(blue)) }
+        assert(math.abs(f64(channel(pixel, i) - values[i])) <= 2.0)
+    }
+}
+fn render_projection(device $&ren.Device3D, name string, light &light_data.Environment3D, world fm.Mat4, projection fm.Mat4) int {
+    asset := assets.load_glb_geometry("build/glb-material-fixtures/" + name + ".glb") or >>
+    $model := glb.upload_model(device, &asset) or >>
+    $tree := nexus.new_scene_tree_3d("Import", 32) or >>
+    root := tree.root()
+    instance := assets.instantiate(&asset, $&tree, root, "Model") or >>
+    node := instance.source_node(0) or >>
+    tree.set_transform_3d(node, world) or >>
+    $scene := scene_render.new_scene_3d(device) or >>
+    assert((model.bind($&scene, &tree, &instance) or >>) == 1)
+    device.begin(255) or >>
+    assert((scene.draw_lit(device, &tree, projection, light) or >>).instances == 1)
+    pixel := device.read_pixel(32, 32) or >>
+    device.present() or >>
+    model.close() or >>
+    model.close() or >>
+    << pixel
+}
+fn render(device $&ren.Device3D, name string, light &light_data.Environment3D, world fm.Mat4) int {
+    << render_projection(device, name, light, world, fm.identity_3d()) or >>
+}
+fn bad_upload(device &ren.Device3D, asset &gltf.GlbGeometry) bool {
+    glb.upload_model(device, asset) or (err) { << true }
+    << false
+}
+fn bad_bind(model &glb.GlbModel3D, scene $&scene_render.Scene3D, tree &nexus.SceneTree, instance &assets.GlbInstance) bool {
+    model.bind(scene, tree, instance) or (err) { << true }
+    << false
+}
+fn failed_mesh_staging() int {
+    mesh_program_0 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d("GLB partial mesh rollback", 32, 32, gpu.AUTO, &mesh_program_0) or >>
+    asset := assets.load_glb_geometry("build/glb-material-fixtures/two.glb") or >>
+    $meshes := []ren.Mesh3D{}
+    for i in 0:511 { meshes.push(glb.upload_primitive(&device, &asset, 0) or >>) }
+    assert(bad_upload(&device, &asset))
+    $last := glb.upload_primitive(&device, &asset, 0) or >>
+    // A texture was uploaded before the second mesh failed. The full 64 MiB
+    // image budget must be available again while all 512 meshes remain alive.
+    $pixels := []int{}
+    for i in 0:4194304 { pixels.push(4294967295) }
+    $textures := []ren.Texture3D{}
+    for i in 0:4 { textures.push(device.texture_rgba(2048, 2048, &pixels, false, false, false) or >>) }
+    device.close() or >>
+    << 0
+}
+fn failed_staging() int {
+    mesh_program_1 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d("GLB upload rollback", 32, 32, gpu.AUTO, &mesh_program_1) or >>
+    for name in ["no-normal", "no-tangent", "no-uv", "broken-png", "gpu-budget", "decode-budget"] {
+        asset := assets.load_glb_geometry("build/glb-material-fixtures/" + name + ".glb") or >>
+        assert(bad_upload(&device, &asset))
+    }
+    // Failed staged uploads must release every already-created image, including
+    // the three large mip chains allocated before the fourth exceeded 64 MiB.
+    $large_pixels := []int{}
+    for i in 0:4194304 { large_pixels.push(4294967295) }
+    $large_textures := []ren.Texture3D{}
+    for i in 0:4 { large_textures.push(device.texture_rgba(2048, 2048, &large_pixels, false, false, false) or >>) }
+    device.close() or >>
+    mesh_program_2 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $slots := ren.open_3d("GLB rollback texture slots", 32, 32, gpu.AUTO, &mesh_program_2) or >>
+    pixel := [4294967295]
+    $textures := []ren.Texture3D{}
+    for i in 0:512 { textures.push(slots.texture_rgba(1, 1, &pixel, false, false, false) or >>) }
+    slots.close() or >>
+    << 0
+}
+fn run() int {
+    mesh_program_3 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d("Xu GLB material GPU checks", 64, 64, gpu.AUTO, &mesh_program_3) or >>
+    println("GLB material GPU backend: " + gpu_info.backend_name(device.backend() or >>))
+    zero := fm.vec3(0.0, 0.0, 0.0)
+    ambient := light_data.environment(fm.vec3(1.0, 1.0, 1.0), fm.vec3(0.0, 0.0, 2.0), 1.0, [light_data.directional(fm.vec3(0.0, 0.0, 1.0), zero) or >>]) or >>
+    direct := light_data.environment(zero, fm.vec3(0.0, 0.0, 2.0), 1.0, [light_data.directional(fm.vec3(0.0, 0.0, 1.0), fm.vec3(3.0, 3.0, 3.0)) or >>]) or >>
+    identity := fm.identity_3d()
+    check(render($&device, "base", &ambient, identity) or >>, 117, 117, 117)
+    check(render($&device, "mr", &ambient, identity) or >>, 188, 188, 188)
+    check(render($&device, "ao", &ambient, identity) or >>, 156, 156, 156)
+    check(render($&device, "independent", &ambient, identity) or >>, 156, 156, 156)
+    check(render($&device, "all", &ambient, identity) or >>, 156, 161, 175)
+    check(render($&device, "sharing", &ambient, identity) or >>, 104, 104, 104)
+    mirrored := fm.scale_3d(fm.vec3(-1.0, 1.0, 1.0))
+    check(render($&device, "base", &ambient, mirrored) or >>, 117, 117, 117)
+    check(render_projection($&device, "base", &ambient, identity, mirrored) or >>, 117, 117, 117)
+    check(render_projection($&device, "double", &ambient, identity, mirrored) or >>, 188, 188, 188)
+    rotated := fm.translation_3d(fm.vec3(0.0, 0.0, 1.0)).multiply(fm.rotation_y(math.pi()))
+    check(render($&device, "base", &ambient, rotated) or >>, 0, 0, 0)
+    // A reversed single-sided surface is culled. Double-sided surface remains
+    // visible and reverses its normal before direct lighting.
+    front := render($&device, "double", &direct, identity) or >>
+    back := render($&device, "double", &direct, rotated) or >>
+    assert(channel(front, 0) > 100 && math.abs(f64(channel(front, 0) - channel(back, 0))) <= 2.0)
+    assert(channel(render($&device, "double", &direct, mirrored) or >>, 0) > 100)
+    for name in ["sharing", "samplers", "all", "default", "empty-pbr"] {
+        asset := assets.load_glb_geometry("build/glb-material-fixtures/" + name + ".glb") or >>
+        $model := glb.upload_model(&device, &asset) or >>
+        $wanted := 0
+        if name == "sharing" || name == "samplers" { wanted = 2 }
+        if name == "all" { wanted = 5 }
+        assert(model.texture_count() == wanted && model.material_count() == asset.material_count() + 1)
+        $tree := nexus.new_scene_tree_3d("Shared", 32) or >>
+        root := tree.root()
+        first := assets.instantiate(&asset, $&tree, root, "First") or >>
+        second := assets.instantiate(&asset, $&tree, root, "Second") or >>
+        $scene := scene_render.new_scene_3d(&device) or >>
+        model.bind($&scene, &tree, &first) or >>
+        model.bind($&scene, &tree, &second) or >>
+        assert(scene.binding_count() == 2 && model.texture_count() == wanted)
+        model.close() or >>
+    }
+    // A whole-batch error must not publish the earlier valid primitive.
+    two := assets.load_glb_geometry("build/glb-material-fixtures/two.glb") or >>
+    $two_model := glb.upload_model(&device, &two) or >>
+    $tree := nexus.new_scene_tree_3d("Atomic", 32) or >>
+    root := tree.root()
+    instance := assets.instantiate(&two, $&tree, root, "Two") or >>
+    first_node := instance.primitive_node(0) or >>
+    last_node := instance.primitive_node(1) or >>
+    $mesh := glb.upload_primitive(&device, &two, 0) or >>
+    $scene := scene_render.new_scene_3d(&device) or >>
+    red := ren.material_3d(fm.vec3(1.0, 0.0, 0.0), 0.0, 1.0, zero) or >>
+    scene.attach_surface(&tree, first_node, &mesh, red) or >>
+    tree.queue_free(last_node) or >>
+    assert(bad_bind(&two_model, $&scene, &tree, &instance) && scene.binding_count() == 1)
+    device.begin(255) or >>
+    scene.draw_lit($&device, &tree, identity, &ambient) or >>
+    check(device.read_pixel(32, 32) or >>, 188, 0, 0)
+    device.present() or >>
+    // A new surface replaces a stale old material atomically; preflight must
+    // check the candidate rather than requiring the retired texture to live.
+    base_asset := assets.load_glb_geometry("build/glb-material-fixtures/base.glb") or >>
+    $base_model := glb.upload_model(&device, &base_asset) or >>
+    $base_tree := nexus.new_scene_tree_3d("Replace", 32) or >>
+    base_root := base_tree.root()
+    base_instance := assets.instantiate(&base_asset, $&base_tree, base_root, "Base") or >>
+    base_node := base_instance.primitive_node(0) or >>
+    $base_scene := scene_render.new_scene_3d(&device) or >>
+    pixels := [4294967295]
+    $old_texture := device.texture_rgba(1, 1, &pixels, true, false, false) or >>
+    old_material := red.with_base_texture(&old_texture) or >>
+    base_scene.attach_surface(&base_tree, base_node, &mesh, old_material) or >>
+    old_texture.close() or >>
+    assert((base_model.bind($&base_scene, &base_tree, &base_instance) or >>) == 1)
+    assert(base_scene.binding_count() == 1)
+    assert(bad_bind(&base_model, $&scene, &tree, &instance))
+    device.begin(255) or >>
+    base_scene.draw_lit($&device, &base_tree, identity, &ambient) or >>
+    check(device.read_pixel(32, 32) or >>, 117, 117, 117)
+    device.present() or >>
+    base_model.close() or >>
+    assert(bad_bind(&base_model, $&base_scene, &base_tree, &base_instance))
+    device.close() or >>
+    failed_staging() or >>
+    failed_mesh_staging() or >>
+    println("PASS: GLB PBR factors/color/MR/AO/normal/emission, MR R ignored, independent AO, sRGB variants/sampler dedup, shared instances, sidedness/back-normal/mirror and staged PNG/CPU/GPU budget rollback")
+    << 0
+}
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

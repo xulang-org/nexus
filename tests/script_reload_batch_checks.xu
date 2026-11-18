@@ -1,0 +1,45 @@
+@main
+host #"github.com/xulang-org/nexus/script/host"
+bc #"github.com/xulang-org/nexus/script/bytecode"
+nexus #"github.com/xulang-org/nexus/scene"
+#os
+
+fn load(name string) bc.Module {
+    raw := os.read("build/scene-script-fixtures/" + name + ".xubc") or >>
+    << bc.decode(&raw) or >>
+}
+fn bad_batch(scripts $&host.SceneScripts, tree &nexus.SceneTree, ids &[]int, raw &string) bool {
+    scripts.reload_many(tree, ids, raw) or (err) { << true }
+    << false
+}
+fn run() int {
+    $tree := nexus.new_scene_tree("World", 8) or >>
+    root := tree.root()
+    a := tree.add_child(root, "A") or >>
+    b := tree.add_child(root, "B") or >>
+    $scripts := host.new_scene_scripts(4) or >>
+    first := scripts.attach(&tree, a, load("mover") or >>) or >>
+    second := scripts.attach(&tree, b, load("mover") or >>) or >>
+    scripts.physics_process(&tree, first, 0.1, 1.0) or >>
+    // Only the second instance has retired field 3; a batch reintroducing it
+    // fails after a valid first candidate, without publishing that candidate.
+    scripts.reload(&tree, second, load("drop-field") or >>) or >>
+    raw := os.read("build/scene-script-fixtures/next.xubc") or >>
+    ids := [first, second]
+    assert(bad_batch($&scripts, &tree, &ids, &raw))
+    assert((scripts.epoch(first) or >>) == 1 && (scripts.epoch(second) or >>) == 2)
+    assert((scripts.calls(first) or >>) == 1 && (scripts.state(first, 1) or >>) == 1.0 && scripts.pending_signals() == 1)
+    duplicate := [first, first]
+    assert(bad_batch($&scripts, &tree, &duplicate, &raw))
+    drop := os.read("build/scene-script-fixtures/drop-field.xubc") or >>
+    assert((scripts.reload_many(&tree, &ids, &drop) or >>) == 1)
+    assert((scripts.epoch(first) or >>) == 2 && (scripts.epoch(second) or >>) == 2 && scripts.pending_signals() == 1)
+    assert(bad_batch($&scripts, &tree, &ids, &raw))
+    assert((scripts.epoch(first) or >>) == 2 && (scripts.epoch(second) or >>) == 2)
+    tree.queue_free(b) or >>
+    assert(bad_batch($&scripts, &tree, &ids, &drop))
+    println("PASS: batch reload preserves counters/outboxes/retirement history, rejects duplicate/stale targets and publishes no early candidate on a later VM failure")
+    << 0
+}
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

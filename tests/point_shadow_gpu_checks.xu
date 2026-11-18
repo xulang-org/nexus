@@ -1,0 +1,180 @@
+@main
+#gpu
+#os
+fm #"github.com/xulang-org/nexus/foundation/math"
+policy #"github.com/xulang-org/nexus/resources/shadow"
+mesh #"github.com/xulang-org/nexus/resources/mesh"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+nexus #"github.com/xulang-org/nexus/scene"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+bridge #"github.com/xulang-org/nexus/integration/rendering/three_d"
+shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+
+fn basis_right(face int) fm.Vec3 {
+    forward := policy.point_face_direction(face) or >>
+    $up := fm.vec3(0.0,1.0,0.0)
+    if face==2 || face==3 { up=fm.vec3(0.0,0.0,1.0) }
+    << up.cross(forward.scaled(-1.0))
+}
+fn cube(size f64) mesh.MeshData3D {
+    $data := mesh.new_mesh_data_3d()
+    for face in 0:6 {
+        forward := policy.point_face_direction(face) or >>
+        right := basis_right(face) or >>
+        up := forward.scaled(-1.0).cross(right)
+        center := forward.scaled(size)
+        for xy in [fm.vec2(-size,-size),fm.vec2(size,-size),fm.vec2(size,size),fm.vec2(-size,size)] {
+            data.vertex_lit(center.add(right.scaled(xy.x)).add(up.scaled(xy.y)),4294967295,forward.scaled(-1.0)) or >>
+        }
+        data.triangle(face*4,face*4+1,face*4+2) or >>
+        data.triangle(face*4,face*4+2,face*4+3) or >>
+    }
+    << data
+}
+fn world(center fm.Vec3,half f64) fm.Mat4 {
+    << fm.translation_3d(center).multiply(fm.scale_3d(fm.vec3(half,half,half)))
+}
+fn camera(face int,offset f64) fm.Mat4 {
+    forward := policy.point_face_direction(face) or >>
+    right := basis_right(face) or >>
+    up := forward.scaled(-1.0).cross(right)
+    // Offset the view axis to exercise face selection inside the output image.
+    target := forward.add(right.scaled(0.03+offset)).add(up.scaled(0.017))
+    view := nexus.look_at_3d(fm.vec3(0.0,0.0,0.0),target,up) or >>
+    << (nexus.perspective_3d(1.62,1.0,0.1,100.0) or >>).multiply(view)
+}
+fn capture(device $&ren.Device3D,scene &bridge.Scene3D,tree &nexus.SceneTree,vp fm.Mat4,env &lights.Environment3D,
+    shadow &ren.ShadowMap3D,enabled bool,name string,values $&[]int) string {
+    device.begin(255) or >>
+    if enabled { scene.draw_lit_shadowed(device,tree,vp,env,shadow,1) or >>
+    } else { scene.draw_lit(device,tree,vp,env) or >> }
+    values.push(device.read_pixel(32,32) or >>)
+    path := "build/point-shadow-"+name+".png"
+    device.capture(path+"") or >>
+    device.present() or >>
+    << os.read(path) or >>
+}
+fn failed_binding(shadow &ren.ShadowMap3D,env &lights.Environment3D) bool {
+    shadow.binding(env,1) or(err){ << true }
+    << false
+}
+fn failed_render(shadow $&ren.ShadowMap3D,device &ren.Device3D,description policy.ShadowDescription3D) bool {
+    empty := []ren.ShadowCaster3D{}
+    shadow.render(device,&empty,description) or(err){ << true }
+    << false
+}
+fn failed_create(device &ren.Device3D,description policy.ShadowDescription3D,program &ren.ShadowProgram3D) bool {
+    device.shadow_map(description,program) or(err){ << true }
+    << false
+}
+fn run() int {
+    program := shaders.load_mesh("build/mesh-shaders") or >>
+    shadow_program := shaders.load_shadow("build/mesh-shaders") or >>
+    $device := ren.open_3d("Point atlas shadow checks",64,64,gpu.METAL,&program) or >>
+    origin := fm.vec3(0.0,0.0,0.0)
+    white := fm.vec3(48.0,48.0,48.0)
+    point := lights.point(origin,white,10.0) or >>
+    description := policy.point(point,0.1,128) or >>
+    $shadow := device.shadow_map(description,&shadow_program) or >>
+    distant := lights.point(fm.vec3(100.0,100.0,100.0),white,1.0) or >>
+    env := lights.environment(fm.vec3(0.08,0.08,0.08),origin,1.0,[distant,point]) or >>
+    room_data := cube(3.0) or >>
+    box_data := cube(1.0) or >>
+    $room := device.upload(&room_data) or >>
+    $box := device.upload(&box_data) or >>
+    $casters := []ren.ShadowCaster3D{}
+    for center in [fm.vec3(1.5,0.12,-0.07),fm.vec3(-1.4,-0.15,0.08),fm.vec3(0.06,1.6,-0.09),
+        fm.vec3(-0.12,-1.45,0.16),fm.vec3(0.1,-0.08,1.3),fm.vec3(-0.14,0.09,-1.55)] {
+        casters.push(ren.ShadowCaster3D{mesh: box.reference(),world: world(center,0.25)})
+    }
+    // All twelve cube edges and eight corners have real occluders.
+    for pair in 0:3 { for a in [-1.0,1.0] { for b in [-1.0,1.0] {
+        $center := fm.vec3(a*1.1,b*1.1,0.15)
+        if pair==1 { center=fm.vec3(a*1.1,0.15,b*1.1) }
+        if pair==2 { center=fm.vec3(0.15,a*1.1,b*1.1) }
+        casters.push(ren.ShadowCaster3D{mesh: box.reference(),world: world(center,0.12)})
+    } } }
+    for x in [-1.0,1.0] { for y in [-1.0,1.0] { for z in [-1.0,1.0] {
+        casters.push(ren.ShadowCaster3D{mesh: box.reference(),world: world(fm.vec3(x,y,z),0.1)})
+    } } }
+    assert(casters.len==26 && (shadow.render(&device,&casters,description) or >>)==1872)
+    $tree := nexus.new_scene_tree_3d("World",16) or >>
+    node := tree.add_child_3d(tree.root(),"Room") or >>
+    $scene := bridge.new_scene_3d(&device) or >>
+    scene.attach_mesh(&tree,node,&room) or >>
+    material := ren.material_3d(fm.vec3(0.6,0.6,0.6),0.0,0.8,fm.vec3(0.0,0.0,0.0)) or >>
+    scene.set_material(&tree,node,material) or >>
+    $values := []int{}
+    $lit := []string{}
+    $dark := []string{}
+    for face in 0:6 {
+        vp := camera(face,0.0) or >>
+        lit.push(capture($&device,&scene,&tree,vp,&env,&shadow,false,str(face)+"-lit",$&values) or >>)
+        dark.push(capture($&device,&scene,&tree,vp,&env,&shadow,true,str(face)+"-occluded",$&values) or >>)
+        assert(values[face*2+1]<values[face*2] && lit[face]!=dark[face])
+    }
+    duplicate := lights.environment(fm.vec3(0.08,0.08,0.08),origin,1.0,[distant,point,point]) or >>
+    capture($&device,&scene,&tree,camera(0,0.0) or >>,&duplicate,&shadow,true,"duplicate",$&values) or >>
+    assert(values[12]==values[0])
+    for changed in [lights.point(fm.vec3(0.1,0.0,0.0),white,10.0) or >>,lights.point(origin,white,9.0) or >>,
+        lights.directional(fm.vec3(0.0,0.0,1.0),white) or >>] {
+        changed_env := lights.environment(fm.vec3(0.08,0.08,0.08),origin,1.0,[distant,changed]) or >>
+        assert(failed_binding(&shadow,&changed_env))
+    }
+    assert(failed_render($&shadow,&device,policy.default_directional()))
+    after := capture($&device,&scene,&tree,camera(0,0.0) or >>,&env,&shadow,true,"after-invalid",$&values) or >>
+    assert(after==dark[0])
+    capture($&device,&scene,&tree,camera(0,-0.00001) or >>,&env,&shadow,true,"jitter-left",$&values) or >>
+    capture($&device,&scene,&tree,camera(0,0.00001) or >>,&env,&shadow,true,"jitter-right",$&values) or >>
+    moved_point := lights.point(fm.vec3(0.25,0.1,-0.2),white,10.0) or >>
+    moved_description := policy.point(moved_point,0.1,128) or >>
+    moved_env := lights.environment(fm.vec3(0.08,0.08,0.08),origin,1.0,[distant,moved_point]) or >>
+    shadow.render(&device,&casters,moved_description) or >>
+    moved_lit := capture($&device,&scene,&tree,camera(0,0.0) or >>,&moved_env,&shadow,false,"moved-lit",$&values) or >>
+    moved_dark := capture($&device,&scene,&tree,camera(0,0.0) or >>,&moved_env,&shadow,true,"moved-occluded",$&values) or >>
+    assert(moved_lit!=moved_dark && moved_dark!=dark[0])
+    moved_empty := []ren.ShadowCaster3D{}
+    shadow.render(&device,&moved_empty,moved_description) or >>
+    moved_clear := capture($&device,&scene,&tree,camera(0,0.0) or >>,&moved_env,&shadow,true,"moved-empty",$&values) or >>
+    assert(moved_clear==moved_lit)
+    // A sloped receiving plane crosses point-face seams; normals are smoothed.
+    $plane := mesh.new_mesh_data_3d()
+    for xy in [fm.vec2(-5.0,-5.0),fm.vec2(-5.0,5.0),fm.vec2(5.0,5.0),fm.vec2(5.0,-5.0)] {
+        plane.vertex_lit(fm.vec3(xy.x,xy.y,3.0+0.2*xy.x+0.1*xy.y),4294967295,fm.vec3(0.0,0.0,-1.0)) or >>
+    }
+    plane.triangle(0,1,2) or >>
+    plane.triangle(0,2,3) or >>
+    $sloped := device.upload(&plane) or >>
+    scene.attach_mesh(&tree,node,&sloped) or >>
+    self_casters := scene.shadow_casters(&tree) or >>
+    shadow.render(&device,&self_casters,description) or >>
+    control := capture($&device,&scene,&tree,camera(4,0.0) or >>,&env,&shadow,false,"plane-control",$&values) or >>
+    self := capture($&device,&scene,&tree,camera(4,0.0) or >>,&env,&shadow,true,"plane-self",$&values) or >>
+    assert(control==self)
+    scene.attach_mesh(&tree,node,&room) or >>
+    empty := []ren.ShadowCaster3D{}
+    for i in 0:30 { shadow.render(&device,&empty,description) or >> }
+    for face in 0:6 {
+        cleared := capture($&device,&scene,&tree,camera(face,0.0) or >>,&env,&shadow,true,str(face)+"-empty",$&values) or >>
+        assert(cleared==lit[face])
+    }
+    large := policy.point(point,0.1,512) or >>
+    $extra := []ren.ShadowMap3D{}
+    for i in 0:2 { item := device.shadow_map(large,&shadow_program) or >>
+        extra.push(item) }
+    assert(failed_create(&device,large,&shadow_program))
+    for i in 0:extra.len { item := $&extra[i]
+        item.close() or >> }
+    $recovered := device.shadow_map(large,&shadow_program) or >>
+    recovered.close() or >>
+    shadow.close() or >>
+    assert(failed_binding(&shadow,&env))
+    room.close() or >>
+    box.close() or >>
+    sloped.close() or >>
+    device.close() or >>
+    println("PASS: point shadow atlas six faces/12 edges/8 corners, stable duplicate-light identity, stale source/layout rejection, cross-face sloped-plane self shadow, six-face clear/30 refreshes, 24 MiB map budget/lifetime recovery")
+    << 0
+}
+fn main() int { << run() or(err){ eprintln(err.msg())
+    << 1 } }

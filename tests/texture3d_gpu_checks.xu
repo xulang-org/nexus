@@ -1,0 +1,264 @@
+@main
+
+light_data #"github.com/xulang-org/nexus/resources/lighting"
+
+#gpu
+
+gpu_info #"github.com/xulang-org/nexus/platform/gpu"
+
+mesh_shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+fm #"github.com/xulang-org/nexus/foundation/math"
+scene_render #"github.com/xulang-org/nexus/integration/rendering/three_d"
+nexus #"github.com/xulang-org/nexus/scene"
+assets #"github.com/xulang-org/nexus/assets/gltf"
+glb #"github.com/xulang-org/nexus/integration/gltf_render"
+#math
+
+fn quad(uv fm.Vec2, varying bool, flags int, color int) meshes.MeshData3D {
+    $data := meshes.new_mesh_data_3d()
+    positions := [fm.vec3(-1.0, 1.0, 0.5), fm.vec3(1.0, 1.0, 0.5), fm.vec3(1.0, -1.0, 0.5), fm.vec3(-1.0, -1.0, 0.5)]
+    coordinates := [fm.vec2(0.0, 0.0), fm.vec2(1.0, 0.0), fm.vec2(1.0, 1.0), fm.vec2(0.0, 1.0)]
+    for i in 0:4 {
+        $point := uv
+        if varying { point = coordinates[i] }
+        if flags == 3 { data.vertex_lit_uv(positions[i], color, fm.vec3(0.0, 0.0, 1.0), point) or >>
+        } else if flags == 2 { data.vertex_uv(positions[i], color, point) or >>
+        } else if flags == 1 || (flags == 4 && i == 3) { data.vertex_lit(positions[i], color, fm.vec3(0.0, 0.0, 1.0)) or >>
+        } else if flags == 4 { data.vertex_lit_uv(positions[i], color, fm.vec3(0.0, 0.0, 1.0), point) or >>
+        } else { data.vertex(positions[i], color) or >> }
+    }
+    data.triangle(0, 2, 1) or >>
+    data.triangle(0, 3, 2) or >>
+    << data
+}
+fn channel(pixel int, index int) int {
+    if index == 0 { << pixel / 16777216 % 256 }
+    if index == 1 { << pixel / 65536 % 256 }
+    << pixel / 256 % 256
+}
+fn check(pixel int, red int, green int, blue int) {
+    expected := [red, green, blue]
+    for i in 0:3 { assert(math.abs(f64(channel(pixel, i) - expected[i])) <= 2.0) }
+    assert(pixel % 256 == 255)
+}
+fn sample(device $&ren.Device3D, mesh &ren.Mesh3D, material &ren.Material3D, light &light_data.Environment3D) int {
+    device.begin(255) or >>
+    device.draw_material(mesh, fm.identity_3d(), fm.identity_3d(), material, light) or >>
+    pixel := device.read_pixel(32, 32) or >>
+    device.present() or >>
+    << pixel
+}
+fn rejected(device $&ren.Device3D, mesh &ren.Mesh3D, material &ren.Material3D, light &light_data.Environment3D) bool {
+    device.draw_material(mesh, fm.identity_3d(), fm.identity_3d(), material, light) or (err) { << true }
+    << false
+}
+fn bad_upload(device &ren.Device3D, width int, height int, pixels &[]int) bool {
+    device.texture_rgba(width, height, pixels, true, false, false) or (err) { << true }
+    << false
+}
+fn bad_set(scene $&scene_render.Scene3D, tree &nexus.SceneTree, node int, material ren.Material3D) bool {
+    scene.set_material(tree, node, material) or (err) { << true }
+    << false
+}
+fn bad_replace(scene $&scene_render.Scene3D, tree &nexus.SceneTree, node int, mesh &ren.Mesh3D) bool {
+    scene.attach_mesh(tree, node, mesh) or (err) { << true }
+    << false
+}
+fn bad_uv(data $&meshes.MeshData3D) bool {
+    data.vertex_lit_uv(fm.vec3(0.0, 0.0, 0.0), 4294967295, fm.vec3(0.0, 0.0, 1.0), fm.vec2(1000001.0, 0.0)) or (err) { << true }
+    << false
+}
+fn stale_bind(material &ren.Material3D, texture &ren.Texture3D) bool {
+    material.with_base_texture(texture) or (err) { << true }
+    << false
+}
+fn texture_budget() int {
+    mesh_program_0 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d("Texture budget checks", 32, 32, gpu.AUTO, &mesh_program_0) or >>
+    $pixels := []int{}
+    for i in 0:4194304 { pixels.push(4294967295) }
+    $textures := []ren.Texture3D{}
+    for i in 0:4 { textures.push(device.texture_rgba(2048, 2048, &pixels, true, false, false) or >>) }
+    single := [4294967295]
+    assert(bad_upload(&device, 1, 1, &single))
+    first := $&textures[0]
+    first.close() or >>
+    $after := device.texture_rgba(1, 1, &single, true, false, false) or >>
+    device.close() or >>
+    after.close() or >>
+    << 0
+}
+fn texture_capacity() int {
+    mesh_program_1 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d("Texture capacity checks", 32, 32, gpu.AUTO, &mesh_program_1) or >>
+    pixels := [4294967295]
+    $textures := []ren.Texture3D{}
+    for i in 0:512 { textures.push(device.texture_rgba(1, 1, &pixels, true, false, false) or >>) }
+    assert(bad_upload(&device, 1, 1, &pixels))
+    first := $&textures[0]
+    first.close() or >>
+    $after := device.texture_rgba(1, 1, &pixels, true, false, false) or >>
+    device.close() or >>
+    after.close() or >>
+    << 0
+}
+fn run() int {
+    mesh_program_2 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d("Xu base texture GPU checks", 64, 64, gpu.AUTO, &mesh_program_2) or >>
+    println("Texture GPU checks backend: " + gpu_info.backend_name(device.backend() or >>))
+    zero := fm.vec3(0.0, 0.0, 0.0)
+    white := fm.vec3(1.0, 1.0, 1.0)
+    material := ren.material_3d(white, 0.0, 1.0, zero) or >>
+    light := light_data.environment(white, fm.vec3(0.0, 0.0, 2.0), 1.0, [light_data.directional(fm.vec3(0.0, 0.0, 1.0), zero) or >>]) or >>
+    $source := quad(fm.vec2(0.5, 0.5), true, 3, 4294967295) or >>
+    before := source.vertex_count()
+    assert(bad_uv($&source) && source.vertex_count() == before)
+    $mesh := device.upload(&source) or >>
+    $pixels := [2155905279]
+    $srgb := device.texture_rgba(1, 1, &pixels, true, false, false) or >>
+    $linear := device.texture_rgba(1, 1, &pixels, false, false, false) or >>
+    srgb_material := material.with_base_texture(&srgb) or >>
+    linear_material := material.with_base_texture(&linear) or >>
+    // Independent reference: sRGB(128/255) decodes to 0.21586, then
+    // Reinhard + sRGB output yields 117. Linear 128/255 yields 156.
+    check(sample($&device, &mesh, &srgb_material, &light) or >>, 117, 117, 117)
+    check(sample($&device, &mesh, &linear_material, &light) or >>, 156, 156, 156)
+    pixels[0] = 4294967295
+    check(sample($&device, &mesh, &srgb_material, &light) or >>, 117, 117, 117)
+    $quadrants := [4278190335, 16711935, 65535, 4294967295]
+    $corners := device.texture_rgba(2, 2, &quadrants, true, false, false) or >>
+    corner_material := material.with_base_texture(&corners) or >>
+    device.begin(255) or >>
+    device.draw_material(&mesh, fm.identity_3d(), fm.identity_3d(), &corner_material, &light) or >>
+    check(device.read_pixel(16, 16) or >>, 188, 0, 0)
+    check(device.read_pixel(48, 16) or >>, 0, 188, 0)
+    check(device.read_pixel(16, 48) or >>, 0, 0, 188)
+    check(device.read_pixel(48, 48) or >>, 188, 188, 188)
+    device.present() or >>
+    $bw := [255, 4294967295]
+    $filtered := device.texture_rgba(2, 1, &bw, true, true, false) or >>
+    filtered_material := material.with_base_texture(&filtered) or >>
+    middle_source := quad(fm.vec2(0.5, 0.5), false, 3, 4294967295) or >>
+    $middle := device.upload(&middle_source) or >>
+    // Black/white sRGB texels must be filtered AFTER decoding, yielding
+    // linear 0.5 -> 156. Filtering encoded bytes first would yield 117.
+    check(sample($&device, &middle, &filtered_material, &light) or >>, 156, 156, 156)
+    $rg := [4278190335, 16711935]
+    $clamped := device.texture_rgba(2, 1, &rg, true, false, false) or >>
+    $repeated := device.texture_rgba(2, 1, &rg, true, false, true) or >>
+    clamp_material := material.with_base_texture(&clamped) or >>
+    repeat_material := material.with_base_texture(&repeated) or >>
+    for u in [1.25, -0.75] {
+        outside_source := quad(fm.vec2(u, 0.5), false, 3, 4294967295) or >>
+        $outside := device.upload(&outside_source) or >>
+        check(sample($&device, &outside, &repeat_material, &light) or >>, 188, 0, 0)
+        if u > 0.0 { check(sample($&device, &outside, &clamp_material, &light) or >>, 0, 188, 0)
+        } else { check(sample($&device, &outside, &clamp_material, &light) or >>, 188, 0, 0) }
+    }
+    // Both sampler axes, alpha ignored by the opaque pipeline.
+    $alpha_pixels := [4278190080, 65535]
+    $vertical := device.texture_rgba(1, 2, &alpha_pixels, true, false, true) or >>
+    vertical_material := material.with_base_texture(&vertical) or >>
+    v_source := quad(fm.vec2(0.5, 1.25), false, 3, 4294967295) or >>
+    $v_mesh := device.upload(&v_source) or >>
+    check(sample($&device, &v_mesh, &vertical_material, &light) or >>, 188, 0, 0)
+    // Switch textured -> plain material -> old vertex colors in one frame.
+    device.begin(255) or >>
+    device.draw_material(&mesh, fm.translation_3d(fm.vec3(0.0, 0.0, -0.2)), fm.identity_3d(), &corner_material, &light) or >>
+    device.draw_material(&mesh, fm.identity_3d(), fm.identity_3d(), &material, &light) or >>
+    check(device.read_pixel(32, 32) or >>, 188, 188, 188)
+    device.present() or >>
+    device.begin(255) or >>
+    device.draw_material(&mesh, fm.identity_3d(), fm.identity_3d(), &corner_material, &light) or >>
+    device.draw(&mesh, fm.translation_3d(fm.vec3(0.0, 0.0, 0.2))) or >>
+    check(device.read_pixel(32, 32) or >>, 255, 255, 255)
+    device.present() or >>
+    $tree := nexus.new_scene_tree_3d("Textures", 16) or >>
+    node := tree.add_child_3d(tree.root(), "Quad") or >>
+    $scene := scene_render.new_scene_3d(&device) or >>
+    scene.attach_mesh(&tree, node, &mesh) or >>
+    scene.set_material(&tree, node, corner_material) or >>
+    for flags in [0, 1, 2, 4] {
+        bad_source := quad(fm.vec2(0.0, 0.0), false, flags, 4294967295) or >>
+        $bad_mesh := device.upload(&bad_source) or >>
+        assert(bad_replace($&scene, &tree, node, &bad_mesh))
+        other_node := tree.add_child_3d(tree.root(), "Missing attributes" + str(flags)) or >>
+        scene.attach_mesh(&tree, other_node, &bad_mesh) or >>
+        assert(bad_set($&scene, &tree, other_node, corner_material))
+        scene.detach_mesh(other_node) or >>
+        device.begin(255) or >>
+        assert(rejected($&device, &bad_mesh, &corner_material, &light))
+        draws := scene.draw_lit($&device, &tree, fm.identity_3d(), &light) or >>
+        assert(draws.instances == 1)
+        check(device.read_pixel(16, 16) or >>, 188, 0, 0)
+        device.present() or >>
+    }
+    mesh_program_3 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $other := ren.open_3d("Foreign texture owner", 64, 64, gpu.AUTO, &mesh_program_3) or >>
+    $foreign := other.texture_rgba(1, 1, &pixels, true, false, false) or >>
+    foreign_material := material.with_base_texture(&foreign) or >>
+    assert(bad_set($&scene, &tree, node, foreign_material))
+    device.begin(255) or >>
+    assert(rejected($&device, &mesh, &foreign_material, &light))
+    assert(bad_upload(&device, 1, 1, &pixels))
+    device.present() or >>
+    assert(bad_upload(&device, 0, 1, &pixels) && bad_upload(&device, 4097, 1, &pixels) && bad_upload(&device, 2, 2, &pixels))
+    bad_pixels := [-1]
+    assert(bad_upload(&device, 1, 1, &bad_pixels))
+    bad_pixels2 := [4294967296]
+    assert(bad_upload(&device, 1, 1, &bad_pixels2))
+    srgb.close() or >>
+    srgb.close() or >>
+    $reused := device.texture_rgba(1, 1, &pixels, true, false, false) or >>
+    assert(stale_bind(&material, &srgb))
+    assert(bad_set($&scene, &tree, node, srgb_material))
+    device.begin(255) or >>
+    assert(rejected($&device, &mesh, &srgb_material, &light))
+    device.present() or >>
+    // Imported geometry must retain UV values, not just a presence flag.
+    asset := assets.load_glb_geometry("build/glb-fixtures/triangle.glb") or >>
+    $imported := glb.upload_primitive(&device, &asset, 0) or >>
+    $fade_pixels := [255, 4294967295]
+    $fade_texture := device.texture_rgba(2, 1, &fade_pixels, true, true, false) or >>
+    fade_material := material.with_base_texture(&fade_texture) or >>
+    projection := nexus.perspective_3d(math.pi() / 2.0, 1.0, 0.1, 100.0) or >>
+    device.begin(255) or >>
+    device.draw_material(&imported, fm.translation_3d(fm.vec3(0.0, 0.0, -2.0)), projection, &fade_material, &light) or >>
+    check(device.read_pixel(32, 32) or >>, 159, 0, 0)
+    device.present() or >>
+    // Odd row widths and three distinct image rows expose upload pitch bugs.
+    $odd_pixels := []int{}
+    for color in [4278190335, 16711935, 65535] {
+        for column in 0:7 { odd_pixels.push(color) }
+    }
+    $odd := device.texture_rgba(7, 3, &odd_pixels, true, false, false) or >>
+    odd_material := material.with_base_texture(&odd) or >>
+    for row in 0:3 {
+        odd_source := quad(fm.vec2(0.5, (f64(row) + 0.5) / 3.0), false, 3, 4294967295) or >>
+        $odd_mesh := device.upload(&odd_source) or >>
+        pixel := sample($&device, &odd_mesh, &odd_material, &light) or >>
+        if row == 0 { check(pixel, 188, 0, 0) }
+        if row == 1 { check(pixel, 0, 188, 0) }
+        if row == 2 { check(pixel, 0, 0, 188) }
+    }
+    assert(!material.has_base_texture() && corner_material.has_base_texture() && !corner_material.without_base_texture().has_base_texture())
+    // Releasing device first invalidates children safely even after slot reuse.
+    other.close() or >>
+    mesh_program_4 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $replacement := ren.open_3d("Reused device slot", 64, 64, gpu.AUTO, &mesh_program_4) or >>
+    foreign.close() or >>
+    replacement.close() or >>
+    device.close() or >>
+    corners.close() or >>
+    reused.close() or >>
+    texture_budget() or >>
+    texture_capacity() or >>
+    println("PASS: 64 MiB budget/512-texture capacity recovery, odd row pitch, sRGB/linear sampling, decode-before-filter, UV orientation/repeat/clamp, opaque alpha, state switching, GLB UV upload, scene preflight, stale/foreign resources and lifetime/bounds")
+    << 0
+}
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

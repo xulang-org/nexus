@@ -1,0 +1,51 @@
+@main
+
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+scene_canvas #"github.com/xulang-org/nexus/integration/rendering/two_d"
+scene #"github.com/xulang-org/nexus/scene"
+fm #"github.com/xulang-org/nexus/foundation/math"
+#math
+
+fn rejected(batch $&canvas.Batch2D, bounds fm.Rect2, uv fm.Rect2) bool {
+    batch.quad_region(bounds,fm.identity(),4294967295,uv) or(err){ << true }
+    << false
+}
+fn run() int {
+    $batch := canvas.new_batch()
+    uv := fm.rect2(0.25,0.5,0.25,0.5)
+    batch.quad_region(fm.rect2(0.123456789,2.0,3.0,4.0),fm.identity(),4278190335,uv) or >>
+    first := batch.vertex_at(0) or >>
+    assert(first.point.x == 0.123456789 && first.uv.x == 0.25 && first.uv.y == 0.5)
+    assert(first.color == 4278190335 && batch.triangle_count() == 2)
+    assert(rejected($&batch,fm.rect2(0.0,0.0,1.0,1.0),fm.rect2(0.75,0.0,0.5,1.0)))
+    assert(rejected($&batch,fm.rect2(999999.0,0.0,2.0,1.0),uv))
+    assert(batch.vertex_count() == 6)
+    batch.clear()
+    for i in 0:(canvas.MAX_VERTICES_2D/3-1) {
+        batch.triangle(fm.vec2(0.0,0.0),fm.vec2(1.0,0.0),fm.vec2(0.0,1.0),4294967295) or >>
+    }
+    assert(rejected($&batch,fm.rect2(0.0,0.0,1.0,1.0),uv))
+    assert(batch.vertex_count() == canvas.MAX_VERTICES_2D-3)
+    batch.clear()
+    $tree := scene.new_scene_tree("World",8) or >>
+    node := tree.add_child(tree.root(),"Sprite") or >>
+    tree.set_position(node,fm.vec2(8.0,16.0)) or >>
+    sprite := scene_canvas.Sprite2D{node: node,bounds: fm.rect2(0.0,0.0,2.0,4.0),region: uv,tint: 4278190335}
+    camera := fm.transform_2d(fm.vec2(-4.0,-8.0),0.0,fm.vec2(1.0,1.0))
+    sprite.record(&tree,camera,$&batch) or >>
+    transformed := batch.vertex_at(0) or >>
+    assert(math.abs(transformed.point.x-4.0)<0.000001 && math.abs(transformed.point.y-8.0)<0.000001)
+    batch.clear()
+    tree.set_visible(tree.root(),false) or >>
+    sprite.record(&tree,camera,$&batch) or >>
+    assert(batch.vertex_count() == 0)
+    tree.set_visible(tree.root(),true) or >>
+    tree.queue_free(node) or >>
+    tree.flush_free() or >>
+    sprite.record(&tree,camera,$&batch) or >>
+    assert(batch.vertex_count() == 0)
+    println("PASS: CPU canvas precision, atlas UVs, atomic validation/budget, scene transforms and visibility without GPU/native dependencies")
+    << 0
+}
+fn main() int { << run() or(err){ eprintln(err.msg())
+    << 1 } }

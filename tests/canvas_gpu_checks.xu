@@ -1,0 +1,113 @@
+@main
+ren #"github.com/xulang-org/nexus/rendering/two_d"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+shaders #"github.com/xulang-org/nexus/assets/shaders/two_d"
+fm #"github.com/xulang-org/nexus/foundation/math"
+#gpu
+#window
+#window/events
+
+fn rejected_begin(renderer $&ren.Renderer2D) bool {
+    renderer.begin(255) or(err){ << true }
+    << false
+}
+fn rejected_clip(renderer $&ren.Renderer2D) bool {
+    renderer.clip_rect(fm.rect2(-1.0,0.0,10.0,10.0)) or(err){ << true }
+    << false
+}
+fn rejected_read(renderer $&ren.Renderer2D) bool {
+    renderer.read_pixel(-1,0) or(err){ << true }
+    << false
+}
+fn rejected_present(renderer $&ren.Renderer2D) bool {
+    renderer.present() or(err){ << true }
+    << false
+}
+fn rejected_submit(renderer $&ren.Renderer2D, batch &canvas.Batch2D) bool {
+    renderer.submit(batch) or(err){ << true }
+    << false
+}
+fn rejected_shader(program &ren.ShaderProgram2D) bool {
+    ren.open_2d("Rejected canvas shader",64,64,gpu.AUTO,program) or(err){ << true }
+    << false
+}
+fn drain(renderer &ren.Renderer2D) int {
+    id := (renderer.window() or >>).id()
+    $count := 0
+    for {
+        event := renderer.poll() or >>
+        if event.kind == events.EVENT_NONE { <- }
+        assert(event.window_id == id)
+        count += 1
+    }
+    << count
+}
+fn run() int {
+    program := shaders.load_canvas("build/canvas-shaders") or >>
+    invalid := ren.ShaderProgram2D{format: program.format,entrypoint: program.entrypoint+"",vertex: []u8{},fragment: []u8{}}
+    before := window.live_count() or >>
+    for i in 0:12 { assert(rejected_shader(&invalid)) }
+    assert((window.live_count() or >>) == before)
+    $renderer := ren.open_2d("Standard canvas without nexus native archives",128,128,gpu.AUTO,&program) or >>
+    $other := ren.open_2d("Second standard canvas",64,64,gpu.AUTO,&program) or >>
+    assert((window.live_count() or >>) == before+2)
+    $batch := canvas.new_batch()
+    batch.quad(fm.rect2(0.0,0.0,128.0,128.0),fm.identity(),4278190335) or >>
+    assert(rejected_present($&renderer))
+    renderer.begin(255) or >>
+    assert(rejected_begin($&renderer))
+    renderer.clip_rect(fm.rect2(16.5,16.5,15.0,15.0)) or >>
+    assert(rejected_clip($&renderer))
+    renderer.submit(&batch) or >>
+    assert((renderer.read_pixel(16,16) or >>)==4278190335)
+    assert((renderer.read_pixel(15,16) or >>)==255)
+    assert((renderer.read_pixel(31,31) or >>)==4278190335)
+    assert((renderer.read_pixel(32,32) or >>)==255)
+    assert(rejected_read($&renderer))
+    renderer.clip_rect(fm.rect2(1024.0,1024.0,1.0,1.0)) or >>
+    renderer.submit(&batch) or >>
+    assert((renderer.read_pixel(0,0) or >>)==255)
+    renderer.reset_clip() or >>
+    renderer.submit(&batch) or >>
+    assert((renderer.read_pixel(0,0) or >>)==4278190335)
+    renderer.capture("build/canvas-standard.png") or >>
+    renderer.present() or >>
+    assert(rejected_present($&renderer))
+    $alpha := canvas.new_batch()
+    alpha.quad(fm.rect2(0.0,0.0,128.0,128.0),fm.identity(),4278190208) or >>
+    renderer.begin(65535) or >>
+    renderer.submit(&alpha) or >>
+    blended := renderer.read_pixel(0,0) or >>
+    assert(((blended >> 24) & 255)>=127 && ((blended >> 24) & 255)<=128)
+    assert(((blended >> 16) & 255)==0 && ((blended >> 8) & 255)>=127 && ((blended >> 8) & 255)<=128 && (blended & 255)==255)
+    renderer.present() or >>
+    // Invisible draws still consume the frame budget; failed submit is recoverable.
+    renderer.begin(255) or >>
+    renderer.clip_rect(fm.rect2(1024.0,1024.0,1.0,1.0)) or >>
+    for i in 0:(canvas.MAX_VERTICES_2D/6) { renderer.submit(&batch) or >> }
+    assert(rejected_submit($&renderer,&batch))
+    assert((renderer.read_pixel(0,0) or >>)==255)
+    renderer.present() or >>
+    // A window borrow uses the same standard event routing and resize lifecycle.
+    target := renderer.window() or >>
+    target.resize(96,80) or >>
+    for i in 0:4 { window.pump() or >>
+        drain(&renderer) or >>
+        drain(&other) or >> }
+    assert((renderer.width() or >>)==96 && (renderer.height() or >>)==80)
+    renderer.begin(16711935) or >>
+    assert((renderer.read_pixel(95,79) or >>)==16711935)
+    renderer.present() or >>
+    // Parent teardown invalidates only its own device/window; the other draws.
+    renderer.close() or >>
+    renderer.close() or >>
+    other.begin(65535) or >>
+    assert((other.read_pixel(0,0) or >>)==65535)
+    other.present() or >>
+    other.close() or >>
+    assert((window.live_count() or >>)==before)
+    println("PASS: native-free standard canvas pixels/capture, alpha, scissor/cache/frame budget, resize, independent windows, shader failure cleanup and frame recovery")
+    << 0
+}
+fn main() int { << run() or(err){ eprintln(err.msg())
+    << 1 } }

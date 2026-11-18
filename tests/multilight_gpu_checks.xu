@@ -1,0 +1,132 @@
+@main
+#gpu
+#math
+lights #"github.com/xulang-org/nexus/resources/lighting"
+scene #"github.com/xulang-org/nexus/scene"
+scene_lights #"github.com/xulang-org/nexus/integration/lighting"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+fm #"github.com/xulang-org/nexus/foundation/math"
+
+fn channel(pixel int,index int) int { << (pixel >> (24-index*8)) & 255 }
+fn check(pixel int,r int,g int,b int) {
+    expected := [r,g,b]
+    for i in 0:3 {
+        if math.abs(f64(channel(pixel,i)-expected[i]))>2.0 { println("Light pixel "+str(channel(pixel,i))+" expected "+str(expected[i])) }
+        assert(math.abs(f64(channel(pixel,i)-expected[i]))<=2.0)
+    }
+    assert((pixel & 255)==255)
+}
+fn sample(device $&ren.Device3D,mesh &ren.Mesh3D,material &ren.Material3D,environment &lights.Environment3D) int {
+    // Pixel 32,32 has world position exactly zero, with N=V=(0,0,1).
+    vp := fm.translation_3d(fm.vec3(1.0/64.0,-1.0/64.0,0.5))
+    device.begin(255) or >>
+    device.draw_material(mesh,fm.identity_3d(),vp,material,environment) or >>
+    pixel := device.read_pixel(32,32) or >>
+    device.present() or >>
+    << pixel
+}
+fn bad_environment(device $&ren.Device3D,mesh &ren.Mesh3D,material &ren.Material3D) bool {
+    invalid := lights.Environment3D{}
+    device.draw_material(mesh,fm.identity_3d(),fm.identity_3d(),material,&invalid) or(err){ << true }
+    << false
+}
+fn run() int {
+    program := shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d("Multiple GPU light types",64,64,gpu.AUTO,&program) or >>
+    zero := fm.vec3(0.0,0.0,0.0)
+    white := fm.vec3(1.0,1.0,1.0)
+    normal := fm.vec3(0.0,0.0,1.0)
+    eye := fm.vec3(0.0,0.0,2.0)
+    $data := meshes.new_mesh_data_3d()
+    for point in [fm.vec3(-1.0,1.0,0.0),fm.vec3(1.0,1.0,0.0),fm.vec3(1.0,-1.0,0.0),fm.vec3(-1.0,-1.0,0.0)] {
+        data.vertex_lit(point,4294967295,normal) or >>
+    }
+    data.triangle(0,2,1) or >>
+    data.triangle(0,3,2) or >>
+    $mesh := device.upload(&data) or >>
+    material := ren.material_3d(white,0.0,1.0,zero) or >>
+    red := lights.directional(normal,fm.vec3(1.0,0.0,0.0)) or >>
+    green := lights.directional(normal,fm.vec3(0.0,1.0,0.0)) or >>
+    blue := lights.directional(normal,fm.vec3(0.0,0.0,1.0)) or >>
+    // Closed form for N=V=L, roughness=1, dielectric white: direct=0.97/pi.
+    // Expected bytes include one Reinhard map and one sRGB encode, not a CPU BRDF clone.
+    single := lights.environment(zero,eye,1.0,[red]) or >>
+    check(sample($&device,&mesh,&material,&single) or >>,133,0,0)
+    mixed := lights.environment(zero,eye,1.0,[red,green,blue]) or >>
+    check(sample($&device,&mesh,&material,&mixed) or >>,133,133,133)
+    $sixteen := []lights.Light3D{}
+    for i in 0:16 { sixteen.push(lights.directional(normal,white.scaled(1.0/16.0)) or >>) }
+    maximum := lights.environment(zero,eye,1.0,sixteen) or >>
+    check(sample($&device,&mesh,&material,&maximum) or >>,133,133,133)
+    $last_slot := []lights.Light3D{}
+    for i in 0:15 { last_slot.push(lights.directional(normal,zero) or >>) }
+    last_slot.push(blue)
+    final_slot := lights.environment(zero,eye,1.0,last_slot) or >>
+    check(sample($&device,&mesh,&material,&final_slot) or >>,0,0,133)
+    empty := lights.environment(zero,eye,1.0,[]lights.Light3D{}) or >>
+    check(sample($&device,&mesh,&material,&empty) or >>,0,0,0)
+    for distance in [1.0,2.0] {
+        source := lights.point(fm.vec3(0.0,0.0,distance),white,10.0) or >>
+        environment := lights.environment(zero,eye,1.0,[source]) or >>
+        $expected := 133
+        if distance==2.0 { expected=76 }
+        check(sample($&device,&mesh,&material,&environment) or >>,expected,expected,expected)
+    }
+    finite_range := lights.environment(zero,eye,1.0,[lights.point(normal,white,2.0) or >>]) or >>
+    check(sample($&device,&mesh,&material,&finite_range) or >>,127,127,127)
+    for source in [lights.point(normal,white,1.0) or >>,lights.point(zero,white,10.0) or >>,
+        lights.point(fm.vec3(0.0,0.0,-1.0),white,10.0) or >>] {
+        environment := lights.environment(zero,eye,1.0,[source]) or >>
+        check(sample($&device,&mesh,&material,&environment) or >>,0,0,0)
+    }
+    near := lights.environment(zero,eye,1.0,[lights.point(fm.vec3(0.0,0.0,0.001),white,10.0) or >>]) or >>
+    check(sample($&device,&mesh,&material,&near) or >>,255,255,255)
+    inner := 0.2
+    outer := 0.6
+    for fraction in [0.0,0.25,0.5,0.75,1.0] {
+        cosine := math.cos(outer)+(math.cos(inner)-math.cos(outer))*fraction
+        forward := fm.vec3(math.sqrt(1.0-cosine*cosine),0.0,-cosine)
+        source := lights.spot(normal,forward,white,10.0,inner,outer) or >>
+        environment := lights.environment(zero,eye,1.0,[source]) or >>
+        $expected := 0
+        if fraction==0.25 { expected=61 }
+        if fraction==0.5 { expected=102 }
+        if fraction==0.75 { expected=125 }
+        if fraction==1.0 { expected=133 }
+        check(sample($&device,&mesh,&material,&environment) or >>,expected,expected,expected)
+    }
+    emitter := ren.material_3d(white,0.0,1.0,white.scaled(0.1)) or >>
+    ambient := lights.environment(white.scaled(0.2),eye,1.0,[]lights.Light3D{}) or >>
+    check(sample($&device,&mesh,&emitter,&ambient) or >>,132,132,132)
+    $off := []lights.Light3D{}
+    for i in 0:16 { off.push(lights.directional(normal,zero) or >>) }
+    unchanged := lights.environment(white.scaled(0.2),eye,1.0,off) or >>
+    check(sample($&device,&mesh,&emitter,&unchanged) or >>,132,132,132)
+    // Pure scene gathering drives real pixels; hidden and moved sources update.
+    $tree := scene.new_scene_tree_3d("Lights",4) or >>
+    node := tree.add_child_3d(tree.root(),"Point") or >>
+    $world := scene_lights.new_scene_lights_3d()
+    world.attach(&tree,node,lights.point(zero,white,10.0) or >>) or >>
+    tree.set_position_3d(node,normal) or >>
+    first := lights.environment(zero,eye,1.0,world.gather(&tree) or >>) or >>
+    check(sample($&device,&mesh,&material,&first) or >>,133,133,133)
+    tree.set_position_3d(node,normal.scaled(2.0)) or >>
+    second := lights.environment(zero,eye,1.0,world.gather(&tree) or >>) or >>
+    check(sample($&device,&mesh,&material,&second) or >>,76,76,76)
+    tree.set_visible(node,false) or >>
+    hidden := lights.environment(zero,eye,1.0,world.gather(&tree) or >>) or >>
+    check(sample($&device,&mesh,&material,&hidden) or >>,0,0,0)
+    device.begin(255) or >>
+    assert(bad_environment($&device,&mesh,&material))
+    device.draw_material(&mesh,fm.identity_3d(),fm.translation_3d(fm.vec3(0.0,0.0,0.5)),&material,&single) or >>
+    check(device.read_pixel(32,32) or >>,133,0,0)
+    device.present() or >>
+    device.close() or >>
+    mesh.close() or >>
+    println("PASS: Metal multiple directional/point/spot sources, slots 1/16, inverse-square/range/cone pixels, one ambient/emission tone map, scene movement/visibility and invalid-environment frame recovery")
+    << 0
+}
+fn main() int { << run() or(err){ eprintln(err.msg())
+    << 1 } }

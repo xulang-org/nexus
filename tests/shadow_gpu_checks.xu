@@ -1,0 +1,176 @@
+@main
+#gpu
+#os
+fm #"github.com/xulang-org/nexus/foundation/math"
+policy #"github.com/xulang-org/nexus/resources/shadow"
+mesh #"github.com/xulang-org/nexus/resources/mesh"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+nexus #"github.com/xulang-org/nexus/scene"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+bridge #"github.com/xulang-org/nexus/integration/rendering/three_d"
+shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+fn quad(size f64,slope bool) mesh.MeshData3D {
+    $data := mesh.new_mesh_data_3d()
+    $normal := fm.vec3(0.0,0.0,1.0)
+    // Deliberately smoothed/author normals that differ from the receiver plane.
+    // Shadow bias must use geometry rather than assuming these are flat normals.
+    for xy in [fm.vec2(-size,-size),fm.vec2(size,-size),fm.vec2(size,size),fm.vec2(-size,size)] {
+        $z := 0.0
+        if slope { z=xy.x*0.2+xy.y*0.1 }
+        data.vertex_lit(fm.vec3(xy.x,xy.y,z),4294967295,normal) or >>
+    }
+    data.triangle(0,1,2) or >>
+    data.triangle(0,2,3) or >>
+    << data
+}
+fn capture(device $&ren.Device3D,scene &bridge.Scene3D,tree &nexus.SceneTree,vp fm.Mat4,env &lights.Environment3D,
+    shadow &ren.ShadowMap3D,enabled bool,name string,values $&[]int) string {
+    device.begin(255) or >>
+    if enabled {
+        report := scene.draw_lit_shadowed(device,tree,vp,env,shadow,1) or >>
+        values.push(report.culled_instances)
+    } else {
+        report := scene.draw_lit(device,tree,vp,env) or >>
+        values.push(report.culled_instances)
+    }
+    values.push(device.read_pixel(32,32) or >>)
+    path := "build/shadow-"+name+".png"
+    device.capture(path+"") or >>
+    device.present() or >>
+    << os.read(path) or >>
+}
+fn failed_render(shadow $&ren.ShadowMap3D,device &ren.Device3D,casters &[]ren.ShadowCaster3D,description policy.ShadowDescription3D) bool {
+    shadow.render(device,casters,description) or(err){ << true }
+    << false
+}
+fn failed_binding(shadow &ren.ShadowMap3D,env &lights.Environment3D,index int) bool {
+    shadow.binding(env,index) or(err){ << true }
+    << false
+}
+fn failed_create(device &ren.Device3D,program &ren.ShadowProgram3D) bool {
+    description := policy.directional(fm.vec3(0.0,0.0,0.0),fm.vec3(0.0,0.0,1.0),2.0,6.0,1024) or >>
+    device.shadow_map(description,program) or(err){ << true }
+    << false
+}
+fn failed_projection_create(device &ren.Device3D,description policy.ShadowDescription3D,program &ren.ShadowProgram3D) bool {
+    device.shadow_map(description,program) or(err){ << true }
+    << false
+}
+fn run() int {
+    program := shaders.load_mesh("build/mesh-shaders") or >>
+    shadow_program := shaders.load_shadow("build/mesh-shaders") or >>
+    $device := ren.open_3d("Shadow checks",64,64,gpu.METAL,&program) or >>
+    $foreign := ren.open_3d("Foreign shadow",32,32,gpu.METAL,&program) or >>
+    direction := fm.vec3(0.0,0.0,1.0)
+    description := policy.directional(fm.vec3(0.0,0.0,0.0),direction,2.0,6.0,128) or >>
+    $shadow := device.shadow_map(description,&shadow_program) or >>
+    distant := lights.point(fm.vec3(100.0,100.0,100.0),fm.vec3(1.0,1.0,1.0),1.0) or >>
+    sun := lights.directional(direction,fm.vec3(3.0,3.0,3.0)) or >>
+    eye := fm.vec3(0.0,0.0,4.0)
+    env := lights.environment(fm.vec3(0.08,0.08,0.08),eye,1.0,[distant,sun]) or >>
+    assert(failed_binding(&shadow,&env,1))
+    data := quad(2.0,false) or >>
+    small := quad(0.5,false) or >>
+    sloped_data := quad(2.0,true) or >>
+    $receiver := device.upload(&data) or >>
+    $occluder := device.upload(&small) or >>
+    $sloped := device.upload(&sloped_data) or >>
+    $tree := nexus.new_scene_tree_3d("World",16) or >>
+    root := tree.root()
+    floor := tree.add_child_3d(root,"Receiver") or >>
+    $scene := bridge.new_scene_3d(&device) or >>
+    scene.attach_mesh(&tree,floor,&receiver) or >>
+    material := ren.material_3d(fm.vec3(0.6,0.6,0.6),0.0,0.8,fm.vec3(0.0,0.0,0.0)) or >>
+    scene.set_material(&tree,floor,material) or >>
+    view := nexus.look_at_3d(eye,fm.vec3(0.0,0.0,0.0),fm.vec3(0.0,1.0,0.0)) or >>
+    vp := (nexus.perspective_3d(0.8,1.0,0.1,100.0) or >>).multiply(view)
+    caster := ren.ShadowCaster3D{mesh: occluder.reference(),world: fm.translation_3d(fm.vec3(0.0,0.0,1.0))}
+    casters := [caster]
+    assert((shadow.render(&device,&casters,description) or >>)==2)
+    $lit_values := []int{}
+    lit := capture($&device,&scene,&tree,vp,&env,&shadow,false,"lit",$&lit_values) or >>
+    $dark_values := []int{}
+    dark := capture($&device,&scene,&tree,vp,&env,&shadow,true,"occluded",$&dark_values) or >>
+    assert(dark_values[1]<lit_values[1] && dark!=lit)
+    assert(failed_binding(&shadow,&env,0) && failed_binding(&shadow,&env,3))
+    assert(failed_render($&shadow,&foreign,&casters,description))
+    unencodable := policy.directional(fm.vec3(1000000000000.0,0.0,0.0),direction,2.0,6.0,128) or >>
+    none := []ren.ShadowCaster3D{}
+    assert(failed_projection_create(&device,unencodable,&shadow_program))
+    assert(failed_render($&shadow,&device,&none,unencodable))
+    $retired := device.upload(&small) or >>
+    invalid := ren.ShadowCaster3D{mesh: retired.reference(),world: fm.identity_3d()}
+    retired.close() or >>
+    bad_casters := [caster,invalid]
+    assert(failed_render($&shadow,&device,&bad_casters,description))
+    $after_values := []int{}
+    after := capture($&device,&scene,&tree,vp,&env,&shadow,true,"after-failure",$&after_values) or >>
+    assert(after==dark)
+    duplicate := lights.environment(fm.vec3(0.08,0.08,0.08),eye,1.0,[distant,sun,sun]) or >>
+    $duplicate_values := []int{}
+    capture($&device,&scene,&tree,vp,&duplicate,&shadow,true,"one-of-two",$&duplicate_values) or >>
+    assert(duplicate_values[1]==lit_values[1])
+    // Visibility only attenuates direct light, never ambient or emission.
+    indirect := lights.environment(fm.vec3(0.3,0.2,0.1),eye,1.0,[distant,lights.directional(direction,fm.vec3(0.0,0.0,0.0)) or >>]) or >>
+    emissive := ren.material_3d(fm.vec3(0.6,0.6,0.6),0.0,0.8,fm.vec3(0.2,0.3,0.4)) or >>
+    scene.set_material(&tree,floor,emissive) or >>
+    $indirect_values := []int{}
+    indirect_control := capture($&device,&scene,&tree,vp,&indirect,&shadow,false,"indirect-control",$&indirect_values) or >>
+    indirect_shadow := capture($&device,&scene,&tree,vp,&indirect,&shadow,true,"indirect-shadow",$&indirect_values) or >>
+    assert(indirect_control==indirect_shadow)
+    scene.set_material(&tree,floor,material) or >>
+    device.begin(255) or >>
+    assert(failed_render($&shadow,&device,&casters,description))
+    device.present() or >>
+    // A receiver rendered by itself must not acquire PCF stripes/acne.
+    scene.attach_mesh(&tree,floor,&sloped) or >>
+    self_casters := scene.shadow_casters(&tree) or >>
+    tilted := policy.directional(fm.vec3(0.0,0.0,0.0),fm.vec3(0.3,0.9,0.4),2.0,6.0,128) or >>
+    shadow.render(&device,&self_casters,tilted) or >>
+    sloped_env := lights.environment(fm.vec3(0.08,0.08,0.08),eye,1.0,[distant,lights.directional(tilted.direction(),fm.vec3(3.0,3.0,3.0)) or >>]) or >>
+    $self_values := []int{}
+    control := capture($&device,&scene,&tree,vp,&sloped_env,&shadow,false,"plane-control",$&self_values) or >>
+    self := capture($&device,&scene,&tree,vp,&sloped_env,&shadow,true,"plane-self",$&self_values) or >>
+    assert(self==control)
+    // A caster outside the main camera can still shadow an on-screen receiver.
+    scene.attach_mesh(&tree,floor,&receiver) or >>
+    outside := tree.add_child_3d(root,"OutsideCamera") or >>
+    tree.set_transform_3d(outside,fm.translation_3d(fm.vec3(2.2,0.0,1.0))) or >>
+    scene.attach_mesh(&tree,outside,&occluder) or >>
+    scene.set_material(&tree,outside,material) or >>
+    outside_description := policy.directional(fm.vec3(0.0,0.0,0.0),fm.vec3(2.2,0.0,1.0),3.0,8.0,128) or >>
+    outside_env := lights.environment(fm.vec3(0.08,0.08,0.08),eye,1.0,[distant,lights.directional(outside_description.direction(),fm.vec3(3.0,3.0,3.0)) or >>]) or >>
+    all := scene.shadow_casters(&tree) or >>
+    assert(all.len==2)
+    shadow.render(&device,&all,outside_description) or >>
+    $outside_values := []int{}
+    capture($&device,&scene,&tree,vp,&outside_env,&shadow,true,"outside-camera",$&outside_values) or >>
+    assert(outside_values[0]==1)
+    tree.set_visible(outside,false) or >>
+    hidden := scene.shadow_casters(&tree) or >>
+    assert(hidden.len==1)
+    shadow.render(&device,&hidden,outside_description) or >>
+    capture($&device,&scene,&tree,vp,&outside_env,&shadow,true,"hidden-caster",$&outside_values) or >>
+    assert(outside_values[3]>outside_values[1])
+    // Double-buffer ownership is bounded across many map refreshes.
+    for i in 0:100 { shadow.render(&device,&hidden,outside_description) or >> }
+    $extra := []ren.ShadowMap3D{}
+    large := policy.directional(fm.vec3(0.0,0.0,0.0),direction,2.0,6.0,1024) or >>
+    for i in 0:3 { item := device.shadow_map(large,&shadow_program) or >>
+        extra.push(item) }
+    assert(failed_create(&device,&shadow_program) or >>)
+    for i in 0:extra.len { item := $&extra[i]
+        item.close() or >> }
+    recovered := device.shadow_map(large,&shadow_program) or >>
+    shadow.close() or >>
+    assert(failed_binding(&shadow,&env,1))
+    receiver.close() or >>
+    occluder.close() or >>
+    sloped.close() or >>
+    device.close() or >>
+    foreign.close() or >>
+    println("PASS: actual R32/D32 directional shadows, per-mesh light identity/duplicate sun isolation, ambient/emission preservation, sloped-plane acne rejection, off-camera/hidden casters, failed-render preservation, map lifetime and shared-budget recovery")
+    << 0
+}
+fn main() int { << run() or(err){ eprintln(err.msg())
+    << 1 } }

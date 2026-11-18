@@ -1,0 +1,226 @@
+@main
+
+nexus #"github.com/xulang-org/nexus/scene"
+bc #"github.com/xulang-org/nexus/script/bytecode"
+vm #"github.com/xulang-org/nexus/script/vm"
+host #"github.com/xulang-org/nexus/script/host"
+files #"github.com/xulang-org/nexus/internal/file_snapshot"
+#math
+#strings
+
+fn load(name string) bc.Module { raw := files.read("build/script-fixtures/" + name + ".xubc", bc.MAX_BYTES) or >>
+    << bc.decode(&raw) or >> }
+fn near(a f64, b f64) bool { << math.abs(a - b) < 0.000001 }
+fn handler_error(machine $&vm.Instance, expected string, bound f64) bool {
+    machine.invoke_handler(41, 1.0, 4096, bound) or (err) { message := err.msg()
+        << strings.contains(&message, expected) }
+    << false
+}
+fn reload_error(machine $&vm.Instance, program bc.Module) bool {
+    machine.reload(program) or (err) { message := err.msg()
+        << strings.contains(&message, "retired handler ID") }
+    << false
+}
+fn physics_error(machine $&vm.Instance) bool {
+    machine.execute(0.1, 1.0, 4096, 1024.0) or (err) { message := err.msg()
+        << strings.contains(&message, "no physics_process") }
+    << false
+}
+fn stale(scripts &host.SceneScripts, id int) bool { scripts.epoch(id) or (err) { << true }
+    << false }
+fn duplicate_attach(scripts $&host.SceneScripts, tree &nexus.SceneTree, node int, program bc.Module) bool {
+    scripts.attach(tree, node, program) or (err) { << true }
+    << false
+}
+fn connect_error(scripts $&host.SceneScripts, tree &nexus.SceneTree, source int, signal string, target int, handler string) bool {
+    scripts.connect(tree, source, signal, target, handler) or (err) { << true }
+    << false
+}
+fn dispatch_error(scripts $&host.SceneScripts, tree &nexus.SceneTree, limit int) bool {
+    scripts.dispatch(tree, limit) or (err) { << true }
+    << false
+}
+fn leak_rejected(machine $&vm.Instance) bool {
+    machine.invoke_handler(42, 1.0, 4096, 1024.0) or (err) { message := err.msg()
+        << strings.contains(&message, "uninitialized register") }
+    << false
+}
+fn vm_checks() int {
+    program := load("receiver") or >>
+    assert(program.function_count() == 2 && program.physics_index() == -1)
+    assert((program.handler_id("on_moved") or >>) == 41)
+    $machine := vm.instantiate(program) or >>
+    assert(physics_error($&machine))
+    assert(near(machine.invoke_handler(41, 3.0, 4096, 1000000000.0) or >>, 90.0))
+    assert(near(machine.invoke_handler(42, 7.0, 4096, 1000000000.0) or >>, 7.0))
+    assert(machine.calls() == 2 && near(machine.state(1) or >>, 11.0) && near(machine.state(2) or >>, -7.0))
+    assert(machine.pending_signals() == 1)
+    machine.reload(load("receiver-v2") or >>) or >>
+    assert((machine.handler_id("on_motion") or >>) == 41)
+    assert(near(machine.invoke_handler(41, 6.0, 4096, 1000000000.0) or >>, 360.0))
+    assert(machine.calls() == 3 && near(machine.state(1) or >>, 12.0))
+    events := machine.drain_signals() or >>
+    assert(events.len == 2 && events[0].epoch == 1 && events[1].epoch == 2 && events[1].call == 3)
+    machine.reload(load("receiver-delete") or >>) or >>
+    assert(!machine.has_handler(41) && machine.has_handler(42))
+    assert(reload_error($&machine, load("receiver") or >>) && machine.epoch() == 3)
+    machine.reload(load("receiver-none") or >>) or >>
+    assert(!machine.has_handler(42) && physics_error($&machine) == false)
+    for name in ["receiver-fail", "receiver-budget"] {
+        $case := vm.instantiate(load("receiver") or >>) or >>
+        case.invoke_handler(42, 5.0, 4096, 1000000000.0) or >>
+        case.reload(load(name + "") or >>) or >>
+        $expected := "division by zero"
+        if name == "receiver-budget" { expected = "budget exhausted" }
+        assert(handler_error($&case, expected, 1000000000.0))
+        assert(case.calls() == 1 && near(case.state(1) or >>, 10.0) && case.pending_signals() == 0)
+    }
+    $bounded := vm.instantiate(load("receiver") or >>) or >>
+    assert(handler_error($&bounded, "host bound", 5.0))
+    assert(bounded.calls() == 0 && near(bounded.state(1) or >>, 0.0) && bounded.pending_signals() == 0)
+    $limit := vm.instantiate(load("function-limit") or >>) or >>
+    assert(near(limit.execute(0.1, 1.0, 4096, 1024.0) or >>, 1.1))
+    assert(near(limit.invoke_handler(16, 2.0, 4096, 1024.0) or >>, 17.0))
+    $isolated := vm.instantiate(load("receiver-register-leak") or >>) or >>
+    isolated.invoke_handler(41, 3.0, 4096, 1000000000.0) or >>
+    assert(leak_rejected($&isolated))
+    assert(isolated.calls() == 1 && isolated.pending_signals() == 1 && near(isolated.state(1) or >>, 1.0))
+    << 0
+}
+fn manager_checks() int {
+    $tree := nexus.new_scene_tree("Scripts", 16) or >>
+    source_node := tree.add_child(tree.root(), "Source") or >>
+    node_a := tree.add_child(tree.root(), "ReceiverA") or >>
+    node_b := tree.add_child_3d(tree.root(), "ReceiverB") or >>
+    bad_node := tree.add_child(tree.root(), "Faulty") or >>
+    $scripts := host.new_scene_scripts(4) or >>
+    source := scripts.attach(&tree, source_node, load("signal-basic") or >>) or >>
+    a := scripts.attach(&tree, node_a, load("receiver") or >>) or >>
+    b := scripts.attach(&tree, node_b, load("receiver") or >>) or >>
+    assert(duplicate_attach($&scripts, &tree, source_node, load("signal-basic") or >>))
+    connection := scripts.connect(&tree, source, "moved", a, "on_moved") or >>
+    scripts.connect(&tree, a, "updated", b, "on_other") or >>
+    assert(connect_error($&scripts, &tree, source, "missing", a, "on_moved"))
+    assert(connect_error($&scripts, &tree, source, "moved", a, "missing"))
+    scripts.physics_process(&tree, source, 0.1, 1.0) or >>
+    tree.paused = true
+    first := scripts.dispatch(&tree, 64) or >>
+    assert(first.collected == 1 && first.delivered == 1 && first.deferred_events == 1 && first.remaining == 0)
+    assert((scripts.calls(a) or >>) == 1 && (scripts.calls(b) or >>) == 0)
+    assert(near(scripts.state(a, 3) or >>, 540.0))
+    second := scripts.dispatch(&tree, 64) or >>
+    assert(second.collected == 1 && second.delivered == 1 && second.deferred_events == 0)
+    assert(near(scripts.state(b, 1) or >>, 10.0) && near(scripts.state(b, 2) or >>, -540.0))
+    tree.paused = false
+    scripts.reload(&tree, source, load("signal-rename") or >>) or >>
+    scripts.reload(&tree, a, load("receiver-v2") or >>) or >>
+    assert((scripts.connect(&tree, source, "motion", a, "on_motion") or >>) == connection)
+    scripts.physics_process(&tree, source, 0.1, 1.0) or >>
+    renamed := scripts.dispatch(&tree, 64) or >>
+    assert(renamed.delivered == 1 && near(scripts.state(a, 3) or >>, 2160.0) && near(scripts.state(a, 1) or >>, 2.0))
+    scripts.dispatch(&tree, 64) or >>
+    bad := scripts.attach(&tree, bad_node, load("receiver-fail") or >>) or >>
+    scripts.connect(&tree, source, "motion", bad, "on_moved") or >>
+    scripts.physics_process(&tree, source, 0.1, 1.0) or >>
+    isolated := scripts.dispatch(&tree, 64) or >>
+    assert(isolated.delivered == 1 && isolated.rejected == 1 && isolated.first_error.len > 0)
+    assert((scripts.calls(bad) or >>) == 0 && near(scripts.state(bad, 1) or >>, 0.0))
+    scripts.dispatch(&tree, 64) or >>
+    scripts.physics_process(&tree, source, 0.1, 1.0) or >>
+    partial := scripts.dispatch(&tree, 1) or >>
+    assert(partial.delivered == 1 && partial.remaining == 1)
+    scripts.detach(bad) or >>
+    replacement := scripts.attach(&tree, bad_node, load("receiver") or >>) or >>
+    assert(replacement != bad && stale(&scripts, bad))
+    scripts.connect(&tree, source, "motion", replacement, "on_moved") or >>
+    old := scripts.dispatch(&tree, 64) or >>
+    assert(old.dropped == 1 && old.delivered == 0 && (scripts.calls(replacement) or >>) == 0)
+    scripts.dispatch(&tree, 64) or >>
+    tree.queue_free(node_a) or >>
+    assert(scripts.prune(&tree) == 1 && stale(&scripts, a) && scripts.connection_count() == 1)
+    scripts.physics_process(&tree, source, 0.1, 1.0) or >>
+    final := scripts.dispatch(&tree, 64) or >>
+    assert(final.delivered == 1 && (scripts.calls(replacement) or >>) == 1)
+    << 0
+}
+fn capacity_checks() int {
+    $tree := nexus.new_scene_tree("Capacity", 8) or >>
+    source_node := tree.add_child(tree.root(), "Source") or >>
+    node_a := tree.add_child(tree.root(), "A") or >>
+    node_b := tree.add_child(tree.root(), "B") or >>
+    extra_node := tree.add_child(tree.root(), "Extra") or >>
+    $scripts := host.new_scene_scripts(3) or >>
+    source := scripts.attach(&tree, source_node, load("signal-batch") or >>) or >>
+    a := scripts.attach(&tree, node_a, load("function-limit") or >>) or >>
+    b := scripts.attach(&tree, node_b, load("function-limit") or >>) or >>
+    assert(duplicate_attach($&scripts, &tree, extra_node, load("receiver") or >>))
+    for target in [a, b] {
+        for i in 0:bc.MAX_HANDLERS { scripts.connect(&tree, source, "moved", target, "handle_" + str(i)) or >> }
+    }
+    assert(scripts.connection_count() == host.MAX_CONNECTIONS)
+    assert((scripts.connect(&tree, source, "moved", a, "handle_0") or >>) == 1)
+    assert(connect_error($&scripts, &tree, source, "halted", a, "handle_0"))
+    for i in 0:4 { scripts.physics_process(&tree, source, 0.1, 1.0) or >> }
+    first := scripts.dispatch(&tree, 128) or >>
+    assert(first.collected == 4096 && first.delivered == 128 && first.remaining == 3968)
+    scripts.physics_process(&tree, source, 0.1, 1.0) or >>
+    assert(dispatch_error($&scripts, &tree, 0) && dispatch_error($&scripts, &tree, 129))
+    assert(scripts.pending_signals() == 32 && scripts.pending_deliveries() == 3968)
+    $zero := host.SceneScripts{}
+    assert(dispatch_error($&zero, &tree, 64))
+    next := scripts.dispatch(&tree, 128) or >>
+    assert(next.collected == 0 && next.deferred_events == 32)
+    $delivered := first.delivered + next.delivered
+    while scripts.pending_deliveries() > 0 { report := scripts.dispatch(&tree, 128) or >>
+        delivered = delivered + report.delivered }
+    assert(delivered == 4096 && (scripts.calls(a) or >>) + (scripts.calls(b) or >>) == 4096)
+    new_wave := scripts.dispatch(&tree, 128) or >>
+    assert(new_wave.collected == 1024 && new_wave.delivered == 128)
+    << 0
+}
+fn pending_handler_delete_checks() int {
+    $tree := nexus.new_scene_tree("DeletedHandler", 4) or >>
+    source_node := tree.add_child(tree.root(), "Source") or >>
+    target_node := tree.add_child(tree.root(), "Target") or >>
+    $scripts := host.new_scene_scripts(2) or >>
+    source := scripts.attach(&tree, source_node, load("signal-basic") or >>) or >>
+    target := scripts.attach(&tree, target_node, load("receiver") or >>) or >>
+    scripts.connect(&tree, source, "moved", target, "on_moved") or >>
+    scripts.connect(&tree, source, "halted", target, "on_other") or >>
+    scripts.physics_process(&tree, source, 0.1, 1.0) or >>
+    first := scripts.dispatch(&tree, 1) or >>
+    assert(first.delivered == 1 && first.remaining == 1)
+    scripts.reload(&tree, target, load("receiver-none") or >>) or >>
+    assert(scripts.connection_count() == 0)
+    next := scripts.dispatch(&tree, 64) or >>
+    assert(next.dropped == 1 && next.delivered == 0 && (scripts.calls(target) or >>) == 1)
+    << 0
+}
+fn feedback_checks() int {
+    $tree := nexus.new_scene_tree("Feedback", 4) or >>
+    source_node := tree.add_child(tree.root(), "Source") or >>
+    receiver_node := tree.add_child(tree.root(), "Receiver") or >>
+    $scripts := host.new_scene_scripts(2) or >>
+    source := scripts.attach(&tree, source_node, load("signal-basic") or >>) or >>
+    receiver := scripts.attach(&tree, receiver_node, load("receiver-feedback") or >>) or >>
+    scripts.connect(&tree, source, "moved", receiver, "on_moved") or >>
+    scripts.connect(&tree, receiver, "updated", receiver, "on_moved") or >>
+    scripts.physics_process(&tree, source, 0.1, 1.0) or >>
+    for i in 0:100 {
+        report := scripts.dispatch(&tree, 128) or >>
+        assert(report.attempted == 1 && report.delivered == 1 && report.deferred_events == 1 && report.remaining == 0)
+    }
+    assert((scripts.calls(receiver) or >>) == 100 && near(scripts.state(receiver, 1) or >>, 100.0))
+    << 0
+}
+fn run() int {
+    vm_checks() or >>
+    manager_checks() or >>
+    capacity_checks() or >>
+    feedback_checks() or >>
+    pending_handler_delete_checks() or >>
+    println("PASS: multiple isolated callback entries, stable handler IDs/hot reload/retirement, script-to-script dispatch, failure rollback/isolation, attachment generation, pause/deletion, 4096 queued deliveries, 100 bounded feedback phases")
+    << 0
+}
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

@@ -1,0 +1,52 @@
+@main
+
+codec #"github.com/xulang-org/nexus/formats/scene"
+resource #"github.com/xulang-org/nexus/resources/scene"
+#os
+#strings
+
+fn rejected(raw &string) bool { codec.decode(raw) or (err) { << true }
+    << false }
+fn run() int {
+    raw := os.read("build/scene-asset-fixtures/base.xuscene") or >>
+    document := codec.decode(&raw) or >>
+    assert(document.node_count() == 2 && document.resource_count() == 1 && document.surface_count() == 1)
+    reference := document.resource(0) or >>
+    assert(reference.uid == "11001100110011001100110011001100" && reference.path == "base.glb" && reference.kind == "glb_model")
+    surface := document.surface(0) or >>
+    assert(surface.node == 1 && surface.primitive == 0 && surface.resource_uid == reference.uid)
+    canonical := codec.encode(&document) or >>
+    restored := codec.decode(&canonical) or >>
+    assert(canonical == (codec.encode(&restored) or >>))
+    original := os.read("examples/scene_assets/assets/world.xuscene") or >>
+    gallery := codec.decode(&original) or >>
+    assert(gallery.node_count() == 10 && gallery.surface_count() == 8 && gallery.resource_count() == 1)
+    // A maximum-size document shares one source model across all surface nodes.
+    $nodes := []resource.NodeData{}
+    $surfaces := []resource.Surface{}
+    for i in 0:4096 {
+        $parent := 0
+        if i == 0 { parent = -1 }
+        nodes.push(resource.node(parent, "n" + str(i), resource.NODE_3D))
+        surfaces.push(resource.Surface{node: i, resource_uid: reference.uid + "", primitive: 0})
+    }
+    plain := resource.make_document(nodes) or >>
+    largest := resource.with_attachments(&plain, [reference], surfaces, []resource.AudioBus{}, []resource.AudioEmitter{}, []resource.ScriptAttachment{}, []resource.ScriptConnection{}, []resource.LightAttachment{}) or >>
+    largest_raw := codec.encode(&largest) or >>
+    largest_loaded := codec.decode(&largest_raw) or >>
+    assert(largest_loaded.surface_count() == 4096 && largest_loaded.node_count() == 4096)
+    failures := os.read("build/scene-asset-fixtures/reject-list.txt") or >>
+    rows := strings.split(&failures, "\n")
+    $count := 0
+    for row in rows {
+        if row.len == 0 { -> }
+        bad := os.read("build/scene-asset-fixtures/" + row) or >>
+        if !rejected(&bad) { println("Accepted invalid resource scene: " + row)
+            assert(false) }
+        count = count + 1
+    }
+    println("PASS: pinned resource/surface descriptors, canonical roundtrip, original PBR gallery, 4096 shared surfaces and " + str(count) + " strict rejection cases")
+    << 0
+}
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

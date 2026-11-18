@@ -1,0 +1,226 @@
+@main
+
+light_data #"github.com/xulang-org/nexus/resources/lighting"
+
+#gpu
+
+gpu_info #"github.com/xulang-org/nexus/platform/gpu"
+
+mesh_shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+fm #"github.com/xulang-org/nexus/foundation/math"
+colors #"github.com/xulang-org/nexus/foundation/color"
+scene_render #"github.com/xulang-org/nexus/integration/rendering/three_d"
+nexus #"github.com/xulang-org/nexus/scene"
+#math
+
+fn quad(flags int, span f64) meshes.MeshData3D {
+    $mesh := meshes.new_mesh_data_3d()
+    positions := [fm.vec3(-1.0, 1.0, 0.5), fm.vec3(1.0, 1.0, 0.5), fm.vec3(1.0, -1.0, 0.5), fm.vec3(-1.0, -1.0, 0.5)]
+    uvs := [fm.vec2(0.0, 0.0), fm.vec2(span, 0.0), fm.vec2(span, span), fm.vec2(0.0, span)]
+    for i in 0:4 {
+        if flags == 0 { mesh.vertex(positions[i], 4294967295) or >>
+        } else if flags == 1 || (flags == 3 && i == 3) { mesh.vertex_lit(positions[i], 4294967295, fm.vec3(0.0, 0.0, 1.0)) or >>
+        } else { mesh.vertex_lit_uv(positions[i], 4294967295, fm.vec3(0.0, 0.0, 1.0), uvs[i]) or >> }
+    }
+    mesh.triangle(0, 2, 1) or >>
+    mesh.triangle(0, 3, 2) or >>
+    << mesh
+}
+fn channel(pixel int, index int) int {
+    if index == 0 { << pixel / 16777216 % 256 }
+    if index == 1 { << pixel / 65536 % 256 }
+    << pixel / 256 % 256
+}
+fn check(pixel int, red int, green int, blue int) {
+    wanted := [red, green, blue]
+    for i in 0:3 {
+        if math.abs(f64(channel(pixel, i) - wanted[i])) > 2.0 {
+            println("Pixel=" + str(channel(pixel, 0)) + "," + str(channel(pixel, 1)) + "," + str(channel(pixel, 2)) +
+                " expected=" + str(red) + "," + str(green) + "," + str(blue))
+        }
+        assert(math.abs(f64(channel(pixel, i) - wanted[i])) <= 2.0)
+    }
+    assert(pixel % 256 == 255)
+}
+fn equal_pixels(left int, right int) {
+    for i in 0:3 { assert(math.abs(f64(channel(left, i) - channel(right, i))) <= 2.0) }
+}
+fn sample(device $&ren.Device3D, mesh &ren.Mesh3D, material &ren.Material3D, light &light_data.Environment3D) int {
+    device.begin(255) or >>
+    device.draw_material(mesh, fm.identity_3d(), fm.identity_3d(), material, light) or >>
+    pixel := device.read_pixel(32, 32) or >>
+    device.present() or >>
+    << pixel
+}
+fn bad_orm(material &ren.Material3D, texture &ren.Texture3D, strength f64) bool {
+    material.with_orm_texture(texture, strength) or (err) { << true }
+    << false
+}
+fn bad_set(scene $&scene_render.Scene3D, tree &nexus.SceneTree, node int, material ren.Material3D) bool {
+    scene.set_material(tree, node, material) or (err) { << true }
+    << false
+}
+fn bad_replace(scene $&scene_render.Scene3D, tree &nexus.SceneTree, node int, mesh &ren.Mesh3D) bool {
+    scene.attach_mesh(tree, node, mesh) or (err) { << true }
+    << false
+}
+fn bad_draw(device $&ren.Device3D, mesh &ren.Mesh3D, material &ren.Material3D, light &light_data.Environment3D) bool {
+    device.draw_material(mesh, fm.identity_3d(), fm.identity_3d(), material, light) or (err) { << true }
+    << false
+}
+fn bad_format(texture &ren.Texture3D) bool { texture.is_srgb() or (err) { << true }
+    << false }
+fn run() int {
+    mesh_program_0 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d("Xu material map GPU checks", 64, 64, gpu.AUTO, &mesh_program_0) or >>
+    println("Material maps GPU backend: " + gpu_info.backend_name(device.backend() or >>))
+    zero := fm.vec3(0.0, 0.0, 0.0)
+    white := fm.vec3(1.0, 1.0, 1.0)
+    eye := fm.vec3(0.0, 0.0, 2.0)
+    normal := fm.vec3(0.0, 0.0, 1.0)
+    ambient := light_data.environment(white, eye, 1.0, [light_data.directional(normal, zero) or >>]) or >>
+    direct := light_data.environment(zero, eye, 1.0, [light_data.directional(normal, fm.vec3(3.0, 3.0, 3.0)) or >>]) or >>
+    dark := light_data.environment(zero, eye, 1.0, [light_data.directional(normal, zero) or >>]) or >>
+    source := quad(2, 1.0) or >>
+    $mesh := device.upload(&source) or >>
+    base := ren.material_3d(white, 0.0, 1.0, zero) or >>
+    black_ao_pixels := [colors.rgba8(0, 255, 0, 0) or >>]
+    $black_ao := device.texture_rgba(1, 1, &black_ao_pixels, false, false, false) or >>
+    assert(!(black_ao.is_srgb() or >>))
+    occluded := base.with_orm_texture(&black_ao, 1.0) or >>
+    partial := base.with_orm_texture(&black_ao, 0.5) or >>
+    disabled := base.with_orm_texture(&black_ao, 0.0) or >>
+    check(sample($&device, &mesh, &occluded, &ambient) or >>, 0, 0, 0)
+    check(sample($&device, &mesh, &partial, &ambient) or >>, 156, 156, 156)
+    check(sample($&device, &mesh, &disabled, &ambient) or >>, 188, 188, 188)
+    equal_pixels(sample($&device, &mesh, &base, &direct) or >>, sample($&device, &mesh, &occluded, &direct) or >>)
+    emitting := ren.material_3d(zero, 0.0, 1.0, fm.vec3(1.0, 0.25, 0.0)) or >>
+    ao_emitting := emitting.with_orm_texture(&black_ao, 1.0) or >>
+    check(sample($&device, &mesh, &ao_emitting, &dark) or >>, 188, 124, 0)
+    // Metallic/roughness channels multiply factors; compare to an independently
+    // parameterized scalar material, rather than copying BRDF equations.
+    factor_base := ren.material_3d(fm.vec3(0.7, 0.2, 0.08), 0.8, 0.8, zero) or >>
+    factor_pixels := [colors.rgba8(255, 64, 128, 0) or >>]
+    $factor_texture := device.texture_rgba(1, 1, &factor_pixels, false, false, false) or >>
+    factor_material := factor_base.with_orm_texture(&factor_texture, 1.0) or >>
+    reference := ren.material_3d(fm.vec3(0.7, 0.2, 0.08), 0.8 * 128.0 / 255.0, 0.8 * 64.0 / 255.0, zero) or >>
+    equal_pixels(sample($&device, &mesh, &factor_material, &direct) or >>, sample($&device, &mesh, &reference, &direct) or >>)
+    floor_pixels := [colors.rgba8(255, 0, 0, 255) or >>]
+    $floor_texture := device.texture_rgba(1, 1, &floor_pixels, false, false, false) or >>
+    floor_material := base.with_orm_texture(&floor_texture, 1.0) or >>
+    floor_reference := ren.material_3d(white, 0.0, 0.045, zero) or >>
+    equal_pixels(sample($&device, &mesh, &floor_material, &direct) or >>, sample($&device, &mesh, &floor_reference, &direct) or >>)
+    gray_pixels := [colors.rgba8(128, 128, 128, 0) or >>]
+    $gray_srgb := device.texture_rgba(1, 1, &gray_pixels, true, true, false) or >>
+    $gray_linear := device.texture_rgba(1, 1, &gray_pixels, false, true, false) or >>
+    assert(gray_srgb.is_srgb() or >>)
+    assert(bad_orm(&base, &gray_srgb, 1.0))
+    for strength in [-0.1, 1.1, math.nan(), math.inf(1), math.inf(-1)] { assert(bad_orm(&base, &black_ao, strength)) }
+    emitter := ren.material_3d(zero, 0.0, 1.0, white) or >>
+    encoded_emission := emitter.with_emission_texture(&gray_srgb) or >>
+    linear_emission := emitter.with_emission_texture(&gray_linear) or >>
+    check(sample($&device, &mesh, &encoded_emission, &dark) or >>, 117, 117, 117)
+    check(sample($&device, &mesh, &linear_emission, &dark) or >>, 156, 156, 156)
+    no_emission := base.with_emission_texture(&gray_srgb) or >>
+    check(sample($&device, &mesh, &no_emission, &dark) or >>, 0, 0, 0)
+    // All eight combinations, non-sequential order, and ignored alpha. Each
+    // constructor/removal must preserve the other slots and scalar factors.
+    red_pixels := [colors.rgba8(255, 0, 0, 0) or >>]
+    green_pixels := [colors.rgba8(0, 255, 0, 0) or >>]
+    orm_pixels := [colors.rgba8(128, 255, 0, 0) or >>]
+    $red := device.texture_rgba(1, 1, &red_pixels, true, false, false) or >>
+    $green := device.texture_rgba(1, 1, &green_pixels, true, false, false) or >>
+    $orm := device.texture_rgba(1, 1, &orm_pixels, false, false, false) or >>
+    combined_base := ren.material_3d(white, 0.0, 1.0, fm.vec3(0.25, 0.25, 0.25)) or >>
+    all_base := combined_base.with_base_texture(&red) or >>
+    all_orm := all_base.with_orm_texture(&orm, 1.0) or >>
+    all := all_orm.with_emission_texture(&green) or >>
+    red_expected := [198, 198, 175, 175, 188, 188, 156, 156]
+    green_expected := [198, 124, 175, 124, 198, 124, 175, 124]
+    blue_expected := [198, 124, 175, 124, 188, 0, 156, 0]
+    for mask in [7, 0, 5, 2, 4, 1, 6, 3] {
+        $material := all
+        if mask % 2 == 0 { material = material.without_base_texture() }
+        if mask / 2 % 2 == 0 { material = material.without_orm_texture() }
+        if mask / 4 % 2 == 0 { material = material.without_emission_texture() }
+        assert(material.has_base_texture() == (mask % 2 == 1))
+        assert(material.has_orm_texture() == (mask / 2 % 2 == 1))
+        assert(material.has_emission_texture() == (mask / 4 % 2 == 1))
+        check(sample($&device, &mesh, &material, &ambient) or >>, red_expected[mask], green_expected[mask], blue_expected[mask])
+    }
+    device.begin(255) or >>
+    device.draw_material(&mesh, fm.translation_3d(fm.vec3(0.0, 0.0, -0.2)), fm.identity_3d(), &all, &ambient) or >>
+    device.draw_material(&mesh, fm.identity_3d(), fm.identity_3d(), &base, &ambient) or >>
+    check(device.read_pixel(32, 32) or >>, 188, 188, 188)
+    device.present() or >>
+    device.begin(255) or >>
+    device.draw_material(&mesh, fm.identity_3d(), fm.identity_3d(), &all, &ambient) or >>
+    device.draw(&mesh, fm.translation_3d(fm.vec3(0.0, 0.0, 0.2))) or >>
+    check(device.read_pixel(32, 32) or >>, 255, 255, 255)
+    device.present() or >>
+    // Data and color maps have their own mip samplers; no base map is needed.
+    mip_sampling := ren.TextureSampling3D{min_linear: true, mag_linear: true, repeat_u: true, repeat_v: true, mip_filter: ren.MIP_LINEAR}
+    mip_orm_pixels := [colors.rgba8(0, 255, 0, 255) or >>, colors.rgba8(255, 255, 0, 255) or >>]
+    $mip_orm := device.texture_rgba_sampled(2, 1, &mip_orm_pixels, false, mip_sampling) or >>
+    mip_emission_pixels := [255, 4294967295]
+    $mip_emission := device.texture_rgba_sampled(2, 1, &mip_emission_pixels, true, mip_sampling) or >>
+    mip_source := quad(2, 128.0) or >>
+    $mip_mesh := device.upload(&mip_source) or >>
+    mip_ao := base.with_orm_texture(&mip_orm, 1.0) or >>
+    mip_emit := emitter.with_emission_texture(&mip_emission) or >>
+    check(sample($&device, &mip_mesh, &mip_ao, &ambient) or >>, 156, 156, 156)
+    check(sample($&device, &mip_mesh, &mip_emit, &dark) or >>, 156, 156, 156)
+    $tree := nexus.new_scene_tree_3d("Maps", 16) or >>
+    node := tree.add_child_3d(tree.root(), "Quad") or >>
+    $scene := scene_render.new_scene_3d(&device) or >>
+    scene.attach_mesh(&tree, node, &mesh) or >>
+    scene.set_material(&tree, node, all) or >>
+    for flags in [0, 1, 3] {
+        missing_source := quad(flags, 1.0) or >>
+        $missing := device.upload(&missing_source) or >>
+        assert(bad_replace($&scene, &tree, node, &missing))
+        for map_material in [occluded, encoded_emission] {
+            device.begin(255) or >>
+            assert(bad_draw($&device, &missing, &map_material, &ambient))
+            scene.draw_lit($&device, &tree, fm.identity_3d(), &ambient) or >>
+            check(device.read_pixel(32, 32) or >>, 156, 124, 0)
+            device.present() or >>
+        }
+    }
+    mesh_program_1 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $other := ren.open_3d("Foreign map owner", 32, 32, gpu.AUTO, &mesh_program_1) or >>
+    $foreign := other.texture_rgba(1, 1, &gray_pixels, false, false, false) or >>
+    for material in [base.with_base_texture(&foreign) or >>, base.with_orm_texture(&foreign, 1.0) or >>, base.with_emission_texture(&foreign) or >>] {
+        assert(bad_set($&scene, &tree, node, material))
+        device.begin(255) or >>
+        assert(bad_draw($&device, &mesh, &material, &ambient))
+        device.present() or >>
+    }
+    for slot in 0:3 {
+        $texture := device.texture_rgba(1, 1, &gray_pixels, false, false, false) or >>
+        $stale := base
+        if slot == 0 { stale = base.with_base_texture(&texture) or >> }
+        if slot == 1 { stale = base.with_orm_texture(&texture, 1.0) or >> }
+        if slot == 2 { stale = base.with_emission_texture(&texture) or >> }
+        texture.close() or >>
+        $replacement := device.texture_rgba(1, 1, &gray_pixels, false, false, false) or >>
+        assert(bad_format(&texture) && bad_set($&scene, &tree, node, stale))
+        device.begin(255) or >>
+        assert(bad_draw($&device, &mesh, &stale, &ambient))
+        scene.draw_lit($&device, &tree, fm.identity_3d(), &ambient) or >>
+        check(device.read_pixel(32, 32) or >>, 156, 124, 0)
+        device.present() or >>
+    }
+    other.close() or >>
+    assert(bad_format(&foreign))
+    device.close() or >>
+    assert(bad_format(&orm) && bad_format(&green))
+    println("PASS: packed ORM channels/factors/roughness floor, ambient-only AO/strength, emission colorspace/factor, all 8 map combinations, 3-slot state, mip samplers, scene preflight, missing UV and stale/foreign resource rejection")
+    << 0
+}
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

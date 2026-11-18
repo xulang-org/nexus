@@ -1,0 +1,91 @@
+@main
+shadow #"github.com/xulang-org/nexus/resources/shadow"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+fm #"github.com/xulang-org/nexus/foundation/math"
+#math
+
+fn projection() fm.Mat4 {
+    << fm.Mat4{c0: fm.vec4(1.0,0.0,0.0,0.0),c1: fm.vec4(0.0,1.0,0.0,0.0),c2: fm.vec4(0.0,0.0,1.0/39.0,-1.0),c3: fm.vec4(0.0,0.0,40.0/39.0,0.0)}
+}
+fn invalid_camera(view fm.Mat4,p fm.Mat4) bool { shadow.cascade_camera(view,p) or(err){ << true }
+    << false }
+fn invalid_settings(source lights.Light3D,camera shadow.CascadeCamera3D,settings shadow.CascadeSettings3D) bool { shadow.cascaded(source,camera,settings) or(err){ << true }
+    << false }
+fn close(a f64,b f64) bool { << math.abs(a-b)<0.000000001 }
+fn run() int {
+    p := projection()
+    camera := shadow.cascade_camera(fm.identity_3d(),p) or >>
+    source := lights.directional(fm.vec3(0.3,1.0,0.2),fm.vec3(3.0,3.0,3.0)) or >>
+    $settings := shadow.default_cascades()
+    settings.resolution=128
+    settings.distance=40.0
+    settings.caster_padding=5.0
+    for world in [fm.identity_3d(),fm.translation_3d(fm.vec3(2.0,3.0,4.0)).multiply(fm.rotation_y(0.7)),
+        fm.scale_3d(fm.vec3(1.2,0.8,1.1)).multiply(fm.rotation_y(-0.3))] {
+        view := world.affine_inverse() or >>
+        posed := shadow.cascade_camera(view,p) or >>
+        for count in [2,3,4] { for lambda in [0.0,0.6,1.0] {
+            settings.count=count
+            settings.split_lambda=lambda
+            description := shadow.cascaded(source,posed,settings) or >>
+            assert(description.face_count()==count && description.cascade_count()==count && description.matches_camera(p.multiply(view)))
+            plane := description.cascade_depth_plane()
+            $previous_start := 1.0
+            $previous_end := 1.0
+            for i in 0:count {
+                range := description.cascade_parameters(i) or >>
+                assert(close(range.x,previous_end) && range.y>range.x && range.z<range.y && range.w>0.0 && range.w<=1.0)
+                if lambda==0.0 { assert(close(range.y,1.0+39.0*f64(i+1)/f64(count))) }
+                $fit_near := range.x
+                if i>0 { fit_near=range.x-(range.x-previous_start)*settings.blend_fraction }
+                matrix := description.view_projection(i) or >>
+                for distance in [fit_near,range.y] { for x in [-1.0,1.0] { for y in [-1.0,1.0] {
+                    q := world.transform(fm.vec4(x*distance,y*distance,-distance,1.0))
+                    clip := matrix.transform(q)
+                    assert(math.abs(clip.x)<1.0-4.0/128.0 && math.abs(clip.y)<1.0-4.0/128.0 && clip.z>=0.0 && clip.z<=1.0 && clip.w==1.0)
+                    assert(close(plane.x*q.x+plane.y*q.y+plane.z*q.z+plane.w,distance))
+                } } }
+                previous_start=range.x
+                previous_end=range.y
+            }
+            assert(close(previous_end,40.0))
+        } }
+    }
+    settings.count=4
+    settings.split_lambda=0.6
+    vertical := lights.directional(fm.vec3(0.0,1.0,0.0),fm.vec3(1.0,1.0,1.0)) or >>
+    a := shadow.cascaded(vertical,camera,settings) or >>
+    moved_view := fm.translation_3d(fm.vec3(-0.00001,0.0,0.0))
+    moved_camera := shadow.cascade_camera(moved_view,p) or >>
+    b := shadow.cascaded(vertical,moved_camera,settings) or >>
+    assert(!a.matches_camera(p.multiply(moved_view)))
+    for i in 0:4 {
+        ma := a.view_projection(i) or >>
+        mb := b.view_projection(i) or >>
+        assert(ma.c0.x==mb.c0.x && ma.c1.y==mb.c1.y && ma.c2.z==mb.c2.z && ma.c3.x==mb.c3.x && ma.c3.y==mb.c3.y && ma.c3.z==mb.c3.z)
+    }
+    settings.count=1
+    assert(invalid_settings(source,camera,settings))
+    settings.count=5
+    assert(invalid_settings(source,camera,settings))
+    settings.count=4
+    settings.split_lambda=1.1
+    assert(invalid_settings(source,camera,settings))
+    settings.split_lambda=0.6
+    settings.blend_fraction=0.4
+    assert(invalid_settings(source,camera,settings))
+    settings.blend_fraction=0.1
+    settings.distance=0.5
+    assert(invalid_settings(source,camera,settings))
+    settings.distance=40.0
+    settings.stabilization_step=0.0
+    assert(invalid_settings(source,camera,settings))
+    assert(invalid_camera(fm.scale_3d(fm.vec3(0.0,1.0,1.0)),p) && invalid_camera(fm.identity_3d(),fm.identity_3d()))
+    $overflow_projection := p
+    overflow_projection.c0.x=1.0e308
+    assert(invalid_camera(fm.scale_3d(fm.vec3(2.0,2.0,2.0)),overflow_projection))
+    println("PASS: 2/3/4 cascade uniform/log/mixed splits, rotated/scaled camera overlap corner coverage, depth plane, texel stability, stale camera and invalid settings")
+    << 0
+}
+fn main() int { << run() or(err){ eprintln(err.msg())
+    << 1 } }

@@ -1,0 +1,138 @@
+@main
+
+#gpu
+
+gpu_info #"github.com/xulang-org/nexus/platform/gpu"
+
+canvas_shaders #"github.com/xulang-org/nexus/assets/shaders/two_d"
+
+ren_data #"github.com/xulang-org/nexus/resources/canvas"
+
+image_render #"github.com/xulang-org/nexus/integration/image_render/two_d"
+images #"github.com/xulang-org/nexus/assets/image"
+colors #"github.com/xulang-org/nexus/foundation/color"
+ren #"github.com/xulang-org/nexus/rendering/two_d"
+sprite_anim #"github.com/xulang-org/nexus/animation/sprite"
+fm #"github.com/xulang-org/nexus/foundation/math"
+
+fn begin_rejected(renderer $&ren.Renderer2D, background int) bool {
+    renderer.begin(background) or (err) { << true }
+    << false
+}
+fn present_rejected(renderer $&ren.Renderer2D) bool {
+    renderer.present() or (err) { << true }
+    << false
+}
+fn png_rejected(renderer &ren.Renderer2D, path string) bool {
+    image := images.load_png(path) or (err) { << true }
+    image_render.upload_image_2d(renderer, &image, false) or (err) { << true }
+    << false
+}
+
+fn run() int {
+    canvas_program_0 := canvas_shaders.load_canvas("build/canvas-shaders") or >>
+    $renderer := ren.open_2d("Xu Game / GPU validation", 320, 180, gpu.AUTO, &canvas_program_0) or >>
+    backend := renderer.backend() or >>
+    println("GPU backend: " + gpu_info.backend_name(backend))
+    $batch := ren_data.new_batch()
+    color := colors.rgba8(80, 220, 160, 255) or >>
+    background := colors.rgba8(16, 24, 32, 255) or >>
+    red := colors.rgba8(255, 0, 0, 255) or >>
+    green := colors.rgba8(0, 255, 0, 255) or >>
+    blue := colors.rgba8(0, 0, 255, 255) or >>
+    white := colors.rgba8(255, 255, 255, 255) or >>
+    pixels := [red, green, blue, white]
+    $texture := renderer.texture_rgba(2, 2, &pixels, false) or >>
+    $sprite_batch := ren_data.new_batch()
+    sprite_batch.quad(fm.rect2(160.0, 24.0, 96.0, 96.0), fm.identity(), white) or >>
+    batch.quad(fm.rect2(32.0, 32.0, 96.0, 64.0), fm.identity(), color) or >>
+    assert(batch.triangle_count() == 2)
+    renderer.begin(background) or >>
+    assert(begin_rejected($&renderer, background))
+    count := renderer.submit(&batch) or >>
+    assert(count == 2)
+    renderer.submit_texture(&sprite_batch, &texture) or >>
+    pixel := renderer.read_pixel(64, 64) or >>
+    clear_pixel := renderer.read_pixel(200, 120) or >>
+    println("GPU pixel RGBA: " + str(pixel) + ", expected: " + str(color))
+    assert(pixel == color && clear_pixel == background)
+    texture_red := renderer.read_pixel(176, 40) or >>
+    texture_green := renderer.read_pixel(240, 40) or >>
+    texture_blue := renderer.read_pixel(176, 104) or >>
+    assert(texture_red == red && texture_green == green && texture_blue == blue)
+    renderer.capture("build/gpu-smoke.png") or >>
+    renderer.present() or >>
+    assert(present_rejected($&renderer))
+    // Round trip actual GPU output through a PNG file and upload it again.
+    image_png := images.load_png("build/gpu-smoke.png") or >>
+    $png := image_render.upload_image_2d(&renderer, &image_png, false) or >>
+    assert(png.width == 320 && png.height == 180)
+    $roundtrip := ren_data.new_batch()
+    roundtrip.quad(fm.rect2(0.0, 0.0, 320.0, 180.0), fm.identity(), white) or >>
+    renderer.begin(background) or >>
+    renderer.submit_texture(&roundtrip, &png) or >>
+    roundtrip_green := renderer.read_pixel(64, 64) or >>
+    roundtrip_blue := renderer.read_pixel(176, 104) or >>
+    assert(roundtrip_green == color && roundtrip_blue == blue)
+    renderer.present() or >>
+    assert(png_rejected(&renderer, "build/does-not-exist.png"))
+    write_file("build/not-png.png", "this is not a png file, even with at least thirty-three bytes") or >>
+    assert(png_rejected(&renderer, "build/not-png.png"))
+    // Real atlas cells have different eye pixels; transparent pixels reveal the clear color.
+    image_atlas := images.load_png("examples/arena/assets/player.png") or >>
+    $atlas := image_render.upload_image_2d(&renderer, &image_atlas, false) or >>
+    assert(atlas.width == 64 && atlas.height == 16)
+    clip := sprite_anim.new_atlas_animation(4, 1, 0, 4, 8.0, true) or >>
+    $animator := sprite_anim.new_sprite_animator(clip) or >>
+    $atlas_batch := ren_data.new_batch()
+    bounds := fm.rect2(8.0, 8.0, 32.0, 32.0)
+    first_region := animator.region() or >>
+    atlas_batch.quad_region(bounds, fm.identity(), white, first_region) or >>
+    renderer.begin(background) or >>
+    renderer.submit_texture(&atlas_batch, &atlas) or >>
+    eye := renderer.read_pixel(19, 21) or >>
+    transparent := renderer.read_pixel(9, 9) or >>
+    eye_color := colors.rgba8(14, 30, 40, 255) or >>
+    body_color := colors.rgba8(96, 230, 192, 255) or >>
+    assert(eye == eye_color && transparent == background)
+    renderer.present() or >>
+    advanced := animator.advance(0.25) or >>
+    assert(advanced.frame == 2)
+    atlas_batch.clear()
+    second_region := animator.region() or >>
+    atlas_batch.quad_region(bounds, fm.identity(), white, second_region) or >>
+    renderer.begin(background) or >>
+    renderer.submit_texture(&atlas_batch, &atlas) or >>
+    animated := renderer.read_pixel(19, 21) or >>
+    assert(animated == body_color)
+    renderer.present() or >>
+    // Exact scissor edges and per-frame reset are visible in GPU readback.
+    renderer.begin(background) or >>
+    renderer.clip_rect(fm.rect2(40.0, 40.0, 32.0, 32.0)) or >>
+    renderer.submit(&batch) or >>
+    outside := renderer.read_pixel(34, 34) or >>
+    inside := renderer.read_pixel(50, 50) or >>
+    assert(outside == background && inside == color)
+    renderer.reset_clip() or >>
+    renderer.submit(&batch) or >>
+    unclipped := renderer.read_pixel(34, 34) or >>
+    assert(unclipped == color)
+    renderer.clip_rect(fm.rect2(40.0, 40.0, 32.0, 32.0)) or >>
+    renderer.present() or >>
+    renderer.begin(background) or >>
+    renderer.submit(&batch) or >>
+    reset := renderer.read_pixel(34, 34) or >>
+    assert(reset == color)
+    renderer.present() or >>
+    renderer.close() or >>
+    renderer.close() or >>
+    texture.close() or >>
+    texture.close() or >>
+    png.close() or >>
+    atlas.close() or >>
+    assert(begin_rejected($&renderer, background))
+    println("PASS: GPU triangles, PNG upload, texture sampling, scissor/reset, readback, frame state and ownership")
+    << 0
+}
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

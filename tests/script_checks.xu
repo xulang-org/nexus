@@ -1,0 +1,151 @@
+@main
+
+dev #"github.com/xulang-org/nexus/script/development"
+bc #"github.com/xulang-org/nexus/script/bytecode"
+vm #"github.com/xulang-org/nexus/script/vm"
+host #"github.com/xulang-org/nexus/script/host"
+files #"github.com/xulang-org/nexus/internal/file_snapshot"
+nexus #"github.com/xulang-org/nexus/scene"
+#os
+#strings
+#math
+
+fn load(name string) bc.Module {
+    raw := files.read("build/script-fixtures/" + name + ".xubc", bc.MAX_BYTES) or >>
+    << bc.decode(&raw) or >>
+}
+fn near(a f64, b f64) bool { << math.abs(a - b) < 0.000000001 }
+fn execute_error(machine $&vm.Instance, name string) bool {
+    machine.execute(1.0 / 60.0, 1.0, 200, 1024.0) or (err) {
+        message := err.msg()
+        if !strings.contains(&message, name) { eprintln("Wrong VM failure: " + message)
+            << false }
+        << true
+    }
+    << false
+}
+fn reload_rejected(machine $&vm.Instance, program bc.Module) bool {
+    machine.reload(program) or (err) { << true }
+    << false
+}
+fn decode_rejected(raw &string, expected string) bool {
+    bc.decode(raw) or (err) {
+        message := err.msg()
+        if !strings.contains(&message, expected) { eprintln("Wrong verification failure: " + message)
+            << false }
+        << true
+    }
+    << false
+}
+fn host_rejected(script $&host.NodeScript, tree &nexus.SceneTree) bool {
+    script.physics_process(tree, 1.0 / 60.0, 1.0) or (err) { << true }
+    << false
+}
+fn zero_program_rejected() bool { vm.instantiate(bc.Module{}) or (err) { << true }
+    << false }
+fn zero_instance_rejected() bool {
+    $empty := vm.Instance{}
+    empty.execute(0.1, 1.0, 4096, 1024.0) or (err) { << true }
+    << false
+}
+fn run() int {
+    assert(zero_program_rejected() && zero_instance_rejected())
+    program := load("v1") or >>
+    raw := program.encode() or >>
+    again := bc.decode(&raw) or >>
+    assert(program.fingerprint() == again.fingerprint())
+    $machine := vm.instantiate(program) or >>
+    first := machine.execute(1.0 / 60.0, 1.0, 4096, 1024.0) or >>
+    assert(near(first, 3.0) && machine.calls() == 1 && machine.epoch() == 1)
+    assert(near(machine.state(1) or >>, 1.0) && near(machine.state(2) or >>, 3.0))
+    machine.reload(load("v2") or >>) or >>
+    assert(machine.calls() == 1 && machine.epoch() == 2 && near(machine.state(1) or >>, 1.0))
+    second := machine.execute(1.0 / 60.0, 1.0, 4096, 1024.0) or >>
+    assert(near(second, 6.0) && near(machine.state(2) or >>, 9.0))
+    machine.reload(load("rename-add") or >>) or >>
+    assert(near(machine.state(1) or >>, 2.0) && near(machine.state(2) or >>, 9.0) && near(machine.state(3) or >>, 100.0))
+    machine.reload(load("delete") or >>) or >>
+    epoch := machine.epoch()
+    assert(reload_rejected($&machine, load("v1") or >>))
+    assert(reload_rejected($&machine, load("foreign") or >>))
+    assert(machine.epoch() == epoch && machine.field_count() == 2 && near(machine.state(1) or >>, 2.0))
+    $cycles := vm.instantiate(load("v1") or >>) or >>
+    for i in 0:100 {
+        $name := "v2"
+        if i % 2 == 1 { name = "v1" }
+        assert((cycles.reload(load(name) or >>) or >>) == 1)
+        cycles.execute(1.0 / 60.0, 1.0, 4096, 1024.0) or >>
+    }
+    assert(cycles.epoch() == 101 && cycles.calls() == 100 && cycles.field_count() == 2)
+    assert(near(cycles.state(1) or >>, 100.0) && near(cycles.state(2) or >>, 450.0))
+    cycles.reload(load("reorder") or >>) or >>
+    assert(near(cycles.state(1) or >>, 100.0) && near(cycles.state(2) or >>, 450.0))
+    assert((cycles.reload(load("reorder") or >>) or >>) == 0)
+    for name in ["alias", "loop", "branches", "short-circuit", "typed", "early-return", "boolean", "empty-state"] {
+        $case := vm.instantiate(load(name + "") or >>) or >>
+        result := case.execute(1.0 / 60.0, 1.0, 4096, 1024.0) or >>
+        if name == "alias" || name == "boolean" { assert(near(result, 1.0))
+        } else if name == "loop" { assert(near(result, 0.05) && near(case.state(1) or >>, 3.0))
+        } else if name == "branches" { assert(near(result, 3.0))
+            assert(near(case.execute(0.1, -1.0, 4096, 1024.0) or >>, -3.0))
+            assert(near(case.execute(0.1, 0.0, 4096, 1024.0) or >>, 2.0))
+        } else if name == "short-circuit" { assert(near(result, 2.0) && near(case.state(1) or >>, 1.0))
+        } else if name == "typed" { assert(near(result, 3.0))
+        } else if name == "early-return" { assert(near(result, 1.0 / 60.0))
+            assert(near(case.execute(0.1, 0.0, 4096, 1024.0) or >>, 0.0))
+        } else { assert(near(result, 1.0 / 30.0) && case.field_count() == 0) }
+    }
+    names := ["divide-zero", "overflow", "host-bound", "infinite", "uninitialized"]
+    messages := ["division by zero", "out-of-range", "host bound", "budget exhausted", "uninitialized register"]
+    for i in 0:names.len {
+        $case := vm.instantiate(load(names[i] + "") or >>) or >>
+        case.set_state(1, 17.0) or >>
+        assert(execute_error($&case, messages[i] + ""))
+        assert(case.calls() == 0 && near(case.state(1) or >>, 17.0))
+    }
+    rejection_list := os.read("build/script-fixtures/reject-list.txt") or >>
+    rows := strings.split(&rejection_list, "\n")
+    $rejections := 0
+    for row in rows {
+        if row.len == 0 { -> }
+        parts := strings.split(&row, "|")
+        invalid := files.read("build/script-fixtures/" + parts[0], bc.MAX_BYTES) or >>
+        assert(decode_rejected(&invalid, parts[1] + ""))
+        rejections = rejections + 1
+    }
+    $tree := nexus.new_scene_tree("World", 8) or >>
+    root := tree.root()
+    node := tree.add_child(root, "Player") or >>
+    $script := host.attach(&tree, node, load("v1") or >>) or >>
+    script.physics_process(&tree, 1.0 / 60.0, 1.0) or >>
+    tree.paused = true
+    assert((script.physics_process(&tree, 1.0 / 60.0, 1.0) or >>) == 0.0 && script.calls() == 1)
+    tree.paused = false
+    path := "build/script-fixtures/live.xubc"
+    files.write_atomic(path + "", &raw) or >>
+    $file := dev.development_file(path + "", &raw)
+    next := (load("v2") or >>).encode() or >>
+    files.write_atomic(path + "", &next) or >>
+    changed := file.poll(&tree, $&script)
+    assert(changed.status == host.ACTIVATED && script.epoch() == 2 && script.calls() == 1)
+    assert(near(script.state(1) or >>, 1.0))
+    invalid := "invalid artifact"
+    files.write_atomic(path + "", &invalid) or >>
+    rejected := file.poll(&tree, $&script)
+    assert(rejected.status == host.REJECTED && file.has_error() && script.epoch() == 2)
+    repeated := file.poll(&tree, $&script)
+    assert(repeated.status == host.UNCHANGED && file.has_error())
+    assert(near(script.physics_process(&tree, 1.0 / 60.0, 1.0) or >>, 6.0))
+    files.write_atomic(path + "", &next) or >>
+    recovered := file.poll(&tree, $&script)
+    assert(recovered.status == host.UNCHANGED && !file.has_error() && script.epoch() == 2)
+    tree.queue_free(node) or >>
+    assert((script.physics_process(&tree, 1.0 / 60.0, 1.0) or >>) == 0.0 && script.calls() == 2)
+    tree.flush_free() or >>
+    replacement := tree.add_child(root, "Replacement") or >>
+    assert(replacement != node && host_rejected($&script, &tree))
+    println("PASS: scalar VM/compiler semantics, 100 state-preserving reloads, stable field rename/reorder/add/delete, retired IDs, transactional callback failure, node lifecycle, artifact rejection/recovery; rejected " + str(rejections) + " malformed bytecodes")
+    << 0
+}
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

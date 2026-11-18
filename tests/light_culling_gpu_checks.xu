@@ -1,0 +1,157 @@
+@main
+#gpu
+#math
+lights #"github.com/xulang-org/nexus/resources/lighting"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+fm #"github.com/xulang-org/nexus/foundation/math"
+nexus #"github.com/xulang-org/nexus/scene"
+scene_render #"github.com/xulang-org/nexus/integration/rendering/three_d"
+fn bad_draw(device $&ren.Device3D,mesh &ren.Mesh3D,material &ren.Material3D,lighting &lights.Environment3D) bool {
+    device.draw_material(mesh,fm.identity_3d(),fm.identity_3d(),material,lighting) or(err){ << true }
+    << false
+}
+fn pixel(device $&ren.Device3D,mesh &ren.Mesh3D,material &ren.Material3D,lighting &lights.Environment3D) int {
+    device.begin(255) or >>
+    vp := fm.translation_3d(fm.vec3(1.0/64.0,-1.0/64.0,0.5))
+    device.draw_material(mesh,fm.identity_3d(),vp,material,lighting) or >>
+    result := device.read_pixel(32,32) or >>
+    device.present() or >>
+    << result
+}
+fn stats(device &ren.Device3D,draws int,candidates int,selected int) int {
+    value := device.lighting_stats() or >>
+    assert(value.draws==draws && value.candidates==candidates && value.selected==selected && value.culled==candidates-selected)
+    << 0
+}
+fn quad() meshes.MeshData3D {
+    $mesh := meshes.new_mesh_data_3d()
+    for p in [fm.vec3(-0.5,0.5,0.0),fm.vec3(0.5,0.5,0.0),fm.vec3(0.5,-0.5,0.0),fm.vec3(-0.5,-0.5,0.0)] {
+        mesh.vertex_lit(p,4294967295,fm.vec3(0.0,0.0,1.0)) or >>
+    }
+    mesh.triangle(0,2,1) or >>
+    mesh.triangle(0,3,2) or >>
+    << mesh
+}
+fn run() int {
+    zero := fm.vec3(0.0,0.0,0.0)
+    one := fm.vec3(1.0,1.0,1.0)
+    normal := fm.vec3(0.0,0.0,1.0)
+    eye := normal.scaled(2.0)
+    program := shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d("Per-mesh light selection",64,64,gpu.AUTO,&program) or >>
+    data := quad() or >>
+    $mesh := device.upload(&data) or >>
+    material := ren.material_3d(one,0.0,1.0,zero) or >>
+    source := lights.point(normal,one,10.0) or >>
+    baseline := lights.environment(zero,eye,1.0,[source]) or >>
+    expected := pixel($&device,&mesh,&material,&baseline) or >>
+    assert(math.abs(f64((expected >> 24)-133))<=2.0)
+    $many := []lights.Light3D{}
+    for i in 0:255 { many.push(lights.point(fm.vec3(100.0+f64(i),0.0,1.0),one,1.0) or >>) }
+    many.push(source)
+    candidates := lights.environment(zero,eye,1.0,many) or >>
+    assert((pixel($&device,&mesh,&material,&candidates) or >>)==expected)
+    stats(&device,1,256,1) or >>
+    // These spots are inside radius but point away from the entire mesh.
+    $spots := []lights.Light3D{}
+    for i in 0:255 { spots.push(lights.spot(fm.vec3(2.0+f64(i)*0.01,0.0,1.0),fm.vec3(1.0,0.0,0.0),one,10.0,0.1,0.3) or >>) }
+    spots.push(source)
+    cones := lights.environment(zero,eye,1.0,spots) or >>
+    assert((pixel($&device,&mesh,&material,&cones) or >>)==expected)
+    stats(&device,1,256,1) or >>
+    // All 17 sources are valid candidates, but an overlapping draw is rejected
+    // before GPU encoding; statistics and an existing frame remain usable.
+    $all := []lights.Light3D{}
+    for i in 0:17 { all.push(source) }
+    overload := lights.environment(zero,eye,1.0,all) or >>
+    device.begin(255) or >>
+    assert(bad_draw($&device,&mesh,&material,&overload))
+    stats(&device,0,0,0) or >>
+    device.draw_material(&mesh,fm.identity_3d(),fm.translation_3d(fm.vec3(1.0/64.0,-1.0/64.0,0.5)),&material,&baseline) or >>
+    assert((device.read_pixel(32,32) or >>)==expected)
+    stats(&device,1,1,1) or >>
+    device.present() or >>
+    // Shared mesh metadata follows per-node world transforms. Two spatial
+    // islands have 17 global lights, while each draw receives only 9 or 8.
+    $left := []lights.Light3D{}
+    $right := []lights.Light3D{}
+    $global := []lights.Light3D{}
+    for i in 0:17 {
+        $p := fm.vec3(-5.0,0.0,1.0)
+        $intensity := 1.0/9.0
+        if i>=9 { p.x=5.0
+            intensity=1.0/8.0 }
+        light := lights.point(p,one.scaled(intensity),2.0) or >>
+        global.push(light)
+        if i<9 { left.push(light)
+        } else { right.push(light) }
+    }
+    left_env := lights.environment(zero,eye,1.0,left) or >>
+    right_env := lights.environment(zero,eye,1.0,right) or >>
+    combined := lights.environment(zero,eye,1.0,global) or >>
+    vp := fm.translation_3d(fm.vec3(0.0,0.0,0.5)).multiply(fm.scale_3d(fm.vec3(0.1,1.0,1.0)))
+    left_world := fm.translation_3d(fm.vec3(-5.0,0.0,0.0))
+    right_world := fm.translation_3d(fm.vec3(5.0,0.0,0.0))
+    device.begin(255) or >>
+    device.draw_material(&mesh,left_world,vp,&material,&left_env) or >>
+    device.draw_material(&mesh,right_world,vp,&material,&right_env) or >>
+    a := device.read_pixel(16,32) or >>
+    b := device.read_pixel(48,32) or >>
+    assert(a!=255 && b!=255)
+    device.present() or >>
+    $tree := nexus.new_scene_tree_3d("Islands",4) or >>
+    l := tree.add_child_3d(tree.root(),"Left") or >>
+    r := tree.add_child_3d(tree.root(),"Right") or >>
+    tree.set_transform_3d(l,left_world) or >>
+    tree.set_transform_3d(r,right_world) or >>
+    $scene := scene_render.new_scene_3d(&device) or >>
+    for node in [l,r] { scene.attach_mesh(&tree,node,&mesh) or >>
+        scene.set_material(&tree,node,material) or >> }
+    device.begin(255) or >>
+    assert((scene.draw_lit($&device,&tree,vp,&combined) or >>).instances==2)
+    assert((device.read_pixel(16,32) or >>)==a && (device.read_pixel(48,32) or >>)==b)
+    stats(&device,2,34,17) or >>
+    device.present() or >>
+    // Negative scale, shear and nonuniform scale change the world bounds, not
+    // the local bounds of a shared mesh. A light moving with the mesh stays lit.
+    for sign in [-1.0,1.0] {
+        $world := fm.scale_3d(fm.vec3(sign*2.0,3.0,1.0))
+        world.c1.x=0.75
+        world.c3=fm.vec4(6.0,2.0,0.0,1.0)
+        moved := lights.environment(zero,fm.vec3(6.0,2.0,2.0),1.0,[lights.point(fm.vec3(6.0,2.0,1.0),one,10.0) or >>]) or >>
+        inverse := world.affine_inverse() or >>
+        view := fm.translation_3d(fm.vec3(1.0/64.0,-1.0/64.0,0.5)).multiply(inverse)
+        device.begin(255) or >>
+        device.draw_material(&mesh,world,view,&material,&moved) or >>
+        assert((device.read_pixel(32,32) or >>)==expected)
+        stats(&device,1,1,1) or >>
+        device.present() or >>
+    }
+    // Large f64 positions can collapse onto different binary32 extrema. A
+    // cancellation-prone GPU model multiply/add can then land exactly at zero.
+    $precise := meshes.new_mesh_data_3d()
+    for p in [fm.vec3(100000001.0,0.0,0.0),fm.vec3(100000001.0,1.0,0.0),fm.vec3(100000001.0,0.0,1.0)] {
+        precise.vertex_lit(p,4294967295,normal) or >>
+    }
+    precise.triangle(0,1,2) or >>
+    $quantized := device.upload(&precise) or >>
+    assert((precise.bounds() or >>).minimum.x==100000001.0 && quantized.local_bounds().minimum.x==100000000.0)
+    $cancellation := fm.scale_3d(fm.vec3(1e-8,1.0,1.0))
+    cancellation.c3.x = -1.0
+    guard := quantized.world_bounds(cancellation) or >>
+    assert(guard.contains(zero) or >>)
+    quantized.close() or >>
+    // Static metadata never bypasses weak-resource lifetime validation.
+    mesh.close() or >>
+    device.begin(255) or >>
+    assert(bad_draw($&device,&mesh,&material,&baseline))
+    stats(&device,0,0,0) or >>
+    device.present() or >>
+    device.close() or >>
+    println("PASS: Metal 256->1 range/cone filtering with identical pixels, global 17 split 9/8 per mesh, reflection/shear/scale, uploaded float extrema/cancellation guard, overload recovery, frame statistics and closed-resource validation")
+    << 0
+}
+fn main() int { << run() or(err){ eprintln(err.msg())
+    << 1 } }

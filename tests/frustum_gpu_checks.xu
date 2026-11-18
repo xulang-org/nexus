@@ -1,0 +1,184 @@
+@main
+#gpu
+#os
+#math
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+fm #"github.com/xulang-org/nexus/foundation/math"
+nexus #"github.com/xulang-org/nexus/scene"
+scene_render #"github.com/xulang-org/nexus/integration/rendering/three_d"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+fn bad_draw(scene &scene_render.Scene3D,device $&ren.Device3D,tree &nexus.SceneTree,view fm.Mat4) bool {
+    scene.draw(device,tree,view) or(err){ << true }
+    << false
+}
+fn bad_lit(scene &scene_render.Scene3D,device $&ren.Device3D,tree &nexus.SceneTree,view fm.Mat4,env &lights.Environment3D) bool {
+    scene.draw_lit(device,tree,view,env) or(err){ << true }
+    << false
+}
+fn bad_query(owner &ren.DeviceRef3D,mesh ren.MeshRef3D,view fm.Mat4) bool {
+    owner.mesh_in_view(mesh,view) or(err){ << true }
+    << false
+}
+fn run() int {
+    program := shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d("Frustum submission checks",64,64,gpu.AUTO,&program) or >>
+    zero := fm.vec3(0.0,0.0,0.0)
+    one := fm.vec3(1.0,1.0,1.0)
+    $source := meshes.new_mesh_data_3d()
+    for p in [fm.vec3(-0.25,0.25,0.0),fm.vec3(0.25,0.25,0.0),fm.vec3(0.25,-0.25,0.0),fm.vec3(-0.25,-0.25,0.0)] {
+        source.vertex_lit_uv(p,4294967295,fm.vec3(0.0,0.0,1.0),fm.vec2(p.x+0.25,p.y+0.25)) or >>
+    }
+    source.triangle(0,2,1) or >>
+    source.triangle(0,3,2) or >>
+    $mesh := device.upload(&source) or >>
+    material := ren.material_3d(one,0.0,1.0,zero) or >>
+    environment := lights.environment(one,fm.vec3(0.0,0.0,2.0),1.0,[]lights.Light3D{}) or >>
+    $tree := nexus.new_scene_tree_3d("Clip",256) or >>
+    node := tree.add_child_3d(tree.root(),"Visible") or >>
+    $scene := scene_render.new_scene_3d(&device) or >>
+    scene.attach_mesh(&tree,node,&mesh) or >>
+    view := fm.translation_3d(fm.vec3(0.0,0.0,0.5))
+    assert(bad_draw(&scene,$&device,&tree,view))
+    for p in [fm.vec3(-2.0,0.0,0.0),fm.vec3(2.0,0.0,0.0),fm.vec3(0.0,-2.0,0.0),
+              fm.vec3(0.0,2.0,0.0),fm.vec3(0.0,0.0,-2.0),fm.vec3(0.0,0.0,2.0)] {
+        tree.set_position_3d(node,p) or >>
+        device.begin(255) or >>
+        report := scene.draw($&device,&tree,view) or >>
+        assert(report.instances==0 && report.triangles==0 && report.culled_instances==1 && report.culled_triangles==2)
+        assert((device.read_pixel(32,32) or >>)==255)
+        assert(bad_draw(&scene,$&device,&tree,view))
+        device.present() or >>
+    }
+    // Contact with a clip face is retained, even if depth/raster rules later
+    // give it no covered samples. No false-negative epsilon-edge decision.
+    for p in [fm.vec3(-1.25,0.0,0.0),fm.vec3(1.25,0.0,0.0),fm.vec3(0.0,-1.25,0.0),
+              fm.vec3(0.0,1.25,0.0),fm.vec3(0.0,0.0,-0.5),fm.vec3(0.0,0.0,0.5)] {
+        tree.set_position_3d(node,p) or >>
+        device.begin(255) or >>
+        report := scene.draw($&device,&tree,view) or >>
+        assert(report.instances==1 && report.culled_instances==0)
+        device.present() or >>
+    }
+    perspective := nexus.perspective_3d(math.pi()/2.0,1.0,1.0,10.0) or >>
+    for z in [-0.5,2.0,-12.0] {
+        tree.set_position_3d(node,fm.vec3(0.0,0.0,z)) or >>
+        device.begin(255) or >>
+        assert((scene.draw($&device,&tree,perspective) or >>).culled_instances==1)
+        device.present() or >>
+    }
+    for z in [-1.0,-2.0,-10.0] {
+        tree.set_position_3d(node,fm.vec3(0.0,0.0,z)) or >>
+        device.begin(255) or >>
+        assert((scene.draw($&device,&tree,perspective) or >>).instances==1)
+        device.present() or >>
+    }
+    for sign in [-1.0,1.0] {
+        $world := fm.rotation_y(0.4).multiply(fm.scale_3d(fm.vec3(sign*2.0,1.2,1.0)))
+        world.c1.x+=0.4
+        world.c3.x=sign*0.85
+        tree.set_transform_3d(node,world) or >>
+        device.begin(255) or >>
+        device.draw(&mesh,view.multiply(world)) or >>
+        device.capture("build/frustum-affine-direct.png") or >>
+        device.present() or >>
+        device.begin(255) or >>
+        assert((scene.draw($&device,&tree,view) or >>).instances==1)
+        device.capture("build/frustum-affine-scene.png") or >>
+        device.present() or >>
+        assert((os.read("build/frustum-affine-direct.png") or >>)==(os.read("build/frustum-affine-scene.png") or >>))
+    }
+    tree.set_transform_3d(node,fm.identity_3d()) or >>
+    $ids := []int{}
+    for i in 0:128 {
+        id := tree.add_child_3d(tree.root(),"Outside"+str(i)) or >>
+        tree.set_position_3d(id,fm.vec3(100.0+f64(i),0.0,0.0)) or >>
+        scene.attach_mesh(&tree,id,&mesh) or >>
+        ids.push(id)
+    }
+    // The raw reference path deliberately remains an explicit GPU submission.
+    device.begin(255) or >>
+    device.draw(&mesh,view) or >>
+    device.capture("build/frustum-direct.png") or >>
+    device.present() or >>
+    device.begin(255) or >>
+    report := scene.draw($&device,&tree,view) or >>
+    assert(report.instances==1 && report.triangles==2 && report.culled_instances==128 && report.culled_triangles==256)
+    device.capture("build/frustum-scene.png") or >>
+    device.present() or >>
+    assert((os.read("build/frustum-direct.png") or >>)==(os.read("build/frustum-scene.png") or >>))
+    for id in ids { scene.set_material(&tree,id,material) or >> }
+    scene.set_material(&tree,node,material) or >>
+    device.begin(255) or >>
+    device.draw_material(&mesh,fm.identity_3d(),view,&material,&environment) or >>
+    device.capture("build/frustum-material-direct.png") or >>
+    device.present() or >>
+    device.begin(255) or >>
+    lit := scene.draw_lit($&device,&tree,view,&environment) or >>
+    assert(lit.instances==1 && lit.culled_instances==128)
+    summary := device.lighting_stats() or >>
+    assert(summary.draws==1)
+    device.capture("build/frustum-material-scene.png") or >>
+    device.present() or >>
+    assert((os.read("build/frustum-material-direct.png") or >>)==(os.read("build/frustum-material-scene.png") or >>))
+    // Hidden/queued sources do not count as frustum culled candidates.
+    tree.set_visible(ids[0],false) or >>
+    tree.queue_free(ids[1]) or >>
+    device.begin(255) or >>
+    reduced := scene.draw_lit($&device,&tree,view,&environment) or >>
+    assert(reduced.instances==1 && reduced.culled_instances==126)
+    device.present() or >>
+    // An entirely offscreen scene needs no per-mesh light selection/upload.
+    tree.set_visible(node,false) or >>
+    $sources := []lights.Light3D{}
+    for i in 0:17 { sources.push(lights.directional(fm.vec3(0.0,0.0,1.0),one) or >>) }
+    overload := lights.environment(zero,one,1.0,sources) or >>
+    device.begin(255) or >>
+    assert((scene.draw_lit($&device,&tree,view,&overload) or >>).instances==0)
+    assert((device.lighting_stats() or >>).draws==0)
+    tree.set_position_3d(ids[2],zero) or >>
+    assert(bad_lit(&scene,$&device,&tree,view,&overload))
+    assert((device.lighting_stats() or >>).draws==0)
+    assert((scene.draw_lit($&device,&tree,view,&environment) or >>).instances==1)
+    device.present() or >>
+    tree.set_position_3d(ids[2],fm.vec3(100.0,0.0,0.0)) or >>
+    // Offscreen invalid maps/transforms still fail, before any submission.
+    pixels := [4294967295]
+    $texture := device.texture_rgba(1,1,&pixels,true,false,false) or >>
+    textured := material.with_base_texture(&texture) or >>
+    scene.set_material(&tree,ids[2],textured) or >>
+    texture.close() or >>
+    device.begin(255) or >>
+    assert(bad_lit(&scene,$&device,&tree,view,&environment))
+    assert((device.lighting_stats() or >>).draws==0)
+    scene.set_material(&tree,ids[2],material) or >>
+    $singular := fm.scale_3d(fm.vec3(0.0,1.0,1.0))
+    singular.c3.x=100.0
+    tree.set_transform_3d(ids[2],singular) or >>
+    assert(bad_lit(&scene,$&device,&tree,view,&environment))
+    tree.set_transform_3d(ids[2],fm.translation_3d(fm.vec3(1e12,0.0,0.0))) or >>
+    assert(bad_lit(&scene,$&device,&tree,view,&environment))
+    tree.set_transform_3d(ids[2],fm.translation_3d(fm.vec3(100.0,0.0,0.0))) or >>
+    assert((scene.draw_lit($&device,&tree,view,&environment) or >>).instances==0)
+    device.present() or >>
+    // f64 constants outside the right plane both round to the same binary32
+    // value. Visibility must use the packed MVP, retaining the boundary.
+    packed_edge := fm.Mat4{c0: fm.vec4(0.0,0.0,0.0,0.0),c1: fm.vec4(0.0,0.0,0.0,0.0),
+        c2: fm.vec4(0.0,0.0,0.0,0.0),c3: fm.vec4(100000002.0,0.0,0.5,100000001.0)}
+    assert(device.reference().mesh_in_view(mesh.reference(),packed_edge) or >>)
+    mesh.close() or >>
+    device.begin(255) or >>
+    assert(bad_lit(&scene,$&device,&tree,view,&environment))
+    device.present() or >>
+    $other := ren.open_3d("Foreign clip query",16,16,gpu.AUTO,&program) or >>
+    $foreign := other.upload(&source) or >>
+    assert(bad_query(&device.reference(),foreign.reference(),view))
+    foreign.close() or >>
+    other.close() or >>
+    device.close() or >>
+    println("PASS: Metal six-face/reverse-Z clipping, boundary retention, affine/reflected/sheared partial boxes, 129->1 scene submissions with exact raw-path PNGs, hidden/queued accounting, offscreen light-budget bypass, frame/resource/map/transform error recovery and packed-MVP rounding")
+    << 0
+}
+fn main() int { << run() or(err){ eprintln(err.msg())
+    << 1 } }

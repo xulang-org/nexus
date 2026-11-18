@@ -1,0 +1,125 @@
+@main
+
+#gpu
+
+gpu_info #"github.com/xulang-org/nexus/platform/gpu"
+
+mesh_shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+
+canvas_shaders #"github.com/xulang-org/nexus/assets/shaders/two_d"
+
+ren_2d #"github.com/xulang-org/nexus/rendering/two_d"
+
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+colors #"github.com/xulang-org/nexus/foundation/color"
+fm #"github.com/xulang-org/nexus/foundation/math"
+nexus #"github.com/xulang-org/nexus/scene"
+#math
+
+fn triangle(color int) meshes.MeshData3D {
+    $mesh := meshes.new_mesh_data_3d()
+    mesh.vertex(fm.vec3(-1.0, -1.0, 0.0), color) or >>
+    mesh.vertex(fm.vec3(1.0, -1.0, 0.0), color) or >>
+    mesh.vertex(fm.vec3(0.0, 1.0, 0.0), color) or >>
+    mesh.triangle(0, 1, 2) or >>
+    << mesh
+}
+fn draw_rejected(device $&ren.Device3D, mesh &ren.Mesh3D) bool {
+    device.draw(mesh, fm.identity_3d()) or (err) { << true }
+    << false
+}
+fn begin_rejected(device $&ren.Device3D, color int) bool {
+    device.begin(color) or (err) { << true }
+    << false
+}
+fn run() int {
+    mesh_program_0 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d("Xu 3D GPU depth validation", 256, 256, gpu.AUTO, &mesh_program_0) or >>
+    backend := device.backend() or >>
+    println("3D GPU test backend: " + gpu_info.backend_name(backend))
+    red := colors.rgba8(255, 0, 0, 255) or >>
+    blue := colors.rgba8(0, 0, 255, 255) or >>
+    green := colors.rgba8(0, 255, 0, 255) or >>
+    background := colors.rgba8(16, 24, 32, 255) or >>
+    red_source := triangle(red) or >>
+    blue_source := triangle(blue) or >>
+    green_source := triangle(green) or >>
+    $near_mesh := device.upload(&red_source) or >>
+    $far_mesh := device.upload(&blue_source) or >>
+    $clipped_mesh := device.upload(&green_source) or >>
+    projection := nexus.perspective_3d(math.pi() / 2.0, 1.0, 0.1, 100.0) or >>
+    near := projection.multiply(fm.translation_3d(fm.vec3(0.0, 0.0, -2.0)))
+    far := projection.multiply(fm.translation_3d(fm.vec3(0.0, 0.0, -4.0))).multiply(fm.scale_3d(fm.vec3(2.0, 2.0, 2.0)))
+    assert(draw_rejected($&device, &near_mesh))
+    device.begin(background) or >>
+    assert(begin_rejected($&device, background))
+    device.draw(&near_mesh, near) or >>
+    device.draw(&far_mesh, far) or >>
+    device.draw(&clipped_mesh, projection.multiply(fm.translation_3d(fm.vec3(0.0, 0.0, 1.0)))) or >>
+    device.draw(&clipped_mesh, projection.multiply(fm.translation_3d(fm.vec3(0.0, 0.0, -0.05)))) or >>
+    pixel := device.read_pixel(128, 128) or >>
+    corner := device.read_pixel(0, 0) or >>
+    println("depth pixel=" + str(pixel) + " red=" + str(red) + " corner=" + str(corner) + " background=" + str(background))
+    assert(pixel == red && corner == background)
+    assert(draw_rejected($&device, &near_mesh))
+    device.capture("build/gpu3d-depth.png") or >>
+    device.present() or >>
+    // Clear depth each frame: a farther triangle must now pass.
+    device.begin(background) or >>
+    device.draw(&far_mesh, far) or >>
+    assert((device.read_pixel(128, 128) or >>) == blue)
+    device.present() or >>
+    // Opposite submission order must produce the same nearest surface.
+    device.begin(background) or >>
+    device.draw(&far_mesh, far) or >>
+    device.draw(&near_mesh, near) or >>
+    assert((device.read_pixel(128, 128) or >>) == red)
+    device.present() or >>
+    // GPU MVP translation changes the covered pixels; no CPU projection occurs.
+    device.begin(background) or >>
+    translated := projection.multiply(fm.translation_3d(fm.vec3(1.4, 0.0, -2.0)))
+    device.draw(&near_mesh, translated) or >>
+    assert((device.read_pixel(128, 128) or >>) == background)
+    assert((device.read_pixel(217, 150) or >>) == red)
+    device.present() or >>
+    near_mesh.close() or >>
+    assert(draw_rejected($&device, &near_mesh))
+    device.close() or >>
+    device.close() or >>
+    far_mesh.close() or >>
+    clipped_mesh.close() or >>
+    // Reuse a device slot; resources from its old generation stay invalid.
+    mesh_program_1 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $replacement := ren.open_3d("Xu 3D lifetime validation", 127, 93, gpu.AUTO, &mesh_program_1) or >>
+    assert(draw_rejected($&replacement, &far_mesh))
+    replacement.begin(background) or >>
+    assert((replacement.read_pixel(126, 92) or >>) == background)
+    replacement.capture("build/gpu3d-odd-pitch.png") or >>
+    replacement.present() or >>
+    replacement.close() or >>
+    // Shared SDL video lifetime: destroying one kind must preserve the other.
+    canvas_program_0 := canvas_shaders.load_canvas("build/canvas-shaders") or >>
+    $two_d := ren_2d.open_2d("2D lifetime peer", 128, 128, gpu.AUTO, &canvas_program_0) or >>
+    mesh_program_2 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $three_d := ren.open_3d("3D lifetime peer", 128, 128, gpu.AUTO, &mesh_program_2) or >>
+    two_d.close() or >>
+    three_d.begin(background) or >>
+    assert((three_d.read_pixel(64, 64) or >>) == background)
+    three_d.present() or >>
+    three_d.close() or >>
+    canvas_program_1 := canvas_shaders.load_canvas("build/canvas-shaders") or >>
+    $two_d_again := ren_2d.open_2d("2D lifetime survivor", 128, 128, gpu.AUTO, &canvas_program_1) or >>
+    mesh_program_3 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $three_d_again := ren.open_3d("3D lifetime transient", 128, 128, gpu.AUTO, &mesh_program_3) or >>
+    three_d_again.close() or >>
+    two_d_again.begin(background) or >>
+    assert((two_d_again.read_pixel(64, 64) or >>) == background)
+    two_d_again.present() or >>
+    two_d_again.close() or >>
+    println("3D GPU checks passed: indexed upload, GPU MVP, reverse-Z order, depth clear, clip, readback, frame states, lifetime, padded rows")
+    << 0
+}
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

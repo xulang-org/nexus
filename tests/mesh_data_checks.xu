@@ -1,0 +1,118 @@
+@main
+
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+fm #"github.com/xulang-org/nexus/foundation/math"
+#math
+
+fn near(a f64, b f64) bool { << math.abs(a - b) < 0.000001 }
+fn quad(scale f64, uv_scale f64, mirror bool) meshes.MeshData3D {
+    $mesh := meshes.new_mesh_data_3d()
+    positions := [fm.vec3(-0.5, -0.5, 0.0), fm.vec3(0.5, -0.5, 0.0), fm.vec3(0.5, 0.5, 0.0), fm.vec3(-0.5, 0.5, 0.0)]
+    for p in positions {
+        $v := (p.y + 0.5) * uv_scale
+        if mirror { v = -v }
+        mesh.vertex_lit_uv(p.scaled(scale), 4294967295, fm.vec3(0.0, 0.0, 2.0), fm.vec2((p.x + 0.5) * uv_scale, v)) or >>
+    }
+    mesh.triangle(0, 1, 2) or >>
+    mesh.triangle(0, 2, 3) or >>
+    << mesh
+}
+fn seam() meshes.MeshData3D {
+    $mesh := meshes.new_mesh_data_3d()
+    positions := [fm.vec3(0.0, 0.0, 0.0), fm.vec3(1.0, 0.0, 0.0), fm.vec3(0.0, 1.0, 0.0), fm.vec3(-1.0, 0.0, 0.0)]
+    uvs := [fm.vec2(0.0, 0.0), fm.vec2(1.0, 0.0), fm.vec2(0.0, 1.0), fm.vec2(1.0, 0.0)]
+    for i in 0:4 { mesh.vertex_lit_uv(positions[i], 4294967295 - i * 16777216, fm.vec3(0.0, 0.0, 1.0), uvs[i]) or >> }
+    mesh.triangle(0, 1, 2) or >>
+    mesh.triangle(0, 2, 3) or >>
+    << mesh
+}
+fn same(a &meshes.MeshData3D, b &meshes.MeshData3D) bool {
+    if a.vertices.len != b.vertices.len || a.indices.len != b.indices.len { << false }
+    for i in 0:a.indices.len { if a.indices[i] != b.indices[i] { << false } }
+    for i in 0:a.vertices.len {
+        x := a.vertices[i]
+        y := b.vertices[i]
+        if x.position.x != y.position.x || x.position.y != y.position.y || x.position.z != y.position.z ||
+            x.color != y.color || x.normal.x != y.normal.x || x.normal.y != y.normal.y || x.normal.z != y.normal.z ||
+            x.uv.x != y.uv.x || x.uv.y != y.uv.y || x.has_uv != y.has_uv || x.has_tangent != y.has_tangent ||
+            x.tangent.x != y.tangent.x || x.tangent.y != y.tangent.y || x.tangent.z != y.tangent.z || x.tangent.w != y.tangent.w { << false }
+    }
+    << true
+}
+fn rejects(mesh $&meshes.MeshData3D) bool { mesh.generate_tangents() or (err) { << true }
+    << false }
+fn atomic_failure(mesh $&meshes.MeshData3D, original &meshes.MeshData3D) {
+    assert(rejects(mesh) && same(mesh, original))
+}
+fn limits() int {
+    $mesh := seam() or >>
+    // Every source vertex participates; seam duplication alone exceeds budget.
+    for i in 0:(meshes.MAX_VERTICES - 4) / 3 {
+        offset := mesh.vertex_count()
+        for p in [fm.vec3(0.0, 0.0, 0.0), fm.vec3(1.0, 0.0, 0.0), fm.vec3(0.0, 1.0, 0.0)] {
+            mesh.vertex_lit_uv(p, 4294967295, fm.vec3(0.0, 0.0, 1.0), fm.vec2(p.x, p.y)) or >>
+        }
+        mesh.triangle(offset, offset + 1, offset + 2) or >>
+    }
+    assert(mesh.vertex_count() == meshes.MAX_VERTICES)
+    assert(rejects($&mesh) && mesh.vertex_count() == meshes.MAX_VERTICES && !mesh.vertices[0].has_tangent)
+    assert(mesh.indices[0] == 0 && mesh.indices[1] == 1 && mesh.indices[2] == 2)
+    << 0
+}
+fn run() int {
+    for scale in [1.0, 0.0000001, 1000000000.0, 1.0e-150] {
+        for uv_scale in [1.0, 1000000.0, 1.0e-150] {
+            for mirror in [false, true] {
+                $mesh := quad(scale, uv_scale, mirror) or >>
+                original := ~mesh
+                assert((mesh.generate_tangents() or >>) == 0)
+                assert(!original.vertices[0].has_tangent)
+                mesh.validate() or >>
+                for vertex in mesh.vertices {
+                    assert(near(vertex.tangent.x, 1.0) && near(vertex.tangent.y, 0.0) && near(vertex.tangent.z, 0.0))
+                    assert(vertex.has_tangent && (vertex.tangent.w == -1.0) == mirror)
+                    assert(near(vertex.normal.dot(vertex.tangent.xyz()), 0.0))
+                }
+                assert((mesh.generate_tangents() or >>) == 0 && mesh.vertex_count() == 4)
+            }
+        }
+    }
+    $split := seam() or >>
+    assert((split.generate_tangents() or >>) == 2 && split.vertex_count() == 6 && split.triangle_count() == 2)
+    split.validate() or >>
+    for i in 0:3 { assert(split.vertices[split.indices[i]].tangent.w == 1.0 && near(split.vertices[split.indices[i]].tangent.x, 1.0)) }
+    for i in 3:6 { assert(split.vertices[split.indices[i]].tangent.w == -1.0 && near(split.vertices[split.indices[i]].tangent.x, -1.0)) }
+    assert(split.indices[0] != split.indices[3] && split.indices[2] != split.indices[4])
+    assert(split.vertices[0].color == split.vertices[1].color && split.vertices[0].uv.x == split.vertices[1].uv.x)
+    assert((split.generate_tangents() or >>) == 0)
+    // Two equal corner angles contribute X and normalized (X-Y).
+    $smooth := seam() or >>
+    smooth.vertices[3].uv = fm.vec2(-1.0, -1.0)
+    assert((smooth.generate_tangents() or >>) == 0)
+    expected := fm.vec3(1.0 + math.sqrt(0.5), -math.sqrt(0.5), 0.0).normalized() or >>
+    assert(near(smooth.vertices[0].tangent.x, expected.x) && near(smooth.vertices[0].tangent.y, expected.y))
+    $projected := quad(1.0, 1.0, false) or >>
+    for i in 0:4 { projected.vertices[i].normal = fm.vec3(0.6, 0.0, 0.8) }
+    projected.generate_tangents() or >>
+    assert(near(projected.vertices[0].tangent.x, 0.8) && near(projected.vertices[0].tangent.z, -0.6))
+    for mode in 0:9 {
+        $bad := quad(1.0, 1.0, false) or >>
+        if mode == 0 { bad.vertices[0].has_uv = false }
+        if mode == 1 { bad.vertices[0].normal = fm.vec3(0.0, 0.0, 0.0) }
+        if mode == 2 { for i in 0:4 { bad.vertices[i].uv = fm.vec2(0.0, 0.0) } }
+        if mode == 3 { bad.indices[5] = 0 }
+        if mode == 4 { bad.indices[5] = 99 }
+        if mode == 5 { bad.vertices[0].position.x = math.nan() }
+        if mode == 6 { bad.vertex_lit_uv(fm.vec3(0.0, 0.0, 0.0), 4294967295, fm.vec3(0.0, 0.0, 1.0), fm.vec2(0.0, 0.0)) or >> }
+        if mode == 7 { bad.vertices[0].normal = fm.vec3(1.0, 0.0, 0.0) }
+        if mode == 8 { for i in 0:4 { bad.vertices[i].uv.y *= 0.00000000000001 } }
+        before := ~bad
+        if mode == 5 { assert(rejects($&bad) && math.is_nan(bad.vertices[0].position.x)) }
+        else { atomic_failure($&bad, &before) }
+    }
+    limits() or >>
+    println("PASS: CPU typed meshes, angle-weighted tangents, mirrored seam splits, normal projection, scale stability, atomic rejection/COW and 262144-vertex split budget")
+    << 0
+}
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

@@ -1,0 +1,86 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#math
+nexus #"github.com/xulang-org/nexus/scene"
+scene_audio #"github.com/xulang-org/nexus/integration/audio"
+mix #"github.com/xulang-org/nexus/audio/mixer"
+pcm #"github.com/xulang-org/nexus/resources/audio"
+
+fn run() int {
+    $tree := nexus.new_scene_tree("World", 8) or >>
+    node := tree.add_child(tree.root(), "Sound") or >>
+    $mixer := mix.new_mixer(48000, 4) or >>
+    source := pcm.pcm16(48000, 1, [1000, -1000]) or >>
+    clip := mixer.add_clip(source) or >>
+    $scene := scene_audio.new_scene_audio()
+    voice := scene.play(&tree, $&mixer, node, clip, 0, 1.0, 0.0, true) or >>
+    first := mixer.render(1) or >>
+    assert(first[0] == 1000)
+    listener := tree.add_child(tree.root(), "Listener") or >>
+    tree.set_position(node, fm.vec2(5.0, 0.0)) or >>
+    spatial := scene.spatial_2d(&tree, $&mixer, node, listener, 10.0, 1.0) or >>
+    assert(spatial.volume == 0.25 && spatial.pan == 1.0)
+    balanced := mixer.render(2) or >>
+    assert(balanced[0] == 0 && balanced[1] == -250)
+    tree.set_position(node, fm.vec2(0.0, 0.0)) or >>
+    scene.spatial_2d(&tree, $&mixer, node, listener, 10.0, 1.0) or >>
+    tree.paused = true
+    scene.sync(&tree, $&mixer) or >>
+    paused := mixer.render(1) or >>
+    assert(paused[0] == 0 && (mixer.position_frames(voice) or >>) == 1.0)
+    tree.set_process_mode(node, nexus.PROCESS_ALWAYS) or >>
+    scene.sync(&tree, $&mixer) or >>
+    active := mixer.render(1) or >>
+    assert(active[0] == -1000)
+    tree.queue_free(node) or >>
+    assert((scene.sync(&tree, $&mixer) or >>) == 1 && !(mixer.is_playing(voice) or >>))
+    tree.flush_free() or >>
+    replacement := tree.add_child(tree.root(), "NewSound") or >>
+    assert(replacement != node)
+    fresh := scene.play(&tree, $&mixer, replacement, clip, 0, 1.0, 0.0, true) or >>
+    mixer.stop(fresh) or >>
+    independent := mixer.play(clip, 0, 1.0, 0.0, true) or >>
+    assert(!mixer.is_voice(fresh))
+    assert((scene.sync(&tree, $&mixer) or >>) == 1 && (mixer.is_playing(independent) or >>))
+    assert(scene.binding_count() == 0 && (scene.detach($&mixer, replacement) or >>) == 0)
+    source3d := tree.add_child_3d(tree.root(), "Source3D") or >>
+    listener3d := tree.add_child_3d(tree.root(), "Listener3D") or >>
+    scene.play(&tree, $&mixer, source3d, clip, 0, 1.0, 0.0, true) or >>
+    tree.set_position_3d(source3d, fm.vec3(5.0, 0.0, 0.0)) or >>
+    right := scene.spatial_3d(&tree, $&mixer, source3d, listener3d, 10.0, 1.0) or >>
+    assert(right.pan == 1.0 && right.volume == 0.25)
+    tree.set_transform_3d(listener3d, fm.rotation_y(math.pi())) or >>
+    left := scene.spatial_3d(&tree, $&mixer, source3d, listener3d, 10.0, 1.0) or >>
+    assert(left.pan < -0.999999 && left.volume == 0.25)
+    far := mix.spatial_3d(fm.vec3(0.0, 20.0, 0.0), fm.vec3(0.0, 0.0, 0.0), fm.vec3(1.0, 0.0, 0.0), 10.0) or >>
+    assert(far.volume == 0.0)
+    scene.detach($&mixer, source3d) or >>
+    mixer.stop(independent) or >>
+    ring := mixer.open_stream(48000, 1, 2) or >>
+    samples := [1000, -1000]
+    mixer.feed_stream(ring, &samples, true) or >>
+    tree.paused = false
+    stream_voice := scene.play_stream(&tree, $&mixer, listener3d, ring, 0, 1.0, 0.0) or >>
+    first_stream := mixer.render(1) or >>
+    assert(first_stream[0] == 1000)
+    tree.paused = true
+    scene.sync(&tree, $&mixer) or >>
+    paused_stream := mixer.render(1) or >>
+    assert(paused_stream[0] == 0 && (mixer.position_frames(stream_voice) or >>) == 1.0)
+    replacement_pcm := [2000, -2000]
+    mixer.reset_stream(ring, &replacement_pcm, true, false) or >>
+    assert(mixer.is_voice(stream_voice) && scene.binding_count() == 1)
+    tree.paused = false
+    scene.sync(&tree, $&mixer) or >>
+    positioned := mixer.render(1) or >>
+    assert(positioned[0] == 2000)
+    tree.queue_free(listener3d) or >>
+    scene.sync(&tree, $&mixer) or >>
+    assert(!(mixer.is_playing(stream_voice) or >>))
+    mixer.close_stream(ring) or >>
+    println("PASS: node audio pause/process modes, queue/free, and node/voice generation isolation")
+    << 0
+}
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

@@ -1,0 +1,90 @@
+@main
+shadow #"github.com/xulang-org/nexus/resources/shadow"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+fm #"github.com/xulang-org/nexus/foundation/math"
+#math
+fn invalid(extent f64,depth f64,resolution int,direction fm.Vec3) bool { shadow.directional(fm.vec3(0.0,0.0,0.0),direction,extent,depth,resolution) or(err){ << true }
+    << false }
+fn bad_bias(value &shadow.ShadowDescription3D,constant f64,slope f64) bool { value.with_bias(constant,slope) or(err){ << true }
+    << false }
+fn bad_spot(source lights.Light3D,near f64,resolution int) bool { shadow.spot(source,near,resolution) or(err){ << true }
+    << false }
+fn bad_point(source lights.Light3D,near f64,resolution int) bool { shadow.point(source,near,resolution) or(err){ << true }
+    << false }
+fn bad_face(description &shadow.ShadowDescription3D,face int) bool { description.view_projection(face) or(err){ << true }
+    << false }
+fn close(a f64,b f64) bool { << math.abs(a-b)<0.000000001 }
+fn run() int {
+    defaults := shadow.default_directional()
+    defaults.validate() or >>
+    for direction in [fm.vec3(0.0,0.0,1.0),fm.vec3(0.0,1.0,0.0),fm.vec3(0.0,-1.0,0.0),fm.vec3(0.3,0.8,-0.5)] {
+        description := shadow.directional(fm.vec3(0.0,0.0,0.0),direction,2.0,12.0,512) or >>
+        matrix := description.view_projection(0) or >>
+        back := description.direction()
+        near := back.scaled(6.0)
+        far := back.scaled(-6.0)
+        assert(close(matrix.transform(fm.vec4(near.x,near.y,near.z,1.0)).z,1.0))
+        assert(close(matrix.transform(fm.vec4(far.x,far.y,far.z,1.0)).z,0.0))
+        assert(close(matrix.c3.z,0.5) && matrix.is_affine())
+        matrix.affine_inverse() or >>
+    }
+    a := shadow.directional(fm.vec3(0.0,0.0,0.0),fm.vec3(0.0,0.0,1.0),2.0,12.0,512) or >>
+    b := shadow.directional(fm.vec3(0.001,0.0,0.0),fm.vec3(0.0,0.0,1.0),2.0,12.0,512) or >>
+    c := shadow.directional(fm.vec3(0.008,0.0,0.0),fm.vec3(0.0,0.0,1.0),2.0,12.0,512) or >>
+    assert((a.view_projection(0) or >>).c3.x==(b.view_projection(0) or >>).c3.x)
+    assert(close((c.view_projection(0) or >>).c3.x,-1.0/256.0))
+    assert(invalid(0.0,12.0,512,fm.vec3(0.0,1.0,0.0)))
+    assert(invalid(2.0,0.0,512,fm.vec3(0.0,1.0,0.0)))
+    assert(invalid(2.0,12.0,300,fm.vec3(0.0,1.0,0.0)))
+    assert(invalid(2.0,12.0,2048,fm.vec3(0.0,1.0,0.0)))
+    assert(invalid(2.0,12.0,512,fm.vec3(0.0,0.0,0.0)))
+    assert(bad_bias(&a,-0.1,0.001) && bad_bias(&a,0.001,0.1))
+    for forward in [fm.vec3(0.0,0.0,-1.0),fm.vec3(0.0,1.0,0.0),fm.vec3(0.0,-1.0,0.0),fm.vec3(0.2,-0.3,-0.8)] {
+        origin := fm.vec3(2.0,3.0,4.0)
+        source := lights.spot(origin,forward,fm.vec3(4.0,3.0,2.0),8.0,0.3,0.6) or >>
+        perspective := shadow.spot(source,0.2,512) or >>
+        matrix := perspective.view_projection(0) or >>
+        for distance in [0.2,8.0] {
+            point := origin.add(source.direction().scaled(distance))
+            clip := matrix.transform(fm.vec4(point.x,point.y,point.z,1.0))
+            assert(clip.w>0.0 && close(clip.x/clip.w,0.0) && close(clip.y/clip.w,0.0))
+            $expected := 0.0
+            if distance==0.2 { expected=1.0 }
+            assert(close(clip.z/clip.w,expected))
+        }
+        assert(perspective.matches_source(&source) or >>)
+        assert(bad_spot(source,0.0,512) && bad_spot(source,8.0,512) && bad_spot(source,0.2,300))
+    }
+    axial := lights.spot(fm.vec3(0.0,0.0,4.0),fm.vec3(0.0,0.0,-1.0),fm.vec3(1.0,1.0,1.0),8.0,0.3,0.6) or >>
+    perspective := shadow.spot(axial,0.2,128) or >>
+    edge := (perspective.view_projection(0) or >>).transform(fm.vec4(4.0*math.tan(0.6),0.0,0.0,1.0))
+    assert(close(edge.x/edge.w,1.0))
+    behind := (perspective.view_projection(0) or >>).transform(fm.vec4(0.0,0.0,5.0,1.0))
+    assert(behind.w<0.0)
+    point_source := lights.point(fm.vec3(2.0,3.0,4.0),fm.vec3(8.0,8.0,8.0),8.0) or >>
+    omni := shadow.point(point_source,0.1,512) or >>
+    assert(omni.face_count()==6 && (omni.matches_source(&point_source) or >>))
+    assert(bad_point(point_source,0.0,128) && bad_point(point_source,8.0,128) && bad_point(point_source,0.1,1024))
+    assert(bad_point(axial,0.1,128) && bad_face(&omni,-1) && bad_face(&omni,6) && bad_face(&a,1))
+    for face in 0:6 {
+        matrix := omni.view_projection(face) or >>
+        forward := shadow.point_face_direction(face) or >>
+        for distance in [0.1,8.0] {
+            p := point_source.position().add(forward.scaled(distance))
+            clip := matrix.transform(fm.vec4(p.x,p.y,p.z,1.0))
+            $expected := 0.0
+            if distance==0.1 { expected=1.0 }
+            assert(clip.w>0.0 && close(clip.x/clip.w,0.0) && close(clip.y/clip.w,0.0) && close(clip.z/clip.w,expected))
+        }
+    }
+    box := fm.aabb3(fm.vec3(-1.0,-1.0,-1.0),fm.vec3(1.0,1.0,1.0)) or >>
+    local := lights.point(fm.vec3(100.0,100.0,100.0),fm.vec3(1.0,1.0,1.0),1.0) or >>
+    sun := lights.directional(fm.vec3(0.0,1.0,0.0),fm.vec3(1.0,1.0,1.0)) or >>
+    assert(bad_spot(sun,0.2,128) && !(perspective.matches_source(&sun) or >>))
+    env := lights.environment(fm.vec3(0.0,0.0,0.0),fm.vec3(0.0,0.0,5.0),1.0,[local,sun,sun]) or >>
+    assert((env.selected_source_index(box,0) or >>)== -1 && (env.selected_source_index(box,1) or >>)==0 && (env.selected_source_index(box,2) or >>)==1)
+    println("PASS: pure directional/spot/point reverse-Z, six axes/near/far, cone edges/vertical bases/texel stability/bias and bounds; candidate identity survives light filtering")
+    << 0
+}
+fn main() int { << run() or(err){ eprintln(err.msg())
+    << 1 } }

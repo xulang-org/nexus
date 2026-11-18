@@ -1,0 +1,52 @@
+@main
+lod #"github.com/xulang-org/nexus/resources/lod"
+#math
+fn bad_policy(thresholds []f64,h f64) bool { lod.distance_lod(thresholds,h) or(err){ << true }
+    << false }
+fn bad_choice(policy &lod.DistanceLod,distance f64,level int) bool { policy.choose(distance,level) or(err){ << true }
+    << false }
+fn bad_threshold(policy &lod.DistanceLod,index int) bool { policy.threshold(index) or(err){ << true }
+    << false }
+fn run() int {
+    $input := [10.0,20.0]
+    policy := lod.distance_lod(~input,0.1) or >>
+    input[0]=1.0
+    assert(policy.level_count()==3 && (policy.threshold(0) or >>)==10.0 && policy.hysteresis()==0.1)
+    for d in [0.0,9.999] { assert((policy.choose(d,-1) or >>)==0) }
+    for d in [10.0,19.999] { assert((policy.choose(d,-1) or >>)==1) }
+    for d in [20.0,1e300] { assert((policy.choose(d,-1) or >>)==2) }
+    assert((policy.choose(10.999,0) or >>)==0 && (policy.choose(11.0,0) or >>)==1)
+    assert((policy.choose(9.0,1) or >>)==1 && (policy.choose(8.999,1) or >>)==0)
+    assert((policy.choose(21.999,1) or >>)==1 && (policy.choose(22.0,1) or >>)==2)
+    assert((policy.choose(18.0,2) or >>)==2 && (policy.choose(17.999,2) or >>)==1)
+    assert((policy.choose(1000.0,0) or >>)==2 && (policy.choose(0.0,2) or >>)==0)
+    $near := 0
+    $far := 1
+    for i in 0:10000 {
+        $d := 9.9
+        if i%2==0 { d=10.1 }
+        near=policy.choose(d,near) or >>
+        far=policy.choose(d,far) or >>
+        assert(near==0 && far==1)
+    }
+    plain := lod.distance_lod([10.0],0.0) or >>
+    assert((plain.choose(10.0,0) or >>)==1 && (plain.choose(9.999,1) or >>)==0)
+    single := lod.distance_lod([]f64{},0.0) or >>
+    assert((single.choose(1e300,-1) or >>)==0 && single.level_count()==1)
+    max := lod.distance_lod([1.0,2.0,3.0,4.0,5.0,6.0,1000000000.0],0.4999) or >>
+    assert(max.level_count()==8 && (max.choose(1e300,0) or >>)==7)
+    nan := math.float64_from_bits(9221120237041090560)
+    infinity := math.float64_from_bits(9218868437227405312)
+    assert(bad_policy([0.0],0.1) && bad_policy([-1.0],0.1))
+    assert(bad_policy([10.0,10.0],0.1) && bad_policy([20.0,10.0],0.1))
+    assert(bad_policy([1000000001.0],0.1) && bad_policy([nan],0.1) && bad_policy([infinity],0.1))
+    assert(bad_policy([1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0],0.0))
+    for h in [-0.01,0.5,nan,infinity] { assert(bad_policy([10.0],h)) }
+    assert(bad_choice(&policy,-1.0,0) && bad_choice(&policy,nan,0) && bad_choice(&policy,infinity,0))
+    assert(bad_choice(&policy,1.0,-2) && bad_choice(&policy,1.0,3))
+    assert(bad_threshold(&policy,-1) && bad_threshold(&policy,2))
+    println("PASS: immutable distance LOD, nominal/equal thresholds, two-sided hysteresis, 10000 jitter steps, multi-level teleports, 1/8-level bounds and invalid policies/distances/indices")
+    << 0
+}
+fn main() int { << run() or(err){ eprintln(err.msg())
+    << 1 } }

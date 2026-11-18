@@ -1,0 +1,112 @@
+@main
+lights #"github.com/xulang-org/nexus/resources/lighting"
+scene_lights #"github.com/xulang-org/nexus/integration/lighting"
+scene #"github.com/xulang-org/nexus/scene"
+fm #"github.com/xulang-org/nexus/foundation/math"
+#math
+
+fn near(a f64,b f64) bool { << math.abs(a-b)<0.000001 }
+fn bad_source(source lights.Light3D) bool { source.validate() or(err){ << true }
+    << false }
+fn bad_direction(direction fm.Vec3) bool { lights.directional(direction,fm.vec3(1.0,1.0,1.0)) or(err){ << true }
+    << false }
+fn bad_point(position fm.Vec3,radiance fm.Vec3,radius f64) bool { lights.point(position,radiance,radius) or(err){ << true }
+    << false }
+fn bad_spot(direction fm.Vec3,inner f64,outer f64) bool {
+    lights.spot(fm.vec3(0.0,0.0,0.0),direction,fm.vec3(1.0,1.0,1.0),4.0,inner,outer) or(err){ << true }
+    << false
+}
+fn bad_environment(sources []lights.Light3D) bool {
+    lights.environment(fm.vec3(0.0,0.0,0.0),fm.vec3(0.0,0.0,1.0),1.0,sources) or(err){ << true }
+    << false
+}
+fn bad_gather(world &scene_lights.SceneLights3D,tree &scene.SceneTree) bool { world.gather(tree) or(err){ << true }
+    << false }
+fn bad_attach(world $&scene_lights.SceneLights3D,tree &scene.SceneTree,node int,source lights.Light3D) bool {
+    world.attach(tree,node,source) or(err){ << true }
+    << false
+}
+fn run() int {
+    zero := fm.vec3(0.0,0.0,0.0)
+    white := fm.vec3(1.0,1.0,1.0)
+    directional := lights.directional(fm.vec3(0.0,0.0,1e200),white) or >>
+    assert(near(directional.direction().z,1.0) && directional.kind()==lights.DIRECTIONAL)
+    tiny := lights.directional(fm.vec3(1e-300,0.0,0.0),white) or >>
+    assert(near(tiny.direction().x,1.0) && bad_direction(zero))
+    assert(bad_source(lights.Light3D{}))
+    assert(bad_point(zero,white,0.0) && bad_point(zero,white,1000001.0))
+    assert(bad_point(fm.vec3(1e10,0.0,0.0),white,4.0) && bad_point(zero,fm.vec3(-1.0,0.0,0.0),4.0))
+    nan := math.float64_from_bits(9221120237041090560)
+    assert(bad_point(zero,white,nan) && bad_point(zero,fm.vec3(nan,0.0,0.0),4.0))
+    assert(bad_spot(zero,0.1,0.5) && bad_spot(white,0.5,0.1) && bad_spot(white,-0.1,0.5))
+    assert(bad_spot(white,0.1,2.0) && bad_spot(white,0.0,0.00001))
+    point := lights.point(fm.vec3(1.0,2.0,3.0),white,5.0) or >>
+    transform := fm.translation_3d(fm.vec3(10.0,20.0,30.0)).multiply(fm.scale_3d(fm.vec3(2.0,3.0,4.0)))
+    moved := point.transformed(transform) or >>
+    assert(moved.position().x==12.0 && moved.position().y==26.0 && moved.position().z==42.0 && moved.radius()==5.0)
+    rotated := directional.transformed(fm.translation_3d(white).multiply(fm.rotation_y(math.pi()/2.0))) or >>
+    assert(near(rotated.direction().x,1.0) && near(rotated.direction().z,0.0))
+    diagonal := lights.directional(white,white) or >>
+    scaled := diagonal.transformed(transform) or >>
+    assert(near(scaled.direction().x,2.0/math.sqrt(29.0)) && near(scaled.direction().z,4.0/math.sqrt(29.0)))
+    $shear := fm.identity_3d()
+    shear.c1.x=2.0
+    vertical := lights.directional(fm.vec3(0.0,1.0,0.0),white) or >>
+    skewed := vertical.transformed(shear) or >>
+    assert(near(skewed.direction().x,2.0/math.sqrt(5.0)) && near(skewed.direction().y,1.0/math.sqrt(5.0)))
+    reflected := tiny.transformed(fm.scale_3d(fm.vec3(-1.0,1.0,1.0))) or >>
+    assert(near(reflected.direction().x,-1.0))
+    spot := lights.spot(zero,fm.vec3(0.0,0.0,-1.0),white,4.0,0.2,0.6) or >>
+    changed := spot.transformed(transform) or >>
+    assert(changed.radius()==4.0 && near(changed.direction().z,-1.0) && changed.inner_cosine()==spot.inner_cosine())
+    $sources := [point]
+    environment := lights.environment(zero,white,1.0,~sources) or >>
+    sources[0]=directional
+    assert((environment.source(0) or >>).kind()==lights.POINT)
+    assert((lights.environment(zero,white,1.0,[]lights.Light3D{}) or >>).source_count()==0)
+    for i in 0:lights.MAX_SOURCES { sources.push(point) }
+    assert(bad_environment(sources))
+    $tree := scene.new_scene_tree_3d("World",512) or >>
+    $world := scene_lights.new_scene_lights_3d()
+    parent := tree.add_child_3d(tree.root(),"Parent") or >>
+    tree.set_position_3d(parent,fm.vec3(10.0,20.0,30.0)) or >>
+    node := tree.add_child_3d(parent,"Point") or >>
+    tree.set_position_3d(node,fm.vec3(1.0,0.0,0.0)) or >>
+    world.attach(&tree,node,point) or >>
+    collected := world.gather(&tree) or >>
+    assert(collected.len==1 && collected[0].position().x==12.0 && collected[0].position().y==22.0)
+    assert(bad_attach($&world,&tree,node,lights.Light3D{}) && world.binding_count()==1)
+    node2d := tree.add_child(tree.root(),"TwoD") or >>
+    assert(bad_attach($&world,&tree,node2d,point))
+    tree.set_visible(parent,false) or >>
+    assert((world.gather(&tree) or >>).len==0)
+    tree.set_visible(parent,true) or >>
+    tree.paused=true
+    assert((world.gather(&tree) or >>).len==1)
+    tree.queue_free(node) or >>
+    assert((world.gather(&tree) or >>).len==0 && (world.prune(&tree) or >>)==1)
+    tree.flush_free() or >>
+    replacement := tree.add_child_3d(parent,"Replacement") or >>
+    assert(replacement!=node && (world.gather(&tree) or >>).len==0)
+    world.attach(&tree,replacement,directional) or >>
+    tree.set_transform_3d(replacement,fm.scale_3d(zero)) or >>
+    assert(bad_gather(&world,&tree))
+    tree.set_visible(replacement,false) or >>
+    assert((world.gather(&tree) or >>).len==0)
+    assert((world.detach(replacement) or >>)==1 && (world.detach(replacement) or >>)==0)
+    $nodes := []int{}
+    for i in 0:257 { nodes.push(tree.add_child_3d(tree.root(),"Light"+str(i)) or >>) }
+    // Reverse attachment still gathers in stable scene order.
+    for i in 0:257 { index := 256-i
+        value := lights.point(fm.vec3(f64(index),0.0,0.0),white,1.0) or >>
+        world.attach(&tree,nodes[index],value) or >> }
+    assert(bad_gather(&world,&tree) && world.binding_count()==257)
+    last := nodes[256]
+    tree.set_visible(last,false) or >>
+    ordered := world.gather(&tree) or >>
+    assert(ordered.len==256 && ordered[0].position().x==0.0 && ordered[255].position().x==255.0)
+    println("PASS: immutable light descriptions, cone/radius/finite bounds, affine transforms, scene visibility/pause/deletion/order and atomic 256-candidate budget without GPU/native code")
+    << 0
+}
+fn main() int { << run() or(err){ eprintln(err.msg())
+    << 1 } }
