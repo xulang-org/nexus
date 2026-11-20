@@ -26,8 +26,8 @@ def build(project_path, output, tool):
     arrays = {'nodes', 'resources', 'surfaces', 'audio_buses', 'audio_emitters', 'scripts', 'script_connections', 'lights'}
     if not isinstance(scene, dict) or set(scene) != arrays | {'format', 'version'}:
         raise ValueError('scene template must provide the complete current schema')
-    if scene['format'] != 'xu.scene' or type(scene['version']) is not int or scene['version'] != 1:
-        raise ValueError('script scene template must use xu.scene version 1')
+    if scene['format'] != 'xu.scene' or type(scene['version']) is not int or scene['version'] not in (1, 2, 3, 4):
+        raise ValueError('script scene template must use xu.scene version 1 through 4')
     if any(not isinstance(scene[name], list) for name in arrays):
         raise ValueError('scene template collections must be arrays')
     scripts = {item['uid']: item for item in project['scripts']}

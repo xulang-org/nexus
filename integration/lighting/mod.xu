@@ -2,43 +2,69 @@
 
 scene #"github.com/xulang-org/nexus/scene"
 lights #"github.com/xulang-org/nexus/resources/lighting"
+shadows #"github.com/xulang-org/nexus/resources/shadow"
 #errors
 
 // Bindings use full IDs scoped to the same SceneTree, like scene mesh/sprite
 // bindings. They store CPU descriptions and never create renderer resources.
-pub struct SceneLights3D { sources map[int]lights.Light3D }
-pub fn new_scene_lights_3d() SceneLights3D { << SceneLights3D{sources: map[int]lights.Light3D{}} }
+pub struct LightBinding3D {
+    pub source lights.Light3D
+    pub cascades shadows.CascadeProfile3D
+}
+pub struct CascadeSelection3D {
+    pub source int
+    pub profile shadows.CascadeProfile3D
+}
+pub struct SceneLights3D { sources map[int]LightBinding3D }
+pub fn new_scene_lights_3d() SceneLights3D { << SceneLights3D{sources: map[int]LightBinding3D{}} }
 pub fn (world &SceneLights3D) binding_count() int { << world.sources.len() }
 pub fn (world &SceneLights3D) has(node int) bool { << world.sources.has(node) }
 // Return the local description, before any world transform or visibility test.
-pub fn (world &SceneLights3D) source(tree &scene.SceneTree, node int) lights.Light3D {
+pub fn (world &SceneLights3D) binding(tree &scene.SceneTree, node int) LightBinding3D {
     info := tree.node_info(node) or >>
     if info.queued_free || !world.sources.has(node) { >> errors.new("nexus lights: no editable source binding") }
     << world.sources[node]
 }
+pub fn (world &SceneLights3D) source(tree &scene.SceneTree, node int) lights.Light3D {
+    binding := world.binding(tree, node) or >>
+    << binding.source
+}
 // Validate the complete batch before publishing any replacement. Undeclared
 // bindings remain unchanged; callers detach explicitly when removing sources.
-pub fn (world $&SceneLights3D) attach_batch(tree &scene.SceneTree, nodes []int, sources []lights.Light3D) int {
-    if nodes.len!=sources.len || nodes.len>scene.MAX_NODES { >> errors.new("nexus lights: invalid binding batch length") }
+pub fn (world $&SceneLights3D) attach_bindings(tree &scene.SceneTree, nodes []int, bindings []LightBinding3D) int {
+    if nodes.len!=bindings.len || nodes.len>scene.MAX_NODES { >> errors.new("nexus lights: invalid binding batch length") }
     $seen := map[int]bool{}
     $added := 0
     for i in 0:nodes.len {
         info := tree.node_info(nodes[i]) or >>
         if info.kind!=scene.NODE_3D || info.queued_free || seen.has(nodes[i]) { >> errors.new("nexus lights: batch requires unique editable Node3D IDs") }
-        sources[i].validate() or >>
+        bindings[i].source.validate() or >>
+        if bindings[i].cascades.enabled() && bindings[i].source.kind() != lights.DIRECTIONAL {
+            >> errors.new("nexus lights: cascade profiles require a directional light")
+        }
         seen[nodes[i]]=true
         if !world.sources.has(nodes[i]) { added+=1 }
     }
     if added>scene.MAX_NODES-world.sources.len() { >> errors.new("nexus lights: scene binding capacity exceeded; prune retired nodes") }
-    for i in 0:nodes.len { world.sources[nodes[i]]=sources[i] }
+    for i in 0:nodes.len { world.sources[nodes[i]]=bindings[i] }
     << nodes.len
 }
+// Source-only edits retain the profile while the source is directional.
+pub fn (world $&SceneLights3D) attach_batch(tree &scene.SceneTree, nodes []int, sources []lights.Light3D) int {
+    if nodes.len != sources.len || nodes.len > scene.MAX_NODES { >> errors.new("nexus lights: invalid binding batch length") }
+    $bindings := []LightBinding3D{}
+    for i in 0:nodes.len {
+        source := sources[i]
+        $cascades := shadows.CascadeProfile3D{}
+        if source.kind() == lights.DIRECTIONAL && world.sources.has(nodes[i]) {
+            cascades = world.sources[nodes[i]].cascades
+        }
+        bindings.push(LightBinding3D{source: source, cascades: cascades})
+    }
+    << world.attach_bindings(tree,nodes,bindings) or >>
+}
 pub fn (world $&SceneLights3D) attach(tree &scene.SceneTree, node int, source lights.Light3D) int {
-    info := tree.node_info(node) or >>
-    if info.kind!=scene.NODE_3D || info.queued_free { >> errors.new("nexus lights: binding requires an editable Node3D") }
-    source.validate() or >>
-    if !world.sources.has(node) && world.sources.len()>=scene.MAX_NODES { >> errors.new("nexus lights: scene binding capacity exceeded; prune retired nodes") }
-    world.sources[node]=source
+    world.attach_batch(tree,[node],[source]) or >>
     << 0
 }
 pub fn (world $&SceneLights3D) detach(node int) int {
@@ -50,22 +76,36 @@ pub fn (world $&SceneLights3D) detach(node int) int {
 }
 // Stable scene pre-order. Hidden/queued/freed nodes emit no source; pausing nexus
 // processing does not turn off rendered light. Invalid output is all-or-nothing.
-pub fn (world &SceneLights3D) gather(tree &scene.SceneTree) []lights.Light3D {
+pub fn (world &SceneLights3D) gather_with_cascades(tree &scene.SceneTree, selection $&CascadeSelection3D) []lights.Light3D {
     order := tree.subtree(tree.root()) or >>
     $result := []lights.Light3D{}
+    $cascade_source := -1
+    $profile := shadows.CascadeProfile3D{}
     for node in order {
         if !world.sources.has(node) { -> }
         info := tree.node_info(node) or >>
         if info.queued_free || !(tree.is_visible(node) or >>) { -> }
         if result.len>=lights.MAX_SOURCES { >> errors.new("nexus lights: more than 256 visible candidate sources") }
-        source := world.sources[node]
-        result.push(source.transformed(tree.global_transform_3d(node) or >>) or >>)
+        binding := world.sources[node]
+        // The renderer accepts one shadow map per draw. Choose the first visible
+        // configured light in the same order used for candidate indices.
+        if cascade_source < 0 && binding.cascades.enabled() {
+            cascade_source = result.len
+            profile = binding.cascades
+        }
+        result.push(binding.source.transformed(tree.global_transform_3d(node) or >>) or >>)
     }
+    selection.source = cascade_source
+    selection.profile = profile
     << result
+}
+pub fn (world &SceneLights3D) gather(tree &scene.SceneTree) []lights.Light3D {
+    $selection := CascadeSelection3D{source: -1, profile: shadows.CascadeProfile3D{}}
+    << world.gather_with_cascades(tree, $&selection) or >>
 }
 pub fn (world $&SceneLights3D) prune(tree &scene.SceneTree) int {
     order := tree.subtree(tree.root()) or >>
-    $next := map[int]lights.Light3D{}
+    $next := map[int]LightBinding3D{}
     for node in order {
         if !world.sources.has(node) { -> }
         if !(tree.node_info(node) or >>).queued_free { next[node]=world.sources[node] }

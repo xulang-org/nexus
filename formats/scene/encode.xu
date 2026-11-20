@@ -30,7 +30,8 @@ fn transform(node &resource.NodeData) []f64 {
 pub fn encode(document &resource.Document) string {
     if document.node_count() < 1 { >> errors.new("nexus scene: cannot encode an empty document") }
     $out := strings.new_byte_builder(4096)
-    out.write_str("{\"format\":\"" + FORMAT + "\",\"version\":" + str(VERSION) + ",\"nodes\":[\n")
+    $version := LEGACY_VERSION
+    out.write_str(",\"nodes\":[\n")
     for i in 0:document.node_count() {
         if i > 0 { out.write_str(",\n") }
         node := document.describe_node(i) or >>
@@ -48,6 +49,12 @@ pub fn encode(document &resource.Document) string {
             }
             out.write_str("]")
         }
+        if node.camera_2d.is_set() || node.orthographic.is_set() {
+            version = CAMERA_VERSION
+        } else if node.camera.is_set() && version == LEGACY_VERSION {
+            version = PERSPECTIVE_VERSION
+        }
+        out.write_str(encode_camera(&node) or >>)
         out.write_str("}")
     }
     out.write_str("\n]")
@@ -55,8 +62,14 @@ pub fn encode(document &resource.Document) string {
     out.write_str(encode_audio(document) or >>)
     out.write_str(encode_scripts(document) or >>)
     out.write_str(encode_lights(document) or >>)
+    for i in 0:document.light_count() {
+        if (document.light(i) or >>).cascades.enabled() {
+            version = VERSION
+            <-
+        }
+    }
     out.write_str("}\n")
-    raw := out.to_string()
+    raw := "{\"format\":\"" + FORMAT + "\",\"version\":" + str(version) + out.to_string()
     if raw.len > MAX_BYTES { >> errors.new("nexus scene: encoded file exceeds byte limit") }
     << raw
 }

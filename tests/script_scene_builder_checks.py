@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='xu-scene-builder-') as temporary:
  manifest=json.loads((project/'project.json').read_text())
  template=project/manifest['template'];valid=json.loads(template.read_text())
  for label,mutate in [
-  ('version',lambda d:d.update(version=2)),
+  ('version',lambda d:d.update(version=5)),
   ('boolean-version',lambda d:d.update(version=True)),
   ('missing-array',lambda d:d.pop('surfaces')),
   ('missing-lights',lambda d:d.pop('lights')),
@@ -35,4 +35,25 @@ with tempfile.TemporaryDirectory(prefix='xu-scene-builder-') as temporary:
   assert failed.returncode and output.read_bytes()==before,label
   assert not list(output.parent.glob('.scene-candidate-*')) and not list(output.parent.glob('world.xuscene.tmp-*'))
   for name,digest in resources.items():assert hashlib.sha256((output.parent/name).read_bytes()).hexdigest()==digest
-print('PASS: immutable resource publication; compile and seven current-schema contract failures preserve the previous scene and every artifact')
+ lens=dict(vertical_fov=.9,near=.2,far=100)
+ camera_scene=json.loads(json.dumps(valid));camera_scene['version']=2
+ camera=next(node for node in camera_scene['nodes'] if node['type']=='Node3D')
+ camera['camera']=lens;template.write_text(json.dumps(camera_scene))
+ subprocess.run(command,cwd=root,check=True,capture_output=True,timeout=30)
+ published=json.loads(output.read_bytes())
+ assert published['version']==2 and published['nodes']==camera_scene['nodes']
+ camera_scene['version']=3
+ camera['camera']=dict(projection='orthographic',vertical_size=6,near=.2,far=100)
+ template.write_text(json.dumps(camera_scene))
+ subprocess.run(command,cwd=root,check=True,capture_output=True,timeout=30)
+ published=json.loads(output.read_bytes())
+ assert published['version']==3 and published['nodes']==camera_scene['nodes']
+ camera_scene['version']=4
+ light=next(item for item in camera_scene['lights'] if item['type']=='directional')
+ light['cascades']=dict(count=3,resolution=256,distance=32,split_lambda=.6,blend_fraction=.15,
+                        caster_padding=3,stabilization_step=.0625,raster_bias_texels=.00390625)
+ template.write_text(json.dumps(camera_scene))
+ subprocess.run(command,cwd=root,check=True,capture_output=True,timeout=30)
+ published=json.loads(output.read_bytes())
+ assert published['version']==4 and published['nodes']==camera_scene['nodes'] and published['lights']==camera_scene['lights']
+print('PASS: immutable resource publication, authored cameras and cascade profiles, and failure rollback for compile and schema errors')

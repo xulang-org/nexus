@@ -22,5 +22,7 @@ assert delta<=1,delta
 assert set(low[0::4])<={0,255} and any(0<v<255 for v in aa[0::4])
 assert all(a==255 for a in aa[3::4])
 assert pixels('quality-resized.png')[:2]==pixels('quality-restored.png')[:2]==(80,60)
-(ROOT/'build/detail-models/quality-results.json').write_text(json.dumps({'max_box_filter_error':delta,'output':[w,h],'high_reference':[hw,hh],'opaque':True,'partial_coverage_pixels':sum(0<v<255 for v in aa[0::4])},indent=2)+'\n')
+report = ROOT / 'build/detail-models/quality-results.json'
+report.parent.mkdir(parents=True, exist_ok=True)
+report.write_text(json.dumps({'max_box_filter_error':delta,'output':[w,h],'high_reference':[hw,hh],'opaque':True,'partial_coverage_pixels':sum(0<v<255 for v in aa[0::4])},indent=2)+'\n')
 print('PASS: GPU 2x output matches independent 128x96 four-sample reference within one code value; smooth edge coverage, opaque alpha and resize dimensions')

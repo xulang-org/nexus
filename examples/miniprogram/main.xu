@@ -1,0 +1,73 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+physics #"github.com/xulang-org/nexus/physics2d"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+webgl #"github.com/xulang-org/nexus/integration/rendering/webgl"
+#math
+#os
+#errors
+
+const WIDTH = 360
+const HEIGHT = 240
+const FIXED_SCALE = 8
+const PLAYER_SIZE = 18
+
+fn pack_state(position fm.Vec2, collected int) int {
+    x := int(math.round(position.x * f64(FIXED_SCALE)))
+    y := int(math.round(position.y * f64(FIXED_SCALE)))
+    << x | (y << 12) | (collected << 24)
+}
+
+pub fn nexus_reset() int { << pack_state(fm.vec2(24.0, 108.0), 0) }
+
+fn frame(state int, target_x int, target_y int, delta_us int) int {
+    $position := fm.vec2(f64(state & 4095) / f64(FIXED_SCALE),
+        f64((state >> 12) & 4095) / f64(FIXED_SCALE))
+    $collected := (state >> 24) & 7
+    walls := [fm.rect2(0.0, 0.0, 360.0, 8.0), fm.rect2(0.0, 232.0, 360.0, 8.0),
+        fm.rect2(0.0, 8.0, 8.0, 224.0), fm.rect2(352.0, 8.0, 8.0, 224.0),
+        fm.rect2(114.0, 8.0, 14.0, 143.0), fm.rect2(235.0, 88.0, 14.0, 144.0)]
+    if target_x >= 0 && target_x < WIDTH && target_y >= 0 && target_y < HEIGHT && delta_us > 0 {
+        center := position.add(fm.vec2(9.0, 9.0))
+        offset := fm.vec2(f64(target_x), f64(target_y)).sub(center)
+        distance := offset.length()
+        if distance > 0.125 {
+            travel := math.min(distance, math.min(f64(delta_us), 50000.0) * 0.00018)
+            body := fm.rect2(position.x, position.y, f64(PLAYER_SIZE), f64(PLAYER_SIZE))
+            movement := physics.move_and_slide(body, offset.scaled(travel / distance), &walls) or >>
+            position = movement.position
+        }
+    }
+    gems := [fm.vec2(74.0, 46.0), fm.vec2(179.0, 186.0), fm.vec2(304.0, 43.0)]
+    $solid := canvas.new_batch()
+    $atlas := canvas.new_batch()
+    identity := fm.identity()
+    solid.quad(fm.rect2(0.0, 0.0, 360.0, 240.0), identity, 0x152332ff) or >>
+    for wall in walls { solid.quad(wall, identity, 0x485c78ff) or >> }
+    player := fm.rect2(position.x, position.y, f64(PLAYER_SIZE), f64(PLAYER_SIZE))
+    for i in 0:gems.len {
+        gem := gems[i]
+        area := fm.rect2(gem.x - 6.0, gem.y - 6.0, 12.0, 12.0)
+        if player.overlaps(area) { collected = collected | (1 << i) }
+        if (collected & (1 << i)) == 0 {
+            solid.quad(area, identity, 0xffd477ff) or >>
+        }
+    }
+    atlas.quad_region(player, identity, 0xffffffff, fm.rect2(0.0, 0.0, 0.25, 1.0)) or >>
+    packet := webgl.encode_frame(&solid, &atlas) or >>
+    expected := packet.len
+    if (os.fd_write(1, packet) or >>) != expected {
+        >> errors.new("Nexus WebGL: short frame write")
+    }
+    << pack_state(position, collected)
+}
+
+pub fn nexus_frame(state int, target_x int, target_y int, delta_us int) int {
+    << frame(state, target_x, target_y, delta_us) or (err) {
+        eprintln(err.msg())
+        << -1
+    }
+}
+
+fn main() int { << 0 }

@@ -42,6 +42,7 @@ check: layers native canvas-shaders mesh-shaders
 	$(XU) check examples/arena/main.xu
 	$(XU) check examples/phone_arena
 	$(XU) check examples/phone_3d
+	$(XU) check examples/miniprogram
 	$(XU) check examples/headless/main.xu
 	$(XU) check examples/two_d/main.xu
 	$(XU) check examples/three_d/main.xu
@@ -177,7 +178,28 @@ phone-3d-budget-test: sdk mesh-shaders
 	$(XU) build tests/phone_3d_budget_checks.xu -o build/phone-3d-budget-tests
 	./build/phone-3d-budget-tests
 
-.PHONY: phone-frame-test phone-state-test phone-audio-test
+.PHONY: phone-frame-test phone-state-test phone-audio-test miniprogram miniprogram-test douyin douyin-test miniprogram-3d douyin-3d webgl-3d-test
+miniprogram: layers sdk
+	$(PYTHON) tools/build_miniprogram.py --xu "$(XU)"
+
+miniprogram-test: miniprogram
+	node tests/miniprogram_webgl.cjs
+
+douyin: layers sdk
+	$(PYTHON) tools/build_miniprogram.py --platform douyin --xu "$(XU)"
+
+douyin-test: douyin
+	node tests/douyin_webgl.cjs
+
+miniprogram-3d: layers sdk
+	$(PYTHON) tools/build_miniprogram.py --scene 3d --xu "$(XU)"
+
+douyin-3d: layers sdk
+	$(PYTHON) tools/build_miniprogram.py --platform douyin --scene 3d --xu "$(XU)"
+
+webgl-3d-test: miniprogram-3d douyin-3d
+	node tests/webgl_3d.cjs
+
 phone-frame-test: sdk
 	mkdir -p build
 	$(XU) build tests/phone_frame_checks.xu -o build/phone-frame-tests
@@ -333,7 +355,7 @@ script-live-smoke: mesh-shaders canvas-shaders native script-tool
 	$(XU) build examples/script_reload/main.xu -o build/script-reload
 	$(PYTHON) tests/script_live_checks.py
 
-gpu-smoke: present-fallback-test text-2d-test ui-hud-test shadow-gpu-test render-quality-test gltf-animation-gpu-test model-format-gpu-test lod-gpu-test lod-demo-test frustum-gpu-test scene-lighting-services-test lighting-demo-test lighting-gpu-test mesh-shaders canvas-shaders gpu-offscreen-smoke gpu-compute-smoke gpu-surface-smoke window-input-smoke native glb-fixtures glb-material-fixtures image-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
+gpu-smoke: present-fallback-test text-2d-test ui-hud-test scene-camera-gpu-test shadow-gpu-test render-quality-test gltf-animation-gpu-test model-format-gpu-test lod-gpu-test lod-demo-test frustum-gpu-test scene-lighting-services-test lighting-demo-test lighting-gpu-test mesh-shaders canvas-shaders gpu-offscreen-smoke gpu-compute-smoke gpu-surface-smoke window-input-smoke native glb-fixtures glb-material-fixtures image-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
 	mkdir -p build
 	$(XU) build tests/gpu_smoke.xu -o build/gpu-smoke
 	./build/gpu-smoke
@@ -594,6 +616,13 @@ text-2d-test: canvas-shaders mesh-shaders
 ui-hud-test: canvas-shaders mesh-shaders
 	mkdir -p build
 	$(PYTHON) tests/ui_hud_checks.py
+
+.PHONY: scene-camera-gpu-test
+scene-camera-gpu-test: mesh-shaders canvas-shaders native-image
+	mkdir -p build/scene-camera-gpu
+	$(XU) build examples/scene_file/main.xu -o build/scene-camera-gpu/scene-file
+	$(XU) build examples/two_d/main.xu -o build/scene-camera-gpu/two-d
+	$(PYTHON) tests/scene_camera_gpu_checks.py
 
 demo-ui-hud: canvas-shaders mesh-shaders
 	mkdir -p build

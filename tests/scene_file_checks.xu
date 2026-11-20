@@ -4,6 +4,7 @@ scene #"github.com/xulang-org/nexus/integration/scene"
 resource #"github.com/xulang-org/nexus/resources/scene"
 codec #"github.com/xulang-org/nexus/formats/scene"
 fm #"github.com/xulang-org/nexus/foundation/math"
+camera_data #"github.com/xulang-org/nexus/resources/camera"
 nexus #"github.com/xulang-org/nexus/scene"
 #os
 #strings
@@ -106,6 +107,131 @@ fn precision() int {
         if value == 0.0 { assert((1.0 / got) == (1.0 / value)) }
         assert(raw == (codec.encode(&loaded) or >>))
     }
+    << 0
+}
+fn bad_camera(tree $&nexus.SceneTree, node int, lens camera_data.Perspective) bool {
+    tree.set_camera_3d(node, lens) or (err) { << true }
+    << false
+}
+fn camera_roundtrip() int {
+    legacy := scene.load("build/scene-fixtures/valid.xuscene") or >>
+    assert(!(legacy.describe_node(2) or >>).camera.is_set())
+    document := scene.load("build/scene-fixtures/camera.xuscene") or >>
+    lens := (document.describe_node(2) or >>).camera
+    assert(lens.is_set() && lens.vertical_fov() == 0.8765432101234567 && lens.near() == 0.25 && lens.far() == 50.0)
+    packed := scene.to_packed(&document) or >>
+    $tree := nexus.new_scene_tree_3d("CameraWorld", 16) or >>
+    root := tree.root()
+    tree.set_position_3d(root, fm.vec3(3.0, -2.0, 1.0)) or >>
+    left := packed.instantiate($&tree, root, "Left") or >>
+    right := packed.instantiate($&tree, root, "Right") or >>
+    camera := tree.find_node(left, "Group/Cube") or >>
+    other := tree.find_node(right, "Group/Cube") or >>
+    group := tree.find_node(left, "Group") or >>
+    hud := tree.find_node(left, "HUD") or >>
+    assert(bad_camera($&tree, group, lens) && bad_camera($&tree, hud, lens))
+    bound := nexus.new_camera_node_3d(&tree, camera) or >>
+    assert(bound.node == camera && bound.vertical_fov == lens.vertical_fov() && bound.near == lens.near() && bound.far == lens.far())
+    eye := (tree.global_transform_3d(camera) or >>).c3.xyz()
+    view := bound.view_projection(&tree, 1.5) or >>
+    at_near := view.transform(fm.vec4(eye.x, eye.y, eye.z - bound.near, 1.0))
+    at_far := view.transform(fm.vec4(eye.x, eye.y, eye.z - bound.far, 1.0))
+    assert(math.abs(at_near.z / at_near.w - 1.0) < 1e-12 && math.abs(at_far.z / at_far.w) < 1e-12)
+
+    captured := scene.capture_nodes(&tree, left) or >>
+    scene.save("build/scene-fixtures/saved-camera.xuscene", &captured) or >>
+    loaded := scene.load("build/scene-fixtures/saved-camera.xuscene") or >>
+    assert((loaded.describe_node(2) or >>).camera.vertical_fov() == lens.vertical_fov())
+    assert((codec.encode(&loaded) or >>) == (codec.encode(&captured) or >>))
+    // Editing one instance does not alter the saved lens or another instance.
+    tree.set_camera_3d(camera, camera_data.Perspective{}) or >>
+    assert(!(tree.node_3d(camera) or >>).camera.is_set())
+    assert((nexus.new_camera_node_3d(&tree, camera) or >>).near == 0.1)
+    assert((nexus.new_camera_node_3d(&tree, other) or >>).near == 0.25)
+    tree.queue_free(right) or >>
+    assert(bad_camera($&tree, other, lens))
+    tree.flush_free() or >>
+    assert(bad_camera($&tree, other, lens))
+    recycled := tree.add_child_3d(root, "Recycled") or >>
+    assert(!(tree.node_3d(recycled) or >>).camera.is_set())
+    println("PASS: version 1 legacy lens defaults, version 2 lens save/load, inherited pose, reverse-Z, independent PackedScene instances and slot reuse")
+    << 0
+}
+fn rejects_perspective_binding(tree &nexus.SceneTree, node int) bool {
+    nexus.new_camera_node_3d(tree, node) or (err) { << true }
+    << false
+}
+fn rejects_camera_2d(tree &nexus.SceneTree, node int) bool {
+    nexus.new_camera_node_2d(tree, node) or (err) { << true }
+    << false
+}
+fn rejects_camera_projection(tree &nexus.SceneTree, node int, aspect f64) bool {
+    tree.camera_view_projection_3d(node, aspect) or (err) { << true }
+    << false
+}
+fn mixed_cameras_roundtrip() int {
+    document := scene.load("build/scene-fixtures/multi-camera.xuscene") or >>
+    packed := scene.to_packed(&document) or >>
+    $tree := nexus.new_scene_tree_3d("World", 24) or >>
+    root := tree.root()
+    tree.set_position_3d(root, fm.vec3(2.0, 3.0, 7.0)) or >>
+    first := packed.instantiate($&tree, root, "First") or >>
+    second := packed.instantiate($&tree, root, "Second") or >>
+    ortho_node := tree.find_node(first, "Group/Cube") or >>
+    view_node := tree.find_node(first, "HUD/View") or >>
+    assert(rejects_perspective_binding(&tree, ortho_node))
+    assert(!(tree.node_3d(ortho_node) or >>).camera.is_set())
+    assert((nexus.new_camera_node_3d(&tree, first) or >>).vertical_fov == 0.8765432101234567)
+    eye := (tree.global_transform_3d(ortho_node) or >>).c3.xyz()
+    projection := tree.camera_view_projection_3d(ortho_node, 2.0) or >>
+    near := projection.transform(fm.vec4(eye.x + 6.0, eye.y + 3.0, eye.z - 0.25, 1.0))
+    far := projection.transform(fm.vec4(eye.x + 6.0, eye.y + 3.0, eye.z - 50.0, 1.0))
+    assert(math.abs(near.x - 1.0) < 1e-12 && near.y == 1.0 && near.w == 1.0 && far.w == 1.0)
+    assert(near.x == far.x && near.y == far.y && math.abs(near.z - 1.0) < 1e-12 && math.abs(far.z) < 1e-12)
+    square := tree.camera_view_projection_3d(ortho_node, 1.0) or >>
+    assert(square.c0.x == 2.0 * projection.c0.x && square.c1.y == projection.c1.y)
+    assert(rejects_camera_projection(&tree, ortho_node, 0.0))
+
+    hud := tree.find_node(first, "HUD") or >>
+    tree.set_transform(hud, fm.Transform2D{a: 0.0, b: 2.0, c: -3.0, d: 0.0, tx: 30.0, ty: 40.0}) or >>
+    camera := nexus.new_camera_node_2d(&tree, view_node) or >>
+    assert(camera.position.x == 21.0 && camera.position.y == 44.0 && camera.zoom == 2.0)
+    viewport := camera.viewport(640.0, 480.0) or >>
+    assert(viewport.size.x == 640.0 && viewport.size.y == 360.0 && viewport.position.y == 60.0)
+    point := camera.world_to_screen(fm.vec2(21.0, 54.0), 640.0, 480.0) or >>
+    assert(math.abs(point.x - 360.0) < 1e-8 && math.abs(point.y - 240.0) < 1e-8)
+    pick := camera.screen_to_world(point, 640.0, 480.0) or >>
+    assert(math.abs(pick.x - 21.0) < 1e-8 && math.abs(pick.y - 54.0) < 1e-8)
+
+    captured := scene.capture_nodes(&tree, first) or >>
+    scene.save("build/scene-fixtures/saved-multi-camera.xuscene", &captured) or >>
+    loaded := scene.load("build/scene-fixtures/saved-multi-camera.xuscene") or >>
+    assert((codec.encode(&loaded) or >>) == (codec.encode(&captured) or >>))
+    copy := scene.instantiate(&loaded, $&tree, root, "Reloaded") or >>
+    restored_view := tree.find_node(copy, "HUD/View") or >>
+    assert((nexus.new_camera_node_2d(&tree, restored_view) or >>).position.x == 21.0)
+    restored_ortho := tree.find_node(copy, "Group/Cube") or >>
+    assert((tree.node_3d(restored_ortho) or >>).orthographic.vertical_size() == 6.0)
+
+    tree.set_camera_3d(ortho_node, camera_data.perspective(0.9, 0.2, 100.0) or >>) or >>
+    assert(!(tree.node_3d(ortho_node) or >>).orthographic.is_set())
+    other_ortho := tree.find_node(second, "Group/Cube") or >>
+    assert((tree.node_3d(other_ortho) or >>).orthographic.is_set())
+    tree.set_transform(hud, fm.Transform2D{a: 0.0, b: 0.0, c: -3.0, d: 0.0, tx: 30.0, ty: 40.0}) or >>
+    assert(rejects_camera_2d(&tree, view_node))
+    tree.set_camera_2d(view_node, camera_data.View2D{}) or >>
+    assert(!(tree.node(view_node) or >>).camera.is_set())
+    other_view := tree.find_node(second, "HUD/View") or >>
+    assert((nexus.new_camera_node_2d(&tree, other_view) or >>).zoom == 2.0)
+    tree.queue_free(second) or >>
+    assert(rejects_camera_2d(&tree, other_view))
+    assert(rejects_camera_projection(&tree, other_ortho, 1.0))
+    tree.flush_free() or >>
+    assert(rejects_camera_2d(&tree, other_view))
+    assert(rejects_camera_projection(&tree, other_ortho, 1.0))
+    recycled := tree.add_child(root, "Recycled2D") or >>
+    assert(!(tree.node(recycled) or >>).camera.is_set())
+    println("PASS: mixed version 3 orthographic, perspective and Node2D cameras, projection depth, viewport and picking, independent instances and invalid poses")
     << 0
 }
 fn failure_atomicity() int {
@@ -214,6 +340,8 @@ fn files() int {
 fn run() int {
     roundtrip() or >>
     precision() or >>
+    camera_roundtrip() or >>
+    mixed_cameras_roundtrip() or >>
     failure_atomicity() or >>
     limits() or >>
     files() or >>

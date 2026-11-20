@@ -16,6 +16,7 @@ timing #"github.com/xulang-org/nexus/timing"
 controls #"github.com/xulang-org/nexus/input"
 ren #"github.com/xulang-org/nexus/rendering/two_d"
 scene_render #"github.com/xulang-org/nexus/integration/rendering/two_d"
+files #"github.com/xulang-org/nexus/integration/scene"
 image_render #"github.com/xulang-org/nexus/integration/image_render/two_d"
 images #"github.com/xulang-org/nexus/assets/image"
 input_bridge #"github.com/xulang-org/nexus/integration/input"
@@ -32,10 +33,11 @@ struct Options {
     backend int
     capture string
     shaders string
+    camera_scene string
 }
 fn options() Options {
     args := os.args()
-    $config := Options{frames: 0, backend: gpu.AUTO, capture: "", shaders: "build/canvas-shaders"}
+    $config := Options{frames: 0, backend: gpu.AUTO, capture: "", shaders: "build/canvas-shaders", camera_scene: ""}
     $i := 1
     while i < args.len {
         if i + 1 >= args.len { >> errors.new("missing option value") }
@@ -45,6 +47,7 @@ fn options() Options {
             if config.frames < 1 || config.frames > 1000000 { >> errors.new("frames outside 1...1000000") }
         } else if args[i] == "--shaders" { config.shaders = args[next] + ""
         } else if args[i] == "--capture" { config.capture = args[next] + ""
+        } else if args[i] == "--camera-scene" { config.camera_scene = args[next] + ""
         } else if args[i] == "--backend" {
             name := args[next]
             if name == "metal" { config.backend = gpu.METAL
@@ -57,8 +60,19 @@ fn options() Options {
     if config.capture.len > 0 && config.frames == 0 { >> errors.new("capture requires bounded --frames") }
     << config
 }
+fn camera_from_scene(path string) nexus.Camera2D {
+    if path.len == 0 { << nexus.new_camera_2d(960.0, 640.0) or >> }
+    document := files.load(path) or >>
+    $rig := nexus.new_scene_tree("CameraWorld", document.node_count() + 1) or >>
+    root := rig.root()
+    packed := files.to_packed_nodes(&document) or >>
+    instance := packed.instantiate($&rig, root, "CameraRig") or >>
+    node := rig.find_node(instance, "Camera2D") or >>
+    << nexus.new_camera_node_2d(&rig, node) or >>
+}
 fn run() int {
     config := options() or >>
+    camera := camera_from_scene(config.camera_scene + "") or >>
     // CPU image loading is independent of the window and GPU allocation.
     image := images.load_png("examples/arena/assets/player.png") or >>
     canvas_program_0 := canvas_shaders.load_canvas(config.shaders + "") or >>
@@ -84,7 +98,6 @@ fn run() int {
         region: fm.rect2(0.0, 0.0, 0.25, 1.0), tint: white}
     clip := sprite_anim.new_atlas_animation(4, 1, 0, 4, 8.0, true) or >>
     $animator := sprite_anim.new_sprite_animator(clip) or >>
-    camera := nexus.new_camera_2d(960.0, 640.0) or >>
     $input := controls.new_input_map()
     input.bind("left", window_events.KEY_LEFT) or >>
     input.bind("right", window_events.KEY_RIGHT) or >>
