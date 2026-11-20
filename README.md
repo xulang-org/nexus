@@ -14,7 +14,7 @@ GLB 已支持受限 TRS 动画采样、CPU 四权重线性蒙皮和相对路径 
 3D 已加入带法线/切线/UV 的金属度/粗糙度直接光材质、基础颜色/ORM/自发光/法线/独立 AO 纹理与 mipmap、单双面渲染、最多 256 个候选方向光/点光/聚光、每网格最多 16 源、场景光源绑定、自发光和曝光。
 3D 可选择 GPU 2× 超采样（四个源像素合成一个输出像素）和方向/聚光/点光 3×3 PCF 阴影及 2–4 级 CSM，图片已接通标准库的受限 baseline JPEG 解码。完整 glTF 材质/纹理、IBL、编辑器、完整脚本类型/绑定/协程、生产更新分发、压缩音频/异步解码与 DSP、刚体求解器、用户材质着色器、GPU 粒子和计算纹理仍待实现。
 
-当前使用 Xu **0.12.7-dev.1**。该 SDK 恢复了 Phone game 对象对原生导入的支持，并随生成工程导出原生归档与 C 桥接。编译器、标准库、native/phone 工具必须来自同一 SDK。两个移动示例已用此 SDK 在 Sony XQ-BE72（Android 13）上运行，并完成 iOS 应用构建。iPhone 8（iOS 16.7.16）的真机结果来自此前的 Xu 0.12.5 构建。
+当前使用 Xu **0.12.7-dev.11**。该 SDK 恢复了 Phone game 对象对原生导入的支持，并随生成工程导出原生归档与 C 桥接。编译器、标准库、native/phone 工具必须来自同一 SDK。两个移动示例此前使用 Xu 0.12.7-dev.1 在 Sony XQ-BE72（Android 13）上运行，并完成 iOS 应用构建。iPhone 8（iOS 16.7.16）的真机结果来自 Xu 0.12.5 构建。
 
 ## 构建所需的 Xu SDK
 
@@ -25,8 +25,8 @@ git clone https://github.com/xulang-org/xu.git ../xu-nexus-sdk
 NEXUS_XU_SDK="$(cd ../xu-nexus-sdk && pwd)"
 (
   cd "$NEXUS_XU_SDK" || exit
-  git fetch origin 55a9d12d732b12f873cef02c6222c0d5994728ba &&
-    git checkout --detach 55a9d12d732b12f873cef02c6222c0d5994728ba &&
+  git fetch origin 74ac865d35894b1f888a3e872b6b13867305a430 &&
+    git checkout --detach 74ac865d35894b1f888a3e872b6b13867305a430 &&
     python3 scripts/restore_product_seed.py --target macos-arm64 --version 0.12.6 --destination build/seed/xu &&
     XU_SEED="$PWD/build/seed/xu" XU_SKIP_CROSS=1 make xu
 )
@@ -35,7 +35,7 @@ export XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" XU="$NEXUS_XU_
 make sdk
 ```
 
-`make sdk` 应输出 `PASS: Xu SDK 0.12.7-dev.1`。平台名可用 `python3 scripts/restore_product_seed.py --help` 查询。已有同一提交构建的 SDK 时，直接设置上述环境变量即可。 [Xu SDK 源码](https://github.com/xulang-org/xu/tree/55a9d12d732b12f873cef02c6222c0d5994728ba)
+`make sdk` 应输出 `PASS: Xu SDK 0.12.7-dev.11`。平台名可用 `python3 scripts/restore_product_seed.py --help` 查询。已有同一提交构建的 SDK 时，直接设置上述环境变量即可。 [Xu SDK 源码](https://github.com/xulang-org/xu/tree/74ac865d35894b1f888a3e872b6b13867305a430)
 
 ## Phone 原生 2D / 3D 示例
 
@@ -45,7 +45,7 @@ make sdk
 - `examples/phone_3d`：`AppHost` + `TouchControls` + `TouchPad`（未命中按钮区域由单指拖动控制轨道旋转，双指支持捏合缩放/桌面滚轮），通过 `Device3D.set_max_render_pixels(921600)` 控制移动端 3D 渲染像素预算并保留全分辨率 `Overlay2D` + `UiFrame` HUD 叠加、贴图 PBR 立方体与 `Back` 暂停/退出。
 
 ```sh
-NEXUS_PHONE_SDK=/path/to/xu-0.12.7-dev.1
+NEXUS_PHONE_SDK=/path/to/xu-0.12.7-dev.11
 export XU_ROOT="$NEXUS_PHONE_SDK" XU_STDLIB_ROOT="$NEXUS_PHONE_SDK/src"
 python3 tools/build_phone.py --xu "$NEXUS_PHONE_SDK/bin/xu" \
   --example phone_arena --target ios-arm64 --sdl-source /path/to/SDL-3.4.14 \
@@ -230,7 +230,7 @@ PNG 文件上传、最近邻/线性采样、透明混合、GPU 裁剪、有序�
 
 ## 运行
 
-需要 **Xu 0.12.7-dev.1**、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
+需要 **Xu 0.12.7-dev.11**、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
 默认通过 `pkg-config sdl3` 查找头文件；Windows 可显式传入包含 `SDL3/SDL.h` 的目录。
 桥接在运行时加载 SDL，不把 SDL 源码或二进制复制进本库。
 
@@ -282,13 +282,13 @@ make demo-glb-materials
 ./build/glb-materials --frames 120 --capture build/glb-materials.png
 ```
 
-`make sdk` 核对实际编译器版本。默认使用 PATH 中的 `xu`，也可用 `XU` 选择完整的 Xu 0.12.7-dev.1 开发 SDK。
+`make sdk` 核对实际编译器版本。默认使用 PATH 中的 `xu`，也可用 `XU` 选择完整的 Xu 0.12.7-dev.11 开发 SDK。
 修复内容属于编译器：解析 native 模块、校验归档/目标/ABI、生成 C 调用适配和链接，调用所选 SDK 的配套工具，
 并为资源所有者及资源数组生成自动析构。标准库新增 `gpu/layout` 统一纹理格式、mip 链、行 pitch 与 mip offset 的受检计算，UI 图片上传与引擎 2D/3D 纹理共用；标准 `gpu` 已提供无窗口设备、缓冲区与异步传输、fence/读回、纹理/采样器、Shader/Pipeline 和离屏 render pass，以及 compact `[]u8` 借用 ABI。标准窗口/呈现已补齐，2D/3D 均已迁移标准事件、资源和绘制命令；PBR、场景和游戏预算仍在引擎。
 完整 SDK 的编译器、标准库和包搜索路径必须一致：
 
 ```sh
-NEXUS_XU_SDK=/path/to/xu-0.12.7-dev.1
+NEXUS_XU_SDK=/path/to/xu-0.12.7-dev.11
 XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" \
 XUPATH="$NEXUS_XU_SDK/src:$NEXUS_XU_SDK/packages" XU="$NEXUS_XU_SDK/bin/xu" \
 make native-probe check test gpu-smoke smoke script-live-smoke
@@ -1521,7 +1521,7 @@ report := scripts.dispatch(&tree, host.DEFAULT_DISPATCH_LIMIT) or >>
 ```yaml
 module: example/my_game
 version: !ver 0.1.0
-xu: !ver 0.12.7-dev.1
+xu: !ver 0.12.7-dev.11
 require:
   "github.com/xulang-org/nexus": file:/path/to/nexus
 ```
@@ -1850,7 +1850,7 @@ MSL、GLSL、HLSL 源码与独立 shader 准备工具均已提供；本机真实
 ## 标准窗口输入与引擎动作示例
 
 ```sh
-NEXUS_XU_SDK=/path/to/xu-0.12.7-dev.1
+NEXUS_XU_SDK=/path/to/xu-0.12.7-dev.11
 XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" XUPATH="$NEXUS_XU_SDK/src" XU="$NEXUS_XU_SDK/bin/xu" make window-input-smoke
 ./build/window-input --frames 600
 ```
