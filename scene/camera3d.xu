@@ -1,7 +1,7 @@
 @"github.com/xulang-org/nexus/scene"
 
 fm #"github.com/xulang-org/nexus/foundation/math"
-#math
+camera_data #"github.com/xulang-org/nexus/resources/camera"
 #errors
 
 // Engine camera conventions stay separate from reusable vector/matrix algebra.
@@ -18,20 +18,7 @@ pub fn look_at_3d(eye fm.Vec3, target fm.Vec3, up fm.Vec3) fm.Mat4 {
 }
 // Finite reverse-Z perspective: NDC depth near=1, far=0, clear=0, compare GREATER.
 pub fn perspective_3d(vertical_fov f64, aspect f64, near f64, far f64) fm.Mat4 {
-    if !fm.finite(vertical_fov) || !fm.finite(aspect) || !fm.finite(near) || !fm.finite(far) ||
-        vertical_fov < 0.01 || vertical_fov > 3.13 || aspect <= 0.0 || near <= 0.0 || far <= near {
-        >> errors.new("nexus: invalid perspective frustum")
-    }
-    half := vertical_fov * 0.5
-    sine := math.sin(half)
-    if sine <= 0.0 { >> errors.new("nexus: invalid perspective angle") }
-    focal := math.cos(half) / sine
-    range := far - near
-    if range <= 0.0 { >> errors.new("nexus: empty perspective depth range") }
-    result := fm.Mat4{c0: fm.vec4(focal / aspect, 0.0, 0.0, 0.0), c1: fm.vec4(0.0, focal, 0.0, 0.0),
-        c2: fm.vec4(0.0, 0.0, near / range, -1.0), c3: fm.vec4(0.0, 0.0, near * (far / range), 0.0)}
-    if !result.is_finite() { >> errors.new("nexus: perspective matrix overflow") }
-    << result
+    << camera_data.projection(vertical_fov, aspect, near, far) or >>
 }
 
 pub struct Camera3D {
@@ -62,8 +49,45 @@ pub struct CameraNode3D {
 }
 pub fn new_camera_node_3d(tree &SceneTree, node int) CameraNode3D {
     index := tree.editable(node) or >>
-    tree.require_spatial(index, NODE_3D) or >>
+    component := tree.require_spatial(index, NODE_3D) or >>
+    if tree.spatial_3d[component].orthographic.is_set() {
+        >> errors.new("nexus: orthographic camera requires camera_view_projection_3d")
+    }
+    lens := tree.spatial_3d[component].camera
+    if lens.is_set() {
+        << CameraNode3D{node: node, vertical_fov: lens.vertical_fov(), near: lens.near(), far: lens.far()}
+    }
     << CameraNode3D{node: node, vertical_fov: 1.0471975511965976, near: 0.1, far: 1000.0}
+}
+
+pub fn (tree $&SceneTree) set_camera_3d(node int, lens camera_data.Perspective) int {
+    index := tree.editable(node) or >>
+    component := tree.require_spatial(index, NODE_3D) or >>
+    tree.spatial_3d[component].camera = lens
+    tree.spatial_3d[component].orthographic = camera_data.Orthographic{}
+    << 0
+}
+pub fn (tree $&SceneTree) set_orthographic_camera_3d(node int, lens camera_data.Orthographic) int {
+    index := tree.editable(node) or >>
+    component := tree.require_spatial(index, NODE_3D) or >>
+    tree.spatial_3d[component].orthographic = lens
+    tree.spatial_3d[component].camera = camera_data.Perspective{}
+    << 0
+}
+pub fn (tree &SceneTree) camera_projection_3d(node int, aspect f64) fm.Mat4 {
+    index := tree.editable(node) or >>
+    component := tree.require_spatial(index, NODE_3D) or >>
+    ortho := tree.spatial_3d[component].orthographic
+    if ortho.is_set() { << ortho.projection(aspect) or >> }
+    camera := new_camera_node_3d(tree, node) or >>
+    << perspective_3d(camera.vertical_fov, aspect, camera.near, camera.far) or >>
+}
+pub fn (tree &SceneTree) camera_view_projection_3d(node int, aspect f64) fm.Mat4 {
+    projection := tree.camera_projection_3d(node, aspect) or >>
+    view := (tree.global_transform_3d(node) or >>).affine_inverse() or >>
+    result := projection.multiply(view)
+    if !result.is_finite() { >> errors.new("nexus: camera view-projection overflow") }
+    << result
 }
 pub fn (camera CameraNode3D) view_projection(tree &SceneTree, aspect f64) fm.Mat4 {
     tree.editable(camera.node) or >>

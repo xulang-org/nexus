@@ -18,6 +18,30 @@ pub struct CascadeSettings3D {
 pub fn default_cascades() CascadeSettings3D {
     << CascadeSettings3D{count: 4,resolution: 512,distance: 100.0,split_lambda: 0.6,blend_fraction: 0.1,caster_padding: 20.0,stabilization_step: 0.0625,raster_bias_texels: 0.00390625}
 }
+pub fn (settings CascadeSettings3D) validate() int {
+    if settings.count < 2 || settings.count > 4 || settings.resolution < 128 || settings.resolution > 1024 ||
+        (settings.resolution & (settings.resolution - 1)) != 0 || !fm.finite(settings.distance) || settings.distance <= 0.0 ||
+        !fm.finite(settings.split_lambda) || settings.split_lambda < 0.0 || settings.split_lambda > 1.0 ||
+        !fm.finite(settings.blend_fraction) || settings.blend_fraction < 0.0 || settings.blend_fraction > 0.3 ||
+        !fm.finite(settings.caster_padding) || settings.caster_padding < 0.0 || settings.caster_padding > 1000000.0 ||
+        !fm.finite(settings.stabilization_step) || settings.stabilization_step <= 0.0 || settings.stabilization_step > 1000000.0 ||
+        !fm.finite(settings.raster_bias_texels) || settings.raster_bias_texels < 0.0 || settings.raster_bias_texels > 0.5 {
+        >> errors.new("nexus shadow: invalid directional cascade settings")
+    }
+    << 0
+}
+
+// A validated, optional authoring profile. Camera fits and maps are per frame.
+pub struct CascadeProfile3D { config CascadeSettings3D }
+pub fn cascade_profile(settings CascadeSettings3D) CascadeProfile3D {
+    settings.validate() or >>
+    << CascadeProfile3D{config: settings}
+}
+pub fn (profile CascadeProfile3D) enabled() bool { << profile.config.count != 0 }
+pub fn (profile CascadeProfile3D) settings() CascadeSettings3D {
+    if !profile.enabled() { >> errors.new("nexus shadow: no cascade profile") }
+    << profile.config
+}
 // Fixed, bounded value payload without owning arrays.
 struct CascadePayload3D {
     count int
@@ -44,13 +68,8 @@ fn no_cascades() CascadePayload3D {
 }
 pub fn cascaded(source lights.Light3D,camera CascadeCamera3D,settings CascadeSettings3D) ShadowDescription3D {
     source.validate() or >>
-    if source.kind()!=lights.DIRECTIONAL || settings.count<2 || settings.count>4 || settings.resolution<128 || settings.resolution>1024 ||
-        (settings.resolution & (settings.resolution-1))!=0 || !fm.finite(settings.distance) || settings.distance<=camera.near ||
-        !fm.finite(settings.split_lambda) || settings.split_lambda<0.0 || settings.split_lambda>1.0 ||
-        !fm.finite(settings.blend_fraction) || settings.blend_fraction<0.0 || settings.blend_fraction>0.3 ||
-        !fm.finite(settings.caster_padding) || settings.caster_padding<0.0 || settings.caster_padding>1000000.0 ||
-        !fm.finite(settings.stabilization_step) || settings.stabilization_step<=0.0 || settings.stabilization_step>1000000.0 ||
-        !fm.finite(settings.raster_bias_texels) || settings.raster_bias_texels<0.0 || settings.raster_bias_texels>0.5 {
+    settings.validate() or >>
+    if source.kind() != lights.DIRECTIONAL || settings.distance <= camera.near {
         >> errors.new("nexus shadow: invalid directional cascade settings")
     }
     // Revalidate value input; zero/default camera values are never accepted.
@@ -59,9 +78,14 @@ pub fn cascaded(source lights.Light3D,camera CascadeCamera3D,settings CascadeSet
     $splits := [camera.near]
     for i in 1:settings.count {
         fraction := f64(i)/f64(settings.count)
-        logarithmic := camera.near*math.pow_f64(far/camera.near,fraction)
         uniform := camera.near+(far-camera.near)*fraction
-        splits.push(settings.split_lambda*logarithmic+(1.0-settings.split_lambda)*uniform)
+        if camera.orthographic {
+            // The footprint is constant with depth, including at near=0.
+            splits.push(uniform)
+        } else {
+            logarithmic := camera.near*math.pow_f64(far/camera.near,fraction)
+            splits.push(settings.split_lambda*logarithmic+(1.0-settings.split_lambda)*uniform)
+        }
     }
     splits.push(far)
     $result := default_directional()
@@ -85,10 +109,14 @@ pub fn cascaded(source lights.Light3D,camera CascadeCamera3D,settings CascadeSet
         middle := (fit_near+end)*0.5
         center := camera.world.transform(fm.vec4(0.0,0.0,-middle,1.0)).xyz()
         $radius := 0.0
-        for distance in [fit_near,end] { for x in [-1.0,1.0] { for y in [-1.0,1.0] {
-            relative := camera.world.transform(fm.vec4(x*distance/camera.fx,y*distance/camera.fy,middle-distance,0.0)).xyz()
-            radius=math.max(radius,relative.length())
-        } } }
+        for distance in [fit_near,end] {
+            $span := distance
+            if camera.orthographic { span = 1.0 }
+            for x in [-1.0,1.0] { for y in [-1.0,1.0] {
+                relative := camera.world.transform(fm.vec4(x*span/camera.fx,y*span/camera.fy,middle-distance,0.0)).xyz()
+                radius=math.max(radius,relative.length())
+            } }
+        }
         // Quantize size, then reserve three texels for center snapping and PCF.
         radius=math.max(settings.stabilization_step,math.ceil(radius/settings.stabilization_step-0.0000001)*settings.stabilization_step)
         extent := radius*f64(settings.resolution)/f64(settings.resolution-6)

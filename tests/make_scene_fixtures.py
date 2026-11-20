@@ -29,7 +29,58 @@ def bad(name, mutate):
     value = copy.deepcopy(base); mutate(value); write(name + '.xuscene', value); rejects.append(name + '.xuscene')
 def top(key, value): return lambda d: d.__setitem__(key, value)
 def prop(key, value, index=2): return lambda d: d['nodes'][index].__setitem__(key, value)
-for v in [2,3,4,5]: bad('version-unsupported-'+str(v), top('version', v))
+for v in [5,6,7]: bad('version-unsupported-'+str(v), top('version', v))
+
+camera_lens = dict(vertical_fov=0.8765432101234567, near=0.25, far=50)
+camera_scene = copy.deepcopy(base)
+camera_scene['version'] = 2
+camera_scene['nodes'][2]['camera'] = camera_lens
+write('camera.xuscene', camera_scene)
+bad('camera-v1', prop('camera', camera_lens))
+for label, index, lens in [
+    ('group', 1, camera_lens),
+    ('2d', 3, camera_lens),
+    ('null', 2, None),
+    ('missing', 2, dict(vertical_fov=0.9, near=0.25)),
+    ('unknown', 2, dict(camera_lens, aspect=1)),
+    ('fov-zero', 2, dict(camera_lens, vertical_fov=0)),
+    ('fov-wide', 2, dict(camera_lens, vertical_fov=3.14)),
+    ('near-zero', 2, dict(camera_lens, near=0)),
+    ('clip-order', 2, dict(camera_lens, far=0.25)),
+    ('clip-string', 2, dict(camera_lens, far='50')),
+    ('projection-overflow', 2, dict(camera_lens, near=1e308, far=1.5e308)),
+]:
+    def invalid_camera(d, node_index=index, invalid_lens=lens):
+        d['version'] = 2
+        d['nodes'][node_index]['camera'] = invalid_lens
+    bad('camera-' + label, invalid_camera)
+ortho_lens = dict(projection='orthographic', vertical_size=6, near=0.25, far=50)
+view_lens = dict(design_width=320, design_height=180, zoom=2)
+multi_camera_scene = copy.deepcopy(camera_scene)
+multi_camera_scene['version'] = 3
+multi_camera_scene['nodes'][0]['camera'] = camera_lens
+multi_camera_scene['nodes'][2]['camera'] = ortho_lens
+multi_camera_scene['nodes'].append(dict(node(3, 'View', 'Node2D'),
+    camera=view_lens, transform=[1, 0, 0, 1, 2, 3]))
+write('multi-camera.xuscene', multi_camera_scene)
+for label, version, index, lens in [
+    ('ortho-v2', 2, 2, ortho_lens),
+    ('ortho-size', 3, 2, dict(ortho_lens, vertical_size=0)),
+    ('ortho-near', 3, 2, dict(ortho_lens, near=-1)),
+    ('ortho-depth', 3, 2, dict(ortho_lens, far=0.25)),
+    ('ortho-conflict', 3, 2, dict(ortho_lens, vertical_fov=1)),
+    ('projection-name', 3, 2, dict(ortho_lens, projection='custom')),
+    ('2d-v2', 2, 3, view_lens),
+    ('2d-on-3d', 3, 2, view_lens),
+    ('3d-on-2d', 3, 3, ortho_lens),
+    ('2d-size', 3, 3, dict(view_lens, design_height=16385)),
+    ('2d-zoom', 3, 3, dict(view_lens, zoom=0.0001)),
+    ('2d-unknown', 3, 3, dict(view_lens, rotation=1)),
+]:
+    def invalid_lens(d, schema=version, node_index=index, invalid=lens):
+        d['version'] = schema
+        d['nodes'][node_index]['camera'] = invalid
+    bad('camera-' + label, invalid_lens)
 for key in ['resources','surfaces','audio_buses','audio_emitters','scripts','script_connections','lights']: bad('missing-'+key, lambda d,k=key:d.pop(k))
 bad('version-old', top('version', 0))
 bad('version-string', top('version', '1'))

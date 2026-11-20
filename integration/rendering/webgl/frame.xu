@@ -1,0 +1,75 @@
+@"github.com/xulang-org/nexus/integration/rendering/webgl"
+
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+fm #"github.com/xulang-org/nexus/foundation/math"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+#errors
+#math
+
+const MAX_VERTICES = 65532
+
+fn put_word(out $&string, word int) {
+    for i in 0:4 { out.push_byte((word >> (i * 8)) & 255) }
+}
+
+fn put_color(out $&string, color int) {
+    for i in 0:4 { out.push_byte((color >> ((3 - i) * 8)) & 255) }
+}
+
+fn put_vertices(out $&string, batch &canvas.Batch2D) int {
+    for index in 0:batch.vertex_count() {
+        vertex := batch.vertex_at(index) or >>
+        put_word(out, math.float32_bits(vertex.point.x))
+        put_word(out, math.float32_bits(vertex.point.y))
+        put_word(out, math.float32_bits(vertex.uv.x))
+        put_word(out, math.float32_bits(vertex.uv.y))
+        put_color(out, vertex.color)
+    }
+    << 0
+}
+
+// A WebGL 1 frame contains two ordered triangle ranges. The first uses a white
+// texture, the second uses the host's atlas. Positions and UVs are float32 LE,
+// followed by straight RGBA8. The host performs upload and presentation.
+pub fn encode_frame(solid &canvas.Batch2D, atlas &canvas.Batch2D) string {
+    solid_count := solid.vertex_count()
+    atlas_count := atlas.vertex_count()
+    count := solid_count + atlas_count
+    if count > MAX_VERTICES || solid_count % 3 != 0 || atlas_count % 3 != 0 {
+        >> errors.new("nexus webgl: invalid triangle batch size")
+    }
+    $out := "NXG1"
+    put_word($&out, solid_count)
+    put_word($&out, atlas_count)
+    put_vertices($&out, solid) or >>
+    put_vertices($&out, atlas) or >>
+    << out
+}
+
+// NXG3 uses the same 20-byte stride as NXG1, with homogeneous clip XYZW
+// in place of XY and UV. Convert Nexus reverse-Z [0,w] to WebGL [-w,w].
+pub fn encode_mesh_frame(mesh &meshes.MeshData3D, view_projection fm.Mat4) string {
+    count := mesh.indices.len
+    if count > MAX_VERTICES || !view_projection.is_finite() {
+        >> errors.new("nexus webgl: invalid mesh frame")
+    }
+    mesh.validate() or >>
+    $out := "NXG3"
+    put_word($&out, count)
+    put_word($&out, 0)
+    for index in mesh.indices {
+        vertex := &mesh.vertices[index]
+        p := vertex.position
+        clip := view_projection.transform(fm.vec4(p.x, p.y, p.z, 1.0))
+        z := (clip.z - clip.w * 0.5) * 2.0
+        for coordinate in [clip.x, clip.y, z, clip.w] {
+            bits := math.float32_bits(coordinate)
+            if (bits & 0x7f800000) == 0x7f800000 {
+                >> errors.new("nexus webgl: non-finite float32 clip position")
+            }
+            put_word($&out, bits)
+        }
+        put_color($&out, vertex.color)
+    }
+    << out
+}

@@ -11,7 +11,7 @@ root = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='xu-nexus-scene-isolation-') as directory:
     target = Path(directory)
     shutil.copyfile(root / 'xu.xun', target / 'xu.xun')
-    for package in ['scene', 'foundation/math', 'resources/scene','resources/lighting', 'formats/scene', 'internal/file_snapshot', 'integration/scene']:
+    for package in ['scene', 'foundation/math', 'resources/camera', 'resources/scene','resources/lighting','resources/shadow', 'formats/scene', 'internal/file_snapshot', 'integration/scene']:
         shutil.copytree(root / package, target / package)
     check = target / 'checks'
     check.mkdir()
@@ -26,6 +26,6 @@ with tempfile.TemporaryDirectory(prefix='xu-nexus-scene-isolation-') as director
         result = subprocess.run([str(binary), operation, str(path)], cwd=target, env=environment, check=True, capture_output=True, text=True, timeout=20)
         assert result.stdout.strip() == ('saved' if operation == 'write' else 'loaded'), result.stdout
     assert not list(target.glob('*.tmp-*'))
-print('PASS: save/exit/fresh-process load with mixed node tree and exact decimal pose; no GPU/SDL initialization or rendering package; no native archives')
+print('PASS: save/exit/fresh-process load with a mixed tree, exact pose and camera lens; no GPU/SDL initialization or native archives')
 # The main suite exercises close/rename failures as well as successful overwrites.
 assert not list((root / 'build/scene-fixtures').glob('*.tmp-*'))

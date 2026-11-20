@@ -34,10 +34,13 @@ pub fn new_scene_3d(device &ren.Device3D) Scene3D {
 pub fn (scene $&Scene3D) attach_mesh(tree &nexus.SceneTree, node int, mesh &ren.Mesh3D) int {
     added := scene.check_mesh_binding(tree, node, mesh) or >>
     scene.clear_lods(node)
-    scene.count = scene.count + added
-    if added == 1 { scene.bound_nodes.push(node) }
-    scene.meshes[node] = mesh.reference()
+    scene.set_mesh_binding(node, mesh.reference(), added)
     << 0
+}
+fn (scene $&Scene3D) set_mesh_binding(node int, mesh ren.MeshRef3D, added int) {
+    if added == 1 { scene.bound_nodes.push(node) }
+    scene.meshes[node] = mesh
+    scene.count = scene.count + added
 }
 // Read-only preflight for importers/tools. Returns 1 for a new binding, 0 for
 // replacement. A caller binding several nodes must also check the total room.
@@ -59,21 +62,25 @@ pub fn (scene &Scene3D) remaining_bindings() int { << nexus.MAX_NODES - scene.co
 pub fn (scene $&Scene3D) detach_mesh(node int) int {
     if node <= 0 { >> errors.new("nexus GPU: invalid mesh node") }
     if !scene.meshes.has(node) { << 0 }
+    scene.remove_mesh_binding(node)
+    scene.compact_bound_nodes()
+    << 1
+}
+fn (scene $&Scene3D) remove_mesh_binding(node int) {
     scene.clear_lods(node)
     meshes := $&scene.meshes
     meshes.delete(node)
     materials := $&scene.materials
     materials.delete(node)
     scene.count = scene.count - 1
-    scene.forget_bound(node)
-    << 1
 }
 // The mesh map has no key iteration, so this index is what lets prune find
 // bindings whose node was already freed from the tree.
-fn (scene $&Scene3D) forget_bound(node int) {
+fn (scene $&Scene3D) compact_bound_nodes() {
     $kept := []int{}
     for i in 0:scene.bound_nodes.len {
-        if scene.bound_nodes[i] != node { kept.push(scene.bound_nodes[i]) }
+        node := scene.bound_nodes[i]
+        if scene.meshes.has(node) { kept.push(node) }
     }
     scene.bound_nodes = kept
 }
@@ -84,17 +91,19 @@ pub fn (scene $&Scene3D) prune(tree &nexus.SceneTree) int {
     $drop := []int{}
     for i in 0:scene.bound_nodes.len {
         node := scene.bound_nodes[i]
-        if !scene.meshes.has(node) { -> }
-        if !tree.is_alive(node) { drop.push(node)
-            -> }
+        if !tree.is_alive(node) {
+            drop.push(node)
+            ->
+        }
         info := tree.node_info(node) or >>
         if info.queued_free { drop.push(node) }
     }
-    $removed := 0
+    if drop.len == 0 { << 0 }
     for i in 0:drop.len {
-        removed = removed + (scene.detach_mesh(drop[i]) or >>)
+        scene.remove_mesh_binding(drop[i])
     }
-    << removed
+    scene.compact_bound_nodes()
+    << drop.len
 }
 // Draw inside Device3D.begin/present. Hidden and queued nodes emit no draws.
 // Stable scene pre-order decides equal-depth ties. Opaque depth resolves overlap.

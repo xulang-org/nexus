@@ -9,7 +9,7 @@ ROOT=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='xu light data ') as directory:
     root=Path(directory)
     shutil.copyfile(ROOT/'xu.xun',root/'xu.xun')
-    for package in ('foundation/math','resources/lighting','scene','integration/lighting'):
+    for package in ('foundation/math', 'resources/camera','resources/lighting','resources/shadow','scene','integration/lighting'):
         shutil.copytree(ROOT/package,root/package)
     (root/'checks').mkdir()
     sdk=next(line for line in (ROOT/'xu.xun').read_text().splitlines() if line.startswith('xu:'))

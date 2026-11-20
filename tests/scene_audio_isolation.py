@@ -9,7 +9,7 @@ import tempfile
 root=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='xu-scene-audio-') as temporary:
  target=Path(temporary);shutil.copyfile(root/'xu.xun',target/'xu.xun')
- for package in ['scene','foundation/math','resources/scene','resources/lighting','resources/audio','formats/scene','formats/wav','internal/file_snapshot','integration/scene','integration/scene_audio','integration/audio','audio','platform/sdl_audio']:
+ for package in ['scene','foundation/math', 'resources/camera','resources/scene','resources/lighting','resources/shadow','resources/audio','formats/scene','formats/wav','internal/file_snapshot','integration/scene','integration/scene_audio','integration/audio','audio','platform/sdl_audio']:
   shutil.copytree(root/package,target/package)
  (target/'native').mkdir()
  shutil.copyfile(root/'native/nexus_audio.xulib',target/'native/nexus_audio.xulib')

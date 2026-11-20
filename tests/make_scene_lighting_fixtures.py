@@ -25,6 +25,14 @@ base=dict(format='xu.scene',version=1,
 def write(name,data):
     (OUT/(name+'.xuscene')).write_text(json.dumps(data,ensure_ascii=False,separators=(',',':'))+'\n')
 write('base',base)
+profile = dict(count=3, resolution=256, distance=42.98765432101234, split_lambda=.71, blend_fraction=.19,
+               caster_padding=7.5, stabilization_step=.03125, raster_bias_texels=.0078125)
+authored = copy.deepcopy(base)
+authored['version'] = 4
+authored['lights'][0]['cascades'] = profile
+authored['lights'][3] = dict(node=5, type='directional', direction=[1,0,0], radiance=[2,2,2],
+                             cascades=dict(profile, count=4))
+write('cascades', authored)
 full=copy.deepcopy(base)
 full['nodes']=[node(-1,'World')]+[node(0,'Light'+str(i),visible=False) for i in range(256)]
 full['lights']=[dict(node=i+1,type='point',position=[0,0,0],radiance=[1,1,1],radius=5) for i in range(256)]
@@ -57,6 +65,28 @@ for name,index,change in [
     ('cone-string',2,dict(inner_cosine='0.9')),('cone-degrees',2,dict(inner_half_angle=20)),
 ]:bad(name,lambda d,i=index,c=change:d['lights'][i].update(c))
 bad('duplicate-node',lambda d:d['lights'].append(copy.deepcopy(d['lights'][0])))
+for label, version, index, value in [
+    ('legacy', 3, 0, profile),
+    ('point', 4, 1, profile),
+    ('spot', 4, 2, profile),
+    ('null', 4, 0, None),
+    ('extra', 4, 0, dict(profile, atlas_handle=7)),
+    ('missing', 4, 0, {k: v for k, v in profile.items() if k != 'distance'}),
+    ('count-zero', 4, 0, dict(profile, count=0)),
+    ('count-high', 4, 0, dict(profile, count=5)),
+    ('count-fraction', 4, 0, dict(profile, count=3.5)),
+    ('resolution', 4, 0, dict(profile, resolution=260)),
+    ('distance-zero', 4, 0, dict(profile, distance=0)),
+    ('lambda', 4, 0, dict(profile, split_lambda=1.1)),
+    ('blend', 4, 0, dict(profile, blend_fraction=.31)),
+    ('padding', 4, 0, dict(profile, caster_padding=-1)),
+    ('step', 4, 0, dict(profile, stabilization_step=0)),
+    ('bias', 4, 0, dict(profile, raster_bias_texels=.51)),
+]:
+    def invalid_cascades(scene, schema=version, light=index, cascades=value):
+        scene['version'] = schema
+        scene['lights'][light]['cascades'] = cascades
+    bad('cascades-' + label, invalid_cascades)
 large=copy.deepcopy(full);large['nodes'].append(node(0,'Overflow'));large['lights'].append(dict(node=257,type='point',position=[0,0,0],radiance=[0,0,0],radius=1));write('reject-count',large);rejects.append('reject-count.xuscene')
 # JSON duplicate fields must fail before a last-write-wins dictionary can hide them.
 raw=json.dumps(base,separators=(',',':'))

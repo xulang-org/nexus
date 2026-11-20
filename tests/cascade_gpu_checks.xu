@@ -2,6 +2,7 @@
 #gpu
 #os
 fm #"github.com/xulang-org/nexus/foundation/math"
+camera_data #"github.com/xulang-org/nexus/resources/camera"
 policy #"github.com/xulang-org/nexus/resources/shadow"
 mesh #"github.com/xulang-org/nexus/resources/mesh"
 lights #"github.com/xulang-org/nexus/resources/lighting"
@@ -144,6 +145,41 @@ fn run() int {
     lens.far=40.0
     adapted := bridge.cascade_node_camera(&lens,&tree,1.0) or >>
     assert((policy.cascaded(source,adapted,settings) or >>).matches_camera(moved_vp))
+
+    // Reuse the same atlas layouts with a scene-attached orthographic lens.
+    ortho_aspect := 15.5 / 5.0
+    tree.set_orthographic_camera_3d(camera_node, camera_data.orthographic(10.0, 0.0, 40.0) or >>) or >>
+    tree.set_position_3d(parent, fm.vec3(0.0, 0.0, 0.0)) or >>
+    ortho_camera := bridge.cascade_scene_camera(&tree, camera_node, ortho_aspect) or >>
+    ortho_vp := tree.camera_view_projection_3d(camera_node, ortho_aspect) or >>
+    for count in [2, 3, 4] {
+        settings.count = count
+        ortho_description := policy.cascaded(source, ortho_camera, settings) or >>
+        assert(ortho_description.matches_camera(ortho_vp))
+        index := count - 2
+        item := $&maps[index]
+        assert((item.render(&device, &casters, ortho_description) or >>) == count * 14)
+        name := "ortho-" + str(count)
+        plain := capture($&device, &scene, &tree, ortho_vp, &env, item, false, name + "-lit") or >>
+        shaded := capture($&device, &scene, &tree, ortho_vp, &env, item, true, name + "-shadow") or >>
+        assert(plain != shaded)
+    }
+    tree.set_position_3d(parent, fm.vec3(0.25, 0.0, 0.0)) or >>
+    ortho_moved := bridge.cascade_scene_camera(&tree, camera_node, ortho_aspect) or >>
+    ortho_moved_vp := tree.camera_view_projection_3d(camera_node, ortho_aspect) or >>
+    item := $&maps[2]
+    device.begin(255) or >>
+    assert(rejected(&scene, $&device, &tree, ortho_moved_vp, &moved_env, item))
+    device.present() or >>
+    ortho_updated := policy.cascaded(source, ortho_moved, settings) or >>
+    item.render(&device, &casters, ortho_updated) or >>
+    capture($&device, &scene, &tree, ortho_moved_vp, &moved_env, item, false, "ortho-moved-lit") or >>
+    capture($&device, &scene, &tree, ortho_moved_vp, &moved_env, item, true, "ortho-moved-shadow") or >>
+    item.render(&device, &self_casters, ortho_updated) or >>
+    ortho_self := capture($&device, &scene, &tree, ortho_moved_vp, &moved_env, item, true, "ortho-plane-self") or >>
+    ortho_control := capture($&device, &scene, &tree, ortho_moved_vp, &moved_env, item, false, "ortho-plane-control") or >>
+    assert(ortho_self == ortho_control)
+
     settings.resolution=1024
     huge := policy.cascaded(source,camera,settings) or >>
     assert(failed_create(&device,huge,&shadow_program))
@@ -154,7 +190,7 @@ fn run() int {
     receiver.close() or >>
     occluder.close() or >>
     device.close() or >>
-    println("PASS: actual 2/3/4 CSM, overlap and far fade, camera refresh/stale rejection, parented camera adapter, sloped self projection, clear and 64 MiB map budget recovery")
+    println("PASS: actual perspective/orthographic 2/3/4 CSM, overlap and far fade, camera refresh/stale rejection, parented camera adapter, sloped self projection, clear and 64 MiB map budget recovery")
     << 0
 }
 fn main() int { << run() or(err){ eprintln(err.msg())

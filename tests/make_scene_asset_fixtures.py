@@ -94,7 +94,7 @@ bad('duplicate-surface',lambda d:d['surfaces'].append(copy.deepcopy(d['surfaces'
 for label,value in [('negative',-1),('outside',1024),('float',.5),('null',None)]:bad('primitive-'+label,sprop('primitive',value))
 bad('surface-extra',sprop('material',1));bad('surface-missing',lambda d:d['surfaces'][0].pop('node'))
 bad('version-future',lambda d:d.__setitem__('version',5))
-bad('unsupported-version',lambda d:d.__setitem__('version',2))
+bad('unsupported-version',lambda d:d.__setitem__('version',5))
 bad('too-many-resources',lambda d:d.__setitem__('resources',d['resources']*33))
 bad('too-many-surfaces',lambda d:d.__setitem__('surfaces',d['surfaces']*4097))
 (out/'reject-list.txt').write_text('\n'.join(rejects)+'\n')

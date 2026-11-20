@@ -7,7 +7,7 @@ import tempfile
 root=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='xu-scene-script-') as temporary:
  target=Path(temporary);shutil.copyfile(root/'xu.xun',target/'xu.xun')
- for package in ['scene','foundation/math','resources/scene','resources/lighting','formats/scene','internal/file_snapshot','integration/scene','integration/scene_script','script/bytecode','script/vm','script/host']:
+ for package in ['scene','foundation/math', 'resources/camera','resources/scene','resources/lighting','resources/shadow','formats/scene','internal/file_snapshot','integration/scene','integration/scene_script','script/bytecode','script/vm','script/host']:
   shutil.copytree(root/package,target/package)
  check=target/'checks';check.mkdir();shutil.copyfile(root/'tests/scene_script_process_cli.xu',check/'main.xu')
  (check/'xu.xun').write_text('module: example/script_scene_isolation\nversion: !ver 0.1.0\nxu: !ver 0.12.3\nrequire:\n  "github.com/xulang-org/nexus": file:..\n')
