@@ -1,0 +1,150 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+models3d #"github.com/xulang-org/nexus/integration/scene_render"
+world3d #"github.com/xulang-org/nexus/integration/rendering/three_d"
+scene #"github.com/xulang-org/nexus/scene"
+events #window/events
+#errors
+#math
+
+fn check_node_named(tree &scene.SceneTree, root int, name string) int {
+    for node in tree.subtree(root) or >> {
+        if (tree.node_info(node) or >>).name == name { << node }
+    }
+    >> errors.new("viewport check target missing: " + name)
+}
+
+struct DragPoints { start fm.Vec2
+    end fm.Vec2 }
+fn check_handle(frame CameraFrame, pivot fm.Vec3, basis GizmoBasis, mode int, axis_index int, amount f64) DragPoints {
+    handles := axis_handles(frame, pivot, basis, mode)
+    for i in 0:handles.len {
+        handle := &handles[i]
+        if handle.index != axis_index { -> }
+        axis := handle.axis
+        if mode == GIZMO_ROTATE {
+            for step in 0:48 {
+                angle := f64(step) * 6.283185307179586 / 48.0
+                start := frame.project(ring_point(pivot, basis, axis_index, handle.length, angle))
+                end := frame.project(ring_point(pivot, basis, axis_index, handle.length, angle + amount))
+                if start.visible && end.visible && handle_at(&handles, start.position, mode) == i {
+                    << DragPoints{start: start.position, end: end.position}
+                }
+            }
+        } else if axis.dot(axis) == 0.0 {
+            << DragPoints{start: handle.begin, end: handle.begin.add(fm.vec2(amount, 0.0))}
+        } else {
+            $distance := amount
+            if mode == GIZMO_SCALE { distance *= handle.length }
+            start := frame.project(pivot.add(axis.scaled(handle.length))).position
+            end := frame.project(pivot.add(axis.scaled(handle.length + distance))).position
+            if handle_at(&handles, start, mode) == i { << DragPoints{start: start, end: end} }
+        }
+    }
+    >> errors.new("viewport check could not reach the requested handle")
+}
+
+fn send_drag(editor $&EditorView, tree $&scene.SceneTree, world $&world3d.Scene3D,
+    picker &models3d.ScenePicker3D, size fm.Vec2, points DragPoints, cancel bool) int {
+    basis := editor_basis(editor, tree) or >>
+    $event := events.empty()
+    event.kind = events.EVENT_POINTER_DOWN
+    event.button = events.BUTTON_LEFT
+    handle_event(editor, tree, world, picker, &event, size, points.start) or >>
+    if !editor.dragging { >> errors.new("viewport check could not start the drag") }
+    event.kind = events.EVENT_POINTER_MOVE
+    handle_event(editor, tree, world, picker, &event, size, points.end) or >>
+    shown := editor_basis(editor, tree) or >>
+    if shown.x.sub(basis.x).length() > 0.000001 || shown.y.sub(basis.y).length() > 0.000001 ||
+        shown.z.sub(basis.z).length() > 0.000001 { >> errors.new("viewport changed local axes during a drag") }
+    event.kind = events.EVENT_POINTER_UP
+    if cancel { event.kind = events.EVENT_FOCUS_LOST }
+    handle_event(editor, tree, world, picker, &event, size, points.end) or >>
+    if editor.dragging { >> errors.new("viewport check drag did not finish") }
+    << 0
+}
+
+fn check_group(editor $&EditorView, tree $&scene.SceneTree, world $&world3d.Scene3D, picker &models3d.ScenePicker3D,
+    root int, size fm.Vec2, first_name string, second_name string, check_local bool) int {
+    first := check_node_named(tree, root, first_name) or >>
+    second := check_node_named(tree, root, second_name) or >>
+    frame := camera_frame(editor.orbit, size) or >>
+    first_click := check_click(picker, world, tree, frame, first) or >>
+    second_click := check_click(picker, world, tree, frame, second) or >>
+    $event := events.empty()
+    event.kind = events.EVENT_POINTER_DOWN
+    event.button = events.BUTTON_LEFT
+    handle_event(editor, tree, world, picker, &event, size, first_click) or >>
+    event.modifiers = events.MOD_SHIFT
+    handle_event(editor, tree, world, picker, &event, size, second_click) or >>
+    if editor.selection.len != 2 { >> errors.new("viewport Shift-click did not add selection") }
+    handle_event(editor, tree, world, picker, &event, size, second_click) or >>
+    if editor.selection.len != 1 || editor.selection[0] != first { >> errors.new("viewport Shift-click did not remove selection") }
+    handle_event(editor, tree, world, picker, &event, size, second_click) or >>
+    roots := selection_roots(tree, &editor.selection) or >>
+    pivot := selection_pivot(tree, &roots) or >>
+    event.kind = events.EVENT_KEY_DOWN
+    event.modifiers = 0
+    $distance := 0.2
+    $angle := 0.5235987755982988
+    $scale_amount := 0.25
+    $uniform_amount := 9.531017980432493
+    if check_local {
+        event.physical_key = events.KEY_S
+        handle_event(editor, tree, world, picker, &event, size, first_click) or >>
+        grid := check_handle(frame, pivot, world_basis(), GIZMO_MOVE, 0, 0.36) or >>
+        click_only := DragPoints{start: grid.start, end: grid.start}
+        send_drag(editor, tree, world, picker, size, click_only, false) or >>
+        at_rest := selection_pivot(tree, &roots) or >>
+        if at_rest.sub(pivot).length() > 0.000001 { >> errors.new("viewport snapped without a drag") }
+        send_drag(editor, tree, world, picker, size, grid, false) or >>
+        aligned := selection_pivot(tree, &roots) or >>
+        grid_step := editor.snap.move
+        want := math.round((pivot.x + 0.36) / grid_step) * grid_step
+        if math.abs(aligned.x - want) > 0.000001 || math.abs(aligned.y - pivot.y) > 0.000001 ||
+            math.abs(aligned.z - pivot.z) > 0.000001 { >> errors.new("viewport world grid snap missed its axis plane") }
+        restore_transform(tree, &editor.drag) or >>
+        event.physical_key = events.KEY_Q
+        handle_event(editor, tree, world, picker, &event, size, first_click) or >>
+        if !editor.local_axes || !editor.snapping { >> errors.new("viewport local snap keys did not toggle") }
+        distance = -0.36
+        angle = 0.6108652381980153
+        scale_amount = 0.26
+        uniform_amount = 100.0 * math.log(1.24)
+        if math.abs(scale_delta(-1.0, 0.4) + 0.8) > 0.000001 || math.abs(scale_delta(100.0, 0.4) - 98.8) > 0.000001 ||
+            math.abs(scale_delta(-1.0, 0.33) + 0.99) > 0.000001 || scale_delta(-1.0, 1.0) != 0.0 {
+            >> errors.new("viewport scale limits left the snap grid")
+        }
+    }
+    basis := editor_basis(editor, tree) or >>
+    move := check_handle(frame, pivot, basis, GIZMO_MOVE, 0, distance) or >>
+    send_drag(editor, tree, world, picker, size, move, false) or >>
+
+    event.physical_key = events.KEY_2
+    handle_event(editor, tree, world, picker, &event, size, first_click) or >>
+    pivot_after_move := selection_pivot(tree, &roots) or >>
+    rotate := check_handle(frame, pivot_after_move, basis, GIZMO_ROTATE, 2, angle) or >>
+    local_before := (tree.node_3d(first) or >>).transform
+    send_drag(editor, tree, world, picker, size, rotate, true) or >>
+    restored := (tree.node_3d(first) or >>).transform
+    if restored.c0.xyz().sub(local_before.c0.xyz()).length() > 0.000001 {
+        >> errors.new("viewport group cancel did not restore its original basis")
+    }
+    send_drag(editor, tree, world, picker, size, rotate, false) or >>
+
+    event.physical_key = events.KEY_3
+    handle_event(editor, tree, world, picker, &event, size, first_click) or >>
+    rotated_basis := editor_basis(editor, tree) or >>
+    scale := check_handle(frame, pivot_after_move, rotated_basis, GIZMO_SCALE, 0, scale_amount) or >>
+    send_drag(editor, tree, world, picker, size, scale, false) or >>
+    // The screen drag for uniform scale is logarithmic.
+    uniform := check_handle(frame, pivot_after_move, rotated_basis, GIZMO_SCALE, 3, uniform_amount) or >>
+    send_drag(editor, tree, world, picker, size, uniform, false) or >>
+    event.physical_key = events.KEY_ENTER
+    handle_event(editor, tree, world, picker, &event, size, first_click) or >>
+    if editor.outcome != APPLY { >> errors.new("viewport did not accept the checked group") }
+    if check_local { println("PASS: world grid, local handles, snapped translation, rotation and scale") }
+    else { println("PASS: Shift selection, group translation, canceled and applied rotation, axis and uniform scale") }
+    << 0
+}

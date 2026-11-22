@@ -20,6 +20,37 @@ pub const KEY_LEFT = 80
 pub const KEY_DOWN = 81
 pub const KEY_UP = 82
 
+fn quote_xun_string(value &string) string {
+    hex := "0123456789ABCDEF"
+    $out := strings.builder()
+    out.write_byte(34)
+    for i in 0:value.len {
+        c := value[i] & 255
+        if c == 34 || c == 92 {
+            out.write_byte(92)
+            out.write_byte(c)
+        } else if c == 10 {
+            out.write_byte(92)
+            out.write_byte(110)
+        } else if c == 13 {
+            out.write_byte(92)
+            out.write_byte(114)
+        } else if c == 9 {
+            out.write_byte(92)
+            out.write_byte(116)
+        } else if c < 32 || c == 127 {
+            out.write_byte(92)
+            out.write_byte(120)
+            out.write_byte(hex[c >> 4])
+            out.write_byte(hex[c & 15])
+        } else {
+            out.write_byte(c)
+        }
+    }
+    out.write_byte(34)
+    << out.text()
+}
+
 fn serialize_float(v f64) string {
     text := strconv.format_float(v, 103, -1) or (err) { << "0.0" }
     << text
@@ -88,10 +119,12 @@ pub fn (ctrl $&GameControl) dispatch_job(job &GameJob, tree $&scene.SceneTree, i
 
     if job.op == "nexus.step" {
         $frames := 1
-        fn_node := doc.get(args, "frames")
-        if fn_node >= 0 {
-            frames = doc.as_int(fn_node)
-            if frames <= 0 { frames = 1 }
+        if args >= 0 {
+            fn_node := doc.get(args, "frames")
+            if fn_node >= 0 {
+                frames = doc.as_int(fn_node)
+                if frames <= 0 { frames = 1 }
+            }
         }
         ctrl.steps_remaining = frames
         $paused_str := "false"
@@ -110,8 +143,8 @@ pub fn (ctrl $&GameControl) dispatch_job(job &GameJob, tree $&scene.SceneTree, i
             "  node_count: !i " + str(all_nodes.len) + "\n" +
             "  root_id: !i " + str(tree.root()) + "\n" +
             "  steps_remaining: !i " + str(ctrl.steps_remaining) + "\n" +
-            "  canvas_width: !i 960\n" +
-            "  canvas_height: !i 640\n"
+            "  canvas_width: !i " + str(ctrl.resolved_width()) + "\n" +
+            "  canvas_height: !i " + str(ctrl.resolved_height()) + "\n"
         << GameReply{ok: true, err_code: "", err_msg: "", data: res}
     }
 
@@ -120,17 +153,18 @@ pub fn (ctrl $&GameControl) dispatch_job(job &GameJob, tree $&scene.SceneTree, i
 
 fn (ctrl &GameControl) handle_tree(tree &scene.SceneTree, doc &xun.Doc, args int) string {
     $start := 0
-    start_node := doc.get(args, "start")
-    if start_node >= 0 {
-        start = doc.as_int(start_node)
-        if start < 0 { start = 0 }
-    }
-
     $max_rows := 512
-    max_node := doc.get(args, "max_table_rows")
-    if max_node >= 0 {
-        max_rows = doc.as_int(max_node)
-        if max_rows <= 0 || max_rows > 1024 { max_rows = 512 }
+    if args >= 0 {
+        start_node := doc.get(args, "start")
+        if start_node >= 0 {
+            start = doc.as_int(start_node)
+            if start < 0 { start = 0 }
+        }
+        max_node := doc.get(args, "max_table_rows")
+        if max_node >= 0 {
+            max_rows = doc.as_int(max_node)
+            if max_rows <= 0 || max_rows > 1024 { max_rows = 512 }
+        }
     }
 
     node_ids := tree.subtree(tree.root()) or >>
@@ -163,13 +197,31 @@ fn (ctrl &GameControl) handle_tree(tree &scene.SceneTree, doc &xun.Doc, args int
         out.write_string(&"  nodes: []\n")
     } else {
         out.write_string(&"  nodes:\n")
-        w_px := 960.0
-        h_px := 640.0
+        w_px := f64(ctrl.resolved_width())
+        h_px := f64(ctrl.resolved_height())
 
         for i in start:start + count {
             nid := node_ids[i]
-            nd := tree.node(nid) or >>
-            tf := tree.global_transform(nid) or >>
+            info := tree.node_info(nid) or >>
+            $nx := 0.0
+            $ny := 0.0
+            $nz := 0.0
+            $ndim := 0
+            $kind_name := "Group"
+            if info.kind == scene.NODE_2D {
+                tf := tree.global_transform(nid) or >>
+                nx = tf.tx
+                ny = tf.ty
+                ndim = 2
+                kind_name = "Node2D"
+            } else if info.kind == scene.NODE_3D {
+                tf3 := tree.global_transform_3d(nid) or >>
+                nx = tf3.c3.x
+                ny = tf3.c3.y
+                nz = tf3.c3.z
+                ndim = 3
+                kind_name = "Node3D"
+            }
             is_vis := tree.is_visible(nid)
             $vis_str := "false"
             if is_vis { vis_str = "true" }
@@ -186,12 +238,18 @@ fn (ctrl &GameControl) handle_tree(tree &scene.SceneTree, doc &xun.Doc, args int
 
             out.write_string(&"    - id: !i ")
             out.write_string(&str(nid))
-            out.write_string(&"\n      kind: !i 1\n      parent: !i ")
-            out.write_string(&str(nd.parent))
+            out.write_string(&"\n      kind: !i 1\n      dim: !i ")
+            out.write_string(&str(ndim))
+            out.write_string(&"\n      node_kind: \"")
+            out.write_string(&kind_name)
+            out.write_string(&"\"\n      parent: !i ")
+            out.write_string(&str(info.parent))
             out.write_string(&"\n      x: !f ")
-            out.write_string(&serialize_float(tf.tx))
+            out.write_string(&serialize_float(nx))
             out.write_string(&"\n      y: !f ")
-            out.write_string(&serialize_float(tf.ty))
+            out.write_string(&serialize_float(ny))
+            out.write_string(&"\n      z: !f ")
+            out.write_string(&serialize_float(nz))
             out.write_string(&"\n      width: !f ")
             out.write_string(&serialize_float(nw))
             out.write_string(&"\n      height: !f ")
@@ -200,9 +258,10 @@ fn (ctrl &GameControl) handle_tree(tree &scene.SceneTree, doc &xun.Doc, args int
             out.write_string(&vis_str)
             out.write_string(&"\n      enabled: !b ")
             out.write_string(&proc_str)
-            out.write_string(&"\n      focusable: !b false\n      focused: !b false\n      text: \"")
-            out.write_string(&nd.name)
-            out.write_string(&"\"\n")
+            out.write_string(&"\n      focusable: !b false\n      focused: !b false\n      text: ")
+            quoted_name := quote_xun_string(&info.name)
+            out.write_string(&quoted_name)
+            out.write_string(&"\n")
         }
     }
     << out.text()
@@ -211,15 +270,18 @@ fn (ctrl &GameControl) handle_tree(tree &scene.SceneTree, doc &xun.Doc, args int
 pub fn (ctrl $&GameControl) fulfill_screenshot(w int, h int, path string) int {
     if !ctrl.has_screenshot_job { << 0 }
     ctrl.has_screenshot_job = false
+    ctrl.set_canvas_size(w, h)
 
     doc := xun.parse(&ctrl.screenshot_job.body)
     $mode := "inline_b64"
     if doc.ok() {
         args := doc.get(doc.root(), "args")
-        mode_node := doc.get(args, "mode")
-        if mode_node >= 0 {
-            m := doc.text(mode_node)
-            if m == "file" { mode = "file" }
+        if args >= 0 {
+            mode_node := doc.get(args, "mode")
+            if mode_node >= 0 {
+                m := doc.text(mode_node)
+                if m == "file" { mode = "file" }
+            }
         }
     }
 
@@ -236,7 +298,7 @@ pub fn (ctrl $&GameControl) fulfill_screenshot(w int, h int, path string) int {
             "  mime: \"image/png\"\n" +
             "  bytes: !i " + str(content.len) + "\n" +
             "  mode: \"file\"\n" +
-            "  path: \"" + path + "\"\n" +
+            "  path: " + quote_xun_string(&path) + "\n" +
             "  dir_hint: \"build\"\n"
         ctrl.screenshot_job.reply <- GameReply{ok: true, err_code: "", err_msg: "", data: res}
         << 0
@@ -269,6 +331,7 @@ pub fn (ctrl $&GameControl) reject_screenshot(reason string) int {
 }
 
 fn (ctrl &GameControl) handle_input(input $&controls.InputMap, doc &xun.Doc, args int) int {
+    if args < 0 { << 0 }
     steps := doc.get(args, "steps")
     if steps < 0 { << 0 }
     step_count := doc.count(steps)
@@ -292,11 +355,16 @@ fn (ctrl &GameControl) handle_input(input $&controls.InputMap, doc &xun.Doc, arg
 }
 
 fn (ctrl &GameControl) handle_act(tree $&scene.SceneTree, doc &xun.Doc, args int) int {
+    if args < 0 { << 0 }
     act_node := doc.get(args, "act")
     if act_node < 0 { << 0 }
     act := doc.text(act_node)
-    if act == "pause" {
+    if act == "pause" || act == "toggle_pause" {
         tree.paused = !tree.paused
+    } else if act == "unpause" || act == "resume" {
+        tree.paused = false
+    } else {
+        >> errors.new("unsupported ui.act action: " + act)
     }
     << 0
 }

@@ -1,0 +1,685 @@
+@"github.com/xulang-org/nexus/integration/project"
+
+resource #"github.com/xulang-org/nexus/resources/scene"
+node_files #"github.com/xulang-org/nexus/integration/scene"
+scene_fmt #"github.com/xulang-org/nexus/formats/scene"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#crypto/sha256
+#encoding/json
+#path/filepath
+#strconv
+#strings
+#os
+#os/exec
+#errors
+
+pub struct PrimitiveInfo {
+    pub triangles int
+    pub has_uvs bool
+    pub has_tangents bool
+    pub needs_uvs bool
+    pub needs_tangents bool
+}
+
+pub struct ImportRecord {
+    pub uid string
+    pub source_rel string
+    pub resolved string
+    pub source_hash string
+    pub validator_hash string
+    pub size_bytes int
+    pub cached bool
+    pub primitives []PrimitiveInfo
+}
+
+pub struct PublishResult {
+    pub generation string
+    pub root string
+    pub rebuilt_assets int
+    pub reused_assets int
+    pub scenes []Entry
+}
+
+pub struct ImportAssetResult {
+    pub uid string
+    pub rel_path string
+    pub resolved string
+    pub reused bool
+    pub primitive_count int
+}
+
+const MODE_READ_ONLY = 292 // 0o444
+
+pub fn sha256_file(path string) string {
+    $f := os.open(path + "") or >>
+    $digest := sha256.new()
+    while true {
+        chunk := f.read(65536) or (err) {
+            _ := f.close()
+            >> err
+        }
+        if chunk.len == 0 {
+            <-
+        }
+        digest.write(&chunk)
+    }
+    f.close() or >>
+    << digest.sum()
+}
+
+pub fn resolve_validator_path(validator string) string {
+    raw := strings.trim_space(&validator)
+    $cand := DEFAULT_VALIDATOR
+    if raw.len > 0 {
+        cand = raw
+    }
+    if strings.contains(&cand, "/") || strings.contains(&cand, "\\") {
+        abs := filepath.abs(&cand) or >>
+        info := os.stat(abs + "") or >>
+        if info.is_dir {
+            >> errors.new("nexus project: validator path is a directory: " + abs)
+        }
+        << abs
+    }
+    found := exec.look_path(cand + "") or >>
+    abs := filepath.abs(&found) or >>
+    << abs
+}
+
+pub fn validate_glb_primitives(validator string, glb_path string) []PrimitiveInfo {
+    bin := resolve_validator_path(validator + "") or >>
+    cmd := exec.command(bin + "", "glb", glb_path + "")
+    out := cmd.combined_output() or (err) {
+        >> errors.new("nexus project: GLB validation failed for " + glb_path + ": " + err.msg())
+    }
+    lines := strings.split(&out, "\n")
+    $prims := []PrimitiveInfo{}
+    for raw_line in lines {
+        line := strings.trim_space(&raw_line)
+        if line.len == 0 { -> }
+        cols := strings.fields(&line)
+        if cols.len != 5 {
+            >> errors.new("nexus project: malformed validator output: " + line)
+        }
+        tris := strconv.atoi(&cols[0]) or >>
+        if tris < 0 {
+            >> errors.new("nexus project: negative primitive triangle count")
+        }
+        prims.push(PrimitiveInfo{
+            triangles: tris,
+            has_uvs: cols[1] == "1",
+            has_tangents: cols[2] == "1",
+            needs_uvs: cols[3] == "1",
+            needs_tangents: cols[4] == "1"
+        })
+    }
+    if prims.len == 0 {
+        >> errors.new("nexus project: GLB contains no mesh primitives: " + glb_path)
+    }
+    << prims
+}
+
+fn load_receipt(path &string, validator_hash &string, glb_hash &string) []PrimitiveInfo {
+    if !path_exists(path + "") {
+        << []PrimitiveInfo{}
+    }
+    raw := snapshot.read(path + "", 1048576) or (err) { << []PrimitiveInfo{} }
+    doc := json.parse_max(&raw, 1048576)
+    if !doc.ok() { << []PrimitiveInfo{} }
+    root := doc.root()
+    if !doc.is_dict(root) { << []PrimitiveInfo{} }
+    vhash := doc.as_string(doc.get(root, "validator_sha256")) or (err) { << []PrimitiveInfo{} }
+    ghash := doc.as_string(doc.get(root, "glb_sha256")) or (err) { << []PrimitiveInfo{} }
+    if vhash != validator_hash + "" || ghash != glb_hash + "" {
+        << []PrimitiveInfo{}
+    }
+    list := doc.get(root, "primitives")
+    if list < 0 || !doc.is_list(list) || doc.count(list) < 1 {
+        << []PrimitiveInfo{}
+    }
+    $prims := []PrimitiveInfo{}
+    for i in 0:doc.count(list) {
+        row := doc.at(list, i)
+        if !doc.is_dict(row) { << []PrimitiveInfo{} }
+        tris := doc.as_int(doc.get(row, "triangles")) or (err) { << []PrimitiveInfo{} }
+        has_uvs := doc.as_bool(doc.get(row, "has_uvs")) or (err) { << []PrimitiveInfo{} }
+        has_tangents := doc.as_bool(doc.get(row, "has_tangents")) or (err) { << []PrimitiveInfo{} }
+        needs_uvs := doc.as_bool(doc.get(row, "needs_uvs")) or (err) { << []PrimitiveInfo{} }
+        needs_tangents := doc.as_bool(doc.get(row, "needs_tangents")) or (err) { << []PrimitiveInfo{} }
+        prims.push(PrimitiveInfo{
+            triangles: tris,
+            has_uvs: has_uvs,
+            has_tangents: has_tangents,
+            needs_uvs: needs_uvs,
+            needs_tangents: needs_tangents
+        })
+    }
+    << prims
+}
+
+fn save_receipt(path &string, validator_hash &string, glb_hash &string, prims &[]PrimitiveInfo) int {
+    ensure_parent_dir(path) or >>
+    $out := strings.new_byte_builder(512)
+    out.write_str("{\"validator_sha256\":" + json.quote(validator_hash) +
+        ",\"glb_sha256\":" + json.quote(glb_hash) + ",\"primitives\":[")
+    for i in 0:prims.len {
+        if i > 0 { out.write_str(",") }
+        p := prims[i]
+        out.write_str("{\"triangles\":" + str(p.triangles) +
+            ",\"has_uvs\":" + strconv.format_bool(p.has_uvs) +
+            ",\"has_tangents\":" + strconv.format_bool(p.has_tangents) +
+            ",\"needs_uvs\":" + strconv.format_bool(p.needs_uvs) +
+            ",\"needs_tangents\":" + strconv.format_bool(p.needs_tangents) + "}")
+    }
+    out.write_str("]}\n")
+    raw := out.to_string()
+    snapshot.write_atomic(path + "", &raw) or >>
+    << 0
+}
+
+fn import_glb(entry &Entry, validator_bin &string, validator_hash &string, cache_dir &string) ImportRecord {
+    raw := snapshot.read(entry.resolved + "", snapshot.MAX_BYTES) or >>
+    source_hash := sha256.sum256(raw + "")
+    receipt := filepath.join([cache_dir + "", "imports", source_hash + ".json"])
+    $prims := load_receipt(&receipt, validator_hash, &source_hash)
+    $cached := prims.len > 0
+    if !cached {
+        prims = validate_glb_primitives(validator_bin + "", entry.resolved + "") or >>
+        save_receipt(&receipt, validator_hash, &source_hash, &prims) or >>
+    }
+    << ImportRecord{
+        uid: entry.key + "",
+        source_rel: entry.path + "",
+        resolved: entry.resolved + "",
+        source_hash: source_hash,
+        validator_hash: validator_hash + "",
+        size_bytes: raw.len,
+        cached: cached,
+        primitives: prims
+    }
+}
+
+fn check_primitive_binding(uid &string, prim_idx int, prims &[]PrimitiveInfo, context &string) PrimitiveInfo {
+    if prim_idx < 0 || prim_idx >= prims.len {
+        >> errors.new("nexus project: " + context + " primitive " + str(prim_idx) +
+            " outside GLB asset '" + uid + "' (count=" + str(prims.len) + ")")
+    }
+    p := prims[prim_idx]
+    if p.needs_uvs && !p.has_uvs {
+        >> errors.new("nexus project: " + context + " requires UVs missing on '" + uid + "' primitive " + str(prim_idx))
+    }
+    if p.needs_tangents && !p.has_tangents {
+        >> errors.new("nexus project: " + context + " requires tangents missing on '" + uid + "' primitive " + str(prim_idx))
+    }
+    << p
+}
+
+pub fn check_surface_bindings(document &resource.Document, records &[]ImportRecord) int {
+    $by_uid := map[string]int{}
+    for i in 0:records.len {
+        by_uid[records[i].uid + ""] = i
+    }
+    for i in 0:document.surface_count() {
+        surface := document.surface(i) or >>
+        if !by_uid.has(surface.resource_uid + "") {
+            >> errors.new("nexus project: surface references unregistered UID '" + surface.resource_uid + "'")
+        }
+        base_idx := by_uid[surface.resource_uid + ""]
+        base_rec := &records[base_idx]
+        base_prim := check_primitive_binding(&surface.resource_uid, surface.primitive, &base_rec.primitives, &"surface") or >>
+        $prev_tris := base_prim.triangles
+        $prev_dist := -1.0
+        for j in 0:surface.levels.len {
+            lvl := &surface.levels[j]
+            if lvl.distance <= 0.0 || (prev_dist > 0.0 && lvl.distance <= prev_dist) {
+                >> errors.new("nexus project: surface LOD distances must be strictly increasing positive values")
+            }
+            if !by_uid.has(lvl.resource_uid + "") {
+                >> errors.new("nexus project: LOD level references unregistered UID '" + lvl.resource_uid + "'")
+            }
+            lrec_idx := by_uid[lvl.resource_uid + ""]
+            lrec := &records[lrec_idx]
+            lp := check_primitive_binding(&lvl.resource_uid, lvl.primitive, &lrec.primitives, &"LOD") or >>
+            if lp.triangles > prev_tris {
+                >> errors.new("nexus project: LOD level triangles (" + str(lp.triangles) +
+                    ") exceed finer level (" + str(prev_tris) + ")")
+            }
+            prev_tris = lp.triangles
+            prev_dist = lvl.distance
+        }
+    }
+    << 0
+}
+
+fn copy_document_with_resources(document &resource.Document, next_refs []resource.ResourceReference) resource.Document {
+    << resource.with_references(document, document, next_refs) or >>
+}
+
+struct CookedScene {
+    key string
+    encoded string
+    hashes []string
+}
+
+fn cook_scene_raw(scene_key &string, raw &string, records &[]ImportRecord) CookedScene {
+    document := scene_fmt.decode(raw) or >>
+    if document.resource_count() > resource.MAX_RESOURCES {
+        >> errors.new("nexus project: scene exceeds resource limit of 32")
+    }
+    $by_uid := map[string]int{}
+    for i in 0:records.len {
+        by_uid[records[i].uid + ""] = i
+    }
+    check_surface_bindings(&document, records) or >>
+    $seen_hashes := map[string]int{}
+    $unique_hashes := []string{}
+    $total_bytes := 0
+    $next_refs := []resource.ResourceReference{}
+    for i in 0:document.resource_count() {
+        ref := document.resource(i) or >>
+        if ref.kind != "glb_model" {
+            >> errors.new("nexus project: unsupported scene resource type '" + ref.kind + "' in " + scene_key)
+        }
+        if !by_uid.has(ref.uid + "") {
+            >> errors.new("nexus project: scene '" + scene_key + "' references unregistered UID '" + ref.uid + "'")
+        }
+        rec_idx := by_uid[ref.uid + ""]
+        rec := &records[rec_idx]
+        if !seen_hashes.has(rec.source_hash + "") {
+            seen_hashes[rec.source_hash + ""] = 1
+            unique_hashes.push(rec.source_hash + "")
+            total_bytes = total_bytes + rec.size_bytes
+            if total_bytes > snapshot.MAX_BYTES {
+                >> errors.new("nexus project: scene '" + scene_key + "' GLB source budget exceeds 32 MiB")
+            }
+        }
+        next_refs.push(resource.ResourceReference{
+            uid: ref.uid + "",
+            kind: ref.kind + "",
+            path: "assets/" + rec.source_hash + ".glb",
+            content_hash: rec.source_hash + ""
+        })
+    }
+    cooked_doc := copy_document_with_resources(&document, next_refs) or >>
+    encoded := scene_fmt.encode(&cooked_doc) or >>
+    _ := scene_fmt.decode(&encoded) or >>
+    << CookedScene{key: scene_key + "", encoded: encoded, hashes: unique_hashes}
+}
+
+fn link_or_copy_readonly(src &string, dst &string) int {
+    ensure_parent_dir(dst) or >>
+    if path_exists(dst + "") {
+        << 0
+    }
+    ln_res := exec.command("ln", src + "", dst + "").run_status() or (err) {
+        << 1
+    }
+    if ln_res == 0 {
+        _ := os.chmod(dst + "", MODE_READ_ONLY)
+        << 0
+    }
+    data := snapshot.read(src + "", snapshot.MAX_BYTES) or >>
+    snapshot.write_atomic(dst + "", &data) or >>
+    os.chmod(dst + "", MODE_READ_ONLY) or >>
+    << 0
+}
+
+fn ensure_store_asset(store_dir &string, rec &ImportRecord) string {
+    store_path := filepath.join([store_dir + "", rec.source_hash + ".glb"])
+    if path_exists(store_path + "") {
+        existing_hash := sha256_file(store_path + "") or (err) { << "" }
+        if existing_hash == rec.source_hash {
+            _ := os.chmod(store_path + "", MODE_READ_ONLY)
+            << store_path
+        }
+    }
+    ensure_parent_dir(&store_path) or >>
+    raw := snapshot.read(rec.resolved + "", snapshot.MAX_BYTES) or >>
+    if sha256.sum256(raw + "") != rec.source_hash {
+        >> errors.new("nexus project: source asset changed during publish: " + rec.source_rel)
+    }
+    snapshot.write_atomic(store_path + "", &raw) or >>
+    os.chmod(store_path + "", MODE_READ_ONLY) or >>
+    << store_path
+}
+
+fn finish_stage_rename(stage_dir &string, gen_dir &string) int {
+    os.rename(stage_dir + "", gen_dir + "") or (err) {
+        _ := os.remove_all(stage_dir + "")
+        if !path_exists(gen_dir + "") {
+            >> err
+        }
+        << 0
+    }
+    << 0
+}
+
+fn install_generation(out_dir &string, cooked &[]CookedScene, records &[]ImportRecord, validator_hash &string) string {
+    $digest := sha256.new()
+    hdr := "nexus.generation.v1\nvalidator:" + validator_hash + "\n"
+    digest.write(&hdr)
+    for i in 0:cooked.len {
+        cs := &cooked[i]
+        s_line := "scene:" + cs.key + "\n"
+        digest.write(&s_line)
+        scene_hash := sha256.sum256(cs.encoded + "")
+        h_line := scene_hash + "\n"
+        digest.write(&h_line)
+    }
+    gen_hash := digest.sum()
+
+    store_dir := filepath.join([out_dir + "", "store"])
+    os.mkdir_all(store_dir + "") or >>
+    $hash_to_store := map[string]string{}
+    for i in 0:records.len {
+        h := records[i].source_hash + ""
+        if !hash_to_store.has(h + "") {
+            hash_to_store[h + ""] = ensure_store_asset(&store_dir, &records[i]) or >>
+        }
+    }
+
+    gens_dir := filepath.join([out_dir + "", "generations"])
+    os.mkdir_all(gens_dir + "") or >>
+    gen_dir := filepath.join([gens_dir + "", gen_hash + ""])
+    if !path_exists(gen_dir + "") {
+        stage_dir := filepath.join([gens_dir + "", ".staging-" + gen_hash + "-" + str(os.getpid())])
+        _ := os.remove_all(stage_dir + "")
+        os.mkdir_all(stage_dir + "") or >>
+        $needed_hashes := map[string]int{}
+        for i in 0:cooked.len {
+            cs := &cooked[i]
+            scene_dst := filepath.join([stage_dir + "", cs.key + ""])
+            raw := cs.encoded + ""
+            snapshot.write_atomic(scene_dst + "", &raw) or (err) {
+                _ := os.remove_all(stage_dir + "")
+                >> err
+            }
+            _ := os.chmod(scene_dst + "", MODE_READ_ONLY)
+            for k in 0:cs.hashes.len {
+                h := cs.hashes[k] + ""
+                needed_hashes[h + ""] = 1
+            }
+        }
+        assets_dir := filepath.join([stage_dir + "", "assets"])
+        os.mkdir_all(assets_dir + "") or >>
+        for i in 0:records.len {
+            h := records[i].source_hash + ""
+            if needed_hashes.has(h + "") {
+                dst := filepath.join([assets_dir + "", h + ".glb"])
+                if !path_exists(dst + "") {
+                    store_src := hash_to_store[h + ""]
+                    link_or_copy_readonly(&store_src, &dst) or (err) {
+                        _ := os.remove_all(stage_dir + "")
+                        >> err
+                    }
+                }
+            }
+        }
+        finish_stage_rename(&stage_dir, &gen_dir) or >>
+    }
+    << gen_hash
+}
+
+fn write_current_pointer(out_dir &string, gen_hash &string, scenes &[]Entry) int {
+    $out := strings.new_byte_builder(512)
+    out.write_str("{\n  \"format\": \"nexus.generation\",\n  \"version\": 1,\n  \"generation\": " +
+        json.quote(gen_hash) + ",\n  \"scenes\": {")
+    for i in 0:scenes.len {
+        if i > 0 { out.write_str(",") }
+        s := scenes[i]
+        key := s.key + ""
+        rel := s.path + ""
+        out.write_str("\n    " + json.quote(&key) + ": " + json.quote(&rel))
+    }
+    if scenes.len > 0 { out.write_str("\n  ") }
+    out.write_str("}\n}\n")
+    raw := out.to_string()
+    ptr := filepath.join([out_dir + "", "current.json"])
+    snapshot.write_atomic(ptr, &raw) or >>
+    << 0
+}
+
+pub fn publish_with_drafts(project_path string, output_dir string, validator_bin string, draft_key string, draft_doc &resource.Document, has_draft bool) PublishResult {
+    project := load_project(project_path) or >>
+    abs_out := filepath.abs(&output_dir) or >>
+    os.mkdir_all(abs_out + "") or >>
+    val_bin := resolve_validator_path(validator_bin + "") or >>
+    val_hash := sha256_file(val_bin + "") or >>
+    cache_dir := filepath.join([abs_out + "", "cache"])
+    os.mkdir_all(cache_dir + "") or >>
+
+    $records := []ImportRecord{}
+    $session_cache := map[string]int{}
+    $rebuilt := 0
+    $reused := 0
+    for i in 0:project.assets.len {
+        entry := project.assets[i]
+        $rec := import_glb(&entry, &val_bin, &val_hash, &cache_dir) or >>
+        if session_cache.has(rec.source_hash + "") {
+            rec.cached = true
+        }
+        session_cache[rec.source_hash + ""] = 1
+        if rec.cached {
+            reused = reused + 1
+        } else {
+            rebuilt = rebuilt + 1
+        }
+        records.push(rec)
+    }
+
+    $cooked := []CookedScene{}
+    for i in 0:project.scenes.len {
+        s := project.scenes[i]
+        $raw := ""
+        if has_draft && s.key == draft_key {
+            raw = scene_fmt.encode(draft_doc) or >>
+        } else {
+            resolved := project.scene_source(i) or >>
+            raw = snapshot.read(resolved + "", scene_fmt.MAX_BYTES) or >>
+        }
+        cooked.push(cook_scene_raw(&s.key, &raw, &records) or >>)
+    }
+
+    gen_hash := install_generation(&abs_out, &cooked, &records, &val_hash) or >>
+    gen_dir := filepath.join([abs_out + "", "generations", gen_hash + ""])
+    $pub_scenes := []Entry{}
+    for s in project.scenes {
+        rel := "generations/" + gen_hash + "/" + s.key
+        resolved := filepath.join([gen_dir + "", s.key + ""])
+        pub_scenes.push(Entry{key: s.key + "", path: rel, resolved: resolved})
+    }
+    write_current_pointer(&abs_out, &gen_hash, &pub_scenes) or >>
+    << PublishResult{
+        generation: gen_hash,
+        root: gen_dir,
+        rebuilt_assets: rebuilt,
+        reused_assets: reused,
+        scenes: pub_scenes
+    }
+}
+
+pub fn publish(project_path string, output_dir string, validator_bin string) PublishResult {
+    empty_doc := resource.make_document([resource.node(-1, "Empty", resource.NODE_3D)]) or >>
+    << publish_with_drafts(project_path, output_dir, validator_bin, "", &empty_doc, false) or >>
+}
+
+pub fn published_scene(output_dir string, name string) string {
+    abs_out := filepath.abs(&output_dir) or >>
+    ptr := filepath.join([abs_out + "", "current.json"])
+    raw := snapshot.read(ptr, snapshot.MAX_BYTES) or >>
+    doc := json.parse_max(&raw, snapshot.MAX_BYTES)
+    if !doc.ok() {
+        >> errors.new("nexus project: invalid current.json: " + doc.error())
+    }
+    root := doc.root()
+    root_keys := dict_unique_keys(&doc, root, &"current.json") or >>
+    if root_keys.len != 4 || !doc.has(root, "format") || !doc.has(root, "version") ||
+        !doc.has(root, "generation") || !doc.has(root, "scenes") {
+        >> errors.new("nexus project: invalid current.json fields")
+    }
+    format := doc.as_string(doc.get(root, "format")) or >>
+    if format != GENERATION_FORMAT {
+        >> errors.new("nexus project: invalid generation format '" + format + "'")
+    }
+    version := doc.as_int(doc.get(root, "version")) or >>
+    if version != VERSION {
+        >> errors.new("nexus project: unsupported generation version " + str(version))
+    }
+    scenes_node := doc.get(root, "scenes")
+    _ := dict_unique_keys(&doc, scenes_node, &"current.json scenes") or >>
+    key := scene_name(&name) or >>
+    if !doc.has(scenes_node, key + "") {
+        >> errors.new("nexus project: scene '" + key + "' not published in current generation")
+    }
+    rel_val := doc.as_string(doc.get(scenes_node, key + "")) or >>
+    rel := relative_file(&rel_val) or >>
+    resolved := resolve_project_path(&abs_out, &rel, true) or >>
+    << resolved
+}
+
+pub fn stage_scene(project &Project, document &resource.Document, scene_path &string, directory &string) string {
+    abs_dir := filepath.abs(directory) or >>
+    os.mkdir_all(abs_dir + "") or >>
+    assets_dir := filepath.join([abs_dir + "", "assets"])
+    os.mkdir_all(assets_dir + "") or >>
+    scene_base := filepath.base(scene_path)
+    scene_dir := filepath.dir(scene_path)
+    $next_refs := []resource.ResourceReference{}
+    for i in 0:document.resource_count() {
+        ref := document.resource(i) or >>
+        if ref.kind == "glb_model" {
+            src := project.asset_source(&ref.uid) or >>
+            raw := snapshot.read(src + "", snapshot.MAX_BYTES) or >>
+            hash := sha256.sum256(raw + "")
+            rel := "assets/" + hash + ".glb"
+            dst := filepath.join([assets_dir + "", hash + ".glb"])
+            if !path_exists(dst + "") {
+                snapshot.write_atomic(dst + "", &raw) or >>
+            }
+            next_refs.push(resource.ResourceReference{
+                uid: ref.uid + "",
+                kind: ref.kind + "",
+                path: rel,
+                content_hash: hash
+            })
+        } else {
+            // Preserve non-GLB references if resolvable inside project/scene dir.
+            ref_rel := relative_file(&ref.path) or >>
+            src := resolve_project_path(&scene_dir, &ref_rel, true) or >>
+            raw := snapshot.read(src + "", snapshot.MAX_BYTES) or >>
+            hash := sha256.sum256(raw + "")
+            ext := filepath.ext(&ref_rel)
+            rel := "assets/" + hash + ext
+            dst := filepath.join([assets_dir + "", hash + ext])
+            if !path_exists(dst + "") {
+                snapshot.write_atomic(dst + "", &raw) or >>
+            }
+            next_refs.push(resource.ResourceReference{
+                uid: ref.uid + "",
+                kind: ref.kind + "",
+                path: rel,
+                content_hash: hash
+            })
+        }
+    }
+    staged_doc := copy_document_with_resources(document, next_refs) or >>
+    encoded := scene_fmt.encode(&staged_doc) or >>
+    staged_path := filepath.join([abs_dir + "", scene_base + ""])
+    snapshot.write_atomic(staged_path + "", &encoded) or >>
+    << staged_path
+}
+
+fn sanitize_glb_filename(name &string) string {
+    base := filepath.base(name)
+    $out := []int{}
+    for i in 0:base.len {
+        b := base[i] & 255
+        if (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 95 || b == 46 {
+            out.push(b)
+        } else {
+            out.push(95)
+        }
+    }
+    cleaned := string_from_bytes(out)
+    if cleaned.len == 0 || cleaned == "." || cleaned == ".." {
+        << "imported.glb"
+    }
+    if !strings.ends_with(&strings.to_lower(&cleaned), ".glb") {
+        << cleaned + ".glb"
+    }
+    << cleaned
+}
+
+fn try_sha256_file(path string) string {
+    << sha256_file(path + "") or (err) {
+        << ""
+    }
+}
+
+fn try_rel_in_project(dir &string, abs_src &string) string {
+    rel := filepath.rel(dir, abs_src) or (err) {
+        << ""
+    }
+    slashed := filepath.to_slash(&rel)
+    << try_project_rel(dir, &slashed, true)
+}
+
+pub fn import_external_glb(project_path string, external_glb string, validator_bin string) ImportAssetResult {
+    project := load_project(project_path + "") or >>
+    abs_src := filepath.abs(&external_glb) or >>
+    info := os.stat(abs_src + "") or >>
+    if info.is_dir {
+        >> errors.new("nexus project: selected GLB is a directory")
+    }
+    prims := validate_glb_primitives(validator_bin, abs_src + "") or >>
+    raw := snapshot.read(abs_src + "", snapshot.MAX_BYTES) or >>
+    src_hash := sha256.sum256(raw + "")
+
+    $rel := try_rel_in_project(&project.directory, &abs_src)
+    if rel.len == 0 {
+        fname := sanitize_glb_filename(&abs_src)
+        stem := strings.trim_suffix(&fname, ".glb")
+        $cand_rel := "assets/" + fname
+        $suffix := 2
+        while suffix < 1000 {
+            dest := resolve_project_path(&project.directory, &cand_rel, false) or >>
+            if !path_exists(dest + "") {
+                ensure_parent_dir(&dest) or >>
+                snapshot.write_atomic(dest + "", &raw) or >>
+                rel = cand_rel
+                <-
+            }
+            if try_sha256_file(dest + "") == src_hash {
+                rel = cand_rel
+                <-
+            }
+            cand_rel = "assets/" + stem + "-" + str(suffix) + ".glb"
+            suffix = suffix + 1
+        }
+        if rel.len == 0 {
+            >> errors.new("nexus project: unable to allocate unique destination for " + fname)
+        }
+    }
+
+    existing_uid := project.find_asset_uid_by_rel(&rel)
+    if existing_uid.len > 0 {
+        resolved_existing := project.asset_source(&existing_uid) or >>
+        << ImportAssetResult{
+            uid: existing_uid,
+            rel_path: rel,
+            resolved: resolved_existing,
+            reused: true,
+            primitive_count: prims.len
+        }
+    }
+    new_uid := register_asset(project_path + "", rel + "") or >>
+    updated := load_project(project_path) or >>
+    resolved_new := updated.asset_source(&new_uid) or >>
+    << ImportAssetResult{
+        uid: new_uid,
+        rel_path: rel,
+        resolved: resolved_new,
+        reused: false,
+        primitive_count: prims.len
+    }
+}

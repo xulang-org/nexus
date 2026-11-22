@@ -1,0 +1,52 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+phone_controls #"github.com/xulang-org/nexus/integration/phone_controls"
+vp #"github.com/xulang-org/nexus/integration/viewport"
+events #window/events
+#math
+
+struct GroundTap {
+    active bool
+    device int
+    finger int
+    origin fm.Vec2
+}
+
+fn no_tap() GroundTap { << GroundTap{active: false, device: 0, finger: 0, origin: fm.vec2(0.0, 0.0)} }
+
+fn (tap $&GroundTap) feed(event &events.Event, layout &phone_controls.TouchLayout) bool {
+    point := fm.vec2(event.x, event.y)
+    if event.kind == events.EVENT_TOUCH_DOWN && !tap.active && !layout.hits_control(point) {
+        tap.active = true
+        tap.device = event.device_id
+        tap.finger = event.touch_id
+        tap.origin = point
+    } else if tap.active && event.device_id == tap.device && event.touch_id == tap.finger {
+        if event.kind == events.EVENT_TOUCH_CANCEL { tap.active = false }
+        if event.kind == events.EVENT_TOUCH_MOVE || event.kind == events.EVENT_TOUCH_UP {
+            if point.sub(tap.origin).length() > 12.0 { tap.active = false }
+            if event.kind == events.EVENT_TOUCH_UP && tap.active {
+                tap.active = false
+                << true
+            }
+        }
+    }
+    << false
+}
+
+fn scene_area(view &vp.Viewport, touch_enabled bool) fm.Rect2 {
+    if !touch_enabled { << fm.rect2(0.0, 0.0, f64(view.pixel_width), f64(view.pixel_height)) }
+    $area := view.safe_rect
+    if !view.is_landscape() {
+        // In portrait, leave a control band below the world and a status row above it.
+        unit := math.max(0.2, math.min(2.0, math.min(area.size.x, area.size.y) / 360.0))
+        inset := view.safe_inset_rect(0.0, 62.0 * unit, 0.0, 114.0 * unit) or >>
+        if inset.valid() { area = inset }
+    }
+    pixels := view.screen_transform()
+    origin := pixels.point(area.position)
+    size := pixels.point(area.size)
+    << fm.rect2(origin.x, origin.y, size.x, size.y)
+}
+

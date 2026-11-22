@@ -199,10 +199,10 @@ fn cascade_profiles() int {
     first_sun := tree.find_node(first, "Pivot/Directional") or >>
     second_sun := tree.find_node(second, "Pivot/Directional") or >>
     first_point := tree.find_node(first, "Pivot/Point") or >>
-    $selected := bindings.CascadeSelection3D{source: -1, profile: shadows.CascadeProfile3D{}}
-    sources := world.gather_with_cascades(&tree, $&selected) or >>
+    $selected := bindings.no_shadow_selection()
+    sources := world.gather_with_shadows(&tree, $&selected) or >>
     assert(sources.len == 7 && selected.source == 1 && sources[1].kind() == lights.DIRECTIONAL)
-    assert((selected.profile.settings() or >>).distance == config.distance)
+    assert((selected.cascades.settings() or >>).distance == config.distance)
     hidden := tree.find_node(first, "Hidden") or >>
     retained := world.binding(&tree, hidden) or >>
     assert((retained.cascades.settings() or >>).count == 4)
@@ -210,14 +210,14 @@ fn cascade_profiles() int {
     sun_edit := lights.directional(fm.vec3(0.0,1.0,0.0), fm.vec3(5.0,5.0,5.0)) or >>
     world.attach(&tree, first_sun, sun_edit) or >>
     assert((world.binding(&tree, first_sun) or >>).cascades.enabled())
-    plain_sun := bindings.LightBinding3D{source: sun_edit, cascades: shadows.CascadeProfile3D{}}
-    invalid_point := bindings.LightBinding3D{source: point, cascades: authored.cascades}
+    plain_sun := bindings.LightBinding3D{source: sun_edit, cascades: shadows.CascadeProfile3D{}, punctual: shadows.PunctualProfile3D{}}
+    invalid_point := bindings.LightBinding3D{source: point, cascades: authored.cascades, punctual: shadows.PunctualProfile3D{}}
     assert(bad_configured_batch($&world, &tree, [first_sun, first_point], [plain_sun, invalid_point]))
     assert((world.binding(&tree, first_sun) or >>).cascades.enabled())
     tree.set_visible(first_sun, false) or >>
-    after_hide := world.gather_with_cascades(&tree, $&selected) or >>
+    after_hide := world.gather_with_shadows(&tree, $&selected) or >>
     assert(after_hide.len == 6 && selected.source == 3)
-    assert((selected.profile.settings() or >>).count == 3)
+    assert((selected.cascades.settings() or >>).count == 3)
     world.attach(&tree, first_sun, point) or >>
     assert(!(world.binding(&tree, first_sun) or >>).cascades.enabled())
     assert((world.binding(&tree, second_sun) or >>).cascades.enabled())
@@ -227,9 +227,64 @@ fn cascade_profiles() int {
     println("PASS: cascade profiles round-trip exactly, hidden profiles persist, selection follows visible candidate identity, instances and failed batches stay isolated")
     << 0
 }
+fn punctual_profiles() int {
+    document := files.load("build/scene-lighting-fixtures/punctual.xuscene") or >>
+    original := codec.encode(&document) or >>
+    restored := codec.decode(&original) or >>
+    assert((codec.encode(&restored) or >>) == original)
+    $tree := nexus.new_scene_tree_3d("World", 32) or >>
+    root := tree.root()
+    tree.set_position_3d(root, fm.vec3(20.0,0.0,0.0)) or >>
+    $world := bindings.new_scene_lights_3d()
+    first := persist.instantiate(&restored, $&world, $&tree, root, "First") or >>
+    second := persist.instantiate(&restored, $&world, $&tree, root, "Second") or >>
+    sun := tree.find_node(first, "Pivot/Directional") or >>
+    point_node := tree.find_node(first, "Pivot/Point") or >>
+    spot_node := tree.find_node(first, "Pivot/Spot") or >>
+    second_point := tree.find_node(second, "Pivot/Point") or >>
+    $selected := bindings.no_shadow_selection()
+    world.gather_with_shadows(&tree, $&selected) or >>
+    assert(selected.source == 0 && selected.cascades.enabled() && !selected.punctual.enabled())
+    tree.set_visible(sun, false) or >>
+    sources := world.gather_with_shadows(&tree, $&selected) or >>
+    point := selected.punctual.description(sources[selected.source]) or >>
+    assert(selected.source == 0 && !selected.cascades.enabled() && point.face_count() == 6)
+    assert(point.resolution() == 512 && point.receiver_reference().x == 30.125)
+    assert(point.constant_bias() == 0.00002 && point.slope_bias() == 0.00005)
+    assert((selected.punctual.settings() or >>).near == 0.12345678901234567)
+    tree.set_visible(point_node, false) or >>
+    spots := world.gather_with_shadows(&tree, $&selected) or >>
+    spot := selected.punctual.description(spots[selected.source]) or >>
+    assert(selected.source == 0 && spot.face_count() == 1 && spot.resolution() == 1024)
+    assert(spot.direction().z == -1.0 && spot.constant_bias() == 0.00003 && spot.slope_bias() == 0.00004)
+
+    replacement := lights.point(fm.vec3(0.75,0.0,0.0), fm.vec3(9.0,8.0,7.0), 4.0) or >>
+    world.attach(&tree, point_node, replacement) or >>
+    original_point := world.binding(&tree, point_node) or >>
+    assert(original_point.punctual.enabled() && original_point.source.position().x == 0.75)
+    $invalid := original_point
+    invalid.source = lights.point(fm.vec3(0.0,0.0,0.0), fm.vec3(1.0,1.0,1.0), 0.01) or >>
+    spot_binding := world.binding(&tree, spot_node) or >>
+    $clear_spot := spot_binding
+    clear_spot.punctual = shadows.PunctualProfile3D{}
+    assert(bad_configured_batch($&world, &tree, [spot_node, point_node], [clear_spot, invalid]))
+    assert((world.binding(&tree, spot_node) or >>).punctual.enabled())
+    assert((world.binding(&tree, point_node) or >>).source.radius() == 4.0)
+
+    captured := persist.capture(&restored, &world, &tree, first) or >>
+    assert(!(captured.describe_node(3) or >>).visible && (captured.light(1) or >>).punctual.enabled())
+    assert((captured.light(1) or >>).source.position().x == 0.75)
+    assert((world.binding(&tree, second_point) or >>).source.position().x == 0.125)
+    world.attach(&tree, point_node, spot_binding.source) or >>
+    assert(!(world.binding(&tree, point_node) or >>).punctual.enabled())
+    assert((world.binding(&tree, second_point) or >>).punctual.enabled())
+    println("PASS: point and spot shadow profiles round-trip, follow world pose and visible source identity, and retain atomic edits")
+    << 0
+}
 fn main() int { << run() or(err){ eprintln(err.msg())
     << 1 } }
 fn run() int { corpus() or >>
     runtime() or >>
     cascade_profiles() or >>
+    punctual_profiles() or >>
     << 0 }

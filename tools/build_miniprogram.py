@@ -10,6 +10,8 @@ import subprocess
 import sys
 import tempfile
 
+from webgl_demo_model import crate_glb
+
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples/miniprogram"
 PROJECTS = {
@@ -53,8 +55,13 @@ def main():
         shutil.copytree(template, stage, dirs_exist_ok=True)
         shutil.copytree(ROOT / "platform/webgl", stage / "runtime")
         (stage / "runtime/demo.js").write_text(f"module.exports = {{ mesh: {str(mesh).lower()} }};\n")
-        if not mesh:
-            (stage / "assets").mkdir()
+        (stage / "assets").mkdir()
+        exports = ["--wasm-export", "nexus_reset", "--wasm-export", "nexus_frame"]
+        if mesh:
+            pixels = (ROOT / "examples/textures3d/assets/uv-grid.png").read_bytes()
+            (stage / "assets/crate.glb").write_bytes(crate_glb(pixels))
+            exports += ["--wasm-export", "nexus_load_model"]
+        else:
             shutil.copyfile(ROOT / "examples/arena/assets/player.png", stage / "assets/player.png")
         config = stage / "project.config.json"
         if (mesh or args.platform == "douyin") and args.appid is None and (output / config.name).is_file():
@@ -67,7 +74,7 @@ def main():
                 metadata["projectname"] += " 3D"
             config.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n")
         subprocess.run([xu, "build", str(example), "--target", "wasm32-wasi",
-                        "--wasm-export", "nexus_reset", "--wasm-export", "nexus_frame",
+                        *exports,
                         "-o", str(stage / "game.wasm")], check=True)
         for file in stage.rglob("*"):
             if file.is_file():

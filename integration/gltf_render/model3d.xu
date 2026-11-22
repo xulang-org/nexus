@@ -45,25 +45,34 @@ fn material_description(asset &gltf.GlbGeometry, index int) gltf.MaterialDescrip
     << asset.material(index) or >>
 }
 pub fn upload_model(device &ren.Device3D, asset &gltf.GlbGeometry) GlbModel3D {
-    if asset.skin_count()>0 { >> errors.new("nexus GPU: skinned GLB requires upload_animated and explicit pose sampling") }
+    check_static_model(asset) or >>
     << upload_material_model(device,asset) or >>
 }
-fn upload_material_model(device &ren.Device3D,asset &gltf.GlbGeometry) GlbModel3D {
-    device.backend() or >>
+fn check_static_model(asset &gltf.GlbGeometry) int {
+    if asset.skin_count()>0 { >> errors.new("nexus GPU: skinned GLB requires upload_animated and explicit pose sampling") }
+    << 0
+}
+fn needs_uvs(description &gltf.MaterialDescription) bool {
+    << description.base_texture >= 0 || description.metallic_roughness_texture >= 0 ||
+        description.normal_texture >= 0 || description.occlusion_texture >= 0 || description.emission_texture >= 0
+}
+fn material_slots(asset &gltf.GlbGeometry) []int {
     if asset.primitive_count() < 1 { >> errors.new("nexus GPU: GLB has no primitives") }
-    $primitive_materials := []int{}
+    $slots := []int{}
     // Capability checks precede PNG decoding and every GPU resource allocation.
     for i in 0:asset.primitive_count() {
         material_index := asset.primitive_material(i) or >>
         description := material_description(asset, material_index) or >>
         if !(asset.has_normals(i) or >>) { >> errors.new("nexus GPU: PBR GLB requires authored normals") }
-        if (description.base_texture >= 0 || description.metallic_roughness_texture >= 0 || description.normal_texture >= 0 ||
-            description.occlusion_texture >= 0 || description.emission_texture >= 0) && !(asset.has_uvs(i) or >>) {
+        if needs_uvs(&description) && !(asset.has_uvs(i) or >>) {
             >> errors.new("nexus GPU: PBR GLB maps require TEXCOORD_0")
         }
         if description.normal_texture >= 0 && !(asset.has_tangents(i) or >>) { >> errors.new("nexus GPU: PBR GLB normal map requires authored tangents") }
-        primitive_materials.push(material_index + 1)
+        slots.push(material_index + 1)
     }
+    << slots
+}
+fn texture_plan(asset &gltf.GlbGeometry) map[string]int {
     $cache := map[string]int{}
     for i in 0:asset.material_count() {
         description := asset.material(i) or >>
@@ -73,24 +82,67 @@ fn upload_material_model(device &ren.Device3D,asset &gltf.GlbGeometry) GlbModel3
         plan_texture(asset, $&cache, description.normal_texture, false) or >>
         plan_texture(asset, $&cache, description.occlusion_texture, false) or >>
     }
+    << cache
+}
+fn planned_image(asset &gltf.GlbGeometry, cache &map[string]int, image_index int) bool {
+    for i in 0:asset.texture_count() {
+        texture := asset.texture(i) or >>
+        if texture.image != image_index { -> }
+        for space in [false, true] {
+            key := texture_key(asset, i, space) or >>
+            if cache.has(key) { << true }
+        }
+    }
+    << false
+}
+fn bounded_model_image(asset &gltf.GlbGeometry, image_index int, decoded_pixels int) images.ImageRGBA8 {
+    $limit := 4194304
+    if 8388608 - decoded_pixels < limit { limit = 8388608 - decoded_pixels }
+    if limit < 1 { >> errors.new("nexus GPU: GLB decoded image budget exceeds 8M pixels") }
+    raw := asset.image_bytes(image_index) or >>
+    << decode_model_image(asset,image_index,&raw,limit) or >>
+}
+pub struct StaticPrimitive3D {
+    pub triangles int
+    pub has_uvs bool
+    pub has_tangents bool
+    pub needs_uvs bool
+    pub needs_tangents bool
+}
+// Offline validation uses the static renderer's material profile and decoders.
+pub fn validate_static_model(asset &gltf.GlbGeometry) []StaticPrimitive3D {
+    check_static_model(asset) or >>
+    slots := material_slots(asset) or >>
+    for i in 0:asset.image_count() {
+        uri := asset.image_uri(i) or >>
+        if uri.len > 0 { >> errors.new("nexus GLB: scene import requires embedded images") }
+    }
+    cache := texture_plan(asset) or >>
+    $decoded_pixels := 0
+    for i in 0:asset.image_count() {
+        if !(planned_image(asset, &cache, i) or >>) { -> }
+        image := bounded_model_image(asset, i, decoded_pixels) or >>
+        decoded_pixels += image.width * image.height
+    }
+    $primitives := []StaticPrimitive3D{}
+    for i in 0:slots.len {
+        description := material_description(asset, slots[i] - 1) or >>
+        indices := asset.index_count(i) or >>
+        primitives.push(StaticPrimitive3D{triangles: indices / 3, has_uvs: asset.has_uvs(i) or >>,
+            has_tangents: asset.has_tangents(i) or >>, needs_uvs: needs_uvs(&description),
+            needs_tangents: description.normal_texture >= 0})
+    }
+    << primitives
+}
+fn upload_material_model(device &ren.Device3D,asset &gltf.GlbGeometry) GlbModel3D {
+    device.backend() or >>
+    primitive_materials := material_slots(asset) or >>
+    $cache := texture_plan(asset) or >>
     $textures := []ren.Texture3D{}
     $decoded_pixels := 0
     for image_index in 0:asset.image_count() {
-        $needed := false
-        for i in 0:asset.texture_count() {
-            texture := asset.texture(i) or >>
-            if texture.image != image_index { -> }
-            for space in [false, true] {
-                key := texture_key(asset, i, space) or >>
-                if cache.has(key) { needed = true }
-            }
-        }
-        if !needed { -> }
-        $limit := 4194304
-        if 8388608 - decoded_pixels < limit { limit = 8388608 - decoded_pixels }
-        if limit < 1 { >> errors.new("nexus GPU: GLB decoded image budget exceeds 8M pixels") }
-        raw := asset.image_bytes(image_index) or >>
-        image := decode_model_image(asset,image_index,&raw,limit) or >>
+        if !(planned_image(asset, &cache, image_index) or >>) { -> }
+        image := bounded_model_image(asset, image_index, decoded_pixels) or >>
         decoded_pixels = decoded_pixels + image.width * image.height
         for i in 0:asset.texture_count() {
             description := asset.texture(i) or >>

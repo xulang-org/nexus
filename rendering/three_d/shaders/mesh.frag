@@ -27,22 +27,38 @@ layout(set=2,binding=1) uniform sampler2D orm_texture;
 layout(set=2,binding=2) uniform sampler2D emission_texture;
 layout(set=2,binding=3) uniform sampler2D normal_texture;
 layout(set=2,binding=4) uniform sampler2D occlusion_texture;
-layout(set=3,binding=0,std140) uniform Material { vec4 base_metallic; vec4 emission_roughness; vec4 maps_normal; vec4 surface; } p;
+layout(set=3,binding=0,std140) uniform Material { vec4 base_metallic; vec4 emission_roughness; vec4 maps_normal; vec4 surface; vec4 uv_rect; } p;
 layout(set=3,binding=1,std140) uniform Lighting { vec4 ambient_count; vec4 eye_exposure; vec4 sources[XU_MAX_LIGHTS*4]; } l;
 layout(location=0) out vec4 output_color;
 void main() {
     if (p.surface.z < 0.5) { output_color=vertex_color; return; };
     int mask = int(p.maps_normal.x);
+    vec2 sample_uv = p.uv_rect.xy + texture_uv * p.uv_rect.zw;
     vec3 base = p.base_metallic.xyz * vertex_color.xyz;
-    if ((mask & 1) != 0) base *= texture(base_texture,texture_uv).rgb;
+    float alpha = vertex_color.a;
+    if ((mask & 1) != 0) {
+        vec4 base_texel = texture(base_texture, sample_uv);
+        base *= base_texel.rgb;
+        alpha *= base_texel.a;
+    }
+    if (p.surface.w > 0.0 && alpha < p.surface.w) discard;
+    if (p.surface.z > 1.5) {
+        vec3 clamped = clamp(base, vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0));
+        output_color = vec4(srgb_channel(clamped.x), srgb_channel(clamped.y), srgb_channel(clamped.z), 1.0);
+        return;
+    }
     vec3 orm = vec3(1.0, 1.0, 1.0);
-    if ((mask & 2) != 0) orm = texture(orm_texture,texture_uv).rgb;
+    if ((mask & 2) != 0) orm = texture(orm_texture, sample_uv).rgb;
     float ao_strength = p.maps_normal.y;
-    if ((mask & 16) != 0) { orm.x = texture(occlusion_texture,texture_uv).r; ao_strength = p.surface.y; }
+    if ((mask & 16) != 0) { orm.x = texture(occlusion_texture, sample_uv).r; ao_strength = p.surface.y; }
     vec3 emission = p.emission_roughness.xyz;
-    if ((mask & 4) != 0) emission *= texture(emission_texture,texture_uv).rgb;
+    if ((mask & 4) != 0) emission *= texture(emission_texture, sample_uv).rgb;
     vec3 shading_normal = world_normal;
-    if ((mask & 8) != 0) shading_normal = normal_map_direction(world_normal, world_tangent, world_bitangent, texture(normal_texture,texture_uv).rgb, p.maps_normal.z);
+    if ((mask & 8) != 0) {
+        vec3 adj_tangent = p.uv_rect.z < 0.0 ? -world_tangent : world_tangent;
+        vec3 adj_bitangent = p.uv_rect.w < 0.0 ? -world_bitangent : world_bitangent;
+        shading_normal = normal_map_direction(world_normal, adj_tangent, adj_bitangent, texture(normal_texture, sample_uv).rgb, p.maps_normal.z);
+    }
     bool surface_front = gl_FrontFacing;
     if (p.surface.x < 0.0) surface_front = !surface_front;
     if (p.maps_normal.w == 1.0 && !surface_front) shading_normal = -shading_normal;

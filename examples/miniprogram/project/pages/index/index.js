@@ -1,7 +1,7 @@
 const { WebGLCanvas } = require("../../runtime/canvas");
 const { loadGame } = require("../../runtime/wasm");
 const { mesh } = require("../../runtime/demo");
-const hint = mesh ? "拖动画布旋转视角。" : "按住或拖动，绕过墙壁收集宝石。";
+const hint = mesh ? "拖动画布查看 GLB 模型与贴图。" : "按住或拖动，绕过墙壁收集宝石。";
 
 function locate() {
     return new Promise((resolve, reject) => {
@@ -47,12 +47,14 @@ Page({
             if (typeof WXWebAssembly === "undefined" || typeof WXWebAssembly.instantiate !== "function") {
                 throw new Error("当前微信基础库无法加载 WebAssembly");
             }
+            const model = mesh ? wx.getFileSystemManager().readFileSync("assets/crate.glb") : null;
             const [game, atlas] = await Promise.all([
-                loadGame((path, imports) => WXWebAssembly.instantiate(path, imports), "/game.wasm"),
+                loadGame((path, imports) => WXWebAssembly.instantiate(path, imports), "/game.wasm", model),
                 mesh ? null : loadAtlas(canvas),
             ]);
             if (runtime.closed) return;
-            runtime.renderer = new WebGLCanvas(canvas, atlas, 360, 240, mesh);
+            runtime.renderer = new WebGLCanvas(canvas, mesh ? game.model : atlas, 360, 240, mesh);
+            game.model = null;
             resize(runtime, bounds);
             runtime.game = game;
             runtime.state = game.reset();

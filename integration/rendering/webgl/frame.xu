@@ -46,30 +46,48 @@ pub fn encode_frame(solid &canvas.Batch2D, atlas &canvas.Batch2D) string {
     << out
 }
 
-// NXG3 uses the same 20-byte stride as NXG1, with homogeneous clip XYZW
-// in place of XY and UV. Convert Nexus reverse-Z [0,w] to WebGL [-w,w].
-pub fn encode_mesh_frame(mesh &meshes.MeshData3D, view_projection fm.Mat4) string {
-    count := mesh.indices.len
-    if count > MAX_VERTICES || !view_projection.is_finite() {
-        >> errors.new("nexus webgl: invalid mesh frame")
-    }
+fn put_float(out $&string, value f64) int {
+    bits := math.float32_bits(value)
+    if (bits & 0x7f800000) == 0x7f800000 { >> errors.new("nexus webgl: non-finite float32") }
+    put_word(out, bits)
+    << 0
+}
+
+fn put_mesh(out $&string, mesh &meshes.MeshData3D) int {
     mesh.validate() or >>
-    $out := "NXG3"
-    put_word($&out, count)
-    put_word($&out, 0)
     for index in mesh.indices {
         vertex := &mesh.vertices[index]
         p := vertex.position
-        clip := view_projection.transform(fm.vec4(p.x, p.y, p.z, 1.0))
-        z := (clip.z - clip.w * 0.5) * 2.0
-        for coordinate in [clip.x, clip.y, z, clip.w] {
-            bits := math.float32_bits(coordinate)
-            if (bits & 0x7f800000) == 0x7f800000 {
-                >> errors.new("nexus webgl: non-finite float32 clip position")
-            }
-            put_word($&out, bits)
+        for value in [p.x, p.y, p.z, vertex.uv.x, vertex.uv.y] { put_float(out, value) or >> }
+        put_color(out, vertex.color)
+    }
+    << 0
+}
+
+// NXM1 loads once. Two triangle ranges use XYZ/UV as float32 LE and RGBA8
+// tint. A tightly packed RGBA8 texture follows the geometry.
+pub fn encode_mesh_asset(solid &meshes.MeshData3D, textured &meshes.MeshData3D,
+    width int, height int, pixels &[]int) string {
+    if solid.indices.len + textured.indices.len > MAX_VERTICES || width < 1 || width > 256 ||
+        height < 1 || height > 256 || pixels.len != width * height * 4 {
+        >> errors.new("nexus webgl: invalid mesh asset budget")
+    }
+    $out := "NXM1"
+    for value in [solid.indices.len, textured.indices.len, width, height] { put_word($&out, value) }
+    put_mesh($&out, solid) or >>
+    put_mesh($&out, textured) or >>
+    for value in pixels { out.push_byte(value) }
+    << out
+}
+
+// NXC1 updates only the column-major matrix. Convert reverse-Z [0,w] to
+// WebGL [-w,w] once per matrix instead of transforming each vertex on the CPU.
+pub fn encode_camera_frame(view_projection fm.Mat4) string {
+    $out := "NXC1"
+    for column in [view_projection.c0, view_projection.c1, view_projection.c2, view_projection.c3] {
+        for value in [column.x, column.y, column.z * 2.0 - column.w, column.w] {
+            put_float($&out, value) or >>
         }
-        put_color($&out, vertex.color)
     }
     << out
 }

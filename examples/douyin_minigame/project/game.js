@@ -141,11 +141,13 @@ async function start() {
             if (changedTouches.some((entry) => entry.identifier === touchId)) releaseTouch();
         });
         tt.onTouchCancel(releaseTouch);
+        const model = mesh ? tt.getFileSystemManager().readFileSync("assets/crate.glb") : null;
         const [loadedGame, atlas] = await Promise.all([
-            loadGame((path, imports) => TTWebAssembly.instantiate(path, imports), "game.wasm"),
+            loadGame((path, imports) => TTWebAssembly.instantiate(path, imports), "game.wasm", model),
             mesh ? null : loadAtlas(),
         ]);
-        renderer = new WebGLCanvas(canvas, atlas, DESIGN_WIDTH, DESIGN_HEIGHT, mesh);
+        renderer = new WebGLCanvas(canvas, mesh ? loadedGame.model : atlas, DESIGN_WIDTH, DESIGN_HEIGHT, mesh);
+        loadedGame.model = null;
         resize();
         game = loadedGame;
         state = game.reset();

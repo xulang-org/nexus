@@ -10,10 +10,15 @@ shadows #"github.com/xulang-org/nexus/resources/shadow"
 pub struct LightBinding3D {
     pub source lights.Light3D
     pub cascades shadows.CascadeProfile3D
+    pub punctual shadows.PunctualProfile3D
 }
-pub struct CascadeSelection3D {
+pub struct ShadowSelection3D {
     pub source int
-    pub profile shadows.CascadeProfile3D
+    pub cascades shadows.CascadeProfile3D
+    pub punctual shadows.PunctualProfile3D
+}
+pub fn no_shadow_selection() ShadowSelection3D {
+    << ShadowSelection3D{source: -1, cascades: shadows.CascadeProfile3D{}, punctual: shadows.PunctualProfile3D{}}
 }
 pub struct SceneLights3D { sources map[int]LightBinding3D }
 pub fn new_scene_lights_3d() SceneLights3D { << SceneLights3D{sources: map[int]LightBinding3D{}} }
@@ -38,10 +43,8 @@ pub fn (world $&SceneLights3D) attach_bindings(tree &scene.SceneTree, nodes []in
     for i in 0:nodes.len {
         info := tree.node_info(nodes[i]) or >>
         if info.kind!=scene.NODE_3D || info.queued_free || seen.has(nodes[i]) { >> errors.new("nexus lights: batch requires unique editable Node3D IDs") }
-        bindings[i].source.validate() or >>
-        if bindings[i].cascades.enabled() && bindings[i].source.kind() != lights.DIRECTIONAL {
-            >> errors.new("nexus lights: cascade profiles require a directional light")
-        }
+        binding := bindings[i]
+        shadows.validate_profiles(binding.source, binding.cascades, binding.punctual) or >>
         seen[nodes[i]]=true
         if !world.sources.has(nodes[i]) { added+=1 }
     }
@@ -49,17 +52,21 @@ pub fn (world $&SceneLights3D) attach_bindings(tree &scene.SceneTree, nodes []in
     for i in 0:nodes.len { world.sources[nodes[i]]=bindings[i] }
     << nodes.len
 }
-// Source-only edits retain the profile while the source is directional.
+// Source-only edits retain the profile when the light kind stays the same.
 pub fn (world $&SceneLights3D) attach_batch(tree &scene.SceneTree, nodes []int, sources []lights.Light3D) int {
     if nodes.len != sources.len || nodes.len > scene.MAX_NODES { >> errors.new("nexus lights: invalid binding batch length") }
     $bindings := []LightBinding3D{}
     for i in 0:nodes.len {
         source := sources[i]
-        $cascades := shadows.CascadeProfile3D{}
-        if source.kind() == lights.DIRECTIONAL && world.sources.has(nodes[i]) {
-            cascades = world.sources[nodes[i]].cascades
+        $binding := LightBinding3D{source: source, cascades: shadows.CascadeProfile3D{}, punctual: shadows.PunctualProfile3D{}}
+        if world.sources.has(nodes[i]) {
+            previous := world.sources[nodes[i]]
+            if source.kind() == previous.source.kind() {
+                binding.cascades = previous.cascades
+                binding.punctual = previous.punctual
+            }
         }
-        bindings.push(LightBinding3D{source: source, cascades: cascades})
+        bindings.push(binding)
     }
     << world.attach_bindings(tree,nodes,bindings) or >>
 }
@@ -76,11 +83,10 @@ pub fn (world $&SceneLights3D) detach(node int) int {
 }
 // Stable scene pre-order. Hidden/queued/freed nodes emit no source; pausing nexus
 // processing does not turn off rendered light. Invalid output is all-or-nothing.
-pub fn (world &SceneLights3D) gather_with_cascades(tree &scene.SceneTree, selection $&CascadeSelection3D) []lights.Light3D {
+pub fn (world &SceneLights3D) gather_with_shadows(tree &scene.SceneTree, selection $&ShadowSelection3D) []lights.Light3D {
     order := tree.subtree(tree.root()) or >>
     $result := []lights.Light3D{}
-    $cascade_source := -1
-    $profile := shadows.CascadeProfile3D{}
+    $selected := no_shadow_selection()
     for node in order {
         if !world.sources.has(node) { -> }
         info := tree.node_info(node) or >>
@@ -89,19 +95,19 @@ pub fn (world &SceneLights3D) gather_with_cascades(tree &scene.SceneTree, select
         binding := world.sources[node]
         // The renderer accepts one shadow map per draw. Choose the first visible
         // configured light in the same order used for candidate indices.
-        if cascade_source < 0 && binding.cascades.enabled() {
-            cascade_source = result.len
-            profile = binding.cascades
+        if selected.source < 0 && (binding.cascades.enabled() || binding.punctual.enabled()) {
+            selected = ShadowSelection3D{source: result.len, cascades: binding.cascades, punctual: binding.punctual}
         }
         result.push(binding.source.transformed(tree.global_transform_3d(node) or >>) or >>)
     }
-    selection.source = cascade_source
-    selection.profile = profile
+    selection.source = selected.source
+    selection.cascades = selected.cascades
+    selection.punctual = selected.punctual
     << result
 }
 pub fn (world &SceneLights3D) gather(tree &scene.SceneTree) []lights.Light3D {
-    $selection := CascadeSelection3D{source: -1, profile: shadows.CascadeProfile3D{}}
-    << world.gather_with_cascades(tree, $&selection) or >>
+    $selection := no_shadow_selection()
+    << world.gather_with_shadows(tree, $&selection) or >>
 }
 pub fn (world $&SceneLights3D) prune(tree &scene.SceneTree) int {
     order := tree.subtree(tree.root()) or >>

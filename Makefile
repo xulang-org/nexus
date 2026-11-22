@@ -1,5 +1,6 @@
 XU ?= xu
 PYTHON ?= python3
+EDITOR_PYTHON ?= $(PYTHON)
 export XU
 
 .PHONY: xacp-test lighting-demo-test demo-lighting lighting-core-test lighting-gpu-test gpu-failure-test present-fallback-test text-2d-test ui-hud-test demo-ui-hud mesh-shaders canvas-shaders native-image window-input-smoke gpu-surface-smoke sdk gpu-compute-smoke native-probe gpu-offscreen-smoke gpu-transfer-smoke check-core test-core mesh-core-test audio-core-test audio-device-test native native-audio audio-fixtures audio-test audio-smoke demo-audio demo-audio-stream demo-audio-seek check layers test demo demo2d demo3d demo-glb demo-script demo-materials demo-textures3d demo-mipmaps3d demo-material-maps demo-normal-maps demo-generated-tangents demo-glb-materials smoke gpu-smoke gpu3d-smoke image-fixtures glb-fixtures script-tool script-fixtures script-live-smoke glb-material-fixtures scene-fixtures demo-scene-file scene-asset-fixtures demo-scene-assets scene-audio-fixtures demo-scene-audio demo-scene-av scene-script-assets scene-script-fixtures demo-scene-scripts
@@ -43,11 +44,19 @@ check: layers native canvas-shaders mesh-shaders
 	$(XU) check examples/phone_arena
 	$(XU) check examples/phone_3d
 	$(XU) check examples/miniprogram
+	$(XU) check examples/webgl_3d/main.xu
 	$(XU) check examples/headless/main.xu
 	$(XU) check examples/two_d/main.xu
 	$(XU) check examples/three_d/main.xu
+	$(XU) check examples/isometric_2d
+	$(XU) check examples/hd2d_scene
+	$(XU) check examples/physics_3d/main.xu
+	$(XU) check examples/character_course/main.xu
 	$(XU) check examples/glb_preview/main.xu
 	$(XU) check cmd/scriptc/main.xu
+	$(XU) check cmd/project_validate/main.xu
+	$(XU) check cmd/project_viewport
+	$(XU) check cmd/tilemap_editor
 	$(XU) check examples/script_reload/main.xu
 	$(XU) check examples/materials/main.xu
 	$(XU) check examples/textures3d/main.xu
@@ -68,6 +77,82 @@ check: layers native canvas-shaders mesh-shaders
 script-tool: sdk
 	mkdir -p build
 	$(XU) build cmd/scriptc/main.xu -o build/xu-nexus-script
+
+.PHONY: project-validator
+project-validator: native-image
+	mkdir -p build
+	$(XU) build cmd/project_validate/main.xu -o build/nexus-project-validate
+
+.PHONY: project-test project-preview project-gpu-test
+project-test: project-validator
+	$(PYTHON) tests/project_import_checks.py --validator build/nexus-project-validate
+
+project-preview: mesh-shaders native-image
+	$(XU) build examples/scene_assets/main.xu -o build/nexus-project-preview
+
+.PHONY: project-viewport
+project-viewport: mesh-shaders canvas-shaders native-image
+	$(XU) build cmd/project_viewport -o build/nexus-project-viewport
+
+project-gpu-test: project-validator project-preview
+	$(PYTHON) tests/project_import_checks.py --validator build/nexus-project-validate --preview build/nexus-project-preview
+
+.PHONY: project-picking-test
+project-picking-test: mesh-shaders native-image scene-asset-fixtures
+	$(XU) build tests/scene_picker_gpu_checks.xu -o build/scene-picker-checks
+	./build/scene-picker-checks
+
+.PHONY: demo-project-editor demo-course-editor project-editor-test
+demo-project-editor: project-validator project-preview project-viewport
+	mkdir -p build/project-example/assets
+	cp -n examples/scene_assets/project.json build/project-example/
+	cp -n examples/scene_assets/assets/world.xuscene examples/scene_assets/assets/panels.glb build/project-example/assets/
+	$(EDITOR_PYTHON) tools/project_editor.py build/project-example/project.json --output build/project-gallery
+
+demo-course-editor: project-validator character-course project-viewport
+	mkdir -p build/course-authoring/assets
+	cp -n examples/character_course/project.json build/course-authoring/
+	cp -n examples/character_course/assets/course.xuscene examples/character_course/assets/course.glb build/course-authoring/assets/
+	$(EDITOR_PYTHON) tools/project_editor.py build/course-authoring/project.json --output build/course-edits --preview build/nexus-character-course
+
+project-editor-test: project-validator project-preview character-course project-viewport
+	$(EDITOR_PYTHON) tests/project_editor_checks.py
+
+.PHONY: tilemap-editor demo-tilemap-editor tilemap-editor-test
+tilemap-editor: sdk
+	mkdir -p build
+	$(XU) build --desktop cmd/tilemap_editor -o build/nexus-tilemap-editor
+
+demo-tilemap-editor: tilemap-editor
+	mkdir -p build/isometric-edit
+	test -f build/isometric-edit/world.xuscene || cp examples/isometric_2d/assets/world.xuscene build/isometric-edit/
+	test -f build/isometric-edit/iso_tiles.png || cp examples/isometric_2d/assets/iso_tiles.png build/isometric-edit/
+	./build/nexus-tilemap-editor build/isometric-edit/world.xuscene
+
+tilemap-editor-test: tilemap-editor isometric-2d
+	./build/nexus-tilemap-editor examples/isometric_2d/assets/world.xuscene --check build/tilemap-editor-check
+	cp examples/isometric_2d/assets/iso_tiles.png build/tilemap-editor-check/
+	./build/isometric-2d --scene build/tilemap-editor-check/edited.xuscene --frames 10 --autoplay --capture build/tilemap-editor-check/runtime.png
+
+.PHONY: character-course demo-character-course character-course-test
+character-course: mesh-shaders native-image
+	$(XU) build examples/character_course/main.xu -o build/nexus-character-course
+
+demo-character-course: character-course
+	./build/nexus-character-course
+
+character-course-test: character-course
+	./build/nexus-character-course --frames 240 --autoplay --capture build/character-course.png
+
+.PHONY: character-course-project benchmark-course benchmark-webgl
+character-course-project: project-validator
+	$(PYTHON) tools/project.py build examples/character_course/project.json --output build/character-course-project
+
+benchmark-course: character-course character-course-project
+	$(PYTHON) tools/benchmark_course.py --project-build build/character-course-project --output build/nexus-benchmark
+
+benchmark-webgl: miniprogram-3d douyin-3d
+	node tools/benchmark_webgl.cjs
 
 script-fixtures: script-tool
 	$(PYTHON) tests/make_script_fixtures.py
@@ -102,7 +187,7 @@ check-core: layers sdk
 
 # Pure Xu validation stays usable while a compiler/platform backend is incomplete.
 # The aggregate check/test/gpu targets still fail on real device build failures.
-test-core: shadow-core-test gltf-animation-test mesh-format-core-test lod-core-test frustum-core-test scene-lighting-test lighting-core-test check-core mesh-core-test glb-fixtures glb-material-fixtures script-fixtures audio-core-test scene-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
+test-core: 25d-core-test shadow-core-test gltf-animation-test mesh-format-core-test lod-core-test frustum-core-test physics3d-test scene-lighting-test lighting-core-test check-core mesh-core-test glb-fixtures glb-material-fixtures script-fixtures audio-core-test scene-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
 	mkdir -p build
 	$(PYTHON) tests/layer_rules_checks.py
 	$(PYTHON) tests/layer_headless_checks.py
@@ -139,7 +224,7 @@ test-core: shadow-core-test gltf-animation-test mesh-format-core-test lod-core-t
 	$(XU) build tests/audio_scene_checks.xu -o build/audio-scene-tests
 	./build/audio-scene-tests
 
-test: canvas-memory-test phone-input-test phone-viewport-test phone-pinch-test phone-app-test phone-3d-budget-test phone-frame-test phone-state-test phone-audio-test jpeg-test test-core native audio-device-test image-fixtures
+test: canvas-memory-test phone-input-test phone-viewport-test phone-pinch-test phone-app-test phone-3d-budget-test phone-frame-test phone-state-test phone-audio-test jpeg-test test-core project-test native audio-device-test image-fixtures
 	$(XU) build tests/scene_audio_checks.xu -o build/scene-audio-tests
 	XU_NEXUS_SDL_LIBRARY=/nonexistent XU_NEXUS_SDL_AUDIO_LIBRARY=/nonexistent ./build/scene-audio-tests
 	$(XU) build tests/scene_audio_output_checks.xu -o build/scene-audio-output-tests
@@ -177,6 +262,18 @@ phone-3d-budget-test: sdk mesh-shaders
 	mkdir -p build
 	$(XU) build tests/phone_3d_budget_checks.xu -o build/phone-3d-budget-tests
 	./build/phone-3d-budget-tests
+
+.PHONY: physics3d-test
+physics3d-test: sdk
+	mkdir -p build
+	$(XU) build tests/physics3d_checks.xu -o build/physics3d-checks
+	./build/physics3d-checks
+	$(XU) build tests/character3d_checks.xu -o build/character3d-checks
+	./build/character3d-checks
+	$(XU) build tests/capsule3d_checks.xu -o build/capsule3d-checks
+	./build/capsule3d-checks
+	$(XU) build tests/rigid3d_checks.xu -o build/rigid3d-checks
+	./build/rigid3d-checks
 
 .PHONY: phone-frame-test phone-state-test phone-audio-test miniprogram miniprogram-test douyin douyin-test miniprogram-3d douyin-3d webgl-3d-test
 miniprogram: layers sdk
@@ -229,6 +326,45 @@ demo3d: mesh-shaders native
 	mkdir -p build
 	$(XU) build examples/three_d/main.xu -o build/three-d
 	./build/three-d
+
+.PHONY: isometric-2d hd2d-scene demo-isometric-2d demo-hd2d 25d-core-test 25d-gpu-test phone-isometric-test phone-hd2d-test
+isometric-2d: canvas-shaders native-image
+	mkdir -p build
+	$(XU) build examples/isometric_2d -o build/isometric-2d
+
+hd2d-scene: mesh-shaders native-image
+	mkdir -p build
+	$(XU) build examples/hd2d_scene -o build/hd2d-scene
+
+demo-isometric-2d: isometric-2d
+	./build/isometric-2d
+
+demo-hd2d: hd2d-scene
+	./build/hd2d-scene
+
+25d-core-test: sdk
+	mkdir -p build
+	$(XU) build tests/scene_25d_checks.xu -o build/scene-25d-checks
+	./build/scene-25d-checks
+
+25d-gpu-test: isometric-2d hd2d-scene
+	$(PYTHON) tests/scene_25d_gpu_checks.py
+
+phone-isometric-test: isometric-2d
+	$(PYTHON) tests/phone_isometric_checks.py
+
+phone-hd2d-test: hd2d-scene
+	$(PYTHON) tests/phone_hd2d_checks.py
+
+.PHONY: physics3d-demo-build demo-physics3d physics3d-gpu-test
+physics3d-demo-build: mesh-shaders
+	$(XU) build examples/physics_3d/main.xu -o build/physics3d-demo
+
+demo-physics3d: physics3d-demo-build
+	./build/physics3d-demo
+
+physics3d-gpu-test: physics3d-demo-build
+	./build/physics3d-demo --autoplay --frames 120 --capture build/physics3d.png
 
 demo-glb: mesh-shaders native
 	mkdir -p build
@@ -355,7 +491,7 @@ script-live-smoke: mesh-shaders canvas-shaders native script-tool
 	$(XU) build examples/script_reload/main.xu -o build/script-reload
 	$(PYTHON) tests/script_live_checks.py
 
-gpu-smoke: present-fallback-test text-2d-test ui-hud-test scene-camera-gpu-test shadow-gpu-test render-quality-test gltf-animation-gpu-test model-format-gpu-test lod-gpu-test lod-demo-test frustum-gpu-test scene-lighting-services-test lighting-demo-test lighting-gpu-test mesh-shaders canvas-shaders gpu-offscreen-smoke gpu-compute-smoke gpu-surface-smoke window-input-smoke native glb-fixtures glb-material-fixtures image-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
+gpu-smoke: 25d-gpu-test present-fallback-test text-2d-test ui-hud-test scene-camera-gpu-test scene-lod-gpu-test physics3d-gpu-test project-gpu-test project-picking-test character-course-test shadow-gpu-test render-quality-test gltf-animation-gpu-test model-format-gpu-test lod-gpu-test lod-demo-test frustum-gpu-test scene-lighting-services-test lighting-demo-test lighting-gpu-test mesh-shaders canvas-shaders gpu-offscreen-smoke gpu-compute-smoke gpu-surface-smoke window-input-smoke native glb-fixtures glb-material-fixtures image-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
 	mkdir -p build
 	$(XU) build tests/gpu_smoke.xu -o build/gpu-smoke
 	./build/gpu-smoke
@@ -540,6 +676,11 @@ frustum-gpu-test: mesh-shaders frustum-core-test
 	./build/frustum-gpu
 
 .PHONY: lod-core-test lod-gpu-test lod-demo-test demo-lod
+.PHONY: scene-lod-gpu-test
+scene-lod-gpu-test: mesh-shaders native-image scene-asset-fixtures
+	$(XU) build examples/scene_assets/main.xu -o build/scene-lod-preview
+	$(PYTHON) tests/scene_lod_preview_checks.py
+
 lod-core-test: sdk
 	$(PYTHON) tests/lod_isolation.py
 

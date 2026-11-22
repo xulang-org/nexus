@@ -1,0 +1,251 @@
+@"github.com/xulang-org/nexus/resources/sprite3d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const BILLBOARD_DISABLED = 0
+pub const BILLBOARD_ENABLED = 1
+pub const BILLBOARD_Y_AXIS = 2
+
+pub const ALPHA_MODE_OPAQUE = 0
+pub const ALPHA_MODE_CUTOUT = 1
+
+pub const MAX_SPRITES_3D = 4096
+
+// Pure CPU description for a 3D billboard / HD-2D sprite quad.
+// Size is in metres; pivot is normalized in [0, 1]^2 where (0.5, 0) stands on the ground.
+pub struct Sprite3D {
+    pub size fm.Vec2
+    pub pivot fm.Vec2
+    pub region fm.Rect2
+    pub billboard int
+    pub alpha_mode int
+    pub alpha_cutoff f64
+    pub double_sided bool
+    pub cast_shadow bool
+    pub shaded bool
+    pub flip_x bool
+    pub flip_y bool
+    pub tint fm.Vec3
+    pub pixel_art bool
+}
+
+pub fn sprite_3d(size fm.Vec2) Sprite3D {
+    spec := Sprite3D{
+        size: size,
+        pivot: fm.vec2(0.5, 0.0),
+        region: fm.rect2(0.0, 0.0, 1.0, 1.0),
+        billboard: BILLBOARD_Y_AXIS,
+        alpha_mode: ALPHA_MODE_CUTOUT,
+        alpha_cutoff: 0.5,
+        double_sided: true,
+        cast_shadow: true,
+        shaded: true,
+        flip_x: false,
+        flip_y: false,
+        tint: fm.vec3(1.0, 1.0, 1.0),
+        pixel_art: true
+    }
+    spec.validate() or >>
+    << spec
+}
+
+pub fn (spec &Sprite3D) validate() int {
+    if !fm.finite(spec.size.x) || !fm.finite(spec.size.y) ||
+        spec.size.x <= 0.0 || spec.size.y <= 0.0 ||
+        spec.size.x > 10000.0 || spec.size.y > 10000.0 {
+        >> errors.new("nexus sprite3d: size must be finite and in (0, 10000]")
+    }
+    if !fm.finite(spec.pivot.x) || !fm.finite(spec.pivot.y) ||
+        spec.pivot.x < 0.0 || spec.pivot.x > 1.0 || spec.pivot.y < 0.0 || spec.pivot.y > 1.0 {
+        >> errors.new("nexus sprite3d: pivot must be in 0...1")
+    }
+    if !spec.region.valid() || spec.region.position.x < 0.0 || spec.region.position.y < 0.0 ||
+        spec.region.position.x + spec.region.size.x > 1.0 + 0.000001 ||
+        spec.region.position.y + spec.region.size.y > 1.0 + 0.000001 {
+        >> errors.new("nexus sprite3d: UV region must lie inside 0...1")
+    }
+    if spec.billboard < BILLBOARD_DISABLED || spec.billboard > BILLBOARD_Y_AXIS {
+        >> errors.new("nexus sprite3d: unsupported billboard mode")
+    }
+    if spec.alpha_mode != ALPHA_MODE_OPAQUE && spec.alpha_mode != ALPHA_MODE_CUTOUT {
+        >> errors.new("nexus sprite3d: unsupported alpha mode")
+    }
+    if !fm.finite(spec.alpha_cutoff) || spec.alpha_cutoff < 0.0 || spec.alpha_cutoff > 1.0 {
+        >> errors.new("nexus sprite3d: alpha cutoff must be finite and in 0...1")
+    }
+    if spec.alpha_mode == ALPHA_MODE_CUTOUT && spec.alpha_cutoff <= 0.0 {
+        >> errors.new("nexus sprite3d: cutout mode requires alpha cutoff > 0")
+    }
+    if spec.alpha_mode == ALPHA_MODE_OPAQUE && spec.alpha_cutoff != 0.0 {
+        >> errors.new("nexus sprite3d: opaque mode requires alpha cutoff == 0")
+    }
+    if !spec.tint.is_finite() || spec.tint.x < 0.0 || spec.tint.y < 0.0 || spec.tint.z < 0.0 ||
+        spec.tint.x > 1.0 || spec.tint.y > 1.0 || spec.tint.z > 1.0 {
+        >> errors.new("nexus sprite3d: linear tint must be finite and in 0...1")
+    }
+    << 0
+}
+
+pub fn (spec &Sprite3D) effective_alpha_cutoff() f64 {
+    if spec.alpha_mode == ALPHA_MODE_CUTOUT { << spec.alpha_cutoff }
+    << 0.0
+}
+
+pub fn (spec &Sprite3D) clone() Sprite3D {
+    << Sprite3D{
+        size: spec.size,
+        pivot: spec.pivot,
+        region: spec.region,
+        billboard: spec.billboard,
+        alpha_mode: spec.alpha_mode,
+        alpha_cutoff: spec.alpha_cutoff,
+        double_sided: spec.double_sided,
+        cast_shadow: spec.cast_shadow,
+        shaded: spec.shaded,
+        flip_x: spec.flip_x,
+        flip_y: spec.flip_y,
+        tint: spec.tint,
+        pixel_art: spec.pixel_art
+    }
+}
+
+pub fn (spec &Sprite3D) with_pivot(pivot fm.Vec2) Sprite3D {
+    $next := spec.clone()
+    next.pivot = pivot
+    next.validate() or >>
+    << next
+}
+
+pub fn (spec &Sprite3D) with_region(region fm.Rect2) Sprite3D {
+    $next := spec.clone()
+    next.region = region
+    next.validate() or >>
+    << next
+}
+
+pub fn (spec &Sprite3D) with_billboard(mode int) Sprite3D {
+    $next := spec.clone()
+    next.billboard = mode
+    next.validate() or >>
+    << next
+}
+
+pub fn (spec &Sprite3D) with_alpha_cutout(cutoff f64) Sprite3D {
+    $next := spec.clone()
+    if cutoff == 0.0 {
+        next.alpha_mode = ALPHA_MODE_OPAQUE
+        next.alpha_cutoff = 0.0
+    } else {
+        next.alpha_mode = ALPHA_MODE_CUTOUT
+        next.alpha_cutoff = cutoff
+    }
+    next.validate() or >>
+    << next
+}
+
+pub fn (spec &Sprite3D) with_double_sided(enabled bool) Sprite3D {
+    $next := spec.clone()
+    next.double_sided = enabled
+    next.validate() or >>
+    << next
+}
+
+pub fn (spec &Sprite3D) with_cast_shadow(enabled bool) Sprite3D {
+    $next := spec.clone()
+    next.cast_shadow = enabled
+    next.validate() or >>
+    << next
+}
+
+pub fn (spec &Sprite3D) with_shaded(enabled bool) Sprite3D {
+    $next := spec.clone()
+    next.shaded = enabled
+    next.validate() or >>
+    << next
+}
+
+pub fn (spec &Sprite3D) with_flip(flip_x bool, flip_y bool) Sprite3D {
+    $next := spec.clone()
+    next.flip_x = flip_x
+    next.flip_y = flip_y
+    next.validate() or >>
+    << next
+}
+
+pub fn (spec &Sprite3D) with_tint(tint fm.Vec3) Sprite3D {
+    $next := spec.clone()
+    next.tint = tint
+    next.validate() or >>
+    << next
+}
+
+pub fn (spec &Sprite3D) with_pixel_art(enabled bool) Sprite3D {
+    $next := spec.clone()
+    next.pixel_art = enabled
+    next.validate() or >>
+    << next
+}
+
+fn horizontal_camera_back(camera_world fm.Mat4) fm.Vec3 {
+    back := fm.vec3(camera_world.c2.x, 0.0, camera_world.c2.z)
+    if back.dot(back) > 0.000000000001 {
+        << back.normalized() or >>
+    }
+    // Fallback when looking vertically along +/-Y: orient upright billboard along camera -up projected onto XZ.
+    up_proj := fm.vec3(-camera_world.c1.x, 0.0, -camera_world.c1.z)
+    if up_proj.dot(up_proj) > 0.000000000001 {
+        << up_proj.normalized() or >>
+    }
+    << fm.vec3(0.0, 0.0, 1.0)
+}
+
+// Compute the world matrix mapping a [0, 1]^2 XY unit quad to this sprite's
+// oriented, scaled, and pivot-aligned world pose.
+pub fn (spec &Sprite3D) quad_world_matrix(node_world fm.Mat4, camera_world fm.Mat4) fm.Mat4 {
+    spec.validate() or >>
+    if !node_world.is_affine() || !camera_world.is_affine() {
+        >> errors.new("nexus sprite3d: node and camera transforms must be finite affine")
+    }
+    if spec.billboard == BILLBOARD_DISABLED {
+        local_quad := fm.translation_3d(fm.vec3(-spec.pivot.x * spec.size.x, -spec.pivot.y * spec.size.y, 0.0)).multiply(
+            fm.scale_3d(fm.vec3(spec.size.x, spec.size.y, 1.0)))
+        result := node_world.multiply(local_quad)
+        if !result.is_affine() { >> errors.new("nexus sprite3d: billboard transform overflow") }
+        << result
+    }
+    sx := node_world.c0.xyz().length()
+    sy := node_world.c1.xyz().length()
+    sz := node_world.c2.xyz().length()
+    if sx <= 0.000000001 || sy <= 0.000000001 || sz <= 0.000000001 {
+        >> errors.new("nexus sprite3d: degenerate node scale for billboard")
+    }
+    $right := fm.vec3(1.0, 0.0, 0.0)
+    $up := fm.vec3(0.0, 1.0, 0.0)
+    $forward := fm.vec3(0.0, 0.0, 1.0)
+    if spec.billboard == BILLBOARD_ENABLED {
+        forward = camera_world.c2.xyz().normalized() or >>
+        cam_up := camera_world.c1.xyz().normalized() or >>
+        right = cam_up.cross(forward).normalized() or >>
+        up = forward.cross(right)
+    } else {
+        up = fm.vec3(0.0, 1.0, 0.0)
+        forward = horizontal_camera_back(camera_world) or >>
+        right = up.cross(forward).normalized() or >>
+    }
+    width := sx * spec.size.x
+    height := sy * spec.size.y
+    origin := node_world.c3.xyz().sub(right.scaled(spec.pivot.x * width)).sub(up.scaled(spec.pivot.y * height))
+    c0 := right.scaled(width)
+    c1 := up.scaled(height)
+    c2 := forward.scaled(sz)
+    result := fm.Mat4{
+        c0: fm.vec4(c0.x, c0.y, c0.z, 0.0),
+        c1: fm.vec4(c1.x, c1.y, c1.z, 0.0),
+        c2: fm.vec4(c2.x, c2.y, c2.z, 0.0),
+        c3: fm.vec4(origin.x, origin.y, origin.z, 1.0)
+    }
+    if !result.is_affine() { >> errors.new("nexus sprite3d: billboard transform overflow") }
+    << result
+}

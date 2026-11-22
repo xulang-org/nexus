@@ -64,7 +64,7 @@ for key in ['node','resource','bus','volume','pan','looping','autoplay','spatial
 bad('duplicate-emitter',lambda d:d['audio_emitters'].append(copy.deepcopy(d['audio_emitters'][0])))
 bad('bus-limit',lambda d:d.__setitem__('audio_buses',d['audio_buses']*9));bad('emitter-limit',lambda d:d.__setitem__('audio_emitters',d['audio_emitters']*33))
 bad('wrong-source-kind',lambda d:d['resources'][0].update(type='glb_model'))
-bad('future-version',lambda d:d.update(version=5));bad('unversioned-audio',lambda d:d.pop('version'))
+bad('future-version',lambda d:d.update(version=7));bad('unversioned-audio',lambda d:d.pop('version'))
 for label,changes in [('listener-high',dict(listener=2)),('listener-negative',dict(listener=-1)),('range-zero',dict(max_distance=0)),('range-high',dict(max_distance=1000000001)),('pan',dict(pan=.1))]:
  def mutation(d,c=changes):
   d['nodes'][1]=node(0,'Sound','Node3D');d['audio_emitters'][0].update(spatial='3d',listener=0,max_distance=10);d['audio_emitters'][0].update(c)

@@ -29,7 +29,8 @@ def bad(name, mutate):
     value = copy.deepcopy(base); mutate(value); write(name + '.xuscene', value); rejects.append(name + '.xuscene')
 def top(key, value): return lambda d: d.__setitem__(key, value)
 def prop(key, value, index=2): return lambda d: d['nodes'][index].__setitem__(key, value)
-for v in [5,6,7]: bad('version-unsupported-'+str(v), top('version', v))
+for v in [9, 10]: bad('version-unsupported-'+str(v), top('version', v))
+bad('version-7-missing-attachments', top('version', 7))
 
 camera_lens = dict(vertical_fov=0.8765432101234567, near=0.25, far=50)
 camera_scene = copy.deepcopy(base)

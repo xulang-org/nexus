@@ -16,7 +16,8 @@ with tempfile.TemporaryDirectory(prefix='xu-nexus-headless-') as temporary:
         shutil.copytree(ROOT / 'script' / name, target / 'script' / name)
     check = target / 'checks/main.xu'
     check.parent.mkdir()
-    (check.parent / 'xu.xun').write_text('module: example/layer_isolation\nversion: !ver 0.1.0\nxu: !ver 0.12.3\nrequire:\n  "github.com/xulang-org/nexus": file:..\n')
+    sdk = next(line for line in (ROOT / 'xu.xun').read_text().splitlines() if line.startswith('xu:'))
+    (check.parent / 'xu.xun').write_text('module: example/layer_isolation\nversion: !ver 0.1.0\n' + sdk + '\nrequire:\n  "github.com/xulang-org/nexus": file:..\n')
     shutil.copyfile(ROOT / 'tests/layer_headless_checks.xu', check)
     assert not (target / 'native').exists()
     tool = os.environ.get('XU', 'xu')

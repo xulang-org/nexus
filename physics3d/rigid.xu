@@ -1,0 +1,1095 @@
+@"github.com/xulang-org/nexus/physics3d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const MAX_RIGID_BODIES = 256
+pub const MAX_RIGID_SUBSTEPS = 16
+pub const MAX_SOLVER_ITERATIONS = 32
+pub const SHAPE_SPHERE = 1
+pub const SHAPE_BOX = 2
+
+pub const HIT_NONE = 0
+pub const HIT_STATIC_BOX = 1
+pub const HIT_STATIC_RAMP = 2
+pub const HIT_STATIC_TRIANGLE = 3
+pub const HIT_RIGID_BODY = 4
+
+pub struct RigidBody3D {
+    pub kind int
+    pub position fm.Vec3
+    pub velocity fm.Vec3
+    pub radius f64
+    pub half_extents fm.Vec3
+    pub inverse_mass f64
+    pub restitution f64
+    pub friction f64
+    pub linear_damping f64
+    pub layer int
+    pub mask int
+    pub sleeping bool
+    pub sleep_timer f64
+    pub grounded bool
+    pub contacts int
+    pub last_normal fm.Vec3
+}
+
+pub struct RigidStepReport3D {
+    pub substeps int
+    pub broadphase_pairs int
+    pub contacts int
+    pub ccd_hits int
+    pub awake_bodies int
+    pub sleeping_bodies int
+}
+
+pub struct RigidRayHit3D {
+    pub kind int
+    pub index int
+    pub distance f64
+    pub point fm.Vec3
+    pub normal fm.Vec3
+    pub started_inside bool
+}
+
+pub struct RigidWorld3D {
+    gravity fm.Vec3
+    boxes []StaticBox3D
+    ramps []StaticRamp3D
+    triangles []StaticTriangle3D
+    bodies []RigidBody3D
+    box_bounds []fm.Aabb3
+    ramp_bounds []fm.Aabb3
+    triangle_bounds []fm.Aabb3
+}
+
+struct NarrowContact {
+    hit bool
+    normal fm.Vec3
+    penetration f64
+}
+
+struct SolverContact {
+    a int
+    b int
+    normal fm.Vec3
+    penetration f64
+    restitution f64
+    friction f64
+    bounce_bias f64
+    normal_impulse f64
+    tangent_impulse fm.Vec3
+}
+
+fn no_narrow() NarrowContact { << NarrowContact{hit: false, normal: zero(), penetration: 0.0} }
+fn sleep_speed_sq() f64 { << 0.0036 }
+fn sleep_time_limit() f64 { << 0.5 }
+fn wake_speed() f64 { << 0.12 }
+fn bounce_threshold() f64 { << 0.75 }
+fn position_slop() f64 { << 0.0005 }
+fn position_percent() f64 { << 0.8 }
+fn floor_normal_y() f64 { << 0.7 }
+
+fn aabb_overlap(a fm.Aabb3, b fm.Aabb3) bool {
+    << a.minimum.x <= b.maximum.x && a.maximum.x >= b.minimum.x &&
+        a.minimum.y <= b.maximum.y && a.maximum.y >= b.minimum.y &&
+        a.minimum.z <= b.maximum.z && a.maximum.z >= b.minimum.z
+}
+
+fn swept_aabb(box fm.Aabb3, motion fm.Vec3) fm.Aabb3 {
+    end := translated(box, motion)
+    << fm.Aabb3{
+        minimum: fm.vec3(math.min(box.minimum.x, end.minimum.x),
+            math.min(box.minimum.y, end.minimum.y),
+            math.min(box.minimum.z, end.minimum.z)),
+        maximum: fm.vec3(math.max(box.maximum.x, end.maximum.x),
+            math.max(box.maximum.y, end.maximum.y),
+            math.max(box.maximum.z, end.maximum.z))
+    }
+}
+
+fn body_bounds_unchecked(body RigidBody3D) fm.Aabb3 {
+    $extent := body.half_extents
+    if body.kind == SHAPE_SPHERE { extent = fm.vec3(body.radius, body.radius, body.radius) }
+    << fm.Aabb3{minimum: body.position.sub(extent), maximum: body.position.add(extent)}
+}
+
+fn body_min_extent(body RigidBody3D) f64 {
+    if body.kind == SHAPE_SPHERE { << body.radius }
+    << math.min(body.half_extents.x, math.min(body.half_extents.y, body.half_extents.z))
+}
+
+pub fn (body RigidBody3D) is_dynamic() bool { << body.inverse_mass > 0.0 }
+
+pub fn (body RigidBody3D) kinetic_energy() f64 {
+    if body.inverse_mass <= 0.0 { << 0.0 }
+    << 0.5 * (1.0 / body.inverse_mass) * body.velocity.dot(body.velocity)
+}
+
+pub fn (body RigidBody3D) validate() int {
+    if body.kind != SHAPE_SPHERE && body.kind != SHAPE_BOX {
+        >> errors.new("nexus physics3d: invalid rigid body shape kind")
+    }
+    if !valid_point(body.position) || !valid_point(body.velocity) {
+        >> errors.new("nexus physics3d: rigid body position or velocity out of bounds")
+    }
+    if body.kind == SHAPE_SPHERE {
+        if !fm.finite(body.radius) || body.radius < 0.0001 {
+            >> errors.new("nexus physics3d: rigid sphere requires radius >= 0.0001")
+        }
+    } else {
+        if !body.half_extents.is_finite() || body.half_extents.x < 0.0001 ||
+            body.half_extents.y < 0.0001 || body.half_extents.z < 0.0001 {
+            >> errors.new("nexus physics3d: rigid box requires half extents >= 0.0001")
+        }
+    }
+    if !fm.finite(body.inverse_mass) || body.inverse_mass < 0.0 || body.inverse_mass > 10000.0 ||
+        !fm.finite(body.restitution) || body.restitution < 0.0 || body.restitution > 1.0 ||
+        !fm.finite(body.friction) || body.friction < 0.0 || body.friction > 1.0 ||
+        !fm.finite(body.linear_damping) || body.linear_damping < 0.0 || body.linear_damping > 10.0 ||
+        !fm.finite(body.sleep_timer) || body.sleep_timer < 0.0 {
+        >> errors.new("nexus physics3d: invalid rigid body material or mass parameters")
+    }
+    if body.layer <= 0 || body.layer > 0x7fffffff || body.mask < 0 || body.mask > 0x7fffffff {
+        >> errors.new("nexus physics3d: invalid rigid body collision layer or mask")
+    }
+    check_box(body_bounds_unchecked(body)) or >>
+    << 0
+}
+
+pub fn (body RigidBody3D) bounds() fm.Aabb3 {
+    body.validate() or >>
+    << body_bounds_unchecked(body)
+}
+
+pub fn dynamic_sphere_3d(position fm.Vec3, radius f64, mass f64, restitution f64, friction f64) RigidBody3D {
+    if !fm.finite(mass) || mass < 0.0001 || mass > 1000000.0 {
+        >> errors.new("nexus physics3d: dynamic rigid body requires mass in [0.0001, 1000000]")
+    }
+    body := RigidBody3D{kind: SHAPE_SPHERE, position: position, velocity: zero(), radius: radius,
+        half_extents: fm.vec3(radius, radius, radius), inverse_mass: 1.0 / mass,
+        restitution: restitution, friction: friction, linear_damping: 0.02,
+        layer: 1, mask: 0x7fffffff, sleeping: false, sleep_timer: 0.0,
+        grounded: false, contacts: 0, last_normal: zero()}
+    body.validate() or >>
+    << body
+}
+
+pub fn dynamic_box_3d(position fm.Vec3, half_extents fm.Vec3, mass f64, restitution f64, friction f64) RigidBody3D {
+    if !fm.finite(mass) || mass < 0.0001 || mass > 1000000.0 {
+        >> errors.new("nexus physics3d: dynamic rigid body requires mass in [0.0001, 1000000]")
+    }
+    body := RigidBody3D{kind: SHAPE_BOX, position: position, velocity: zero(), radius: half_extents.length(),
+        half_extents: half_extents, inverse_mass: 1.0 / mass,
+        restitution: restitution, friction: friction, linear_damping: 0.02,
+        layer: 1, mask: 0x7fffffff, sleeping: false, sleep_timer: 0.0,
+        grounded: false, contacts: 0, last_normal: zero()}
+    body.validate() or >>
+    << body
+}
+
+pub fn kinematic_sphere_3d(position fm.Vec3, radius f64, layer int) RigidBody3D {
+    body := RigidBody3D{kind: SHAPE_SPHERE, position: position, velocity: zero(), radius: radius,
+        half_extents: fm.vec3(radius, radius, radius), inverse_mass: 0.0,
+        restitution: 0.0, friction: 0.5, linear_damping: 0.0,
+        layer: layer, mask: 0x7fffffff, sleeping: false, sleep_timer: 0.0,
+        grounded: false, contacts: 0, last_normal: zero()}
+    body.validate() or >>
+    << body
+}
+
+pub fn kinematic_box_3d(position fm.Vec3, half_extents fm.Vec3, layer int) RigidBody3D {
+    body := RigidBody3D{kind: SHAPE_BOX, position: position, velocity: zero(), radius: half_extents.length(),
+        half_extents: half_extents, inverse_mass: 0.0,
+        restitution: 0.0, friction: 0.5, linear_damping: 0.0,
+        layer: layer, mask: 0x7fffffff, sleeping: false, sleep_timer: 0.0,
+        grounded: false, contacts: 0, last_normal: zero()}
+    body.validate() or >>
+    << body
+}
+
+pub fn new_rigid_world(gravity fm.Vec3, boxes []StaticBox3D, ramps []StaticRamp3D, triangles []StaticTriangle3D) RigidWorld3D {
+    if !gravity.is_finite() || gravity.length() > 1000.0 {
+        >> errors.new("nexus physics3d: gravity must be finite and <= 1000 m/s^2")
+    }
+    if boxes.len + ramps.len + triangles.len > MAX_COLLIDERS {
+        >> errors.new("nexus physics3d: static rigid world collider budget exceeded")
+    }
+    check_static_boxes(&boxes) or >>
+    $box_bounds := []fm.Aabb3{}
+    for box in boxes { box_bounds.push(box.bounds) }
+    $ramp_bounds := []fm.Aabb3{}
+    for ramp in ramps {
+        check_ramp(ramp) or >>
+        if ramp.layer <= 0 || ramp.layer > 0x7fffffff {
+            >> errors.new("nexus physics3d: invalid ramp collision layer")
+        }
+        ramp_bounds.push(ramp.bounds)
+    }
+    $triangle_bounds := []fm.Aabb3{}
+    for tri in triangles {
+        check_triangle(tri) or >>
+        triangle_bounds.push(triangle_bounds_unchecked(tri))
+    }
+    << RigidWorld3D{gravity: gravity, boxes: boxes, ramps: ramps, triangles: triangles,
+        bodies: []RigidBody3D{}, box_bounds: box_bounds, ramp_bounds: ramp_bounds,
+        triangle_bounds: triangle_bounds}
+}
+
+fn (world &RigidWorld3D) check_body_index(index int) int {
+    if index < 0 || index >= world.bodies.len {
+        >> errors.new("nexus physics3d: rigid body index out of range")
+    }
+    << 0
+}
+
+pub fn (world $&RigidWorld3D) add_body(body RigidBody3D) int {
+    body.validate() or >>
+    if world.bodies.len >= MAX_RIGID_BODIES {
+        >> errors.new("nexus physics3d: rigid body budget exceeded")
+    }
+    id := world.bodies.len
+    world.bodies.push(body)
+    << id
+}
+
+pub fn (world &RigidWorld3D) body_count() int { << world.bodies.len }
+
+pub fn (world &RigidWorld3D) body(index int) RigidBody3D {
+    world.check_body_index(index) or >>
+    << world.bodies[index]
+}
+
+fn (world $&RigidWorld3D) wake_island(seed int) {
+    $queue := [seed]
+    $cursor := 0
+    pad := fm.vec3(0.05, 0.05, 0.05)
+    while cursor < queue.len {
+        current := queue[cursor]
+        cursor += 1
+        world.bodies[current].sleeping = false
+        world.bodies[current].sleep_timer = 0.0
+        b := body_bounds_unchecked(world.bodies[current])
+        expanded := fm.Aabb3{minimum: b.minimum.sub(pad), maximum: b.maximum.add(pad)}
+        for i in 0:world.bodies.len {
+            if !world.bodies[i].sleeping || !world.bodies[i].is_dynamic() { -> }
+            if aabb_overlap(expanded, body_bounds_unchecked(world.bodies[i])) {
+                world.bodies[i].sleeping = false
+                world.bodies[i].sleep_timer = 0.0
+                queue.push(i)
+            }
+        }
+    }
+}
+
+pub fn (world $&RigidWorld3D) wake(index int) int {
+    world.check_body_index(index) or >>
+    world.wake_island(index)
+    << 0
+}
+
+pub fn (world $&RigidWorld3D) set_velocity(index int, velocity fm.Vec3) int {
+    world.check_body_index(index) or >>
+    if !valid_point(velocity) { >> errors.new("nexus physics3d: invalid rigid body velocity") }
+    world.bodies[index].velocity = velocity
+    if velocity.dot(velocity) > 0.0 { world.wake_island(index) }
+    << 0
+}
+
+pub fn (world $&RigidWorld3D) set_position(index int, position fm.Vec3) int {
+    world.check_body_index(index) or >>
+    $candidate := world.bodies[index]
+    candidate.position = position
+    candidate.validate() or >>
+    world.wake_island(index)
+    world.bodies[index].position = position
+    world.wake_island(index)
+    << 0
+}
+
+pub fn (world $&RigidWorld3D) apply_impulse(index int, impulse fm.Vec3) int {
+    world.check_body_index(index) or >>
+    if !valid_point(impulse) { >> errors.new("nexus physics3d: invalid impulse vector") }
+    if world.bodies[index].inverse_mass <= 0.0 { << 0 }
+    next_v := world.bodies[index].velocity.add(impulse.scaled(world.bodies[index].inverse_mass))
+    if !valid_point(next_v) { >> errors.new("nexus physics3d: impulse exceeded world velocity bounds") }
+    world.bodies[index].velocity = next_v
+    if impulse.dot(impulse) > 0.0 { world.wake_island(index) }
+    << 0
+}
+
+// --- Narrowphase Contact Helpers ---
+// Convention: normal always points FROM B TO A (pushing A out of B).
+
+fn sphere_vs_aabb(center fm.Vec3, radius f64, box fm.Aabb3) NarrowContact {
+    qx := clamp_value(center.x, box.minimum.x, box.maximum.x)
+    qy := clamp_value(center.y, box.minimum.y, box.maximum.y)
+    qz := clamp_value(center.z, box.minimum.z, box.maximum.z)
+    delta := center.sub(fm.vec3(qx, qy, qz))
+    dist2 := delta.dot(delta)
+    if dist2 >= radius * radius { << no_narrow() }
+    if dist2 > 0.000000000001 {
+        dist := math.sqrt(dist2)
+        << NarrowContact{hit: true, normal: delta.scaled(1.0 / dist), penetration: radius - dist}
+    }
+    // Center is inside the box; push out along the closest face.
+    dx_min := center.x - box.minimum.x
+    dx_max := box.maximum.x - center.x
+    dy_min := center.y - box.minimum.y
+    dy_max := box.maximum.y - center.y
+    dz_min := center.z - box.minimum.z
+    dz_max := box.maximum.z - center.z
+    $best_d := dy_max
+    $best_n := fm.vec3(0.0, 1.0, 0.0)
+    if dy_min < best_d { best_d = dy_min
+        best_n = fm.vec3(0.0, -1.0, 0.0) }
+    if dx_min < best_d { best_d = dx_min
+        best_n = fm.vec3(-1.0, 0.0, 0.0) }
+    if dx_max < best_d { best_d = dx_max
+        best_n = fm.vec3(1.0, 0.0, 0.0) }
+    if dz_min < best_d { best_d = dz_min
+        best_n = fm.vec3(0.0, 0.0, -1.0) }
+    if dz_max < best_d { best_d = dz_max
+        best_n = fm.vec3(0.0, 0.0, 1.0) }
+    << NarrowContact{hit: true, normal: best_n, penetration: radius + best_d}
+}
+
+fn sphere_vs_ramp(center fm.Vec3, radius f64, ramp StaticRamp3D) NarrowContact {
+    delta := hull_delta(center, capsule_hull(ramp.bounds, ramp.direction, 0.0))
+    dist2 := delta.dot(delta)
+    if dist2 >= radius * radius { << no_narrow() }
+    if dist2 > 0.000000000001 {
+        dist := math.sqrt(dist2)
+        << NarrowContact{hit: true, normal: delta.scaled(1.0 / dist), penetration: radius - dist}
+    }
+    // Sphere center is inside the ramp prism; pick nearest prism face.
+    plane := ramp_slope_plane(ramp)
+    sn := plane.xyz()
+    d_slope := plane.w - sn.dot(center)
+    low := ramp.bounds.minimum
+    high := ramp.bounds.maximum
+    $best_d := d_slope
+    $best_n := sn
+    if center.y - low.y < best_d { best_d = center.y - low.y
+        best_n = fm.vec3(0.0, -1.0, 0.0) }
+    if center.x - low.x < best_d { best_d = center.x - low.x
+        best_n = fm.vec3(-1.0, 0.0, 0.0) }
+    if high.x - center.x < best_d { best_d = high.x - center.x
+        best_n = fm.vec3(1.0, 0.0, 0.0) }
+    if center.z - low.z < best_d { best_d = center.z - low.z
+        best_n = fm.vec3(0.0, 0.0, -1.0) }
+    if high.z - center.z < best_d { best_d = high.z - center.z
+        best_n = fm.vec3(0.0, 0.0, 1.0) }
+    << NarrowContact{hit: true, normal: best_n, penetration: radius + math.max(0.0, best_d)}
+}
+
+fn sphere_vs_triangle(center fm.Vec3, velocity fm.Vec3, radius f64, tri StaticTriangle3D) NarrowContact {
+    q := closest_on_triangle(center, tri.a, tri.b, tri.c)
+    delta := center.sub(q)
+    dist2 := delta.dot(delta)
+    if dist2 >= radius * radius { << no_narrow() }
+    if dist2 > 0.000000000001 {
+        dist := math.sqrt(dist2)
+        << NarrowContact{hit: true, normal: delta.scaled(1.0 / dist), penetration: radius - dist}
+    }
+    $n := tri.b.sub(tri.a).cross(tri.c.sub(tri.a)).normalized() or (err) { << no_narrow() }
+    if n.dot(velocity) > 0.0 { n = n.scaled(-1.0) }
+    << NarrowContact{hit: true, normal: n, penetration: radius}
+}
+
+fn aabb_vs_aabb(pos_a fm.Vec3, half_a fm.Vec3, pos_b fm.Vec3, half_b fm.Vec3) NarrowContact {
+    delta := pos_a.sub(pos_b)
+    ox := half_a.x + half_b.x - math.abs(delta.x)
+    oy := half_a.y + half_b.y - math.abs(delta.y)
+    oz := half_a.z + half_b.z - math.abs(delta.z)
+    if ox <= 0.0 || oy <= 0.0 || oz <= 0.0 { << no_narrow() }
+    if oy <= ox && oy <= oz {
+        if delta.y >= 0.0 { << NarrowContact{hit: true, normal: fm.vec3(0.0, 1.0, 0.0), penetration: oy} }
+        << NarrowContact{hit: true, normal: fm.vec3(0.0, -1.0, 0.0), penetration: oy}
+    }
+    if ox <= oz {
+        if delta.x >= 0.0 { << NarrowContact{hit: true, normal: fm.vec3(1.0, 0.0, 0.0), penetration: ox} }
+        << NarrowContact{hit: true, normal: fm.vec3(-1.0, 0.0, 0.0), penetration: ox}
+    }
+    if delta.z >= 0.0 { << NarrowContact{hit: true, normal: fm.vec3(0.0, 0.0, 1.0), penetration: oz} }
+    << NarrowContact{hit: true, normal: fm.vec3(0.0, 0.0, -1.0), penetration: oz}
+}
+
+// Exact 4-axis SAT for an axis-aligned dynamic box vs StaticRamp3D prism.
+fn box_vs_ramp(pos fm.Vec3, half fm.Vec3, ramp StaticRamp3D) NarrowContact {
+    bc := ramp.bounds.minimum.scaled(0.5).add(ramp.bounds.maximum.scaled(0.5))
+    bh := ramp.bounds.maximum.sub(ramp.bounds.minimum).scaled(0.5)
+    box_hit := aabb_vs_aabb(pos, half, bc, bh)
+    if !box_hit.hit { << no_narrow() }
+    plane := ramp_slope_plane(ramp)
+    sn := plane.xyz()
+    r_box := half.x * math.abs(sn.x) + half.y * math.abs(sn.y) + half.z * math.abs(sn.z)
+    support_min := pos.dot(sn) - r_box
+    pen_slope := plane.w - support_min
+    if pen_slope <= 0.0 { << no_narrow() }
+    if pen_slope <= box_hit.penetration {
+        << NarrowContact{hit: true, normal: sn, penetration: pen_slope}
+    }
+    << box_hit
+}
+
+struct SatAxisResult {
+    separated bool
+    normal fm.Vec3
+    penetration f64
+}
+
+fn test_box_triangle_axis(axis fm.Vec3, half fm.Vec3, p0 fm.Vec3, p1 fm.Vec3, p2 fm.Vec3) SatAxisResult {
+    len2 := axis.dot(axis)
+    if len2 < 0.000000000001 {
+        << SatAxisResult{separated: false, normal: zero(), penetration: 1000000000000.0}
+    }
+    u := axis.scaled(1.0 / math.sqrt(len2))
+    r_box := half.x * math.abs(u.x) + half.y * math.abs(u.y) + half.z * math.abs(u.z)
+    d0 := p0.dot(u)
+    d1 := p1.dot(u)
+    d2 := p2.dot(u)
+    t_min := math.min(d0, math.min(d1, d2))
+    t_max := math.max(d0, math.max(d1, d2))
+    if t_min >= r_box || t_max <= -r_box {
+        << SatAxisResult{separated: true, normal: zero(), penetration: 0.0}
+    }
+    pen_pos := t_max + r_box
+    pen_neg := r_box - t_min
+    if pen_pos <= pen_neg {
+        << SatAxisResult{separated: false, normal: u, penetration: pen_pos}
+    }
+    << SatAxisResult{separated: false, normal: u.scaled(-1.0), penetration: pen_neg}
+}
+
+// Exact 13-axis SAT (1 face normal + 3 box normals + 9 edge cross-products)
+// between an axis-aligned box and an arbitrary 3D triangle.
+fn box_vs_triangle(pos fm.Vec3, half fm.Vec3, tri StaticTriangle3D) NarrowContact {
+    p0 := tri.a.sub(pos)
+    p1 := tri.b.sub(pos)
+    p2 := tri.c.sub(pos)
+    e0 := p1.sub(p0)
+    e1 := p2.sub(p1)
+    e2 := p0.sub(p2)
+    face_n := e0.cross(e1)
+    axes := [face_n, fm.vec3(1.0, 0.0, 0.0), fm.vec3(0.0, 1.0, 0.0), fm.vec3(0.0, 0.0, 1.0),
+        fm.vec3(0.0, -e0.z, e0.y), fm.vec3(0.0, -e1.z, e1.y), fm.vec3(0.0, -e2.z, e2.y),
+        fm.vec3(e0.z, 0.0, -e0.x), fm.vec3(e1.z, 0.0, -e1.x), fm.vec3(e2.z, 0.0, -e2.x),
+        fm.vec3(-e0.y, e0.x, 0.0), fm.vec3(-e1.y, e1.x, 0.0), fm.vec3(-e2.y, e2.x, 0.0)]
+    $best_pen := 1000000000000.0
+    $best_score := 1000000000000.0
+    $best_n := zero()
+    for i in 0:13 {
+        res := test_box_triangle_axis(axes[i], half, p0, p1, p2)
+        if res.separated { << no_narrow() }
+        // Slight preference for the triangle face normal on numeric ties.
+        $score := res.penetration
+        if i == 0 { score = score * 0.999 }
+        if score < best_score {
+            best_score = score
+            best_pen = res.penetration
+            best_n = res.normal
+        }
+    }
+    if best_pen >= 1000000000000.0 { << no_narrow() }
+    << NarrowContact{hit: true, normal: best_n, penetration: best_pen}
+}
+
+fn body_vs_body(a RigidBody3D, b RigidBody3D) NarrowContact {
+    if a.kind == SHAPE_SPHERE && b.kind == SHAPE_SPHERE {
+        delta := a.position.sub(b.position)
+        dist2 := delta.dot(delta)
+        sum_r := a.radius + b.radius
+        if dist2 >= sum_r * sum_r { << no_narrow() }
+        if dist2 > 0.000000000001 {
+            dist := math.sqrt(dist2)
+            << NarrowContact{hit: true, normal: delta.scaled(1.0 / dist), penetration: sum_r - dist}
+        }
+        << NarrowContact{hit: true, normal: fm.vec3(0.0, 1.0, 0.0), penetration: sum_r}
+    }
+    if a.kind == SHAPE_BOX && b.kind == SHAPE_BOX {
+        << aabb_vs_aabb(a.position, a.half_extents, b.position, b.half_extents)
+    }
+    if a.kind == SHAPE_SPHERE && b.kind == SHAPE_BOX {
+        << sphere_vs_aabb(a.position, a.radius, body_bounds_unchecked(b))
+    }
+    flipped := sphere_vs_aabb(b.position, b.radius, body_bounds_unchecked(a))
+    if !flipped.hit { << no_narrow() }
+    << NarrowContact{hit: true, normal: flipped.normal.scaled(-1.0), penetration: flipped.penetration}
+}
+
+// --- CCD Anti-Tunneling Sweeps for Fast Dynamic Bodies ---
+
+fn sweep_box_triangle_ccd(pos fm.Vec3, half fm.Vec3, motion fm.Vec3, tri StaticTriangle3D, bounds fm.Aabb3) SweepHit3D {
+    swept := swept_aabb(fm.Aabb3{minimum: pos.sub(half), maximum: pos.add(half)}, motion)
+    if !aabb_overlap(swept, bounds) { << capsule_miss() }
+    if box_vs_triangle(pos, half, tri).hit {
+        << SweepHit3D{hit: true, time: 0.0, normal: zero(), started_overlapping: true}
+    }
+    n := tri.b.sub(tri.a).cross(tri.c.sub(tri.a)).normalized() or (err) { << capsule_miss() }
+    r_box := half.x * math.abs(n.x) + half.y * math.abs(n.y) + half.z * math.abs(n.z)
+    d0 := n.dot(pos.sub(tri.a))
+    dm := n.dot(motion)
+    $t_low := 0.0
+    $t_high := 1.0
+    if math.abs(dm) <= 0.000000000001 {
+        if math.abs(d0) > r_box { << capsule_miss() }
+    } else {
+        ta := (-r_box - d0) / dm
+        tb := (r_box - d0) / dm
+        t_low = math.max(0.0, math.min(ta, tb))
+        t_high = math.min(1.0, math.max(ta, tb))
+        if t_low > t_high { << capsule_miss() }
+    }
+    // Locate first overlapping sample in [t_low, t_high], then bisect to impact.
+    $hit_t := -1.0
+    $hit_n := zero()
+    samples := 16
+    for s in 0:samples + 1 {
+        t := t_low + (t_high - t_low) * (f64(s) / f64(samples))
+        c := box_vs_triangle(pos.add(motion.scaled(t)), half, tri)
+        if c.hit {
+            hit_t = t
+            hit_n = c.normal
+            <-
+        }
+    }
+    if hit_t < 0.0 { << capsule_miss() }
+    $lo := math.max(0.0, hit_t - (t_high - t_low) / f64(samples))
+    if box_vs_triangle(pos.add(motion.scaled(lo)), half, tri).hit {
+        lo = 0.0
+    }
+    $hi := hit_t
+    for i in 0:24 {
+        mid := lo + (hi - lo) * 0.5
+        c := box_vs_triangle(pos.add(motion.scaled(mid)), half, tri)
+        if c.hit {
+            hi = mid
+            hit_n = c.normal
+        } else {
+            lo = mid
+        }
+    }
+    << SweepHit3D{hit: true, time: lo, normal: hit_n, started_overlapping: false}
+}
+
+fn sweep_box_ramp_ccd(pos fm.Vec3, half fm.Vec3, motion fm.Vec3, ramp StaticRamp3D) SweepHit3D {
+    swept := swept_aabb(fm.Aabb3{minimum: pos.sub(half), maximum: pos.add(half)}, motion)
+    if !aabb_overlap(swept, ramp.bounds) { << capsule_miss() }
+    if box_vs_ramp(pos, half, ramp).hit {
+        << SweepHit3D{hit: true, time: 0.0, normal: zero(), started_overlapping: true}
+    }
+    broad := cast_box(fm.Aabb3{minimum: pos.sub(half), maximum: pos.add(half)}, motion, ramp.bounds, false)
+    if !broad.hit { << capsule_miss() }
+    $hit_t := -1.0
+    $hit_n := zero()
+    samples := 16
+    for s in 0:samples + 1 {
+        t := broad.time + (1.0 - broad.time) * (f64(s) / f64(samples))
+        c := box_vs_ramp(pos.add(motion.scaled(t)), half, ramp)
+        if c.hit {
+            hit_t = t
+            hit_n = c.normal
+            <-
+        }
+    }
+    if hit_t < 0.0 { << capsule_miss() }
+    $lo := math.max(0.0, hit_t - (1.0 - broad.time) / f64(samples))
+    $hi := hit_t
+    for i in 0:24 {
+        mid := lo + (hi - lo) * 0.5
+        c := box_vs_ramp(pos.add(motion.scaled(mid)), half, ramp)
+        if c.hit {
+            hi = mid
+            hit_n = c.normal
+        } else {
+            lo = mid
+        }
+    }
+    << SweepHit3D{hit: true, time: lo, normal: hit_n, started_overlapping: false}
+}
+
+fn ccd_sweep_static(world &RigidWorld3D, body RigidBody3D, motion fm.Vec3) SweepHit3D {
+    swept := swept_aabb(body_bounds_unchecked(body), motion)
+    $best := capsule_miss()
+    if body.kind == SHAPE_SPHERE {
+        sphere := Capsule3D{center: body.position, radius: body.radius, half_segment: 0.0}
+        for i in 0:world.boxes.len {
+            box := world.boxes[i]
+            if box.trigger || (box.layer & body.mask) == 0 || !aabb_overlap(swept, world.box_bounds[i]) { -> }
+            hit := sweep_hull(sphere, motion, capsule_hull(box.bounds, 0, 0.0)) or (err) { -> }
+            if hit.hit && !hit.started_overlapping && (!best.hit || hit.time < best.time) { best = hit }
+        }
+        for i in 0:world.ramps.len {
+            ramp := world.ramps[i]
+            if (ramp.layer & body.mask) == 0 || !aabb_overlap(swept, world.ramp_bounds[i]) { -> }
+            hit := sweep_hull(sphere, motion, capsule_hull(ramp.bounds, ramp.direction, 0.0)) or (err) { -> }
+            if hit.hit && !hit.started_overlapping && (!best.hit || hit.time < best.time) { best = hit }
+        }
+        for i in 0:world.triangles.len {
+            tri := world.triangles[i]
+            if (tri.layer & body.mask) == 0 || !aabb_overlap(swept, world.triangle_bounds[i]) { -> }
+            hit := sweep_capsule_triangle_unchecked(sphere, motion, tri) or (err) { -> }
+            if hit.hit && !hit.started_overlapping && (!best.hit || hit.time < best.time) { best = hit }
+        }
+        << best
+    }
+    box_aabb := body_bounds_unchecked(body)
+    for i in 0:world.boxes.len {
+        box := world.boxes[i]
+        if box.trigger || (box.layer & body.mask) == 0 || !aabb_overlap(swept, world.box_bounds[i]) { -> }
+        if intersects_open(box_aabb, box.bounds) { -> }
+        cast := cast_box(box_aabb, motion, box.bounds, false)
+        if cast.hit && (!best.hit || cast.time < best.time) {
+            best = SweepHit3D{hit: true, time: cast.time, normal: cast.normal, started_overlapping: false}
+        }
+    }
+    for i in 0:world.ramps.len {
+        ramp := world.ramps[i]
+        if (ramp.layer & body.mask) == 0 || !aabb_overlap(swept, world.ramp_bounds[i]) { -> }
+        hit := sweep_box_ramp_ccd(body.position, body.half_extents, motion, ramp)
+        if hit.hit && !hit.started_overlapping && (!best.hit || hit.time < best.time) { best = hit }
+    }
+    for i in 0:world.triangles.len {
+        tri := world.triangles[i]
+        if (tri.layer & body.mask) == 0 || !aabb_overlap(swept, world.triangle_bounds[i]) { -> }
+        hit := sweep_box_triangle_ccd(body.position, body.half_extents, motion, tri, world.triangle_bounds[i])
+        if hit.hit && !hit.started_overlapping && (!best.hit || hit.time < best.time) { best = hit }
+    }
+    << best
+}
+
+fn make_solver_contact(a int, b int, hit NarrowContact, body_a RigidBody3D, body_b_restitution f64,
+    body_b_friction f64, vel_b fm.Vec3) SolverContact {
+    rv := body_a.velocity.sub(vel_b)
+    vn := rv.dot(hit.normal)
+    e := math.max(body_a.restitution, body_b_restitution)
+    mu := math.sqrt(body_a.friction * body_b_friction)
+    $bias := 0.0
+    if vn < -bounce_threshold() { bias = e * vn }
+    << SolverContact{a: a, b: b, normal: hit.normal, penetration: hit.penetration,
+        restitution: e, friction: mu, bounce_bias: bias, normal_impulse: 0.0, tangent_impulse: zero()}
+}
+
+pub fn (world $&RigidWorld3D) step(dt f64, substeps int, iterations int) RigidStepReport3D {
+    if !fm.finite(dt) || dt <= 0.0 || dt > 0.25 {
+        >> errors.new("nexus physics3d: rigid step dt must be in (0, 0.25]")
+    }
+    if substeps < 1 || substeps > MAX_RIGID_SUBSTEPS || iterations < 1 || iterations > MAX_SOLVER_ITERATIONS {
+        >> errors.new("nexus physics3d: invalid rigid substeps or solver iterations")
+    }
+    sub_dt := dt / f64(substeps)
+    $total_pairs := 0
+    $total_contacts := 0
+    $total_ccd := 0
+
+    for sub in 0:substeps {
+        // 1. Integrate forces, linear damping, and CCD-guarded motion.
+        for i in 0:world.bodies.len {
+            $body := world.bodies[i]
+            if !body.is_dynamic() {
+                if body.velocity.dot(body.velocity) > 0.0 {
+                    body.position = body.position.add(body.velocity.scaled(sub_dt))
+                    body.validate() or >>
+                    world.bodies[i] = body
+                }
+                ->
+            }
+            if body.sleeping {
+                world.bodies[i].contacts = 0
+                ->
+            }
+            body.grounded = false
+            body.contacts = 0
+            body.last_normal = zero()
+            body.velocity = body.velocity.add(world.gravity.scaled(sub_dt))
+            damp := math.max(0.0, 1.0 - body.linear_damping * sub_dt)
+            body.velocity = body.velocity.scaled(damp)
+            min_ext := body_min_extent(body)
+            $rem_dt := sub_dt
+            for ccd_pass in 0:2 {
+                if rem_dt <= 0.0 { <- }
+                motion := body.velocity.scaled(rem_dt)
+                if motion.dot(motion) <= (min_ext * 0.5) * (min_ext * 0.5) {
+                    body.position = body.position.add(motion)
+                    rem_dt = 0.0
+                    <-
+                }
+                hit := ccd_sweep_static(world, body, motion)
+                if !hit.hit || hit.time >= 1.0 {
+                    body.position = body.position.add(motion)
+                    rem_dt = 0.0
+                    <-
+                }
+                safe_t := math.max(0.0, hit.time - 0.0001)
+                body.position = body.position.add(motion.scaled(safe_t))
+                vn := body.velocity.dot(hit.normal)
+                if vn < 0.0 {
+                    $e := 0.0
+                    if -vn >= bounce_threshold() { e = body.restitution }
+                    j := -(1.0 + e) * vn
+                    body.velocity = body.velocity.add(hit.normal.scaled(j))
+                    vt := body.velocity.sub(hit.normal.scaled(body.velocity.dot(hit.normal)))
+                    vt_len := vt.length()
+                    if vt_len > 0.0000001 {
+                        max_f := body.friction * j
+                        drop := math.min(vt_len, max_f)
+                        body.velocity = body.velocity.sub(vt.scaled(drop / vt_len))
+                    }
+                }
+                body.contacts += 1
+                body.last_normal = hit.normal
+                if hit.normal.y >= floor_normal_y() { body.grounded = true }
+                total_ccd += 1
+                rem_dt = rem_dt * (1.0 - safe_t)
+            }
+            if rem_dt > 0.0 {
+                body.position = body.position.add(body.velocity.scaled(rem_dt))
+            }
+            body.validate() or >>
+            world.bodies[i] = body
+        }
+
+        // 2. Broadphase AABB culling, pre-contact island waking, and narrowphase contact generation.
+        $body_aabbs := []fm.Aabb3{}
+        for i in 0:world.bodies.len {
+            body_aabbs.push(body_bounds_unchecked(world.bodies[i]))
+        }
+        // Wake sleeping islands before static contact gathering when hit by an awake moving body
+        // or a moving kinematic body. Bodies that remain asleep are treated as immovable (inv_mass=0)
+        // for this substep so they never drift without static support contacts.
+        for i in 0:world.bodies.len {
+            for j in i + 1:world.bodies.len {
+                a := world.bodies[i]
+                b := world.bodies[j]
+                if a.sleeping == b.sleeping { -> }
+                if !a.is_dynamic() && !b.is_dynamic() { -> }
+                if (a.layer & b.mask) == 0 || (b.layer & a.mask) == 0 { -> }
+                if !aabb_overlap(body_aabbs[i], body_aabbs[j]) { -> }
+                kinematic_push := (!a.is_dynamic() && a.velocity.dot(a.velocity) > 0.0) ||
+                    (!b.is_dynamic() && b.velocity.dot(b.velocity) > 0.0)
+                if (kinematic_push || a.velocity.sub(b.velocity).length() > wake_speed()) && body_vs_body(a, b).hit {
+                    if a.sleeping { world.wake_island(i) }
+                    if b.sleeping { world.wake_island(j) }
+                }
+            }
+        }
+        $contacts := []SolverContact{}
+
+        // 2a. Body vs static colliders.
+        for i in 0:world.bodies.len {
+            body := world.bodies[i]
+            if !body.is_dynamic() || body.sleeping { -> }
+            bb := body_aabbs[i]
+            for j in 0:world.boxes.len {
+                box := world.boxes[j]
+                if box.trigger || (box.layer & body.mask) == 0 || !aabb_overlap(bb, world.box_bounds[j]) { -> }
+                total_pairs += 1
+                $hit := no_narrow()
+                if body.kind == SHAPE_SPHERE {
+                    hit = sphere_vs_aabb(body.position, body.radius, box.bounds)
+                } else {
+                    bc := box.bounds.minimum.scaled(0.5).add(box.bounds.maximum.scaled(0.5))
+                    bh := box.bounds.maximum.sub(box.bounds.minimum).scaled(0.5)
+                    hit = aabb_vs_aabb(body.position, body.half_extents, bc, bh)
+                }
+                if hit.hit {
+                    contacts.push(make_solver_contact(i, -1, hit, body, body.restitution, body.friction, zero()))
+                }
+            }
+            for j in 0:world.ramps.len {
+                ramp := world.ramps[j]
+                if (ramp.layer & body.mask) == 0 || !aabb_overlap(bb, world.ramp_bounds[j]) { -> }
+                total_pairs += 1
+                $hit := no_narrow()
+                if body.kind == SHAPE_SPHERE {
+                    hit = sphere_vs_ramp(body.position, body.radius, ramp)
+                } else {
+                    hit = box_vs_ramp(body.position, body.half_extents, ramp)
+                }
+                if hit.hit {
+                    contacts.push(make_solver_contact(i, -1, hit, body, body.restitution, body.friction, zero()))
+                }
+            }
+            for j in 0:world.triangles.len {
+                tri := world.triangles[j]
+                if (tri.layer & body.mask) == 0 || !aabb_overlap(bb, world.triangle_bounds[j]) { -> }
+                total_pairs += 1
+                $hit := no_narrow()
+                if body.kind == SHAPE_SPHERE {
+                    hit = sphere_vs_triangle(body.position, body.velocity, body.radius, tri)
+                } else {
+                    hit = box_vs_triangle(body.position, body.half_extents, tri)
+                }
+                if hit.hit {
+                    contacts.push(make_solver_contact(i, -1, hit, body, body.restitution, body.friction, zero()))
+                }
+            }
+        }
+
+        // 2b. Body vs Body pairs.
+        for i in 0:world.bodies.len {
+            for j in i + 1:world.bodies.len {
+                a := world.bodies[i]
+                b := world.bodies[j]
+                if !a.is_dynamic() && !b.is_dynamic() { -> }
+                if a.sleeping && b.sleeping { -> }
+                if (a.layer & b.mask) == 0 || (b.layer & a.mask) == 0 { -> }
+                if !aabb_overlap(body_aabbs[i], body_aabbs[j]) { -> }
+                total_pairs += 1
+                hit := body_vs_body(a, b)
+                if !hit.hit { -> }
+                contacts.push(make_solver_contact(i, j, hit, world.bodies[i], b.restitution, b.friction, b.velocity))
+            }
+        }
+
+        total_contacts += contacts.len
+
+        // Record contact counters and floor support flags.
+        for c in contacts {
+            world.bodies[c.a].contacts += 1
+            world.bodies[c.a].last_normal = c.normal
+            if c.normal.y >= floor_normal_y() { world.bodies[c.a].grounded = true }
+            if c.b >= 0 {
+                world.bodies[c.b].contacts += 1
+                world.bodies[c.b].last_normal = c.normal.scaled(-1.0)
+                if -c.normal.y >= floor_normal_y() { world.bodies[c.b].grounded = true }
+            }
+        }
+
+        // 3. Sequential impulse velocity solver with accumulated normal & 3D cone friction clamping.
+        for iter in 0:iterations {
+            for ci in 0:contacts.len {
+                $c := contacts[ci]
+                ia := c.a
+                ib := c.b
+                $inv_a := world.bodies[ia].inverse_mass
+                if world.bodies[ia].sleeping { inv_a = 0.0 }
+                $inv_b := 0.0
+                $vel_b := zero()
+                if ib >= 0 {
+                    if !world.bodies[ib].sleeping { inv_b = world.bodies[ib].inverse_mass }
+                    vel_b = world.bodies[ib].velocity
+                }
+                inv_sum := inv_a + inv_b
+                if inv_sum <= 0.0 { -> }
+
+                // Normal impulse with accumulated clamping.
+                rv := world.bodies[ia].velocity.sub(vel_b)
+                vn := rv.dot(c.normal)
+                dj := -(vn + c.bounce_bias) / inv_sum
+                old_j := c.normal_impulse
+                c.normal_impulse = math.max(0.0, old_j + dj)
+                applied_j := c.normal_impulse - old_j
+                n_imp := c.normal.scaled(applied_j)
+                world.bodies[ia].velocity = world.bodies[ia].velocity.add(n_imp.scaled(inv_a))
+                if ib >= 0 {
+                    world.bodies[ib].velocity = world.bodies[ib].velocity.sub(n_imp.scaled(inv_b))
+                    vel_b = world.bodies[ib].velocity
+                }
+
+                // Isotropic 3D Coulomb friction cone impulse.
+                rv2 := world.bodies[ia].velocity.sub(vel_b)
+                vt := rv2.sub(c.normal.scaled(rv2.dot(c.normal)))
+                vt_len := vt.length()
+                if vt_len > 0.0000001 && c.friction > 0.0 {
+                    t_dir := vt.scaled(1.0 / vt_len)
+                    djt := -vt_len / inv_sum
+                    $new_ti := c.tangent_impulse.add(t_dir.scaled(djt))
+                    max_f := c.friction * c.normal_impulse
+                    ti_len := new_ti.length()
+                    if ti_len > max_f {
+                        new_ti = new_ti.scaled(max_f / ti_len)
+                    }
+                    delta_ti := new_ti.sub(c.tangent_impulse)
+                    c.tangent_impulse = new_ti
+                    world.bodies[ia].velocity = world.bodies[ia].velocity.add(delta_ti.scaled(inv_a))
+                    if ib >= 0 {
+                        world.bodies[ib].velocity = world.bodies[ib].velocity.sub(delta_ti.scaled(inv_b))
+                    }
+                }
+                contacts[ci] = c
+            }
+        }
+
+        // 4. Split-impulse positional penetration resolution (slop + percent projection).
+        for c in contacts {
+            depth := c.penetration - position_slop()
+            if depth <= 0.0 { -> }
+            ia := c.a
+            ib := c.b
+            $inv_a := world.bodies[ia].inverse_mass
+            if world.bodies[ia].sleeping { inv_a = 0.0 }
+            $inv_b := 0.0
+            if ib >= 0 && !world.bodies[ib].sleeping { inv_b = world.bodies[ib].inverse_mass }
+            inv_sum := inv_a + inv_b
+            if inv_sum <= 0.0 { -> }
+            correction := c.normal.scaled(position_percent() * depth / inv_sum)
+            world.bodies[ia].position = world.bodies[ia].position.add(correction.scaled(inv_a))
+            if ib >= 0 {
+                world.bodies[ib].position = world.bodies[ib].position.sub(correction.scaled(inv_b))
+            }
+        }
+
+        // 5. Update sleep timers and validate positions/velocities.
+        for i in 0:world.bodies.len {
+            $body := world.bodies[i]
+            if !body.is_dynamic() { -> }
+            if !body.sleeping {
+                speed2 := body.velocity.dot(body.velocity)
+                if body.contacts > 0 && speed2 < sleep_speed_sq() {
+                    body.sleep_timer += sub_dt
+                    if body.sleep_timer >= sleep_time_limit() {
+                        body.sleeping = true
+                        body.velocity = zero()
+                    }
+                } else {
+                    body.sleep_timer = 0.0
+                }
+            }
+            body.validate() or >>
+            world.bodies[i] = body
+        }
+    }
+
+    $awake := 0
+    $sleeping := 0
+    for body in world.bodies {
+        if !body.is_dynamic() { -> }
+        if body.sleeping { sleeping += 1 }
+        else { awake += 1 }
+    }
+    << RigidStepReport3D{substeps: substeps, broadphase_pairs: total_pairs, contacts: total_contacts,
+        ccd_hits: total_ccd, awake_bodies: awake, sleeping_bodies: sleeping}
+}
+
+pub fn (world &RigidWorld3D) body_triggers(index int) []int {
+    world.check_body_index(index) or >>
+    body := world.bodies[index]
+    bb := body_bounds_unchecked(body)
+    $hits := []int{}
+    for i in 0:world.boxes.len {
+        box := world.boxes[i]
+        if !box.trigger || (box.layer & body.mask) == 0 || !aabb_overlap(bb, box.bounds) { -> }
+        if body.kind == SHAPE_SPHERE {
+            if sphere_vs_aabb(body.position, body.radius, box.bounds).hit { hits.push(i) }
+        } else {
+            if intersects_open(bb, box.bounds) { hits.push(i) }
+        }
+    }
+    << hits
+}
+
+fn ray_sphere_cast(origin fm.Vec3, dir_unit fm.Vec3, distance f64, center fm.Vec3, radius f64) RayCastHit {
+    oc := origin.sub(center)
+    r2 := radius * radius
+    if oc.dot(oc) <= r2 {
+        << RayCastHit{hit: true, started_inside: true, time: 0.0, normal: zero()}
+    }
+    b := oc.dot(dir_unit)
+    c := oc.dot(oc) - r2
+    disc := b * b - c
+    if disc < 0.0 { << ray_miss() }
+    t := -b - math.sqrt(disc)
+    if t < 0.0 || t > distance { << ray_miss() }
+    hit_point := origin.add(dir_unit.scaled(t))
+    n := hit_point.sub(center).normalized() or (err) { << ray_miss() }
+    << RayCastHit{hit: true, started_inside: false, time: t / distance, normal: n}
+}
+
+// Unified raycast against static boxes, static ramps, static triangles and rigid bodies.
+pub fn (world &RigidWorld3D) raycast_all(origin fm.Vec3, direction fm.Vec3, distance f64, mask int) RigidRayHit3D {
+    if !fm.finite(distance) || distance <= 0.0 || !valid_point(origin) {
+        >> errors.new("nexus physics3d: invalid ray origin or distance")
+    }
+    check_mask(mask) or >>
+    unit := direction.normalized() or >>
+    motion := unit.scaled(distance)
+    end := origin.add(motion)
+    if !valid_point(end) { >> errors.new("nexus physics3d: ray endpoint outside world bounds") }
+
+    point := fm.Aabb3{minimum: origin, maximum: origin}
+    $best_kind := HIT_NONE
+    $best_index := -1
+    $best_time := 1.0
+    $best_normal := zero()
+
+    for i in 0:world.boxes.len {
+        box := world.boxes[i]
+        if box.trigger || (box.layer & mask) == 0 { -> }
+        if box.bounds.contains(origin) or >> {
+            << RigidRayHit3D{kind: HIT_STATIC_BOX, index: i, distance: 0.0, point: origin,
+                normal: zero(), started_inside: true}
+        }
+        cand := cast_box(point, motion, box.bounds, true)
+        if cand.hit && (best_kind == HIT_NONE || cand.time < best_time) {
+            best_kind = HIT_STATIC_BOX
+            best_index = i
+            best_time = cand.time
+            best_normal = cand.normal
+        }
+    }
+    for i in 0:world.ramps.len {
+        ramp := world.ramps[i]
+        if (ramp.layer & mask) == 0 { -> }
+        cand := ray_ramp_cast(origin, unit, distance, ramp)
+        if cand.started_inside {
+            << RigidRayHit3D{kind: HIT_STATIC_RAMP, index: i, distance: 0.0, point: origin,
+                normal: zero(), started_inside: true}
+        }
+        if cand.hit && (best_kind == HIT_NONE || cand.time < best_time) {
+            best_kind = HIT_STATIC_RAMP
+            best_index = i
+            best_time = cand.time
+            best_normal = cand.normal
+        }
+    }
+    for i in 0:world.triangles.len {
+        tri := world.triangles[i]
+        if (tri.layer & mask) == 0 { -> }
+        cand := ray_triangle_cast(origin, unit, distance, tri, world.triangle_bounds[i])
+        if cand.started_inside {
+            << RigidRayHit3D{kind: HIT_STATIC_TRIANGLE, index: i, distance: 0.0, point: origin,
+                normal: zero(), started_inside: true}
+        }
+        if cand.hit && (best_kind == HIT_NONE || cand.time < best_time) {
+            best_kind = HIT_STATIC_TRIANGLE
+            best_index = i
+            best_time = cand.time
+            best_normal = cand.normal
+        }
+    }
+    for i in 0:world.bodies.len {
+        body := world.bodies[i]
+        if (body.layer & mask) == 0 { -> }
+        if body.kind == SHAPE_SPHERE {
+            cand := ray_sphere_cast(origin, unit, distance, body.position, body.radius)
+            if cand.started_inside {
+                << RigidRayHit3D{kind: HIT_RIGID_BODY, index: i, distance: 0.0, point: origin,
+                    normal: zero(), started_inside: true}
+            }
+            if cand.hit && (best_kind == HIT_NONE || cand.time < best_time) {
+                best_kind = HIT_RIGID_BODY
+                best_index = i
+                best_time = cand.time
+                best_normal = cand.normal
+            }
+        } else {
+            bb := body_bounds_unchecked(body)
+            if bb.contains(origin) or >> {
+                << RigidRayHit3D{kind: HIT_RIGID_BODY, index: i, distance: 0.0, point: origin,
+                    normal: zero(), started_inside: true}
+            }
+            cand := cast_box(point, motion, bb, true)
+            if cand.hit && (best_kind == HIT_NONE || cand.time < best_time) {
+                best_kind = HIT_RIGID_BODY
+                best_index = i
+                best_time = cand.time
+                best_normal = cand.normal
+            }
+        }
+    }
+    << RigidRayHit3D{kind: best_kind, index: best_index, distance: best_time * distance,
+        point: origin.add(motion.scaled(best_time)), normal: best_normal, started_inside: false}
+}

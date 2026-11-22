@@ -1,7 +1,11 @@
 const HEADER_BYTES = 12;
 const VERTEX_BYTES = 20;
+const MODEL_HEADER_BYTES = 20;
+const MODEL_VERTEX_BYTES = 24;
 const MAX_VERTICES = 65532;
 const MAX_FRAME_BYTES = HEADER_BYTES + VERTEX_BYTES * MAX_VERTICES;
+const MAX_MODEL_BYTES = MODEL_HEADER_BYTES + MODEL_VERTEX_BYTES * MAX_VERTICES + 256 * 256 * 4;
+const CAMERA_BYTES = 68;
 const MAX_PIXELS = 2097152;
 
 const VERTEX_SHADER = `
@@ -30,20 +34,16 @@ void main() {
 `;
 
 const MESH_VERTEX_SHADER = `
-attribute vec4 position;
+attribute vec3 position;
+attribute vec2 texcoord;
 attribute vec4 color;
+uniform mat4 camera;
+varying vec2 uv;
 varying vec4 tint;
 void main() {
-    gl_Position = position;
+    gl_Position = camera * vec4(position, 1.0);
+    uv = texcoord;
     tint = color;
-}
-`;
-
-const MESH_FRAGMENT_SHADER = `
-precision mediump float;
-varying vec4 tint;
-void main() {
-    gl_FragColor = tint;
 }
 `;
 
@@ -67,11 +67,11 @@ function program(gl, mesh) {
     let frag;
     try {
         vert = shader(gl, gl.VERTEX_SHADER, mesh ? MESH_VERTEX_SHADER : VERTEX_SHADER);
-        frag = shader(gl, gl.FRAGMENT_SHADER, mesh ? MESH_FRAGMENT_SHADER : FRAGMENT_SHADER);
+        frag = shader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER);
         gl.attachShader(handle, vert);
         gl.attachShader(handle, frag);
         gl.bindAttribLocation(handle, 0, "position");
-        if (!mesh) gl.bindAttribLocation(handle, 1, "texcoord");
+        gl.bindAttribLocation(handle, 1, "texcoord");
         gl.bindAttribLocation(handle, 2, "color");
         gl.linkProgram(handle);
         if (!gl.getProgramParameter(handle, gl.LINK_STATUS)) {
@@ -87,7 +87,7 @@ function program(gl, mesh) {
     }
 }
 
-function texture(gl, image) {
+function texture(gl, image, width, height) {
     const handle = gl.createTexture();
     if (!handle) throw new Error("WebGL 无法分配纹理");
     try {
@@ -97,7 +97,9 @@ function texture(gl, image) {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
         gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-        if (image) {
+        if (width) {
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, image);
+        } else if (image) {
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
         } else {
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA,
@@ -115,20 +117,37 @@ function checkGl(gl) {
     if (error !== gl.NO_ERROR) throw new Error("WebGL 绘制失败（" + error + "）");
 }
 
-function decodeFrame(packet, mesh) {
+function decodeFrame(packet) {
     if (packet.byteLength < HEADER_BYTES || packet.byteLength > MAX_FRAME_BYTES) {
         throw new Error("Nexus WebGL 帧长度无效");
     }
     const header = new DataView(packet.buffer, packet.byteOffset, HEADER_BYTES);
     const solid = header.getUint32(4, true);
     const atlas = header.getUint32(8, true);
-    const magic = mesh ? 0x3347584e : 0x3147584e;
-    if (header.getUint32(0, true) !== magic || solid % 3 !== 0 || atlas % 3 !== 0 ||
-        (mesh && (solid === 0 || atlas !== 0)) ||
+    if (header.getUint32(0, true) !== 0x3147584e || solid % 3 !== 0 || atlas % 3 !== 0 ||
         HEADER_BYTES + (solid + atlas) * VERTEX_BYTES !== packet.byteLength) {
         throw new Error("Nexus WebGL 帧格式无效");
     }
     return { solid, atlas };
+}
+
+function decodeModel(packet) {
+    if (!packet || packet.byteLength < MODEL_HEADER_BYTES || packet.byteLength > MAX_MODEL_BYTES) {
+        throw new Error("Nexus WebGL 模型包长度无效");
+    }
+    const header = new DataView(packet.buffer, packet.byteOffset, MODEL_HEADER_BYTES);
+    const solid = header.getUint32(4, true);
+    const textured = header.getUint32(8, true);
+    const width = header.getUint32(12, true);
+    const height = header.getUint32(16, true);
+    const pixelsAt = MODEL_HEADER_BYTES + (solid + textured) * MODEL_VERTEX_BYTES;
+    if (header.getUint32(0, true) !== 0x314d584e || solid === 0 || textured === 0 ||
+        solid % 3 !== 0 || textured % 3 !== 0 || solid + textured > MAX_VERTICES ||
+        width < 1 || width > 256 || height < 1 || height > 256 ||
+        pixelsAt + width * height * 4 !== packet.byteLength) {
+        throw new Error("Nexus WebGL 模型包格式无效");
+    }
+    return { solid, textured, width, height, pixelsAt };
 }
 
 class WebGLCanvas {
@@ -145,16 +164,17 @@ class WebGLCanvas {
             this.buffer = gl.createBuffer();
             if (!this.buffer) throw new Error("WebGL 无法分配顶点缓冲");
             gl.useProgram(this.program);
+            this.white = texture(gl);
+            gl.uniform1i(gl.getUniformLocation(this.program, "atlas"), 0);
             if (mesh) {
                 if (!(gl.getParameter(gl.DEPTH_BITS) > 0)) throw new Error("WebGL 缺少深度缓冲");
                 gl.enable(gl.DEPTH_TEST);
                 gl.depthFunc(gl.GREATER);
                 gl.clearDepth(0);
+                this.loadModel(image);
             } else {
-                this.white = texture(gl);
                 this.atlas = image ? texture(gl, image) : null;
                 gl.uniform2f(gl.getUniformLocation(this.program, "design"), width, height);
-                gl.uniform1i(gl.getUniformLocation(this.program, "atlas"), 0);
                 gl.enable(gl.BLEND);
                 gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
             }
@@ -164,6 +184,25 @@ class WebGLCanvas {
             this.close();
             throw error;
         }
+    }
+
+    loadModel(packet) {
+        const { gl } = this;
+        const { solid, textured, width, height, pixelsAt } = decodeModel(packet);
+        this.atlas = texture(gl, packet.subarray(pixelsAt), width, height);
+        this.solid = solid;
+        this.textured = textured;
+        this.meshBytes = packet.byteLength - MODEL_HEADER_BYTES;
+        this.camera = new Float32Array(16);
+        this.cameraUniform = gl.getUniformLocation(this.program, "camera");
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, packet.subarray(MODEL_HEADER_BYTES, pixelsAt), gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(0);
+        gl.enableVertexAttribArray(1);
+        gl.enableVertexAttribArray(2);
+        gl.vertexAttribPointer(0, 3, gl.FLOAT, false, MODEL_VERTEX_BYTES, 0);
+        gl.vertexAttribPointer(1, 2, gl.FLOAT, false, MODEL_VERTEX_BYTES, 12);
+        gl.vertexAttribPointer(2, 4, gl.UNSIGNED_BYTE, true, MODEL_VERTEX_BYTES, 20);
     }
 
     resize(bounds, pixelRatio) {
@@ -201,22 +240,21 @@ class WebGLCanvas {
 
     draw(packet) {
         const gl = this.gl;
-        const { solid, atlas } = decodeFrame(packet, this.mesh);
-        if (atlas && !this.atlas) throw new Error("Nexus WebGL 帧缺少图集");
         const { x, y, w, h } = this.viewport;
         gl.viewport(x, y, w, h);
-        gl.clear(this.mesh ? gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT : gl.COLOR_BUFFER_BIT);
+        if (this.mesh) {
+            this.drawModel(packet);
+            return;
+        }
+        const { solid, atlas } = decodeFrame(packet);
+        if (atlas && !this.atlas) throw new Error("Nexus WebGL 帧缺少图集");
+        gl.clear(gl.COLOR_BUFFER_BIT);
         gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
         gl.bufferData(gl.ARRAY_BUFFER, packet.subarray(HEADER_BYTES), gl.STREAM_DRAW);
         gl.enableVertexAttribArray(0);
         gl.enableVertexAttribArray(2);
-        gl.vertexAttribPointer(0, this.mesh ? 4 : 2, gl.FLOAT, false, VERTEX_BYTES, 0);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, VERTEX_BYTES, 0);
         gl.vertexAttribPointer(2, 4, gl.UNSIGNED_BYTE, true, VERTEX_BYTES, 16);
-        if (this.mesh) {
-            gl.drawArrays(gl.TRIANGLES, 0, solid);
-            checkGl(gl);
-            return;
-        }
         gl.enableVertexAttribArray(1);
         gl.vertexAttribPointer(1, 2, gl.FLOAT, false, VERTEX_BYTES, 8);
         if (solid) {
@@ -230,6 +268,25 @@ class WebGLCanvas {
         checkGl(gl);
     }
 
+    drawModel(packet) {
+        if (packet.byteLength !== CAMERA_BYTES) throw new Error("Nexus WebGL 相机帧长度无效");
+        const view = new DataView(packet.buffer, packet.byteOffset, CAMERA_BYTES);
+        if (view.getUint32(0, true) !== 0x3143584e) throw new Error("Nexus WebGL 相机帧格式无效");
+        for (let i = 0; i < 16; i += 1) {
+            const value = view.getFloat32(4 + i * 4, true);
+            if (!Number.isFinite(value)) throw new Error("Nexus WebGL 相机矩阵无效");
+            this.camera[i] = value;
+        }
+        const gl = this.gl;
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        gl.uniformMatrix4fv(this.cameraUniform, false, this.camera);
+        gl.bindTexture(gl.TEXTURE_2D, this.white);
+        gl.drawArrays(gl.TRIANGLES, 0, this.solid);
+        gl.bindTexture(gl.TEXTURE_2D, this.atlas);
+        gl.drawArrays(gl.TRIANGLES, this.solid, this.textured);
+        checkGl(gl);
+    }
+
     close() {
         const gl = this.gl;
         if (this.atlas) gl.deleteTexture(this.atlas);
@@ -240,4 +297,4 @@ class WebGLCanvas {
     }
 }
 
-module.exports = { WebGLCanvas, MAX_FRAME_BYTES };
+module.exports = { WebGLCanvas, MAX_FRAME_BYTES, MAX_MODEL_BYTES, CAMERA_BYTES };

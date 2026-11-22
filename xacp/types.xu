@@ -1,6 +1,7 @@
 @"github.com/xulang-org/nexus/xacp"
 
 #errors
+#time
 
 pub struct GameReply {
     pub ok bool
@@ -20,20 +21,75 @@ pub struct GameJob {
 pub struct GameControl {
     pub jobs chan GameJob
     pub done chan int
+    pub stop chan int
+    pub stopped bool
     pub active bool
     pub paused bool
     pub steps_remaining int
     pub port int
+    pub canvas_width int
+    pub canvas_height int
     pub has_screenshot_job bool
     pub screenshot_job GameJob
+}
+
+pub fn inactive() GameControl {
+    dummy_reply := chan GameReply{cap: 1}
+    << GameControl{
+        jobs: chan GameJob{cap: 1},
+        done: chan int{cap: 1},
+        stop: chan int{cap: 1},
+        stopped: true,
+        active: false,
+        paused: false,
+        steps_remaining: 0,
+        port: 0,
+        canvas_width: 960,
+        canvas_height: 640,
+        has_screenshot_job: false,
+        screenshot_job: GameJob{id: 0, op: "", body: "", permissions: 0, reply: dummy_reply}
+    }
 }
 
 pub fn (ctrl &GameControl) is_open() bool {
     << ctrl.active
 }
 
+pub fn (ctrl $&GameControl) set_canvas_size(w int, h int) {
+    if w > 0 { ctrl.canvas_width = w }
+    if h > 0 { ctrl.canvas_height = h }
+}
+
+pub fn (ctrl &GameControl) resolved_width() int {
+    if ctrl.canvas_width > 0 { << ctrl.canvas_width }
+    << 960
+}
+
+pub fn (ctrl &GameControl) resolved_height() int {
+    if ctrl.canvas_height > 0 { << ctrl.canvas_height }
+    << 640
+}
+
 pub fn (ctrl $&GameControl) close() {
     ctrl.active = false
+    ctrl.reject_screenshot("xacp: control closed")
+    if !ctrl.stopped {
+        ctrl.stopped = true
+        ctrl.stop <- 1
+        select {
+            pending := <-ctrl.jobs {
+                pending.reply <- GameReply{ok: false, err_code: "closed", err_msg: "xacp control closed", data: ""}
+            }
+            else {}
+        }
+        timer := time.new_timer(200 * time.millisecond())
+        select {
+            _ := <-ctrl.done {
+                timer.stop()
+            }
+            _ := <-timer.c {}
+        }
+    }
 }
 
 pub fn (ctrl &GameControl) is_paused() bool {

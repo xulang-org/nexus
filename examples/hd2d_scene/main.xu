@@ -1,0 +1,389 @@
+@main
+
+#app
+#gpu
+#window
+window_events #window/events
+
+gpu_info #"github.com/xulang-org/nexus/platform/gpu"
+mesh_shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+canvas_shaders #"github.com/xulang-org/nexus/assets/shaders/two_d"
+sprite_anim #"github.com/xulang-org/nexus/animation/sprite"
+colors #"github.com/xulang-org/nexus/foundation/color"
+fm #"github.com/xulang-org/nexus/foundation/math"
+controls #"github.com/xulang-org/nexus/input"
+app_host #"github.com/xulang-org/nexus/integration/application"
+phone_controls #"github.com/xulang-org/nexus/integration/phone_controls"
+viewport #"github.com/xulang-org/nexus/integration/viewport"
+light_bindings #"github.com/xulang-org/nexus/integration/lighting"
+scene_render #"github.com/xulang-org/nexus/integration/rendering/three_d"
+files #"github.com/xulang-org/nexus/integration/scene"
+light_files #"github.com/xulang-org/nexus/integration/scene_lighting"
+sprite_files #"github.com/xulang-org/nexus/integration/scene_sprites3d"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+ren2 #"github.com/xulang-org/nexus/rendering/two_d"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+light_data #"github.com/xulang-org/nexus/resources/lighting"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+shadows #"github.com/xulang-org/nexus/resources/shadow"
+nexus #"github.com/xulang-org/nexus/scene"
+#errors
+#math
+#os
+#strconv
+
+const HERO_X_LIMIT = 4
+const HERO_Z_LIMIT = 3
+
+struct Options {
+    path string
+    camera string
+    save string
+    capture string
+    shaders string
+    frames int
+    backend int
+    flip_hero bool
+    touch bool
+    autoplay bool
+}
+
+fn options() Options {
+    args := os.args()
+    $config := Options{
+        path: "examples/hd2d_scene/assets/world.xuscene",
+        camera: "CameraOrtho",
+        save: "",
+        capture: "",
+        shaders: "build/mesh-shaders",
+        frames: 0,
+        backend: gpu.AUTO,
+        flip_hero: false,
+        touch: app.is_hosted() || os.getenv("XU_PHONE_RESOURCE_ROOT").len > 0,
+        autoplay: false
+    }
+    if config.touch {
+        config.path = app_host.resolve_resource("map/world.xuscene", "build") or >>
+        config.shaders = app_host.resolve_resource("mesh", "build") or >>
+    }
+    $i := 1
+    while i < args.len {
+        if args[i] == "--flip-hero" {
+            config.flip_hero = true
+            i = i + 1
+            ->
+        }
+        if args[i] == "--touch" || args[i] == "--autoplay" {
+            config.touch = true
+            if args[i] == "--autoplay" { config.autoplay = true }
+            i = i + 1
+            ->
+        }
+        if i + 1 >= args.len { >> errors.new("missing option value") }
+        next := i + 1
+        if args[i] == "--scene" { config.path = args[next] + ""
+        } else if args[i] == "--camera" { config.camera = args[next] + ""
+        } else if args[i] == "--save" { config.save = args[next] + ""
+        } else if args[i] == "--shaders" { config.shaders = args[next] + ""
+        } else if args[i] == "--capture" { config.capture = args[next] + ""
+        } else if args[i] == "--frames" {
+            config.frames = strconv.atoi(&args[next]) or >>
+            if config.frames < 1 || config.frames > 1000000 { >> errors.new("invalid frames") }
+        } else if args[i] == "--backend" {
+            if args[next] == "metal" { config.backend = gpu.METAL
+            } else if args[next] == "vulkan" { config.backend = gpu.VULKAN
+            } else if args[next] == "d3d12" { config.backend = gpu.D3D12
+            } else if args[next] != "auto" { >> errors.new("unknown backend") }
+        } else { >> errors.new("unknown option: " + args[i]) }
+        i = i + 2
+    }
+    if config.capture.len > 0 && config.frames == 0 { >> errors.new("capture requires --frames") }
+    if config.autoplay && config.frames == 0 { >> errors.new("autoplay requires --frames") }
+    if config.camera != "CameraOrtho" && config.camera != "CameraPersp" { >> errors.new("unknown camera: " + config.camera) }
+    << config
+}
+
+fn box_mesh(sx f64, sy f64, sz f64, color int) meshes.MeshData3D {
+    hx := sx * 0.5
+    hy := sy * 0.5
+    hz := sz * 0.5
+    $mesh := meshes.new_mesh_data_3d()
+    // Top (+Y)
+    t0 := mesh.vertex_lit(fm.vec3(-hx, hy, hz), color, fm.vec3(0.0, 1.0, 0.0)) or >>
+    t1 := mesh.vertex_lit(fm.vec3(hx, hy, hz), color, fm.vec3(0.0, 1.0, 0.0)) or >>
+    t2 := mesh.vertex_lit(fm.vec3(hx, hy, -hz), color, fm.vec3(0.0, 1.0, 0.0)) or >>
+    t3 := mesh.vertex_lit(fm.vec3(-hx, hy, -hz), color, fm.vec3(0.0, 1.0, 0.0)) or >>
+    mesh.triangle(t0, t1, t2) or >>
+    mesh.triangle(t0, t2, t3) or >>
+    // Front (+Z)
+    f0 := mesh.vertex_lit(fm.vec3(-hx, -hy, hz), color, fm.vec3(0.0, 0.0, 1.0)) or >>
+    f1 := mesh.vertex_lit(fm.vec3(hx, -hy, hz), color, fm.vec3(0.0, 0.0, 1.0)) or >>
+    f2 := mesh.vertex_lit(fm.vec3(hx, hy, hz), color, fm.vec3(0.0, 0.0, 1.0)) or >>
+    f3 := mesh.vertex_lit(fm.vec3(-hx, hy, hz), color, fm.vec3(0.0, 0.0, 1.0)) or >>
+    mesh.triangle(f0, f1, f2) or >>
+    mesh.triangle(f0, f2, f3) or >>
+    // Right (+X)
+    r0 := mesh.vertex_lit(fm.vec3(hx, -hy, hz), color, fm.vec3(1.0, 0.0, 0.0)) or >>
+    r1 := mesh.vertex_lit(fm.vec3(hx, -hy, -hz), color, fm.vec3(1.0, 0.0, 0.0)) or >>
+    r2 := mesh.vertex_lit(fm.vec3(hx, hy, -hz), color, fm.vec3(1.0, 0.0, 0.0)) or >>
+    r3 := mesh.vertex_lit(fm.vec3(hx, hy, hz), color, fm.vec3(1.0, 0.0, 0.0)) or >>
+    mesh.triangle(r0, r1, r2) or >>
+    mesh.triangle(r0, r2, r3) or >>
+    // Left (-X)
+    l0 := mesh.vertex_lit(fm.vec3(-hx, -hy, -hz), color, fm.vec3(-1.0, 0.0, 0.0)) or >>
+    l1 := mesh.vertex_lit(fm.vec3(-hx, -hy, hz), color, fm.vec3(-1.0, 0.0, 0.0)) or >>
+    l2 := mesh.vertex_lit(fm.vec3(-hx, hy, hz), color, fm.vec3(-1.0, 0.0, 0.0)) or >>
+    l3 := mesh.vertex_lit(fm.vec3(-hx, hy, -hz), color, fm.vec3(-1.0, 0.0, 0.0)) or >>
+    mesh.triangle(l0, l1, l2) or >>
+    mesh.triangle(l0, l2, l3) or >>
+    << mesh
+}
+
+fn shadow_description(selection light_bindings.ShadowSelection3D, source light_data.Light3D,
+    view fm.Mat4, projection fm.Mat4, mobile bool) shadows.ShadowDescription3D {
+    if selection.cascades.enabled() {
+        camera := shadows.cascade_camera(view, projection) or >>
+        $settings := selection.cascades.settings() or >>
+        if mobile && settings.resolution > PHONE_SHADOW_RESOLUTION { settings.resolution = PHONE_SHADOW_RESOLUTION }
+        << shadows.cascaded(source, camera, settings) or >>
+    }
+    if mobile {
+        $settings := selection.punctual.settings() or >>
+        if settings.resolution > PHONE_SHADOW_RESOLUTION { settings.resolution = PHONE_SHADOW_RESOLUTION }
+        profile := shadows.punctual_profile(source, settings) or >>
+        << profile.description(source) or >>
+    }
+    << selection.punctual.description(source) or >>
+}
+
+fn run() int {
+    config := options() or >>
+    mesh_program := mesh_shaders.load_mesh(config.shaders + "") or >>
+    shadow_program := mesh_shaders.load_shadow(config.shaders + "") or >>
+    $window_options := window.Options{title: "Nexus Engine HD-2D 2.5D", width: 960, height: 640,
+        resizable: true, high_pixel_density: false, hidden: false}
+    if config.touch {
+        // The desktop touch preview is large enough to exercise the same pixel cap.
+        window_options.width = 768
+        window_options.height = 1360
+        window_options.high_pixel_density = true
+    }
+    $device := ren.open_3d_window(window_options, config.backend, &mesh_program) or >>
+    $overlays := []ren2.Overlay2D{}
+    if config.touch {
+        device.set_max_render_pixels(PHONE_RENDER_PIXELS) or >>
+        canvas_program := canvas_shaders.load_canvas(config.shaders + "") or >>
+        sdf_program := canvas_shaders.load_ui_sdf(config.shaders + "") or >>
+        overlays.push(ren2.open_overlay(device.present_session() or >>, &canvas_program, &sdf_program) or >>)
+    }
+    println("HD-2D GPU backend: " + gpu_info.backend_name(device.backend() or >>))
+
+    $sprite_set := sprite_files.load_sprites(&device, config.path + "") or >>
+    packed := files.to_packed_nodes(sprite_set.document()) or >>
+    $tree := nexus.new_scene_tree_3d("Root", 128) or >>
+    root := tree.root()
+    instance := packed.instantiate($&tree, root, "HD2D") or >>
+
+    $light_world := light_bindings.new_scene_lights_3d()
+    light_files.bind(sprite_set.document(), $&light_world, &tree, instance) or >>
+
+    $sprites := scene_render.new_scene_sprites_3d(&device) or >>
+    sprite_set.bind($&sprites, &tree, instance) or >>
+
+    // Procedural 3D PBR courtyard floor and raised stone step outside the saved subtree.
+    $scene := scene_render.new_scene_3d(&device) or >>
+    white := colors.rgba8(255, 255, 255, 255) or >>
+    floor_data := box_mesh(11.0, 0.4, 9.0, white) or >>
+    dais_data := box_mesh(3.2, 0.3, 2.0, white) or >>
+    $floor_mesh := device.upload(&floor_data) or >>
+    $dais_mesh := device.upload(&dais_data) or >>
+    floor_node := tree.add_child_3d(root, "CourtyardFloor") or >>
+    tree.set_position_3d(floor_node, fm.vec3(0.0, -0.2, 0.0)) or >>
+    dais_node := tree.add_child_3d(root, "StoneDais") or >>
+    tree.set_position_3d(dais_node, fm.vec3(0.0, -0.15, -1.6)) or >>
+    floor_mat := ren.material_3d(fm.vec3(0.28, 0.36, 0.25), 0.0, 0.88, fm.vec3(0.0, 0.0, 0.0)) or >>
+    dais_mat := ren.material_3d(fm.vec3(0.45, 0.43, 0.4), 0.0, 0.82, fm.vec3(0.0, 0.0, 0.0)) or >>
+    scene.attach_surface(&tree, floor_node, &floor_mesh, floor_mat) or >>
+    scene.attach_surface(&tree, dais_node, &dais_mesh, dais_mat) or >>
+
+    hero := tree.find_node(instance, "Hero") or >>
+    ortho_cam := tree.find_node(instance, "CameraOrtho") or >>
+    persp_cam := tree.find_node(instance, "CameraPersp") or >>
+    $active_cam := ortho_cam
+    if config.camera == "CameraPersp" { active_cam = persp_cam }
+    hero_spec := sprites.spec(hero) or >>
+    $hero_flip_x := hero_spec.flip_x
+    $checkpoint_path := ""
+    if config.touch && (app.is_hosted() || os.getenv("XU_PHONE_DATA_ROOT").len > 0) {
+        checkpoint_path = app_host.resolve_data("hd2d-v1.json", "build") or >>
+        authored := (tree.node_3d(hero) or >>).transform.c3.xyz()
+        checkpoint := load_phone_checkpoint(checkpoint_path + "", PhoneCheckpoint{x: authored.x, z: authored.z,
+            perspective: active_cam == persp_cam, flip_x: hero_flip_x, paused: tree.paused}) or >>
+        tree.set_position_3d(hero, fm.vec3(checkpoint.x, authored.y, checkpoint.z)) or >>
+        if checkpoint.perspective { active_cam = persp_cam } else { active_cam = ortho_cam }
+        hero_flip_x = checkpoint.flip_x
+        tree.paused = checkpoint.paused
+    }
+    if config.flip_hero {
+        hero_flip_x = !hero_flip_x
+    }
+    if hero_flip_x != hero_spec.flip_x {
+        sprites.set_region(hero, hero_spec.region, hero_flip_x, hero_spec.flip_y) or >>
+    }
+
+    clip := sprite_anim.new_atlas_animation(4, 1, 0, 4, 6.0, true) or >>
+    $animator := sprite_anim.new_sprite_animator(clip) or >>
+    for frame in 0:4 {
+        region := clip.region(frame) or >>
+        if region.position.x == hero_spec.region.position.x && region.position.y == hero_spec.region.position.y &&
+            region.size.x == hero_spec.region.size.x && region.size.y == hero_spec.region.size.y {
+            animator.seek_frame(frame) or >>
+            <-
+        }
+    }
+    $input := controls.new_input_map()
+    actions := ["left", "right", "up", "down", "pause", "toggle_cam"]
+    keys := [window_events.KEY_A, window_events.KEY_D, window_events.KEY_W, window_events.KEY_S,
+        window_events.KEY_SPACE, window_events.KEY_C]
+    for i in 0:actions.len {
+        input.bind(actions[i] + "", keys[i]) or >>
+        input.bind_source(actions[i] + "", i) or >>
+    }
+    input.bind("quit", window_events.KEY_ESCAPE) or >>
+    $host := app_host.new_app_host(60, 8, 1, 1) or >>
+    host.enable_back_handling() or >>
+    initial := viewport.from_window(device.window() or >>) or >>
+    $layout := phone_controls.layout(&initial, config.touch)
+    $touch := layout.controls() or >>
+    $hud := canvas.new_batch()
+    $shadow_maps := []ren.ShadowMap3D{}
+    background := colors.rgba8(18, 26, 42, 255) or >>
+    $frame := 0
+    while (config.frames == 0 || frame < config.frames) && (host.next_frame() or >>) {
+        step := host.begin_step(device.window() or >>, $&input, $&touch, now_ns()) or >>
+        if !step.running || (input.just_pressed("quit") or >>) || (step.back_requested && tree.paused) {
+            host.finish_step(true) or >>
+            <-
+        }
+        if !step.drawable {
+            host.finish_step(true) or >>
+            if !host.is_hosted() { sleep_ns(10000000) }
+            ->
+        }
+        view := &step.viewport
+        if step.layout_changed {
+            touch.cancel($&input) or >>
+            layout = phone_controls.layout(view, config.touch)
+            touch = layout.controls() or >>
+        }
+        if config.autoplay { autoplay_input($&input, $&touch, &layout, frame) or >> }
+        if step.resumed && config.touch { println("HD-2D resumed") }
+        if step.back_requested || (input.just_pressed("pause") or >>) {
+            tree.paused = !tree.paused
+            println("HD-2D paused=" + str(tree.paused))
+        }
+        if input.just_pressed("toggle_cam") or >> {
+            if active_cam == ortho_cam { active_cam = persp_cam } else { active_cam = ortho_cam }
+            println("HD-2D perspective=" + str(active_cam == persp_cam))
+        }
+        $ticks := host.finish_step(tree.paused) or >>
+        if config.frames > 0 && !tree.paused { ticks.steps = 1 }
+        for tick in 0:ticks.steps {
+            move := input.vector("left", "right", "up", "down") or >>
+            if move.x != 0.0 || move.y != 0.0 {
+                if move.x < -0.01 { hero_flip_x = true }
+                if move.x > 0.01 { hero_flip_x = false }
+                cur := (tree.node_3d(hero) or >>).transform.c3.xyz()
+                nx := math.max(-f64(HERO_X_LIMIT), math.min(f64(HERO_X_LIMIT), cur.x + move.x * 2.8 * ticks.fixed_delta))
+                nz := math.max(-f64(HERO_Z_LIMIT), math.min(f64(HERO_Z_LIMIT), cur.z + move.y * 2.8 * ticks.fixed_delta))
+                tree.set_position_3d(hero, fm.vec3(nx, cur.y, nz)) or >>
+            }
+            if config.frames == 0 || frame > 0 {
+                animator.advance(ticks.fixed_delta) or >>
+                sprites.set_region(hero, animator.region() or >>, hero_flip_x, hero_spec.flip_y) or >>
+            }
+        }
+        if config.touch && step.touch_ended {
+            pose := (tree.node_3d(hero) or >>).transform.c3.xyz()
+            x := strconv.format_float(pose.x, 102, 3) or >>
+            z := strconv.format_float(pose.z, 102, 3) or >>
+            println("HD-2D hero: " + x + "," + z)
+        }
+        aspect := view.aspect_ratio()
+        camera_world := tree.global_transform_3d(active_cam) or >>
+        camera_view := camera_world.affine_inverse() or >>
+        $projection := tree.camera_projection_3d(active_cam, aspect) or >>
+        if config.touch { projection = phone_projection(projection, aspect) }
+        vp := projection.multiply(camera_view)
+        eye := camera_world.c3.xyz()
+        $selection := light_bindings.no_shadow_selection()
+        sources := light_world.gather_with_shadows(&tree, $&selection) or >>
+        lighting := light_data.environment(fm.vec3(0.24, 0.27, 0.34), eye, 1.0, sources) or >>
+
+        $shadow_pixels := 0
+        if selection.source >= 0 {
+            shadow_source := lighting.source(selection.source) or >>
+            desc := shadow_description(selection, shadow_source, camera_view, projection, config.touch) or >>
+            shadow_pixels = desc.resolution()
+            if shadow_maps.len == 0 {
+                shadow_maps.push(device.shadow_map(desc, &shadow_program) or >>)
+            }
+            $casters := scene.shadow_casters(&tree) or >>
+            sprite_casters := sprites.shadow_casters(&tree, camera_world) or >>
+            for c in sprite_casters { casters.push(c) }
+            shadow := $&shadow_maps[0]
+            shadow.render(&device, &casters, desc) or >>
+        }
+
+        device.begin(background) or >>
+        if selection.source >= 0 {
+            scene.draw_lit_shadowed($&device, &tree, vp, &lighting, &shadow_maps[0], selection.source) or >>
+            sprites.draw_lit_shadowed($&device, &tree, camera_world, vp, &lighting, &shadow_maps[0], selection.source) or >>
+        } else {
+            scene.draw_lit($&device, &tree, vp, &lighting) or >>
+            sprites.draw_lit($&device, &tree, camera_world, vp, &lighting) or >>
+        }
+        if config.capture.len > 0 && frame + 1 == config.frames {
+            device.capture(config.capture + "") or >>
+        }
+        if config.touch {
+            phone_controls.record($&hud, &touch, &layout, view, tree.paused, active_cam == persp_cam) or >>
+            present_phone($&device, $&overlays[0], &hud) or >>
+            if frame == 0 {
+                println("HD-2D Phone frame: render=" + str(device.render_width() or >>) + "x" + str(device.render_height() or >>) +
+                    "; present=" + str(view.pixel_width) + "x" + str(view.pixel_height) + "; shadow=" + str(shadow_pixels))
+            }
+        } else { device.present() or >> }
+        frame += 1
+    }
+    if checkpoint_path.len > 0 {
+        pose := (tree.node_3d(hero) or >>).transform.c3.xyz()
+        checkpoint := PhoneCheckpoint{x: pose.x, z: pose.z, perspective: active_cam == persp_cam,
+            flip_x: hero_flip_x, paused: tree.paused}
+        persist_phone_checkpoint(checkpoint_path + "", checkpoint)
+    }
+    if config.save.len > 0 {
+        sprite_set.save(config.save + "", &sprites, &tree, instance) or >>
+    }
+    if overlays.len > 0 {
+        overlay := $&overlays[0]
+        overlay.close() or >>
+    }
+    for i in 0:shadow_maps.len {
+        s := $&shadow_maps[i]
+        s.close() or >>
+    }
+    sprites.close() or >>
+    sprite_set.close() or >>
+    floor_mesh.close() or >>
+    dais_mesh.close() or >>
+    device.close() or >>
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

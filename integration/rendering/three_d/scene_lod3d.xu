@@ -20,27 +20,24 @@ fn copy_lods(binding &MeshLods3D) MeshLods3D {
 pub struct LodSelection3D { pub nodes int
     pub changed int
     pub levels []int }
-// Non-owning, atomically installed levels. All meshes share the node's local
-// coordinate system and material; GPU owners must outlive every binding.
-pub fn (scene $&Scene3D) attach_lods(tree &nexus.SceneTree, node int, meshes []ren.MeshRef3D, policy &lod.DistanceLod) int {
+fn (scene &Scene3D) lod_binding_slot(tree &nexus.SceneTree, node int) int {
     info := tree.node_info(node) or >>
     if info.kind!=nexus.NODE_3D || info.queued_free { >> errors.new("nexus LOD: binding requires an editable Node3D") }
+    if scene.meshes.has(node) { << 0 }
+    if scene.count >= nexus.MAX_NODES { >> errors.new("nexus LOD: scene binding capacity exceeded") }
+    << 1
+}
+fn validate_lod_levels(meshes &[]ren.MeshRef3D, policy &lod.DistanceLod) int {
     policy.validate() or >>
     if meshes.len!=policy.level_count() { >> errors.new("nexus LOD: mesh count differs from policy levels") }
     $previous := -1
     for mesh in meshes {
-        if scene.materials.has(node) {
-            material := &scene.materials[node]
-            scene.owner.validate_material(mesh,material) or >>
-        } else { scene.owner.validate_mesh(mesh,false) or >> }
         if previous>=0 && mesh.triangle_count()>previous { >> errors.new("nexus LOD: coarser levels must not increase triangle count") }
         previous=mesh.triangle_count()
     }
-    $added := 0
-    if !scene.meshes.has(node) {
-        if scene.count>=nexus.MAX_NODES { >> errors.new("nexus LOD: scene binding capacity exceeded") }
-        added=1
-    }
+    << 0
+}
+fn (scene $&Scene3D) set_lod_binding(node int, meshes []ren.MeshRef3D, policy &lod.DistanceLod, added int) int {
     $thresholds := []f64{}
     for i in 0:policy.level_count()-1 { thresholds.push(policy.threshold(i) or >>) }
     saved := lod.distance_lod(thresholds,policy.hysteresis()) or >>
@@ -50,6 +47,33 @@ pub fn (scene $&Scene3D) attach_lods(tree &nexus.SceneTree, node int, meshes []r
     if policy.level_count()==1 { initial=0 }
     scene.lod_levels[node]=initial
     scene.set_mesh_binding(node,first,added)
+    << 0
+}
+// Non-owning levels share the node's coordinate system and current material.
+pub fn (scene $&Scene3D) attach_lods(tree &nexus.SceneTree, node int, meshes []ren.MeshRef3D, policy &lod.DistanceLod) int {
+    added := scene.lod_binding_slot(tree, node) or >>
+    validate_lod_levels(&meshes, policy) or >>
+    for mesh in meshes {
+        if scene.materials.has(node) {
+            material := &scene.materials[node]
+            scene.owner.validate_material(mesh, material) or >>
+        } else { scene.owner.validate_mesh(mesh, false) or >> }
+    }
+    << scene.set_lod_binding(node, meshes, policy, added) or >>
+}
+// Validate the replacement material on every level before changing any binding.
+pub fn (scene &Scene3D) check_lod_surface_binding(tree &nexus.SceneTree, node int, meshes &[]ren.MeshRef3D,
+    policy &lod.DistanceLod, material &ren.Material3D) int {
+    added := scene.lod_binding_slot(tree, node) or >>
+    validate_lod_levels(meshes, policy) or >>
+    for mesh in meshes { scene.owner.validate_material(mesh, material) or >> }
+    << added
+}
+pub fn (scene $&Scene3D) attach_lod_surface(tree &nexus.SceneTree, node int, meshes []ren.MeshRef3D,
+    policy &lod.DistanceLod, material ren.Material3D) int {
+    added := scene.check_lod_surface_binding(tree, node, &meshes, policy, &material) or >>
+    scene.set_lod_binding(node, meshes, policy, added) or >>
+    scene.materials[node] = material
     << 0
 }
 pub fn (scene &Scene3D) lod_level(node int) int {

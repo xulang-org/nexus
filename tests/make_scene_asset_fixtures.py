@@ -43,6 +43,51 @@ for name, source in [('bad-png','broken-png.glb'),('bad-basis','no-normal.glb')]
     write(name+'.xuscene',value)
 value=copy.deepcopy(alias);value['resources'][1]['sha256']='0'*64;write('late-hash.xuscene',value)
 value=copy.deepcopy(base);value['surfaces'][0]['primitive']=1;write('actual-primitive.xuscene',value)
+
+def coarse_variant(raw, has_uvs):
+    json_size = struct.unpack_from('<I', raw, 12)[0]
+    document = json.loads(raw[20:20 + json_size])
+    binary = raw[20 + json_size:]
+    primitive = document['meshes'][0]['primitives'][0]
+    document['accessors'][primitive['indices']]['count'] = 3
+    primitive.pop('material')
+    if not has_uvs:
+        primitive['attributes'].pop('TEXCOORD_0')
+        primitive['attributes'].pop('TANGENT')
+    encoded = json.dumps(document, separators=(',', ':')).encode()
+    encoded += b' ' * (-len(encoded) % 4)
+    return struct.pack('<III', 0x46546c67, 2, 20 + len(encoded) + len(binary)) + struct.pack('<I4s', len(encoded), b'JSON') + encoded + binary
+
+coarse_bytes = coarse_variant(base_bytes, True)
+(out / 'lod-coarse.glb').write_bytes(coarse_bytes)
+coarse = reference('lod-coarse.glb', coarse_bytes, uid2)
+level = dict(distance=2.123456789012345, resource=uid2, primitive=0)
+lod_profile = dict(hysteresis=.125, levels=[level])
+lod_scene = copy.deepcopy(base)
+lod_scene['version'] = 6
+lod_scene['nodes'].append(node(0, 'Camera', pos=(0, 0, 2)))
+lod_scene['resources'].append(coarse)
+lod_scene['surfaces'][0]['lod'] = lod_profile
+write('lod-authored.xuscene', lod_scene)
+far = copy.deepcopy(lod_scene)
+far['nodes'][2]['transform'][14] = 3.5
+write('lod-far.xuscene', far)
+
+bad_level = copy.deepcopy(lod_scene)
+bad_level['surfaces'][0]['lod']['levels'][0]['primitive'] = 1
+write('actual-lod-primitive.xuscene', bad_level)
+increasing = copy.deepcopy(lod_scene)
+increasing['surfaces'][0]['resource'] = uid2
+increasing['surfaces'][0]['lod']['levels'][0]['resource'] = uid
+write('lod-increasing.xuscene', increasing)
+untextured = coarse_variant(base_bytes, False)
+(out / 'lod-untextured.glb').write_bytes(untextured)
+incompatible = copy.deepcopy(lod_scene)
+incompatible['resources'][1] = reference('lod-untextured.glb', untextured, uid2)
+incompatible['nodes'].append(node(0, 'Second'))
+incompatible['surfaces'].insert(0, dict(node=3, resource=uid, primitive=0))
+write('lod-material.xuscene', incompatible)
+
 # Valid GLB unknown tail chunks count toward the aggregate source-read budget.
 large_resources=[]
 for i in range(3):
@@ -93,9 +138,27 @@ bad('unknown-resource',sprop('resource',uid2));bad('surface-null',lambda d:d['su
 bad('duplicate-surface',lambda d:d['surfaces'].append(copy.deepcopy(d['surfaces'][0])))
 for label,value in [('negative',-1),('outside',1024),('float',.5),('null',None)]:bad('primitive-'+label,sprop('primitive',value))
 bad('surface-extra',sprop('material',1));bad('surface-missing',lambda d:d['surfaces'][0].pop('node'))
-bad('version-future',lambda d:d.__setitem__('version',5))
-bad('unsupported-version',lambda d:d.__setitem__('version',5))
+bad('version-future',lambda d:d.__setitem__('version',7))
+bad('unsupported-version',lambda d:d.__setitem__('version',9))
 bad('too-many-resources',lambda d:d.__setitem__('resources',d['resources']*33))
 bad('too-many-surfaces',lambda d:d.__setitem__('surfaces',d['surfaces']*4097))
+bad('lod-old-version', sprop('lod', dict(hysteresis=.1, levels=[dict(level, resource=uid)])))
+for name, profile in [
+    ('null', None), ('empty', dict(hysteresis=.125, levels=[])), ('extra', dict(lod_profile, fallback=True)),
+    ('missing', dict(levels=[level])), ('hysteresis-high', dict(lod_profile, hysteresis=.5)),
+    ('hysteresis-negative', dict(lod_profile, hysteresis=-.1)), ('hysteresis-string', dict(lod_profile, hysteresis='.1')),
+    ('resource', dict(lod_profile, levels=[dict(level, resource='3'*32)])),
+    ('primitive', dict(lod_profile, levels=[dict(level, primitive=-1)])),
+    ('primitive-type', dict(lod_profile, levels=[dict(level, primitive=True)])),
+    ('distance-zero', dict(lod_profile, levels=[dict(level, distance=0)])),
+    ('distance-large', dict(lod_profile, levels=[dict(level, distance=1e9+1)])),
+    ('not-increasing', dict(lod_profile, levels=[level, level])),
+    ('too-many', dict(lod_profile, levels=[dict(level, distance=i+1) for i in range(8)])),
+]:
+    invalid = copy.deepcopy(lod_scene)
+    invalid['surfaces'][0]['lod'] = profile
+    name = 'lod-reject-' + name + '.xuscene'
+    write(name, invalid)
+    rejects.append(name)
 (out/'reject-list.txt').write_text('\n'.join(rejects)+'\n')
 print(f'Scene resource fixtures: {len(rejects)} strict rejects; original 10-node/8-surface pinned PBR gallery')

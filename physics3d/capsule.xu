@@ -1,0 +1,211 @@
+@"github.com/xulang-org/nexus/physics3d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const RAMP_POSITIVE_X = 1
+pub const RAMP_NEGATIVE_X = 2
+pub const RAMP_POSITIVE_Z = 3
+pub const RAMP_NEGATIVE_Z = 4
+
+pub struct Capsule3D {
+    pub center fm.Vec3
+    pub radius f64
+    pub half_segment f64
+}
+
+// An extruded triangular prism. The ramp rises from minimum.y to maximum.y
+// along the specified horizontal direction and spans the full other axis.
+pub struct StaticRamp3D {
+    pub bounds fm.Aabb3
+    pub direction int
+    pub layer int
+}
+
+fn contact_epsilon() f64 { << 0.000001 }
+
+fn capsule_aabb(body Capsule3D) fm.Aabb3 {
+    extent := fm.vec3(body.radius, body.radius + body.half_segment, body.radius)
+    << fm.Aabb3{minimum: body.center.sub(extent), maximum: body.center.add(extent)}
+}
+
+pub fn (body Capsule3D) bounds() fm.Aabb3 {
+    if !fm.finite(body.radius) || body.radius < 0.0001 || !fm.finite(body.half_segment) || body.half_segment < 0.0 {
+        >> errors.new("nexus physics3d: capsule requires radius >= 0.0001 and a nonnegative half segment")
+    }
+    box := capsule_aabb(body)
+    check_box(box) or >>
+    << box
+}
+
+pub fn capsule_3d(center fm.Vec3, radius f64, half_segment f64) Capsule3D {
+    body := Capsule3D{center: center, radius: radius, half_segment: half_segment}
+    body.bounds() or >>
+    << body
+}
+
+fn advance_capsule(body Capsule3D, motion fm.Vec3) Capsule3D {
+    << Capsule3D{center: body.center.add(motion), radius: body.radius, half_segment: body.half_segment}
+}
+
+fn ramp_along_x(direction int) bool { << direction == RAMP_POSITIVE_X || direction == RAMP_NEGATIVE_X }
+
+fn check_ramp(ramp StaticRamp3D) int {
+    check_box(ramp.bounds) or >>
+    if ramp.direction < RAMP_POSITIVE_X || ramp.direction > RAMP_NEGATIVE_Z {
+        >> errors.new("nexus physics3d: invalid ramp direction")
+    }
+    size := ramp.bounds.maximum.sub(ramp.bounds.minimum)
+    $run := size.z
+    if ramp_along_x(ramp.direction) { run = size.x }
+    if run < 0.0001 || size.y < 0.0001 { >> errors.new("nexus physics3d: ramp run and rise must be >= 0.0001") }
+    << 0
+}
+
+// Extruding a convex static shape by the capsule's central segment reduces
+// the query to the distance from its center to that extruded shape.
+struct CapsuleHull {
+    bounds fm.Aabb3
+    direction int
+    low_roof f64
+}
+
+fn capsule_hull(box fm.Aabb3, direction int, half_segment f64) CapsuleHull {
+    extent := fm.vec3(0.0, half_segment, 0.0)
+    << CapsuleHull{bounds: fm.Aabb3{minimum: box.minimum.sub(extent), maximum: box.maximum.add(extent)},
+        direction: direction, low_roof: box.minimum.y + half_segment}
+}
+
+fn clamp_value(value f64, lower f64, upper f64) f64 { << math.max(lower, math.min(upper, value)) }
+
+fn closest_on_segment(point fm.Vec2, start fm.Vec2, end fm.Vec2) fm.Vec2 {
+    edge := end.sub(start)
+    length2 := edge.dot(edge)
+    if length2 == 0.0 { << start }
+    factor := clamp_value(point.sub(start).dot(edge) / length2, 0.0, 1.0)
+    << start.add(edge.scaled(factor))
+}
+
+fn ramp_section_delta(point fm.Vec2, run f64, bottom f64, low f64, high f64) fm.Vec2 {
+    if point.x >= 0.0 && point.x <= run && point.y >= bottom &&
+        point.y <= low + (high - low) * (point.x / run) {
+        << fm.vec2(0.0, 0.0)
+    }
+    corners := [fm.vec2(0.0, bottom), fm.vec2(run, bottom), fm.vec2(run, high), fm.vec2(0.0, low)]
+    $best := point.sub(corners[0])
+    for i in 0:4 {
+        closest := closest_on_segment(point, corners[i], corners[(i + 1) % 4])
+        delta := point.sub(closest)
+        if delta.dot(delta) < best.dot(best) { best = delta }
+    }
+    << best
+}
+
+fn hull_delta(point fm.Vec3, hull CapsuleHull) fm.Vec3 {
+    low := hull.bounds.minimum
+    high := hull.bounds.maximum
+    dx := point.x - clamp_value(point.x, low.x, high.x)
+    dy := point.y - clamp_value(point.y, low.y, high.y)
+    dz := point.z - clamp_value(point.z, low.z, high.z)
+    if hull.direction == 0 { << fm.vec3(dx, dy, dz) }
+    negative := hull.direction == RAMP_NEGATIVE_X || hull.direction == RAMP_NEGATIVE_Z
+    along_x := ramp_along_x(hull.direction)
+    $along := point.z - low.z
+    $run := high.z - low.z
+    if along_x {
+        along = point.x - low.x
+        run = high.x - low.x
+    }
+    if negative { along = run - along }
+    delta := ramp_section_delta(fm.vec2(along, point.y - low.y), run, 0.0,
+        hull.low_roof - low.y, high.y - low.y)
+    $across := delta.x
+    if negative { across = -across }
+    if along_x { << fm.vec3(across, delta.y, dz) }
+    << fm.vec3(dx, delta.y, across)
+}
+
+fn capsule_miss() SweepHit3D {
+    << SweepHit3D{hit: false, time: 1.0, normal: zero(), started_overlapping: false}
+}
+
+fn capsule_contact(time f64, separation fm.Vec3) SweepHit3D {
+    normal := separation.normalized() or >>
+    << SweepHit3D{hit: true, time: time, normal: normal, started_overlapping: false}
+}
+
+fn separation_at(body Capsule3D, motion fm.Vec3, time f64, hull CapsuleHull) fm.Vec3 {
+    << hull_delta(body.center.add(motion.scaled(time)), hull)
+}
+
+fn sweep_hull(body Capsule3D, motion fm.Vec3, hull CapsuleHull) SweepHit3D {
+    origin := body.center
+    bounds := hull.bounds
+    r := body.radius
+    x := slab(origin.x - r, origin.x + r, bounds.minimum.x, bounds.maximum.x, motion.x, true)
+    y := slab(origin.y - r, origin.y + r, bounds.minimum.y, bounds.maximum.y, motion.y, true)
+    z := slab(origin.z - r, origin.z + r, bounds.minimum.z, bounds.maximum.z, motion.z, true)
+    entry := math.max(0.0, math.max(x.entry, math.max(y.entry, z.entry)))
+    exit := math.min(1.0, math.min(x.exit, math.min(y.exit, z.exit)))
+    if x.separated || y.separated || z.separated || entry > exit { << capsule_miss() }
+
+    initial := separation_at(body, motion, entry, hull)
+    epsilon := contact_epsilon()
+    inner := (r - epsilon) * (r - epsilon)
+    outer := (r + epsilon) * (r + epsilon)
+    if entry == 0.0 && initial.dot(initial) < inner {
+        << SweepHit3D{hit: true, time: 0.0, normal: zero(), started_overlapping: true}
+    }
+    speed := math.max(math.abs(motion.x), math.max(math.abs(motion.y), math.abs(motion.z)))
+    if speed == 0.0 { << capsule_miss() }
+    // A flat or departing distance curve cannot enter the rounded hull.
+    // Use a spatial tolerance here so long, shallow approaches still hit.
+    derivative_tolerance := r * epsilon * 0.01
+    if motion.dot(initial) >= -derivative_tolerance { << capsule_miss() }
+    if initial.dot(initial) <= outer { << capsule_contact(entry, initial) or >> }
+
+    end := separation_at(body, motion, exit, hull)
+    radius2 := r * r
+    $upper := exit
+    // The squared distance to a convex shape is convex along the motion.
+    // If the end is outside, locate its minimum before looking for entry.
+    if end.dot(end) >= inner {
+        if motion.dot(end) < -derivative_tolerance {
+            if end.dot(end) <= outer { << capsule_contact(exit, end) or >> }
+            << capsule_miss()
+        }
+        $lower := entry
+        for i in 0:56 {
+            mid := lower + (upper - lower) * 0.5
+            delta := separation_at(body, motion, mid, hull)
+            if motion.dot(delta) < 0.0 { lower = mid }
+            else { upper = mid }
+        }
+        minimum := separation_at(body, motion, upper, hull)
+        if minimum.dot(minimum) >= inner { << capsule_miss() }
+    }
+    $safe := entry
+    for i in 0:56 {
+        if (upper - safe) * speed < epsilon * 0.125 { <- }
+        mid := safe + (upper - safe) * 0.5
+        delta := separation_at(body, motion, mid, hull)
+        if delta.dot(delta) < radius2 { upper = mid }
+        else { safe = mid }
+    }
+    << capsule_contact(safe, separation_at(body, motion, safe, hull)) or >>
+}
+
+pub fn sweep_capsule_box(body Capsule3D, motion fm.Vec3, solid fm.Aabb3) SweepHit3D {
+    body.bounds() or >>
+    advance_capsule(body, motion).bounds() or >>
+    check_box(solid) or >>
+    << sweep_hull(body, motion, capsule_hull(solid, 0, body.half_segment)) or >>
+}
+
+pub fn sweep_capsule_ramp(body Capsule3D, motion fm.Vec3, ramp StaticRamp3D) SweepHit3D {
+    body.bounds() or >>
+    advance_capsule(body, motion).bounds() or >>
+    check_ramp(ramp) or >>
+    << sweep_hull(body, motion, capsule_hull(ramp.bounds, ramp.direction, body.half_segment)) or >>
+}

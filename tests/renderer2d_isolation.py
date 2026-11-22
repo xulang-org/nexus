@@ -12,7 +12,8 @@ with tempfile.TemporaryDirectory(prefix='xu-nexus-render-isolation-') as tempora
                  'internal/file_snapshot', 'assets/shaders/two_d', 'build/canvas-shaders'):
         shutil.copytree(ROOT / name, target / name)
     (target / 'checks').mkdir()
-    (target / 'checks/xu.xun').write_text('module: example/renderer_isolation\nversion: !ver 0.1.0\nxu: !ver 0.12.3\nrequire:\n  "github.com/xulang-org/nexus": file:..\n')
+    sdk = next(line for line in (ROOT / 'xu.xun').read_text().splitlines() if line.startswith('xu:'))
+    (target / 'checks/xu.xun').write_text('module: example/renderer_isolation\nversion: !ver 0.1.0\n' + sdk + '\nrequire:\n  "github.com/xulang-org/nexus": file:..\n')
     main = target / 'checks/main.xu'
     shutil.copyfile(ROOT / 'tests/canvas_gpu_checks.xu', main)
     assert not list(target.glob('*.xu'))

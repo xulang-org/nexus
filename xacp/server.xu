@@ -3,6 +3,7 @@
 scene #"github.com/xulang-org/nexus/scene"
 controls #"github.com/xulang-org/nexus/input"
 #encoding/xun
+#net
 #os
 #strconv
 #strings
@@ -12,10 +13,42 @@ controls #"github.com/xulang-org/nexus/input"
 struct FrameReader {
     fd int
     remainder string
+    stop chan int
+    stopped bool
 }
 
-fn new_frame_reader(fd int) FrameReader {
-    << FrameReader{fd: fd, remainder: ""}
+fn new_frame_reader(fd int, stop chan int) FrameReader {
+    << FrameReader{fd: fd, remainder: "", stop: stop, stopped: false}
+}
+
+fn should_stop(stop chan int) bool {
+    select {
+        _ := <-stop { << true }
+        else {}
+    }
+    << false
+}
+
+fn tokens_equal(a &string, b &string) bool {
+    if a.len != b.len { << false }
+    $diff := 0
+    for i in 0:a.len {
+        diff = diff | ((a[i] & 255) ^ (b[i] & 255))
+    }
+    << diff == 0
+}
+
+fn (r $&FrameReader) wait_readable() int {
+    while true {
+        if should_stop(r.stop) {
+            r.stopped = true
+            >> errors.new("xacp: stopped")
+        }
+        ready := os.socket_poll(r.fd, 1) or >>
+        if ready != 0 { << 0 }
+        time.sleep(2000000)
+    }
+    << 0
 }
 
 fn (r $&FrameReader) read_line() string {
@@ -29,6 +62,7 @@ fn (r $&FrameReader) read_line() string {
             }
             << line
         }
+        r.wait_readable() or >>
         chunk := os.socket_read(r.fd, 4096) or >>
         if chunk.len == 0 {
             >> errors.new("EOF")
@@ -39,6 +73,7 @@ fn (r $&FrameReader) read_line() string {
 
 fn (r $&FrameReader) read_bytes(count int) string {
     while r.remainder.len < count {
+        r.wait_readable() or >>
         chunk := os.socket_read(r.fd, 4096) or >>
         if chunk.len == 0 {
             >> errors.new("EOF")
@@ -78,53 +113,83 @@ fn write_frame(fd int, body string) int {
     << 0
 }
 
-fn run_peer_session(peer int, jobs chan GameJob) int {
-    $reader := new_frame_reader(peer)
-    expected_token := os.getenv("XU_XACP_TOKEN")
-    $perms := 31
-    $perm_label := "development"
+fn write_error_frame(fd int, id int, code string, msg string) int {
+    res := "id: !i " + str(id) + "\n" +
+        "ok: !b false\n" +
+        "error:\n" +
+        "  code: " + code + "\n" +
+        "  msg: " + quote_xun_string(&msg) + "\n"
+    << write_frame(fd, res) or >>
+}
+
+// Returns 1 if interrupted by control shutdown, 0 on normal disconnect/EOF.
+fn run_peer_session(peer int, expected_token string, jobs chan GameJob, stop chan int) int {
+    $reader := new_frame_reader(peer, stop)
+    requires_token := expected_token.len > 0
+    $authenticated := !requires_token
+    $perms := 0
+    $perm_label := "none"
+    if authenticated {
+        perms = 31
+        perm_label = "development"
+    }
 
     while true {
         body := reader.read_frame() or (err) {
+            if reader.stopped { << 1 }
             << 0
         }
         doc := xun.parse(&body)
         if !doc.ok() {
-            err_frame := "id: !i 0\nok: !b false\nerror:\n  code: frame_error\n  msg: \"invalid XUN body\"\n"
-            write_frame(peer, err_frame) or (err) { << 0 }
+            write_error_frame(peer, 0, "frame_error", "invalid XUN body") or (err) { << 0 }
             ->
         }
         root := doc.root()
-        req_id := doc.as_int(doc.get(root, "id"))
-        req_op := doc.text(doc.get(root, "op"))
+        id_node := doc.get(root, "id")
+        op_node := doc.get(root, "op")
+        if id_node < 0 || op_node < 0 {
+            write_error_frame(peer, 0, "frame_error", "missing id or op") or (err) { << 0 }
+            ->
+        }
+        req_id := doc.as_int(id_node)
+        req_op := doc.text(op_node)
         req_args := doc.get(root, "args")
 
         if req_op == "xacp.hello" {
-            nonce := doc.text(doc.get(req_args, "nonce"))
-            token_node := doc.get(req_args, "token")
+            $nonce := ""
             $client_token := ""
-            if token_node >= 0 { client_token = doc.text(token_node) }
+            if req_args >= 0 {
+                nonce_node := doc.get(req_args, "nonce")
+                if nonce_node >= 0 { nonce = doc.text(nonce_node) }
+                token_node := doc.get(req_args, "token")
+                if token_node >= 0 { client_token = doc.text(token_node) }
+            }
 
-            if expected_token.len > 0 {
-                if client_token != expected_token {
-                    err_frame := "id: !i " + str(req_id) + "\nok: !b false\nerror:\n  code: auth_failed\n  msg: \"invalid token\"\n"
-                    write_frame(peer, err_frame) or (err) { << 0 }
+            if requires_token {
+                if !tokens_equal(&client_token, &expected_token) {
+                    write_error_frame(peer, req_id, "auth_failed", "invalid token") or (err) { << 0 }
                     << 0
                 }
-                perms = 31
-                perm_label = "development"
             }
+            authenticated = true
+            perms = 31
+            perm_label = "development"
 
             hello_res := "id: !i " + str(req_id) + "\n" +
                 "ok: !b true\n" +
                 "data:\n" +
                 "  ver: !ver 1.0.0\n" +
-                "  nonce: \"" + nonce + "\"\n" +
+                "  nonce: " + quote_xun_string(&nonce) + "\n" +
                 "  permissions: !i " + str(perms) + "\n" +
-                "  permission_label: \"" + perm_label + "\"\n" +
+                "  permission_label: " + quote_xun_string(&perm_label) + "\n" +
                 "  target: \"nexus\"\n" +
                 "  engine: \"github.com/xulang-org/nexus\"\n"
             write_frame(peer, hello_res) or (err) { << 0 }
+            ->
+        }
+
+        if requires_token && !authenticated {
+            write_error_frame(peer, req_id, "auth_required", "xacp.hello authentication required") or (err) { << 0 }
             ->
         }
 
@@ -138,6 +203,7 @@ fn run_peer_session(peer int, jobs chan GameJob) int {
             ->
         }
 
+        if should_stop(stop) { << 1 }
         reply_chan := chan GameReply{cap: 1}
         jobs <- GameJob{
             id: req_id,
@@ -147,7 +213,15 @@ fn run_peer_session(peer int, jobs chan GameJob) int {
             reply: reply_chan
         }
 
-        reply := <-reply_chan
+        $reply := GameReply{ok: false, err_code: "closed", err_msg: "xacp control closed", data: ""}
+        select {
+            r := <-reply_chan {
+                reply = r
+            }
+            _ := <-stop {
+                << 1
+            }
+        }
         if reply.ok {
             res := "id: !i " + str(req_id) + "\n" +
                 "ok: !b true\n" +
@@ -155,61 +229,85 @@ fn run_peer_session(peer int, jobs chan GameJob) int {
                 reply.data
             write_frame(peer, res) or (err) { << 0 }
         } else {
-            res := "id: !i " + str(req_id) + "\n" +
-                "ok: !b false\n" +
-                "error:\n" +
-                "  code: " + reply.err_code + "\n" +
-                "  msg: \"" + reply.err_msg + "\"\n"
-            write_frame(peer, res) or (err) { << 0 }
+            write_error_frame(peer, req_id, reply.err_code, reply.err_msg) or (err) { << 0 }
         }
     }
     << 0
 }
 
-fn tcp_server_worker(port int, jobs chan GameJob, done chan int) int {
-    listener := os.socket(2, 1, 0) or (err) {
-        done <- 1
-        << 1
-    }
-    os.bind4(listener, 127, 0, 0, 1, port) or (err) {
-        os.socket_close(listener) or (ce) { << 1 }
-        done <- 1
-        << 1
-    }
-    os.listen(listener, 8) or (err) {
-        os.socket_close(listener) or (ce) { << 1 }
-        done <- 1
-        << 1
-    }
-
+fn tcp_server_worker(lfd int, expected_token string, jobs chan GameJob, stop chan int, done chan int) int {
     while true {
-        peer := os.accept(listener) or (err) {
-            os.socket_close(listener) or (ce) { << 1 }
-            done <- 1
-            << 1
+        if should_stop(stop) { <- }
+        ready := os.socket_poll(lfd, 1) or (err) { <- }
+        if ready == 0 {
+            time.sleep(2000000)
+            ->
         }
-        _ := run_peer_session(peer, jobs)
-        os.socket_close(peer) or (ce) { << 1 }
+        peer := net.accept(lfd) or (err) { <- }
+        session_rc := run_peer_session(peer, expected_token + "", jobs, stop)
+        os.socket_close(peer) or (ce) {
+            if session_rc != 0 { <- }
+            ->
+        }
+        if session_rc != 0 { <- }
     }
+    _ := os.socket_close(lfd) or (ce) { << 0 }
+    done <- 1
     << 0
 }
 
-pub fn attach_tcp(port int) GameControl {
+fn parse_bound_port(addr &string, fallback int) int {
+    idx := strings.last_index_byte(addr, 58)
+    if idx < 0 || idx + 1 >= addr.len { << fallback }
+    tail := addr[idx + 1:addr.len]
+    parsed := strconv.atoi(&tail) or (err) { << fallback }
+    << parsed
+}
+
+fn attach_tcp_internal(port int, expected_token string) GameControl {
+    if port < 0 || port > 65535 {
+        << inactive()
+    }
+    lfd := net.listen("127.0.0.1:" + str(port)) or (err) {
+        << inactive()
+    }
+    $actual_port := port
+    if actual_port == 0 {
+        raw_addr := os.getsockname(lfd) or (err) {
+            _ := os.socket_close(lfd) or (ce) { << inactive() }
+            << inactive()
+        }
+        bound_addr := net.unpack_sockaddr(raw_addr)
+        actual_port = parse_bound_port(&bound_addr, port)
+    }
     jobs := chan GameJob{cap: 1}
     done := chan int{cap: 1}
+    stop := chan int{cap: 1}
     dummy_reply := chan GameReply{cap: 1}
     dummy_job := GameJob{id: 0, op: "", body: "", permissions: 0, reply: dummy_reply}
-    xu tcp_server_worker(port, jobs, done)
+    xu tcp_server_worker(lfd, expected_token + "", jobs, stop, done)
     << GameControl{
         jobs: jobs,
         done: done,
+        stop: stop,
+        stopped: false,
         active: true,
         paused: false,
         steps_remaining: 0,
-        port: port,
+        port: actual_port,
+        canvas_width: 960,
+        canvas_height: 640,
         has_screenshot_job: false,
         screenshot_job: dummy_job
     }
+}
+
+pub fn attach_tcp(port int) GameControl {
+    << attach_tcp_internal(port, os.getenv("XU_XACP_TOKEN"))
+}
+
+pub fn attach_tcp_with_token(port int, token string) GameControl {
+    << attach_tcp_internal(port, token + "")
 }
 
 pub fn (ctrl $&GameControl) poll(tree $&scene.SceneTree, input $&controls.InputMap) bool {

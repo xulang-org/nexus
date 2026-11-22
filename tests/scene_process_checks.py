@@ -11,12 +11,14 @@ root = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='xu-nexus-scene-isolation-') as directory:
     target = Path(directory)
     shutil.copyfile(root / 'xu.xun', target / 'xu.xun')
-    for package in ['scene', 'foundation/math', 'resources/camera', 'resources/scene','resources/lighting','resources/shadow', 'formats/scene', 'internal/file_snapshot', 'integration/scene']:
+    for package in ['scene', 'foundation/math', 'resources/camera', 'resources/scene','resources/lod','resources/lighting','resources/shadow',
+                    'resources/sprite3d', 'resources/tilemap', 'formats/scene', 'internal/file_snapshot', 'integration/scene']:
         shutil.copytree(root / package, target / package)
     check = target / 'checks'
     check.mkdir()
     shutil.copyfile(root / 'tests/scene_process_cli.xu', check / 'main.xu')
-    (check / 'xu.xun').write_text('module: example/scene_isolation\nversion: !ver 0.1.0\nxu: !ver 0.12.3\nrequire:\n  "github.com/xulang-org/nexus": file:..\n')
+    sdk = next(line for line in (root / 'xu.xun').read_text().splitlines() if line.startswith('xu:'))
+    (check / 'xu.xun').write_text('module: example/scene_isolation\nversion: !ver 0.1.0\n' + sdk + '\nrequire:\n  "github.com/xulang-org/nexus": file:..\n')
     binary = target / 'scene-cli'
     subprocess.run([os.environ.get('XU','xu'), 'build', str(check / 'main.xu'), '-o', str(binary)], cwd=target, check=True, timeout=60)
     assert not (target / 'rendering').exists() and not (target / 'platform').exists()

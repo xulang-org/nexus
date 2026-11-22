@@ -1,0 +1,97 @@
+@"github.com/xulang-org/nexus/resources/scene"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+tilemap #"github.com/xulang-org/nexus/resources/tilemap"
+#errors
+
+pub const MAX_SCENE_TILEMAPS_2D = 64
+
+pub struct TileMap2DAttachment {
+    pub node int
+    pub resource_uid string
+    pub z_index int
+    pub y_sort_cells bool
+    pub y_offset f64
+    pub pixel_art bool
+    pub grid tilemap.TileMap2D
+}
+
+pub fn tilemap_2d_attachment(node int, resource_uid string, z_index int, y_sort_cells bool,
+    y_offset f64, pixel_art bool, grid tilemap.TileMap2D) TileMap2DAttachment {
+    << TileMap2DAttachment{
+        node: node,
+        resource_uid: resource_uid,
+        z_index: z_index,
+        y_sort_cells: y_sort_cells,
+        y_offset: y_offset,
+        pixel_art: pixel_art,
+        grid: grid
+    }
+}
+
+fn validate_tilemaps_2d(document &Document, tilemaps &[]TileMap2DAttachment, kinds &map[string]string, used $&map[string]bool) int {
+    if tilemaps.len > MAX_SCENE_TILEMAPS_2D {
+        >> errors.new("nexus scene: TileMap2D attachment count exceeds 64")
+    }
+    $occupied := map[int]bool{}
+    for item in tilemaps {
+        uid := item.resource_uid + ""
+        if item.node < 0 || item.node >= document.nodes.len || document.nodes[item.node].kind != NODE_2D ||
+            occupied.has(item.node) {
+            >> errors.new("nexus scene: TileMap2D requires a unique Node2D index")
+        }
+        if !kinds.has(uid + "") || kinds[uid + ""] != "image_rgba" {
+            >> errors.new("nexus scene: TileMap2D requires an image_rgba resource")
+        }
+        if item.z_index < -1000000 || item.z_index > 1000000 || !fm.finite(item.y_offset) {
+            >> errors.new("nexus scene: invalid TileMap2D z_index or y_offset")
+        }
+        item.grid.validate() or >>
+        occupied[item.node] = true
+        used[uid] = true
+    }
+    << 0
+}
+
+pub fn (document &Document) tilemap_2d_count() int { << document.tilemaps_2d.len }
+
+pub fn (document &Document) has_solid_tiles_2d() bool {
+    for item in document.tilemaps_2d {
+        if item.grid.solid_tile_count() > 0 { << true }
+    }
+    << false
+}
+
+pub fn (document &Document) tilemap_2d(index int) TileMap2DAttachment {
+    if index < 0 || index >= document.tilemaps_2d.len {
+        >> errors.new("nexus scene: TileMap2D index outside document")
+    }
+    saved := &document.tilemaps_2d[index]
+    << TileMap2DAttachment{
+        node: saved.node,
+        resource_uid: saved.resource_uid + "",
+        z_index: saved.z_index,
+        y_sort_cells: saved.y_sort_cells,
+        y_offset: saved.y_offset,
+        pixel_art: saved.pixel_art,
+        grid: saved.grid.clone() or >>
+    }
+}
+
+pub fn with_tilemaps_2d(document &Document, references []ResourceReference, tilemaps []TileMap2DAttachment) Document {
+    $surfaces := []Surface{}
+    $buses := []AudioBus{}
+    $emitters := []AudioEmitter{}
+    $scripts := []ScriptAttachment{}
+    $connections := []ScriptConnection{}
+    $lights := []LightAttachment{}
+    $sprites := []Sprite3DAttachment{}
+    for i in 0:document.surface_count() { surfaces.push(document.surface(i) or >>) }
+    for i in 0:document.audio_bus_count() { buses.push(document.audio_bus(i) or >>) }
+    for i in 0:document.audio_count() { emitters.push(document.audio_emitter(i) or >>) }
+    for i in 0:document.script_count() { scripts.push(document.script(i) or >>) }
+    for i in 0:document.script_connection_count() { connections.push(document.script_connection(i) or >>) }
+    for i in 0:document.light_count() { lights.push(document.light(i) or >>) }
+    for i in 0:document.sprite_3d_count() { sprites.push(document.sprite_3d(i) or >>) }
+    << with_all_attachments(document, references, surfaces, buses, emitters, scripts, connections, lights, sprites, tilemaps) or >>
+}

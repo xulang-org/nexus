@@ -1,0 +1,73 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+scene #"github.com/xulang-org/nexus/scene"
+models3d #"github.com/xulang-org/nexus/integration/scene_render"
+world3d #"github.com/xulang-org/nexus/integration/rendering/three_d"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+#gpu
+#math
+
+fn overlapping(device &ren.Device3D) int {
+    $models := models3d.load(device, "build/scene-asset-fixtures/sharing.xuscene") or >>
+    $world := world3d.new_scene_3d(device) or >>
+    $tree := scene.new_scene_tree_3d("Test", 16) or >>
+    parent := tree.root()
+    root := models.instantiate($&world, $&tree, parent, "Overlap") or >>
+    back := tree.find_child(root, "Panel") or >>
+    front := tree.find_child(root, "Second") or >>
+    picker := models.picker(&tree, root) or >>
+    mirrored := fm.translation_3d(fm.vec3(0.0, 0.0, 1.0)).multiply(fm.scale_3d(fm.vec3(-1.25, 0.75, 1.0)))
+    tree.set_transform_3d(front, mirrored) or >>
+    origin := fm.vec3(0.0, 0.0, 5.0)
+    direction := fm.vec3(0.0, 0.0, -2.0)
+    first := picker.pick(&world, &tree, origin, direction, 0.1, 10.0) or >>
+    assert(first.node == front && math.abs(first.distance - 3.5) < 0.000001)
+    clipped := picker.pick(&world, &tree, origin, direction, 3.9, 10.0) or >>
+    assert(clipped.node == back && math.abs(clipped.distance - 4.5) < 0.000001)
+    assert((picker.pick(&world, &tree, origin, direction, 0.1, 3.0) or >>).node == 0)
+    assert((picker.pick(&world, &tree, fm.vec3(0.0, 0.0, -3.0), fm.vec3(0.0, 0.0, 1.0), 0.1, 10.0) or >>).node == 0)
+    tree.set_visible(front, false) or >>
+    assert((picker.pick(&world, &tree, origin, direction, 0.1, 10.0) or >>).node == back)
+    tree.set_visible(root, false) or >>
+    assert((picker.pick(&world, &tree, origin, direction, 0.1, 10.0) or >>).node == 0)
+    models.close() or >>
+    << 0
+}
+
+fn lod(device &ren.Device3D) int {
+    $models := models3d.load(device, "build/scene-asset-fixtures/lod-authored.xuscene") or >>
+    $world := world3d.new_scene_3d(device) or >>
+    $tree := scene.new_scene_tree_3d("Test", 16) or >>
+    parent := tree.root()
+    root := models.instantiate($&world, $&tree, parent, "LOD") or >>
+    panel := tree.find_child(root, "Panel") or >>
+    picker := models.picker(&tree, root) or >>
+    direction := fm.vec3(0.0, 0.0, -1.0)
+    upper_left := fm.vec3(-0.45, 0.45, 5.0)
+    lower_right := fm.vec3(0.45, -0.45, 5.0)
+    world.select_lods(&tree, fm.vec3(0.0, 0.0, 1.0)) or >>
+    assert((world.lod_level(panel) or >>) == 0)
+    assert((picker.pick(&world, &tree, upper_left, direction, 0.0, 10.0) or >>).node == panel)
+    world.select_lods(&tree, fm.vec3(0.0, 0.0, 5.0)) or >>
+    assert((world.lod_level(panel) or >>) == 1)
+    // Both rays enter the mesh AABB. Only one meets the remaining triangle.
+    assert((picker.pick(&world, &tree, upper_left, direction, 0.0, 10.0) or >>).node == 0)
+    assert((picker.pick(&world, &tree, lower_right, direction, 0.0, 10.0) or >>).node == panel)
+    models.close() or >>
+    << 0
+}
+
+fn run() int {
+    program := shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d("Nexus picker regression", 360, 240, gpu.AUTO, &program) or >>
+    overlapping(&device) or >>
+    lod(&device) or >>
+    device.close() or >>
+    println("PASS: nearest GLB triangle, mirror transform, inherited visibility, clip range and active LOD")
+    << 0
+}
+
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

@@ -4,7 +4,8 @@ fm #"github.com/xulang-org/nexus/foundation/math"
 #errors
 light_data #"github.com/xulang-org/nexus/resources/lighting"
 
-// Linear RGB inputs. Opaque direct-light metallic/roughness model.
+// Linear RGB inputs. Direct-light metallic/roughness model with optional alpha cutout,
+// atlas UV sub-region/flip, and unlit textured mode for 2.5D / HD-2D sprites.
 pub struct Material3D {
     base fm.Vec3
     metallic f64
@@ -19,6 +20,11 @@ pub struct Material3D {
     occlusion_texture TextureRef3D
     occlusion_texture_strength f64
     surface_mode int
+    alpha_cutoff f64
+    uv_region fm.Rect2
+    flip_u bool
+    flip_v bool
+    shaded bool
 }
 fn color_range(color fm.Vec3, maximum f64) bool {
     << color.is_finite() && color.x >= 0.0 && color.y >= 0.0 && color.z >= 0.0 &&
@@ -26,20 +32,107 @@ fn color_range(color fm.Vec3, maximum f64) bool {
 }
 pub fn material_3d(base fm.Vec3, metallic f64, roughness f64, emission fm.Vec3) Material3D {
     material := Material3D{base: base, metallic: metallic, roughness: roughness, emission: emission, texture: no_texture(),
-        orm_texture: no_texture(), emission_texture: no_texture(), occlusion_strength: 1.0, normal_texture: no_texture(), normal_scale: 1.0, occlusion_texture: no_texture(), occlusion_texture_strength: 1.0, surface_mode: 0}
+        orm_texture: no_texture(), emission_texture: no_texture(), occlusion_strength: 1.0, normal_texture: no_texture(),
+        normal_scale: 1.0, occlusion_texture: no_texture(), occlusion_texture_strength: 1.0, surface_mode: 0,
+        alpha_cutoff: 0.0, uv_region: fm.rect2(0.0, 0.0, 1.0, 1.0), flip_u: false, flip_v: false, shaded: true}
     material.check() or >>
     << material
+}
+fn valid_uv_region(region fm.Rect2) bool {
+    << region.valid() && region.position.x >= 0.0 && region.position.y >= 0.0 &&
+        region.position.x + region.size.x <= 1.0 + 0.000001 &&
+        region.position.y + region.size.y <= 1.0 + 0.000001
 }
 fn (material &Material3D) check() int {
     if !color_range(material.base, 1.0) || !color_range(material.emission, 16.0) ||
         !fm.finite(material.metallic) || material.metallic < 0.0 || material.metallic > 1.0 ||
         !fm.finite(material.roughness) || material.roughness < 0.045 || material.roughness > 1.0 ||
-        !fm.finite(material.occlusion_strength) || material.occlusion_strength < 0.0 || material.occlusion_strength > 1.0 || !fm.finite(material.normal_scale) || material.normal_scale < 0.0 || material.normal_scale > 8.0 || !fm.finite(material.occlusion_texture_strength) || material.occlusion_texture_strength < 0.0 || material.occlusion_texture_strength > 1.0 || material.surface_mode < 0 || material.surface_mode > 1 {
-        >> errors.new("nexus GPU: invalid linear material color, metallic or roughness")
+        !fm.finite(material.occlusion_strength) || material.occlusion_strength < 0.0 || material.occlusion_strength > 1.0 ||
+        !fm.finite(material.normal_scale) || material.normal_scale < 0.0 || material.normal_scale > 8.0 ||
+        !fm.finite(material.occlusion_texture_strength) || material.occlusion_texture_strength < 0.0 || material.occlusion_texture_strength > 1.0 ||
+        material.surface_mode < 0 || material.surface_mode > 1 ||
+        !fm.finite(material.alpha_cutoff) || material.alpha_cutoff < 0.0 || material.alpha_cutoff > 1.0 ||
+        !valid_uv_region(material.uv_region) {
+        >> errors.new("nexus GPU: invalid linear material color, metallic, roughness, alpha cutoff or UV region")
     }
     << 0
 }
 pub fn (material &Material3D) validate() int { << material.check() or >> }
+pub fn (material &Material3D) alpha_cutoff() f64 { << material.alpha_cutoff }
+pub fn (material &Material3D) is_alpha_cutout() bool { << material.alpha_cutoff > 0.0 }
+pub fn (material &Material3D) uv_region() fm.Rect2 { << material.uv_region }
+pub fn (material &Material3D) is_flip_u() bool { << material.flip_u }
+pub fn (material &Material3D) is_flip_v() bool { << material.flip_v }
+pub fn (material &Material3D) is_shaded() bool { << material.shaded }
+pub fn (material &Material3D) base_texture_ref() TextureRef3D { << material.texture }
+fn (material &Material3D) clone_material() Material3D {
+    << Material3D{
+        base: material.base,
+        metallic: material.metallic,
+        roughness: material.roughness,
+        emission: material.emission,
+        texture: material.texture,
+        orm_texture: material.orm_texture,
+        emission_texture: material.emission_texture,
+        occlusion_strength: material.occlusion_strength,
+        normal_texture: material.normal_texture,
+        normal_scale: material.normal_scale,
+        occlusion_texture: material.occlusion_texture,
+        occlusion_texture_strength: material.occlusion_texture_strength,
+        surface_mode: material.surface_mode,
+        alpha_cutoff: material.alpha_cutoff,
+        uv_region: material.uv_region,
+        flip_u: material.flip_u,
+        flip_v: material.flip_v,
+        shaded: material.shaded
+    }
+}
+pub fn (material &Material3D) with_alpha_cutoff(cutoff f64) Material3D {
+    material.check() or >>
+    if !fm.finite(cutoff) || cutoff < 0.0 || cutoff > 1.0 {
+        >> errors.new("nexus GPU: alpha cutoff must be finite and in 0...1")
+    }
+    $next := material.clone_material()
+    next.alpha_cutoff = cutoff
+    << next
+}
+pub fn (material &Material3D) with_uv_region(region fm.Rect2) Material3D {
+    material.check() or >>
+    if !valid_uv_region(region) {
+        >> errors.new("nexus GPU: material UV region must lie inside 0...1")
+    }
+    $next := material.clone_material()
+    next.uv_region = region
+    << next
+}
+pub fn (material &Material3D) with_uv_flip(flip_u bool, flip_v bool) Material3D {
+    material.check() or >>
+    $next := material.clone_material()
+    next.flip_u = flip_u
+    next.flip_v = flip_v
+    << next
+}
+pub fn (material &Material3D) with_shaded(shaded bool) Material3D {
+    material.check() or >>
+    $next := material.clone_material()
+    next.shaded = shaded
+    << next
+}
+pub fn (material &Material3D) uv_transform() fm.Vec4 {
+    $u0 := material.uv_region.position.x
+    $su := material.uv_region.size.x
+    if material.flip_u {
+        u0 = material.uv_region.position.x + material.uv_region.size.x
+        su = -material.uv_region.size.x
+    }
+    $v0 := material.uv_region.position.y
+    $sv := material.uv_region.size.y
+    if material.flip_v {
+        v0 = material.uv_region.position.y + material.uv_region.size.y
+        sv = -material.uv_region.size.y
+    }
+    << fm.vec4(u0, v0, su, sv)
+}
 fn material_words(material &Material3D, orientation f64) []int {
     material.check() or >>
     $words := []int{}
@@ -49,10 +142,14 @@ fn material_words(material &Material3D, orientation f64) []int {
     if material.has_emission_texture() { texture_mode = texture_mode + 4.0 }
     if material.has_normal_texture() { texture_mode = texture_mode + 8.0 }
     if material.has_occlusion_texture() { texture_mode = texture_mode + 16.0 }
+    $shading_mode := 1.0
+    if !material.shaded { shading_mode = 2.0 }
+    uv := material.uv_transform()
     for value in [material.base.x,material.base.y,material.base.z,material.metallic,
         material.emission.x,material.emission.y,material.emission.z,material.roughness,
         texture_mode,material.occlusion_strength,material.normal_scale,f64(material.surface_mode),
-        orientation,material.occlusion_texture_strength,1.0,0.0] { words.push(scalar_word(value) or >>) }
+        orientation,material.occlusion_texture_strength,shading_mode,material.alpha_cutoff,
+        uv.x,uv.y,uv.z,uv.w] { words.push(scalar_word(value) or >>) }
     << words
 }
 fn lit_matrix_words(world fm.Mat4, view_projection fm.Mat4) []int {

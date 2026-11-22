@@ -75,6 +75,39 @@ fn shadow_wall() meshes.MeshData3D {
     wall.triangle(0,2,3) or >>
     << wall
 }
+fn preview_shadow(selection light_bindings.ShadowSelection3D, sources &[]light_data.Light3D,
+    override_count int) light_bindings.ShadowSelection3D {
+    if override_count < 0 { << selection }
+    if override_count == 0 { << light_bindings.no_shadow_selection() }
+    $settings := shadows.default_cascades()
+    settings.distance = 18.0
+    settings.caster_padding = 4.0
+    $source := selection.source
+    if selection.cascades.enabled() {
+        settings = selection.cascades.settings() or >>
+    } else {
+        source = -1
+        for i in 0:sources.len {
+            if sources[i].kind() == light_data.DIRECTIONAL {
+                source = i
+                <-
+            }
+        }
+        if source < 0 { >> errors.new("scene preview: cascades require a visible directional light") }
+    }
+    settings.count = override_count
+    profile := shadows.cascade_profile(settings) or >>
+    << light_bindings.ShadowSelection3D{source: source, cascades: profile, punctual: shadows.PunctualProfile3D{}}
+}
+fn shadow_description(selection light_bindings.ShadowSelection3D, source light_data.Light3D,
+    tree &nexus.SceneTree, camera_node int, aspect f64) shadows.ShadowDescription3D {
+    if selection.cascades.enabled() {
+        camera := scene_render.cascade_scene_camera(tree, camera_node, aspect) or >>
+        settings := selection.cascades.settings() or >>
+        << shadows.cascaded(source, camera, settings) or >>
+    }
+    << selection.punctual.description(source) or >>
+}
 fn run() int {
     config := options() or >>
     document := files.load(config.path + "") or >>
@@ -89,27 +122,13 @@ fn run() int {
     base := (tree.node_3d(blue) or >>).transform
     tree.camera_view_projection_3d(camera_node, 1.0) or >>
 
-    $selection := light_bindings.CascadeSelection3D{source: -1, profile: shadows.CascadeProfile3D{}}
-    $sources := light_world.gather_with_cascades(&tree, $&selection) or >>
-    $settings := shadows.default_cascades()
-    settings.count = 0
-    settings.distance = 18.0
-    settings.caster_padding = 4.0
-    if selection.profile.enabled() { settings = selection.profile.settings() or >> }
-    if config.cascades >= 0 { settings.count = config.cascades }
-    $source_index := selection.source
+    $authored := light_bindings.no_shadow_selection()
+    $sources := light_world.gather_with_shadows(&tree, $&authored) or >>
     if document.light_count() == 0 {
         sources = [light_data.directional(fm.vec3(0.4, 0.7, 1.0), fm.vec3(2.5, 2.5, 2.5)) or >>]
     }
-    if settings.count > 0 && source_index < 0 {
-        for i in 0:sources.len {
-            if sources[i].kind() == light_data.DIRECTIONAL {
-                source_index = i
-                <-
-            }
-        }
-        if source_index < 0 { >> errors.new("scene preview: cascades require a visible directional light") }
-    }
+    selection := preview_shadow(authored, &sources, config.cascades) or >>
+    has_shadow := selection.source >= 0
     mesh_program_0 := mesh_shaders.load_mesh(config.shaders + "") or >>
     $device := ren.open_3d("Xu node scene file | Esc: exit", 960, 640, config.backend, &mesh_program_0) or >>
     println("Scene file GPU backend: " + gpu_info.backend_name(device.backend() or >>))
@@ -124,7 +143,7 @@ fn run() int {
     scene.attach_surface(&tree, hidden, &mesh, gold_material) or >>
     $backdrop := []ren.Mesh3D{}
     $shadow_maps := []ren.ShadowMap3D{}
-    if settings.count > 0 {
+    if has_shadow {
         // Preview geometry stays outside the loaded subtree and its save file.
         wall := shadow_wall() or >>
         uploaded := device.upload(&wall) or >>
@@ -152,11 +171,9 @@ fn run() int {
         if width < 1 || height < 1 { sleep_ns(10000000)
             -> }
         aspect := f64(width) / f64(height)
-        $view := fm.identity_3d()
-        if settings.count > 0 {
-            camera := scene_render.cascade_scene_camera(&tree, camera_node, aspect) or >>
-            view = camera.view_projection()
-            description := shadows.cascaded(sources[source_index], camera, settings) or >>
+        view := tree.camera_view_projection_3d(camera_node, aspect) or >>
+        if has_shadow {
+            description := shadow_description(selection, sources[selection.source], &tree, camera_node, aspect) or >>
             if shadow_maps.len == 0 {
                 shadow_program := mesh_shaders.load_shadow(config.shaders + "") or >>
                 shadow_maps.push(device.shadow_map(description, &shadow_program) or >>)
@@ -164,14 +181,14 @@ fn run() int {
             casters := scene.shadow_casters(&tree) or >>
             shadow := $&shadow_maps[0]
             shadow.render(&device, &casters, description) or >>
-        } else { view = tree.camera_view_projection_3d(camera_node, aspect) or >> }
+        }
         eye := (tree.global_transform_3d(camera_node) or >>).c3.xyz()
         $candidates := []light_data.Light3D{}
         for source in sources { candidates.push(source) }
         lighting := light_data.environment(fm.vec3(0.15, 0.15, 0.15), eye, 1.0, candidates) or >>
         device.begin(background) or >>
-        if settings.count > 0 {
-            draws := scene.draw_lit_shadowed($&device, &tree, view, &lighting, &shadow_maps[0], source_index) or >>
+        if has_shadow {
+            draws := scene.draw_lit_shadowed($&device, &tree, view, &lighting, &shadow_maps[0], selection.source) or >>
             assert(draws.instances + draws.culled_instances == 3)
         } else {
             draws := scene.draw_lit($&device, &tree, view, lighting) or >>

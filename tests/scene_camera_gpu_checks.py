@@ -1,7 +1,10 @@
 """Render both camera types through the actual demos before and after scene save."""
+from io import BytesIO
 import json
 from pathlib import Path
 import subprocess
+
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +28,36 @@ def cameras(path):
     document = json.loads(path.read_text())
     assert document["version"] == 4
     return {node["name"]: node["camera"] for node in document["nodes"] if "camera" in node}
+
+
+def check_punctual_shadow(kind):
+    document = json.loads(AUTHORING.read_text())
+    document["version"] = 5
+    light = dict(node=document["lights"][0]["node"], type=kind, position=[0, 2, 5], radius=16,
+                 radiance=[22, 20, 19], shadow=dict(near=.3, resolution=256, constant_bias=.00002, slope_bias=.00005))
+    if kind == "spot":
+        light.update(direction=[0, -.24, -1], inner_cosine=.9, outer_cosine=.65)
+    document["lights"] = [light]
+    scene = OUTPUT / f"{kind}-authored.xuscene"
+    scene.write_text(json.dumps(document))
+    restored = OUTPUT / f"{kind}-restored.xuscene"
+    authored_png = render("scene-file", f"{kind}-authored", "--scene", scene, "--camera", "Ortho", "--save", restored)
+    restored_png = render("scene-file", f"{kind}-restored", "--scene", restored, "--camera", "Ortho")
+    assert authored_png == restored_png
+    saved = json.loads(restored.read_text())
+    assert saved["version"] == 5 and saved["lights"][0]["shadow"] == light["shadow"]
+
+    # Keep lighting, caster geometry and receiver identical. Raising the depth
+    # bias should brighten the pixels previously inside the punctual shadow.
+    saved["lights"][0]["shadow"]["constant_bias"] = .05
+    high_bias = OUTPUT / f"{kind}-high-bias.xuscene"
+    high_bias.write_text(json.dumps(saved))
+    adjusted_png = render("scene-file", f"{kind}-high-bias", "--scene", high_bias, "--camera", "Ortho")
+    original_pixels = Image.open(BytesIO(restored_png)).convert("RGB").tobytes()
+    adjusted_pixels = Image.open(BytesIO(adjusted_png)).convert("RGB").tobytes()
+    brighter = sum(adjusted_pixels[i] - original_pixels[i] >= 8 for i in range(0, len(original_pixels), 3))
+    assert brighter >= 512, (kind, brighter)
+    print(f"PASS: {kind} shadow survives a fresh process, and the saved depth bias brightens {brighter} pixels")
 
 
 def main():
@@ -63,6 +96,8 @@ def main():
     assert authored_2d == restored_2d
     assert restored_2d != default_2d
     print("PASS: authored CSM and 2D/3D cameras survive fresh-process Metal captures; editing saved shadow distance changes the rendered shadows")
+    for kind in ("point", "spot"):
+        check_punctual_shadow(kind)
 
 
 if __name__ == "__main__":
