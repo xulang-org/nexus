@@ -1,0 +1,481 @@
+@main
+
+#ui
+#ui/draw
+#ui/layout
+widgets #ui/widgets
+#math
+#strings
+#time
+
+pub const MODAL_NONE = 0
+pub const MODAL_SNAP = 1
+pub const MODAL_NEW_SCENE = 2
+pub const MODAL_UNSAVED = 3
+
+pub const ID_MODAL_MOVE = 9001
+pub const ID_MODAL_ROTATE = 9002
+pub const ID_MODAL_SCALE = 9003
+pub const ID_MODAL_SNAP_CANCEL = 9004
+pub const ID_MODAL_SNAP_SAVE = 9005
+
+pub const ID_MODAL_SCENE_NAME = 9011
+pub const ID_MODAL_SCENE_ROOT = 9012
+pub const ID_MODAL_SCENE_CANCEL = 9013
+pub const ID_MODAL_SCENE_CREATE = 9014
+
+pub const ID_MODAL_UNSAVED_CANCEL = 9021
+pub const ID_MODAL_UNSAVED_DISCARD = 9022
+pub const ID_MODAL_UNSAVED_SAVE = 9023
+
+pub struct ModalState {
+    pub kind int
+    pub card layout.Rect
+    pub snap_move widgets.Field
+    pub snap_rotate widgets.Field
+    pub snap_scale widgets.Field
+    pub snap_move_err string
+    pub snap_rotate_err string
+    pub snap_scale_err string
+    pub snap_cancel widgets.Button
+    pub snap_save widgets.Button
+    pub snap_cancel_lbl widgets.StyledLabel
+    pub snap_save_lbl widgets.StyledLabel
+
+    pub scene_name_field widgets.Field
+    pub scene_root_field widgets.Field
+    pub scene_err string
+    pub scene_cancel widgets.Button
+    pub scene_create widgets.Button
+    pub scene_cancel_lbl widgets.StyledLabel
+    pub scene_create_lbl widgets.StyledLabel
+
+    pub unsaved_target_scene int
+    pub unsaved_cancel widgets.Button
+    pub unsaved_discard widgets.Button
+    pub unsaved_save widgets.Button
+    pub unsaved_cancel_lbl widgets.StyledLabel
+    pub unsaved_discard_lbl widgets.StyledLabel
+    pub unsaved_save_lbl widgets.StyledLabel
+    pub unsaved_close_after bool
+    pub focused_id int
+}
+
+fn empty_rect() layout.Rect {
+    << layout.Rect{x: 0.0, y: 0.0, width: 120.0, height: 32.0}
+}
+
+fn make_unit_field(
+    context &draw.Context,
+    identity &ui.CanvasEvent,
+    id int,
+    label string,
+    suffix string,
+    helper string,
+    val string
+) widgets.Field {
+    $dec := widgets.field_decoration(&label)
+    dec.suffix = suffix
+    dec.helper = helper
+    dec.clearable = true
+    << widgets.field(context, identity, id, &empty_rect(), &val, &dec) or >>
+}
+
+pub fn create_modals(context &draw.Context, identity &ui.CanvasEvent, snap &SnapSettings) ModalState {
+    mv := fmt_coord(snap.move_step)
+    rt := fmt_coord(snap.rotate_deg)
+    sc := fmt_coord(snap.scale_pct)
+    snap_move := make_unit_field(context, identity, ID_MODAL_MOVE, "Move snap", "units", "0.0001 .. 1000000", mv)
+    snap_rotate := make_unit_field(context, identity, ID_MODAL_ROTATE, "Rotate snap", "deg", "0.01 .. 180", rt)
+    snap_scale := make_unit_field(context, identity, ID_MODAL_SCALE, "Scale snap", "%", "1 .. 10000", sc)
+
+    $sdec := widgets.field_decoration(&"Scene file *")
+    sdec.helper = "Saved under assets/<name>.xuscene"
+    sdec.clearable = true
+    scene_name_field := widgets.field(context, identity, ID_MODAL_SCENE_NAME, &empty_rect(), &"level_2.xuscene", &sdec) or >>
+
+    $rdec := widgets.field_decoration(&"Root node name")
+    rdec.helper = "Default: World"
+    rdec.clearable = true
+    scene_root_field := widgets.field(context, identity, ID_MODAL_SCENE_ROOT, &empty_rect(), &"World", &rdec) or >>
+
+    << ModalState{
+        kind: MODAL_NONE,
+        card: empty_rect(),
+        snap_move: snap_move,
+        snap_rotate: snap_rotate,
+        snap_scale: snap_scale,
+        snap_move_err: "",
+        snap_rotate_err: "",
+        snap_scale_err: "",
+        snap_cancel: widgets.button(identity, ID_MODAL_SNAP_CANCEL, &empty_rect()) or >>,
+        snap_save: widgets.button(identity, ID_MODAL_SNAP_SAVE, &empty_rect()) or >>,
+        snap_cancel_lbl: widgets.styled_label(context, &"Cancel"),
+        snap_save_lbl: widgets.styled_label(context, &"Save Snap"),
+        scene_name_field: scene_name_field,
+        scene_root_field: scene_root_field,
+        scene_err: "",
+        scene_cancel: widgets.button(identity, ID_MODAL_SCENE_CANCEL, &empty_rect()) or >>,
+        scene_create: widgets.button(identity, ID_MODAL_SCENE_CREATE, &empty_rect()) or >>,
+        scene_cancel_lbl: widgets.styled_label(context, &"Cancel"),
+        scene_create_lbl: widgets.styled_label(context, &"Create Scene"),
+        unsaved_target_scene: -1,
+        unsaved_cancel: widgets.button(identity, ID_MODAL_UNSAVED_CANCEL, &empty_rect()) or >>,
+        unsaved_discard: widgets.button(identity, ID_MODAL_UNSAVED_DISCARD, &empty_rect()) or >>,
+        unsaved_save: widgets.button(identity, ID_MODAL_UNSAVED_SAVE, &empty_rect()) or >>,
+        unsaved_cancel_lbl: widgets.styled_label(context, &"Cancel"),
+        unsaved_discard_lbl: widgets.styled_label(context, &"Discard"),
+        unsaved_save_lbl: widgets.styled_label(context, &"Save"),
+        unsaved_close_after: false,
+        focused_id: 0
+    }
+}
+
+pub fn (m $&ModalState) dispose() {
+    dispose_field($&m.snap_move)
+    dispose_field($&m.snap_rotate)
+    dispose_field($&m.snap_scale)
+    dispose_field($&m.scene_name_field)
+    dispose_field($&m.scene_root_field)
+    dispose_label($&m.snap_cancel_lbl)
+    dispose_label($&m.snap_save_lbl)
+    dispose_label($&m.scene_cancel_lbl)
+    dispose_label($&m.scene_create_lbl)
+    dispose_label($&m.unsaved_cancel_lbl)
+    dispose_label($&m.unsaved_discard_lbl)
+    dispose_label($&m.unsaved_save_lbl)
+}
+
+pub fn (m $&ModalState) open_snap(snap &SnapSettings) {
+    m.kind = MODAL_SNAP
+    mv := fmt_coord(snap.move_step)
+    rt := fmt_coord(snap.rotate_deg)
+    sc := fmt_coord(snap.scale_pct)
+    set_field_val($&m.snap_move, &mv)
+    set_field_val($&m.snap_rotate, &rt)
+    set_field_val($&m.snap_scale, &sc)
+    m.snap_move_err = ""
+    m.snap_rotate_err = ""
+    m.snap_scale_err = ""
+    m.sync_snap_decorations()
+    m.set_focus(ID_MODAL_MOVE)
+}
+
+pub fn (m $&ModalState) open_new_scene() {
+    m.kind = MODAL_NEW_SCENE
+    set_field_val($&m.scene_name_field, &"new_scene.xuscene")
+    set_field_val($&m.scene_root_field, &"World")
+    m.scene_err = ""
+    m.sync_scene_decoration()
+    m.set_focus(ID_MODAL_SCENE_NAME)
+}
+
+pub fn (m $&ModalState) open_unsaved(target_scene int, close_after bool) {
+    m.kind = MODAL_UNSAVED
+    m.unsaved_target_scene = target_scene
+    m.unsaved_close_after = close_after
+    m.set_focus(ID_MODAL_UNSAVED_SAVE)
+}
+
+pub fn (m $&ModalState) close() {
+    m.kind = MODAL_NONE
+    m.set_focus(0)
+}
+
+fn (m $&ModalState) sync_snap_decorations() {
+    $dm := widgets.field_decoration(&"Move snap")
+    dm.suffix = "units"
+    dm.helper = "0.0001 .. 1000000"
+    dm.clearable = true
+    dm.error = m.snap_move_err + ""
+    inv_m := m.snap_move_err.len > 0
+    set_field_dec($&m.snap_move, &dm)
+    set_field_inv($&m.snap_move, inv_m)
+
+    $dr := widgets.field_decoration(&"Rotate snap")
+    dr.suffix = "deg"
+    dr.helper = "0.01 .. 180"
+    dr.clearable = true
+    dr.error = m.snap_rotate_err + ""
+    inv_r := m.snap_rotate_err.len > 0
+    set_field_dec($&m.snap_rotate, &dr)
+    set_field_inv($&m.snap_rotate, inv_r)
+
+    $ds := widgets.field_decoration(&"Scale snap")
+    ds.suffix = "%"
+    ds.helper = "1 .. 10000"
+    ds.clearable = true
+    ds.error = m.snap_scale_err + ""
+    inv_s := m.snap_scale_err.len > 0
+    set_field_dec($&m.snap_scale, &ds)
+    set_field_inv($&m.snap_scale, inv_s)
+}
+
+fn (m $&ModalState) sync_scene_decoration() {
+    $ds := widgets.field_decoration(&"Scene file *")
+    ds.helper = "Saved under assets/<name>.xuscene"
+    ds.clearable = true
+    ds.error = m.scene_err + ""
+    inv_sc := m.scene_err.len > 0
+    set_field_dec($&m.scene_name_field, &ds)
+    set_field_inv($&m.scene_name_field, inv_sc)
+}
+
+pub fn (m $&ModalState) set_focus(id int) {
+    m.focused_id = id
+    focus_field($&m.snap_move, id == ID_MODAL_MOVE)
+    focus_field($&m.snap_rotate, id == ID_MODAL_ROTATE)
+    focus_field($&m.snap_scale, id == ID_MODAL_SCALE)
+    set_btn_focus($&m.snap_cancel, id == ID_MODAL_SNAP_CANCEL)
+    set_btn_focus($&m.snap_save, id == ID_MODAL_SNAP_SAVE)
+
+    focus_field($&m.scene_name_field, id == ID_MODAL_SCENE_NAME)
+    focus_field($&m.scene_root_field, id == ID_MODAL_SCENE_ROOT)
+    set_btn_focus($&m.scene_cancel, id == ID_MODAL_SCENE_CANCEL)
+    set_btn_focus($&m.scene_create, id == ID_MODAL_SCENE_CREATE)
+
+    set_btn_focus($&m.unsaved_cancel, id == ID_MODAL_UNSAVED_CANCEL)
+    set_btn_focus($&m.unsaved_discard, id == ID_MODAL_UNSAVED_DISCARD)
+    set_btn_focus($&m.unsaved_save, id == ID_MODAL_UNSAVED_SAVE)
+}
+
+fn variant_or_default(styles &widgets.Styles, variant int) widgets.ControlStyle {
+    << styles.button_variant(variant) or (err) {
+        _ := err
+        << styles.button.clone()
+    }
+}
+
+pub fn (m $&ModalState) layout(viewport_w f64, viewport_h f64, styles &widgets.Styles) {
+    if m.kind == MODAL_NONE { << }
+    vp := layout.Rect{x: 0.0, y: 0.0, width: viewport_w, height: viewport_h}
+    set_field_viewport($&m.snap_move, &vp)
+    set_field_viewport($&m.snap_rotate, &vp)
+    set_field_viewport($&m.snap_scale, &vp)
+    set_field_viewport($&m.scene_name_field, &vp)
+    set_field_viewport($&m.scene_root_field, &vp)
+    pri := variant_or_default(styles, widgets.BUTTON_PRIMARY)
+    dng := variant_or_default(styles, widgets.BUTTON_DANGER)
+    set_btn_style($&m.snap_save, &pri)
+    set_btn_style($&m.scene_create, &pri)
+    set_btn_style($&m.unsaved_discard, &dng)
+    set_btn_style($&m.unsaved_save, &pri)
+
+    if m.kind == MODAL_SNAP {
+        cw := math.min(390.0, viewport_w - 32.0)
+        ch := 342.0
+        cx := (viewport_w - cw) * 0.5
+        cy := (viewport_h - ch) * 0.5
+        m.card = layout.Rect{x: cx, y: cy, width: cw, height: ch}
+        fw := cw - 40.0
+        place_rect_field($&m.snap_move, &layout.Rect{x: cx + 20.0, y: cy + 62.0, width: fw, height: 64.0}, styles)
+        place_rect_field($&m.snap_rotate, &layout.Rect{x: cx + 20.0, y: cy + 136.0, width: fw, height: 64.0}, styles)
+        place_rect_field($&m.snap_scale, &layout.Rect{x: cx + 20.0, y: cy + 210.0, width: fw, height: 64.0}, styles)
+        set_btn_bounds($&m.snap_cancel, &layout.Rect{x: cx + cw - 208.0, y: cy + ch - 48.0, width: 88.0, height: 32.0})
+        set_btn_bounds($&m.snap_save, &layout.Rect{x: cx + cw - 110.0, y: cy + ch - 48.0, width: 90.0, height: 32.0})
+    } else if m.kind == MODAL_NEW_SCENE {
+        cw := math.min(390.0, viewport_w - 32.0)
+        ch := 268.0
+        cx := (viewport_w - cw) * 0.5
+        cy := (viewport_h - ch) * 0.5
+        m.card = layout.Rect{x: cx, y: cy, width: cw, height: ch}
+        fw := cw - 40.0
+        place_rect_field($&m.scene_name_field, &layout.Rect{x: cx + 20.0, y: cy + 62.0, width: fw, height: 64.0}, styles)
+        place_rect_field($&m.scene_root_field, &layout.Rect{x: cx + 20.0, y: cy + 136.0, width: fw, height: 64.0}, styles)
+        set_btn_bounds($&m.scene_cancel, &layout.Rect{x: cx + cw - 228.0, y: cy + ch - 48.0, width: 88.0, height: 32.0})
+        set_btn_bounds($&m.scene_create, &layout.Rect{x: cx + cw - 130.0, y: cy + ch - 48.0, width: 110.0, height: 32.0})
+    } else if m.kind == MODAL_UNSAVED {
+        cw := math.min(400.0, viewport_w - 32.0)
+        ch := 162.0
+        cx := (viewport_w - cw) * 0.5
+        cy := (viewport_h - ch) * 0.5
+        m.card = layout.Rect{x: cx, y: cy, width: cw, height: ch}
+        set_btn_bounds($&m.unsaved_cancel, &layout.Rect{x: cx + cw - 300.0, y: cy + ch - 48.0, width: 86.0, height: 32.0})
+        set_btn_bounds($&m.unsaved_discard, &layout.Rect{x: cx + cw - 204.0, y: cy + ch - 48.0, width: 92.0, height: 32.0})
+        set_btn_bounds($&m.unsaved_save, &layout.Rect{x: cx + cw - 102.0, y: cy + ch - 48.0, width: 82.0, height: 32.0})
+    }
+}
+
+fn paint_modal_field(f $&widgets.Field, frame $&draw.Frame, styles &widgets.Styles) int {
+    b := f.bounds()
+    frame.push() or >>
+    frame.translate(b.x, b.y) or >>
+    res := f.paint_styled(frame, styles)
+    frame.pop() or >>
+    << res
+}
+
+pub fn (m $&ModalState) paint(frame $&draw.Frame, bounds &layout.Rect, styles &widgets.Styles, pal &PaperPalette) int {
+    if m.kind == MODAL_NONE { << 0 }
+    frame.fill_rect(bounds.x, bounds.y, bounds.width, bounds.height, draw.rgba(40, 35, 41, 108)) or >>
+    c := m.card
+    frame.box_shadow(c.x, c.y, c.width, c.height, 12.0, 0.0, 8.0, 20.0, 0.0, draw.rgba(40, 35, 41, 64)) or >>
+    frame.fill_round_rect(c.x, c.y, c.width, c.height, 12.0, pal.surface) or >>
+    frame.stroke_round_rect(c.x, c.y, c.width, c.height, 12.0, pal.border, 1.0) or >>
+
+    if m.kind == MODAL_SNAP {
+        frame.text(c.x + 20.0, c.y + 16.0, 17.0, pal.text, &"Snap Settings") or >>
+        frame.text(c.x + 20.0, c.y + 39.0, 12.0, pal.muted, &"Used by 3D View gizmos and transforms") or >>
+        paint_modal_field($&m.snap_move, frame, styles) or >>
+        paint_modal_field($&m.snap_rotate, frame, styles) or >>
+        paint_modal_field($&m.snap_scale, frame, styles) or >>
+        b_cancel := m.snap_cancel.clone()
+        _ := b_cancel.paint_styled(frame, $&m.snap_cancel_lbl, styles) or >>
+        b_save := m.snap_save.clone()
+        _ := b_save.paint_styled(frame, $&m.snap_save_lbl, styles) or >>
+        field_popup_paint($&m.snap_move, frame, styles) or >>
+        field_popup_paint($&m.snap_rotate, frame, styles) or >>
+        field_popup_paint($&m.snap_scale, frame, styles) or >>
+    } else if m.kind == MODAL_NEW_SCENE {
+        frame.text(c.x + 20.0, c.y + 16.0, 17.0, pal.text, &"New Scene") or >>
+        frame.text(c.x + 20.0, c.y + 39.0, 12.0, pal.muted, &"Create and register a new .xuscene file") or >>
+        paint_modal_field($&m.scene_name_field, frame, styles) or >>
+        paint_modal_field($&m.scene_root_field, frame, styles) or >>
+        b_cancel := m.scene_cancel.clone()
+        _ := b_cancel.paint_styled(frame, $&m.scene_cancel_lbl, styles) or >>
+        b_create := m.scene_create.clone()
+        _ := b_create.paint_styled(frame, $&m.scene_create_lbl, styles) or >>
+        field_popup_paint($&m.scene_name_field, frame, styles) or >>
+        field_popup_paint($&m.scene_root_field, frame, styles) or >>
+    } else if m.kind == MODAL_UNSAVED {
+        frame.text(c.x + 20.0, c.y + 18.0, 17.0, pal.text, &"Unsaved Changes") or >>
+        frame.text(c.x + 20.0, c.y + 48.0, 13.0, pal.muted, &"Save changes to the current scene before switching?") or >>
+        b_cancel := m.unsaved_cancel.clone()
+        _ := b_cancel.paint_styled(frame, $&m.unsaved_cancel_lbl, styles) or >>
+        b_discard := m.unsaved_discard.clone()
+        _ := b_discard.paint_styled(frame, $&m.unsaved_discard_lbl, styles) or >>
+        b_save := m.unsaved_save.clone()
+        _ := b_save.paint_styled(frame, $&m.unsaved_save_lbl, styles) or >>
+    }
+    << 0
+}
+
+fn tick_field(f $&widgets.Field, now time.Instant, reduced bool) bool {
+    << f.tick(now, reduced) or (err) { << false }
+}
+
+fn field_next_tick(f &widgets.Field, now time.Instant, reduced bool) time.Instant {
+    << f.next_caret_tick(now, reduced) or (err) { << time.zero_instant() }
+}
+
+pub fn (m $&ModalState) tick(now time.Instant, reduced bool) bool {
+    $changed := false
+    if m.kind == MODAL_SNAP {
+        if tick_field($&m.snap_move, now, reduced) { changed = true }
+        if tick_field($&m.snap_rotate, now, reduced) { changed = true }
+        if tick_field($&m.snap_scale, now, reduced) { changed = true }
+    } else if m.kind == MODAL_NEW_SCENE {
+        if tick_field($&m.scene_name_field, now, reduced) { changed = true }
+        if tick_field($&m.scene_root_field, now, reduced) { changed = true }
+    }
+    << changed
+}
+
+pub fn (m &ModalState) next_tick(now time.Instant, reduced bool) time.Instant {
+    $deadline := time.zero_instant()
+    if m.kind == MODAL_SNAP {
+        for next in [field_next_tick(&m.snap_move, now, reduced), field_next_tick(&m.snap_rotate, now, reduced), field_next_tick(&m.snap_scale, now, reduced)] {
+            if !next.is_zero() && (deadline.is_zero() || next.before(deadline)) {
+                deadline = next
+            }
+        }
+    } else if m.kind == MODAL_NEW_SCENE {
+        for next in [field_next_tick(&m.scene_name_field, now, reduced), field_next_tick(&m.scene_root_field, now, reduced)] {
+            if !next.is_zero() && (deadline.is_zero() || next.before(deadline)) {
+                deadline = next
+            }
+        }
+    }
+    << deadline
+}
+
+pub fn modal_close(m $&ModalState) { m.close() }
+pub fn modal_set_focus(m $&ModalState, id int) { m.set_focus(id) }
+
+pub fn (m &ModalState) has_popup_open() bool {
+    if m.kind == MODAL_SNAP {
+        << m.snap_move.has_popup_open() || m.snap_rotate.has_popup_open() || m.snap_scale.has_popup_open()
+    }
+    if m.kind == MODAL_NEW_SCENE {
+        << m.scene_name_field.has_popup_open() || m.scene_root_field.has_popup_open()
+    }
+    << false
+}
+
+pub fn (m &ModalState) cursor_at(x f64, y f64) int {
+    if m.kind == MODAL_SNAP {
+        if m.snap_move.has_popup_open() {
+            if m.snap_move.popup_bounds().contains(x, y) { << ui.CURSOR_HAND }
+            << ui.CURSOR_DEFAULT
+        }
+        if m.snap_rotate.has_popup_open() {
+            if m.snap_rotate.popup_bounds().contains(x, y) { << ui.CURSOR_HAND }
+            << ui.CURSOR_DEFAULT
+        }
+        if m.snap_scale.has_popup_open() {
+            if m.snap_scale.popup_bounds().contains(x, y) { << ui.CURSOR_HAND }
+            << ui.CURSOR_DEFAULT
+        }
+        if m.snap_move.bounds().contains(x, y) { << m.snap_move.cursor_at(x, y) }
+        if m.snap_rotate.bounds().contains(x, y) { << m.snap_rotate.cursor_at(x, y) }
+        if m.snap_scale.bounds().contains(x, y) { << m.snap_scale.cursor_at(x, y) }
+        if m.snap_cancel.bounds().contains(x, y) || m.snap_save.bounds().contains(x, y) { << ui.CURSOR_HAND }
+        << ui.CURSOR_DEFAULT
+    }
+    if m.kind == MODAL_NEW_SCENE {
+        if m.scene_name_field.has_popup_open() {
+            if m.scene_name_field.popup_bounds().contains(x, y) { << ui.CURSOR_HAND }
+            << ui.CURSOR_DEFAULT
+        }
+        if m.scene_root_field.has_popup_open() {
+            if m.scene_root_field.popup_bounds().contains(x, y) { << ui.CURSOR_HAND }
+            << ui.CURSOR_DEFAULT
+        }
+        if m.scene_name_field.bounds().contains(x, y) { << m.scene_name_field.cursor_at(x, y) }
+        if m.scene_root_field.bounds().contains(x, y) { << m.scene_root_field.cursor_at(x, y) }
+        if m.scene_cancel.bounds().contains(x, y) || m.scene_create.bounds().contains(x, y) { << ui.CURSOR_HAND }
+        << ui.CURSOR_DEFAULT
+    }
+    if m.kind == MODAL_UNSAVED {
+        if m.unsaved_cancel.bounds().contains(x, y) || m.unsaved_discard.bounds().contains(x, y) || m.unsaved_save.bounds().contains(x, y) {
+            << ui.CURSOR_HAND
+        }
+        << ui.CURSOR_DEFAULT
+    }
+    << ui.CURSOR_DEFAULT
+}
+
+pub fn (m $&ModalState) handle_text_or_request(event &ui.Event) bool {
+    $dirty := false
+    if m.kind == MODAL_SNAP {
+        a1 := field_event($&m.snap_move, event)
+        a2 := field_event($&m.snap_rotate, event)
+        a3 := field_event($&m.snap_scale, event)
+        if a1.kind == widgets.ACTION_CHANGE && m.snap_move_err.len > 0 {
+            m.snap_move_err = ""
+            m.sync_snap_decorations()
+            dirty = true
+        }
+        if a2.kind == widgets.ACTION_CHANGE && m.snap_rotate_err.len > 0 {
+            m.snap_rotate_err = ""
+            m.sync_snap_decorations()
+            dirty = true
+        }
+        if a3.kind == widgets.ACTION_CHANGE && m.snap_scale_err.len > 0 {
+            m.snap_scale_err = ""
+            m.sync_snap_decorations()
+            dirty = true
+        }
+        if a1.needs_paint || a2.needs_paint || a3.needs_paint { dirty = true }
+    } else if m.kind == MODAL_NEW_SCENE {
+        a1 := field_event($&m.scene_name_field, event)
+        a2 := field_event($&m.scene_root_field, event)
+        if a1.kind == widgets.ACTION_CHANGE && m.scene_err.len > 0 {
+            m.scene_err = ""
+            m.sync_scene_decoration()
+            dirty = true
+        }
+        if a1.needs_paint || a2.needs_paint { dirty = true }
+    }
+    << dirty
+}

@@ -1,0 +1,469 @@
+@main
+
+resource #"github.com/xulang-org/nexus/resources/scene"
+fm #"github.com/xulang-org/nexus/foundation/math"
+#ui/draw
+#ui/layout
+#math
+#strings
+
+pub struct StagePoint {
+    pub index int
+    pub name string
+    pub x f64
+    pub z f64
+    pub visible bool
+    pub has_surface bool
+    pub is_root bool
+}
+
+pub fn clone_stage_points(pts &[]StagePoint) []StagePoint {
+    $out := []StagePoint{}
+    for i in 0:pts.len {
+        p := &pts[i]
+        out.push(StagePoint{
+            index: p.index,
+            name: p.name + "",
+            x: p.x,
+            z: p.z,
+            visible: p.visible,
+            has_surface: p.has_surface,
+            is_root: p.is_root
+        })
+    }
+    << out
+}
+
+pub struct TopViewState {
+    pub center_x f64
+    pub center_z f64
+    pub scale f64
+    pub panning bool
+    pub pan_start_x f64
+    pub pan_start_y f64
+    pub pan_origin_cx f64
+    pub pan_origin_cz f64
+    pub hover_x f64
+    pub hover_z f64
+    pub has_hover bool
+    pub hover_node int
+    pub placed_labels []layout.Rect
+}
+
+pub fn default_top_view() TopViewState {
+    << TopViewState{
+        center_x: 0.0,
+        center_z: 0.0,
+        scale: 28.0,
+        panning: false,
+        pan_start_x: 0.0,
+        pan_start_y: 0.0,
+        pan_origin_cx: 0.0,
+        pan_origin_cz: 0.0,
+        hover_x: 0.0,
+        hover_z: 0.0,
+        has_hover: false,
+        hover_node: -1,
+        placed_labels: []layout.Rect{}
+    }
+}
+
+pub fn extract_stage_points(doc &resource.Document) []StagePoint {
+    $nodes := []resource.NodeData{}
+    for i in 0:doc.node_count() {
+        nodes.push(doc.describe_node(i) or (err) { << []StagePoint{} })
+    }
+    $has_surf := map[int]bool{}
+    for i in 0:doc.surface_count() {
+        s := doc.surface(i) or (err) { << []StagePoint{} }
+        has_surf[s.node] = true
+    }
+    $eff_vis := []bool{}
+    $world_mats := []fm.Mat4{}
+    for i in 0:nodes.len {
+        n := &nodes[i]
+        $vis := n.visible
+        $w := fm.identity_3d()
+        if n.parent >= 0 && n.parent < i {
+            vis = vis && eff_vis[n.parent]
+            w = world_mats[n.parent]
+        }
+        if n.kind == resource.NODE_3D {
+            w = w.multiply(n.local_3d)
+        }
+        eff_vis.push(vis)
+        world_mats.push(w)
+    }
+    $pts := []StagePoint{}
+    for i in 0:nodes.len {
+        n := &nodes[i]
+        $wx := world_mats[i].c3.x
+        $wz := world_mats[i].c3.z
+        if n.kind == resource.NODE_2D {
+            wx = wx + n.local.tx
+            wz = wz + n.local.ty
+        }
+        pts.push(StagePoint{
+            index: i,
+            name: n.name + "",
+            x: wx,
+            z: wz,
+            visible: eff_vis[i],
+            has_surface: has_surf.has(i),
+            is_root: i == 0
+        })
+    }
+    << pts
+}
+
+pub fn grid_step(scale f64) f64 {
+    target := 56.0 / math.max(scale, 0.001)
+    p := math.floor(math.log10(target))
+    $step := math.pow(10.0, int(p))
+    if target / step >= 5.0 {
+        step = step * 5.0
+    }
+    if step < 0.0001 {
+        step = 0.0001
+    }
+    << step
+}
+
+pub fn world_to_screen_x(view &TopViewState, bounds &layout.Rect, wx f64) f64 {
+    << bounds.x + bounds.width * 0.5 + (wx - view.center_x) * view.scale
+}
+
+pub fn world_to_screen_y(view &TopViewState, bounds &layout.Rect, wz f64) f64 {
+    << bounds.y + bounds.height * 0.5 + (wz - view.center_z) * view.scale
+}
+
+pub fn screen_to_world_x(view &TopViewState, bounds &layout.Rect, sx f64) f64 {
+    << view.center_x + (sx - (bounds.x + bounds.width * 0.5)) / math.max(view.scale, 0.001)
+}
+
+pub fn screen_to_world_z(view &TopViewState, bounds &layout.Rect, sy f64) f64 {
+    << view.center_z + (sy - (bounds.y + bounds.height * 0.5)) / math.max(view.scale, 0.001)
+}
+
+pub fn (view $&TopViewState) fit_points(pts &[]StagePoint, bounds &layout.Rect) {
+    if pts.len == 0 || bounds.width < 16.0 || bounds.height < 16.0 {
+        view.center_x = 0.0
+        view.center_z = 0.0
+        view.scale = 28.0
+        <<
+    }
+    $min_x := pts[0].x
+    $max_x := pts[0].x
+    $min_z := pts[0].z
+    $max_z := pts[0].z
+    for i in 1:pts.len {
+        p := &pts[i]
+        if p.x < min_x { min_x = p.x }
+        if p.x > max_x { max_x = p.x }
+        if p.z < min_z { min_z = p.z }
+        if p.z > max_z { max_z = p.z }
+    }
+    view.center_x = (min_x + max_x) * 0.5
+    view.center_z = (min_z + max_z) * 0.5
+    span_x := math.max(max_x - min_x, 4.0)
+    span_z := math.max(max_z - min_z, 4.0)
+    avail_w := math.max(40.0, bounds.width - 72.0)
+    avail_h := math.max(40.0, bounds.height - 72.0)
+    $next_scale := math.min(avail_w / span_x, avail_h / span_z)
+    if next_scale < 4.0 { next_scale = 4.0 }
+    if next_scale > 160.0 { next_scale = 160.0 }
+    view.scale = next_scale
+}
+
+pub fn (view $&TopViewState) zoom_around(bounds &layout.Rect, cursor_x f64, cursor_y f64, wheel_y f64) {
+    if math.abs(wheel_y) < 1e-6 || bounds.width < 1.0 || bounds.height < 1.0 {
+        <<
+    }
+    wx := screen_to_world_x(view, bounds, cursor_x)
+    wz := screen_to_world_z(view, bounds, cursor_y)
+    $delta := wheel_y
+    if delta > 8.0 { delta = 8.0 }
+    if delta < -8.0 { delta = -8.0 }
+    factor := math.pow_f64(1.12, delta)
+    $next_scale := view.scale * factor
+    if next_scale < 2.0 { next_scale = 2.0 }
+    if next_scale > 400.0 { next_scale = 400.0 }
+    view.scale = next_scale
+    view.center_x = wx - (cursor_x - (bounds.x + bounds.width * 0.5)) / view.scale
+    view.center_z = wz - (cursor_y - (bounds.y + bounds.height * 0.5)) / view.scale
+}
+
+pub fn (view $&TopViewState) begin_pan(sx f64, sy f64) {
+    view.panning = true
+    view.pan_start_x = sx
+    view.pan_start_y = sy
+    view.pan_origin_cx = view.center_x
+    view.pan_origin_cz = view.center_z
+}
+
+pub fn (view $&TopViewState) update_pan(sx f64, sy f64) {
+    if !view.panning { << }
+    dx := sx - view.pan_start_x
+    dy := sy - view.pan_start_y
+    view.center_x = view.pan_origin_cx - dx / math.max(view.scale, 0.001)
+    view.center_z = view.pan_origin_cz - dy / math.max(view.scale, 0.001)
+}
+
+pub fn (view $&TopViewState) end_pan() {
+    view.panning = false
+}
+
+pub fn pick_stage_node(view &TopViewState, bounds &layout.Rect, pts &[]StagePoint, mx f64, my f64) int {
+    $best := -1
+    $best_d2 := 16.0 * 16.0
+    for i in 0:pts.len {
+        p := &pts[i]
+        sx := world_to_screen_x(view, bounds, p.x)
+        sy := world_to_screen_y(view, bounds, p.z)
+        dx := sx - mx
+        dy := sy - my
+        d2 := dx * dx + dy * dy
+        if d2 <= best_d2 {
+            best_d2 = d2
+            best = p.index
+        }
+    }
+    << best
+}
+
+pub fn rects_overlap(a &layout.Rect, b &layout.Rect) bool {
+    << !(a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y)
+}
+
+fn rect_inside_pad(r &layout.Rect, bounds &layout.Rect, pad f64) bool {
+    << r.x >= bounds.x + pad &&
+        r.y >= bounds.y + pad &&
+        r.x + r.width <= bounds.x + bounds.width - pad &&
+        r.y + r.height <= bounds.y + bounds.height - pad
+}
+
+fn overlaps_any(cand &layout.Rect, placed &[]layout.Rect) bool {
+    for i in 0:placed.len {
+        if rects_overlap(cand, &placed[i]) {
+            << true
+        }
+    }
+    << false
+}
+
+pub fn choose_label_rect(
+    sx f64,
+    sy f64,
+    label_w f64,
+    label_h f64,
+    bounds &layout.Rect,
+    placed &[]layout.Rect
+) layout.Rect {
+    offs_x := [10.0, 10.0, -label_w - 10.0, -label_w - 10.0, 14.0, 14.0, -label_w - 14.0, -label_w - 14.0]
+    offs_y := [-label_h - 4.0, 6.0, -label_h - 4.0, 6.0, -label_h - 20.0, 20.0, -label_h - 20.0, 20.0]
+    for k in 0:offs_x.len {
+        cand := layout.Rect{
+            x: sx + offs_x[k],
+            y: sy + offs_y[k],
+            width: label_w,
+            height: label_h
+        }
+        if rect_inside_pad(&cand, bounds, 4.0) && !overlaps_any(&cand, placed) {
+            << cand
+        }
+    }
+    << layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 0.0}
+}
+
+pub fn compute_placed_labels(
+    view &TopViewState,
+    bounds &layout.Rect,
+    pts &[]StagePoint,
+    selected_idx int
+) []layout.Rect {
+    $placed := []layout.Rect{}
+    // Reserve node marker discs so labels avoid covering adjacent markers.
+    $markers := []layout.Rect{}
+    for i in 0:pts.len {
+        p := &pts[i]
+        sx := world_to_screen_x(view, bounds, p.x)
+        sy := world_to_screen_y(view, bounds, p.z)
+        if sx >= bounds.x - 12.0 && sx <= bounds.x + bounds.width + 12.0 &&
+            sy >= bounds.y - 12.0 && sy <= bounds.y + bounds.height + 12.0 {
+            markers.push(layout.Rect{x: sx - 8.0, y: sy - 8.0, width: 16.0, height: 16.0})
+        }
+    }
+    $out := []layout.Rect{}
+    for i in 0:pts.len {
+        out.push(layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 0.0})
+    }
+    // Place selected node label first, then root, then remaining nodes.
+    $order := []int{}
+    for i in 0:pts.len {
+        if pts[i].index == selected_idx {
+            order.push(i)
+        }
+    }
+    for i in 0:pts.len {
+        if pts[i].index != selected_idx {
+            order.push(i)
+        }
+    }
+    for o in order {
+        p := &pts[o]
+        sx := world_to_screen_x(view, bounds, p.x)
+        sy := world_to_screen_y(view, bounds, p.z)
+        if sx < bounds.x || sx > bounds.x + bounds.width || sy < bounds.y || sy > bounds.y + bounds.height {
+            ->
+        }
+        w := math.min(180.0, math.max(38.0, f64(p.name.len) * 7.4 + 12.0))
+        h := 18.0
+        $obstacles := []layout.Rect{}
+        for m in 0:markers.len { obstacles.push(markers[m]) }
+        for pl in 0:placed.len { obstacles.push(placed[pl]) }
+        chosen := choose_label_rect(sx, sy, w, h, bounds, &obstacles)
+        if chosen.width > 0.0 {
+            placed.push(chosen)
+            out[o] = chosen
+        }
+    }
+    << out
+}
+
+pub fn paint_top_view(
+    view $&TopViewState,
+    context &draw.Context,
+    frame $&draw.Frame,
+    bounds &layout.Rect,
+    pts &[]StagePoint,
+    selected_idx int,
+    placing_mode bool,
+    pal &PaperPalette
+) int {
+    _ := context
+    frame.push() or >>
+    frame.clip_rect(bounds.x, bounds.y, bounds.width, bounds.height) or >>
+    frame.fill_rect(bounds.x, bounds.y, bounds.width, bounds.height, pal.surface) or >>
+
+    step := grid_step(view.scale)
+    min_wx := screen_to_world_x(view, bounds, bounds.x)
+    max_wx := screen_to_world_x(view, bounds, bounds.x + bounds.width)
+    min_wz := screen_to_world_z(view, bounds, bounds.y)
+    max_wz := screen_to_world_z(view, bounds, bounds.y + bounds.height)
+
+    $ix := int(math.floor(min_wx / step)) - 1
+    ix_end := int(math.ceil(max_wx / step)) + 1
+    while ix <= ix_end {
+        wx := f64(ix) * step
+        sx := world_to_screen_x(view, bounds, wx)
+        if sx >= bounds.x && sx <= bounds.x + bounds.width {
+            $col := pal.grid_minor
+            if ix % 5 == 0 { col = pal.grid_major }
+            frame.line(sx, bounds.y, sx, bounds.y + bounds.height, col, 1.0) or >>
+        }
+        ix = ix + 1
+    }
+
+    $iz := int(math.floor(min_wz / step)) - 1
+    iz_end := int(math.ceil(max_wz / step)) + 1
+    while iz <= iz_end {
+        wz := f64(iz) * step
+        sy := world_to_screen_y(view, bounds, wz)
+        if sy >= bounds.y && sy <= bounds.y + bounds.height {
+            $col := pal.grid_minor
+            if iz % 5 == 0 { col = pal.grid_major }
+            frame.line(bounds.x, sy, bounds.x + bounds.width, sy, col, 1.0) or >>
+        }
+        iz = iz + 1
+    }
+
+    // Origin axes: +X (red), +Z (blue).
+    ox := world_to_screen_x(view, bounds, 0.0)
+    oz := world_to_screen_y(view, bounds, 0.0)
+    if oz >= bounds.y && oz <= bounds.y + bounds.height {
+        frame.line(bounds.x, oz, bounds.x + bounds.width, oz, pal.axis_x, 1.5) or >>
+    }
+    if ox >= bounds.x && ox <= bounds.x + bounds.width {
+        frame.line(ox, bounds.y, ox, bounds.y + bounds.height, pal.axis_z, 1.5) or >>
+    }
+
+    // Node markers + selection halo.
+    for i in 0:pts.len {
+        p := &pts[i]
+        sx := world_to_screen_x(view, bounds, p.x)
+        sy := world_to_screen_y(view, bounds, p.z)
+        if sx < bounds.x - 24.0 || sx > bounds.x + bounds.width + 24.0 ||
+            sy < bounds.y - 24.0 || sy > bounds.y + bounds.height + 24.0 {
+            ->
+        }
+        $radius := 5.5
+        if p.is_root { radius = 6.5 }
+        $dot_col := pal.info
+        if p.has_surface { dot_col = pal.brand }
+        if p.is_root { dot_col = pal.muted }
+
+        if p.index == selected_idx {
+            frame.stroke_circle(sx, sy, radius + 4.5, pal.focus, 2.0) or >>
+        } else if !placing_mode && p.index == view.hover_node {
+            frame.stroke_circle(sx, sy, radius + 3.5, pal.control_border, 1.5) or >>
+        }
+        if p.visible {
+            frame.fill_circle(sx, sy, radius, dot_col) or >>
+        } else {
+            frame.fill_circle(sx, sy, radius, pal.surface) or >>
+            frame.stroke_circle(sx, sy, radius, dot_col, 2.0) or >>
+        }
+    }
+
+    // Compute and draw non-overlapping node labels.
+    labels := compute_placed_labels(view, bounds, pts, selected_idx)
+    view.placed_labels = labels
+    for i in 0:pts.len {
+        r := &view.placed_labels[i]
+        if r.width <= 0.0 { -> }
+        p := &pts[i]
+        $bg := pal.surface
+        $fg := pal.text
+        $bd := pal.border
+        if p.index == selected_idx {
+            bg = pal.elevated
+            bd = pal.focus
+        } else if !p.visible {
+            fg = pal.muted
+        }
+        frame.fill_round_rect(r.x, r.y, r.width, r.height, 4.0, bg) or >>
+        frame.stroke_round_rect(r.x, r.y, r.width, r.height, 4.0, bd, 1.0) or >>
+        frame.text(r.x + 5.0, r.y + 2.0, 11.5, fg, &p.name) or >>
+    }
+
+    // Placement mode cursor preview.
+    if placing_mode {
+        banner_w := math.min(bounds.width - 20.0, 320.0)
+        frame.fill_round_rect(bounds.x + 10.0, bounds.y + 10.0, banner_w, 26.0, 6.0, pal.brand) or >>
+        frame.text(bounds.x + 20.0, bounds.y + 15.0, 12.0, draw.rgb(255, 255, 255), &"Click Top View to place GLB (Esc cancels)") or >>
+        if view.has_hover {
+            hsx := world_to_screen_x(view, bounds, view.hover_x)
+            hsy := world_to_screen_y(view, bounds, view.hover_z)
+            frame.stroke_circle(hsx, hsy, 8.0, pal.brand, 1.5) or >>
+            frame.line(hsx - 12.0, hsy, hsx + 12.0, hsy, pal.brand, 1.0) or >>
+            frame.line(hsx, hsy - 12.0, hsx, hsy + 12.0, pal.brand, 1.0) or >>
+        }
+    }
+
+    // Corner HUD badges: scale step and axis legend.
+    grid_lbl := fmt_coord(step) + " units / grid"
+    badge_w := math.max(118.0, f64(grid_lbl.len) * 7.2 + 16.0)
+    frame.fill_round_rect(bounds.x + 10.0, bounds.y + bounds.height - 32.0, badge_w, 22.0, 5.0, pal.elevated) or >>
+    frame.stroke_round_rect(bounds.x + 10.0, bounds.y + bounds.height - 32.0, badge_w, 22.0, 5.0, pal.border, 1.0) or >>
+    frame.text(bounds.x + 18.0, bounds.y + bounds.height - 28.0, 11.5, pal.muted, &grid_lbl) or >>
+
+    legend := "X →   Z ↓"
+    lw := 94.0
+    frame.fill_round_rect(bounds.x + bounds.width - lw - 10.0, bounds.y + bounds.height - 32.0, lw, 22.0, 5.0, pal.elevated) or >>
+    frame.stroke_round_rect(bounds.x + bounds.width - lw - 10.0, bounds.y + bounds.height - 32.0, lw, 22.0, 5.0, pal.border, 1.0) or >>
+    frame.text(bounds.x + bounds.width - lw - 2.0, bounds.y + bounds.height - 28.0, 11.5, pal.muted, &legend) or >>
+
+    frame.pop() or >>
+    frame.stroke_rect(bounds.x, bounds.y, bounds.width, bounds.height, pal.border, 1.0) or >>
+    << 0
+}

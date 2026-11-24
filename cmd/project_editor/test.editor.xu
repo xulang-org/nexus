@@ -1,0 +1,461 @@
+@main
+
+resource #"github.com/xulang-org/nexus/resources/scene"
+files #"github.com/xulang-org/nexus/integration/scene"
+fm #"github.com/xulang-org/nexus/foundation/math"
+#ui
+#ui/draw
+#ui/layout
+widgets #ui/widgets
+#os
+#os/exec
+#path/filepath
+#math
+#strings
+#errors
+
+fn t_fail(msg string) {
+    eprintln("FAIL: " + msg)
+    assert(false)
+}
+
+fn t_true(cond bool, msg string) {
+    if !cond {
+        t_fail(msg)
+    }
+}
+
+fn t_near(actual f64, expected f64, tol f64, msg string) {
+    if math.abs(actual - expected) > tol {
+        t_fail(msg + " (got " + fmt_coord(actual) + ", want " + fmt_coord(expected) + ")")
+    }
+}
+
+fn copy_file_exact(src string, dst string) int {
+    data := os.read(src + "") or >>
+    parent := filepath.dir(&dst)
+    os.mkdir_all(parent + "") or >>
+    os.write(dst + "", data) or >>
+    << 0
+}
+
+fn setup_fixture_project() string {
+    tmp := os.mkdir_temp("", "nexus-ed-test-") or (err) {
+        t_fail("mkdir_temp: " + err.msg())
+        << ""
+    }
+    _ := copy_file_exact("examples/scene_assets/project.json", filepath.join([tmp + "", "project.json"])) or (err) {
+        t_fail("copy project.json: " + err.msg())
+        << ""
+    }
+    _ := copy_file_exact("examples/scene_assets/assets/world.xuscene", filepath.join([tmp + "", "assets", "world.xuscene"])) or (err) {
+        t_fail("copy world.xuscene: " + err.msg())
+        << ""
+    }
+    _ := copy_file_exact("examples/scene_assets/assets/panels.glb", filepath.join([tmp + "", "assets", "panels.glb"])) or (err) {
+        t_fail("copy panels.glb: " + err.msg())
+        << ""
+    }
+    << tmp
+}
+
+fn setup_external_glb_file() string {
+    ext_dir := os.mkdir_temp("", "nexus-ed-ext-") or (err) {
+        t_fail("mkdir_temp ext: " + err.msg())
+        << ""
+    }
+    _ := copy_file_exact("examples/scene_assets/assets/panels.glb", filepath.join([ext_dir + "", "crate_extra.glb"])) or (err) {
+        cleanup_dir(ext_dir + "")
+        t_fail("copy external crate_extra.glb: " + err.msg())
+        << ""
+    }
+    << ext_dir
+}
+
+fn cleanup_dir(dir string) {
+    if dir.len > 0 {
+        _ := os.remove_all(dir + "") or (err) {
+            _ := err
+            <<
+        }
+    }
+}
+
+fn rect_inside(inner &layout.Rect, outer &layout.Rect) bool {
+    << inner.x >= outer.x - 0.5 &&
+        inner.y >= outer.y - 0.5 &&
+        inner.x + inner.width <= outer.x + outer.width + 0.5 &&
+        inner.y + inner.height <= outer.y + outer.height + 0.5
+}
+
+fn vec4_exact_eq(a &fm.Vec4, b &fm.Vec4) bool {
+    << a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w
+}
+
+fn run_theme_paper_tokens() int {
+    pal := default_palette()
+    t_true(pal.canvas.value() == draw.rgb(246, 243, 239).value(), "canvas token #f6f3ef")
+    t_true(pal.surface.value() == draw.rgb(255, 253, 251).value(), "surface token #fffdfb")
+    t_true(pal.elevated.value() == draw.rgb(238, 235, 231).value(), "elevated token #eeebe7")
+    t_true(pal.text.value() == draw.rgb(40, 35, 41).value(), "text token #282329")
+    t_true(pal.muted.value() == draw.rgb(109, 98, 110).value(), "muted token #6d626e")
+    t_true(pal.brand.value() == draw.rgb(190, 18, 60).value(), "brand token #be123c")
+    t_true(pal.success.value() == draw.rgb(20, 103, 71).value(), "success token #146747")
+    t_true(pal.danger.value() == draw.rgb(184, 33, 56).value(), "danger token #b82138")
+    t_true(pal.focus.value() == draw.rgb(0, 95, 158).value(), "focus token #005f9e")
+
+    styles := make_paper_styles(&pal) or >>
+    cf := compact_field_style(&styles)
+    cb := compact_button_style(&styles, widgets.BUTTON_PRIMARY)
+    t_true(cf.min_height >= 26.0, "compact field style height")
+    t_true(cb.min_height >= 24.0, "compact button style height")
+    t_true(byte_counter_text(&"hero", 255) == "4 / 255 bytes", "byte counter format")
+    t_true(fmt_coord(-0.0) == "0", "fmt_coord strips negative zero")
+    t_true(fmt_coord(1.2500) == "1.25", "fmt_coord trims trailing zeroes")
+    << 0
+}
+
+fn test_theme_paper_tokens() {
+    _ := run_theme_paper_tokens() or (err) {
+        t_fail("theme test: " + err.msg())
+        <<
+    }
+}
+
+fn try_reparent_ok(d $&Draft, idx int, new_parent int, preserve bool) bool {
+    _ := d.reparent_node(idx, new_parent, preserve) or (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn try_create_scene_ok(proj_path &string, raw_key &string, root &string) bool {
+    _ := create_scene(proj_path, raw_key, root) or (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn try_merge_ok(d $&Draft, captured &resource.Document, rev &string) bool {
+    _ := d.merge_viewport(captured, rev) or (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn try_save_ok(d $&Draft, proj &Project, validator &string) bool {
+    _ := d.save(proj, validator) or (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn test_top_view_math_and_labels() {
+    s1 := grid_step(10.0)
+    t_true(s1 == 5.0 || s1 == 10.0, "grid_step finite power/5x step")
+    $tv := default_top_view()
+    bounds := layout.Rect{x: 0.0, y: 0.0, width: 500.0, height: 400.0}
+    $pts := []StagePoint{}
+    pts.push(StagePoint{index: 0, name: "Root", x: 0.0, z: 0.0, visible: true, has_surface: false, is_root: true})
+    pts.push(StagePoint{index: 1, name: "PanelA", x: 4.0, z: 2.0, visible: true, has_surface: true, is_root: false})
+    pts.push(StagePoint{index: 2, name: "PanelB", x: 4.05, z: 2.02, visible: true, has_surface: true, is_root: false})
+
+    tv.fit_points(&pts, &bounds)
+    t_near(tv.center_x, 2.025, 0.05, "fit_points centers X")
+    t_near(tv.center_z, 1.01, 0.05, "fit_points centers Z")
+
+    // Zooming around a cursor must keep the world coordinate under that cursor fixed.
+    cx := 340.0
+    cy := 150.0
+    wx_before := screen_to_world_x(&tv, &bounds, cx)
+    wz_before := screen_to_world_z(&tv, &bounds, cy)
+    tv.zoom_around(&bounds, cx, cy, 3.0)
+    wx_after := screen_to_world_x(&tv, &bounds, cx)
+    wz_after := screen_to_world_z(&tv, &bounds, cy)
+    t_near(wx_after, wx_before, 1e-6, "zoom_around keeps world X fixed under cursor")
+    t_near(wz_after, wz_before, 1e-6, "zoom_around keeps world Z fixed under cursor")
+
+    // Pan shifts world center inversely by pixel delta / scale.
+    old_cx := tv.center_x
+    old_cz := tv.center_z
+    tv.begin_pan(100.0, 100.0)
+    tv.update_pan(100.0 + tv.scale * 2.0, 100.0 - tv.scale * 1.0)
+    tv.end_pan()
+    t_near(tv.center_x, old_cx - 2.0, 1e-5, "pan moves world center X")
+    t_near(tv.center_z, old_cz + 1.0, 1e-5, "pan moves world center Z")
+
+    // Hit testing picks node close to screen coordinates and ignores far misses.
+    px1 := world_to_screen_x(&tv, &bounds, 4.0)
+    py1 := world_to_screen_y(&tv, &bounds, 2.0)
+    t_true(pick_stage_node(&tv, &bounds, &pts, px1, py1) == 1, "pick_stage_node hits exact point")
+    t_true(pick_stage_node(&tv, &bounds, &pts, 12.0, 12.0) == -1, "pick_stage_node misses empty region")
+
+    // Non-overlapping placed labels for nearly-coincident points.
+    labels := compute_placed_labels(&tv, &bounds, &pts, 1)
+    t_true(labels.len == 3, "placed label count matches pts")
+    if labels[1].width > 0.0 && labels[2].width > 0.0 {
+        t_true(!rects_overlap(&labels[1], &labels[2]), "nearby node labels must not overlap")
+    }
+}
+
+fn run_draft_crud_undo_redo_and_trs(tmp string) int {
+    scene_path := filepath.join([tmp + "", "assets", "world.xuscene"])
+    $draft := open_draft(scene_path + "") or >>
+    t_true(!draft.dirty(), "fresh draft not dirty")
+    t_true(!draft.can_undo(), "fresh draft cannot undo")
+
+    doc0 := draft.document() or >>
+    base_nodes := doc0.node_count()
+    t_true(base_nodes >= 2, "world.xuscene has at least 2 nodes")
+
+    // Add node under root (0).
+    added_idx := draft.add_node_under(0, resource.NODE_3D, "PropAnchor") or >>
+    t_true(added_idx == base_nodes, "added index appended cleanly")
+    t_true(draft.dirty(), "draft marks dirty after edit")
+
+    // Position parent anchor at (10, 0, -4).
+    _ := draft.set_node_properties(
+        added_idx,
+        "PropAnchor",
+        true,
+        fm.vec3(10.0, 0.0, -4.0),
+        false,
+        fm.vec3(0.0, 0.0, 0.0),
+        fm.vec3(1.0, 1.0, 1.0)
+    ) or >>
+
+    // Duplicate a surface node (node 1) -> clones node + surface attachment.
+    surf_before := doc0.surface_count()
+    dup_idx := draft.duplicate_node(1) or >>
+    doc_dup := draft.document() or >>
+    t_true(doc_dup.surface_count() > surf_before, "duplicate_node clones surface attachment")
+
+    // Verify zero drift when setting only position on a rotated/scaled node with rs_changed = false.
+    _ := draft.set_node_properties(
+        dup_idx,
+        "RotBox",
+        true,
+        fm.vec3(3.0, 1.0, 2.0),
+        true,
+        fm.vec3(0.0, 45.0, 0.0),
+        fm.vec3(2.0, 0.5, 1.5)
+    ) or >>
+    doc_rot := draft.document() or >>
+    nd_before := doc_rot.describe_node(dup_idx) or >>
+
+    _ := draft.set_node_properties(
+        dup_idx,
+        "RotBoxMoved",
+        true,
+        fm.vec3(7.0, 1.0, 2.0),
+        false,
+        fm.vec3(0.0, 45.0, 0.0),
+        fm.vec3(2.0, 0.5, 1.5)
+    ) or >>
+    doc_moved := draft.document() or >>
+    nd_after := doc_moved.describe_node(dup_idx) or >>
+
+    // Basis columns c0, c1, c2 must match bitwise when rs_changed == false.
+    t_true(vec4_exact_eq(&nd_before.local_3d.c0, &nd_after.local_3d.c0), "zero c0 drift")
+    t_true(vec4_exact_eq(&nd_before.local_3d.c1, &nd_after.local_3d.c1), "zero c1 drift")
+    t_true(vec4_exact_eq(&nd_before.local_3d.c2, &nd_after.local_3d.c2), "zero c2 drift")
+    t_near(nd_after.local_3d.c3.x, 7.0, 1e-6, "updated position X")
+    t_near(nd_after.local_3d.c3.y, 1.0, 1e-6, "updated position Y")
+    t_near(nd_after.local_3d.c3.z, 2.0, 1e-6, "updated position Z")
+
+    // Reparent dup_idx under added_idx preserving world position (7, 1, 2) relative to (10, 0, -4) -> (-3, 1, 6).
+    new_dup_idx := draft.reparent_node(dup_idx, added_idx, true) or >>
+    doc_rep := draft.document() or >>
+    rep_nd := doc_rep.describe_node(new_dup_idx) or >>
+    t_near(rep_nd.local_3d.c3.x, -3.0, 1e-4, "reparent preserve_world local X")
+    t_near(rep_nd.local_3d.c3.y, 1.0, 1e-4, "reparent preserve_world local Y")
+    t_near(rep_nd.local_3d.c3.z, 6.0, 1e-4, "reparent preserve_world local Z")
+
+    // Cycle check: reparenting parent (added_idx) under child (new_dup_idx) must error!
+    cycle_failed := !try_reparent_ok($&draft, added_idx, new_dup_idx, true)
+    t_true(cycle_failed, "reparent cycle must be rejected")
+
+    // Delete parent branch (added_idx + child new_dup_idx) -> restores base_nodes!
+    _ := draft.delete_node(added_idx) or >>
+    doc_del := draft.document() or >>
+    t_true(doc_del.node_count() == base_nodes, "delete subtree restores node count")
+
+    // Verify 32-step undo/redo cap.
+    for step_i in 0:35 {
+        _ := draft.add_node_under(0, resource.NODE_GROUP, "Step" + str(step_i)) or >>
+    }
+    $undo_n := 0
+    while draft.can_undo() {
+        _ := draft.undo_edit() or >>
+        undo_n = undo_n + 1
+    }
+    t_true(undo_n == MAX_HISTORY, "undo history capped at 32")
+    $redo_n := 0
+    while draft.can_redo() {
+        _ := draft.redo_edit() or >>
+        redo_n = redo_n + 1
+    }
+    t_true(redo_n == MAX_HISTORY, "redo replays all 32 steps")
+    << 0
+}
+
+fn test_draft_crud_undo_redo_and_trs() {
+    tmp := setup_fixture_project()
+    _ := run_draft_crud_undo_redo_and_trs(tmp + "") or (err) {
+        cleanup_dir(tmp + "")
+        t_fail("draft crud/trs: " + err.msg())
+        <<
+    }
+    cleanup_dir(tmp + "")
+}
+
+fn test_path_exists(path string) bool {
+    _ := os.stat(path + "") or (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn run_project_scene_import_place_save_and_viewport_merge(tmp string, ext_dir string) int {
+    proj_path := filepath.join([tmp + "", "project.json"])
+    validator := filepath.abs(&"build/nexus-project-validate") or >>
+
+    // Create new scene and verify manifest registration + duplicate rejection.
+    new_key := create_scene(&proj_path, &"level_2.xuscene", &"StageRoot") or >>
+    t_true(new_key == "level_2.xuscene", "create_scene normalizes .xuscene suffix")
+    dup_scene_err := !try_create_scene_ok(&proj_path, &"level_2", &"StageRoot")
+    t_true(dup_scene_err, "duplicate scene key rejected")
+
+    // Import truly external GLB -> copies to assets/ and reuses on second import.
+    ext_glb := filepath.join([ext_dir + "", "crate_extra.glb"])
+    imp1 := import_external_glb(&proj_path, &ext_glb, &validator) or >>
+    t_true(!imp1.reused, "first external GLB import creates new entry")
+    t_true(imp1.primitive_count > 0, "external GLB primitive count > 0")
+    imp2 := import_external_glb(&proj_path, &ext_glb, &validator) or >>
+    t_true(imp2.reused && imp2.uid == imp1.uid, "identical external GLB reuses existing asset")
+
+    // Place imported asset at (4.5, -2.5) with explicit primitive 0, save & verify validator passes.
+    proj := load_project(proj_path + "") or >>
+    lvl2_path := proj.scene_source(1) or >>
+    $draft := open_draft(lvl2_path + "") or >>
+    placed_idx := draft.place_asset(&proj, imp1.uid + "", 0, 4.5, -2.5) or >>
+    doc_placed := draft.document() or >>
+    t_true(doc_placed.resource_count() == 1, "place_asset adds GLB resource")
+    t_true(doc_placed.surface_count() == 1, "place_asset binds surface")
+
+    // Test viewport revision merge + stale revision conflict rejection.
+    rev_ok := draft.current + ""
+    _ := draft.merge_viewport(&doc_placed, &rev_ok) or >>
+    stale_err := !try_merge_ok($&draft, &doc_placed, &"stale-json")
+    t_true(stale_err, "merge_viewport rejects stale revision conflict")
+
+    // Save succeeds against nexus-project-validate.
+    _ := draft.save(&proj, &validator) or >>
+    t_true(!draft.dirty(), "draft clean after save")
+
+    // Deleting last referencing node removes surface and prunes GLB resource.
+    _ := draft.delete_node(placed_idx) or >>
+    doc_pruned := draft.document() or >>
+    t_true(doc_pruned.surface_count() == 0, "deleting node removes surface")
+    t_true(doc_pruned.resource_count() == 0, "deleting last referencing node prunes GLB resource")
+
+    // External modification conflict detection on disk before save.
+    disk_raw := os.read(lvl2_path + "") or >>
+    os.write(lvl2_path + "", disk_raw + "\n") or >>
+    ext_conflict := !try_save_ok($&draft, &proj, &validator)
+    t_true(ext_conflict, "draft.save rejects external disk modification conflict")
+
+    // End-to-end stage_scene -> nexus-project-viewport -> merge_viewport integration.
+    vp_bin := "build/nexus-project-viewport"
+    if test_path_exists(vp_bin + "") {
+        world_path := proj.scene_source(0) or >>
+        $wdraft := open_draft(world_path + "") or >>
+        wdoc0 := wdraft.document() or >>
+        factor_before := (wdoc0.describe_node(1) or >>).local_3d.c3.x
+        vp_dir := filepath.join([tmp + "", "vp_stage"])
+        staged := stage_scene(&proj, &wdoc0, &world_path, &vp_dir) or >>
+        vp_out := filepath.join([vp_dir + "", "viewport-output.xuscene"])
+        wrev := wdraft.current + ""
+        _ := exec.command(
+            vp_bin + "",
+            "--scene", staged + "",
+            "--output", vp_out + "",
+            "--check-node", "Factor",
+            "--snap-move", "0.5",
+            "--snap-rotate", "15",
+            "--snap-scale", "10"
+        ).combined_output() or >>
+        captured := files.load(vp_out + "") or >>
+        wdraft.merge_viewport(&captured, &wrev) or >>
+        t_true(wdraft.dirty(), "real viewport apply marks draft dirty")
+        wdoc1 := wdraft.document() or >>
+        factor_after := (wdoc1.describe_node(1) or >>).local_3d.c3.x
+        t_near(factor_after - factor_before, 0.20, 1e-4, "real viewport Factor X shift merged")
+    }
+    << 0
+}
+
+fn test_project_scene_import_place_save_and_viewport_merge() {
+    tmp := setup_fixture_project()
+    ext_dir := setup_external_glb_file()
+    _ := run_project_scene_import_place_save_and_viewport_merge(tmp + "", ext_dir + "") or (err) {
+        cleanup_dir(ext_dir + "")
+        cleanup_dir(tmp + "")
+        t_fail("project/scene/import: " + err.msg())
+        <<
+    }
+    cleanup_dir(ext_dir + "")
+    cleanup_dir(tmp + "")
+}
+
+fn run_snap_modal_validation_and_persistence(tmp string) int {
+    // Invalid inputs must populate field errors cleanly.
+    bad := validate_snap_inputs(&"0", &"abc", &"15000")
+    t_true(!bad.valid, "out-of-range/non-numeric snap validation fails")
+    t_true(bad.move_err.len > 0, "move=0 fails range [0.0001, 1000000]")
+    t_true(bad.rotate_err.len > 0, "rotate=abc fails numeric check")
+    t_true(bad.scale_err.len > 0, "scale=15000 fails range [1, 10000]")
+
+    good := validate_snap_inputs(&"0.5", &"15", &"25")
+    t_true(good.valid, "valid snap settings pass validation")
+    t_near(snap_scale_factor(&good.settings), 0.25, 1e-6, "snap_scale_factor converts % to ratio")
+
+    _ := save_snap_settings(&tmp, &good.settings) or >>
+    loaded := load_snap_settings(&tmp)
+    t_near(loaded.move_step, 0.5, 1e-6, "loaded move_step")
+    t_near(loaded.rotate_deg, 15.0, 1e-6, "loaded rotate_deg")
+    t_near(loaded.scale_pct, 25.0, 1e-6, "loaded scale_pct")
+    << 0
+}
+
+fn test_snap_modal_validation_and_persistence() {
+    tmp := os.mkdir_temp("", "nexus-snap-test-") or (err) {
+        t_fail("mkdir_temp snap: " + err.msg())
+        <<
+    }
+    _ := run_snap_modal_validation_and_persistence(tmp + "") or (err) {
+        cleanup_dir(tmp + "")
+        t_fail("snap modal: " + err.msg())
+        <<
+    }
+    cleanup_dir(tmp + "")
+}
+
+fn main() int {
+    test_theme_paper_tokens()
+    println("PASS: test_theme_paper_tokens")
+    test_top_view_math_and_labels()
+    println("PASS: test_top_view_math_and_labels")
+    test_draft_crud_undo_redo_and_trs()
+    println("PASS: test_draft_crud_undo_redo_and_trs")
+    test_project_scene_import_place_save_and_viewport_merge()
+    println("PASS: test_project_scene_import_place_save_and_viewport_merge")
+    test_snap_modal_validation_and_persistence()
+    println("PASS: test_snap_modal_validation_and_persistence")
+    << 0
+}
