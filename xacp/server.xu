@@ -42,9 +42,9 @@ fn (r $&FrameReader) wait_readable() int {
     while true {
         if should_stop(r.stop) {
             r.stopped = true
-            >>> errors.new("xacp: stopped")
+            >> errors.new("xacp: stopped")
         }
-        ready := os.socket_poll(r.fd, 1) >>>
+        ready := os.socket_poll(r.fd, 1) or >>
         if ready != 0 { << 0 }
         time.sleep(2000000)
     }
@@ -62,10 +62,10 @@ fn (r $&FrameReader) read_line() string {
             }
             << line
         }
-        r.wait_readable() >>>
-        chunk := os.socket_read(r.fd, 4096) >>>
+        r.wait_readable() or >>
+        chunk := os.socket_read(r.fd, 4096) or >>
         if chunk.len == 0 {
-            >>> errors.new("EOF")
+            >> errors.new("EOF")
         }
         r.remainder = r.remainder + chunk
     }
@@ -73,10 +73,10 @@ fn (r $&FrameReader) read_line() string {
 
 fn (r $&FrameReader) read_bytes(count int) string {
     while r.remainder.len < count {
-        r.wait_readable() >>>
-        chunk := os.socket_read(r.fd, 4096) >>>
+        r.wait_readable() or >>
+        chunk := os.socket_read(r.fd, 4096) or >>
         if chunk.len == 0 {
-            >>> errors.new("EOF")
+            >> errors.new("EOF")
         }
         r.remainder = r.remainder + chunk
     }
@@ -86,16 +86,16 @@ fn (r $&FrameReader) read_bytes(count int) string {
 }
 
 fn (r $&FrameReader) read_frame() string {
-    magic := r.read_line() >>>
+    magic := r.read_line() or >>
     if magic != "XACP/1" {
-        >>> errors.new("invalid XACP/1 magic line: " + magic)
+        >> errors.new("invalid XACP/1 magic line: " + magic)
     }
-    len_line := r.read_line() >>>
-    length := strconv.atoi(&len_line) >>>
+    len_line := r.read_line() or >>
+    length := strconv.atoi(&len_line) or >>
     if length <= 0 || length > 1048576 {
-        >>> errors.new("invalid XACP/1 frame length")
+        >> errors.new("invalid XACP/1 frame length")
     }
-    body := r.read_bytes(length) >>>
+    body := r.read_bytes(length) or >>
     << body
 }
 
@@ -106,8 +106,8 @@ fn write_frame(fd int, body string) int {
     while offset < full.len {
         $chunk_end := offset + 1024
         if chunk_end > full.len { chunk_end = full.len }
-        n := os.socket_write(fd, full[offset:chunk_end]) >>>
-        if n <= 0 { >>> errors.new("xacp: socket write error") }
+        n := os.socket_write(fd, full[offset:chunk_end]) or >>
+        if n <= 0 { >> errors.new("xacp: socket write error") }
         offset += n
     }
     << 0
@@ -119,7 +119,7 @@ fn write_error_frame(fd int, id int, code string, msg string) int {
         "error:\n" +
         "  code: " + code + "\n" +
         "  msg: " + quote_xun_string(&msg) + "\n"
-    << write_frame(fd, res) >>>
+    << write_frame(fd, res) or >>
 }
 
 // Returns 1 if interrupted by control shutdown, 0 on normal disconnect/EOF.
@@ -135,20 +135,20 @@ fn run_peer_session(peer int, expected_token string, jobs chan GameJob, stop cha
     }
 
     while true {
-        body := reader.read_frame() >>> (err) {
+        body := reader.read_frame() or (err) {
             if reader.stopped { << 1 }
             << 0
         }
         doc := xun.parse(&body)
         if !doc.ok() {
-            write_error_frame(peer, 0, "frame_error", "invalid XUN body") >>> (err) { << 0 }
+            write_error_frame(peer, 0, "frame_error", "invalid XUN body") or (err) { << 0 }
             ->
         }
         root := doc.root()
         id_node := doc.get(root, "id")
         op_node := doc.get(root, "op")
         if id_node < 0 || op_node < 0 {
-            write_error_frame(peer, 0, "frame_error", "missing id or op") >>> (err) { << 0 }
+            write_error_frame(peer, 0, "frame_error", "missing id or op") or (err) { << 0 }
             ->
         }
         req_id := doc.as_int(id_node)
@@ -167,7 +167,7 @@ fn run_peer_session(peer int, expected_token string, jobs chan GameJob, stop cha
 
             if requires_token {
                 if !tokens_equal(&client_token, &expected_token) {
-                    write_error_frame(peer, req_id, "auth_failed", "invalid token") >>> (err) { << 0 }
+                    write_error_frame(peer, req_id, "auth_failed", "invalid token") or (err) { << 0 }
                     << 0
                 }
             }
@@ -184,12 +184,12 @@ fn run_peer_session(peer int, expected_token string, jobs chan GameJob, stop cha
                 "  permission_label: " + quote_xun_string(&perm_label) + "\n" +
                 "  target: \"nexus\"\n" +
                 "  engine: \"github.com/xulang-org/nexus\"\n"
-            write_frame(peer, hello_res) >>> (err) { << 0 }
+            write_frame(peer, hello_res) or (err) { << 0 }
             ->
         }
 
         if requires_token && !authenticated {
-            write_error_frame(peer, req_id, "auth_required", "xacp.hello authentication required") >>> (err) { << 0 }
+            write_error_frame(peer, req_id, "auth_required", "xacp.hello authentication required") or (err) { << 0 }
             ->
         }
 
@@ -199,7 +199,7 @@ fn run_peer_session(peer int, expected_token string, jobs chan GameJob, stop cha
                 "data:\n" +
                 "  pid: !i " + str(os.getpid()) + "\n" +
                 "  state: \"OPEN\"\n"
-            write_frame(peer, status_res) >>> (err) { << 0 }
+            write_frame(peer, status_res) or (err) { << 0 }
             ->
         }
 
@@ -227,9 +227,9 @@ fn run_peer_session(peer int, expected_token string, jobs chan GameJob, stop cha
                 "ok: !b true\n" +
                 "data:\n" +
                 reply.data
-            write_frame(peer, res) >>> (err) { << 0 }
+            write_frame(peer, res) or (err) { << 0 }
         } else {
-            write_error_frame(peer, req_id, reply.err_code, reply.err_msg) >>> (err) { << 0 }
+            write_error_frame(peer, req_id, reply.err_code, reply.err_msg) or (err) { << 0 }
         }
     }
     << 0
@@ -238,20 +238,20 @@ fn run_peer_session(peer int, expected_token string, jobs chan GameJob, stop cha
 fn tcp_server_worker(lfd int, expected_token string, jobs chan GameJob, stop chan int, done chan int) int {
     while true {
         if should_stop(stop) { <- }
-        ready := os.socket_poll(lfd, 1) >>> (err) { <- }
+        ready := os.socket_poll(lfd, 1) or (err) { <- }
         if ready == 0 {
             time.sleep(2000000)
             ->
         }
-        peer := net.accept(lfd) >>> (err) { <- }
+        peer := net.accept(lfd) or (err) { <- }
         session_rc := run_peer_session(peer, expected_token + "", jobs, stop)
-        os.socket_close(peer) >>> (ce) {
+        os.socket_close(peer) or (ce) {
             if session_rc != 0 { <- }
             ->
         }
         if session_rc != 0 { <- }
     }
-    _ := os.socket_close(lfd) >>> (ce) { << 0 }
+    _ := os.socket_close(lfd) or (ce) { << 0 }
     done <- 1
     << 0
 }
@@ -260,7 +260,7 @@ fn parse_bound_port(addr &string, fallback int) int {
     idx := strings.last_index_byte(addr, 58)
     if idx < 0 || idx + 1 >= addr.len { << fallback }
     tail := addr[idx + 1:addr.len]
-    parsed := strconv.atoi(&tail) >>> (err) { << fallback }
+    parsed := strconv.atoi(&tail) or (err) { << fallback }
     << parsed
 }
 
@@ -268,13 +268,13 @@ fn attach_tcp_internal(port int, expected_token string) GameControl {
     if port < 0 || port > 65535 {
         << inactive()
     }
-    lfd := net.listen("127.0.0.1:" + str(port)) >>> (err) {
+    lfd := net.listen("127.0.0.1:" + str(port)) or (err) {
         << inactive()
     }
     $actual_port := port
     if actual_port == 0 {
-        raw_addr := os.getsockname(lfd) >>> (err) {
-            _ := os.socket_close(lfd) >>> (ce) { << inactive() }
+        raw_addr := os.getsockname(lfd) or (err) {
+            _ := os.socket_close(lfd) or (ce) { << inactive() }
             << inactive()
         }
         bound_addr := net.unpack_sockaddr(raw_addr)

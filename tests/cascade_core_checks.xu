@@ -7,9 +7,9 @@ fm #"github.com/xulang-org/nexus/foundation/math"
 fn projection() fm.Mat4 {
     << fm.Mat4{c0: fm.vec4(1.0,0.0,0.0,0.0),c1: fm.vec4(0.0,1.0,0.0,0.0),c2: fm.vec4(0.0,0.0,1.0/39.0,-1.0),c3: fm.vec4(0.0,0.0,40.0/39.0,0.0)}
 }
-fn invalid_camera(view fm.Mat4,p fm.Mat4) bool { shadow.cascade_camera(view,p) >>> (err){ << true }
+fn invalid_camera(view fm.Mat4,p fm.Mat4) bool { shadow.cascade_camera(view,p) or(err){ << true }
     << false }
-fn invalid_settings(source lights.Light3D,camera shadow.CascadeCamera3D,settings shadow.CascadeSettings3D) bool { shadow.cascaded(source,camera,settings) >>> (err){ << true }
+fn invalid_settings(source lights.Light3D,camera shadow.CascadeCamera3D,settings shadow.CascadeSettings3D) bool { shadow.cascaded(source,camera,settings) or(err){ << true }
     << false }
 fn close(a f64,b f64) bool { << math.abs(a-b)<0.000000001 }
 fn check_orthographic(source lights.Light3D) int {
@@ -19,24 +19,24 @@ fn check_orthographic(source lights.Light3D) int {
     settings.caster_padding = 5.0
     pose := fm.translation_3d(fm.vec3(1.0, 3.0, 7.0)).multiply(fm.rotation_y(0.5))
     world := pose.multiply(fm.scale_3d(fm.vec3(1.2, 0.8, 1.1)))
-    view := world.affine_inverse() >>>
+    view := world.affine_inverse() or >>
     for near in [0.0, 2.0] {
         depth := 40.0 - near
         p := fm.Mat4{c0: fm.vec4(1.0 / 12.0, 0.0, 0.0, 0.0), c1: fm.vec4(0.0, 1.0 / 5.0, 0.0, 0.0),
             c2: fm.vec4(0.0, 0.0, 1.0 / depth, 0.0), c3: fm.vec4(0.0, 0.0, 40.0 / depth, 1.0)}
-        camera := shadow.cascade_camera(view, p) >>>
+        camera := shadow.cascade_camera(view, p) or >>
         for count in [2, 3, 4] { for lambda in [0.0, 1.0] {
             settings.count = count
             settings.split_lambda = lambda
-            description := shadow.cascaded(source, camera, settings) >>>
+            description := shadow.cascaded(source, camera, settings) or >>
             assert(description.cascade_count() == count && description.matches_camera(p.multiply(view)))
             plane := description.cascade_depth_plane()
             step := (settings.distance - near) / f64(count)
             for i in 0:count {
-                range := description.cascade_parameters(i) >>>
+                range := description.cascade_parameters(i) or >>
                 assert(close(range.x, near + step * f64(i)) && close(range.y, near + step * f64(i + 1)))
                 fit_near := math.max(near, range.x - step * settings.blend_fraction)
-                matrix := description.view_projection(i) >>>
+                matrix := description.view_projection(i) or >>
                 for distance in [fit_near, range.y] { for x in [-12.0, 12.0] { for y in [-5.0, 5.0] {
                     point := world.transform(fm.vec4(x, y, -distance, 1.0))
                     clip := matrix.transform(point)
@@ -57,32 +57,32 @@ fn check_orthographic(source lights.Light3D) int {
 }
 fn run() int {
     p := projection()
-    camera := shadow.cascade_camera(fm.identity_3d(),p) >>>
-    source := lights.directional(fm.vec3(0.3,1.0,0.2),fm.vec3(3.0,3.0,3.0)) >>>
-    check_orthographic(source) >>>
+    camera := shadow.cascade_camera(fm.identity_3d(),p) or >>
+    source := lights.directional(fm.vec3(0.3,1.0,0.2),fm.vec3(3.0,3.0,3.0)) or >>
+    check_orthographic(source) or >>
     $settings := shadow.default_cascades()
     settings.resolution=128
     settings.distance=40.0
     settings.caster_padding=5.0
     for world in [fm.identity_3d(),fm.translation_3d(fm.vec3(2.0,3.0,4.0)).multiply(fm.rotation_y(0.7)),
         fm.scale_3d(fm.vec3(1.2,0.8,1.1)).multiply(fm.rotation_y(-0.3))] {
-        view := world.affine_inverse() >>>
-        posed := shadow.cascade_camera(view,p) >>>
+        view := world.affine_inverse() or >>
+        posed := shadow.cascade_camera(view,p) or >>
         for count in [2,3,4] { for lambda in [0.0,0.6,1.0] {
             settings.count=count
             settings.split_lambda=lambda
-            description := shadow.cascaded(source,posed,settings) >>>
+            description := shadow.cascaded(source,posed,settings) or >>
             assert(description.face_count()==count && description.cascade_count()==count && description.matches_camera(p.multiply(view)))
             plane := description.cascade_depth_plane()
             $previous_start := 1.0
             $previous_end := 1.0
             for i in 0:count {
-                range := description.cascade_parameters(i) >>>
+                range := description.cascade_parameters(i) or >>
                 assert(close(range.x,previous_end) && range.y>range.x && range.z<range.y && range.w>0.0 && range.w<=1.0)
                 if lambda==0.0 { assert(close(range.y,1.0+39.0*f64(i+1)/f64(count))) }
                 $fit_near := range.x
                 if i>0 { fit_near=range.x-(range.x-previous_start)*settings.blend_fraction }
-                matrix := description.view_projection(i) >>>
+                matrix := description.view_projection(i) or >>
                 for distance in [fit_near,range.y] { for x in [-1.0,1.0] { for y in [-1.0,1.0] {
                     q := world.transform(fm.vec4(x*distance,y*distance,-distance,1.0))
                     clip := matrix.transform(q)
@@ -97,15 +97,15 @@ fn run() int {
     }
     settings.count=4
     settings.split_lambda=0.6
-    vertical := lights.directional(fm.vec3(0.0,1.0,0.0),fm.vec3(1.0,1.0,1.0)) >>>
-    a := shadow.cascaded(vertical,camera,settings) >>>
+    vertical := lights.directional(fm.vec3(0.0,1.0,0.0),fm.vec3(1.0,1.0,1.0)) or >>
+    a := shadow.cascaded(vertical,camera,settings) or >>
     moved_view := fm.translation_3d(fm.vec3(-0.00001,0.0,0.0))
-    moved_camera := shadow.cascade_camera(moved_view,p) >>>
-    b := shadow.cascaded(vertical,moved_camera,settings) >>>
+    moved_camera := shadow.cascade_camera(moved_view,p) or >>
+    b := shadow.cascaded(vertical,moved_camera,settings) or >>
     assert(!a.matches_camera(p.multiply(moved_view)))
     for i in 0:4 {
-        ma := a.view_projection(i) >>>
-        mb := b.view_projection(i) >>>
+        ma := a.view_projection(i) or >>
+        mb := b.view_projection(i) or >>
         assert(ma.c0.x==mb.c0.x && ma.c1.y==mb.c1.y && ma.c2.z==mb.c2.z && ma.c3.x==mb.c3.x && ma.c3.y==mb.c3.y && ma.c3.z==mb.c3.z)
     }
     settings.count=1
@@ -131,5 +131,5 @@ fn run() int {
     println("PASS: 2/3/4 perspective and orthographic cascades, split policy, affine-view overlap corner coverage, depth plane, texel stability, stale camera and invalid settings")
     << 0
 }
-fn main() int { << run() >>> (err){ eprintln(err.msg())
+fn main() int { << run() or(err){ eprintln(err.msg())
     << 1 } }

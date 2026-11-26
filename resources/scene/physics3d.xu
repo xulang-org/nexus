@@ -1,0 +1,174 @@
+@"github.com/xulang-org/nexus/resources/scene"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+
+pub const MAX_SCENE_RIGID_BODIES_3D = 1024
+pub const MAX_SCENE_JOINTS_3D = 512
+
+pub const BODY_STATIC = 0
+pub const BODY_KINEMATIC = 1
+pub const BODY_DYNAMIC = 2
+
+pub const SHAPE_BOX = 0
+pub const SHAPE_SPHERE = 1
+pub const SHAPE_CAPSULE = 2
+pub const SHAPE_MESH = 3
+
+pub const JOINT_BALL = 0
+pub const JOINT_HINGE = 1
+pub const JOINT_DISTANCE = 2
+
+pub struct RigidBody3DAttachment {
+    pub node int
+    pub body_type int
+    pub shape_kind int
+    pub half_extents fm.Vec3
+    pub radius f64
+    pub height f64
+    pub mass f64
+    pub restitution f64
+    pub friction f64
+    pub layer int
+    pub mask int
+    pub is_trigger bool
+}
+
+pub struct Joint3DAttachment {
+    pub node_a int
+    pub node_b int
+    pub kind int
+    pub anchor_a fm.Vec3
+    pub anchor_b fm.Vec3
+    pub axis fm.Vec3
+    pub limit_min f64
+    pub limit_max f64
+    pub motor_speed f64
+    pub motor_torque f64
+}
+
+pub fn default_rigid_body_3d(node int) RigidBody3DAttachment {
+    << RigidBody3DAttachment{
+        node: node,
+        body_type: BODY_DYNAMIC,
+        shape_kind: SHAPE_BOX,
+        half_extents: fm.vec3(0.5, 0.5, 0.5),
+        radius: 0.5,
+        height: 1.0,
+        mass: 1.0,
+        restitution: 0.2,
+        friction: 0.6,
+        layer: 1,
+        mask: 1,
+        is_trigger: false
+    }
+}
+
+pub fn default_joint_3d(node_a int, node_b int) Joint3DAttachment {
+    << Joint3DAttachment{
+        node_a: node_a,
+        node_b: node_b,
+        kind: JOINT_BALL,
+        anchor_a: fm.vec3(0.0, 0.0, 0.0),
+        anchor_b: fm.vec3(0.0, 0.0, 0.0),
+        axis: fm.vec3(0.0, 1.0, 0.0),
+        limit_min: -1.5707963267948966,
+        limit_max: 1.5707963267948966,
+        motor_speed: 0.0,
+        motor_torque: 0.0
+    }
+}
+
+pub fn (b &RigidBody3DAttachment) validate() int {
+    if b.body_type < BODY_STATIC || b.body_type > BODY_DYNAMIC {
+        >> errors.new("nexus scene: unsupported RigidBody3D body_type")
+    }
+    if b.shape_kind < SHAPE_BOX || b.shape_kind > SHAPE_MESH {
+        >> errors.new("nexus scene: unsupported RigidBody3D shape_kind")
+    }
+    if !fm.finite(b.half_extents.x) || !fm.finite(b.half_extents.y) || !fm.finite(b.half_extents.z) ||
+        b.half_extents.x <= 0.0 || b.half_extents.y <= 0.0 || b.half_extents.z <= 0.0 {
+        >> errors.new("nexus scene: RigidBody3D half_extents must be finite and positive")
+    }
+    if !fm.finite(b.radius) || b.radius <= 0.0 || !fm.finite(b.height) || b.height <= 0.0 {
+        >> errors.new("nexus scene: RigidBody3D radius and height must be finite and positive")
+    }
+    if !fm.finite(b.mass) || b.mass < 0.0 ||
+        !fm.finite(b.restitution) || b.restitution < 0.0 || b.restitution > 1.0 ||
+        !fm.finite(b.friction) || b.friction < 0.0 {
+        >> errors.new("nexus scene: RigidBody3D physical coefficients outside valid range")
+    }
+    if b.layer < 0 || b.mask < 0 {
+        >> errors.new("nexus scene: RigidBody3D layer/mask cannot be negative")
+    }
+    << 0
+}
+
+pub fn (j &Joint3DAttachment) validate() int {
+    if j.kind < JOINT_BALL || j.kind > JOINT_DISTANCE {
+        >> errors.new("nexus scene: unsupported Joint3D kind")
+    }
+    if j.node_a == j.node_b {
+        >> errors.new("nexus scene: Joint3D requires distinct node_a and node_b")
+    }
+    if !fm.finite(j.anchor_a.x) || !fm.finite(j.anchor_a.y) || !fm.finite(j.anchor_a.z) ||
+        !fm.finite(j.anchor_b.x) || !fm.finite(j.anchor_b.y) || !fm.finite(j.anchor_b.z) ||
+        !fm.finite(j.axis.x) || !fm.finite(j.axis.y) || !fm.finite(j.axis.z) {
+        >> errors.new("nexus scene: Joint3D vectors must be finite")
+    }
+    if j.kind == JOINT_HINGE && j.axis.length() <= 1e-6 {
+        >> errors.new("nexus scene: Joint3D hinge requires non-zero axis")
+    }
+    if !fm.finite(j.limit_min) || !fm.finite(j.limit_max) || j.limit_min > j.limit_max ||
+        !fm.finite(j.motor_speed) || !fm.finite(j.motor_torque) || j.motor_torque < 0.0 {
+        >> errors.new("nexus scene: Joint3D limits or motor parameters invalid")
+    }
+    << 0
+}
+
+fn validate_rigid_bodies_3d(document &Document, bodies &[]RigidBody3DAttachment) int {
+    if bodies.len > MAX_SCENE_RIGID_BODIES_3D {
+        >> errors.new("nexus scene: RigidBody3D attachment count exceeds 1024")
+    }
+    $occupied := map[int]bool{}
+    for b in bodies {
+        if b.node < 0 || b.node >= document.nodes.len || document.nodes[b.node].kind != NODE_3D || occupied.has(b.node) {
+            >> errors.new("nexus scene: RigidBody3D requires a unique Node3D index")
+        }
+        b.validate() or >>
+        occupied[b.node] = true
+    }
+    << 0
+}
+
+fn validate_joints_3d(document &Document, joints &[]Joint3DAttachment) int {
+    if joints.len > MAX_SCENE_JOINTS_3D {
+        >> errors.new("nexus scene: Joint3D attachment count exceeds 512")
+    }
+    for j in joints {
+        if j.node_a < 0 || j.node_a >= document.nodes.len || document.nodes[j.node_a].kind != NODE_3D ||
+            j.node_b < 0 || j.node_b >= document.nodes.len || document.nodes[j.node_b].kind != NODE_3D {
+            >> errors.new("nexus scene: Joint3D requires valid Node3D endpoints")
+        }
+        j.validate() or >>
+    }
+    << 0
+}
+
+pub fn (document &Document) rigid_body_3d_count() int { << document.rigid_bodies_3d.len }
+
+pub fn (document &Document) rigid_body_3d(index int) RigidBody3DAttachment {
+    if index < 0 || index >= document.rigid_bodies_3d.len {
+        >> errors.new("nexus scene: RigidBody3D index outside document")
+    }
+    << document.rigid_bodies_3d[index]
+}
+
+pub fn (document &Document) joint_3d_count() int { << document.joints_3d.len }
+
+pub fn (document &Document) joint_3d(index int) Joint3DAttachment {
+    if index < 0 || index >= document.joints_3d.len {
+        >> errors.new("nexus scene: Joint3D index outside document")
+    }
+    << document.joints_3d[index]
+}

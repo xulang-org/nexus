@@ -1,0 +1,138 @@
+@main
+
+ui_bridge #"github.com/xulang-org/nexus/integration/ui"
+#errors
+#math
+#ui/layout
+widgets #ui/widgets
+wev #window/events
+
+fn assert(ok bool, msg string) int {
+    if !ok { >> errors.new("ui_tree_focus_checks: " + msg) }
+    << 0
+}
+
+fn key_event(key int, mods int) wev.Event {
+    $ev := wev.empty()
+    ev.kind = wev.EVENT_KEY_DOWN
+    ev.physical_key = key
+    ev.modifiers = mods
+    << ev
+}
+
+fn ptr_event(kind int, button int, x f64, y f64) wev.Event {
+    $ev := wev.empty()
+    ev.kind = kind
+    ev.button = button
+    ev.x = x
+    ev.y = y
+    << ev
+}
+
+fn run() int {
+    $tree := ui_bridge.new_control_tree()
+    panel := tree.add_panel(-1, layout.Rect{x: 16.0, y: 16.0, width: 260.0, height: 260.0},
+        ui_bridge.UI_LAYOUT_COLUMN, 12.0, 8.0) or >>
+    lbl := tree.add_label(panel, layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 22.0}, "Controls") or >>
+    row := tree.add_panel(panel, layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 34.0},
+        ui_bridge.UI_LAYOUT_ROW, 0.0, 8.0) or >>
+    btn_a := tree.add_button(row, layout.Rect{x: 0.0, y: 0.0, width: 110.0, height: 32.0}, "Play", 2) or >>
+    btn_b := tree.add_button(row, layout.Rect{x: 0.0, y: 0.0, width: 110.0, height: 32.0}, "Reset", 1) or >>
+    tgl := tree.add_toggle(panel, layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 30.0}, "VFX Bloom", false, 3) or >>
+    sli := tree.add_slider(panel, layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 36.0}, "Exposure", 0.0, 2.0, 1.0, 4) or >>
+    btn_disabled := tree.add_button(panel, layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 28.0}, "Disabled", 0) or >>
+    tree.set_enabled(btn_disabled, false) or >>
+
+    modal := tree.add_modal(-1, layout.Rect{x: 200.0, y: 120.0, width: 240.0, height: 140.0}, "Confirm", false) or >>
+    modal_btn := tree.add_button(modal, layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 32.0}, "OK", 1) or >>
+
+    tree.compute_layout(800.0, 600.0) or >>
+
+    lbl_b := tree.node_bounds(lbl) or >>
+    row_b := tree.node_bounds(row) or >>
+    a_b := tree.node_bounds(btn_a) or >>
+    b_b := tree.node_bounds(btn_b) or >>
+    assert(math.abs(lbl_b.x - 28.0) < 0.01 && math.abs(lbl_b.y - 28.0) < 0.01, "column first item position") or >>
+    assert(math.abs(row_b.y - 58.0) < 0.01 && math.abs(row_b.width - 236.0) < 0.01, "column fill width") or >>
+    assert(math.abs(b_b.x - (a_b.x + 118.0)) < 0.01, "row horizontal gap layout") or >>
+
+    // Deterministic Tab/Shift+Tab order sorted by (tab_index, id), skipping disabled node.
+    order := tree.focusable_order()
+    assert(order.len == 4, "focusable count without modal") or >>
+    assert(order[0] == btn_b && order[1] == btn_a && order[2] == tgl && order[3] == sli, "tab_index order") or >>
+
+    tab := key_event(wev.KEY_TAB, 0)
+    shift_tab := key_event(wev.KEY_TAB, wev.MOD_LEFT_SHIFT)
+    assert(tree.handle_event(&tab).node_id == btn_b, "first tab focuses tab_index 1") or >>
+    assert(tree.handle_event(&tab).node_id == btn_a, "second tab focuses tab_index 2") or >>
+    assert(tree.handle_event(&tab).node_id == tgl, "third tab focuses toggle") or >>
+    assert(tree.handle_event(&shift_tab).node_id == btn_a, "shift+tab returns to btn_a") or >>
+
+    // Space toggles focused toggle control.
+    assert(tree.handle_event(&tab).node_id == tgl, "tab back to toggle") or >>
+    space := key_event(wev.KEY_SPACE, 0)
+    t_act := tree.handle_event(&space)
+    assert(t_act.kind == ui_bridge.UI_ACTION_TOGGLE && t_act.node_id == tgl && t_act.checked, "space toggles checkbox/switch") or >>
+    assert(tree.node_checked(tgl) or >>, "toggle checked updated") or >>
+
+    // Pointer click on btn_a and drag on slider.
+    down_a := ptr_event(wev.EVENT_POINTER_DOWN, wev.BUTTON_LEFT, a_b.x + 10.0, a_b.y + 10.0)
+    up_a := ptr_event(wev.EVENT_POINTER_UP, wev.BUTTON_LEFT, a_b.x + 10.0, a_b.y + 10.0)
+    _ := tree.handle_event(&down_a)
+    c_act := tree.handle_event(&up_a)
+    assert(c_act.kind == ui_bridge.UI_ACTION_CLICK && c_act.node_id == btn_a, "pointer click btn_a") or >>
+
+    sb := tree.node_bounds(sli) or >>
+    s_down := ptr_event(wev.EVENT_POINTER_DOWN, wev.BUTTON_LEFT, sb.x + sb.width * 0.5, sb.y + sb.height * 0.5)
+    _ := tree.handle_event(&s_down)
+    s_drag := ptr_event(wev.EVENT_POINTER_MOVE, 0, sb.x + sb.width + 50.0, sb.y + sb.height * 0.5)
+    s_act := tree.handle_event(&s_drag)
+    assert(s_act.kind == ui_bridge.UI_ACTION_SLIDE && math.abs(s_act.value - 2.0) < 0.01, "slider drag clamps to max") or >>
+    s_up := ptr_event(wev.EVENT_POINTER_UP, wev.BUTTON_LEFT, sb.x + sb.width + 50.0, sb.y + sb.height * 0.5)
+    _ := tree.handle_event(&s_up)
+
+    // Sync HudRouter and verify hit arbitration.
+    $router := ui_bridge.new_hud_router()
+    $bridge := ui_bridge.default_input_bridge()
+    tree.sync_hud_router($&router) or >>
+    hud_click := ptr_event(wev.EVENT_POINTER_DOWN, wev.BUTTON_LEFT, a_b.x + 5.0, a_b.y + 5.0)
+    dec_hud := router.route_event($&bridge, &hud_click)
+    assert(dec_hud.to_ui && !dec_hud.to_game, "HudRouter routes HUD click to UI only") or >>
+
+    // Modal focus trap & background blocking.
+    tree.set_visible(modal, true) or >>
+    tree.compute_layout(800.0, 600.0) or >>
+    m_order := tree.focusable_order()
+    assert(m_order.len == 1 && m_order[0] == modal_btn, "modal traps focus to modal subtree") or >>
+    assert(tree.handle_event(&tab).node_id == modal_btn, "tab trapped in modal") or >>
+    tree.sync_hud_router($&router) or >>
+    assert(router.is_modal(), "HudRouter sees active modal") or >>
+    world_click := ptr_event(wev.EVENT_POINTER_DOWN, wev.BUTTON_LEFT, 700.0, 500.0)
+    dec_modal := router.route_event($&bridge, &world_click)
+    assert(dec_modal.to_ui && !dec_modal.to_game, "modal blocks world input") or >>
+
+    // Escape closes active modal.
+    esc := key_event(wev.KEY_ESCAPE, 0)
+    esc_act := tree.handle_event(&esc)
+    assert(esc_act.node_id == modal && esc_act.consumed, "escape closes modal") or >>
+    tree.compute_layout(800.0, 600.0) or >>
+    assert(tree.focusable_order().len == 4, "focus restored after modal closes") or >>
+
+    // Render into UiFrame.
+    styles := widgets.dark_styles()
+    $frame := ui_bridge.new_ui_frame(&styles) or >>
+    frame.begin() or >>
+    tree.render($&frame) or >>
+    assert(frame.chunk_count() > 0, "UiControlTree emitted render chunks") or >>
+
+    println("PASS: ui_tree_focus_checks")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

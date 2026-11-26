@@ -27,11 +27,11 @@ struct GizmoDrag {
 }
 
 fn local_basis(transform fm.Mat4) GizmoBasis {
-    x := transform.c0.xyz().normalized() >>>
-    y_column := transform.c1.xyz().normalized() >>>
-    y := y_column.sub(x.scaled(x.dot(y_column))).normalized() >>>
-    z_column := transform.c2.xyz().normalized() >>>
-    $z := x.cross(y).normalized() >>>
+    x := transform.c0.xyz().normalized() or >>
+    y_column := transform.c1.xyz().normalized() or >>
+    y := y_column.sub(x.scaled(x.dot(y_column))).normalized() or >>
+    z_column := transform.c2.xyz().normalized() or >>
+    $z := x.cross(y).normalized() or >>
     if z.dot(z_column) < 0.0 { z = z.scaled(-1.0) }
     << GizmoBasis{x: x, y: y, z: z}
 }
@@ -58,9 +58,9 @@ fn selection_roots(tree &scene.SceneTree, selection &[]int) []int {
     for node in selection { chosen[node] = true }
     $result := []int{}
     for node in selection {
-        $parent := (tree.node_info(node) >>>).parent
+        $parent := (tree.node_info(node) or >>).parent
         while parent != 0 {
-            info := tree.node_info(parent) >>>
+            info := tree.node_info(parent) or >>
             if info.kind == scene.NODE_2D { <- }
             if chosen.has(parent) { <- }
             parent = info.parent
@@ -71,11 +71,11 @@ fn selection_roots(tree &scene.SceneTree, selection &[]int) []int {
 }
 
 fn parent_transform(tree &scene.SceneTree, node int) fm.Mat4 {
-    $parent := (tree.node_info(node) >>>).parent
+    $parent := (tree.node_info(node) or >>).parent
     while parent != 0 {
-        info := tree.node_info(parent) >>>
+        info := tree.node_info(parent) or >>
         if info.kind == scene.NODE_2D { <- }
-        if info.kind == scene.NODE_3D { << tree.global_transform_3d(parent) >>> }
+        if info.kind == scene.NODE_3D { << tree.global_transform_3d(parent) or >> }
         parent = info.parent
     }
     << fm.identity_3d()
@@ -86,7 +86,7 @@ fn selection_pivot(tree &scene.SceneTree, roots &[]int) fm.Vec3 {
     if roots.len == 0 { << total }
     weight := 1.0 / f64(roots.len)
     for node in roots {
-        world := tree.global_transform_3d(node) >>>
+        world := tree.global_transform_3d(node) or >>
         total = total.add(world.c3.xyz().scaled(weight))
     }
     << total
@@ -106,7 +106,7 @@ fn rotation_radial(ray ViewRay, pivot fm.Vec3, axis fm.Vec3) fm.Vec3 {
     vector := ray.origin.add(ray.direction.scaled(distance)).sub(pivot)
     // Remove the plane residual introduced by finite-precision ray arithmetic.
     on_plane := vector.sub(axis.scaled(vector.dot(axis)))
-    << on_plane.normalized() >>> (err) { << empty }
+    << on_plane.normalized() or (err) { << empty }
 }
 
 fn start_transform(tree &scene.SceneTree, roots &[]int, pivot fm.Vec3, basis GizmoBasis, mode int,
@@ -115,19 +115,19 @@ fn start_transform(tree &scene.SceneTree, roots &[]int, pivot fm.Vec3, basis Giz
     $radial := fm.vec3(0.0, 0.0, 0.0)
     $start := point.x
     if mode == GIZMO_ROTATE {
-        radial = rotation_radial(ray, pivot, axis) >>>
-        if radial.dot(radial) < 0.5 { >>> errors.new("rotation ring is edge-on") }
+        radial = rotation_radial(ray, pivot, axis) or >>
+        if radial.dot(radial) < 0.5 { >> errors.new("rotation ring is edge-on") }
     } else if axis.dot(axis) > 0.0 {
         q := ray.direction.dot(axis)
-        if 1.0 - q * q <= 0.000001 { >>> errors.new("transform axis is edge-on") }
+        if 1.0 - q * q <= 0.000001 { >> errors.new("transform axis is edge-on") }
         start = axis_amount(ray, pivot, axis, q)
     }
     $targets := []DragTarget{}
     for node in roots {
-        local := (tree.node_3d(node) >>>).transform
-        parent := parent_transform(tree, node) >>>
-        inverse := parent.affine_inverse() >>>
-        targets.push(DragTarget{node: node, local: local, world: tree.global_transform_3d(node) >>>,
+        local := (tree.node_3d(node) or >>).transform
+        parent := parent_transform(tree, node) or >>
+        inverse := parent.affine_inverse() or >>
+        targets.push(DragTarget{node: node, local: local, world: tree.global_transform_3d(node) or >>,
             parent: parent, inverse_parent: inverse})
     }
     $origin := 0.0
@@ -137,13 +137,13 @@ fn start_transform(tree &scene.SceneTree, roots &[]int, pivot fm.Vec3, basis Giz
 }
 
 fn restore_transform(tree $&scene.SceneTree, drag &GizmoDrag) int {
-    for target in drag.targets { tree.set_transform_3d(target.node, target.local) >>> }
+    for target in drag.targets { tree.set_transform_3d(target.node, target.local) or >> }
     << 0
 }
 
 fn rotation_transform(axis fm.Vec3, angle f64) fm.Mat4 {
     sine := math.sin(angle * 0.5)
-    << fm.quaternion(axis.x * sine, axis.y * sine, axis.z * sine, math.cos(angle * 0.5)).rotation_matrix() >>>
+    << fm.quaternion(axis.x * sine, axis.y * sine, axis.z * sine, math.cos(angle * 0.5)).rotation_matrix() or >>
 }
 
 fn scaled_transform(axis fm.Vec3, factor f64) fm.Mat4 {
@@ -191,7 +191,7 @@ fn update_transform(tree $&scene.SceneTree, drag &GizmoDrag, ray ViewRay, point 
     axis := drag.axis
     $amount := 0.0
     if drag.mode == GIZMO_ROTATE {
-        radial := rotation_radial(ray, drag.pivot, axis) >>>
+        radial := rotation_radial(ray, drag.pivot, axis) or >>
         if radial.dot(radial) < 0.5 { << 0 }
         amount = math.atan2(axis.dot(drag.radial.cross(radial)), drag.radial.dot(radial))
     } else if axis.dot(axis) == 0.0 {
@@ -203,15 +203,15 @@ fn update_transform(tree $&scene.SceneTree, drag &GizmoDrag, ray ViewRay, point 
         if drag.mode == GIZMO_SCALE { amount = amount / drag.extent }
     }
     if !fm.finite(amount) { << 0 }
-    if math.abs(amount) <= 0.0000000001 { << restore_transform(tree, drag) >>> }
+    if math.abs(amount) <= 0.0000000001 { << restore_transform(tree, drag) or >> }
     if drag.mode == GIZMO_SCALE {
         amount = scale_delta(amount, drag.snap_step)
     } else if drag.snap_step > 0.0 {
         amount = snap_amount(amount, drag.snap_origin, drag.snap_step)
     }
-    if math.abs(amount) <= 0.0000000001 { << restore_transform(tree, drag) >>> }
+    if math.abs(amount) <= 0.0000000001 { << restore_transform(tree, drag) or >> }
     $delta := fm.identity_3d()
-    if drag.mode == GIZMO_ROTATE { delta = at_pivot(rotation_transform(axis, amount) >>>, drag.pivot) }
+    if drag.mode == GIZMO_ROTATE { delta = at_pivot(rotation_transform(axis, amount) or >>, drag.pivot) }
     if drag.mode == GIZMO_SCALE { delta = at_pivot(scaled_transform(axis, 1.0 + amount), drag.pivot) }
     $candidates := []fm.Mat4{}
     for i in 0:drag.targets.len {
@@ -221,9 +221,9 @@ fn update_transform(tree $&scene.SceneTree, drag &GizmoDrag, ray ViewRay, point 
         else { next = target.inverse_parent.multiply(delta.multiply(target.world)) }
         world := target.parent.multiply(next)
         if !next.is_affine() || !world.is_affine() || !edit_range(next.c3.xyz()) || !edit_range(world.c3.xyz()) { << 0 }
-        if drag.mode != GIZMO_MOVE { world.affine_inverse() >>> (err) { << 0 } }
+        if drag.mode != GIZMO_MOVE { world.affine_inverse() or (err) { << 0 } }
         candidates.push(next)
     }
-    for i in 0:candidates.len { tree.set_transform_3d(drag.targets[i].node, candidates[i]) >>> }
+    for i in 0:candidates.len { tree.set_transform_3d(drag.targets[i].node, candidates[i]) or >> }
     << 0
 }

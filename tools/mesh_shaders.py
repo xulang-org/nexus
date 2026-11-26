@@ -16,40 +16,53 @@ def main():
     prepare_mesh(backend, args.out_dir)
 
 
+STAGE_PROFILES = {
+    'vert': 'vs_6_0',
+    'frag': 'ps_6_0',
+    'comp': 'cs_6_0',
+}
+
+
+def discover_shaders(source: Path):
+    items = []
+    for msl_path in sorted(source.glob('*.msl')):
+        stem = msl_path.stem
+        if '.' not in stem:
+            continue
+        stage = stem.rsplit('.', 1)[1]
+        if stage in STAGE_PROFILES:
+            items.append((stem, stage, STAGE_PROFILES[stage]))
+    return items
+
+
+def expand_includes(raw: bytes, source: Path) -> bytes:
+    for include in ('lighting.inc', 'shadow.inc'):
+        raw = raw.replace(f'#include "{include}"'.encode(), (source / include).read_bytes())
+    return raw
+
+
 def prepare_mesh(backend, out_dir):
     prepare(backend, out_dir)
     source = Path(__file__).resolve().parents[1] / 'rendering/three_d/shaders'
     if backend == 'd3d12':
         compiler = shutil.which('dxc')
+        if not compiler:
+            raise SystemExit('d3d12 shaders require DXC')
     elif backend == 'vulkan':
         vulkan = vulkan_shader_command()
-    for name in ('mesh', 'shadow'):
-        for stage, profile in (('vert', 'vs_6_0'), ('frag', 'ps_6_0')):
-            shader = f'{name}.{stage}'
-            output = out_dir / f'{shader}.bin'
-            if backend == 'metal':
-                data = (source / f'{shader}.msl').read_bytes()
-                for include in ('lighting.inc', 'shadow.inc'):
-                    data = data.replace(f'#include "{include}"'.encode(), (source / include).read_bytes())
-                output.write_bytes(data)
-            elif backend == 'd3d12':
-                subprocess.run(
-                    [compiler, '-T', profile, '-E', 'main', '-Fo', str(output), str(source / f'{shader}.hlsl')],
-                    check=True,
-                )
-            else:
-                subprocess.run([*vulkan, '-o', str(output), str(source / shader)], check=True)
-    if backend == 'metal':
-        for comp in source.glob('*.msl'):
-            if comp.stem.endswith('.comp') or comp.stem.endswith('.vert') or comp.stem.endswith('.frag'):
-                name_key = comp.stem
-                if name_key in ('mesh.vert', 'mesh.frag', 'shadow.vert', 'shadow.frag'):
-                    continue
-                data = comp.read_bytes()
-                for include in ('lighting.inc', 'shadow.inc'):
-                    data = data.replace(f'#include "{include}"'.encode(), (source / include).read_bytes())
-                (out_dir / f'{name_key}.bin').write_bytes(data)
-    print(f'Prepared {backend} mesh shader artifacts in {out_dir}')
+    for shader, stage, profile in discover_shaders(source):
+        output = out_dir / f'{shader}.bin'
+        if backend == 'metal':
+            data = expand_includes((source / f'{shader}.msl').read_bytes(), source)
+            output.write_bytes(data)
+        elif backend == 'd3d12':
+            subprocess.run(
+                [compiler, '-T', profile, '-E', 'main', '-Fo', str(output), str(source / f'{shader}.hlsl')],
+                check=True,
+            )
+        else:
+            subprocess.run([*vulkan, '-o', str(output), str(source / shader)], check=True)
+    print(f'Prepared {backend} cross-backend 3D shader artifacts in {out_dir}')
 
 
 if __name__ == '__main__':

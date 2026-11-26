@@ -1,0 +1,134 @@
+#version 450
+
+const uint CLUSTER_X = 16u;
+const uint CLUSTER_Y = 16u;
+const uint CLUSTER_Z = 24u;
+const uint TOTAL_CLUSTERS = CLUSTER_X * CLUSTER_Y * CLUSTER_Z;
+const uint MAX_LIGHTS_PER_CLUSTER = 64u;
+
+struct LightGpu {
+    vec4 position_kind;
+    vec4 direction_range;
+    vec4 radiance_inner;
+    vec4 cone;
+};
+
+layout(set = 2, binding = 0, std140) uniform ClusterParams {
+    mat4 view;
+    mat4 inv_proj;
+    vec4 grid;
+    vec4 screen_depth;
+    vec4 mode_log;
+} params;
+
+layout(set = 0, binding = 0, std430) readonly buffer LightsBuf {
+    LightGpu lights[];
+};
+
+layout(set = 1, binding = 0, std430) buffer ClusterCountsBuf {
+    uint cluster_counts[];
+};
+
+layout(set = 1, binding = 1, std430) buffer ClusterIndicesBuf {
+    uint cluster_indices[];
+};
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+vec3 unproject_ndc(mat4 inv_proj, float ndc_x, float ndc_y, float ndc_z) {
+    vec4 v = inv_proj * vec4(ndc_x, ndc_y, ndc_z, 1.0);
+    return v.xyz / v.w;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint light_count = uint(params.grid.w);
+
+    if (gid == TOTAL_CLUSTERS) {
+        uint dir_count = 0u;
+        for (uint li = 0u; li < light_count; ++li) {
+            if (lights[li].position_kind.w < 0.5) {
+                if (dir_count < MAX_LIGHTS_PER_CLUSTER) {
+                    cluster_indices[TOTAL_CLUSTERS * MAX_LIGHTS_PER_CLUSTER + dir_count] = li;
+                    dir_count += 1u;
+                }
+            }
+        }
+        cluster_counts[TOTAL_CLUSTERS] = dir_count;
+        return;
+    }
+
+    if (gid > TOTAL_CLUSTERS) return;
+
+    uint tx = gid % CLUSTER_X;
+    uint ty = (gid / CLUSTER_X) % CLUSTER_Y;
+    uint tz = gid / (CLUSTER_X * CLUSTER_Y);
+
+    float ndc_x0 = (float(tx) / float(CLUSTER_X)) * 2.0 - 1.0;
+    float ndc_x1 = (float(tx + 1u) / float(CLUSTER_X)) * 2.0 - 1.0;
+    float ndc_y1 = 1.0 - (float(ty) / float(CLUSTER_Y)) * 2.0;
+    float ndc_y0 = 1.0 - (float(ty + 1u) / float(CLUSTER_Y)) * 2.0;
+
+    float z_near = params.screen_depth.z;
+    float z_far = params.screen_depth.w;
+    float d0 = z_near;
+    float d1 = z_far;
+    if (params.mode_log.x < 0.5) {
+        d0 = z_near * exp(params.mode_log.y * (float(tz) / float(CLUSTER_Z)));
+        d1 = z_near * exp(params.mode_log.y * (float(tz + 1u) / float(CLUSTER_Z)));
+    } else {
+        d0 = mix(z_near, z_far, float(tz) / float(CLUSTER_Z));
+        d1 = mix(z_near, z_far, float(tz + 1u) / float(CLUSTER_Z));
+    }
+
+    vec2 corners[4] = vec2[4](
+        vec2(ndc_x0, ndc_y0),
+        vec2(ndc_x1, ndc_y0),
+        vec2(ndc_x0, ndc_y1),
+        vec2(ndc_x1, ndc_y1)
+    );
+
+    vec3 box_min = vec3(1e30);
+    vec3 box_max = vec3(-1e30);
+
+    for (int i = 0; i < 4; ++i) {
+        vec3 p_near = unproject_ndc(params.inv_proj, corners[i].x, corners[i].y, 1.0);
+        vec3 p_far = unproject_ndc(params.inv_proj, corners[i].x, corners[i].y, 0.0);
+        vec3 a = p_near;
+        vec3 b = p_far;
+        if (params.mode_log.x < 0.5) {
+            vec3 ray = unproject_ndc(params.inv_proj, corners[i].x, corners[i].y, 0.5);
+            float rz = max(-ray.z, 1e-6);
+            a = ray * (d0 / rz);
+            b = ray * (d1 / rz);
+        } else {
+            float zn = -p_near.z;
+            float zf = -p_far.z;
+            float span = max(abs(zf - zn), 1e-6);
+            float t0 = (d0 - zn) / span;
+            float t1 = (d1 - zn) / span;
+            a = mix(p_near, p_far, t0);
+            b = mix(p_near, p_far, t1);
+        }
+        box_min = min(box_min, min(a, b));
+        box_max = max(box_max, max(a, b));
+    }
+
+    uint local_count = 0u;
+    uint out_base = gid * MAX_LIGHTS_PER_CLUSTER;
+    for (uint li = 0u; li < light_count; ++li) {
+        vec4 pk = lights[li].position_kind;
+        if (pk.w < 0.5) continue;
+        float radius = lights[li].direction_range.w;
+        vec3 lv = (params.view * vec4(pk.xyz, 1.0)).xyz;
+        vec3 closest = clamp(lv, box_min, box_max);
+        vec3 diff = lv - closest;
+        if (dot(diff, diff) <= radius * radius) {
+            if (local_count < MAX_LIGHTS_PER_CLUSTER) {
+                cluster_indices[out_base + local_count] = li;
+                local_count += 1u;
+            }
+        }
+    }
+    cluster_counts[gid] = local_count;
+}

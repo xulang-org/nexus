@@ -16,34 +16,34 @@ SOURCE = '''@main
 canvas #"github.com/xulang-org/nexus/resources/canvas"
 fm #"github.com/xulang-org/nexus/foundation/math"
 fn inaccessible(batch &canvas.Batch2D, index int) bool {
-    batch.vertex_at(index) >>> (err) { << true }
+    batch.vertex_at(index) or (err) { << true }
     << false
 }
 fn record(batch $&canvas.Batch2D, frame int) int {
     batch.clear()
     assert(batch.vertex_count() == 0)
     for i in 0:20 { batch.quad(fm.rect2(f64(frame % 4) + f64(i),0.0,20.0,20.0),
-        fm.identity(),4294967295) >>> }
+        fm.identity(),4294967295) or >> }
     assert(batch.vertex_count() == 120)
-    first := batch.vertex_at(0) >>>
+    first := batch.vertex_at(0) or >>
     assert(first.point.x == f64(frame % 4))
     << 0
 }
 fn run() int {
     $batch := canvas.new_batch()
     assert(inaccessible(&batch, 0))
-    for i in 0:10000 { record($&batch, i) >>> }
+    for i in 0:10000 { record($&batch, i) or >> }
     println("warm")
     sleep_ns(1000000000)
-    for i in 0:90000 { record($&batch, i) >>> }
+    for i in 0:90000 { record($&batch, i) or >> }
     batch.clear()
-    batch.quad(fm.rect2(0.0,0.0,1.0,1.0),fm.identity(),4294967295) >>>
+    batch.quad(fm.rect2(0.0,0.0,1.0,1.0),fm.identity(),4294967295) or >>
     assert(batch.vertex_count() == 6 && inaccessible(&batch,6))
     println("steady")
     sleep_ns(1000000000)
     << 0
 }
-fn main() int { << run() >>> (err) { eprintln(err.msg())
+fn main() int { << run() or (err) { eprintln(err.msg())
     << 1 } }
 '''
 

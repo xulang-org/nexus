@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='xu-scene-builder-') as temporary:
  manifest=json.loads((project/'project.json').read_text())
  template=project/manifest['template'];valid=json.loads(template.read_text())
  for label,mutate in [
-  ('version',lambda d:d.update(version=9)),
+  ('version',lambda d:d.update(version=10)),
   ('missing-v7-arrays',lambda d:d.update(version=7)),
   ('boolean-version',lambda d:d.update(version=True)),
   ('missing-array',lambda d:d.pop('surfaces')),

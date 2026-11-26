@@ -109,45 +109,45 @@ pub struct StreamingManager3D {
 }
 
 fn glb_primitive0_mesh(path string) meshes.MeshData3D {
-    asset := asset_gltf.load_glb_geometry(path + "") >>>
-    if asset.primitive_count() < 1 { >>> errors.new("nexus streaming: GLB contains no primitives") }
-    verts := asset.vertex_count(0) >>>
-    inds := asset.index_count(0) >>>
+    asset := asset_gltf.load_glb_geometry(path + "") or >>
+    if asset.primitive_count() < 1 { >> errors.new("nexus streaming: GLB contains no primitives") }
+    verts := asset.vertex_count(0) or >>
+    inds := asset.index_count(0) or >>
     $out := meshes.new_mesh_data_3d()
-    hn := asset.has_normals(0) >>>
-    hu := asset.has_uvs(0) >>>
-    ht := asset.has_tangents(0) >>>
+    hn := asset.has_normals(0) or >>
+    hu := asset.has_uvs(0) or >>
+    ht := asset.has_tangents(0) or >>
     for i in 0:verts {
-        p := asset.position(0, i) >>>
-        c := asset.color(0, i) >>>
+        p := asset.position(0, i) or >>
+        c := asset.color(0, i) or >>
         if ht {
-            out.vertex_tangent(p, c, asset.normal(0, i) >>>, asset.uv(0, i) >>>, asset.tangent(0, i) >>>) >>>
+            out.vertex_tangent(p, c, asset.normal(0, i) or >>, asset.uv(0, i) or >>, asset.tangent(0, i) or >>) or >>
         } else if hn && hu {
-            out.vertex_lit_uv(p, c, asset.normal(0, i) >>>, asset.uv(0, i) >>>) >>>
+            out.vertex_lit_uv(p, c, asset.normal(0, i) or >>, asset.uv(0, i) or >>) or >>
         } else if hn {
-            out.vertex_lit(p, c, asset.normal(0, i) >>>) >>>
+            out.vertex_lit(p, c, asset.normal(0, i) or >>) or >>
         } else if hu {
-            out.vertex_uv(p, c, asset.uv(0, i) >>>) >>>
+            out.vertex_uv(p, c, asset.uv(0, i) or >>) or >>
         } else {
-            out.vertex(p, c) >>>
+            out.vertex(p, c) or >>
         }
     }
     for i in 0:(inds / 3) {
-        out.triangle(asset.index(0, i * 3) >>>, asset.index(0, i * 3 + 1) >>>, asset.index(0, i * 3 + 2) >>>) >>>
+        out.triangle(asset.index(0, i * 3) or >>, asset.index(0, i * 3 + 1) or >>, asset.index(0, i * 3 + 2) or >>) or >>
     }
-    out.validate() >>>
+    out.validate() or >>
     << out
 }
 
 fn decode_mesh_job(job &StreamJob) DecodedMeshMsg {
     $data := meshes.new_mesh_data_3d()
     if job.kind == STREAM_KIND_MESH {
-        loaded := asset_mesh.load(job.path + "") >>> (err){
+        loaded := asset_mesh.load(job.path + "") or(err){
             << DecodedMeshMsg{handle: job.handle, ok: false, err: err.msg(), byte_size: 0, data: meshes.new_mesh_data_3d()}
         }
         data = loaded
     } else {
-        loaded := glb_primitive0_mesh(job.path + "") >>> (err){
+        loaded := glb_primitive0_mesh(job.path + "") or(err){
             << DecodedMeshMsg{handle: job.handle, ok: false, err: err.msg(), byte_size: 0, data: meshes.new_mesh_data_3d()}
         }
         data = loaded
@@ -157,7 +157,7 @@ fn decode_mesh_job(job &StreamJob) DecodedMeshMsg {
 }
 
 fn decode_tex_job(job &StreamJob) DecodedTextureMsg {
-    loaded := asset_img.load_png(job.path + "") >>> (err){
+    loaded := asset_img.load_png(job.path + "") or(err){
         << DecodedTextureMsg{
             handle: job.handle, ok: false, err: err.msg(), byte_size: 0,
             srgb: job.srgb, sampling: job.sampling, imgs: []images.ImageRGBA8{}
@@ -198,10 +198,10 @@ fn stream_worker(
 }
 
 pub fn new_streaming_manager(device &ren.Device3D, cfg StreamConfig) StreamingManager3D {
-    device.alive() >>>
+    device.alive() or >>
     if cfg.workers < 1 || cfg.workers > 8 || cfg.max_uploads_per_frame < 1 ||
         cfg.max_bytes_per_frame < 64 || cfg.max_resident_bytes < cfg.max_bytes_per_frame {
-        >>> errors.new("nexus streaming: invalid worker count or streaming memory budget")
+        >> errors.new("nexus streaming: invalid worker count or streaming memory budget")
     }
     jobs := chan StreamJob{cap: 256}
     mesh_done := chan DecodedMeshMsg{cap: 256}
@@ -233,12 +233,12 @@ pub fn new_streaming_manager(device &ren.Device3D, cfg StreamConfig) StreamingMa
 }
 
 pub fn (mgr $&StreamingManager3D) request_mesh(path string, kind int, priority f64, pinned bool) int {
-    if mgr.closed { >>> errors.new("nexus streaming: manager is closed") }
+    if mgr.closed { >> errors.new("nexus streaming: manager is closed") }
     if kind != STREAM_KIND_MESH && kind != STREAM_KIND_GLB_MESH {
-        >>> errors.new("nexus streaming: expected STREAM_KIND_MESH or STREAM_KIND_GLB_MESH")
+        >> errors.new("nexus streaming: expected STREAM_KIND_MESH or STREAM_KIND_GLB_MESH")
     }
     if !fm.finite(priority) || path.len == 0 {
-        >>> errors.new("nexus streaming: invalid mesh path or priority")
+        >> errors.new("nexus streaming: invalid mesh path or priority")
     }
     h := mgr.entries.len
     default_samp := ren.TextureSampling3D{min_linear: false, mag_linear: false, repeat_u: false, repeat_v: false, mip_filter: 0}
@@ -255,11 +255,11 @@ pub fn (mgr $&StreamingManager3D) request_mesh(path string, kind int, priority f
 pub fn (mgr $&StreamingManager3D) request_texture(
     path string, srgb bool, sampling ren.TextureSampling3D, priority f64, pinned bool
 ) int {
-    if mgr.closed { >>> errors.new("nexus streaming: manager is closed") }
+    if mgr.closed { >> errors.new("nexus streaming: manager is closed") }
     if !fm.finite(priority) || path.len == 0 {
-        >>> errors.new("nexus streaming: invalid texture path or priority")
+        >> errors.new("nexus streaming: invalid texture path or priority")
     }
-    sampling.validate() >>>
+    sampling.validate() or >>
     h := mgr.entries.len
     mgr.entries.push(StreamEntry{
         handle: h, kind: STREAM_KIND_TEXTURE, path: path + "", priority: priority, pinned: pinned,
@@ -273,7 +273,7 @@ pub fn (mgr $&StreamingManager3D) request_texture(
 
 pub fn (mgr $&StreamingManager3D) set_priority(handle int, priority f64) int {
     if handle < 0 || handle >= mgr.entries.len || !fm.finite(priority) {
-        >>> errors.new("nexus streaming: invalid handle or priority")
+        >> errors.new("nexus streaming: invalid handle or priority")
     }
     mgr.entries[handle].priority = priority
     << 0
@@ -281,7 +281,7 @@ pub fn (mgr $&StreamingManager3D) set_priority(handle int, priority f64) int {
 
 pub fn (mgr $&StreamingManager3D) touch(handle int, frame int) int {
     if handle < 0 || handle >= mgr.entries.len {
-        >>> errors.new("nexus streaming: invalid asset handle")
+        >> errors.new("nexus streaming: invalid asset handle")
     }
     mgr.entries[handle].last_used_frame = frame
     << 0
@@ -289,7 +289,7 @@ pub fn (mgr $&StreamingManager3D) touch(handle int, frame int) int {
 
 pub fn (mgr $&StreamingManager3D) restream(handle int, priority f64, frame int) int {
     if mgr.closed || handle < 0 || handle >= mgr.entries.len || !fm.finite(priority) {
-        >>> errors.new("nexus streaming: cannot restream invalid or closed handle")
+        >> errors.new("nexus streaming: cannot restream invalid or closed handle")
     }
     e := $&mgr.entries[handle]
     if e.state == STREAM_STATE_RESIDENT {
@@ -325,13 +325,13 @@ fn (mgr $&StreamingManager3D) evict_one_lru(needed_free int) bool {
     if e.kind == STREAM_KIND_TEXTURE {
         if slot >= 0 && slot < mgr.resident_textures.len && mgr.tex_alive[slot] {
             t := $&mgr.resident_textures[slot]
-            t.close() >>>
+            t.close() or >>
             mgr.tex_alive[slot] = false
         }
     } else {
         if slot >= 0 && slot < mgr.resident_meshes.len && mgr.mesh_alive[slot] {
             m := $&mgr.resident_meshes[slot]
-            m.close() >>>
+            m.close() or >>
             mgr.mesh_alive[slot] = false
         }
     }
@@ -345,7 +345,7 @@ fn (mgr $&StreamingManager3D) evict_one_lru(needed_free int) bool {
 fn (mgr $&StreamingManager3D) ensure_vram_room(incoming_bytes int) int {
     $evicted := 0
     while mgr.resident_bytes + incoming_bytes > mgr.config.max_resident_bytes {
-        ok := mgr.evict_one_lru(incoming_bytes) >>>
+        ok := mgr.evict_one_lru(incoming_bytes) or >>
         if !ok { << evicted }
         evicted += 1
     }
@@ -393,9 +393,9 @@ fn (mgr $&StreamingManager3D) accept_tex_msg(msg DecodedTextureMsg) int {
 }
 
 pub fn (mgr $&StreamingManager3D) pump(device &ren.Device3D, frame int) StreamPumpStats {
-    device.alive() >>>
+    device.alive() or >>
     if mgr.closed || !mgr.owner.matches(device) {
-        >>> errors.new("nexus streaming: closed or foreign streaming manager")
+        >> errors.new("nexus streaming: closed or foreign streaming manager")
     }
 
     $decoded_n := 0
@@ -465,12 +465,12 @@ pub fn (mgr $&StreamingManager3D) pump(device &ren.Device3D, frame int) StreamPu
         h := mgr.ready_handles[best_pos]
         mgr.ready_handles = drop_ready_handle_at(&mgr.ready_handles, best_pos)
         ibytes := mgr.entries[h].byte_size
-        evicted_n += mgr.ensure_vram_room(ibytes) >>>
+        evicted_n += mgr.ensure_vram_room(ibytes) or >>
 
         if mgr.entries[h].kind == STREAM_KIND_TEXTURE {
             item := <-mgr.entries[h].tex_box
-            tex := device.texture_rgba_sampled(item.imgs[0].width, item.imgs[0].height, &item.imgs[0].pixels, item.srgb, item.sampling) >>>
-            actual_bytes := tex.storage_bytes() >>>
+            tex := device.texture_rgba_sampled(item.imgs[0].width, item.imgs[0].height, &item.imgs[0].pixels, item.srgb, item.sampling) or >>
+            actual_bytes := tex.storage_bytes() or >>
             slot := mgr.resident_textures.len
             mgr.resident_textures.push(tex)
             mgr.tex_alive.push(true)
@@ -483,7 +483,7 @@ pub fn (mgr $&StreamingManager3D) pump(device &ren.Device3D, frame int) StreamPu
             bytes_up += ibytes
         } else {
             item := <-mgr.entries[h].mesh_box
-            gm := device.upload(&item.data) >>>
+            gm := device.upload(&item.data) or >>
             slot := mgr.resident_meshes.len
             mgr.resident_meshes.push(gm)
             mgr.mesh_alive.push(true)
@@ -518,22 +518,22 @@ fn (mgr &StreamingManager3D) count_state(state int) int {
 }
 
 pub fn (mgr &StreamingManager3D) state(handle int) int {
-    if handle < 0 || handle >= mgr.entries.len { >>> errors.new("nexus streaming: invalid handle") }
+    if handle < 0 || handle >= mgr.entries.len { >> errors.new("nexus streaming: invalid handle") }
     << mgr.entries[handle].state
 }
 
 pub fn (mgr &StreamingManager3D) error_message(handle int) string {
-    if handle < 0 || handle >= mgr.entries.len { >>> errors.new("nexus streaming: invalid handle") }
+    if handle < 0 || handle >= mgr.entries.len { >> errors.new("nexus streaming: invalid handle") }
     << mgr.entries[handle].err + ""
 }
 
 pub fn (mgr &StreamingManager3D) mesh_ref(handle int) ren.MeshRef3D {
     if mgr.closed || handle < 0 || handle >= mgr.entries.len {
-        >>> errors.new("nexus streaming: closed manager or invalid mesh handle")
+        >> errors.new("nexus streaming: closed manager or invalid mesh handle")
     }
     e := &mgr.entries[handle]
     if e.kind == STREAM_KIND_TEXTURE || e.state != STREAM_STATE_RESIDENT {
-        >>> errors.new("nexus streaming: streamed mesh is not currently resident")
+        >> errors.new("nexus streaming: streamed mesh is not currently resident")
     }
     slot := e.gpu_slot
     << mgr.resident_meshes[slot].reference()
@@ -541,11 +541,11 @@ pub fn (mgr &StreamingManager3D) mesh_ref(handle int) ren.MeshRef3D {
 
 pub fn (mgr &StreamingManager3D) texture_ref(handle int) ren.TextureRef3D {
     if mgr.closed || handle < 0 || handle >= mgr.entries.len {
-        >>> errors.new("nexus streaming: closed manager or invalid texture handle")
+        >> errors.new("nexus streaming: closed manager or invalid texture handle")
     }
     e := &mgr.entries[handle]
     if e.kind != STREAM_KIND_TEXTURE || e.state != STREAM_STATE_RESIDENT {
-        >>> errors.new("nexus streaming: streamed texture is not currently resident")
+        >> errors.new("nexus streaming: streamed texture is not currently resident")
     }
     slot := e.gpu_slot
     << mgr.resident_textures[slot].reference()
@@ -564,14 +564,14 @@ pub fn (mgr $&StreamingManager3D) shutdown() int {
     for i in 0:mgr.resident_meshes.len {
         if mgr.mesh_alive[i] {
             m := $&mgr.resident_meshes[i]
-            m.close() >>>
+            m.close() or >>
             mgr.mesh_alive[i] = false
         }
     }
     for i in 0:mgr.resident_textures.len {
         if mgr.tex_alive[i] {
             t := $&mgr.resident_textures[i]
-            t.close() >>>
+            t.close() or >>
             mgr.tex_alive[i] = false
         }
     }
@@ -584,5 +584,5 @@ pub fn (mgr $&StreamingManager3D) shutdown() int {
 }
 
 fn (mgr $&StreamingManager3D) drop() {
-    mgr.shutdown() >>> (err) { << }
+    mgr.shutdown() or (err) { << }
 }

@@ -1,0 +1,260 @@
+@"github.com/xulang-org/nexus/navigation"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const MAX_NAV_OBSTACLES = 1024
+
+pub struct NavObstacle3D {
+    pub id int
+    pub center fm.Vec3
+    pub radius f64
+    pub half_extents fm.Vec3
+    pub is_box bool
+    pub active bool
+}
+
+// Dynamic obstacle registry supporting runtime cylinder and AABB obstacles,
+// movement updates, active toggling, and obstacle-aware NavMesh pathfinding.
+pub struct NavObstacleManager {
+    obstacles []NavObstacle3D
+    next_id int
+}
+
+pub fn new_obstacle_manager() NavObstacleManager {
+    << NavObstacleManager{
+        obstacles: []NavObstacle3D{},
+        next_id: 1
+    }
+}
+
+pub fn (m $&NavObstacleManager) add_cylinder(center fm.Vec3, radius f64) int {
+    if !center.is_finite() || !fm.finite(radius) || radius <= 0.0 {
+        >> errors.new("nexus nav: invalid cylinder obstacle")
+    }
+    if m.obstacles.len >= MAX_NAV_OBSTACLES {
+        >> errors.new("nexus nav: dynamic obstacle limit exceeded")
+    }
+    id := m.next_id
+    m.next_id = m.next_id + 1
+    m.obstacles.push(NavObstacle3D{
+        id: id,
+        center: center,
+        radius: radius,
+        half_extents: fm.vec3(radius, radius, radius),
+        is_box: false,
+        active: true
+    })
+    << id
+}
+
+pub fn (m $&NavObstacleManager) add_box(center fm.Vec3, half_extents fm.Vec3) int {
+    if !center.is_finite() || !half_extents.is_finite() ||
+       half_extents.x <= 0.0 || half_extents.y <= 0.0 || half_extents.z <= 0.0 {
+        >> errors.new("nexus nav: invalid box obstacle")
+    }
+    if m.obstacles.len >= MAX_NAV_OBSTACLES {
+        >> errors.new("nexus nav: dynamic obstacle limit exceeded")
+    }
+    id := m.next_id
+    m.next_id = m.next_id + 1
+    m.obstacles.push(NavObstacle3D{
+        id: id,
+        center: center,
+        radius: math.sqrt(half_extents.x * half_extents.x + half_extents.z * half_extents.z),
+        half_extents: half_extents,
+        is_box: true,
+        active: true
+    })
+    << id
+}
+
+fn (m &NavObstacleManager) find_idx(id int) int {
+    for i in 0:m.obstacles.len {
+        if m.obstacles[i].id == id { << i }
+    }
+    >> errors.new("nexus nav: unknown obstacle id")
+}
+
+pub fn (m $&NavObstacleManager) move_obstacle(id int, center fm.Vec3) int {
+    if !center.is_finite() { >> errors.new("nexus nav: obstacle center must be finite") }
+    idx := m.find_idx(id) or >>
+    m.obstacles[idx].center = center
+    << 0
+}
+
+pub fn (m $&NavObstacleManager) set_active(id int, active bool) int {
+    idx := m.find_idx(id) or >>
+    m.obstacles[idx].active = active
+    << 0
+}
+
+pub fn (m $&NavObstacleManager) remove_obstacle(id int) int {
+    idx := m.find_idx(id) or >>
+    $next := []NavObstacle3D{}
+    for i in 0:m.obstacles.len {
+        if i != idx { next.push(m.obstacles[i]) }
+    }
+    m.obstacles = next
+    << 0
+}
+
+pub fn (m &NavObstacleManager) active_count() int {
+    $cnt := 0
+    for o in m.obstacles {
+        if o.active { cnt = cnt + 1 }
+    }
+    << cnt
+}
+
+fn obstacle_blocks_point(o &NavObstacle3D, p fm.Vec3) bool {
+    if !o.active { << false }
+    dx := math.abs(p.x - o.center.x)
+    dz := math.abs(p.z - o.center.z)
+    if o.is_box {
+        << dx <= o.half_extents.x && dz <= o.half_extents.z && math.abs(p.y - o.center.y) <= o.half_extents.y + 1.5
+    }
+    << (dx * dx + dz * dz) <= (o.radius * o.radius) && math.abs(p.y - o.center.y) <= o.radius + 1.5
+}
+
+pub fn (m &NavObstacleManager) point_blocked(p fm.Vec3) bool {
+    for i in 0:m.obstacles.len {
+        if obstacle_blocks_point(&m.obstacles[i], p) { << true }
+    }
+    << false
+}
+
+pub fn (m &NavObstacleManager) poly_blocked(nav &NavMesh3D, poly_idx int) bool {
+    if poly_idx < 0 || poly_idx >= nav.polys.len { << true }
+    p := &nav.polys[poly_idx]
+    a := nav.vertices[p.v0]
+    b := nav.vertices[p.v1]
+    c := nav.vertices[p.v2]
+    for i in 0:m.obstacles.len {
+        o := &m.obstacles[i]
+        if !o.active { -> }
+        if obstacle_blocks_point(o, p.center) { << true }
+        cp := closest_point_tri(o.center, a, b, c)
+        if obstacle_blocks_point(o, cp) { << true }
+    }
+    << false
+}
+
+pub fn (nav &NavMesh3D) count_blocked_polys(obstacles &NavObstacleManager) int {
+    $cnt := 0
+    for i in 0:nav.polys.len {
+        if obstacles.poly_blocked(nav, i) { cnt = cnt + 1 }
+    }
+    << cnt
+}
+
+// Finds an A* path avoiding all active obstacles in `obstacles`, returning empty
+// if start/goal are blocked or all routes are sealed by dynamic obstacles.
+pub fn (nav &NavMesh3D) find_path_avoiding(
+    start fm.Vec3,
+    goal fm.Vec3,
+    include_mask int,
+    area_costs &[]f64,
+    obstacles &NavObstacleManager
+) []fm.Vec3 {
+    if !start.is_finite() || !goal.is_finite() {
+        >> errors.new("nexus nav: invalid start or goal coordinate")
+    }
+    s_hit := nav.find_nearest_point(start, include_mask) or >>
+    g_hit := nav.find_nearest_point(goal, include_mask) or >>
+    if obstacles.point_blocked(s_hit.point) || obstacles.point_blocked(g_hit.point) {
+        << []fm.Vec3{}
+    }
+    if obstacles.poly_blocked(nav, s_hit.poly_id) || obstacles.poly_blocked(nav, g_hit.poly_id) {
+        << []fm.Vec3{}
+    }
+    if s_hit.poly_id == g_hit.poly_id {
+        << [s_hit.point, g_hit.point]
+    }
+
+    n := nav.polys.len
+    $g_score := []f64{}
+    $f_score := []f64{}
+    $parent := []int{}
+    $state := []int{}
+    for _ in 0:n {
+        g_score.push(1e30)
+        f_score.push(1e30)
+        parent.push(-1)
+        state.push(0)
+    }
+
+    g_score[s_hit.poly_id] = 0.0
+    f_score[s_hit.poly_id] = s_hit.point.sub(g_hit.point).length()
+    state[s_hit.poly_id] = 1
+    $open_list := [s_hit.poly_id]
+    $open_len := 1
+    $found := false
+
+    while open_len > 0 {
+        $best_pos := 0
+        $best_f := f_score[open_list[0]]
+        for oi in 1:open_len {
+            cand := open_list[oi]
+            if f_score[cand] < best_f {
+                best_f = f_score[cand]
+                best_pos = oi
+            }
+        }
+        cur := open_list[best_pos]
+        open_len -= 1
+        open_list[best_pos] = open_list[open_len]
+        if cur == g_hit.poly_id {
+            found = true
+            <-
+        }
+        state[cur] = 2
+
+        cur_poly := &nav.polys[cur]
+        for e in 0:3 {
+            nbr := poly_neighbor(cur_poly, e)
+            if nbr < 0 || state[nbr] == 2 { -> }
+            if obstacles.poly_blocked(nav, nbr) { -> }
+            nbr_poly := &nav.polys[nbr]
+            if (nbr_poly.flags & include_mask) == 0 { -> }
+
+            $cost_mul := 1.0
+            if area_costs.len > nbr_poly.area_id && area_costs[nbr_poly.area_id] > 0.0 {
+                cost_mul = area_costs[nbr_poly.area_id]
+            }
+            step_cost := cur_poly.center.sub(nbr_poly.center).length() * cost_mul
+            tentative_g := g_score[cur] + step_cost
+            if tentative_g < g_score[nbr] {
+                parent[nbr] = cur
+                g_score[nbr] = tentative_g
+                h := nbr_poly.center.sub(g_hit.point).length()
+                f_score[nbr] = tentative_g + h
+                if state[nbr] == 0 {
+                    state[nbr] = 1
+                    if open_len == open_list.len {
+                        open_list.push(nbr)
+                    } else {
+                        open_list[open_len] = nbr
+                    }
+                    open_len += 1
+                }
+            }
+        }
+    }
+
+    if !found { << []fm.Vec3{} }
+
+    $rev_corridor := []int{}
+    $walk := g_hit.poly_id
+    while walk >= 0 {
+        rev_corridor.push(walk)
+        if walk == s_hit.poly_id { <- }
+        walk = parent[walk]
+    }
+    $corridor := []int{}
+    for ri in 0:rev_corridor.len {
+        corridor.push(rev_corridor[rev_corridor.len - 1 - ri])
+    }
+    << string_pull_funnel(nav, &corridor, s_hit.point, g_hit.point)
+}

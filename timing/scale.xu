@@ -1,0 +1,119 @@
+@"github.com/xulang-org/nexus/timing"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub struct ScaledFrameStep {
+    pub steps int
+    pub fixed_delta f64
+    pub scaled_delta f64
+    pub unscaled_delta f64
+    pub alpha f64
+    pub dropped_seconds f64
+    pub paused bool
+    pub in_hitstop bool
+}
+
+// Fixed-step clock wrapper adding time_scale (slow-mo / fast-forward),
+// explicit pause, hitstop freeze frames, and unscaled/scaled accumulators.
+pub struct ScaledClock {
+    clock Clock
+    time_scale f64
+    paused bool
+    hitstop_remaining f64
+    unscaled_total f64
+    scaled_total f64
+}
+
+pub fn new_scaled_clock(ticks_per_second int, max_steps int) ScaledClock {
+    clk := new_clock(ticks_per_second, max_steps) or >>
+    << ScaledClock{
+        clock: clk,
+        time_scale: 1.0,
+        paused: false,
+        hitstop_remaining: 0.0,
+        unscaled_total: 0.0,
+        scaled_total: 0.0
+    }
+}
+
+pub fn (c $&ScaledClock) set_time_scale(scale f64) int {
+    if !fm.finite(scale) || scale < 0.0 || scale > 10.0 {
+        >> errors.new("nexus timing: time_scale must be finite within 0..10")
+    }
+    c.time_scale = scale
+    << 0
+}
+
+pub fn (c &ScaledClock) time_scale() f64 { << c.time_scale }
+pub fn (c $&ScaledClock) set_paused(paused bool) { c.paused = paused }
+pub fn (c &ScaledClock) is_paused() bool { << c.paused }
+
+pub fn (c $&ScaledClock) trigger_hitstop(seconds f64) int {
+    if !fm.finite(seconds) || seconds < 0.0 || seconds > 5.0 {
+        >> errors.new("nexus timing: hitstop duration must be finite within 0..5s")
+    }
+    if seconds > c.hitstop_remaining {
+        c.hitstop_remaining = seconds
+    }
+    << 0
+}
+
+pub fn (c &ScaledClock) in_hitstop() bool { << c.hitstop_remaining > 0.0 }
+pub fn (c &ScaledClock) unscaled_elapsed() f64 { << c.unscaled_total }
+pub fn (c &ScaledClock) scaled_elapsed() f64 { << c.scaled_total }
+
+pub fn (c $&ScaledClock) reset() {
+    clk := $&c.clock
+    clk.reset()
+    c.hitstop_remaining = 0.0
+    c.unscaled_total = 0.0
+    c.scaled_total = 0.0
+}
+
+pub fn (c $&ScaledClock) advance(raw_delta f64) ScaledFrameStep {
+    if !fm.finite(raw_delta) || raw_delta < 0.0 {
+        >> errors.new("nexus timing: raw_delta must be finite and non-negative")
+    }
+    c.unscaled_total = c.unscaled_total + raw_delta
+    if c.paused {
+        << ScaledFrameStep{
+            steps: 0,
+            fixed_delta: c.clock.fixed_delta,
+            scaled_delta: 0.0,
+            unscaled_delta: raw_delta,
+            alpha: 0.0,
+            dropped_seconds: 0.0,
+            paused: true,
+            in_hitstop: c.hitstop_remaining > 0.0
+        }
+    }
+    if c.hitstop_remaining > 0.0 {
+        c.hitstop_remaining = math.max(0.0, c.hitstop_remaining - raw_delta)
+        << ScaledFrameStep{
+            steps: 0,
+            fixed_delta: c.clock.fixed_delta,
+            scaled_delta: 0.0,
+            unscaled_delta: raw_delta,
+            alpha: 0.0,
+            dropped_seconds: 0.0,
+            paused: false,
+            in_hitstop: true
+        }
+    }
+    scaled := raw_delta * c.time_scale
+    c.scaled_total = c.scaled_total + scaled
+    clk := $&c.clock
+    step := clk.advance(scaled) or >>
+    << ScaledFrameStep{
+        steps: step.steps,
+        fixed_delta: step.fixed_delta,
+        scaled_delta: scaled,
+        unscaled_delta: raw_delta,
+        alpha: step.alpha,
+        dropped_seconds: step.dropped_seconds,
+        paused: false,
+        in_hitstop: false
+    }
+}

@@ -14,41 +14,41 @@ SOURCE='''@main
 ren #"github.com/xulang-org/nexus/rendering/three_d"
 shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
 fn failed_read(device $&ren.Device3D) bool {
-    device.read_pixel(0,0) >>> (err){ assert(err.msg()=="gpu: injected consumed submit failure")
+    device.read_pixel(0,0) or(err){ assert(err.msg()=="gpu: injected consumed submit failure")
         println(err.msg())
         << true }
     << false
 }
 fn failed_begin(device $&ren.Device3D) bool {
-    device.begin(255) >>> (err){ assert(err.msg()=="gpu: injected depth allocation failure")
+    device.begin(255) or(err){ assert(err.msg()=="gpu: injected depth allocation failure")
         println(err.msg())
         << true }
     << false
 }
 fn run() int {
     args := os.args()
-    program := shaders.load_mesh("build/mesh-shaders") >>>
-    $device := ren.open_3d("3D failure recovery",64,64,0,&program) >>>
-    device.begin(4278190335) >>>
-    write_file(args[1]+"","submit") >>>
+    program := shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d("3D failure recovery",64,64,0,&program) or >>
+    device.begin(4278190335) or >>
+    write_file(args[1]+"","submit") or >>
     assert(failed_read($&device))
-    device.begin(16711935) >>>
-    assert((device.read_pixel(0,0) >>>)==16711935)
-    device.present() >>>
-    target := device.window() >>>
-    target.resize(96,80) >>>
-    window.pump() >>>
-    write_file(args[2]+"","depth") >>>
+    device.begin(16711935) or >>
+    assert((device.read_pixel(0,0) or >>)==16711935)
+    device.present() or >>
+    target := device.window() or >>
+    target.resize(96,80) or >>
+    window.pump() or >>
+    write_file(args[2]+"","depth") or >>
     assert(failed_begin($&device))
-    device.begin(65535) >>>
-    assert((device.read_pixel(95,79) >>>)==65535)
-    device.present() >>>
-    device.close() >>>
-    assert((window.live_count() >>>)==0)
+    device.begin(65535) or >>
+    assert((device.read_pixel(95,79) or >>)==65535)
+    device.present() or >>
+    device.close() or >>
+    assert((window.live_count() or >>)==0)
     println("PASS: consumed submit failure and partial resize allocation failure preserve errors and recover the next 3D frame")
     << 0
 }
-fn main() int { << run() >>> (err){ eprintln(err.msg())
+fn main() int { << run() or(err){ eprintln(err.msg())
     << 1 } }
 '''
 SHIM='''#include <SDL3/SDL.h>

@@ -82,19 +82,19 @@ fn push_tag(out $&[]int, name string) {
 
 // Encodes any validated mono/stereo PCM16 clip into Microsoft IMA ADPCM (0x0011, ~4:1).
 pub fn encode_ima_adpcm_wav(clip &pcm.Clip) string {
-    clip.validate() >>>
+    clip.validate() or >>
     ch := clip.channel_count()
     rate := clip.sample_rate()
     frames := clip.frame_count()
     block_align := ADPCM_MONO_BLOCK_ALIGN * ch
     spb := ADPCM_SAMPLES_PER_BLOCK
-    if block_align < 1 || spb < 9 { >>> errors.new("nexus WAV: invalid ADPCM block format") }
+    if block_align < 1 || spb < 9 { >> errors.new("nexus WAV: invalid ADPCM block format") }
     blocks := (frames + spb - 1) / spb
     data_bytes := blocks * block_align
     // 12 (RIFF+WAVE) + 28 (fmt 20) + 12 (fact 4) + 8 (data hdr) + data_bytes -> body = 52 + data_bytes
     total_bytes := 60 + data_bytes
     if total_bytes > MAX_BYTES || ch < 1 || blocks * spb > pcm.MAX_SAMPLES / ch {
-        >>> errors.new("nexus WAV: IMA ADPCM output exceeds container limits")
+        >> errors.new("nexus WAV: IMA ADPCM output exceeds container limits")
     }
     avg_bps := int(math.round_to_even(f64(rate) * f64(block_align) / f64(spb)))
 
@@ -127,7 +127,7 @@ pub fn encode_ima_adpcm_wav(clip &pcm.Clip) string {
         f_base := b * spb
         for c in 0:ch {
             $init_s := 0
-            if f_base < frames { init_s = clip.sample(f_base, c) >>> }
+            if f_base < frames { init_s = clip.sample(f_base, c) or >> }
             preds[c] = init_s
             u16_pred := init_s & 65535
             push_u16($&bytes, u16_pred)
@@ -142,8 +142,8 @@ pub fn encode_ima_adpcm_wav(clip &pcm.Clip) string {
                 for _ in 0:4 {
                     $s0 := 0
                     $s1 := 0
-                    if s_idx < frames { s0 = clip.sample(s_idx, c) >>> }
-                    if s_idx + 1 < frames { s1 = clip.sample(s_idx + 1, c) >>> }
+                    if s_idx < frames { s0 = clip.sample(s_idx, c) or >> }
+                    if s_idx + 1 < frames { s1 = clip.sample(s_idx + 1, c) or >> }
                     n0 := ima_step_encode(s0, $&p, $&idx, &steps)
                     n1 := ima_step_encode(s1, $&p, $&idx, &steps)
                     bytes.push((n0 & 15) | ((n1 & 15) << 4))
@@ -159,16 +159,16 @@ pub fn encode_ima_adpcm_wav(clip &pcm.Clip) string {
 
 // Decodes a complete Microsoft IMA ADPCM (0x0011) data chunk into interleaved PCM16 samples.
 pub fn decode_ima_adpcm(layout &Layout, raw &string) []int {
-    layout.validate() >>>
+    layout.validate() or >>
     if layout.encoding != ENCODING_IMA_ADPCM {
-        >>> errors.new("nexus WAV: expected IMA ADPCM layout")
+        >> errors.new("nexus WAV: expected IMA ADPCM layout")
     }
     block_align := layout.alignment
     ch := layout.channels
     spb := layout.samples_per_block
     if block_align < 1 || ch < 1 || ch > 2 || spb < 9 || (spb - 1) % 8 != 0 ||
         raw.len < block_align || raw.len > MAX_BYTES || raw.len != layout.bytes || raw.len % block_align != 0 {
-        >>> errors.new("nexus WAV: invalid IMA ADPCM payload size")
+        >> errors.new("nexus WAV: invalid IMA ADPCM payload size")
     }
     blocks := raw.len / block_align
     words_per_channel := (spb - 1) / 8
@@ -178,7 +178,7 @@ pub fn decode_ima_adpcm(layout &Layout, raw &string) []int {
         target_frames = layout.fact_frames
     }
     if target_frames < 1 || target_frames * ch > pcm.MAX_SAMPLES {
-        >>> errors.new("nexus WAV: decoded IMA ADPCM sample count exceeds limit")
+        >> errors.new("nexus WAV: decoded IMA ADPCM sample count exceeds limit")
     }
 
     steps := new_ima_steps()
@@ -194,7 +194,7 @@ pub fn decode_ima_adpcm(layout &Layout, raw &string) []int {
             $p := read16(raw, boff + c * 4)
             if p >= 32768 { p -= 65536 }
             idx := byte_value(raw, boff + c * 4 + 2)
-            if idx > 88 { >>> errors.new("nexus WAV: invalid IMA ADPCM block step index") }
+            if idx > 88 { >> errors.new("nexus WAV: invalid IMA ADPCM block step index") }
             preds[c] = p
             idxs[c] = idx
             block_buf[c] = p

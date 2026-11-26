@@ -21,15 +21,15 @@ pub fn asset_ref_for_uid(
     uid &string,
     kind string
 ) resource.ResourceReference {
-    resolved := project.asset_source(uid) >>>
-    raw := snapshot.read(resolved + "", snapshot.MAX_BYTES) >>>
+    resolved := project.asset_source(uid) or >>
+    raw := snapshot.read(resolved + "", snapshot.MAX_BYTES) or >>
     hash := sha256.sum256(raw + "")
     scene_dir := filepath.dir(scene_path)
     $rel := try_rel_path(&scene_dir, &resolved)
     if rel.len == 0 || rel == "." || rel == ".." || strings.has_prefix(&rel, "../") {
         proj_rel := try_rel_path(&project.directory, &resolved)
         if proj_rel.len == 0 || proj_rel == "." || proj_rel == ".." || strings.has_prefix(&proj_rel, "../") {
-            >>> errors.new("nexus editor: asset '" + resolved + "' must reside inside project directory '" + project.directory + "'")
+            >> errors.new("nexus editor: asset '" + resolved + "' must reside inside project directory '" + project.directory + "'")
         }
         rel = proj_rel
     }
@@ -67,27 +67,45 @@ struct DocSnapshot {
     lights []resource.LightAttachment
     sprites []resource.Sprite3DAttachment
     tilemaps []resource.TileMap2DAttachment
+    environments []resource.EnvironmentAttachment
+    rigid_bodies_3d []resource.RigidBody3DAttachment
+    joints_3d []resource.Joint3DAttachment
+    terrains []resource.TerrainAttachment
+    particles_3d []resource.ParticleEmitter3DAttachment
+    prefab_instances []resource.PrefabInstanceAttachment
 }
 
 fn unpack_doc(doc &resource.Document) DocSnapshot {
-    nodes := document_nodes_and_refs(doc) >>>
-    refs := document_refs(doc) >>>
+    nodes := document_nodes_and_refs(doc) or >>
+    refs := document_refs(doc) or >>
     $surfaces := []resource.Surface{}
-    for i in 0:doc.surface_count() { surfaces.push(doc.surface(i) >>>) }
+    for i in 0:doc.surface_count() { surfaces.push(doc.surface(i) or >>) }
     $buses := []resource.AudioBus{}
-    for i in 0:doc.audio_bus_count() { buses.push(doc.audio_bus(i) >>>) }
+    for i in 0:doc.audio_bus_count() { buses.push(doc.audio_bus(i) or >>) }
     $emitters := []resource.AudioEmitter{}
-    for i in 0:doc.audio_count() { emitters.push(doc.audio_emitter(i) >>>) }
+    for i in 0:doc.audio_count() { emitters.push(doc.audio_emitter(i) or >>) }
     $scripts := []resource.ScriptAttachment{}
-    for i in 0:doc.script_count() { scripts.push(doc.script(i) >>>) }
+    for i in 0:doc.script_count() { scripts.push(doc.script(i) or >>) }
     $conns := []resource.ScriptConnection{}
-    for i in 0:doc.script_connection_count() { conns.push(doc.script_connection(i) >>>) }
+    for i in 0:doc.script_connection_count() { conns.push(doc.script_connection(i) or >>) }
     $lights := []resource.LightAttachment{}
-    for i in 0:doc.light_count() { lights.push(doc.light(i) >>>) }
+    for i in 0:doc.light_count() { lights.push(doc.light(i) or >>) }
     $sprites := []resource.Sprite3DAttachment{}
-    for i in 0:doc.sprite_3d_count() { sprites.push(doc.sprite_3d(i) >>>) }
+    for i in 0:doc.sprite_3d_count() { sprites.push(doc.sprite_3d(i) or >>) }
     $tilemaps := []resource.TileMap2DAttachment{}
-    for i in 0:doc.tilemap_2d_count() { tilemaps.push(doc.tilemap_2d(i) >>>) }
+    for i in 0:doc.tilemap_2d_count() { tilemaps.push(doc.tilemap_2d(i) or >>) }
+    $envs := []resource.EnvironmentAttachment{}
+    for i in 0:doc.environment_count() { envs.push(doc.environment(i) or >>) }
+    $bodies := []resource.RigidBody3DAttachment{}
+    for i in 0:doc.rigid_body_3d_count() { bodies.push(doc.rigid_body_3d(i) or >>) }
+    $joints := []resource.Joint3DAttachment{}
+    for i in 0:doc.joint_3d_count() { joints.push(doc.joint_3d(i) or >>) }
+    $terrains := []resource.TerrainAttachment{}
+    for i in 0:doc.terrain_count() { terrains.push(doc.terrain(i) or >>) }
+    $particles := []resource.ParticleEmitter3DAttachment{}
+    for i in 0:doc.particle_emitter_3d_count() { particles.push(doc.particle_emitter_3d(i) or >>) }
+    $prefabs := []resource.PrefabInstanceAttachment{}
+    for i in 0:doc.prefab_instance_count() { prefabs.push(doc.prefab_instance(i) or >>) }
     << DocSnapshot{
         nodes: nodes,
         refs: refs,
@@ -98,7 +116,13 @@ fn unpack_doc(doc &resource.Document) DocSnapshot {
         conns: conns,
         lights: lights,
         sprites: sprites,
-        tilemaps: tilemaps
+        tilemaps: tilemaps,
+        environments: envs,
+        rigid_bodies_3d: bodies,
+        joints_3d: joints,
+        terrains: terrains,
+        particles_3d: particles,
+        prefab_instances: prefabs
     }
 }
 
@@ -148,70 +172,86 @@ fn commit_snapshot(draft $&Draft, snap $&DocSnapshot) int {
     $tilemaps := []resource.TileMap2DAttachment{}
     for i in 0:snap.tilemaps.len {
         tm := &snap.tilemaps[i]
-        tilemaps.push(clone_tilemap_2d(tm, tm.node) >>>)
+        tilemaps.push(clone_tilemap_2d(tm, tm.node) or >>)
     }
-    next := collect_refs_and_build(nodes, &refs, surfaces, buses, emitters, scripts, conns, lights, sprites, tilemaps) >>>
-    draft.replace(&next) >>>
+    $envs := []resource.EnvironmentAttachment{}
+    for i in 0:snap.environments.len { envs.push(snap.environments[i]) }
+    $bodies := []resource.RigidBody3DAttachment{}
+    for i in 0:snap.rigid_bodies_3d.len { bodies.push(snap.rigid_bodies_3d[i]) }
+    $joints := []resource.Joint3DAttachment{}
+    for i in 0:snap.joints_3d.len { joints.push(snap.joints_3d[i]) }
+    $terrains := []resource.TerrainAttachment{}
+    for i in 0:snap.terrains.len { terrains.push(snap.terrains[i]) }
+    $particles := []resource.ParticleEmitter3DAttachment{}
+    for i in 0:snap.particles_3d.len { particles.push(snap.particles_3d[i]) }
+    $prefabs := []resource.PrefabInstanceAttachment{}
+    for i in 0:snap.prefab_instances.len {
+        pf := &snap.prefab_instances[i]
+        prefabs.push(clone_prefab_instance(pf, pf.node))
+    }
+    next := collect_refs_and_build_v9(nodes, &refs, surfaces, buses, emitters, scripts, conns, lights, sprites, tilemaps,
+        envs, bodies, joints, terrains, particles, prefabs) or >>
+    draft.replace(&next) or >>
     << 0
 }
 
 fn require_node_idx(snap &DocSnapshot, idx int) int {
     if idx < 0 || idx >= snap.nodes.len {
-        >>> errors.new("nexus editor: node index out of range")
+        >> errors.new("nexus editor: node index out of range")
     }
     << 0
 }
 
 pub fn (draft $&Draft) set_node_camera_perspective(idx int, fov_deg f64, near f64, far f64) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
-    require_node_idx(&snap, idx) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
     if snap.nodes[idx].kind != resource.NODE_3D {
-        >>> errors.new("nexus editor: 3D perspective camera requires a Node3D")
+        >> errors.new("nexus editor: 3D perspective camera requires a Node3D")
     }
     rad := fov_deg * pi_val() / 180.0
-    lens := camera_data.perspective(rad, near, far) >>>
+    lens := camera_data.perspective(rad, near, far) or >>
     snap.nodes[idx].camera = lens
     snap.nodes[idx].orthographic = camera_data.Orthographic{}
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) set_node_camera_orthographic(idx int, v_size f64, near f64, far f64) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
-    require_node_idx(&snap, idx) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
     if snap.nodes[idx].kind != resource.NODE_3D {
-        >>> errors.new("nexus editor: 3D orthographic camera requires a Node3D")
+        >> errors.new("nexus editor: 3D orthographic camera requires a Node3D")
     }
-    lens := camera_data.orthographic(v_size, near, far) >>>
+    lens := camera_data.orthographic(v_size, near, far) or >>
     snap.nodes[idx].orthographic = lens
     snap.nodes[idx].camera = camera_data.Perspective{}
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) set_node_camera_2d(idx int, width f64, height f64, zoom f64) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
-    require_node_idx(&snap, idx) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
     if snap.nodes[idx].kind != resource.NODE_2D {
-        >>> errors.new("nexus editor: 2D camera requires a Node2D")
+        >> errors.new("nexus editor: 2D camera requires a Node2D")
     }
-    view := camera_data.view_2d(width, height, zoom) >>>
+    view := camera_data.view_2d(width, height, zoom) or >>
     snap.nodes[idx].camera_2d = view
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) clear_node_camera(idx int) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
-    require_node_idx(&snap, idx) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
     snap.nodes[idx].camera = camera_data.Perspective{}
     snap.nodes[idx].orthographic = camera_data.Orthographic{}
     snap.nodes[idx].camera_2d = camera_data.View2D{}
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
@@ -239,18 +279,18 @@ pub fn (draft $&Draft) set_node_light(
     shadow_dist f64,
     shadow_cascades int
 ) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
-    require_node_idx(&snap, idx) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
     if snap.nodes[idx].kind != resource.NODE_3D {
-        >>> errors.new("nexus editor: light attachment requires a Node3D")
+        >> errors.new("nexus editor: light attachment requires a Node3D")
     }
     rad_v := fm.vec3(r, g, b)
-    $src := light_data.point(fm.vec3(0.0, 0.0, 0.0), rad_v, 10.0) >>>
+    $src := light_data.point(fm.vec3(0.0, 0.0, 0.0), rad_v, 10.0) or >>
     if kind == light_data.DIRECTIONAL {
-        src = light_data.directional(fm.vec3(dir_x, dir_y, dir_z), rad_v) >>>
+        src = light_data.directional(fm.vec3(dir_x, dir_y, dir_z), rad_v) or >>
     } else if kind == light_data.POINT {
-        src = light_data.point(fm.vec3(0.0, 0.0, 0.0), rad_v, radius) >>>
+        src = light_data.point(fm.vec3(0.0, 0.0, 0.0), rad_v, radius) or >>
     } else if kind == light_data.SPOT {
         deg2rad := pi_val() / 180.0
         src = light_data.spot(
@@ -260,9 +300,9 @@ pub fn (draft $&Draft) set_node_light(
             radius,
             inner_deg * deg2rad,
             outer_deg * deg2rad
-        ) >>>
+        ) or >>
     } else {
-        >>> errors.new("nexus editor: unsupported light kind")
+        >> errors.new("nexus editor: unsupported light kind")
     }
     $cas := shadow_data.CascadeProfile3D{}
     $punc := shadow_data.PunctualProfile3D{}
@@ -278,12 +318,12 @@ pub fn (draft $&Draft) set_node_light(
             settings.count = cnt
             settings.resolution = res
             settings.distance = dist
-            cas = shadow_data.cascade_profile(settings) >>>
+            cas = shadow_data.cascade_profile(settings) or >>
         } else {
             punc = shadow_data.punctual_profile(
                 src,
                 shadow_data.PunctualSettings3D{near: 0.1, resolution: res, constant_bias: 0.0005, slope_bias: 0.002}
-            ) >>>
+            ) or >>
         }
     }
     att := resource.LightAttachment{node: idx, source: src, cascades: cas, punctual: punc}
@@ -295,14 +335,14 @@ pub fn (draft $&Draft) set_node_light(
     }
     next_lights.push(att)
     snap.lights = next_lights
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) clear_node_light(idx int) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
-    require_node_idx(&snap, idx) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
     $next_lights := []resource.LightAttachment{}
     for i in 0:snap.lights.len {
         if snap.lights[i].node != idx {
@@ -310,7 +350,7 @@ pub fn (draft $&Draft) clear_node_light(idx int) int {
         }
     }
     snap.lights = next_lights
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
@@ -324,14 +364,14 @@ pub fn parse_script_initials(raw &string) []resource.ScriptInitial {
         if part.len == 0 { -> }
         eq := strings.index_byte(&part, 61)
         if eq <= 0 || eq + 1 >= part.len {
-            >>> errors.new("nexus editor: script initial entry must be id=value: '" + part + "'")
+            >> errors.new("nexus editor: script initial entry must be id=value: '" + part + "'")
         }
         id_s := strings.trim_space(&part[0:eq])
         val_s := strings.trim_space(&part[eq + 1:part.len])
-        id_val := strconv.atoi(&id_s) >>> (err) {
-            >>> errors.new("nexus editor: invalid script field id '" + id_s + "'")
+        id_val := strconv.atoi(&id_s) or (err) {
+            >> errors.new("nexus editor: invalid script field id '" + id_s + "'")
         }
-        f_val := parse_f64_or(&val_s, "Script initial value") >>>
+        f_val := parse_f64_or(&val_s, "Script initial value") or >>
         out.push(resource.ScriptInitial{id: id_val, value: f_val})
     }
     << out
@@ -351,10 +391,10 @@ pub fn (draft $&Draft) set_node_script(
     uid string,
     initials []resource.ScriptInitial
 ) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
-    require_node_idx(&snap, idx) >>>
-    ref := asset_ref_for_uid(project, &draft.source, &uid, "xu_bytecode") >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
+    ref := asset_ref_for_uid(project, &draft.source, &uid, "xu_bytecode") or >>
     upsert_ref($&snap.refs, ref)
     $clean_init := []resource.ScriptInitial{}
     for i in 0:initials.len { clean_init.push(initials[i]) }
@@ -366,14 +406,14 @@ pub fn (draft $&Draft) set_node_script(
     }
     next_scripts.push(resource.ScriptAttachment{node: idx, resource_uid: uid + "", initial: clean_init})
     snap.scripts = next_scripts
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) clear_node_script(idx int) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
-    require_node_idx(&snap, idx) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
     $next_scripts := []resource.ScriptAttachment{}
     for i in 0:snap.scripts.len {
         if snap.scripts[i].node != idx {
@@ -389,30 +429,30 @@ pub fn (draft $&Draft) clear_node_script(idx int) int {
     }
     snap.scripts = next_scripts
     snap.conns = next_conns
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) add_script_connection(source int, signal int, target int, handler int) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
     snap.conns.push(resource.ScriptConnection{source: source, signal: signal, target: target, handler: handler})
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) remove_script_connection(conn_idx int) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
     if conn_idx < 0 || conn_idx >= snap.conns.len {
-        >>> errors.new("nexus editor: script connection index out of range")
+        >> errors.new("nexus editor: script connection index out of range")
     }
     $next_conns := []resource.ScriptConnection{}
     for i in 0:snap.conns.len {
         if i != conn_idx { next_conns.push(snap.conns[i]) }
     }
     snap.conns = next_conns
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
@@ -429,10 +469,10 @@ pub fn (draft $&Draft) set_node_audio_emitter(
     listener int,
     max_distance f64
 ) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
-    require_node_idx(&snap, idx) >>>
-    ref := asset_ref_for_uid(project, &draft.source, &uid, "wav_clip") >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
+    ref := asset_ref_for_uid(project, &draft.source, &uid, "wav_clip") or >>
     upsert_ref($&snap.refs, ref)
 
     if snap.buses.len == 0 {
@@ -470,14 +510,14 @@ pub fn (draft $&Draft) set_node_audio_emitter(
     }
     next_emitters.push(em)
     snap.emitters = next_emitters
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) clear_node_audio_emitter(idx int) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
-    require_node_idx(&snap, idx) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
     $next_emitters := []resource.AudioEmitter{}
     for i in 0:snap.emitters.len {
         e := &snap.emitters[i]
@@ -489,48 +529,48 @@ pub fn (draft $&Draft) clear_node_audio_emitter(idx int) int {
     if snap.emitters.len == 0 {
         snap.buses = []resource.AudioBus{}
     }
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) add_audio_bus(parent int, raw_name string, volume f64, muted bool, paused bool) int {
-    doc := draft.document() >>>
+    doc := draft.document() or >>
     if doc.audio_count() == 0 {
-        >>> errors.new("nexus editor: add at least one AudioEmitter before adding sub-buses")
+        >> errors.new("nexus editor: add at least one AudioEmitter before adding sub-buses")
     }
     name := strings.trim_space(&raw_name)
-    $snap := unpack_doc(&doc) >>>
+    $snap := unpack_doc(&doc) or >>
     snap.buses.push(resource.AudioBus{parent: parent, name: name, volume: volume, muted: muted, paused: paused})
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) toggle_audio_bus_mute(bus_idx int) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
     if bus_idx < 0 || bus_idx >= snap.buses.len {
-        >>> errors.new("nexus editor: audio bus index out of range")
+        >> errors.new("nexus editor: audio bus index out of range")
     }
     b := $&snap.buses[bus_idx]
     b.muted = !b.muted
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) remove_audio_bus(bus_idx int) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
     if bus_idx <= 0 || bus_idx >= snap.buses.len {
-        >>> errors.new("nexus editor: cannot remove Master bus or out-of-range bus")
+        >> errors.new("nexus editor: cannot remove Master bus or out-of-range bus")
     }
     for i in 0:snap.buses.len {
         if i != bus_idx && snap.buses[i].parent == bus_idx {
-            >>> errors.new("nexus editor: audio bus has child buses")
+            >> errors.new("nexus editor: audio bus has child buses")
         }
     }
     for i in 0:snap.emitters.len {
         if snap.emitters[i].bus == bus_idx {
-            >>> errors.new("nexus editor: audio bus is still used by an emitter")
+            >> errors.new("nexus editor: audio bus is still used by an emitter")
         }
     }
     $next_buses := []resource.AudioBus{}
@@ -549,7 +589,7 @@ pub fn (draft $&Draft) remove_audio_bus(bus_idx int) int {
     }
     snap.buses = next_buses
     snap.emitters = next_emitters
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
@@ -566,22 +606,22 @@ pub fn (draft $&Draft) set_node_sprite_3d(
     flip_x bool,
     flip_y bool
 ) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
-    require_node_idx(&snap, idx) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
     if snap.nodes[idx].kind != resource.NODE_3D {
-        >>> errors.new("nexus editor: Sprite3D attachment requires a Node3D")
+        >> errors.new("nexus editor: Sprite3D attachment requires a Node3D")
     }
-    ref := asset_ref_for_uid(project, &draft.source, &uid, "image_rgba") >>>
+    ref := asset_ref_for_uid(project, &draft.source, &uid, "image_rgba") or >>
     upsert_ref($&snap.refs, ref)
-    $sp := sprite3d.sprite_3d(fm.vec2(width, height)) >>>
+    $sp := sprite3d.sprite_3d(fm.vec2(width, height)) or >>
     sp.billboard = billboard
     sp.alpha_mode = alpha_mode
     sp.alpha_cutoff = alpha_cutoff
     sp.shaded = shaded
     sp.flip_x = flip_x
     sp.flip_y = flip_y
-    sp.validate() >>>
+    sp.validate() or >>
 
     $next_sprites := []resource.Sprite3DAttachment{}
     for i in 0:snap.sprites.len {
@@ -591,14 +631,14 @@ pub fn (draft $&Draft) set_node_sprite_3d(
     }
     next_sprites.push(resource.sprite_3d_attachment(idx, uid + "", sp))
     snap.sprites = next_sprites
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) clear_node_sprite_3d(idx int) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
-    require_node_idx(&snap, idx) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
     $next_sprites := []resource.Sprite3DAttachment{}
     for i in 0:snap.sprites.len {
         if snap.sprites[i].node != idx {
@@ -606,54 +646,54 @@ pub fn (draft $&Draft) clear_node_sprite_3d(idx int) int {
         }
     }
     snap.sprites = next_sprites
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) ensure_node_tilemap_2d(project &Project, idx int, uid string) int {
-    doc := draft.document() >>>
-    $snap := unpack_doc(&doc) >>>
-    require_node_idx(&snap, idx) >>>
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
     if snap.nodes[idx].kind != resource.NODE_2D {
-        >>> errors.new("nexus editor: TileMap2D attachment requires a Node2D")
+        >> errors.new("nexus editor: TileMap2D attachment requires a Node2D")
     }
     for i in 0:snap.tilemaps.len {
         if snap.tilemaps[i].node == idx {
             if uid.len == 0 || snap.tilemaps[i].resource_uid == uid {
                 << 0
             }
-            ref := asset_ref_for_uid(project, &draft.source, &uid, "image_rgba") >>>
+            ref := asset_ref_for_uid(project, &draft.source, &uid, "image_rgba") or >>
             upsert_ref($&snap.refs, ref)
-            tm_copy := clone_tilemap_2d(&snap.tilemaps[i], idx) >>>
-            grid := tm_copy.grid.clone() >>>
+            tm_copy := clone_tilemap_2d(&snap.tilemaps[i], idx) or >>
+            grid := tm_copy.grid.clone() or >>
             snap.tilemaps[i] = resource.tilemap_2d_attachment(idx, uid + "", tm_copy.z_index, tm_copy.y_sort_cells, tm_copy.y_offset, tm_copy.pixel_art, grid)
-            commit_snapshot(draft, $&snap) >>>
+            commit_snapshot(draft, $&snap) or >>
             << 0
         }
     }
     if uid.len == 0 {
-        >>> errors.new("nexus editor: select a PNG image asset for TileMap2D")
+        >> errors.new("nexus editor: select a PNG image asset for TileMap2D")
     }
-    ref := asset_ref_for_uid(project, &draft.source, &uid, "image_rgba") >>>
+    ref := asset_ref_for_uid(project, &draft.source, &uid, "image_rgba") or >>
     upsert_ref($&snap.refs, ref)
-    ts := tilemap.tileset_2d(4, 4, 32.0, 32.0, fm.vec2(0.5, 0.5)) >>>
-    grid := tilemap.new_tilemap_2d(tilemap.LAYOUT_ORTHOGONAL, 8, 8, 32.0, 32.0, 0.0, ts) >>>
+    ts := tilemap.tileset_2d(4, 4, 32.0, 32.0, fm.vec2(0.5, 0.5)) or >>
+    grid := tilemap.new_tilemap_2d(tilemap.LAYOUT_ORTHOGONAL, 8, 8, 32.0, 32.0, 0.0, ts) or >>
     snap.tilemaps.push(resource.tilemap_2d_attachment(idx, uid + "", 0, true, 0.0, true, grid))
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) merge_tilemaps(edited_doc &resource.Document, expected_revision &string) int {
     if draft.current != *expected_revision {
-        >>> errors.new("nexus editor: scene changed while TileMap Editor was open")
+        >> errors.new("nexus editor: scene changed while TileMap Editor was open")
     }
-    doc := draft.document() >>>
+    doc := draft.document() or >>
     if doc.node_count() != edited_doc.node_count() {
-        >>> errors.new("nexus editor: TileMap Editor topology mismatch")
+        >> errors.new("nexus editor: TileMap Editor topology mismatch")
     }
-    $snap := unpack_doc(&doc) >>>
+    $snap := unpack_doc(&doc) or >>
     for i in 0:edited_doc.resource_count() {
-        er := edited_doc.resource(i) >>>
+        er := edited_doc.resource(i) or >>
         $already := false
         for k in 0:snap.refs.len {
             if snap.refs[k].uid == er.uid {
@@ -672,27 +712,27 @@ pub fn (draft $&Draft) merge_tilemaps(edited_doc &resource.Document, expected_re
     }
     $next_tilemaps := []resource.TileMap2DAttachment{}
     for i in 0:edited_doc.tilemap_2d_count() {
-        tm := edited_doc.tilemap_2d(i) >>>
+        tm := edited_doc.tilemap_2d(i) or >>
         next_tilemaps.push(tm)
     }
     snap.tilemaps = next_tilemaps
-    commit_snapshot(draft, $&snap) >>>
+    commit_snapshot(draft, $&snap) or >>
     << 0
 }
 
 pub fn (draft $&Draft) add_preset_camera_node(parent_idx int) int {
-    doc := draft.document() >>>
+    doc := draft.document() or >>
     if doc.node_count() >= resource.MAX_NODES {
-        >>> errors.new("nexus editor: scene node limit reached")
+        >> errors.new("nexus editor: scene node limit reached")
     }
     if parent_idx < 0 || parent_idx >= doc.node_count() {
-        >>> errors.new("nexus editor: invalid parent node index")
+        >> errors.new("nexus editor: invalid parent node index")
     }
-    $nodes := document_nodes_and_refs(&doc) >>>
+    $nodes := document_nodes_and_refs(&doc) or >>
     $children := children_table(&nodes)
-    label := unique_sibling_name(&nodes, &children, parent_idx, "Camera") >>>
+    label := unique_sibling_name(&nodes, &children, parent_idx, "Camera") or >>
     $created := resource.node(parent_idx, label, resource.NODE_3D)
-    created.camera = camera_data.perspective(60.0 * pi_val() / 180.0, 0.1, 200.0) >>>
+    created.camera = camera_data.perspective(60.0 * pi_val() / 180.0, 0.1, 200.0) or >>
     raw_idx := nodes.len
     nodes.push(created)
     children.push([]int{})
@@ -711,28 +751,28 @@ pub fn (draft $&Draft) add_preset_camera_node(parent_idx int) int {
         []resource.Sprite3DAttachment{},
         []resource.TileMap2DAttachment{},
         $&remap
-    ) >>>
-    draft.replace(&next) >>>
+    ) or >>
+    draft.replace(&next) or >>
     << remap[raw_idx]
 }
 
 pub fn (draft $&Draft) add_preset_light_node(parent_idx int) int {
-    doc := draft.document() >>>
+    doc := draft.document() or >>
     if doc.node_count() >= resource.MAX_NODES {
-        >>> errors.new("nexus editor: scene node limit reached")
+        >> errors.new("nexus editor: scene node limit reached")
     }
     if parent_idx < 0 || parent_idx >= doc.node_count() {
-        >>> errors.new("nexus editor: invalid parent node index")
+        >> errors.new("nexus editor: invalid parent node index")
     }
-    $nodes := document_nodes_and_refs(&doc) >>>
+    $nodes := document_nodes_and_refs(&doc) or >>
     $children := children_table(&nodes)
-    label := unique_sibling_name(&nodes, &children, parent_idx, "PointLight") >>>
+    label := unique_sibling_name(&nodes, &children, parent_idx, "PointLight") or >>
     $created := resource.node(parent_idx, label, resource.NODE_3D)
     raw_idx := nodes.len
     nodes.push(created)
     children.push([]int{})
     children[parent_idx].push(raw_idx)
-    src := light_data.point(fm.vec3(0.0, 0.0, 0.0), fm.vec3(2.5, 2.2, 1.9), 12.0) >>>
+    src := light_data.point(fm.vec3(0.0, 0.0, 0.0), fm.vec3(2.5, 2.2, 1.9), 12.0) or >>
     extra_light := resource.light_attachment(raw_idx, src)
     $remap := []int{}
     next := rebuild_from_children(
@@ -748,7 +788,306 @@ pub fn (draft $&Draft) add_preset_light_node(parent_idx int) int {
         []resource.Sprite3DAttachment{},
         []resource.TileMap2DAttachment{},
         $&remap
-    ) >>>
-    draft.replace(&next) >>>
+    ) or >>
+    draft.replace(&next) or >>
     << remap[raw_idx]
+}
+
+pub fn (draft $&Draft) set_node_environment(
+    idx int,
+    sky_mode int,
+    sun_intensity f64,
+    exposure f64,
+    fog_density f64,
+    bloom_enabled bool,
+    gtao_enabled bool,
+    ssr_enabled bool,
+    taa_enabled bool,
+    ddgi_enabled bool
+) int {
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
+    if snap.nodes[idx].kind != resource.NODE_3D {
+        >> errors.new("nexus editor: Environment attachment requires a Node3D")
+    }
+    $env := resource.default_environment_attachment(idx)
+    env.sky_mode = sky_mode
+    env.sun_intensity = sun_intensity
+    env.exposure = exposure
+    env.fog_density = fog_density
+    env.bloom_enabled = bloom_enabled
+    env.gtao_enabled = gtao_enabled
+    env.ssr_enabled = ssr_enabled
+    env.taa_enabled = taa_enabled
+    env.ddgi_enabled = ddgi_enabled
+    env.validate() or >>
+    $next_envs := []resource.EnvironmentAttachment{}
+    for i in 0:snap.environments.len {
+        if snap.environments[i].node != idx {
+            next_envs.push(snap.environments[i])
+        }
+    }
+    next_envs.push(env)
+    snap.environments = next_envs
+    commit_snapshot(draft, $&snap) or >>
+    << 0
+}
+
+pub fn (draft $&Draft) clear_node_environment(idx int) int {
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
+    $next_envs := []resource.EnvironmentAttachment{}
+    for i in 0:snap.environments.len {
+        if snap.environments[i].node != idx {
+            next_envs.push(snap.environments[i])
+        }
+    }
+    snap.environments = next_envs
+    commit_snapshot(draft, $&snap) or >>
+    << 0
+}
+
+pub fn (draft $&Draft) set_node_rigid_body_3d(
+    idx int,
+    body_type int,
+    shape_kind int,
+    half_extents fm.Vec3,
+    radius f64,
+    mass f64,
+    restitution f64,
+    friction f64,
+    is_trigger bool
+) int {
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
+    if snap.nodes[idx].kind != resource.NODE_3D {
+        >> errors.new("nexus editor: RigidBody3D attachment requires a Node3D")
+    }
+    $rb := resource.default_rigid_body_3d(idx)
+    rb.body_type = body_type
+    rb.shape_kind = shape_kind
+    rb.half_extents = half_extents
+    rb.radius = radius
+    rb.mass = mass
+    rb.restitution = restitution
+    rb.friction = friction
+    rb.is_trigger = is_trigger
+    rb.validate() or >>
+    $next_bodies := []resource.RigidBody3DAttachment{}
+    for i in 0:snap.rigid_bodies_3d.len {
+        if snap.rigid_bodies_3d[i].node != idx {
+            next_bodies.push(snap.rigid_bodies_3d[i])
+        }
+    }
+    next_bodies.push(rb)
+    snap.rigid_bodies_3d = next_bodies
+    commit_snapshot(draft, $&snap) or >>
+    << 0
+}
+
+pub fn (draft $&Draft) clear_node_rigid_body_3d(idx int) int {
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
+    $next_bodies := []resource.RigidBody3DAttachment{}
+    for i in 0:snap.rigid_bodies_3d.len {
+        if snap.rigid_bodies_3d[i].node != idx {
+            next_bodies.push(snap.rigid_bodies_3d[i])
+        }
+    }
+    snap.rigid_bodies_3d = next_bodies
+    commit_snapshot(draft, $&snap) or >>
+    << 0
+}
+
+pub fn (draft $&Draft) set_node_terrain(
+    idx int,
+    grid_x int,
+    cell_size f64,
+    height_scale f64,
+    foliage_density f64
+) int {
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
+    if snap.nodes[idx].kind != resource.NODE_3D {
+        >> errors.new("nexus editor: Terrain attachment requires a Node3D")
+    }
+    $t := resource.default_terrain_attachment(idx)
+    t.grid_x = grid_x
+    t.grid_z = grid_x
+    t.cell_size = cell_size
+    t.height_scale = height_scale
+    t.foliage_density = foliage_density
+    t.validate() or >>
+    $next_terr := []resource.TerrainAttachment{}
+    for i in 0:snap.terrains.len {
+        if snap.terrains[i].node != idx {
+            next_terr.push(snap.terrains[i])
+        }
+    }
+    next_terr.push(t)
+    snap.terrains = next_terr
+    commit_snapshot(draft, $&snap) or >>
+    << 0
+}
+
+pub fn (draft $&Draft) clear_node_terrain(idx int) int {
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
+    $next_terr := []resource.TerrainAttachment{}
+    for i in 0:snap.terrains.len {
+        if snap.terrains[i].node != idx {
+            next_terr.push(snap.terrains[i])
+        }
+    }
+    snap.terrains = next_terr
+    commit_snapshot(draft, $&snap) or >>
+    << 0
+}
+
+pub fn (draft $&Draft) set_node_particle_emitter_3d(
+    idx int,
+    max_particles int,
+    spawn_rate f64,
+    lifetime f64,
+    speed f64,
+    size f64,
+    additive bool
+) int {
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
+    if snap.nodes[idx].kind != resource.NODE_3D {
+        >> errors.new("nexus editor: ParticleEmitter3D attachment requires a Node3D")
+    }
+    $p := resource.default_particle_emitter_3d(idx)
+    p.max_particles = max_particles
+    p.spawn_rate = spawn_rate
+    p.lifetime = lifetime
+    p.speed = speed
+    p.size = size
+    p.additive = additive
+    p.validate() or >>
+    $next_p := []resource.ParticleEmitter3DAttachment{}
+    for i in 0:snap.particles_3d.len {
+        if snap.particles_3d[i].node != idx {
+            next_p.push(snap.particles_3d[i])
+        }
+    }
+    next_p.push(p)
+    snap.particles_3d = next_p
+    commit_snapshot(draft, $&snap) or >>
+    << 0
+}
+
+pub fn (draft $&Draft) clear_node_particle_emitter_3d(idx int) int {
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
+    $next_p := []resource.ParticleEmitter3DAttachment{}
+    for i in 0:snap.particles_3d.len {
+        if snap.particles_3d[i].node != idx {
+            next_p.push(snap.particles_3d[i])
+        }
+    }
+    snap.particles_3d = next_p
+    commit_snapshot(draft, $&snap) or >>
+    << 0
+}
+
+pub fn prefab_uid_for_scene_key(key &string) string {
+    digest := sha256.sum256("nexus:scene_prefab:" + *key)
+    << digest[0:32] + ""
+}
+
+fn scene_ref_for_prefab(project &Project, scene_path &string, scene_key_or_uid &string) resource.ResourceReference {
+    $resolved := ""
+    $uid := ""
+    for i in 0:project.scenes.len {
+        s := &project.scenes[i]
+        suid := prefab_uid_for_scene_key(&s.key)
+        if s.key == *scene_key_or_uid || suid == *scene_key_or_uid {
+            resolved = s.resolved + ""
+            uid = suid
+            <-
+        }
+    }
+    if resolved.len == 0 {
+        << asset_ref_for_uid(project, scene_path, scene_key_or_uid, "scene_file") or >>
+    }
+    raw := snapshot.read(resolved + "", snapshot.MAX_BYTES) or >>
+    hash := sha256.sum256(raw + "")
+    scene_dir := filepath.dir(scene_path)
+    $rel := try_rel_path(&scene_dir, &resolved)
+    if rel.len == 0 || rel == "." || rel == ".." || strings.has_prefix(&rel, "../") {
+        proj_rel := try_rel_path(&project.directory, &resolved)
+        if proj_rel.len == 0 || proj_rel == "." || proj_rel == ".." || strings.has_prefix(&proj_rel, "../") {
+            >> errors.new("nexus editor: prefab scene '" + resolved + "' must reside inside project directory")
+        }
+        rel = proj_rel
+    }
+    << resource.ResourceReference{
+        uid: uid,
+        kind: "scene_file",
+        path: rel,
+        content_hash: hash
+    }
+}
+
+pub fn (draft $&Draft) set_node_prefab_instance(
+    project &Project,
+    idx int,
+    scene_uid string,
+    override_target string,
+    override_visible bool
+) int {
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
+    ref := scene_ref_for_prefab(project, &draft.source, &scene_uid) or >>
+    ref_uid := ref.uid + ""
+    upsert_ref($&snap.refs, ref)
+    $ovs := []resource.PrefabOverride{}
+    trimmed := strings.trim_space(&override_target)
+    if trimmed.len > 0 {
+        ovs.push(resource.PrefabOverride{
+            target_path: trimmed,
+            visible_set: true,
+            visible: override_visible,
+            position_set: false,
+            position: fm.vec3(0.0, 0.0, 0.0)
+        })
+    }
+    pf := resource.prefab_instance_attachment(idx, ref_uid, ovs)
+    pf.validate() or >>
+    $next_pf := []resource.PrefabInstanceAttachment{}
+    for i in 0:snap.prefab_instances.len {
+        if snap.prefab_instances[i].node != idx {
+            next_pf.push(clone_prefab_instance(&snap.prefab_instances[i], snap.prefab_instances[i].node))
+        }
+    }
+    next_pf.push(pf)
+    snap.prefab_instances = next_pf
+    commit_snapshot(draft, $&snap) or >>
+    << 0
+}
+
+pub fn (draft $&Draft) clear_node_prefab_instance(idx int) int {
+    doc := draft.document() or >>
+    $snap := unpack_doc(&doc) or >>
+    require_node_idx(&snap, idx) or >>
+    $next_pf := []resource.PrefabInstanceAttachment{}
+    for i in 0:snap.prefab_instances.len {
+        if snap.prefab_instances[i].node != idx {
+            next_pf.push(clone_prefab_instance(&snap.prefab_instances[i], snap.prefab_instances[i].node))
+        }
+    }
+    snap.prefab_instances = next_pf
+    commit_snapshot(draft, $&snap) or >>
+    << 0
 }

@@ -1,0 +1,56 @@
+#version 450
+
+layout(set = 0, binding = 0) uniform sampler2D curr_hdr;
+layout(set = 0, binding = 1) uniform sampler2D prev_history;
+layout(set = 0, binding = 2) uniform sampler2D src_depth;
+layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D dst_history;
+
+layout(set = 2, binding = 0, std140) uniform TaaParams {
+    mat4 reproj;
+    vec4 info;
+} params;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    uint w = uint(params.info.x), h = uint(params.info.y);
+    if (gid.x >= w || gid.y >= h) return;
+
+    vec2 inv_res = vec2(1.0 / params.info.x, 1.0 / params.info.y);
+    vec2 uv = (vec2(gid) + 0.5) * inv_res;
+    vec3 curr = textureLod(curr_hdr, uv, 0.0).rgb;
+
+    if (params.info.w < 0.5) {
+        imageStore(dst_history, ivec2(gid), vec4(curr, 1.0));
+        return;
+    }
+
+    float d = textureLod(src_depth, uv, 0.0).r;
+    vec4 clip_curr = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
+    vec4 clip_prev = params.reproj * clip_curr;
+    if (clip_prev.w <= 1e-5) {
+        imageStore(dst_history, ivec2(gid), vec4(curr, 1.0));
+        return;
+    }
+    vec2 ndc_prev = clip_prev.xy / clip_prev.w;
+    vec2 prev_uv = vec2(ndc_prev.x * 0.5 + 0.5, 0.5 - ndc_prev.y * 0.5);
+    if (prev_uv.x <= 0.0 || prev_uv.x >= 1.0 || prev_uv.y <= 0.0 || prev_uv.y >= 1.0) {
+        imageStore(dst_history, ivec2(gid), vec4(curr, 1.0));
+        return;
+    }
+
+    vec3 box_min = curr, box_max = curr;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            vec2 suv = clamp(uv + vec2(float(dx), float(dy)) * inv_res, vec2(0.0001), vec2(0.9999));
+            vec3 n = textureLod(curr_hdr, suv, 0.0).rgb;
+            box_min = min(box_min, n);
+            box_max = max(box_max, n);
+        }
+    }
+
+    vec3 hist = clamp(textureLod(prev_history, prev_uv, 0.0).rgb, box_min, box_max);
+    vec3 resolved = mix(curr, hist, clamp(params.info.z, 0.0, 0.95));
+    imageStore(dst_history, ivec2(gid), vec4(resolved, 1.0));
+}

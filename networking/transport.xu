@@ -72,20 +72,20 @@ pub fn seq_diff(newer int, older int) int {
 
 pub fn encode_packet(hdr PacketHeader, payload &[]u8) []u8 {
     if hdr.channel < 0 || hdr.channel > 2 || hdr.kind < 1 || hdr.kind > 5 {
-        >>> errors.new("nexus net: invalid packet channel or kind")
+        >> errors.new("nexus net: invalid packet channel or kind")
     }
     if HEADER_BYTES + payload.len > MAX_PACKET_BYTES {
-        >>> errors.new("nexus net: packet exceeds MAX_PACKET_BYTES (1400)")
+        >> errors.new("nexus net: packet exceeds MAX_PACKET_BYTES (1400)")
     }
     order := binary.little_endian()
     $out := zero_bytes_net(HEADER_BYTES + payload.len)
-    order.put_u16_bytes($&out, 0, NET_MAGIC) >>>
+    order.put_u16_bytes($&out, 0, NET_MAGIC) or >>
     out[2] = u8(hdr.channel & 255)
     out[3] = u8(hdr.kind & 255)
-    order.put_u16_bytes($&out, 4, hdr.sequence & 65535) >>>
-    order.put_u16_bytes($&out, 6, hdr.ack & 65535) >>>
-    order.put_u32_bytes($&out, 8, hdr.ack_bits) >>>
-    order.put_u16_bytes($&out, 12, hdr.reliable_seq & 65535) >>>
+    order.put_u16_bytes($&out, 4, hdr.sequence & 65535) or >>
+    order.put_u16_bytes($&out, 6, hdr.ack & 65535) or >>
+    order.put_u32_bytes($&out, 8, hdr.ack_bits) or >>
+    order.put_u16_bytes($&out, 12, hdr.reliable_seq & 65535) or >>
     for i in 0:payload.len {
         out[HEADER_BYTES + i] = payload[i]
     }
@@ -94,22 +94,22 @@ pub fn encode_packet(hdr PacketHeader, payload &[]u8) []u8 {
 
 pub fn decode_packet(raw &[]u8) DecodedPacket {
     if raw.len < HEADER_BYTES || raw.len > MAX_PACKET_BYTES {
-        >>> errors.new("nexus net: invalid packet length")
+        >> errors.new("nexus net: invalid packet length")
     }
     order := binary.little_endian()
-    magic := order.get_u16_bytes(raw, 0) >>>
+    magic := order.get_u16_bytes(raw, 0) or >>
     if magic != NET_MAGIC {
-        >>> errors.new("nexus net: bad packet magic")
+        >> errors.new("nexus net: bad packet magic")
     }
     ch := int(raw[2])
     kind := int(raw[3])
     if ch < 0 || ch > 2 || kind < 1 || kind > 5 {
-        >>> errors.new("nexus net: invalid header channel or kind")
+        >> errors.new("nexus net: invalid header channel or kind")
     }
-    seq := order.get_u16_bytes(raw, 4) >>>
-    ack := order.get_u16_bytes(raw, 6) >>>
-    ack_bits := order.get_u32_bytes(raw, 8) >>>
-    rseq := order.get_u16_bytes(raw, 12) >>>
+    seq := order.get_u16_bytes(raw, 4) or >>
+    ack := order.get_u16_bytes(raw, 6) or >>
+    ack_bits := order.get_u32_bytes(raw, 8) or >>
+    rseq := order.get_u16_bytes(raw, 12) or >>
     $payload := []u8{}
     for i in HEADER_BYTES:raw.len {
         payload.push(raw[i])
@@ -220,7 +220,7 @@ pub fn (ch $&ReliableChannel) send(channel int, kind int, payload &[]u8, now_ms 
         ack_bits: ack_st[1],
         reliable_seq: rseq
     }
-    wire := encode_packet(hdr, payload) >>>
+    wire := encode_packet(hdr, payload) or >>
     if channel == CHANNEL_RELIABLE_ORDERED || channel == CHANNEL_RELIABLE_UNORDERED {
         rto := ch.initial_rto_ms()
         ch.pending.push(PendingReliable{
@@ -385,7 +385,7 @@ fn (ch $&ReliableChannel) flush_ordered(out $&[]DeliveredMessage) {
 }
 
 pub fn (ch $&ReliableChannel) on_receive(raw &[]u8, now_ms f64) []DeliveredMessage {
-    pkt := decode_packet(raw) >>>
+    pkt := decode_packet(raw) or >>
     ch.packets_received += 1
     ch.process_acks(pkt.header.ack, pkt.header.ack_bits, now_ms)
 
@@ -426,7 +426,7 @@ fn retransmit_wire_if_due(p &PendingReliable, new_seq int, ack_st &[]int, now_ms
         ack_bits: ack_st[1],
         reliable_seq: p.reliable_seq
     }
-    << encode_packet(hdr, &p.payload) >>>
+    << encode_packet(hdr, &p.payload) or >>
 }
 
 pub fn (ch $&ReliableChannel) poll_retransmits(now_ms f64) []NetPacket {
@@ -434,7 +434,7 @@ pub fn (ch $&ReliableChannel) poll_retransmits(now_ms f64) []NetPacket {
     ack_st := ch.current_ack_state()
     for i in 0:ch.pending.len {
         new_seq := ch.next_send_seq
-        wire := retransmit_wire_if_due(&ch.pending[i], new_seq, &ack_st, now_ms) >>>
+        wire := retransmit_wire_if_due(&ch.pending[i], new_seq, &ack_st, now_ms) or >>
         if wire.len > 0 {
             ch.next_send_seq = (ch.next_send_seq + 1) % 65536
             ch.pending[i].seq = new_seq
@@ -476,34 +476,34 @@ pub struct UdpTransport {
 }
 
 pub fn bind_udp(addr string) UdpTransport {
-    laddr := net.resolve_udp_addr("udp4", addr) >>>
-    conn := net.listen_udp("udp4", laddr) >>>
+    laddr := net.resolve_udp_addr("udp4", addr) or >>
+    conn := net.listen_udp("udp4", laddr) or >>
     << UdpTransport{conns: [conn], closed: false}
 }
 
 pub fn (u &UdpTransport) local_addr() string {
-    if u.closed || u.conns.len == 0 { >>> errors.new("nexus net: closed UdpTransport") }
+    if u.closed || u.conns.len == 0 { >> errors.new("nexus net: closed UdpTransport") }
     << u.conns[0].local_addr()
 }
 
 pub fn (u &UdpTransport) send_to(peer_addr string, payload &[]u8) int {
-    if u.closed || u.conns.len == 0 { >>> errors.new("nexus net: closed UdpTransport") }
-    if payload.len > MAX_PACKET_BYTES { >>> errors.new("nexus net: UDP payload exceeds 1400 bytes") }
-    dest := net.resolve_udp_addr("udp4", peer_addr) >>>
+    if u.closed || u.conns.len == 0 { >> errors.new("nexus net: closed UdpTransport") }
+    if payload.len > MAX_PACKET_BYTES { >> errors.new("nexus net: UDP payload exceeds 1400 bytes") }
+    dest := net.resolve_udp_addr("udp4", peer_addr) or >>
     wire := bytes_to_wire(payload)
-    << u.conns[0].write_to(&wire, &dest) >>>
+    << u.conns[0].write_to(&wire, &dest) or >>
 }
 
 pub fn (u $&UdpTransport) recv_from(timeout_ms int) UdpDatagram {
-    if u.closed || u.conns.len == 0 { >>> errors.new("nexus net: closed UdpTransport") }
+    if u.closed || u.conns.len == 0 { >> errors.new("nexus net: closed UdpTransport") }
     c := $&u.conns[0]
     if timeout_ms >= 0 {
         deadline := time.now() + timeout_ms * 1000000
-        c.set_read_deadline(deadline) >>>
+        c.set_read_deadline(deadline) or >>
     } else {
-        c.set_read_deadline(0) >>>
+        c.set_read_deadline(0) or >>
     }
-    pkt := c.read_from(MAX_PACKET_BYTES + 64) >>> (err) {
+    pkt := c.read_from(MAX_PACKET_BYTES + 64) or (err) {
         << UdpDatagram{received: false, from: "", data: []u8{}}
     }
     << UdpDatagram{
@@ -517,7 +517,7 @@ pub fn (u $&UdpTransport) close() int {
     if u.closed { << 0 }
     for i in 0:u.conns.len {
         c := $&u.conns[i]
-        c.close() >>>
+        c.close() or >>
     }
     u.conns = []net.PacketConn{}
     u.closed = true
@@ -525,7 +525,7 @@ pub fn (u $&UdpTransport) close() int {
 }
 
 fn (u $&UdpTransport) drop() {
-    u.close() >>> (err) { << }
+    u.close() or (err) { << }
 }
 
 // --- Deterministic Loss / Jitter / Reordering / Duplication Link Simulator ---
@@ -568,7 +568,7 @@ pub fn new_simulated_link(cfg SimLinkConfig) SimulatedLink {
     if cfg.loss_rate < 0.0 || cfg.loss_rate >= 1.0 ||
         cfg.latency_ms < 0.0 || cfg.jitter_ms < 0.0 ||
         cfg.duplicate_rate < 0.0 || cfg.reorder_rate < 0.0 {
-        >>> errors.new("nexus net: invalid SimulatedLink configuration")
+        >> errors.new("nexus net: invalid SimulatedLink configuration")
     }
     $s := cfg.seed
     if s == 0 { s = 1234567 }

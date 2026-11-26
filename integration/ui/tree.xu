@@ -1,0 +1,711 @@
+@"github.com/xulang-org/nexus/integration/ui"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+#ui/draw
+#ui/layout
+wev #window/events
+
+pub const UI_LAYOUT_FIXED = 0
+pub const UI_LAYOUT_ROW = 1
+pub const UI_LAYOUT_COLUMN = 2
+
+pub const UI_PANEL = 0
+pub const UI_LABEL = 1
+pub const UI_BUTTON = 2
+pub const UI_TOGGLE = 3
+pub const UI_SLIDER = 4
+pub const UI_MODAL = 5
+
+pub const UI_ACTION_NONE = 0
+pub const UI_ACTION_CLICK = 1
+pub const UI_ACTION_TOGGLE = 2
+pub const UI_ACTION_SLIDE = 3
+pub const UI_ACTION_FOCUS = 4
+
+pub struct UiNode {
+    pub id int
+    pub parent int
+    pub kind int
+    pub layout_mode int
+    pub label string
+    pub bounds layout.Rect
+    pub computed layout.Rect
+    pub padding f64
+    pub gap f64
+    pub visible bool
+    pub enabled bool
+    pub focusable bool
+    pub tab_index int
+    pub modal_trap bool
+    pub checked bool
+    pub value f64
+    pub min_val f64
+    pub max_val f64
+    pub bg_color draw.Color
+    pub border_color draw.Color
+    pub fg_color draw.Color
+}
+
+pub struct UiTreeAction {
+    pub kind int
+    pub node_id int
+    pub checked bool
+    pub value f64
+    pub consumed bool
+}
+
+// Retained UI control hierarchy with row/column/fixed layout, deterministic
+// Tab/Shift+Tab focus order, modal focus trapping, pointer interaction, and
+// HudRouter + UiFrame integration.
+pub struct UiControlTree {
+    pub nodes []UiNode
+    pub focused_id int
+    pub hovered_id int
+    pub pressed_id int
+    pub dragging_id int
+    pub active_modal_id int
+}
+
+pub fn empty_tree_action() UiTreeAction {
+    << UiTreeAction{kind: UI_ACTION_NONE, node_id: 0, checked: false, value: 0.0, consumed: false}
+}
+
+pub fn new_control_tree() UiControlTree {
+    << UiControlTree{
+        nodes: []UiNode{},
+        focused_id: 0,
+        hovered_id: 0,
+        pressed_id: 0,
+        dragging_id: 0,
+        active_modal_id: 0
+    }
+}
+
+fn validate_parent(tree &UiControlTree, parent int) int {
+    if parent == -1 { << 0 }
+    if parent < 1 || parent > tree.nodes.len {
+        >> errors.new("nexus ui tree: invalid parent id")
+    }
+    << 0
+}
+
+fn validate_node_id(tree &UiControlTree, id int) int {
+    if id < 1 || id > tree.nodes.len {
+        >> errors.new("nexus ui tree: invalid node id")
+    }
+    << id - 1
+}
+
+fn push_node(tree $&UiControlTree, parent int, kind int, layout_mode int, label string,
+        bounds layout.Rect, padding f64, gap f64, focusable bool, tab_index int,
+        modal_trap bool, checked bool, value f64, min_val f64, max_val f64) int {
+    validate_parent(tree, parent) or >>
+    id := tree.nodes.len + 1
+    $bg := draw.rgba(26, 30, 38, 224)
+    $border := draw.rgba(72, 84, 102, 230)
+    $fg := draw.rgb(236, 240, 246)
+    if kind == UI_LABEL {
+        bg = draw.rgba(0, 0, 0, 0)
+        border = draw.rgba(0, 0, 0, 0)
+    } else if kind == UI_BUTTON {
+        bg = draw.rgba(46, 56, 74, 240)
+        border = draw.rgba(104, 126, 160, 245)
+    } else if kind == UI_MODAL {
+        bg = draw.rgba(22, 26, 34, 245)
+        border = draw.rgba(128, 164, 224, 255)
+    }
+    tree.nodes.push(UiNode{
+        id: id,
+        parent: parent,
+        kind: kind,
+        layout_mode: layout_mode,
+        label: label,
+        bounds: bounds,
+        computed: bounds,
+        padding: math.max(0.0, padding),
+        gap: math.max(0.0, gap),
+        visible: true,
+        enabled: true,
+        focusable: focusable,
+        tab_index: tab_index,
+        modal_trap: modal_trap,
+        checked: checked,
+        value: value,
+        min_val: min_val,
+        max_val: max_val,
+        bg_color: bg,
+        border_color: border,
+        fg_color: fg
+    })
+    << id
+}
+
+pub fn (t $&UiControlTree) add_panel(parent int, rect layout.Rect, layout_mode int, padding f64, gap f64) int {
+    << push_node(t, parent, UI_PANEL, layout_mode, "", rect, padding, gap, false, 0, false, false, 0.0, 0.0, 1.0) or >>
+}
+
+pub fn (t $&UiControlTree) add_label(parent int, rect layout.Rect, text string) int {
+    << push_node(t, parent, UI_LABEL, UI_LAYOUT_FIXED, text, rect, 0.0, 0.0, false, 0, false, false, 0.0, 0.0, 1.0) or >>
+}
+
+pub fn (t $&UiControlTree) add_button(parent int, rect layout.Rect, text string, tab_index int) int {
+    << push_node(t, parent, UI_BUTTON, UI_LAYOUT_FIXED, text, rect, 6.0, 0.0, true, tab_index, false, false, 0.0, 0.0, 1.0) or >>
+}
+
+pub fn (t $&UiControlTree) add_toggle(parent int, rect layout.Rect, text string, initial bool, tab_index int) int {
+    << push_node(t, parent, UI_TOGGLE, UI_LAYOUT_FIXED, text, rect, 6.0, 0.0, true, tab_index, false, initial, 0.0, 0.0, 1.0) or >>
+}
+
+pub fn (t $&UiControlTree) add_slider(parent int, rect layout.Rect, text string, min_v f64, max_v f64, initial f64, tab_index int) int {
+    lo := math.min(min_v, max_v)
+    hi := math.max(min_v, max_v)
+    clamped := math.max(lo, math.min(hi, initial))
+    << push_node(t, parent, UI_SLIDER, UI_LAYOUT_FIXED, text, rect, 6.0, 0.0, true, tab_index, false, false, clamped, lo, hi) or >>
+}
+
+pub fn (t $&UiControlTree) add_modal(parent int, rect layout.Rect, title string, visible bool) int {
+    id := push_node(t, parent, UI_MODAL, UI_LAYOUT_COLUMN, title, rect, 12.0, 8.0, false, 0, true, false, 0.0, 0.0, 1.0) or >>
+    t.nodes[id - 1].visible = visible
+    << id
+}
+
+pub fn (t $&UiControlTree) set_visible(id int, visible bool) int {
+    idx := validate_node_id(t, id) or >>
+    t.nodes[idx].visible = visible
+    if !visible && t.focused_id == id { t.focused_id = 0 }
+    if !visible && t.active_modal_id == id { t.active_modal_id = 0 }
+    << 0
+}
+
+pub fn (t $&UiControlTree) set_enabled(id int, enabled bool) int {
+    idx := validate_node_id(t, id) or >>
+    t.nodes[idx].enabled = enabled
+    if !enabled && t.focused_id == id { t.focused_id = 0 }
+    << 0
+}
+
+pub fn (t $&UiControlTree) set_label(id int, text string) int {
+    idx := validate_node_id(t, id) or >>
+    t.nodes[idx].label = text
+    << 0
+}
+
+pub fn (t $&UiControlTree) set_value(id int, v f64) int {
+    idx := validate_node_id(t, id) or >>
+    lo := t.nodes[idx].min_val
+    hi := t.nodes[idx].max_val
+    t.nodes[idx].value = math.max(lo, math.min(hi, v))
+    << 0
+}
+
+pub fn (t $&UiControlTree) set_checked(id int, checked bool) int {
+    idx := validate_node_id(t, id) or >>
+    t.nodes[idx].checked = checked
+    << 0
+}
+
+pub fn (t &UiControlTree) node_bounds(id int) layout.Rect {
+    idx := validate_node_id(t, id) or >>
+    << t.nodes[idx].computed
+}
+
+pub fn (t &UiControlTree) node_checked(id int) bool {
+    idx := validate_node_id(t, id) or >>
+    << t.nodes[idx].checked
+}
+
+pub fn (t &UiControlTree) node_value(id int) f64 {
+    idx := validate_node_id(t, id) or >>
+    << t.nodes[idx].value
+}
+
+pub fn (t &UiControlTree) focused() int { << t.focused_id }
+pub fn (t &UiControlTree) hovered() int { << t.hovered_id }
+
+fn (t &UiControlTree) is_effectively_visible(id int) bool {
+    $cur := id
+    for _guard in 0:(t.nodes.len + 1) {
+        if cur < 1 || cur > t.nodes.len { << false }
+        n := t.nodes[cur - 1]
+        if !n.visible { << false }
+        if n.parent == -1 { << true }
+        cur = n.parent
+    }
+    << false
+}
+
+fn (t &UiControlTree) is_effectively_enabled(id int) bool {
+    $cur := id
+    for _guard in 0:(t.nodes.len + 1) {
+        if cur < 1 || cur > t.nodes.len { << false }
+        n := t.nodes[cur - 1]
+        if !n.visible || !n.enabled { << false }
+        if n.parent == -1 { << true }
+        cur = n.parent
+    }
+    << false
+}
+
+fn (t &UiControlTree) is_in_subtree(root_id int, id int) bool {
+    if root_id <= 0 { << true }
+    $cur := id
+    for _guard in 0:(t.nodes.len + 1) {
+        if cur == root_id { << true }
+        if cur < 1 || cur > t.nodes.len { << false }
+        p := t.nodes[cur - 1].parent
+        if p == -1 { << false }
+        cur = p
+    }
+    << false
+}
+
+fn layout_subtree(t $&UiControlTree, id int, parent_rect layout.Rect, is_root bool) {
+    idx := id - 1
+    req := t.nodes[idx].bounds
+    $cur_rect := req
+    if !is_root {
+        cur_rect = layout.Rect{
+            x: parent_rect.x + req.x,
+            y: parent_rect.y + req.y,
+            width: req.width,
+            height: req.height
+        }
+    }
+    t.nodes[idx].computed = cur_rect
+    mode := t.nodes[idx].layout_mode
+    pad := t.nodes[idx].padding
+    gap := t.nodes[idx].gap
+    $title_offset := 0.0
+    if t.nodes[idx].kind == UI_MODAL && t.nodes[idx].label.len > 0 {
+        title_offset = 24.0
+    }
+    $cursor_x := cur_rect.x + pad
+    $cursor_y := cur_rect.y + pad + title_offset
+    inner_w := math.max(0.0, cur_rect.width - pad * 2.0)
+    inner_h := math.max(0.0, cur_rect.height - pad * 2.0 - title_offset)
+    for ci in 0:t.nodes.len {
+        child := t.nodes[ci]
+        if child.parent != id { -> }
+        if !child.visible {
+            t.nodes[ci].computed = layout.Rect{x: cur_rect.x, y: cur_rect.y, width: 0.0, height: 0.0}
+            ->
+        }
+        $child_rect := child.bounds
+        if mode == UI_LAYOUT_ROW {
+            $ch := child.bounds.height
+            if ch <= 0.0 { ch = inner_h }
+            child_rect = layout.Rect{x: cursor_x, y: cursor_y, width: child.bounds.width, height: ch}
+            cursor_x = cursor_x + child.bounds.width + gap
+            t.nodes[ci].computed = child_rect
+            layout_children_only(t, child.id)
+        } else if mode == UI_LAYOUT_COLUMN {
+            $cw := child.bounds.width
+            if cw <= 0.0 { cw = inner_w }
+            child_rect = layout.Rect{x: cursor_x, y: cursor_y, width: cw, height: child.bounds.height}
+            cursor_y = cursor_y + child.bounds.height + gap
+            t.nodes[ci].computed = child_rect
+            layout_children_only(t, child.id)
+        } else {
+            layout_subtree(t, child.id, cur_rect, false)
+        }
+    }
+}
+
+fn layout_children_only(t $&UiControlTree, parent_id int) {
+    parent_rect := t.nodes[parent_id - 1].computed
+    mode := t.nodes[parent_id - 1].layout_mode
+    pad := t.nodes[parent_id - 1].padding
+    gap := t.nodes[parent_id - 1].gap
+    $title_offset := 0.0
+    if t.nodes[parent_id - 1].kind == UI_MODAL && t.nodes[parent_id - 1].label.len > 0 {
+        title_offset = 24.0
+    }
+    $cursor_x := parent_rect.x + pad
+    $cursor_y := parent_rect.y + pad + title_offset
+    inner_w := math.max(0.0, parent_rect.width - pad * 2.0)
+    inner_h := math.max(0.0, parent_rect.height - pad * 2.0 - title_offset)
+    for ci in 0:t.nodes.len {
+        child := t.nodes[ci]
+        if child.parent != parent_id { -> }
+        if !child.visible {
+            t.nodes[ci].computed = layout.Rect{x: parent_rect.x, y: parent_rect.y, width: 0.0, height: 0.0}
+            ->
+        }
+        if mode == UI_LAYOUT_ROW {
+            $ch := child.bounds.height
+            if ch <= 0.0 { ch = inner_h }
+            t.nodes[ci].computed = layout.Rect{x: cursor_x, y: cursor_y, width: child.bounds.width, height: ch}
+            cursor_x = cursor_x + child.bounds.width + gap
+            layout_children_only(t, child.id)
+        } else if mode == UI_LAYOUT_COLUMN {
+            $cw := child.bounds.width
+            if cw <= 0.0 { cw = inner_w }
+            t.nodes[ci].computed = layout.Rect{x: cursor_x, y: cursor_y, width: cw, height: child.bounds.height}
+            cursor_y = cursor_y + child.bounds.height + gap
+            layout_children_only(t, child.id)
+        } else {
+            t.nodes[ci].computed = layout.Rect{
+                x: parent_rect.x + child.bounds.x,
+                y: parent_rect.y + child.bounds.y,
+                width: child.bounds.width,
+                height: child.bounds.height
+            }
+            layout_children_only(t, child.id)
+        }
+    }
+}
+
+pub fn (t $&UiControlTree) compute_layout(viewport_w f64, viewport_h f64) int {
+    vp := layout.Rect{x: 0.0, y: 0.0, width: math.max(0.0, viewport_w), height: math.max(0.0, viewport_h)}
+    $modal_id := 0
+    for i in 0:t.nodes.len {
+        n := t.nodes[i]
+        if n.parent == -1 && n.visible {
+            layout_subtree(t, n.id, vp, true)
+        }
+        if n.kind == UI_MODAL && n.modal_trap && t.is_effectively_visible(n.id) {
+            modal_id = n.id
+        }
+    }
+    t.active_modal_id = modal_id
+    if t.focused_id > 0 {
+        if !t.is_effectively_enabled(t.focused_id) ||
+           (modal_id > 0 && !t.is_in_subtree(modal_id, t.focused_id)) {
+            t.focused_id = 0
+        }
+    }
+    << 0
+}
+
+pub fn (t &UiControlTree) focusable_order() []int {
+    $ids := []int{}
+    for i in 0:t.nodes.len {
+        n := t.nodes[i]
+        if !n.focusable { -> }
+        if !t.is_effectively_enabled(n.id) { -> }
+        if t.active_modal_id > 0 && !t.is_in_subtree(t.active_modal_id, n.id) { -> }
+        ids.push(n.id)
+    }
+    // Insertion sort by (tab_index, id) ascending for deterministic traversal.
+    for i in 1:ids.len {
+        key_id := ids[i]
+        key_tab := t.nodes[key_id - 1].tab_index
+        $j := i - 1
+        while j >= 0 {
+            cur_id := ids[j]
+            cur_tab := t.nodes[cur_id - 1].tab_index
+            if cur_tab > key_tab || (cur_tab == key_tab && cur_id > key_id) {
+                ids[j + 1] = cur_id
+                j = j - 1
+            } else {
+                <-
+            }
+        }
+        ids[j + 1] = key_id
+    }
+    << ids
+}
+
+pub fn (t $&UiControlTree) set_focus(id int) bool {
+    if id <= 0 || id > t.nodes.len { << false }
+    n := t.nodes[id - 1]
+    if !n.focusable || !t.is_effectively_enabled(id) { << false }
+    if t.active_modal_id > 0 && !t.is_in_subtree(t.active_modal_id, id) { << false }
+    t.focused_id = id
+    << true
+}
+
+pub fn (t $&UiControlTree) focus_next() int {
+    order := t.focusable_order()
+    if order.len == 0 {
+        t.focused_id = 0
+        << 0
+    }
+    for i in 0:order.len {
+        if order[i] == t.focused_id {
+            next_id := order[(i + 1) % order.len]
+            t.focused_id = next_id
+            << next_id
+        }
+    }
+    t.focused_id = order[0]
+    << order[0]
+}
+
+pub fn (t $&UiControlTree) focus_prev() int {
+    order := t.focusable_order()
+    if order.len == 0 {
+        t.focused_id = 0
+        << 0
+    }
+    for i in 0:order.len {
+        if order[i] == t.focused_id {
+            prev_idx := (i - 1 + order.len) % order.len
+            prev_id := order[prev_idx]
+            t.focused_id = prev_id
+            << prev_id
+        }
+    }
+    last_id := order[order.len - 1]
+    t.focused_id = last_id
+    << last_id
+}
+
+fn (t &UiControlTree) hit_test(x f64, y f64) int {
+    $i := t.nodes.len - 1
+    while i >= 0 {
+        n := t.nodes[i]
+        if n.kind != UI_PANEL && n.kind != UI_LABEL && n.kind != UI_MODAL &&
+           t.is_effectively_enabled(n.id) &&
+           (t.active_modal_id == 0 || t.is_in_subtree(t.active_modal_id, n.id)) &&
+           n.computed.contains(x, y) {
+            << n.id
+        }
+        i = i - 1
+    }
+    << 0
+}
+
+fn update_slider_from_pointer(t $&UiControlTree, id int, px f64) f64 {
+    idx := id - 1
+    r := t.nodes[idx].computed
+    lo := t.nodes[idx].min_val
+    hi := t.nodes[idx].max_val
+    $ratio := 0.0
+    if r.width > 12.0 {
+        ratio = (px - (r.x + 6.0)) / (r.width - 12.0)
+    } else if r.width > 0.0 {
+        ratio = (px - r.x) / r.width
+    }
+    ratio = math.max(0.0, math.min(1.0, ratio))
+    val := lo + (hi - lo) * ratio
+    t.nodes[idx].value = val
+    << val
+}
+
+pub fn (t $&UiControlTree) handle_event(ev &wev.Event) UiTreeAction {
+    $act := empty_tree_action()
+    k := ev.kind
+    if k == wev.EVENT_KEY_DOWN {
+        if ev.physical_key == wev.KEY_ESCAPE && t.active_modal_id > 0 {
+            modal_id := t.active_modal_id
+            t.nodes[modal_id - 1].visible = false
+            t.active_modal_id = 0
+            t.focused_id = 0
+            act.kind = UI_ACTION_TOGGLE
+            act.node_id = modal_id
+            act.consumed = true
+            << act
+        }
+        if ev.physical_key == wev.KEY_TAB {
+            $next_id := 0
+            if (ev.modifiers & wev.MOD_SHIFT) != 0 { next_id = t.focus_prev() }
+            else { next_id = t.focus_next() }
+            act.kind = UI_ACTION_FOCUS
+            act.node_id = next_id
+            act.consumed = next_id > 0 || t.active_modal_id > 0
+            << act
+        }
+        if (ev.physical_key == wev.KEY_ENTER || ev.physical_key == wev.KEY_SPACE) && t.focused_id > 0 {
+            idx := t.focused_id - 1
+            n := t.nodes[idx]
+            if t.is_effectively_enabled(n.id) {
+                if n.kind == UI_BUTTON {
+                    act.kind = UI_ACTION_CLICK
+                    act.node_id = n.id
+                    act.consumed = true
+                    << act
+                } else if n.kind == UI_TOGGLE {
+                    t.nodes[idx].checked = !n.checked
+                    act.kind = UI_ACTION_TOGGLE
+                    act.node_id = n.id
+                    act.checked = t.nodes[idx].checked
+                    act.consumed = true
+                    << act
+                }
+            }
+        }
+        << act
+    }
+    if k == wev.EVENT_POINTER_MOVE {
+        t.hovered_id = t.hit_test(ev.x, ev.y)
+        if t.dragging_id > 0 {
+            val := update_slider_from_pointer(t, t.dragging_id, ev.x)
+            act.kind = UI_ACTION_SLIDE
+            act.node_id = t.dragging_id
+            act.value = val
+            act.consumed = true
+        } else if t.active_modal_id > 0 {
+            act.consumed = true
+        }
+        << act
+    }
+    if k == wev.EVENT_POINTER_DOWN && ev.button == wev.BUTTON_LEFT {
+        hit := t.hit_test(ev.x, ev.y)
+        if hit > 0 {
+            t.pressed_id = hit
+            _ := t.set_focus(hit)
+            n := t.nodes[hit - 1]
+            if n.kind == UI_SLIDER {
+                t.dragging_id = hit
+                val := update_slider_from_pointer(t, hit, ev.x)
+                act.kind = UI_ACTION_SLIDE
+                act.node_id = hit
+                act.value = val
+            } else {
+                act.kind = UI_ACTION_FOCUS
+                act.node_id = hit
+            }
+            act.consumed = true
+            << act
+        }
+        if t.active_modal_id > 0 { act.consumed = true }
+        << act
+    }
+    if k == wev.EVENT_POINTER_UP && ev.button == wev.BUTTON_LEFT {
+        pressed := t.pressed_id
+        dragging := t.dragging_id
+        t.pressed_id = 0
+        t.dragging_id = 0
+        if dragging > 0 {
+            act.consumed = true
+            << act
+        }
+        hit := t.hit_test(ev.x, ev.y)
+        if pressed > 0 && hit == pressed {
+            n := t.nodes[hit - 1]
+            if n.kind == UI_BUTTON {
+                act.kind = UI_ACTION_CLICK
+                act.node_id = hit
+                act.consumed = true
+            } else if n.kind == UI_TOGGLE {
+                t.nodes[hit - 1].checked = !n.checked
+                act.kind = UI_ACTION_TOGGLE
+                act.node_id = hit
+                act.checked = t.nodes[hit - 1].checked
+                act.consumed = true
+            }
+            << act
+        }
+        if t.active_modal_id > 0 { act.consumed = true }
+        << act
+    }
+    << act
+}
+
+pub fn (t &UiControlTree) sync_hud_router(router $&HudRouter) int {
+    router.begin_frame()
+    router.set_modal(t.active_modal_id > 0)
+    for i in 0:t.nodes.len {
+        n := t.nodes[i]
+        if !t.is_effectively_visible(n.id) { -> }
+        if n.parent == -1 || n.kind == UI_MODAL || n.focusable {
+            if n.computed.width > 0.0 && n.computed.height > 0.0 {
+                router.add_rect(&n.computed) or >>
+            }
+        }
+    }
+    << 0
+}
+
+fn render_node_self(t &UiControlTree, frame $&UiFrame, n &UiNode) int {
+    r := n.computed
+    if r.width <= 0.0 || r.height <= 0.0 { << 0 }
+    $bg := n.bg_color
+    $border := n.border_color
+    $fg := n.fg_color
+    if !n.enabled {
+        bg = draw.rgba(30, 32, 36, 180)
+        fg = draw.rgba(140, 146, 158, 220)
+    } else if t.pressed_id == n.id {
+        bg = draw.rgba(34, 42, 58, 250)
+    } else if t.hovered_id == n.id {
+        bg = draw.rgba(60, 74, 98, 245)
+    }
+    if t.focused_id == n.id {
+        border = draw.rgb(122, 198, 255)
+    }
+    if n.kind == UI_PANEL {
+        frame.draw_panel(&r, 8.0, bg, border, 1.0) or >>
+        << 0
+    }
+    if n.kind == UI_MODAL {
+        frame.draw_panel(&r, 10.0, bg, border, 2.0) or >>
+        if n.label.len > 0 {
+            hdr := layout.Rect{x: r.x + 12.0, y: r.y + 6.0, width: math.max(0.0, r.width - 24.0), height: 20.0}
+            frame.draw_label(&hdr, &n.label, fg, 14.0, 0.0, 0.5) or >>
+        }
+        << 0
+    }
+    if n.kind == UI_LABEL {
+        frame.draw_label(&r, &n.label, fg, 13.0, 0.0, 0.5) or >>
+        << 0
+    }
+    if n.kind == UI_BUTTON {
+        frame.draw_panel(&r, 6.0, bg, border, 1.5) or >>
+        if n.label.len > 0 {
+            frame.draw_label(&r, &n.label, fg, 13.0, 0.5, 0.5) or >>
+        }
+        << 0
+    }
+    if n.kind == UI_TOGGLE {
+        frame.draw_panel(&r, 6.0, bg, border, 1.0) or >>
+        pill_w := 30.0
+        pill_h := math.min(16.0, math.max(8.0, r.height - 8.0))
+        pill_x := r.x + 8.0
+        pill_y := r.y + (r.height - pill_h) * 0.5
+        $pill_col := draw.rgb(74, 82, 98).value()
+        if n.checked { pill_col = draw.rgb(72, 196, 132).value() }
+        frame.record_sdf_rect(fm.rect2(pill_x, pill_y, pill_w, pill_h), pill_h * 0.5, pill_col, 0.0, 0) or >>
+        $knob_x := pill_x + 2.0
+        if n.checked { knob_x = pill_x + pill_w - pill_h + 2.0 }
+        knob_d := math.max(4.0, pill_h - 4.0)
+        frame.record_sdf_rect(fm.rect2(knob_x, pill_y + 2.0, knob_d, knob_d), knob_d * 0.5,
+            draw.rgb(245, 247, 250).value(), 0.0, 0) or >>
+        if n.label.len > 0 {
+            lbl_r := layout.Rect{x: pill_x + pill_w + 8.0, y: r.y, width: math.max(0.0, r.width - pill_w - 20.0), height: r.height}
+            frame.draw_label(&lbl_r, &n.label, fg, 13.0, 0.0, 0.5) or >>
+        }
+        << 0
+    }
+    if n.kind == UI_SLIDER {
+        frame.draw_panel(&r, 6.0, bg, border, 1.0) or >>
+        span := math.max(1e-9, n.max_val - n.min_val)
+        ratio := math.max(0.0, math.min(1.0, (n.value - n.min_val) / span))
+        track_x := r.x + 8.0
+        track_w := math.max(4.0, r.width - 16.0)
+        track_y := r.y + r.height - 10.0
+        frame.record_sdf_rect(fm.rect2(track_x, track_y, track_w, 4.0), 2.0,
+            draw.rgb(62, 70, 84).value(), 0.0, 0) or >>
+        fill_w := math.max(2.0, track_w * ratio)
+        frame.record_sdf_rect(fm.rect2(track_x, track_y, fill_w, 4.0), 2.0,
+            draw.rgb(92, 168, 255).value(), 0.0, 0) or >>
+        if n.label.len > 0 {
+            lbl_r := layout.Rect{x: r.x + 8.0, y: r.y + 2.0, width: math.max(0.0, r.width - 16.0), height: math.max(12.0, r.height - 14.0)}
+            frame.draw_label(&lbl_r, &n.label, fg, 12.0, 0.0, 0.5) or >>
+        }
+        << 0
+    }
+    << 0
+}
+
+pub fn (t &UiControlTree) render(frame $&UiFrame) int {
+    // Draw non-modal nodes first, then modal nodes on top.
+    for i in 0:t.nodes.len {
+        n := t.nodes[i]
+        if !t.is_effectively_visible(n.id) { -> }
+        if t.active_modal_id > 0 && t.is_in_subtree(t.active_modal_id, n.id) { -> }
+        render_node_self(t, frame, &n) or >>
+    }
+    if t.active_modal_id > 0 {
+        for i in 0:t.nodes.len {
+            n := t.nodes[i]
+            if t.is_effectively_visible(n.id) && t.is_in_subtree(t.active_modal_id, n.id) {
+                render_node_self(t, frame, &n) or >>
+            }
+        }
+    }
+    << 0
+}

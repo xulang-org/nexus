@@ -8,62 +8,65 @@ lod #"github.com/xulang-org/nexus/resources/lod"
 #errors
 
 fn rows_min(doc &json.Doc, node int, minimum int, limit int) []int {
-    if node < 0 || !doc.is_list(node) || doc.count(node) < minimum || doc.count(node) > limit { >>> errors.new("nexus scene: resource/surface array outside limits") }
+    if node < 0 || !doc.is_list(node) || doc.count(node) < minimum || doc.count(node) > limit { >> errors.new("nexus scene: resource/surface array outside limits") }
     $result := []int{}
     for i in 0:doc.count(node) { result.push(doc.at(node, i)) }
     << result
 }
 fn decode_attachments(doc &json.Doc, root int, version int, document &resource.Document) resource.Document {
-    resource_nodes := rows_min(doc, doc.get(root, "resources"), 0, resource.MAX_RESOURCES) >>>
+    resource_nodes := rows_min(doc, doc.get(root, "resources"), 0, resource.MAX_RESOURCES) or >>
     resource_fields := ["uid", "type", "path", "sha256"]
     $references := []resource.ResourceReference{}
     for node in resource_nodes {
-        fields(doc, node, &resource_fields) >>>
-        uid := doc.as_string(doc.get(node, "uid")) >>>
-        kind := doc.as_string(doc.get(node, "type")) >>>
+        fields(doc, node, &resource_fields) or >>
+        uid := doc.as_string(doc.get(node, "uid")) or >>
+        kind := doc.as_string(doc.get(node, "type")) or >>
         if version < SPRITE_TILEMAP_VERSION && kind == "image_rgba" {
-            >>> errors.new("nexus scene: image_rgba resource requires version 7")
+            >> errors.new("nexus scene: image_rgba resource requires version 7")
         }
-        path := doc.as_string(doc.get(node, "path")) >>>
-        hash := doc.as_string(doc.get(node, "sha256")) >>>
+        if version < MODERN_COMPONENTS_VERSION && kind == "scene_file" {
+            >> errors.new("nexus scene: scene_file resource requires version 9")
+        }
+        path := doc.as_string(doc.get(node, "path")) or >>
+        hash := doc.as_string(doc.get(node, "sha256")) or >>
         references.push(resource.ResourceReference{uid: uid, kind: kind, path: path, content_hash: hash})
     }
-    surface_nodes := rows_min(doc, doc.get(root, "surfaces"), 0, resource.MAX_SURFACES) >>>
+    surface_nodes := rows_min(doc, doc.get(root, "surfaces"), 0, resource.MAX_SURFACES) or >>
     surface_fields := ["node", "resource", "primitive"]
     lod_surface_fields := ["node", "resource", "primitive", "lod"]
     $surfaces := []resource.Surface{}
     for node in surface_nodes {
         has_lod := version >= LOD_VERSION && doc.has(node, "lod")
-        if has_lod { fields(doc, node, &lod_surface_fields) >>> }
-        else { fields(doc, node, &surface_fields) >>> }
-        index := doc.as_int(doc.get(node, "node")) >>>
-        uid := doc.as_string(doc.get(node, "resource")) >>>
-        primitive := doc.as_int(doc.get(node, "primitive")) >>>
+        if has_lod { fields(doc, node, &lod_surface_fields) or >> }
+        else { fields(doc, node, &surface_fields) or >> }
+        index := doc.as_int(doc.get(node, "node")) or >>
+        uid := doc.as_string(doc.get(node, "resource")) or >>
+        primitive := doc.as_int(doc.get(node, "primitive")) or >>
         $surface := resource.surface(index, uid, primitive)
         if has_lod {
             lod_node := doc.get(node, "lod")
-            fields(doc, lod_node, &["hysteresis", "levels"]) >>>
-            surface.hysteresis = doc.as_f64(doc.get(lod_node, "hysteresis")) >>>
-            rows := rows_min(doc, doc.get(lod_node, "levels"), 1, lod.MAX_LEVELS - 1) >>>
+            fields(doc, lod_node, &["hysteresis", "levels"]) or >>
+            surface.hysteresis = doc.as_f64(doc.get(lod_node, "hysteresis")) or >>
+            rows := rows_min(doc, doc.get(lod_node, "levels"), 1, lod.MAX_LEVELS - 1) or >>
             for row in rows {
-                fields(doc, row, &["distance", "resource", "primitive"]) >>>
-                surface.levels.push(resource.SurfaceLevel{distance: doc.as_f64(doc.get(row, "distance")) >>>,
-                    resource_uid: doc.as_string(doc.get(row, "resource")) >>>,
-                    primitive: doc.as_int(doc.get(row, "primitive")) >>>})
+                fields(doc, row, &["distance", "resource", "primitive"]) or >>
+                surface.levels.push(resource.SurfaceLevel{distance: doc.as_f64(doc.get(row, "distance")) or >>,
+                    resource_uid: doc.as_string(doc.get(row, "resource")) or >>,
+                    primitive: doc.as_int(doc.get(row, "primitive")) or >>})
             }
         }
         surfaces.push(surface)
     }
-    buses := decode_buses(doc, root, 0) >>>
-    emitters := decode_emitters(doc, root, 0) >>>
-    << decode_scripts(doc, root, version, document, references, surfaces, buses, emitters) >>>
+    buses := decode_buses(doc, root, 0) or >>
+    emitters := decode_emitters(doc, root, 0) or >>
+    << decode_scripts(doc, root, version, document, references, surfaces, buses, emitters) or >>
 }
 fn encode_surfaces(document &resource.Document) string {
     $out := strings.new_byte_builder(1024)
     out.write_str(",\"resources\":[\n")
     for i in 0:document.resource_count() {
         if i > 0 { out.write_str(",\n") }
-        reference := document.resource(i) >>>
+        reference := document.resource(i) or >>
         uid := reference.uid + ""
         kind := reference.kind + ""
         path := reference.path + ""
@@ -73,16 +76,16 @@ fn encode_surfaces(document &resource.Document) string {
     out.write_str("\n],\"surfaces\":[\n")
     for i in 0:document.surface_count() {
         if i > 0 { out.write_str(",\n") }
-        surface := document.surface(i) >>>
+        surface := document.surface(i) or >>
         uid := surface.resource_uid + ""
         out.write_str("{\"node\":" + str(surface.node) + ",\"resource\":" + json.quote(&uid) + ",\"primitive\":" + str(surface.primitive))
         if surface.levels.len > 0 {
-            hysteresis := strconv.format_float(surface.hysteresis, 103, -1) >>>
+            hysteresis := strconv.format_float(surface.hysteresis, 103, -1) or >>
             out.write_str(",\"lod\":{\"hysteresis\":" + hysteresis + ",\"levels\":[")
             for j in 0:surface.levels.len {
                 if j > 0 { out.write_str(",") }
                 level := &surface.levels[j]
-                distance := strconv.format_float(level.distance, 103, -1) >>>
+                distance := strconv.format_float(level.distance, 103, -1) or >>
                 level_uid := level.resource_uid + ""
                 out.write_str("{\"distance\":" + distance + ",\"resource\":" + json.quote(&level_uid) + ",\"primitive\":" + str(level.primitive) + "}")
             }

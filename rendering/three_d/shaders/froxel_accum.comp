@@ -1,0 +1,44 @@
+#version 450
+
+layout(set = 2, binding = 0, std140) uniform FroxelAccumParams {
+    mat4 inv_vp;
+    vec4 eye_near;
+    vec4 cam_fwd_far;
+    vec4 grid_pad;
+} p;
+
+layout(set = 0, binding = 0, std430) readonly buffer ScatterBuf { vec4 froxel_scatter[]; };
+layout(set = 1, binding = 0, std430) writeonly buffer AccumBuf { vec4 froxel_accum[]; };
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint fx_n = uint(p.grid_pad.x), fy_n = uint(p.grid_pad.y), fz_n = uint(p.grid_pad.z);
+    uint slice_xy = fx_n * fy_n;
+    if (gid >= slice_xy) return;
+
+    uint fy = gid / fx_n, fx = gid - fy * fx_n;
+    vec2 uv = vec2((float(fx) + 0.5) / float(fx_n), (float(fy) + 0.5) / float(fy_n));
+    float ndc_x = uv.x * 2.0 - 1.0, ndc_y = 1.0 - uv.y * 2.0;
+    vec4 far4 = p.inv_vp * vec4(ndc_x, ndc_y, 0.001, 1.0);
+    vec3 far_p = far4.xyz / max(far4.w, 1e-6);
+    vec3 ray_dir = normalize(far_p - p.eye_near.xyz), cam_fwd = normalize(p.cam_fwd_far.xyz);
+    float cos_ang = max(dot(ray_dir, cam_fwd), 0.1);
+
+    float fog_near = p.eye_near.w, fog_far = p.cam_fwd_far.w, ratio = fog_far / max(fog_near, 1e-4);
+    vec3 accum_rgb = vec3(0.0);
+    float trans = 1.0;
+
+    for (uint fz = 0u; fz < fz_n; ++fz) {
+        float z0 = fog_near * pow(ratio, float(fz) / float(fz_n)), z1 = fog_near * pow(ratio, float(fz + 1u) / float(fz_n));
+        float ds = (z1 - z0) / cos_ang;
+        uint idx = fz * slice_xy + gid;
+        vec4 scat_ext = froxel_scatter[idx];
+        float ext = max(scat_ext.w, 1e-6), slice_t = exp(-ext * ds);
+        vec3 slice_s = (scat_ext.rgb - scat_ext.rgb * slice_t) / ext;
+        accum_rgb += trans * slice_s;
+        trans *= slice_t;
+        froxel_accum[idx] = vec4(accum_rgb, trans);
+    }
+}

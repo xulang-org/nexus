@@ -1,0 +1,78 @@
+#version 450
+
+struct FoliageInstanceGpu {
+    vec4 pos_scale;
+    vec4 rot_wind;
+    vec4 tint_var;
+};
+
+struct FoliageIndirectState {
+    uint num_indices;
+    uint num_instances;
+    uint first_index;
+    int vertex_offset;
+    uint first_instance;
+    uint frustum_culled;
+    uint distance_culled;
+    uint pad;
+};
+
+layout(set = 2, binding = 0, std140) uniform FoliageCullParams {
+    mat4 view_proj;
+    vec4 camera_pos_count;
+    vec4 dist_params;
+    vec4 extra;
+} params;
+
+layout(set = 0, binding = 0, std430) readonly buffer InstancesBuf { FoliageInstanceGpu instances[]; };
+layout(set = 1, binding = 0, std430) buffer VisibleIdxBuf { uint visible_indices[]; };
+layout(set = 1, binding = 1, std430) buffer StateBuf { FoliageIndirectState state; };
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint count = uint(params.camera_pos_count.w);
+    if (gid >= count) return;
+
+    FoliageInstanceGpu inst = instances[gid];
+    float s = inst.pos_scale.w;
+    float sy = s * inst.rot_wind.w;
+    float half_y = params.dist_params.w * sy;
+    float radius = max(s, sy) * params.dist_params.z + params.extra.x;
+    vec3 center = inst.pos_scale.xyz + vec3(0.0, half_y, 0.0);
+
+    float dist = length(center - params.camera_pos_count.xyz);
+    if (dist - radius > params.dist_params.x) {
+        atomicAdd(state.distance_culled, 1u);
+        return;
+    }
+
+    vec3 bmin = center - vec3(radius, half_y + params.extra.x, radius);
+    vec3 bmax = center + vec3(radius, half_y + params.extra.x, radius);
+    uint out_left = 1u, out_right = 1u, out_bottom = 1u, out_top = 1u, out_far = 1u, out_near = 1u, all_behind = 1u;
+
+    for (uint corner = 0u; corner < 8u; ++corner) {
+        vec3 p = vec3(
+            (corner & 1u) != 0u ? bmax.x : bmin.x,
+            (corner & 2u) != 0u ? bmax.y : bmin.y,
+            (corner & 4u) != 0u ? bmax.z : bmin.z
+        );
+        vec4 c = params.view_proj * vec4(p, 1.0);
+        if (c.x + c.w >= 0.0) out_left = 0u;
+        if (-c.x + c.w >= 0.0) out_right = 0u;
+        if (c.y + c.w >= 0.0) out_bottom = 0u;
+        if (-c.y + c.w >= 0.0) out_top = 0u;
+        if (c.z >= 0.0) out_far = 0u;
+        if (c.w - c.z >= 0.0) out_near = 0u;
+        if (c.w > 0.0) all_behind = 0u;
+    }
+
+    if ((out_left | out_right | out_bottom | out_top | out_far | out_near | all_behind) != 0u) {
+        atomicAdd(state.frustum_culled, 1u);
+        return;
+    }
+
+    uint slot = atomicAdd(state.num_instances, 1u);
+    visible_indices[slot] = gid;
+}

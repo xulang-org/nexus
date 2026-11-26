@@ -40,16 +40,16 @@ fn build_large_obj(grid_n int) string {
 }
 
 fn run() int {
-    os.mkdir_all("build/streaming-fixtures") >>>
+    os.mkdir_all("build/streaming-fixtures") or >>
     obj_a := build_large_obj(12)
     obj_b := build_large_obj(12)
     obj_c := build_large_obj(12)
-    write_file("build/streaming-fixtures/mesh_a.obj", obj_a) >>>
-    write_file("build/streaming-fixtures/mesh_b.obj", obj_b) >>>
-    write_file("build/streaming-fixtures/mesh_c.obj", obj_c) >>>
+    write_file("build/streaming-fixtures/mesh_a.obj", obj_a) or >>
+    write_file("build/streaming-fixtures/mesh_b.obj", obj_b) or >>
+    write_file("build/streaming-fixtures/mesh_c.obj", obj_c) or >>
 
-    program := shaders.load_mesh("build/mesh-shaders") >>>
-    $device := ren.open_3d("Streaming checks", 64, 64, gpu.METAL, &program) >>>
+    program := shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d("Streaming checks", 64, 64, gpu.METAL, &program) or >>
 
     // Tight per-frame budget (max 1 upload/frame) and tight VRAM cap (fits <= 2 meshes -> forces LRU eviction on 3rd!).
     cfg := stream.StreamConfig{
@@ -58,13 +58,13 @@ fn run() int {
         max_bytes_per_frame: 130000,
         max_resident_bytes: 130000
     }
-    $mgr := stream.new_streaming_manager(&device, cfg) >>>
+    $mgr := stream.new_streaming_manager(&device, cfg) or >>
 
     // Request low-prio B first, high-prio A second, medium C third, plus missing bad path + PNG texture!
-    h_b := mgr.request_mesh("build/streaming-fixtures/mesh_b.obj", stream.STREAM_KIND_MESH, 1.0, false) >>>
-    h_a := mgr.request_mesh("build/streaming-fixtures/mesh_a.obj", stream.STREAM_KIND_MESH, 100.0, false) >>>
-    h_c := mgr.request_mesh("build/streaming-fixtures/mesh_c.obj", stream.STREAM_KIND_MESH, 50.0, false) >>>
-    h_bad := mgr.request_mesh("build/streaming-fixtures/does_not_exist.obj", stream.STREAM_KIND_MESH, 10.0, false) >>>
+    h_b := mgr.request_mesh("build/streaming-fixtures/mesh_b.obj", stream.STREAM_KIND_MESH, 1.0, false) or >>
+    h_a := mgr.request_mesh("build/streaming-fixtures/mesh_a.obj", stream.STREAM_KIND_MESH, 100.0, false) or >>
+    h_c := mgr.request_mesh("build/streaming-fixtures/mesh_c.obj", stream.STREAM_KIND_MESH, 50.0, false) or >>
+    h_bad := mgr.request_mesh("build/streaming-fixtures/does_not_exist.obj", stream.STREAM_KIND_MESH, 10.0, false) or >>
 
     // Give async worker coroutines brief moment so all 4 CPU decodes enter ready queue cleanly,
     // then verify strict priority scheduling (100 -> 50 -> 1) and frame-budget pacing!
@@ -82,7 +82,7 @@ fn run() int {
         mgr.state(h_c) == stream.STREAM_STATE_READY_CPU ||
         mgr.state(h_bad) == stream.STREAM_STATE_PENDING
     ) {
-        stats := mgr.pump(&device, frame) >>>
+        stats := mgr.pump(&device, frame) or >>
         assert(stats.uploaded_this_frame <= 1)
         assert(stats.resident_bytes <= 130000)
         if stats.uploaded_this_frame == 1 {
@@ -92,7 +92,7 @@ fn run() int {
         }
         // Touch h_a on frame when both h_a and h_c are uploaded so h_c becomes LRU victim when h_b streams!
         if mgr.state(h_a) == stream.STREAM_STATE_RESIDENT {
-            mgr.touch(h_a, frame + 10) >>>
+            mgr.touch(h_a, frame + 10) or >>
         }
         time.sleep(1000000)
         frame += 1
@@ -108,14 +108,14 @@ fn run() int {
     assert(mgr.resident_bytes_used() <= 130000)
 
     // Verify resident GPU mesh renders cleanly on Metal!
-    _ := mgr.mesh_ref(h_a) >>>
+    _ := mgr.mesh_ref(h_a) or >>
     // Test PNG async stream + restreaming evicted C cleanly!
     h_tex := mgr.request_texture("build/gltf-animation-fixtures/Textures/map.png", true,
         ren.TextureSampling3D{min_linear: false, mag_linear: false, repeat_u: false, repeat_v: false, mip_filter: 0},
-        200.0, true) >>>
-    mgr.restream(h_c, 150.0, frame) >>>
+        200.0, true) or >>
+    mgr.restream(h_c, 150.0, frame) or >>
     for _ in 0:30 {
-        _ := mgr.pump(&device, frame) >>>
+        _ := mgr.pump(&device, frame) or >>
         if mgr.state(h_tex) == stream.STREAM_STATE_RESIDENT && mgr.state(h_c) == stream.STREAM_STATE_RESIDENT {
             ->
         }
@@ -124,18 +124,18 @@ fn run() int {
     }
     assert(mgr.state(h_tex) == stream.STREAM_STATE_RESIDENT)
     assert(mgr.state(h_c) == stream.STREAM_STATE_RESIDENT)
-    _ := mgr.texture_ref(h_tex) >>>
+    _ := mgr.texture_ref(h_tex) or >>
 
-    mgr.shutdown() >>>
+    mgr.shutdown() or >>
     assert(mgr.resident_bytes_used() == 0)
-    device.close() >>>
+    device.close() or >>
     println("PASS: Async Worker Streaming + Priority + Budgeted Paging + LRU VRAM Eviction (frames=" +
         str(frame) + ", eviction & restream verified)")
     << 0
 }
 
 fn main() int {
-    << run() >>> (err) {
+    << run() or (err) {
         eprintln(err.msg())
         << 1
     }

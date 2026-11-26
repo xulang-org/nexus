@@ -17,9 +17,9 @@ fn read_glb_source(reference &resource.ResourceReference, directory string, cons
     path := filepath.join([directory, reference.path + ""])
     $limit := gltf.MAX_GLB_BYTES
     if MAX_SOURCE_BYTES - consumed < limit { limit = MAX_SOURCE_BYTES - consumed }
-    if limit < 1 { >>> errors.new("nexus scene: GLB source budget exceeds 32 MiB") }
-    raw := snapshot.read(path, limit) >>>
-    if sha256.sum256(raw + "") != reference.content_hash { >>> errors.new("nexus scene: GLB content hash mismatch: " + reference.path) }
+    if limit < 1 { >> errors.new("nexus scene: GLB source budget exceeds 32 MiB") }
+    raw := snapshot.read(path, limit) or >>
+    if sha256.sum256(raw + "") != reference.content_hash { >> errors.new("nexus scene: GLB content hash mismatch: " + reference.path) }
     << raw
 }
 // Owns source models; surface bindings are weak. The source document preserves
@@ -33,137 +33,137 @@ pub struct SceneModels3D {
     base_directory string
 }
 pub fn prepare(device &ren.Device3D, document resource.Document, base_directory string) SceneModels3D {
-    if document.script_count() > 0 || document.audio_count() > 0 || document.light_count() > 0 || document.sprite_3d_count() > 0 || document.tilemap_2d_count() > 0 { >>> errors.new("nexus scene: other attachments require explicit prepare_surfaces and service binding") }
-    << prepare_surfaces(device, document, base_directory) >>>
+    if document.script_count() > 0 || document.audio_count() > 0 || document.light_count() > 0 || document.sprite_3d_count() > 0 || document.tilemap_2d_count() > 0 { >> errors.new("nexus scene: other attachments require explicit prepare_surfaces and service binding") }
+    << prepare_surfaces(device, document, base_directory) or >>
 }
 // Explicit partial restoration for a caller composing audio and GPU services.
 pub fn prepare_surfaces(device &ren.Device3D, document resource.Document, base_directory string) SceneModels3D {
-    device.backend() >>>
-    directory := filepath.abs(&base_directory) >>>
-    packed := node_files.to_packed_nodes(&document) >>>
+    device.backend() or >>
+    directory := filepath.abs(&base_directory) or >>
+    packed := node_files.to_packed_nodes(&document) or >>
     $models := []glb.GlbModel3D{}
     $by_hash := map[string]int{}
     $resource_models := map[string]int{}
     $source_bytes := 0
     for i in 0:document.resource_count() {
-        reference := document.resource(i) >>>
+        reference := document.resource(i) or >>
         if reference.kind != "glb_model" { -> }
-        raw := read_glb_source(&reference, directory + "", source_bytes) >>>
+        raw := read_glb_source(&reference, directory + "", source_bytes) or >>
         source_bytes = source_bytes + raw.len
         hash := reference.content_hash + ""
         if !by_hash.has(hash + "") {
-            asset := gltf.decode_glb_geometry(&raw) >>>
-            model := glb.upload_model(device, &asset) >>>
+            asset := gltf.decode_glb_geometry(&raw) or >>
+            model := glb.upload_model(device, &asset) or >>
             by_hash[hash + ""] = models.len
             models.push(model)
         }
         resource_models[reference.uid + ""] = by_hash[hash]
     }
     for i in 0:document.surface_count() {
-        surface := document.surface(i) >>>
+        surface := document.surface(i) or >>
         slot := resource_models[surface.resource_uid + ""]
         model := &models[slot]
-        if surface.primitive >= model.primitive_count() { >>> errors.new("nexus scene: source primitive outside GLB model") }
+        if surface.primitive >= model.primitive_count() { >> errors.new("nexus scene: source primitive outside GLB model") }
         for level in surface.levels {
             level_slot := resource_models[level.resource_uid + ""]
             level_model := &models[level_slot]
-            if level.primitive >= level_model.primitive_count() { >>> errors.new("nexus scene: LOD primitive outside GLB model") }
+            if level.primitive >= level_model.primitive_count() { >> errors.new("nexus scene: LOD primitive outside GLB model") }
         }
     }
     << SceneModels3D{document: document, packed: packed, models: models, resource_models: resource_models, closed: false, base_directory: directory}
 }
 pub fn load(device &ren.Device3D, path string) SceneModels3D {
-    document := node_files.load(path + "") >>>
+    document := node_files.load(path + "") or >>
     directory := filepath.dir(&path)
-    << prepare(device, document, directory) >>>
+    << prepare(device, document, directory) or >>
 }
 pub fn (set &SceneModels3D) model_count() int { << set.models.len }
 pub fn (set &SceneModels3D) surface_count() int { << set.document.surface_count() }
 pub fn (set $&SceneModels3D) close() int {
     if set.closed { << 0 }
     for i in 0:set.models.len { model := $&set.models[i]
-        model.close() >>> }
+        model.close() or >> }
     set.closed = true
     << 0
 }
 fn (set &SceneModels3D) matching_nodes(tree &nexus.SceneTree, root int) []int {
-    if set.closed { >>> errors.new("nexus scene: closed model set") }
-    << node_files.matching_nodes(&set.document, tree, root) >>>
+    if set.closed { >> errors.new("nexus scene: closed model set") }
+    << node_files.matching_nodes(&set.document, tree, root) or >>
 }
 fn (set &SceneModels3D) lod_meshes(surface &resource.Surface, base &glb.GlbModel3D) []ren.MeshRef3D {
-    first := base.mesh_reference(surface.primitive) >>>
+    first := base.mesh_reference(surface.primitive) or >>
     $meshes := [first]
     for level in surface.levels {
         slot := set.resource_models[level.resource_uid + ""]
         model := &set.models[slot]
-        meshes.push(model.mesh_reference(level.primitive) >>>)
+        meshes.push(model.mesh_reference(level.primitive) or >>)
     }
     << meshes
 }
 
 fn (set &SceneModels3D) preflight(scene &scene_render.Scene3D, tree &nexus.SceneTree, root int) []int {
-    ids := set.matching_nodes(tree, root) >>>
+    ids := set.matching_nodes(tree, root) or >>
     $added := 0
     for i in 0:set.document.surface_count() {
-        surface := set.document.surface(i) >>>
+        surface := set.document.surface(i) or >>
         slot := set.resource_models[surface.resource_uid + ""]
         model := &set.models[slot]
         node := ids[surface.node]
         if surface.levels.len == 0 {
-            added += model.check_surface_binding(scene, tree, node, surface.primitive) >>>
+            added += model.check_surface_binding(scene, tree, node, surface.primitive) or >>
         } else {
-            meshes := set.lod_meshes(&surface, model) >>>
-            policy := surface.distance_policy() >>>
-            material := model.primitive_material(surface.primitive) >>>
-            added += scene.check_lod_surface_binding(tree, node, &meshes, &policy, &material) >>>
+            meshes := set.lod_meshes(&surface, model) or >>
+            policy := surface.distance_policy() or >>
+            material := model.primitive_material(surface.primitive) or >>
+            added += scene.check_lod_surface_binding(tree, node, &meshes, &policy, &material) or >>
         }
     }
-    if added > scene.remaining_bindings() { >>> errors.new("nexus scene: surface binding capacity exceeded") }
+    if added > scene.remaining_bindings() { >> errors.new("nexus scene: surface binding capacity exceeded") }
     << ids
 }
 pub fn (set &SceneModels3D) bind(scene $&scene_render.Scene3D, tree &nexus.SceneTree, root int) int {
-    ids := set.preflight(scene, tree, root) >>>
+    ids := set.preflight(scene, tree, root) or >>
     for i in 0:set.document.surface_count() {
-        surface := set.document.surface(i) >>>
+        surface := set.document.surface(i) or >>
         slot := set.resource_models[surface.resource_uid + ""]
         model := &set.models[slot]
         node := ids[surface.node]
         if surface.levels.len == 0 {
-            model.attach_surface(scene, tree, node, surface.primitive) >>>
+            model.attach_surface(scene, tree, node, surface.primitive) or >>
         } else {
-            meshes := set.lod_meshes(&surface, model) >>>
-            policy := surface.distance_policy() >>>
-            material := model.primitive_material(surface.primitive) >>>
-            scene.attach_lod_surface(tree, node, meshes, &policy, material) >>>
+            meshes := set.lod_meshes(&surface, model) or >>
+            policy := surface.distance_policy() or >>
+            material := model.primitive_material(surface.primitive) or >>
+            scene.attach_lod_surface(tree, node, meshes, &policy, material) or >>
         }
     }
     << set.document.surface_count()
 }
 // Validate every GPU candidate off-tree before PackedScene touches the target.
 pub fn (set &SceneModels3D) instantiate(scene $&scene_render.Scene3D, tree $&nexus.SceneTree, parent int, name string) int {
-    if set.closed || set.document.surface_count() > scene.remaining_bindings() { >>> errors.new("nexus scene: closed model set or insufficient binding capacity") }
-    $temporary := nexus.new_scene_tree("Staging", set.document.node_count() + 1) >>>
+    if set.closed || set.document.surface_count() > scene.remaining_bindings() { >> errors.new("nexus scene: closed model set or insufficient binding capacity") }
+    $temporary := nexus.new_scene_tree("Staging", set.document.node_count() + 1) or >>
     container := temporary.root()
-    candidate := set.packed.instantiate($&temporary, container, "Candidate") >>>
-    set.preflight(scene, &temporary, candidate) >>>
-    root := set.packed.instantiate(tree, parent, name) >>>
-    set.bind(scene, tree, root) >>>
+    candidate := set.packed.instantiate($&temporary, container, "Candidate") or >>
+    set.preflight(scene, &temporary, candidate) or >>
+    root := set.packed.instantiate(tree, parent, name) or >>
+    set.bind(scene, tree, root) or >>
     << root
 }
 // Preserve declared source metadata and capture current node transforms/flags.
 // Changes to renderer-side materials are not inferred back into the document.
 pub fn (set &SceneModels3D) capture(tree &nexus.SceneTree, root int) resource.Document {
-    set.matching_nodes(tree, root) >>>
-    nodes := node_files.capture_nodes(tree, root) >>>
+    set.matching_nodes(tree, root) or >>
+    nodes := node_files.capture_nodes(tree, root) or >>
     $references := []resource.ResourceReference{}
-    for i in 0:set.document.resource_count() { references.push(set.document.resource(i) >>>) }
-    << resource.with_references(&set.document, &nodes, references) >>>
+    for i in 0:set.document.resource_count() { references.push(set.document.resource(i) or >>) }
+    << resource.with_references(&set.document, &nodes, references) or >>
 }
 
 // Rebase declarations when moving a scene file. Paths outside the destination
 // directory are rejected before publication; copying assets is a separate step.
 pub fn (set &SceneModels3D) save(path string, tree &nexus.SceneTree, root int) int {
-    if set.document.script_count() > 0 { >>> errors.new("nexus scene: save script revisions through the script restoration owner") }
-    captured := set.capture(tree, root) >>>
-    << node_files.save_rebased(path, &captured, set.base_directory + "") >>>
+    if set.document.script_count() > 0 { >> errors.new("nexus scene: save script revisions through the script restoration owner") }
+    captured := set.capture(tree, root) or >>
+    << node_files.save_rebased(path, &captured, set.base_directory + "") or >>
 }

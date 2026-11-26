@@ -1,0 +1,103 @@
+@main
+
+timing #"github.com/xulang-org/nexus/timing"
+diag #"github.com/xulang-org/nexus/integration/diagnostics"
+ui_bridge #"github.com/xulang-org/nexus/integration/ui"
+#errors
+#gpu
+#math
+#strings
+#ui/layout
+widgets #ui/widgets
+
+fn assert(ok bool, msg string) int {
+    if !ok { >> errors.new("profiler_telemetry_checks: " + msg) }
+    << 0
+}
+
+fn run() int {
+    $tel := diag.new_engine_telemetry()
+    // Record 100 frames: 90 frames at 10.0ms, 5 at 20.0ms, 5 at 40.0ms (sum = 1200ms -> avg 12.0ms).
+    for i in 0:100 {
+        $ms := 10.0
+        if i >= 90 && i < 95 { ms = 20.0 }
+        else if i >= 95 { ms = 40.0 }
+        tel.record_frame_ms(ms)
+        tel.record_scope_ms("physics", 1.5)
+        tel.record_scope_ms("render3d", 6.5)
+    }
+    tel.set_counter("visible_draws", 42)
+    tel.add_counter("visible_draws", 8)
+
+    sum := tel.profiler.summary()
+    assert(sum.frame_count == 100, "frame_count") or >>
+    assert(math.abs(sum.avg_ms - 12.0) < 0.01, "avg_ms") or >>
+    assert(math.abs(sum.min_ms - 10.0) < 0.01, "min_ms") or >>
+    assert(math.abs(sum.max_ms - 40.0) < 0.01, "max_ms") or >>
+    assert(math.abs(sum.p50_ms - 10.0) < 0.01, "p50_ms") or >>
+    assert(math.abs(sum.p95_ms - 20.0) < 0.01, "p95_ms") or >>
+    assert(math.abs(sum.p99_ms - 40.0) < 0.01, "p99_ms") or >>
+    assert(math.abs(sum.fps - (1000.0 / 12.0)) < 0.1, "fps") or >>
+    assert(tel.profiler.counter("visible_draws") == 50, "counter accumulation") or >>
+    assert(tel.profiler.scope_stats("render3d").samples == 100, "scope sample count") or >>
+
+    // Test ring buffer wraparound past 120 frames: 120 more frames of 5.0ms overwrite old window.
+    for _j in 0:timing.PROFILER_WINDOW {
+        tel.record_frame_ms(5.0)
+    }
+    sum2 := tel.profiler.summary()
+    assert(sum2.frame_count == 220, "total frame count after wrap") or >>
+    assert(math.abs(sum2.avg_ms - 5.0) < 0.01 && math.abs(sum2.p99_ms - 5.0) < 0.01, "ring buffer overwrites old samples") or >>
+
+    // GPU telemetry snapshot & asset residency.
+    gstats := gpu.Stats{
+        buffer_count: 14,
+        buffer_bytes: 2097152,
+        submission_count: 3,
+        staging_bytes: 65536,
+        texture_count: 8,
+        texture_bytes: 4194304,
+        sampler_count: 4,
+        shader_count: 12,
+        pipeline_count: 5,
+        encoder_count: 1,
+        render_pass_count: 4,
+        compute_pipeline_count: 2,
+        compute_pass_count: 2,
+        surface_count: 1,
+        frame_count: 220
+    }
+    snap := diag.snapshot_gpu_stats(&gstats)
+    tel.update_gpu(snap)
+    tel.set_assets(diag.AssetResidencyCounters{
+        meshes: 12,
+        textures: 8,
+        shaders: 45,
+        audio_clips: 4,
+        bundle_assets: 6,
+        gpu_memory_bytes: tel.assets.gpu_memory_bytes
+    })
+    tel.set_scene_counts(50, 18, 4)
+
+    js := tel.to_json()
+    assert(strings.contains(js, "\"p95_ms\":5.00"), "telemetry json p95") or >>
+    assert(strings.contains(js, "\"buffer_bytes\":2097152"), "telemetry json gpu buffer_bytes") or >>
+    assert(strings.contains(js, "\"shaders\":45"), "telemetry json asset shader count") or >>
+
+    styles := widgets.dark_styles()
+    $frame := ui_bridge.new_ui_frame(&styles) or >>
+    frame.begin() or >>
+    tel.render_telemetry_hud($&frame, &layout.Rect{x: 10.0, y: 10.0, width: 320.0, height: 140.0}) or >>
+    assert(frame.chunk_count() > 0, "telemetry HUD draws chunks") or >>
+
+    println("PASS: profiler_telemetry_checks")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

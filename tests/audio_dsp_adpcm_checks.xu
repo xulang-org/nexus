@@ -40,7 +40,7 @@ fn make_sine_mono(rate int, frames int, freq_hz f64, amp f64) pcm.Clip {
         v := int(math.round_to_even(math.sin(tau * freq_hz * t) * amp))
         samples.push(v)
     }
-    << pcm.pcm16(rate, 1, samples) >>>
+    << pcm.pcm16(rate, 1, samples) or >>
 }
 
 fn make_sine_stereo(rate int, frames int, f_left f64, f_right f64, amp f64) pcm.Clip {
@@ -53,7 +53,7 @@ fn make_sine_stereo(rate int, frames int, f_left f64, f_right f64, amp f64) pcm.
         samples.push(l)
         samples.push(r)
     }
-    << pcm.pcm16(rate, 2, samples) >>>
+    << pcm.pcm16(rate, 2, samples) or >>
 }
 
 fn channel_rms(samples &[]int, ch int) f64 {
@@ -166,18 +166,18 @@ fn build_two_clip_glb() string {
 }
 
 fn check_adpcm_corrupt(raw &string) bool {
-    _ := wav.decode(raw) >>> (err) { << true }
+    _ := wav.decode(raw) or (err) { << true }
     << false
 }
 
 fn run() int {
     // 1. IMA ADPCM (0x0011) 4:1 compression + mono/stereo SNR & malformed rejection.
-    stereo_src := make_sine_stereo(44100, 8080, 440.0, 660.0, 18000.0) >>>
-    adpcm_stereo_bytes := wav.encode_ima_adpcm_wav(&stereo_src) >>>
+    stereo_src := make_sine_stereo(44100, 8080, 440.0, 660.0, 18000.0) or >>
+    adpcm_stereo_bytes := wav.encode_ima_adpcm_wav(&stereo_src) or >>
     raw_pcm_bytes := stereo_src.sample_count() * 2
     ratio := f64(raw_pcm_bytes) / f64(adpcm_stereo_bytes.len)
     assert(ratio > 3.85)
-    dec_stereo := wav.decode(&adpcm_stereo_bytes) >>>
+    dec_stereo := wav.decode(&adpcm_stereo_bytes) or >>
     assert(dec_stereo.sample_rate() == 44100 && dec_stereo.channel_count() == 2)
     assert(dec_stereo.frame_count() == stereo_src.frame_count())
 
@@ -185,8 +185,8 @@ fn run() int {
     $err_pow := 0.0
     for f in 0:stereo_src.frame_count() {
         for c in 0:2 {
-            s0 := f64(stereo_src.sample(f, c) >>>)
-            s1 := f64(dec_stereo.sample(f, c) >>>)
+            s0 := f64(stereo_src.sample(f, c) or >>)
+            s1 := f64(dec_stereo.sample(f, c) or >>)
             d := s0 - s1
             sig_pow += s0 * s0
             err_pow += d * d
@@ -195,9 +195,9 @@ fn run() int {
     snr_db := 10.0 * math.log10(sig_pow / math.max(err_pow, 1.0))
     assert(snr_db > 32.0)
 
-    mono_src := make_sine_mono(24000, 4040, 520.0, 16000.0) >>>
-    adpcm_mono_bytes := wav.encode_ima_adpcm_wav(&mono_src) >>>
-    dec_mono := wav.decode(&adpcm_mono_bytes) >>>
+    mono_src := make_sine_mono(24000, 4040, 520.0, 16000.0) or >>
+    adpcm_mono_bytes := wav.encode_ima_adpcm_wav(&mono_src) or >>
+    dec_mono := wav.decode(&adpcm_mono_bytes) or >>
     assert(dec_mono.sample_rate() == 24000 && dec_mono.channel_count() == 1)
     assert(dec_mono.frame_count() == mono_src.frame_count())
     assert(f64(mono_src.sample_count() * 2) / f64(adpcm_mono_bytes.len) > 3.7)
@@ -210,57 +210,57 @@ fn run() int {
     assert(check_adpcm_corrupt(&bad_str))
 
     // 2. Per-Bus Audio DSP: Biquad Lowpass / Highpass / Bandpass + Delay + Stereo Reverb + Preview Snapshot Purity.
-    bass := make_sine_mono(24000, 2400, 200.0, 14000.0) >>>
-    treble := make_sine_mono(24000, 2400, 6500.0, 14000.0) >>>
-    burst := make_sine_mono(24000, 240, 1200.0, 16000.0) >>>
+    bass := make_sine_mono(24000, 2400, 200.0, 14000.0) or >>
+    treble := make_sine_mono(24000, 2400, 6500.0, 14000.0) or >>
+    burst := make_sine_mono(24000, 240, 1200.0, 16000.0) or >>
 
-    $mx := mix.new_mixer(24000, 16) >>>
-    c_bass := mx.add_clip(bass) >>>
-    c_treble := mx.add_clip(treble) >>>
-    c_burst := mx.add_clip(burst) >>>
+    $mx := mix.new_mixer(24000, 16) or >>
+    c_bass := mx.add_clip(bass) or >>
+    c_treble := mx.add_clip(treble) or >>
+    c_burst := mx.add_clip(burst) or >>
 
-    b_lp := mx.add_bus(0, "LP", 1.0) >>>
-    mx.enable_bus_lowpass(b_lp, 700.0, 0.707) >>>
-    b_hp := mx.add_bus(0, "HP", 1.0) >>>
-    mx.enable_bus_highpass(b_hp, 3000.0, 0.707) >>>
-    b_fx := mx.add_bus(0, "FX", 1.0) >>>
-    mx.enable_bus_delay(b_fx, 0.03, 0.55, 0.65) >>>
-    mx.enable_bus_reverb(b_fx, 0.85, 0.25, 0.60) >>>
+    b_lp := mx.add_bus(0, "LP", 1.0) or >>
+    mx.enable_bus_lowpass(b_lp, 700.0, 0.707) or >>
+    b_hp := mx.add_bus(0, "HP", 1.0) or >>
+    mx.enable_bus_highpass(b_hp, 3000.0, 0.707) or >>
+    b_fx := mx.add_bus(0, "FX", 1.0) or >>
+    mx.enable_bus_delay(b_fx, 0.03, 0.55, 0.65) or >>
+    mx.enable_bus_reverb(b_fx, 0.85, 0.25, 0.60) or >>
 
     // Lowpass must pass 200Hz cleanly and crush 6500Hz.
-    vlp_b := mx.play(c_bass, b_lp, 1.0, 0.0, false) >>>
-    s_lp_bass := mx.render(2400) >>>
-    mx.stop(vlp_b) >>>
-    mx.clear_bus_dsp(b_lp) >>>
-    mx.enable_bus_lowpass(b_lp, 700.0, 0.707) >>>
-    vlp_t := mx.play(c_treble, b_lp, 1.0, 0.0, false) >>>
-    s_lp_treb := mx.render(2400) >>>
-    mx.stop(vlp_t) >>>
+    vlp_b := mx.play(c_bass, b_lp, 1.0, 0.0, false) or >>
+    s_lp_bass := mx.render(2400) or >>
+    mx.stop(vlp_b) or >>
+    mx.clear_bus_dsp(b_lp) or >>
+    mx.enable_bus_lowpass(b_lp, 700.0, 0.707) or >>
+    vlp_t := mx.play(c_treble, b_lp, 1.0, 0.0, false) or >>
+    s_lp_treb := mx.render(2400) or >>
+    mx.stop(vlp_t) or >>
     rms_lp_bass := channel_rms(&s_lp_bass, 0)
     rms_lp_treb := channel_rms(&s_lp_treb, 0)
     assert(rms_lp_bass > 7000.0 && rms_lp_treb < rms_lp_bass / 12.0)
 
     // Highpass must pass 6500Hz cleanly and crush 200Hz.
-    vhp_t := mx.play(c_treble, b_hp, 1.0, 0.0, false) >>>
-    s_hp_treb := mx.render(2400) >>>
-    mx.stop(vhp_t) >>>
-    mx.clear_bus_dsp(b_hp) >>>
-    mx.enable_bus_highpass(b_hp, 3000.0, 0.707) >>>
-    vhp_b := mx.play(c_bass, b_hp, 1.0, 0.0, false) >>>
-    s_hp_bass := mx.render(2400) >>>
-    mx.stop(vhp_b) >>>
+    vhp_t := mx.play(c_treble, b_hp, 1.0, 0.0, false) or >>
+    s_hp_treb := mx.render(2400) or >>
+    mx.stop(vhp_t) or >>
+    mx.clear_bus_dsp(b_hp) or >>
+    mx.enable_bus_highpass(b_hp, 3000.0, 0.707) or >>
+    vhp_b := mx.play(c_bass, b_hp, 1.0, 0.0, false) or >>
+    s_hp_bass := mx.render(2400) or >>
+    mx.stop(vhp_b) or >>
     rms_hp_treb := channel_rms(&s_hp_treb, 0)
     rms_hp_bass := channel_rms(&s_hp_bass, 0)
     assert(rms_hp_treb > 7000.0 && rms_hp_bass < rms_hp_treb / 10.0)
 
     // Delay + Reverb preview immutability and ringing stereo tail after dry voice ends.
-    v_fx := mx.play(c_burst, b_fx, 1.0, 0.0, false) >>>
-    p_a := mx.prepare(480) >>>
-    p_b := mx.prepare(480) >>>
+    v_fx := mx.play(c_burst, b_fx, 1.0, 0.0, false) or >>
+    p_a := mx.prepare(480) or >>
+    p_b := mx.prepare(480) or >>
     for k in 0:p_a.samples.len { assert(p_a.samples[k] == p_b.samples[k]) }
-    mx.commit(&p_a) >>>
+    mx.commit(&p_a) or >>
     assert(!mx.is_playing(v_fx)) // 240-frame burst finished within 480-frame commit
-    tail := mx.render(2400) >>> // Zero playing voices -> pure delay/reverb tail!
+    tail := mx.render(2400) or >> // Zero playing voices -> pure delay/reverb tail!
     tail_rms_l := channel_rms(&tail, 0)
     tail_rms_r := channel_rms(&tail, 1)
     assert(tail_rms_l > 450.0 && tail_rms_r > 450.0)
@@ -272,9 +272,9 @@ fn run() int {
 
     // 3. glTF TRS Pose Cross-Fade Blending (formats/gltf.sample_blended_pose).
     glb_str := build_two_clip_glb()
-    asset := gltf.decode_glb_geometry(&glb_str) >>>
+    asset := gltf.decode_glb_geometry(&glb_str) or >>
     assert(asset.animation_count() == 2)
-    blended := asset.sample_blended_pose(0, 1.0, 1, 1.0, 0.5) >>>
+    blended := asset.sample_blended_pose(0, 1.0, 1, 1.0, 0.5) or >>
     assert(blended.len >= 3)
     m_joint := blended[1]
     // Translation blends linearly: 0.5 * (4,0,0) + 0.5 * (0,2,0) = (2, 1, 0).
@@ -295,7 +295,7 @@ fn run() int {
 }
 
 fn main() int {
-    << run() >>> (err) {
+    << run() or (err) {
         eprintln(err.msg())
         << 1
     }

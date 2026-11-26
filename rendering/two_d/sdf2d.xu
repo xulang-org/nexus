@@ -23,10 +23,10 @@ pub fn empty_sdf_program() SdfProgram2D {
 
 fn validate_sdf_program(program &SdfProgram2D, formats int) int {
     if program.entrypoint.len == 0 || program.vertex.len == 0 || program.fragment.len == 0 {
-        >>> errors.new("nexus canvas: empty SDF shader program")
+        >> errors.new("nexus canvas: empty SDF shader program")
     }
     if (program.format & formats) == 0 {
-        >>> errors.new("nexus canvas: SDF shader format unsupported by GPU device")
+        >> errors.new("nexus canvas: SDF shader format unsupported by GPU device")
     }
     << 0
 }
@@ -47,25 +47,25 @@ fn build_shader_pipeline(device &gpu.Device, format int, entrypoint string,
     vert_bytes &[]u8, frag_bytes &[]u8, frag_samplers int,
     vert_uniforms []int, desc &gpu.PipelineDesc) gpu.GraphicsPipeline {
     $vs := device.shader(&gpu.ShaderDesc{stage: gpu.VERTEX, format: format, entrypoint: entrypoint + "",
-        samplers: 0, uniform_sizes: vert_uniforms}, vert_bytes) >>>
+        samplers: 0, uniform_sizes: vert_uniforms}, vert_bytes) or >>
     $fs := device.shader(&gpu.ShaderDesc{stage: gpu.FRAGMENT, format: format, entrypoint: entrypoint + "",
-        samplers: frag_samplers, uniform_sizes: []int{}}, frag_bytes) >>>
-    pipe := device.graphics_pipeline(&vs, &fs, desc) >>>
-    vs.close() >>>
-    fs.close() >>>
+        samplers: frag_samplers, uniform_sizes: []int{}}, frag_bytes) or >>
+    pipe := device.graphics_pipeline(&vs, &fs, desc) or >>
+    vs.close() or >>
+    fs.close() or >>
     << pipe
 }
 
 fn build_canvas_pipeline(device &gpu.Device, color_format int, program &ShaderProgram2D) gpu.GraphicsPipeline {
     desc := pipeline_description(color_format, gpu.BLEND_ALPHA)
     << build_shader_pipeline(device, program.format, program.entrypoint,
-        &program.vertex, &program.fragment, 1, [16], &desc) >>>
+        &program.vertex, &program.fragment, 1, [16], &desc) or >>
 }
 
 fn build_sdf_pipeline(device &gpu.Device, color_format int, program &SdfProgram2D) gpu.GraphicsPipeline {
     desc := sdf_pipeline_description(color_format)
     << build_shader_pipeline(device, program.format, program.entrypoint,
-        &program.vertex, &program.fragment, 0, [16], &desc) >>>
+        &program.vertex, &program.fragment, 0, [16], &desc) or >>
 }
 
 fn push_f32_le(out $&[]u8, value f64) {
@@ -101,7 +101,7 @@ fn sdf_vertex_bytes(batch &canvas.SdfBatch) []u8 {
     $out := []u8{}
     count := batch.rect_count()
     for i in 0:count {
-        rect := batch.rect_at(i) >>> (err) { << out }
+        rect := batch.rect_at(i) or (err) { << out }
         w := rect.bounds.size.x
         h := rect.bounds.size.y
         if w <= 0.0 || h <= 0.0 { -> }
@@ -158,7 +158,7 @@ fn new_vertex_pool() GpuVertexPool {
 }
 
 fn close_buf(b $&gpu.Buffer) int {
-    b.close() >>>
+    b.close() or >>
     << 0
 }
 
@@ -207,7 +207,7 @@ fn pool_plan(pool &GpuVertexPool, min_bytes int, whole_frame bool) []int {
 
 fn slot_close_bufs(slot $&VertexPoolSlot) int {
     for j in 0:slot.buffer.len {
-        close_buf($&slot.buffer[j]) >>>
+        close_buf($&slot.buffer[j]) or >>
     }
     slot.buffer = []gpu.Buffer{}
     slot.capacity = 0
@@ -215,7 +215,7 @@ fn slot_close_bufs(slot $&VertexPoolSlot) int {
 }
 
 fn pool_install_buffer(pool $&GpuVertexPool, slot_idx int, next_cap int, new_buf gpu.Buffer) int {
-    slot_close_bufs($&pool.slots[slot_idx]) >>>
+    slot_close_bufs($&pool.slots[slot_idx]) or >>
     pool.slots[slot_idx].buffer = [new_buf]
     pool.slots[slot_idx].capacity = next_cap
     pool.offset = 0
@@ -225,8 +225,8 @@ fn pool_install_buffer(pool $&GpuVertexPool, slot_idx int, next_cap int, new_buf
 fn pool_ensure_slot_capacity(pool $&GpuVertexPool, device &gpu.Device, min_bytes int) int {
     plan := pool_plan(pool, min_bytes, true)
     if plan[2] == 0 { << 0 }
-    new_buf := device.buffer(plan[3], gpu.BUFFER_VERTEX) >>>
-    << pool_install_buffer(pool, plan[0], plan[3], new_buf) >>>
+    new_buf := device.buffer(plan[3], gpu.BUFFER_VERTEX) or >>
+    << pool_install_buffer(pool, plan[0], plan[3], new_buf) or >>
 }
 
 fn pool_upload(pool $&GpuVertexPool, device &gpu.Device, bytes &[]u8, vertex_count int) PooledSlice {
@@ -234,18 +234,18 @@ fn pool_upload(pool $&GpuVertexPool, device &gpu.Device, bytes &[]u8, vertex_cou
     slot_idx := plan[0]
     start := plan[1]
     if plan[2] != 0 {
-        new_buf := device.buffer(plan[3], gpu.BUFFER_VERTEX) >>>
-        pool_install_buffer(pool, slot_idx, plan[3], new_buf) >>>
+        new_buf := device.buffer(plan[3], gpu.BUFFER_VERTEX) or >>
+        pool_install_buffer(pool, slot_idx, plan[3], new_buf) or >>
     }
-    $fence := device.upload(&pool.slots[slot_idx].buffer[0], start, bytes) >>>
-    fence.close() >>>
+    $fence := device.upload(&pool.slots[slot_idx].buffer[0], start, bytes) or >>
+    fence.close() or >>
     pool.offset = align_transfer_offset(start + bytes.len)
     << PooledSlice{slot: slot_idx, offset: start, vertex_count: vertex_count}
 }
 
 fn pool_close(pool $&GpuVertexPool) int {
     for i in 0:pool.slots.len {
-        slot_close_bufs($&pool.slots[i]) >>>
+        slot_close_bufs($&pool.slots[i]) or >>
     }
     pool.offset = 0
     << 0
@@ -257,16 +257,16 @@ fn record_draw_pass(pass &gpu.RenderPass, pipeline &gpu.GraphicsPipeline,
     has_sampler bool, sampler &gpu.Sampler, texture &gpu.Texture,
     vertex_count int) int {
     if vertex_count <= 0 { << 0 }
-    uniform := viewport_uniform(width, height) >>>
-    pass.pipeline(pipeline) >>>
-    pass.viewport(0, 0, width, height) >>>
-    pass.scissor(clip_x, clip_y, clip_width, clip_height) >>>
-    pass.vertex_buffer(0, buf, offset) >>>
+    uniform := viewport_uniform(width, height) or >>
+    pass.pipeline(pipeline) or >>
+    pass.viewport(0, 0, width, height) or >>
+    pass.scissor(clip_x, clip_y, clip_width, clip_height) or >>
+    pass.vertex_buffer(0, buf, offset) or >>
     if has_sampler {
-        pass.sampler(gpu.FRAGMENT, 0, texture, sampler) >>>
+        pass.sampler(gpu.FRAGMENT, 0, texture, sampler) or >>
     }
-    pass.uniform(gpu.VERTEX, 0, &uniform) >>>
-    pass.draw(vertex_count, 0, 1, 0) >>>
+    pass.uniform(gpu.VERTEX, 0, &uniform) or >>
+    pass.draw(vertex_count, 0, 1, 0) or >>
     << 0
 }
 
@@ -275,17 +275,17 @@ fn draw_target_slice(device &gpu.Device, pool &GpuVertexPool, slice PooledSlice,
     has_sampler bool, sampler &gpu.Sampler, texture &gpu.Texture,
     width int, height int, clip_x int, clip_y int, clip_width int, clip_height int) int {
     if slice.vertex_count <= 0 { << 0 }
-    attachment := gpu.ColorAttachment{view: target.view(0) >>>,
+    attachment := gpu.ColorAttachment{view: target.view(0) or >>,
         load: gpu.LOAD, store: gpu.STORE,
         clear: gpu.Color{r: 0.0, g: 0.0, b: 0.0, a: 0.0}}
-    $encoder := device.command_encoder() >>>
-    $pass := encoder.begin_render(attachment, gpu.no_depth()) >>>
+    $encoder := device.command_encoder() or >>
+    $pass := encoder.begin_render(attachment, gpu.no_depth()) or >>
     slot_idx := slice.slot
     record_draw_pass(&pass, pipeline, &pool.slots[slot_idx].buffer[0], slice.offset,
         width, height, clip_x, clip_y, clip_width, clip_height,
-        has_sampler, sampler, texture, slice.vertex_count) >>>
-    pass.end() >>>
-    $fence := encoder.submit() >>>
-    fence.close() >>>
+        has_sampler, sampler, texture, slice.vertex_count) or >>
+    pass.end() or >>
+    $fence := encoder.submit() or >>
+    fence.close() or >>
     << 0
 }

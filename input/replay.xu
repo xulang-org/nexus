@@ -1,0 +1,137 @@
+@"github.com/xulang-org/nexus/input"
+
+#encoding/json
+#errors
+#strconv
+#strings
+
+pub const TAPE_FORMAT = "nexus.input.tape"
+pub const TAPE_VERSION = 1
+
+pub const TAPE_KEY = 0
+pub const TAPE_SOURCE = 1
+
+pub struct InputTapeEvent {
+    pub frame int
+    pub kind int
+    pub code int
+    pub pressed bool
+    pub value f64
+}
+
+pub struct InputRecorder {
+    events []InputTapeEvent
+}
+
+pub struct InputReplayer {
+    events []InputTapeEvent
+    cursor int
+}
+
+pub fn new_recorder() InputRecorder {
+    << InputRecorder{events: []InputTapeEvent{}}
+}
+
+pub fn (r $&InputRecorder) record_key(frame int, key int, pressed bool) int {
+    if frame < 0 || key < 0 || key >= MAX_KEYS {
+        >> errors.new("nexus input tape: invalid frame or key code")
+    }
+    $val := 0.0
+    if pressed { val = 1.0 }
+    r.events.push(InputTapeEvent{frame: frame, kind: TAPE_KEY, code: key, pressed: pressed, value: val})
+    << 0
+}
+
+pub fn (r $&InputRecorder) record_source(frame int, source int, value f64) int {
+    if frame < 0 || source < 0 || source >= MAX_SOURCES || value < 0.0 || value > 1.0 {
+        >> errors.new("nexus input tape: invalid frame or source value")
+    }
+    r.events.push(InputTapeEvent{frame: frame, kind: TAPE_SOURCE, code: source, pressed: value > 0.0, value: value})
+    << 0
+}
+
+pub fn (r &InputRecorder) event_count() int {
+    << r.events.len
+}
+
+pub fn (r &InputRecorder) encode_json() string {
+    $b := strings.new_byte_builder(512)
+    fmt_s := TAPE_FORMAT + ""
+    b.write_str("{\"format\":" + json.quote(&fmt_s) +
+        ",\"version\":" + str(TAPE_VERSION) +
+        ",\"events\":[")
+    for i in 0:r.events.len {
+        if i > 0 { b.write_str(",") }
+        ev := &r.events[i]
+        v_str := strconv.format_float(ev.value, 103, -1) or >>
+        b.write_str("{\"frame\":" + str(ev.frame) +
+            ",\"kind\":" + str(ev.kind) +
+            ",\"code\":" + str(ev.code) +
+            ",\"pressed\":" + str(ev.pressed) +
+            ",\"value\":" + v_str + "}")
+    }
+    b.write_str("]}")
+    << b.to_string()
+}
+
+pub fn decode_tape_json(raw &string) InputReplayer {
+    doc := json.parse_max(raw, 4194304)
+    if !doc.ok() { >> errors.new("nexus input tape JSON: " + doc.error()) }
+    root := doc.root()
+    if !doc.is_dict(root) || !doc.has(root, "format") || !doc.has(root, "version") || !doc.has(root, "events") {
+        >> errors.new("nexus input tape: missing manifest fields")
+    }
+    if (doc.as_string(doc.get(root, "format")) or >>) != TAPE_FORMAT ||
+       (doc.as_int(doc.get(root, "version")) or >>) != TAPE_VERSION {
+        >> errors.new("nexus input tape: unsupported format/version")
+    }
+    elist := doc.get(root, "events")
+    if elist < 0 || !doc.is_list(elist) {
+        >> errors.new("nexus input tape: events must be array")
+    }
+    $evs := []InputTapeEvent{}
+    for i in 0:doc.count(elist) {
+        node := doc.at(elist, i)
+        if !doc.is_dict(node) || !doc.has(node, "frame") || !doc.has(node, "kind") ||
+           !doc.has(node, "code") || !doc.has(node, "pressed") || !doc.has(node, "value") {
+            >> errors.new("nexus input tape: invalid event object")
+        }
+        evs.push(InputTapeEvent{
+            frame: doc.as_int(doc.get(node, "frame")) or >>,
+            kind: doc.as_int(doc.get(node, "kind")) or >>,
+            code: doc.as_int(doc.get(node, "code")) or >>,
+            pressed: doc.as_bool(doc.get(node, "pressed")) or >>,
+            value: doc.as_f64(doc.get(node, "value")) or >>
+        })
+    }
+    << InputReplayer{events: evs, cursor: 0}
+}
+
+pub fn (p $&InputReplayer) reset() {
+    p.cursor = 0
+}
+
+pub fn (p &InputReplayer) is_finished() bool {
+    << p.cursor >= p.events.len
+}
+
+pub fn (p $&InputReplayer) apply_frame(frame int, input $&InputMap) int {
+    $applied := 0
+    while p.cursor < p.events.len {
+        cur := p.cursor
+        ev := &p.events[cur]
+        if ev.frame > frame { <- }
+        if ev.frame == frame {
+            if ev.kind == TAPE_KEY {
+                input.feed_key(ev.code, ev.pressed) or >>
+            } else if ev.kind == TAPE_SOURCE {
+                input.feed_source(ev.code, ev.value) or >>
+            } else {
+                >> errors.new("nexus input tape: unknown event kind")
+            }
+            applied = applied + 1
+        }
+        p.cursor = p.cursor + 1
+    }
+    << applied
+}

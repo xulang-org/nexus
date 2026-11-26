@@ -9,161 +9,161 @@ files #"github.com/xulang-org/nexus/internal/file_snapshot"
 #strings
 
 fn load(name string) bc.Module {
-    raw := files.read("build/script-fixtures/" + name + ".xubc", bc.MAX_BYTES) >>>
-    << bc.decode(&raw) >>>
+    raw := files.read("build/script-fixtures/" + name + ".xubc", bc.MAX_BYTES) or >>
+    << bc.decode(&raw) or >>
 }
 fn near(a f64, b f64) bool { << math.abs(a - b) < 0.000001 }
 fn execution_rejected(machine $&vm.Instance, expected string) bool {
-    machine.execute(0.1, 1.0, 4096, 1024.0) >>> (err) {
+    machine.execute(0.1, 1.0, 4096, 1024.0) or (err) {
         message := err.msg()
         << strings.contains(&message, expected)
     }
     << false
 }
 fn reload_rejected(machine $&vm.Instance) bool {
-    candidate := load("signal-basic") >>>
-    machine.reload(candidate) >>> (err) {
+    candidate := load("signal-basic") or >>
+    machine.reload(candidate) or (err) {
         message := err.msg()
         << strings.contains(&message, "retired signal ID")
     }
     << false
 }
 fn connection_rejected(script $&host.NodeScript, tree &nexus.SceneTree, name string, target int, handler string) bool {
-    script.connect(tree, name, target, handler) >>> (err) { << true }
+    script.connect(tree, name, target, handler) or (err) { << true }
     << false
 }
 fn old_format_rejected() bool {
-    first := old_format_file_rejected("invalid-old-format") >>>
-    second := old_format_file_rejected("invalid-format-two") >>>
-    third := old_format_file_rejected("invalid-format-three") >>>
+    first := old_format_file_rejected("invalid-old-format") or >>
+    second := old_format_file_rejected("invalid-format-two") or >>
+    third := old_format_file_rejected("invalid-format-three") or >>
     << first && second && third
 }
 fn old_format_file_rejected(name string) bool {
-    raw := files.read("build/script-fixtures/" + name + ".xubc", bc.MAX_BYTES) >>>
-    bc.decode(&raw) >>> (err) {
+    raw := files.read("build/script-fixtures/" + name + ".xubc", bc.MAX_BYTES) or >>
+    bc.decode(&raw) or (err) {
         message := err.msg()
         << strings.contains(&message, "magic")
     }
     << false
 }
 fn zero_host_rejected() bool {
-    tree := nexus.new_scene_tree("Zero", 2) >>>
+    tree := nexus.new_scene_tree("Zero", 2) or >>
     $script := host.NodeScript{}
-    script.collect_signals(&tree) >>> (err) { << true }
+    script.collect_signals(&tree) or (err) { << true }
     << false
 }
 fn vm_checks() int {
     assert(old_format_rejected() && zero_host_rejected())
-    program := load("signal-basic") >>>
-    raw := program.encode() >>>
-    decoded := bc.decode(&raw) >>>
+    program := load("signal-basic") or >>
+    raw := program.encode() or >>
+    decoded := bc.decode(&raw) or >>
     assert(decoded.fingerprint() == program.fingerprint() && decoded.signal_count() == 2)
-    assert((decoded.signal_id("moved") >>>) == 11 && decoded.signal_index(12) == 1)
-    $machine := vm.instantiate(decoded) >>>
-    machine.execute(0.1, 1.0, 4096, 1024.0) >>>
+    assert((decoded.signal_id("moved") or >>) == 11 && decoded.signal_index(12) == 1)
+    $machine := vm.instantiate(decoded) or >>
+    machine.execute(0.1, 1.0, 4096, 1024.0) or >>
     assert(machine.pending_signals() == 2 && machine.calls() == 1)
-    first := machine.drain_signals() >>>
+    first := machine.drain_signals() or >>
     assert(first.len == 2 && first[0].id == 11 && near(first[0].value, 18.0))
     assert(first[1].id == 12 && near(first[1].value, 1.0) && first[1].epoch == 1 && first[1].call == 1)
-    assert((machine.drain_signals() >>>).len == 0)
-    machine.execute(0.1, -1.0, 4096, 1024.0) >>>
-    machine.reload(load("signal-rename") >>>) >>>
-    assert(machine.has_signal(11) && machine.pending_signals() == 2 && near(machine.state(1) >>>, 2.0))
-    machine.execute(0.1, 1.0, 4096, 1024.0) >>>
-    mixed := machine.drain_signals() >>>
+    assert((machine.drain_signals() or >>).len == 0)
+    machine.execute(0.1, -1.0, 4096, 1024.0) or >>
+    machine.reload(load("signal-rename") or >>) or >>
+    assert(machine.has_signal(11) && machine.pending_signals() == 2 && near(machine.state(1) or >>, 2.0))
+    machine.execute(0.1, 1.0, 4096, 1024.0) or >>
+    mixed := machine.drain_signals() or >>
     assert(mixed.len == 3 && mixed[0].id == 11 && mixed[0].epoch == 1 && mixed[0].call == 2)
     assert(mixed[2].id == 11 && near(mixed[2].value, 36.0) && mixed[2].epoch == 2 && mixed[2].call == 3)
-    machine.reload(load("signal-delete") >>>) >>>
+    machine.reload(load("signal-delete") or >>) or >>
     assert(!machine.has_signal(11) && machine.has_signal(12))
-    assert((reload_rejected($&machine) >>>) && machine.epoch() == 3 && near(machine.state(1) >>>, 3.0))
+    assert((reload_rejected($&machine) or >>) && machine.epoch() == 3 && near(machine.state(1) or >>, 3.0))
     names := ["signal-fail", "signal-return-fail", "signal-limit", "signal-budget", "signal-uninitialized"]
     messages := ["division by zero", "host bound", "outbox limit", "budget exhausted", "uninitialized register"]
     for i in 0:names.len {
-        $case := vm.instantiate(load("signal-basic") >>>) >>>
-        case.execute(0.1, 1.0, 4096, 1024.0) >>>
-        case.reload(load(names[i] + "") >>>) >>>
+        $case := vm.instantiate(load("signal-basic") or >>) or >>
+        case.execute(0.1, 1.0, 4096, 1024.0) or >>
+        case.reload(load(names[i] + "") or >>) or >>
         assert(execution_rejected($&case, messages[i] + ""))
-        assert(case.pending_signals() == 2 && case.calls() == 1 && near(case.state(1) >>>, 1.0))
-        retained := case.drain_signals() >>>
+        assert(case.pending_signals() == 2 && case.calls() == 1 && near(case.state(1) or >>, 1.0))
+        retained := case.drain_signals() or >>
         assert(retained.len == 2 && retained[0].epoch == 1 && near(retained[0].value, 18.0))
     }
-    $batch := vm.instantiate(load("signal-batch") >>>) >>>
-    for i in 0:4 { batch.execute(0.1, 1.0, 4096, 1024.0) >>> }
+    $batch := vm.instantiate(load("signal-batch") or >>) or >>
+    for i in 0:4 { batch.execute(0.1, 1.0, 4096, 1024.0) or >> }
     assert(batch.pending_signals() == 128 && execution_rejected($&batch, "outbox limit"))
-    assert(batch.calls() == 4 && near(batch.state(1) >>>, 4.0))
-    all := batch.drain_signals() >>>
+    assert(batch.calls() == 4 && near(batch.state(1) or >>, 4.0))
+    all := batch.drain_signals() or >>
     for i in 0:all.len { assert(all[i].call == i / 32 + 1 && near(all[i].value, f64(i % 32))) }
-    batch.execute(0.1, 1.0, 4096, 1024.0) >>>
+    batch.execute(0.1, 1.0, 4096, 1024.0) or >>
     assert(batch.calls() == 5 && batch.pending_signals() == 32)
     << 0
 }
 fn host_checks() int {
-    $tree := nexus.new_scene_tree("Signals", 16) >>>
+    $tree := nexus.new_scene_tree("Signals", 16) or >>
     root := tree.root()
-    source := tree.add_child(root, "Source") >>>
-    target_a := tree.add_child(root, "A") >>>
-    target_b := tree.add_child_3d(root, "B") >>>
-    $script := host.attach(&tree, source, load("signal-basic") >>>) >>>
-    a := script.connect(&tree, "moved", target_a, "on_moved") >>>
-    b := script.connect(&tree, "moved", target_b, "on_moved") >>>
-    halted := script.connect(&tree, "halted", target_a, "on_halted") >>>
+    source := tree.add_child(root, "Source") or >>
+    target_a := tree.add_child(root, "A") or >>
+    target_b := tree.add_child_3d(root, "B") or >>
+    $script := host.attach(&tree, source, load("signal-basic") or >>) or >>
+    a := script.connect(&tree, "moved", target_a, "on_moved") or >>
+    b := script.connect(&tree, "moved", target_b, "on_moved") or >>
+    halted := script.connect(&tree, "halted", target_a, "on_halted") or >>
     assert(a != b && b != halted && script.connection_count() == 3)
-    assert((script.connect(&tree, "moved", target_a, "on_moved") >>>) == a)
+    assert((script.connect(&tree, "moved", target_a, "on_moved") or >>) == a)
     assert(connection_rejected($&script, &tree, "unknown", target_a, "on_moved"))
     assert(connection_rejected($&script, &tree, "moved", target_a, "bad-name"))
-    script.physics_process(&tree, 0.1, 1.0) >>>
+    script.physics_process(&tree, 0.1, 1.0) or >>
     tree.paused = true
-    assert((script.physics_process(&tree, 0.1, 1.0) >>>) == 0.0 && script.calls() == 1)
-    first := script.collect_signals(&tree) >>>
+    assert((script.physics_process(&tree, 0.1, 1.0) or >>) == 0.0 && script.calls() == 1)
+    first := script.collect_signals(&tree) or >>
     assert(first.len == 3 && first[0].connection == a && first[1].connection == b && first[2].connection == halted)
     assert(first[0].source == source && first[0].target == target_a && first[0].signal == 11 && near(first[0].value, 18.0))
     assert(first[0].is_live(&tree) && first[0].handler == "on_moved")
-    assert((script.collect_signals(&tree) >>>).len == 0 && script.pending_signals() == 0)
+    assert((script.collect_signals(&tree) or >>).len == 0 && script.pending_signals() == 0)
     tree.paused = false
     assert(script.disconnect(a) == 1 && script.disconnect(a) == 0)
-    next_a := script.connect(&tree, "moved", target_a, "on_moved") >>>
+    next_a := script.connect(&tree, "moved", target_a, "on_moved") or >>
     assert(next_a > halted)
     // Existing events and connections survive a same-ID rename/reorder.
-    script.physics_process(&tree, 0.1, 1.0) >>>
-    script.reload(&tree, load("signal-rename") >>>) >>>
-    before := script.collect_signals(&tree) >>>
+    script.physics_process(&tree, 0.1, 1.0) or >>
+    script.reload(&tree, load("signal-rename") or >>) or >>
+    before := script.collect_signals(&tree) or >>
     assert(before.len == 3 && before[0].epoch == 1 && before[0].call == 2)
-    assert((script.connect(&tree, "motion", target_a, "on_moved") >>>) == next_a)
-    script.physics_process(&tree, 0.1, 1.0) >>>
-    after := script.collect_signals(&tree) >>>
+    assert((script.connect(&tree, "motion", target_a, "on_moved") or >>) == next_a)
+    script.physics_process(&tree, 0.1, 1.0) or >>
+    after := script.collect_signals(&tree) or >>
     assert(after.len == 2 && after[0].connection == b && after[1].connection == next_a && after[0].epoch == 2)
-    assert(near(after[0].value, 36.0) && near(script.state(1) >>>, 3.0))
-    script.physics_process(&tree, 0.1, 1.0) >>>
-    script.reload(&tree, load("signal-delete") >>>) >>>
+    assert(near(after[0].value, 36.0) && near(script.state(1) or >>, 3.0))
+    script.physics_process(&tree, 0.1, 1.0) or >>
+    script.reload(&tree, load("signal-delete") or >>) or >>
     assert(script.connection_count() == 1 && script.prune_connections(&tree) == 0)
-    assert((script.collect_signals(&tree) >>>).len == 0)
-    script.physics_process(&tree, 0.1, 1.0) >>>
-    remaining := script.collect_signals(&tree) >>>
+    assert((script.collect_signals(&tree) or >>).len == 0)
+    script.physics_process(&tree, 0.1, 1.0) or >>
+    remaining := script.collect_signals(&tree) or >>
     assert(remaining.len == 1 && remaining[0].connection == halted)
     // Generation IDs prevent a deferred event from reaching a reused slot.
-    tree.queue_free(target_a) >>>
+    tree.queue_free(target_a) or >>
     assert(!remaining[0].is_live(&tree))
     assert(connection_rejected($&script, &tree, "halted", target_a, "on_halted"))
-    script.physics_process(&tree, 0.1, 1.0) >>>
-    assert((script.collect_signals(&tree) >>>).len == 0 && script.connection_count() == 0)
-    tree.flush_free() >>>
-    replacement := tree.add_child(root, "Replacement") >>>
+    script.physics_process(&tree, 0.1, 1.0) or >>
+    assert((script.collect_signals(&tree) or >>).len == 0 && script.connection_count() == 0)
+    tree.flush_free() or >>
+    replacement := tree.add_child(root, "Replacement") or >>
     assert(replacement != target_a && !remaining[0].is_live(&tree))
-    script.connect(&tree, "halted", replacement, "on_halted") >>>
-    script.physics_process(&tree, 0.1, 1.0) >>>
-    tree.queue_free(source) >>>
-    assert((script.collect_signals(&tree) >>>).len == 0 && script.connection_count() == 0 && script.pending_signals() == 0)
+    script.connect(&tree, "halted", replacement, "on_halted") or >>
+    script.physics_process(&tree, 0.1, 1.0) or >>
+    tree.queue_free(source) or >>
+    assert((script.collect_signals(&tree) or >>).len == 0 && script.connection_count() == 0 && script.pending_signals() == 0)
     << 0
 }
 fn capacity_checks() int {
-    $tree := nexus.new_scene_tree("Capacity", 4) >>>
-    source := tree.add_child(tree.root(), "Source") >>>
-    target := tree.add_child(tree.root(), "Target") >>>
-    $script := host.attach(&tree, source, load("signal-batch") >>>) >>>
-    for i in 0:host.MAX_CONNECTIONS { script.connect(&tree, "moved", target, "handler_" + str(i)) >>> }
+    $tree := nexus.new_scene_tree("Capacity", 4) or >>
+    source := tree.add_child(tree.root(), "Source") or >>
+    target := tree.add_child(tree.root(), "Target") or >>
+    $script := host.attach(&tree, source, load("signal-batch") or >>) or >>
+    for i in 0:host.MAX_CONNECTIONS { script.connect(&tree, "moved", target, "handler_" + str(i)) or >> }
     assert(connection_rejected($&script, &tree, "moved", target, "extra"))
-    for i in 0:4 { script.physics_process(&tree, 0.1, 1.0) >>> }
-    deliveries := script.collect_signals(&tree) >>>
+    for i in 0:4 { script.physics_process(&tree, 0.1, 1.0) or >> }
+    deliveries := script.collect_signals(&tree) or >>
     assert(deliveries.len == 4096 && script.pending_signals() == 0)
     for i in 0:deliveries.len {
         assert(deliveries[i].connection == i % 32 + 1 && deliveries[i].call == i / 1024 + 1)
@@ -172,35 +172,35 @@ fn capacity_checks() int {
     << 0
 }
 fn collection_snapshot_checks() int {
-    $tree := nexus.new_scene_tree("Snapshots", 4) >>>
-    source := tree.add_child(tree.root(), "Source") >>>
-    target := tree.add_child(tree.root(), "Target") >>>
-    $script := host.attach(&tree, source, load("signal-basic") >>>) >>>
+    $tree := nexus.new_scene_tree("Snapshots", 4) or >>
+    source := tree.add_child(tree.root(), "Source") or >>
+    target := tree.add_child(tree.root(), "Target") or >>
+    $script := host.attach(&tree, source, load("signal-basic") or >>) or >>
     // Connections are resolved when collecting, not when the VM emits.
-    script.physics_process(&tree, 0.1, 1.0) >>>
-    connection := script.connect(&tree, "moved", target, "handler") >>>
-    snapshot := script.collect_signals(&tree) >>>
+    script.physics_process(&tree, 0.1, 1.0) or >>
+    connection := script.connect(&tree, "moved", target, "handler") or >>
+    snapshot := script.collect_signals(&tree) or >>
     assert(snapshot.len == 1 && snapshot[0].call == 1)
     assert(script.disconnect(connection) == 1 && snapshot[0].is_live(&tree))
-    script.physics_process(&tree, 0.1, 1.0) >>>
-    next := script.connect(&tree, "moved", target, "handler") >>>
+    script.physics_process(&tree, 0.1, 1.0) or >>
+    next := script.connect(&tree, "moved", target, "handler") or >>
     assert(next > connection && script.disconnect(next) == 1)
-    assert((script.collect_signals(&tree) >>>).len == 0)
-    script.physics_process(&tree, 0.1, 1.0) >>>
-    script.connect(&tree, "moved", target, "handler") >>>
-    tree.set_process_mode(target, nexus.PROCESS_DISABLED) >>>
-    assert((script.collect_signals(&tree) >>>).len == 1)
-    tree.queue_free(source) >>>
+    assert((script.collect_signals(&tree) or >>).len == 0)
+    script.physics_process(&tree, 0.1, 1.0) or >>
+    script.connect(&tree, "moved", target, "handler") or >>
+    tree.set_process_mode(target, nexus.PROCESS_DISABLED) or >>
+    assert((script.collect_signals(&tree) or >>).len == 1)
+    tree.queue_free(source) or >>
     assert(!snapshot[0].is_live(&tree))
     << 0
 }
 fn run() int {
-    vm_checks() >>>
-    host_checks() >>>
-    capacity_checks() >>>
-    collection_snapshot_checks() >>>
+    vm_checks() or >>
+    host_checks() or >>
+    capacity_checks() or >>
+    collection_snapshot_checks() or >>
     println("PASS: transactional scalar signals, ordered/fan-out delivery, per-call/outbox/connection bounds, stable-ID hot reload, retired signals, pause and node deletion/generation, 4096-delivery boundary")
     << 0
 }
-fn main() int { << run() >>> (err) { eprintln(err.msg())
+fn main() int { << run() or (err) { eprintln(err.msg())
     << 1 } }

@@ -60,7 +60,7 @@ bad('field-duplicate',lambda d:d['scripts'][0]['initial'].append(dict(id=3,value
 for key in ['source','target','signal','handler']:
  bad('route-missing-'+key,lambda d,k=key:d['script_connections'][0].pop(k))
  for label,value in [('negative',-1),('high',2147483648),('null',None),('float',.5)]:bad('route-'+key+'-'+label,lambda d,k=key,v=value:d['script_connections'][0].__setitem__(k,v))
-bad('route-nonscript',lambda d:d['script_connections'][0].update(source=0));bad('route-duplicate',lambda d:d['script_connections'].append(copy.deepcopy(d['script_connections'][0])));bad('route-extra',lambda d:d['script_connections'][0].update(deferred=True));bad('version-7-missing-arrays',lambda d:d.update(version=7));bad('unsupported-version',lambda d:d.update(version=9))
+bad('route-nonscript',lambda d:d['script_connections'][0].update(source=0));bad('route-duplicate',lambda d:d['script_connections'].append(copy.deepcopy(d['script_connections'][0])));bad('route-extra',lambda d:d['script_connections'][0].update(deferred=True));bad('version-7-missing-arrays',lambda d:d.update(version=7));bad('unsupported-version',lambda d:d.update(version=10))
 (out/'reject-list.txt').write_text('\n'.join(rejects)+'\n')
 # Keep a standalone copy for the GPU runner's deterministic mid-frame switch.
 shutil.copyfile(out/'next.xubc',root/'build/scene-scripts/next.xubc')

@@ -1,0 +1,186 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+nav #"github.com/xulang-org/nexus/navigation"
+bt #"github.com/xulang-org/nexus/ai/bt"
+#errors
+#math
+
+fn assert(ok bool, msg string) int {
+    if !ok { >> errors.new("ai_bt_nav_checks: " + msg) }
+    << 0
+}
+
+fn add_nav_quad(verts $&[]fm.Vec3, idxs $&[]int, areas $&[]int, flags $&[]int,
+        x0 f64, z0 f64, x1 f64, z1 f64) {
+    b := verts.len
+    verts.push(fm.vec3(x0, 0.0, z0))
+    verts.push(fm.vec3(x0, 0.0, z1))
+    verts.push(fm.vec3(x1, 0.0, z1))
+    verts.push(fm.vec3(x1, 0.0, z0))
+    idxs.push(b)
+    idxs.push(b + 1)
+    idxs.push(b + 2)
+    areas.push(0)
+    flags.push(1)
+    idxs.push(b)
+    idxs.push(b + 2)
+    idxs.push(b + 3)
+    areas.push(0)
+    flags.push(1)
+}
+
+fn path_len(pts &[]fm.Vec3) f64 {
+    $d := 0.0
+    for i in 0:(pts.len - 1) {
+        d = d + pts[i + 1].sub(pts[i]).length()
+    }
+    << d
+}
+
+fn test_dynamic_nav_obstacles() int {
+    $verts := []fm.Vec3{}
+    $idxs := []int{}
+    $areas := []int{}
+    $flags := []int{}
+    // Two parallel corridors across x=[0..12]:
+    // Bottom direct lane: z=[4..8]; Top detour bypass: z=[8..12] connected at left/right ends.
+    add_nav_quad($&verts, $&idxs, $&areas, $&flags, 0.0, 4.0, 4.0, 8.0)
+    add_nav_quad($&verts, $&idxs, $&areas, $&flags, 4.0, 4.0, 8.0, 8.0)
+    add_nav_quad($&verts, $&idxs, $&areas, $&flags, 8.0, 4.0, 12.0, 8.0)
+    add_nav_quad($&verts, $&idxs, $&areas, $&flags, 0.0, 8.0, 4.0, 12.0)
+    add_nav_quad($&verts, $&idxs, $&areas, $&flags, 4.0, 8.0, 8.0, 12.0)
+    add_nav_quad($&verts, $&idxs, $&areas, $&flags, 8.0, 8.0, 12.0, 12.0)
+    mesh := nav.build_navmesh(&verts, &idxs, 0.75, &areas, &flags) or >>
+    $obs := nav.new_obstacle_manager()
+
+    start := fm.vec3(1.5, 0.0, 5.0)
+    goal := fm.vec3(10.5, 0.0, 5.0)
+    costs := [1.0]
+
+    // Unblocked corridor across bottom lane: direct 9.0m route.
+    p_clear := mesh.find_path_avoiding(start, goal, 1, &costs, &obs) or >>
+    clen := path_len(&p_clear)
+    assert(p_clear.len >= 2 && clen >= 8.9 && clen < 9.5,
+        "clear path length ~9m, got len=" + str(p_clear.len) + " dist=" + str(int(clen * 100.0)) + "cm") or >>
+
+    // Cylinder obstacle blocks center bottom quad (6, 0, 6) -> forces detour through top bypass!
+    cyl := obs.add_cylinder(fm.vec3(6.0, 0.0, 6.0), 1.9) or >>
+    assert(mesh.count_blocked_polys(&obs) >= 2, "center polys blocked") or >>
+    p_detour := mesh.find_path_avoiding(start, goal, 1, &costs, &obs) or >>
+    dlen := path_len(&p_detour)
+    assert(p_detour.len >= 2 && dlen > clen + 1.0,
+        "detour path longer than clear (" + str(int(dlen * 100.0)) + "cm vs " + str(int(clen * 100.0)) + "cm)") or >>
+
+    // Box obstacle blocks top bypass at (6, 0, 10) -> zero unblocked routes.
+    b_top := obs.add_box(fm.vec3(6.0, 0.0, 10.0), fm.vec3(1.5, 1.0, 2.2)) or >>
+    p_sealed := mesh.find_path_avoiding(start, goal, 1, &costs, &obs) or >>
+    assert(p_sealed.len == 0, "completely sealed corridor yields empty path") or >>
+
+    // Move center obstacle out & disable top box -> direct path restored.
+    obs.move_obstacle(cyl, fm.vec3(50.0, 0.0, 50.0)) or >>
+    obs.set_active(b_top, false) or >>
+    assert(obs.active_count() == 1, "active_count after disabling 1 box") or >>
+    p_restored := mesh.find_path_avoiding(start, goal, 1, &costs, &obs) or >>
+    assert(math.abs(path_len(&p_restored) - clen) < 0.05, "restored clear path after obstacle moved") or >>
+    << 0
+}
+
+fn test_behavior_tree() int {
+    $tree := bt.new_tree()
+    root_sel := tree.add_selector("root_ai")
+
+    // Branch 1 (combat): Cooldown(1.0s) -> Sequence[enemy_visible == true, ammo > 0, fire_shot]
+    cd := tree.add_cooldown("attack_cd", 1.0)
+    seq_atk := tree.add_sequence("attack_seq")
+    c_vis := tree.add_cond_bool("enemy_visible", true)
+    c_ammo := tree.add_cond_gt("ammo", 0.0)
+    a_fire := tree.add_action("fire_shot", 25.0)
+    tree.add_child(seq_atk, c_vis) or >>
+    tree.add_child(seq_atk, c_ammo) or >>
+    tree.add_child(seq_atk, a_fire) or >>
+    tree.add_child(cd, seq_atk) or >>
+
+    // Branch 2 (fallback patrol): Sequence[Inverter(enemy_visible == true), Wait(0.1s), set alerted=true, move_patrol]
+    seq_pat := tree.add_sequence("patrol_seq")
+    inv_vis := tree.add_inverter("not_visible")
+    c_vis2 := tree.add_cond_bool("enemy_visible", true)
+    w_pat := tree.add_wait("patrol_pause", 0.1)
+    set_pat := tree.add_set_bool("patrolling", true)
+    a_pat := tree.add_action("move_patrol", 1.0)
+    tree.add_child(inv_vis, c_vis2) or >>
+    tree.add_child(seq_pat, inv_vis) or >>
+    tree.add_child(seq_pat, w_pat) or >>
+    tree.add_child(seq_pat, set_pat) or >>
+    tree.add_child(seq_pat, a_pat) or >>
+
+    tree.add_child(root_sel, cd) or >>
+    tree.add_child(root_sel, seq_pat) or >>
+    tree.set_root(root_sel) or >>
+
+    $bb := bt.new_blackboard()
+    bb.set_bool("enemy_visible", false)
+    bb.set_f64("ammo", 3.0)
+    $runner := bt.new_runner(&tree)
+
+    // Tick 1 (dt=0.05): attack fails (enemy_visible=false), patrol enters Wait -> BT_RUNNING.
+    s1 := runner.tick(&tree, $&bb, 0.05) or >>
+    assert(s1 == bt.BT_RUNNING, "patrol wait running on tick 1") or >>
+    assert(!bb.get_bool("patrolling", false), "set_bool not reached during wait") or >>
+
+    // Tick 2 (dt=0.06): wait completes (0.11 >= 0.10), sets patrolling=true and emits move_patrol -> BT_SUCCESS.
+    s2 := runner.tick(&tree, $&bb, 0.06) or >>
+    assert(s2 == bt.BT_SUCCESS && bb.get_bool("patrolling", false), "patrol completes on tick 2") or >>
+    acts2 := runner.drain_actions()
+    assert(acts2.len == 1 && acts2[0].name == "move_patrol", "emitted move_patrol") or >>
+
+    // Enemy spotted -> fire_shot runs async (BT_RUNNING then BT_SUCCESS), then cooldown blocks next attack for 1.0s!
+    bb.set_bool("enemy_visible", true)
+    runner.set_action_status(a_fire, bt.BT_RUNNING)
+    s3 := runner.tick(&tree, $&bb, 0.016) or >>
+    assert(s3 == bt.BT_RUNNING, "fire_shot running") or >>
+    runner.set_action_status(a_fire, bt.BT_SUCCESS)
+    s4 := runner.tick(&tree, $&bb, 0.016) or >>
+    assert(s4 == bt.BT_SUCCESS, "fire_shot completes") or >>
+    _ := runner.drain_actions()
+
+    // Immediate tick while cooldown > 0 AND enemy_visible=true -> attack blocked by cooldown, inverter fails -> BT_FAILURE.
+    s5 := runner.tick(&tree, $&bb, 0.2) or >>
+    assert(s5 == bt.BT_FAILURE, "cooldown blocks attack and enemy_visible=true blocks patrol") or >>
+
+    // Advance dt=0.9s -> cooldown expires, fire_shot executes again!
+    s6 := runner.tick(&tree, $&bb, 0.9) or >>
+    assert(s6 == bt.BT_SUCCESS, "cooldown expires and attack fires again") or >>
+    acts6 := runner.drain_actions()
+    assert(acts6.len == 1 && acts6[0].name == "fire_shot", "emitted fire_shot after cooldown") or >>
+
+    // Repeater + Parallel smoke check.
+    $t2 := bt.new_tree()
+    par := t2.add_parallel("par", bt.BT_REQUIRE_ALL)
+    rep := t2.add_repeater("rep2", 2)
+    act_r := t2.add_action("ping", 2.0)
+    act_p := t2.add_action("hud", 1.0)
+    t2.add_child(rep, act_r) or >>
+    t2.add_child(par, rep) or >>
+    t2.add_child(par, act_p) or >>
+    t2.set_root(par) or >>
+    $r2 := bt.new_runner(&t2)
+    assert((r2.tick(&t2, $&bb, 0.016) or >>) == bt.BT_RUNNING, "repeater needs 2nd iteration") or >>
+    assert((r2.tick(&t2, $&bb, 0.016) or >>) == bt.BT_SUCCESS, "parallel finishes when repeater reaches 2") or >>
+    << 0
+}
+
+fn run() int {
+    test_dynamic_nav_obstacles() or >>
+    test_behavior_tree() or >>
+    println("PASS: ai_bt_nav_checks")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

@@ -1,0 +1,73 @@
+@main
+
+#errors
+#os
+exec #os/exec
+#strings
+
+struct CmdOutcome {
+    ok bool
+    output string
+}
+
+fn assert(ok bool, msg string) int {
+    if !ok { >> errors.new("project_bundle_cli_checks: " + msg) }
+    << 0
+}
+
+fn clean_dir(path string) int {
+    os.remove_all(path) or (err) {
+        _ := err.msg()
+        << 0
+    }
+    << 0
+}
+
+fn run_cmd(bin string, args &[]string) CmdOutcome {
+    $cmd := exec.command(bin + "")
+    for i in 0:args.len {
+        cmd.args.push(args[i] + "")
+    }
+    out := cmd.combined_output() or (err) {
+        << CmdOutcome{ok: false, output: err.msg()}
+    }
+    << CmdOutcome{ok: true, output: out}
+}
+
+fn run() int {
+    cli := "build/nexus-project"
+    out_dir := "build/cli-bundle-tmp"
+    clean_dir(out_dir + "")
+
+    pack_args := [
+        "bundle-pack", "examples/modern_sandbox/project.json",
+        "--output", out_dir + "",
+        "--bundle-id", "sandbox-pack",
+        "--sequence", "1",
+        "--key", "cli-secret"
+    ]
+    pack_res := run_cmd(cli + "", &pack_args)
+    assert(pack_res.ok && strings.contains(&pack_res.output, "PACKED sandbox-pack seq=1"),
+        "bundle-pack output: " + pack_res.output) or >>
+
+    ver_ok_args := ["bundle-verify", out_dir + "", "--key", "cli-secret"]
+    ver_ok := run_cmd(cli + "", &ver_ok_args)
+    assert(ver_ok.ok && strings.contains(&ver_ok.output, "VERIFIED sandbox-pack seq=1"),
+        "bundle-verify valid key: " + ver_ok.output) or >>
+
+    ver_bad_args := ["bundle-verify", out_dir + "", "--key", "wrong-secret"]
+    ver_bad := run_cmd(cli + "", &ver_bad_args)
+    assert(!ver_bad.ok, "bundle-verify rejects wrong key") or >>
+
+    os.remove_all(out_dir + "") or >>
+    println("PASS: project_bundle_cli_checks")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

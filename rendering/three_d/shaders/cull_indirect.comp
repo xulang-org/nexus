@@ -1,0 +1,164 @@
+#version 450
+
+struct InstanceGpu {
+    mat4 model;
+    mat4 normals;
+    vec4 bounds_min;
+    vec4 bounds_max;
+    uvec4 draw_info;
+};
+
+struct IndexedIndirectCmd {
+    uint num_indices;
+    uint num_instances;
+    uint first_index;
+    int vertex_offset;
+    uint first_instance;
+};
+
+layout(set = 0, binding = 0) uniform sampler2D hiz0;
+layout(set = 0, binding = 1) uniform sampler2D hiz1;
+layout(set = 0, binding = 2) uniform sampler2D hiz2;
+layout(set = 0, binding = 3) uniform sampler2D hiz3;
+layout(set = 0, binding = 4) uniform sampler2D hiz4;
+layout(set = 0, binding = 5) uniform sampler2D hiz5;
+layout(set = 0, binding = 6) uniform sampler2D hiz6;
+layout(set = 0, binding = 7) uniform sampler2D hiz7;
+
+layout(set = 0, binding = 8, std430) readonly buffer InstancesBuf {
+    InstanceGpu instances[];
+};
+
+layout(set = 1, binding = 0, std430) buffer CommandsBuf {
+    IndexedIndirectCmd commands[];
+};
+
+layout(set = 1, binding = 1, std430) buffer ResultsBuf {
+    uint results[];
+};
+
+layout(set = 2, binding = 0, std140) uniform CullParams {
+    mat4 view_proj;
+    vec4 info;
+    vec4 mip_sizes[8];
+} params;
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+float sample_hiz_level(int lvl, vec2 uv) {
+    if (lvl == 0) return textureLod(hiz0, uv, 0.0).r;
+    if (lvl == 1) return textureLod(hiz1, uv, 0.0).r;
+    if (lvl == 2) return textureLod(hiz2, uv, 0.0).r;
+    if (lvl == 3) return textureLod(hiz3, uv, 0.0).r;
+    if (lvl == 4) return textureLod(hiz4, uv, 0.0).r;
+    if (lvl == 5) return textureLod(hiz5, uv, 0.0).r;
+    if (lvl == 6) return textureLod(hiz6, uv, 0.0).r;
+    return textureLod(hiz7, uv, 0.0).r;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint count = uint(params.info.x);
+    if (gid >= count) return;
+
+    InstanceGpu inst = instances[gid];
+    vec3 bmin = inst.bounds_min.xyz;
+    vec3 bmax = inst.bounds_max.xyz;
+    mat4 mvp = params.view_proj * inst.model;
+
+    uint out_left = 1u, out_right = 1u, out_bottom = 1u, out_top = 1u;
+    uint out_far = 1u, out_near = 1u, all_behind = 1u, any_near_straddle = 0u;
+    float min_nx = 1e30, max_nx = -1e30, min_ny = 1e30, max_ny = -1e30, max_nz = -1e30;
+
+    for (uint corner = 0u; corner < 8u; ++corner) {
+        vec3 p = vec3(
+            (corner & 1u) != 0u ? bmax.x : bmin.x,
+            (corner & 2u) != 0u ? bmax.y : bmin.y,
+            (corner & 4u) != 0u ? bmax.z : bmin.z
+        );
+        vec4 c = mvp * vec4(p, 1.0);
+        if (c.x + c.w >= 0.0) out_left = 0u;
+        if (-c.x + c.w >= 0.0) out_right = 0u;
+        if (c.y + c.w >= 0.0) out_bottom = 0u;
+        if (-c.y + c.w >= 0.0) out_top = 0u;
+        if (c.z >= 0.0) out_far = 0u;
+        if (c.w - c.z >= 0.0) out_near = 0u;
+        if (c.w > 0.0) all_behind = 0u;
+
+        if (c.w <= 1e-5) {
+            any_near_straddle = 1u;
+        } else {
+            float inv_w = 1.0 / c.w;
+            float nx = c.x * inv_w;
+            float ny = c.y * inv_w;
+            float nz = c.z * inv_w;
+            min_nx = min(min_nx, nx); max_nx = max(max_nx, nx);
+            min_ny = min(min_ny, ny); max_ny = max(max_ny, ny);
+            max_nz = max(max_nz, nz);
+        }
+    }
+
+    if ((out_left | out_right | out_bottom | out_top | out_far | out_near | all_behind) != 0u) {
+        commands[gid].num_indices = 0u;
+        commands[gid].num_instances = 0u;
+        commands[gid].first_index = inst.draw_info.y;
+        commands[gid].vertex_offset = int(inst.draw_info.z);
+        commands[gid].first_instance = gid;
+        results[gid] = 2u;
+        return;
+    }
+
+    if (params.info.y > 0.5 && any_near_straddle == 0u && max_nz <= 1.0) {
+        int levels = clamp(int(params.info.z), 1, 8);
+        float u0 = clamp(min_nx * 0.5 + 0.5, 0.0, 1.0);
+        float u1 = clamp(max_nx * 0.5 + 0.5, 0.0, 1.0);
+        float v0 = clamp(0.5 - max_ny * 0.5, 0.0, 1.0);
+        float v1 = clamp(0.5 - min_ny * 0.5, 0.0, 1.0);
+
+        int chosen = levels - 1;
+        for (int k = 0; k < levels; ++k) {
+            float mw = params.mip_sizes[k].x;
+            float mh = params.mip_sizes[k].y;
+            if ((u1 - u0) * mw <= 3.0 && (v1 - v0) * mh <= 3.0) {
+                chosen = k;
+                break;
+            }
+        }
+
+        float mw = params.mip_sizes[chosen].x;
+        float mh = params.mip_sizes[chosen].y;
+        int tx0 = clamp(int(floor(u0 * mw)), 0, int(mw) - 1);
+        int tx1 = clamp(int(floor(max(u1 * mw - 1e-5, u0 * mw))), tx0, int(mw) - 1);
+        int ty0 = clamp(int(floor(v0 * mh)), 0, int(mh) - 1);
+        int ty1 = clamp(int(floor(max(v1 * mh - 1e-5, v0 * mh))), ty0, int(mh) - 1);
+
+        float hiz_min = 1.0;
+        vec2 inv_m = vec2(1.0 / mw, 1.0 / mh);
+        int max_x = min(tx1, tx0 + 15);
+        int max_y = min(ty1, ty0 + 15);
+        for (int y = ty0; y <= max_y; ++y) {
+            for (int x = tx0; x <= max_x; ++x) {
+                vec2 uv = (vec2(float(x), float(y)) + 0.5) * inv_m;
+                hiz_min = min(hiz_min, sample_hiz_level(chosen, uv));
+            }
+        }
+
+        float obj_nearest_z = clamp(max_nz, 0.0, 1.0);
+        if (obj_nearest_z + params.info.w < hiz_min) {
+            commands[gid].num_indices = 0u;
+            commands[gid].num_instances = 0u;
+            commands[gid].first_index = inst.draw_info.y;
+            commands[gid].vertex_offset = int(inst.draw_info.z);
+            commands[gid].first_instance = gid;
+            results[gid] = 3u;
+            return;
+        }
+    }
+
+    commands[gid].num_indices = inst.draw_info.x;
+    commands[gid].num_instances = 1u;
+    commands[gid].first_index = inst.draw_info.y;
+    commands[gid].vertex_offset = int(inst.draw_info.z);
+    commands[gid].first_instance = gid;
+    results[gid] = 1u;
+}

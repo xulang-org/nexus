@@ -132,24 +132,24 @@ runner #"example/nexus_script_aot_check/runner"
 fn near(a f64, b f64) bool { << math.abs(a - b) < 1e-11 }
 
 fn expect_handler_err(inst $&runner.DualTrackRunner, id int, val f64, budget int, lim f64) bool {
-    _ := inst.invoke_handler(id, val, budget, lim) >>> (err) { << true }
+    _ := inst.invoke_handler(id, val, budget, lim) or (err) { << true }
     << false
 }
 
 fn expect_exec_err(inst $&runner.DualTrackRunner, dt f64, axis f64, budget int, lim f64) bool {
-    _ := inst.execute(dt, axis, budget, lim) >>> (err) { << true }
+    _ := inst.execute(dt, axis, budget, lim) or (err) { << true }
     << false
 }
 
 fn run() int {
-    raw := os.read("swarm.xubc") >>>
-    mod := bc.decode(&raw) >>>
-    mod_aot := bc.decode(&raw) >>>
-    raw2 := os.read("swarm_v2.xubc") >>>
-    mod2 := bc.decode(&raw2) >>>
+    raw := os.read("swarm.xubc") or >>
+    mod := bc.decode(&raw) or >>
+    mod_aot := bc.decode(&raw) or >>
+    raw2 := os.read("swarm_v2.xubc") or >>
+    mod2 := bc.decode(&raw2) or >>
 
-    $vm_inst := vm.instantiate(mod) >>>
-    $aot_inst := runner.new_dual_track(mod_aot) >>>
+    $vm_inst := vm.instantiate(mod) or >>
+    $aot_inst := runner.new_dual_track(mod_aot) or >>
     assert(aot_inst.is_aot())
 
     // 1. Step-for-step numerical, state, signal, and handler parity across VM, DualTrack C-AOT, and Static-Xu AOT.
@@ -157,78 +157,78 @@ fn run() int {
     for k in 0:40 {
         dt := 1.0 / 60.0
         axis := math.sin(f64(k) * 0.2)
-        rv := vm_inst.execute(dt, axis, 16384, 100000.0) >>>
-        ra := aot_inst.execute(dt, axis, 16384, 100000.0) >>>
-        rs := runner.swarm_run(0, dt, axis, 16384, 100000.0, $&static_state) >>>
+        rv := vm_inst.execute(dt, axis, 16384, 100000.0) or >>
+        ra := aot_inst.execute(dt, axis, 16384, 100000.0) or >>
+        rs := runner.swarm_run(0, dt, axis, 16384, 100000.0, $&static_state) or >>
         assert(near(rv, ra) && near(rv, rs))
         for fid in 1:4 {
-            assert(near(vm_inst.state(fid) >>>, aot_inst.state(fid) >>>))
+            assert(near(vm_inst.state(fid) or >>, aot_inst.state(fid) or >>))
         }
-        assert(near(static_state[0], vm_inst.state(1) >>>))
-        assert(near(static_state[1], vm_inst.state(2) >>>))
-        sv := vm_inst.drain_signals() >>>
-        sa := aot_inst.drain_signals() >>>
+        assert(near(static_state[0], vm_inst.state(1) or >>))
+        assert(near(static_state[1], vm_inst.state(2) or >>))
+        sv := vm_inst.drain_signals() or >>
+        sa := aot_inst.drain_signals() or >>
         assert(sv.len == sa.len)
         for j in 0:sv.len {
             assert(sv[j].id == sa[j].id && near(sv[j].value, sa[j].value) && sv[j].call == sa[j].call)
         }
         if k == 10 {
-            bv := vm_inst.invoke_handler(20, 0.5, 4096, 100000.0) >>>
-            ba := aot_inst.invoke_handler(20, 0.5, 4096, 100000.0) >>>
-            bs := runner.swarm_run(1, 0.5, 0.0, 4096, 100000.0, $&static_state) >>>
+            bv := vm_inst.invoke_handler(20, 0.5, 4096, 100000.0) or >>
+            ba := aot_inst.invoke_handler(20, 0.5, 4096, 100000.0) or >>
+            bs := runner.swarm_run(1, 0.5, 0.0, 4096, 100000.0, $&static_state) or >>
             assert(near(bv, ba) && near(bv, bs))
         }
     }
 
     // 2. Transactional fault & rollback parity (divide by zero + budget exhausted + host bound).
     assert(expect_handler_err($&aot_inst, 20, 0.0, 4096, 100000.0))
-    assert(near(aot_inst.state(3) >>>, vm_inst.state(3) >>>))
+    assert(near(aot_inst.state(3) or >>, vm_inst.state(3) or >>))
 
     assert(expect_exec_err($&aot_inst, 1.0 / 60.0, 1.0, 50, 100000.0))
-    assert(near(aot_inst.state(1) >>>, vm_inst.state(1) >>>))
+    assert(near(aot_inst.state(1) or >>, vm_inst.state(1) or >>))
 
     assert(expect_exec_err($&aot_inst, 1.0 / 60.0, 1.0, 4096, 0.0001))
-    assert(near(aot_inst.state(1) >>>, vm_inst.state(1) >>>))
+    assert(near(aot_inst.state(1) or >>, vm_inst.state(1) or >>))
 
     // 3. Hot reload transition from C-AOT -> Bytecode VM preserving live state!
-    saved_acc := aot_inst.state(1) >>>
-    changed := aot_inst.reload(mod2) >>>
+    saved_acc := aot_inst.state(1) or >>
+    changed := aot_inst.reload(mod2) or >>
     assert(changed == 1 && !aot_inst.is_aot() && aot_inst.epoch() == 2)
-    res2 := aot_inst.execute(1.0 / 60.0, 0.0, 4096, 100000.0) >>>
+    res2 := aot_inst.execute(1.0 / 60.0, 0.0, 4096, 100000.0) or >>
     assert(near(res2, saved_acc + 100.0))
 
     // 4. Performance benchmark (Release-compiled VM vs Native C-AOT across 2000 ticks * 200 loop iters = 400k loop ops).
-    $vm_bench := vm.instantiate(bc.decode(&raw) >>>) >>>
-    $aot_bench := runner.new_dual_track(bc.decode(&raw) >>>) >>>
+    $vm_bench := vm.instantiate(bc.decode(&raw) or >>) or >>
+    $aot_bench := runner.new_dual_track(bc.decode(&raw) or >>) or >>
     $s_bench := [1.0, 0.25, 1.25]
     t0 := time.now()
     for _ in 0:2000 {
-        _ := vm_bench.execute(1.0 / 60.0, 0.5, 16384, 100000.0) >>>
-        _ := vm_bench.drain_signals() >>>
+        _ := vm_bench.execute(1.0 / 60.0, 0.5, 16384, 100000.0) or >>
+        _ := vm_bench.drain_signals() or >>
     }
     t1 := time.now()
     for _ in 0:2000 {
-        _ := aot_bench.execute(1.0 / 60.0, 0.5, 16384, 100000.0) >>>
-        _ := aot_bench.drain_signals() >>>
+        _ := aot_bench.execute(1.0 / 60.0, 0.5, 16384, 100000.0) or >>
+        _ := aot_bench.drain_signals() or >>
     }
     t2 := time.now()
     for _ in 0:2000 {
-        _ := runner.swarm_run(0, 1.0 / 60.0, 0.5, 16384, 100000.0, $&s_bench) >>>
+        _ := runner.swarm_run(0, 1.0 / 60.0, 0.5, 16384, 100000.0, $&s_bench) or >>
     }
     t3 := time.now()
 
     vm_us := (t1 - t0) / 1000
     aot_us := (t2 - t1) / 1000
     sxu_us := (t3 - t2) / 1000
-    assert(near(vm_bench.state(1) >>>, aot_bench.state(1) >>>))
-    assert(near(vm_bench.state(1) >>>, s_bench[0]))
+    assert(near(vm_bench.state(1) or >>, aot_bench.state(1) or >>))
+    assert(near(vm_bench.state(1) or >>, s_bench[0]))
     assert(aot_us * 5 < vm_us)
     println("PASS: XuScript Dual-Track AOT parity & rollback verified (2000x200 iters: vm=" +
         str(vm_us) + "us, c_aot=" + str(aot_us) + "us, static_xu=" + str(sxu_us) + "us)")
     << 0
 }
 fn main() int {
-    << run() >>> (err) {
+    << run() or (err) {
         eprintln(err.msg())
         << 1
     }

@@ -12,29 +12,41 @@ Xu 侧使用组合与显式生命周期通知，不依赖类继承。目前已�
 WAV/IMA ADPCM/总线 DSP/声源的场景恢复，以及沿用 Xu 语法的开发态零分配寄存器复用标量脚本 VM（`vm.Instance`）、保留状态热重载、脚本处理函数、延迟节点信号与 `script/aot`（`cmd/scriptc aot-c`）双轨 C99/Xu AOT 编译器（`AotBundle` / `DualTrackRunner`，支持指令预算、除零回滚与热重载无缝退回 VM）。
 GLB 已支持受限 TRS 动画采样、双动画剪辑 TRS/SLERP 姿态融合（`sample_blended_pose`）、GPU 计算着色器 3×4 仿射线性蒙皮（保留 CPU 蒙皮兼容路径）、保守骨骼包围体及相对路径 PNG，真实人物/动物/植物素材验收见下文。
 3D 已加入带法线/切线/UV 的金属度/粗糙度直接光材质、基础颜色/ORM/自发光/法线/独立 AO 纹理与 mipmap、单双面渲染、传统前向每网格 16 光源与新分簇前向着色（Clustered Forward `16×16×24`，最高 1024 动态光源）、Split-Sum GGX 环境光 IBL 烘焙（`EnvironmentIbl3D`：64×64 BRDF DFG LUT + 5 级预过滤环境贴图）、30-bit Morton 空间排序 Meshlet（`MeshletVisRenderer3D`：64 顶点/124 三角面簇 + 保守法线锥背面剔除 + Reverse-Z 7 级 `R32_FLOAT` Hi-Z 遮挡剔除 + `R32_UINT` Visibility Buffer 解耦计算着色，含解析屏幕空间重心/UV 梯度纹理采样与方向/级联阴影）、GPU `draw_indexed_indirect` 间接绘制、`RGBA16_FLOAT` 线性 HDR + L1 球谐 3D 辐照度探针网格（`IrradianceGrid3D`）、GTAO 环境光遮蔽（含双边滤波）、Hi-Z 加速屏幕空间反射（SSR）、多级 HDR Bloom、ACES Filmic 色调映射与 TAA 历史混合后处理管线，并由 `ModernPipeline3D`（`integration/rendering/three_d/modern_frame3d.xu`）统一串联静态 Meshlet VisBuffer、Split-Sum IBL 与 GPU 蒙皮网格单帧合成。
-3D 场景树与核心服务已加入脏标记拓扑 SoA 变换缓存（`SceneTree`）、静态三角面/AABB/斜坡 BVH、1D X-axis SAP 与增量式 SAH+AVL 平衡动态包围体树（`DynamicBvh3D`）、扩展位置动力学求解器（`XPBD`：15 轴动态 OBB 间互碰与静态三角面库仑摩擦/恢复求解、柔度距离/牵引约束、8×8 布料网格、刚体堆叠与 6 自由度四元数转动 `JointedWorld3D` 球铰链/摆锤/带伺服电机与限位铰链关节，配合 `SkeletonRagdoll3D` 与动画权重平滑融合并驱动 GPU 蒙皮骨骼布娃娃）、3D 导航网格与人群避障（`navigation`：斜率过滤、拓扑边缝合、`A*` 区域代价与 XZ Funnel 路径拉直 + RVO 互惠人群避障）、基于连续分块 SoA 与常驻协程工作池（`ecs.EcsWorkerPool`）的无锁并发 Archetype `ecs` 模块，以及后台解码 + 帧预算分片上传 + LRU 显存淘汰的异步资源流式管理器（`integration/streaming`）；可选择 GPU 2× 超采样（四个源像素合成一个输出像素）和方向/聚光/点光 3×3 PCF 阴影及 2–4 级 CSM，图片已接通标准库的受限 baseline JPEG 解码。静态 GLB 项目支持增量重导入、基础场景编辑及原生预览；3D 物理已支持任意三角面碰撞、胶囊体扫掠、动态刚体互碰摩擦、射线检测与伺服电机关节约束/布娃娃求解。完整 glTF PBR 材质扩展、完整脚本类型/协程、异步流式解码与生产更新分发以及 Vulkan/DXIL 新计算管线着色器（目前新增 `.msl` 计算/VisBuffer/IBL 着色器仅在 macOS arm64 / Metal 验证，本机未安装 `glslangValidator`/`glslc`/`dxc`/`spirv-cross`）仍待继续扩展。
+3D 场景树与核心服务已加入脏标记拓扑 SoA 变换缓存（`SceneTree`）、静态三角面/AABB/斜坡 BVH、1D X-axis SAP 与增量式 SAH+AVL 平衡动态包围体树（`DynamicBvh3D`）、扩展位置动力学求解器（`XPBD`：15 轴动态 OBB 间互碰与静态三角面库仑摩擦/恢复求解、柔度距离/牵引约束、8×8 布料网格、刚体堆叠与 6 自由度四元数转动 `JointedWorld3D` 球铰链/摆锤/带伺服电机与限位铰链关节，配合 `SkeletonRagdoll3D` 与动画权重平滑融合并驱动 GPU 蒙皮骨骼布娃娃）、3D 导航网格与人群避障（`navigation`：斜率过滤、拓扑边缝合、`A*` 区域代价与 XZ Funnel 路径拉直 + RVO 互惠人群避障）、基于连续分块 SoA 与常驻协程工作池（`ecs.EcsWorkerPool`）的无锁并发 Archetype `ecs` 模块，以及后台解码 + 帧预算分片上传 + LRU 显存淘汰的异步资源流式管理器（`integration/streaming`）；场景序列化已升级到 v9（Environment / RigidBody3D / Joint3D / Terrain / ParticleEmitter3D / PrefabInstance 附件，同步接入 `cmd/project_editor` v9 组件检视器与 `cmd/project_viewport --modern` 视口管线）；所有 45 个 3D 着色器已提供 MSL / GLSL 450 / HLSL SM 6.0 三后端源码（本机未安装 MetalToolchain/`glslangValidator`/`dxc` 时 `shader-cross-backend-test` 完成全量奇偶校验、入口点与寄存器约定验证，实际 GPU 像素验证当前覆盖 macOS arm64 / Metal）；引擎整合层新增持久 UI 控件树与焦点/模态路由（`integration/ui/tree.xu`）、120 帧滚动 `FrameProfiler` + GPU/资源驻留 `EngineTelemetry`（`timing/profiler.xu`、`integration/diagnostics`）、HMAC-SHA256 签名资源包与防回滚原子热更新/回滚（`resources/bundle`、`integration/bundle`），并提供全功能 3D 沙盒示例 `examples/modern_sandbox`。完整 glTF 复杂材质扩展与真机跨平台图形驱动运行仍可按需继续扩展。
 
-当前使用 Xu **0.14.1**（基于官方 `origin/release/0.14.1` 并合入 Nexus 所需图形/计算存储缓冲区、计算采样器/读写存储纹理、`R32_UINT` 及 `draw_indexed_indirect` 等扩展的独立 worktree `../.worktrees/xu-0.14.1`，待上游合入）。该 SDK 包含 Phone game 对象对原生导入的支持，并随生成工程导出原生归档与 C 桥接。编译器、标准库、native/phone 工具必须来自同一 SDK。两个移动示例此前使用 Xu 0.12.7-dev.1 在 Sony XQ-BE72（Android 13）上运行，并完成 iOS 应用构建。iPhone 8（iOS 16.7.16）的真机结果来自 Xu 0.12.5 构建。
+当前使用 Xu **0.14.2-dev.2**（本地 `../xu-dev` 工具链，包含 Nexus 所需图形/计算存储缓冲区、计算采样器/读写存储纹理、`R32_UINT`、`draw_indexed_indirect` 及 ARM64 `f64` 索引移位/LICM 优化修复）。该 SDK 包含 Phone game 对象对原生导入的支持，并随生成工程导出原生归档与 C 桥接。编译器、标准库、native/phone 工具必须来自同一 SDK。两个移动示例此前使用 Xu 0.12.7-dev.1 在 Sony XQ-BE72（Android 13）上运行，并完成 iOS 应用构建。iPhone 8（iOS 16.7.16）的真机结果来自 Xu 0.12.5 构建。
 
 ## 构建所需的 Xu SDK
 
-使用 Xu **0.14.1** 工具链（仓库内可直接复用基于 `origin/release/0.14.1` 自举构建的 `../.worktrees/xu-0.14.1` 或已配置对应扩展的 0.14.1 SDK）：
+使用 Xu **0.14.2-dev.2** 工具链（可直接复用已自举构建的 `../xu-dev`）：
 
 ```sh
-# 1. 若已将带 Nexus 扩展的 0.14.1 SDK 安装到 ~/.xu 或设置 env，先激活环境：
+# 1. 若已将同一版本 SDK 安装到 ~/.xu 或设置 env，先激活环境：
 source ~/.xu/env.sh
 make sdk
 
-# 2. 或从 xu 0.14.1 worktree 源码自举构建（macOS arm64）：
-NEXUS_XU_SDK="$(cd ../.worktrees/xu-0.14.1 && pwd)"
+# 2. 或直接使用本地 ../xu-dev 工具链（macOS arm64）：
+NEXUS_XU_SDK="$(cd ../xu-dev && pwd)"
 export NEXUS_XU_SDK
 export XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" XUPATH="$NEXUS_XU_SDK/src" XU="$NEXUS_XU_SDK/bin/xu"
+export PATH="$NEXUS_XU_SDK/bin:$PATH"
 make sdk
 ```
 
-`make sdk` 应输出 `PASS: Xu SDK 0.14.1`。已有同一版本 SDK 时，直接设置上述环境变量或执行 `source /path/to/xu/env.sh` 即可。
+`make sdk` 应输出 `PASS: Xu SDK 0.14.2-dev.2`。已有同一版本 SDK 时，直接设置上述环境变量或执行 `source /path/to/xu/env.sh` 即可。
 
 核心引擎突破与专项测试目标：
+- `make prefab-runtime-test`：验证 `integration/scene/prefabs.xu` 递归多级嵌套 Prefab 实例化、SHA-256 校验、循环引用拦截与节点可见性/位置覆盖应用。
+- `make ai-bt-nav-test`：验证 `navigation/obstacles.xu` 动态球柱/AABB 障碍物避让与路径重路由，及 `ai/bt` 行为树（Selector/Sequence/Parallel/Inverter/Repeater/Cooldown/Wait/Blackboard/Trace）。
+- `make input-replay-timing-test`：验证键位重绑定/JSON 导入导出、手柄死区整形、`InputRecorder`/`InputReplayer` 帧确定性回放及 `ScaledClock`（慢动作/倍速/暂停/顿帧 Hitstop）。
+- `make timeline-test`：验证 `animation/timeline` 通用属性时间轴（Step/Linear/Cubic-Hermite 标量、`Vec3`、RGBA8 颜色混合与循环跨越事件触发）。
+- `make project-bundle-cli-test`：验证 `cmd/project`（`nexus-project bundle-pack` / `bundle-verify`）从工程清单打包与 HMAC-SHA256 校验资源包。
+- `make scene-v9-test`：验证 Scene v9 现代组件与 `PrefabInstance` 覆盖编解码往返及旧版本兼容。
+- `make shader-cross-backend-test`：验证全部 45 个 3D 着色器的 MSL / GLSL 450 / HLSL SM 6.0 源码奇偶性、入口点与 SDL3 GPU set/space 约定（本机存在可用编译器时同步执行语法/SPIR-V/DXIL 检查）。
+- `make ui-tree-test`：验证 `UiControlTree` 固定/行列布局、`Tab`/`Shift+Tab` 焦点遍历、模态弹窗焦点隔离与 `HudRouter` 输入仲裁。
+- `make profiler-test`：验证 120 帧环形缓冲区 `FrameProfiler`（`p50`/`p95`/`p99`/作用域/JSON）与 `EngineTelemetry` GPU/资产 HUD 渲染。
+- `make bundle-test`：验证 HMAC-SHA256 签名 `BundleManifest`、SHA-256 校验、防重放序号检查、路径穿越拦截及 `BundleMount` 原子热更新与回滚。
+- `make modern-sandbox-test`：无窗口/离屏自动运行 `examples/modern_sandbox` 60 帧（串联 Scene v9、`ModernPipeline3D`、角色/载具切换、Terrain、`NavMesh` + `Crowd3D`、XuScript 协程、Audio DSP、`UiControlTree` 与 `EngineTelemetry` HUD）。
 - `make scene-soa-test`：验证 `SceneTree` 拓扑序脏标记 SoA 全局变换缓存。
 - `make ecs-parallel-test`：验证 Archetype Chunk 分块 ECS 与常驻工作池 `EcsWorkerPool` 无锁并发调度。
 - `make script-aot-test`：验证 `script/aot`（`cmd/scriptc aot-c`）双轨 C99/Xu AOT 语义一致、指令预算/除零回滚与热重载 VM 回退。
@@ -123,23 +135,23 @@ make webgl-3d-test
 
 | 子系统 | 当前可用能力 | 继续补齐的验收范围 |
 | --- | --- | --- |
-| 场景/对象 | 混合 2D/3D 树、变换、分组、生命周期、PackedScene、2D 相机与 3D 透视/正交镜头持久化、GLB/音频/脚本/光源/Sprite3D/TileMap2D 附件、方向光 CSM 与点光/聚光阴影配置、初始字段和稳定信号路由 | 实例覆盖、跨世界引用 |
-| 2D 渲染 | GPU 批次、精灵、PNG/图集、裁剪、透明、相机、位图/TrueType 文本、SDF 图元、正交/菱形等距/交错等距 TileMap、跨图集 Y 排序、视差和地面格拾取 | 2D 光照/阴影、粒子、画布特效 |
+| 场景/对象 | 混合 2D/3D 树与拓扑序脏标记 SoA 变换缓存、Archetype 分块并发 `ecs`、分组、生命周期、PackedScene、2D 相机与 3D 透视/正交镜头持久化、v9 现代组件与 `PrefabInstance` 递归实例化/SHA-256 校验/循环防护/属性覆盖、GLB/音频/脚本/光源/Sprite3D/TileMap2D 附件、方向光 CSM 与点光/聚光阴影配置、初始字段和稳定信号路由 | 跨世界持久化实体引用 |
+| 2D 渲染 | GPU 批次、精灵、PNG/图集、裁剪、透明、相机、位图/TrueType 文本、SDF 图元、正交/菱形等距/交错等距 TileMap、跨图集 Y 排序、视差、地面格拾取与 2D GPU 粒子/丝带 | 2D 光照/阴影、画布特效 |
 | 2.5D 渲染 | 等距瓦片场景、HD-2D 图集精灵、3D 深度遮挡、方向光照与轮廓阴影、正交/透视切换、瓦片编辑器、iOS 与 Android 原生运行 | 透明混合精灵、通用 2.5D 场景属性编辑 |
-| 标准 GPU | 独立设备/缓冲传输、纹理/mip、采样器、Shader、图形管线、深度/索引/实例化命令、离屏像素读回、缓冲区计算管线/dispatch、独立窗口/键鼠文本/多点触摸队列与 SDR Surface/Frame | 自绘 IME 候选/剪贴板/手柄、HDR 呈现、计算采样/纹理、间接 dispatch、立方体/3D 纹理、MRT/MSAA/存储绑定及其它高级渲染能力 |
-| 3D 渲染 | 网格/相机、Reverse-Z、法线/UV、程序网格切线生成、256 候选/每网格 16 源方向/点/聚光材质、范围/锥体剔除、场景网格视锥剔除、距离 LOD/滞回与场景保存、GPU 2× 超采样、方向/聚光/点光 3×3 PCF 阴影及 2–4 级 CSM、节点光源收集与持久化、五槽贴图、单双面、mipmap 与三线性采样 | glTF MikkTSpace 切线生成、IBL、HDR、后处理、MSAA/TAA/FXAA、屏幕误差 LOD/自动简化、级间渐变、遮挡剔除、分簇光照 |
-| 资源管线 | PNG/baseline JPEG、受限 GLB 几何/PBR/图片/采样器、受限 OBJ、ASCII/二进制 STL、实例共享、静态 GLB 项目 UID 与依赖索引、增量导入和多场景发布回滚 | 完整材质、更多模型格式、异步加载、更多项目资源类型、资源分包与运行时热替换 |
-| 脚本 | Xu 标量 VM、多入口、场景挂载、稳定 ID 信号与批量热重载 | 完整类型/对象/绑定、普通函数调用、协程、生命周期、调试器、更新分发 |
-| 动画 | 图集帧动画、glTF TRS 关键帧/LINEAR/STEP/CUBICSPLINE、四权重 CPU 线性蒙皮与独立实例 | 通用属性时间轴、GPU 蒙皮、morph、混合树、状态机、事件、根运动及动画场景持久化 |
-| 物理 | 2D AABB 与静态瓦片地面碰撞、连续扫掠和滑动，3D 静态盒/斜坡/任意三角面射线与连续扫掠、直立胶囊体网格行走与坡度限制/地面吸附/上台阶、AABB 宽相位与 CCD 防穿透、动态/运动学球体与盒体刚体（重力、弹性、3D 库仑摩擦、冲量堆叠、休眠唤醒、碰撞层掩码与触发区） | 刚体旋转惯量/角动量、关节约束、空间索引加速结构、连续触发事件与刚体组件场景持久化 |
-| 输入/时间 | 键盘与独立模拟输入源、帧边沿、固定/浮动摇杆与按钮、多指捕获/取消、固定步进、暂停 | 手柄、鼠标完整映射、重绑定、回放与时间缩放 |
-| 音频 | 静态/流式 WAV、32 路混音、分层总线、音量/声像/暂停/循环、定位/重播、逐样本淡化/交叉淡化、2D/3D 距离与声像、节点生命周期、场景 WAV/总线/声源恢复 | 压缩编解码、异步解码、音效 DSP、遮挡、Doppler、HRTF、调试工具 |
-| 游戏 UI | UiFrame 与 Xu 布局/样式、按钮/滑块等控件、文本输入、窗口事件适配、XDF1 回放和 3D HUD 叠加 | 持久控件树、场景级焦点导航/事件路由、无障碍 |
-| 导航/AI | 未实现 | 路径查询、导航网格、动态障碍、避让与行为设施 |
-| 网络游戏 | 未实现 | 会话、同步/RPC、权限、插值、预测与重连；传输复用 Xu 基础库 |
-| 编辑器 | 静态 GLB 项目的场景树、XZ 俯视放置、属性检查器、原生 GPU 透视视口、网格拾取、多选、世界轴和本地轴变换、可配置的网格/角度/缩放吸附、撤销重做、保存和预览 | 子场景与实例覆盖、脚本调试、图形导入与发布设置 |
-| 项目/导出 | Xu CLI 编译；Phone game 原生工程；微信小程序和抖音小游戏 2D/3D WebGL 工程及随包 Wasm | 编辑器导出配置、资源包/热替换、商店发布流程 |
-| 调试/性能 | 源位置错误、回归程序、GPU 像素回读、桌面关卡帧时间/RSS 与本地 Wasm 轨道旋转基线 | 断点/堆栈、GPU 执行时间、资源驻留统计、分平台性能回归门槛 |
+| 标准 GPU | 独立设备/缓冲传输、纹理/mip、采样器、Shader、图形管线、深度/索引/实例化/`draw_indexed_indirect` 命令、离屏像素读回、计算管线/存储缓冲/计算采样与存储纹理、`R32_UINT`、MRT 颜色目标、独立窗口/键鼠文本/多点触摸队列与 SDR Surface/Frame | 自绘 IME 候选/剪贴板/手柄、HDR 呈现、立方体/3D 纹理、MSAA 及其它高级渲染能力 |
+| 3D 渲染 | 网格/相机、Reverse-Z、法线/UV、程序网格切线生成、传统前向与 `16×16×24` Clustered Forward（最高 1024 光源）、Split-Sum GGX IBL、Meshlet + Hi-Z 遮挡剔除 + `R32_UINT` Visibility Buffer、距离 LOD/滞回、GPU 2× 超采样、方向/聚光/点光 3×3 PCF 与 2–4 级 CSM、`RGBA16_FLOAT` HDR + L1 SH `IrradianceGrid3D` + DDGI 光追探针 GI + GTAO + Hi-Z SSR + Bloom + ACES + TAA、投影 Decal、Froxel 体积雾、大气散射天空、分块地形与风吹植被、半透明 PBR 队列、`ModernPipeline3D` 单帧合成，以及 45/45 3D 着色器 MSL/GLSL450/HLSL-SM6 三后端源码 | glTF MikkTSpace 切线生成、屏幕误差 LOD/自动简化、Vulkan/D3D12 实机 GPU 像素对照 |
+| 资源管线 | PNG/baseline JPEG、受限 GLB 几何/PBR/图片/采样器、受限 OBJ、ASCII/二进制 STL、实例共享、静态 GLB 项目 UID 与依赖索引、增量导入、多场景发布回滚、后台协程/帧预算分片上传/LRU 显存流式管理器，以及 HMAC-SHA256 签名 `BundleManifest` 与 `BundleMount` 原子热更新/回滚 | 完整材质扩展与更多模型格式 |
+| 脚本 | Xu 零分配寄存器复用标量 VM、C99/Xu 双轨 AOT（`script/aot`）、多入口、场景挂载、稳定 ID 信号、协同协程与统一宿主 ABI 绑定（Scene/Input/Physics3D/Audio/Nav/VFX）及批量热重载 | 完整类型/对象/绑定、调试器、签名更新包分发 |
+| 动画 | 图集帧动画、glTF TRS 关键帧/LINEAR/STEP/CUBICSPLINE、Pose 代数与双剪辑 TRS/SLERP 融合、BoneMask、BlendSpace 1D/2D、状态机、Two-Bone/LookAt/FABRIK IK、Root Motion、GPU MorphSet3D、GPU 计算 3×4 线性蒙皮，以及 `animation/timeline` 通用属性时间轴（Step/Linear/Cubic-Hermite 标量、`Vec3`、RGBA8 颜色与事件轨迹） | 动画时间轴编辑器面板与状态机序列化 |
+| 物理 | 2D AABB 与静态瓦片地面碰撞、连续扫掠和滑动；3D 静态 BVH/盒/斜坡/任意三角面射线与连续扫掠、直立胶囊体、1D SAP 与增量 SAH+AVL `DynamicBvh3D`、XPBD 15 轴 OBB 互碰摩擦/柔度布料/四面体软体/刚体堆叠、6-DOF 关节与 GPU 蒙皮布娃娃、流体浮力、Ackermann/Pacejka 射线载具与 Scene v9 RigidBody3D/Joint3D 持久化 | 运行中全量约束编辑器可视化拖拽 |
+| 输入/时间 | 键盘与独立模拟输入源、帧边沿、键位重绑定/JSON 导入导出、`InputRecorder`/`InputReplayer` 确定性回放带、死区轴整形、固定/浮动摇杆与按钮、多指捕获/取消、固定步进、`ScaledClock`（倍速/暂停/顿帧 Hitstop） | 原生多手柄热插拔绑定模板 |
+| 音频 | 静态/流式 WAV、IMA ADPCM（`0x0011`）4:1 编解码、32 路混音、分层总线、每总线 DSP 效果架（RBJ Biquad/Delay/Reverb）、音量/声像/暂停/循环、定位/重播、逐样本淡化/交叉淡化、2D/3D 距离与声像、节点生命周期与场景恢复 | 异步解码、遮挡、Doppler、HRTF、调试工具 |
+| 游戏 UI | UiFrame 与 Xu 布局/样式、按钮/滑块等控件、持久 `UiControlTree`（Fixed/Row/Column 布局、`Tab`/`Shift+Tab` 焦点循环、模态焦点锁定与 `HudRouter` 仲裁）、文本输入、窗口事件适配、XDF1 回放和 3D HUD 叠加 | 完整文本选区编辑与无障碍读屏桥接 |
+| 导航/AI | 3D 导航网格构建（斜率过滤/拓扑缝合）、`A*` 区域代价寻路、XZ Funnel 路径拉直、RVO 互惠人群避障、`NavObstacleManager` 动态障碍重路由，以及 `ai/bt` 行为树与类型化黑板（Sequence/Selector/Parallel/Inverter/Repeater/Cooldown/Wait/Trace） | 可视化行为树编辑器与多层级导航网格分块 |
+| 网络游戏 | 二进制比特流（`networking/bitstream`）、UDP/可靠消息传输与模拟弱网（`SimulatedLink`）、服务端权威会话、Delta 快照、AOI 滞回兴趣管理、客户端预测/校正、Hermite 插值与 `SceneTree` 同步 | 真实互联网 NAT/穿透、跨平台确定性锁步 |
+| 编辑器 | 纯 Xu 原生 XUUI（Paper 令牌）工作区、场景树和资产栏、可缩放平移的 XZ 俯视图、属性检查器（含 Scene v9 现代组件与 `PrefabInstance` 检查/编辑）、原生 GPU 透视视口（含 `--modern` `ModernPipeline3D` 渲染路径）、网格拾取、多选、世界轴和本地轴变换、可配置的网格/角度/缩放吸附、撤销重做、保存与瓦片编辑器 | 编辑器内嵌子场景实例实时展开与覆盖编辑可视化 |
+| 项目/导出 | Xu CLI 编译；原生 XUUI 项目构建器；`nexus-project bundle-pack`/`bundle-verify` HMAC-SHA256 签名资源包（`resources/bundle`、`integration/bundle`）；Phone game 原生工程；微信小程序和抖音小游戏 2D/3D WebGL 工程及随包 Wasm | 商店发布自动化签名配置 |
+| 调试/性能 | 源位置错误、回归程序、GPU 像素回读、XACP 协议控制、120 帧滚动 `FrameProfiler`（`p50`/`p95`/`p99`/作用域/JSON）、`EngineTelemetry` GPU/资产 HUD 覆层与桌面/Wasm 基线 | 源码断点调试与分平台性能回归门槛 |
 | 平台 | macOS arm64 / Metal / CoreAudio，iPhone 8 / Metal / CoreAudio，Sony XQ-BE72 / Vulkan / AAudio，双端有原生 2D 与 3D 样例，微信/抖音 2D 与 3D 模拟器验收 | 更多手机型号、实机捏合与生命周期压力、音频中断、微信/抖音真机、Linux/Windows 真机与浏览器部署 |
 
 实施顺序优先打通端到端链路：3D 材质/纹理/光照 → 资源与场景持久化 → 动画/物理/音频/UI → 编辑器与独立导出。
@@ -252,7 +264,7 @@ PNG 文件上传、最近邻/线性采样、透明混合、GPU 裁剪、有序�
 
 ## 运行
 
-需要 **Xu 0.14.1**、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
+需要 **Xu 0.14.2-dev.2**、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
 默认通过 `pkg-config sdl3` 查找头文件；Windows 可显式传入包含 `SDL3/SDL.h` 的目录。
 桥接在运行时加载 SDL，不把 SDL 源码或二进制复制进本库。
 
@@ -305,13 +317,13 @@ make demo-glb-materials
 ./build/glb-materials --frames 120 --capture build/glb-materials.png
 ```
 
-`make sdk` 核对实际编译器版本。默认使用 PATH 中的 `xu`，也可用 `XU` 选择完整的 Xu 0.14.1 SDK。
+`make sdk` 核对实际编译器版本。默认使用 PATH 中的 `xu`，也可用 `XU` 选择完整的 Xu 0.14.2-dev.2 SDK。
 修复内容属于编译器：解析 native 模块、校验归档/目标/ABI、生成 C 调用适配和链接，调用所选 SDK 的配套工具，
 并为资源所有者及资源数组生成自动析构。标准库新增 `gpu/layout` 统一纹理格式、mip 链、行 pitch 与 mip offset 的受检计算，UI 图片上传与引擎 2D/3D 纹理共用；标准 `gpu` 已提供无窗口设备、缓冲区与异步传输、fence/读回、纹理/采样器、Shader/Pipeline 和离屏 render pass，以及 compact `[]u8` 借用 ABI。标准窗口/呈现已补齐，2D/3D 均已迁移标准事件、资源和绘制命令；PBR、场景和游戏预算仍在引擎。
 完整 SDK 的编译器、标准库和包搜索路径必须一致：
 
 ```sh
-NEXUS_XU_SDK=/path/to/xu-0.14.1
+NEXUS_XU_SDK=/path/to/xu-dev
 XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" \
 XUPATH="$NEXUS_XU_SDK/src:$NEXUS_XU_SDK/packages" XU="$NEXUS_XU_SDK/bin/xu" \
 make native-probe check test gpu-smoke smoke script-live-smoke
@@ -442,19 +454,19 @@ image_render #"github.com/xulang-org/nexus/integration/image_render/two_d"
 colors #"github.com/xulang-org/nexus/foundation/color"
 fm #"github.com/xulang-org/nexus/foundation/math"
 
-image := images.load_png("examples/arena/assets/player.png") >>>
-program := shaders.load_canvas("build/canvas-shaders") >>>
-$renderer := ren.open_2d("My 2D Game", 960, 640, gpu.AUTO, &program) >>>
-$texture := image_render.upload_image_2d(&renderer, &image, false) >>>
+image := images.load_png("examples/arena/assets/player.png") or >>
+program := shaders.load_canvas("build/canvas-shaders") or >>
+$renderer := ren.open_2d("My 2D Game", 960, 640, gpu.AUTO, &program) or >>
+$texture := image_render.upload_image_2d(&renderer, &image, false) or >>
 $batch := canvas.new_batch()
-white := colors.rgba8(255, 255, 255, 255) >>>
+white := colors.rgba8(255, 255, 255, 255) or >>
 batch.quad_region(fm.rect2(64.0, 64.0, 64.0, 64.0), fm.identity(), white,
-    fm.rect2(0.0, 0.0, 0.25, 1.0)) >>>
-renderer.begin(colors.rgba8(12, 20, 34, 255) >>>) >>>
-renderer.submit_texture(&batch, &texture) >>>
-renderer.present() >>>
-texture.close() >>>
-renderer.close() >>>
+    fm.rect2(0.0, 0.0, 0.25, 1.0)) or >>
+renderer.begin(colors.rgba8(12, 20, 34, 255) or >>) or >>
+renderer.submit_texture(&batch, &texture) or >>
+renderer.present() or >>
+texture.close() or >>
+renderer.close() or >>
 ```
 
 同一 CPU 图片可上传到不同设备，每次上传同步复制数据并返回独立 GPU 资源。
@@ -499,22 +511,22 @@ colors #"github.com/xulang-org/nexus/foundation/color"
 ren #"github.com/xulang-org/nexus/rendering/three_d"
 nexus #"github.com/xulang-org/nexus/scene"
 
-program := shaders.load_mesh("build/mesh-shaders") >>>
-$device := ren.open_3d("My 3D Game", 960, 640, gpu.AUTO, &program) >>>
+program := shaders.load_mesh("build/mesh-shaders") or >>
+$device := ren.open_3d("My 3D Game", 960, 640, gpu.AUTO, &program) or >>
 $data := meshes.new_mesh_data_3d()
-red := colors.rgba8(255, 80, 64, 255) >>>
-data.vertex(fm.vec3(-1.0, -1.0, 0.0), red) >>>
-data.vertex(fm.vec3(1.0, -1.0, 0.0), red) >>>
-data.vertex(fm.vec3(0.0, 1.0, 0.0), red) >>>
-data.triangle(0, 1, 2) >>>
-$mesh := device.upload(&data) >>>
+red := colors.rgba8(255, 80, 64, 255) or >>
+data.vertex(fm.vec3(-1.0, -1.0, 0.0), red) or >>
+data.vertex(fm.vec3(1.0, -1.0, 0.0), red) or >>
+data.vertex(fm.vec3(0.0, 1.0, 0.0), red) or >>
+data.triangle(0, 1, 2) or >>
+$mesh := device.upload(&data) or >>
 camera := nexus.new_camera_3d()
-view := camera.view_projection(1.5) >>>
-device.begin(colors.rgba8(12, 20, 34, 255) >>>) >>>
-device.draw(&mesh, view) >>>
-device.present() >>>
-mesh.close() >>>
-device.close() >>>
+view := camera.view_projection(1.5) or >>
+device.begin(colors.rgba8(12, 20, 34, 255) or >>) or >>
+device.draw(&mesh, view) or >>
+device.present() or >>
+mesh.close() or >>
+device.close() or >>
 ```
 
 `Vec3` / `Vec4` / `Mat4` 使用 f64；提交时明确转换为 IEEE binary32，列向量矩阵顺序为
@@ -550,20 +562,20 @@ colors #"github.com/xulang-org/nexus/foundation/color"
 scene_render #"github.com/xulang-org/nexus/integration/rendering/three_d"
 nexus #"github.com/xulang-org/nexus/scene"
 
-$tree := nexus.new_scene_tree_3d("World", 64) >>>
+$tree := nexus.new_scene_tree_3d("World", 64) or >>
 root := tree.root()
-pivot := tree.add_child_3d(root, "Pivot") >>>
-object := tree.add_child_3d(pivot, "Object") >>>
-tree.set_transform_3d(pivot, fm.rotation_y(0.5)) >>>
-camera_node := tree.add_child_3d(root, "Camera") >>>
-tree.set_position_3d(camera_node, fm.vec3(0.0, 0.0, 5.0)) >>>
-camera := nexus.new_camera_node_3d(&tree, camera_node) >>>
-$scene := scene_render.new_scene_3d(&device) >>>
-scene.attach_mesh(&tree, object, &mesh) >>>
-view := camera.view_projection(&tree, 1.5) >>>
-device.begin(colors.rgba8(12, 20, 34, 255) >>>) >>>
-draws := scene.draw($&device, &tree, view) >>>
-device.present() >>>
+pivot := tree.add_child_3d(root, "Pivot") or >>
+object := tree.add_child_3d(pivot, "Object") or >>
+tree.set_transform_3d(pivot, fm.rotation_y(0.5)) or >>
+camera_node := tree.add_child_3d(root, "Camera") or >>
+tree.set_position_3d(camera_node, fm.vec3(0.0, 0.0, 5.0)) or >>
+camera := nexus.new_camera_node_3d(&tree, camera_node) or >>
+$scene := scene_render.new_scene_3d(&device) or >>
+scene.attach_mesh(&tree, object, &mesh) or >>
+view := camera.view_projection(&tree, 1.5) or >>
+device.begin(colors.rgba8(12, 20, 34, 255) or >>) or >>
+draws := scene.draw($&device, &tree, view) or >>
+device.present() or >>
 ```
 
 普通分组传递同一维度的祖先变换；遇到另一维度的节点时，变换继承从该边界重新开始。
@@ -612,13 +624,13 @@ light_data #"github.com/xulang-org/nexus/resources/lighting"
 fm #"github.com/xulang-org/nexus/foundation/math"
 ren #"github.com/xulang-org/nexus/rendering/three_d"
 
-material := ren.material_3d(fm.vec3(0.5, 0.15, 0.05), 0.0, 0.4, fm.vec3(0.0, 0.0, 0.0)) >>>
-source := light_data.directional(fm.vec3(0.5, 1.0, 1.0), fm.vec3(4.0, 4.0, 4.0)) >>>
-lighting := light_data.environment(fm.vec3(0.03, 0.03, 0.03), camera_position, 1.0, [source]) >>>
-scene.set_material(&tree, object, material) >>>
-device.begin(background) >>>
-scene.draw_lit($&device, &tree, view_projection, &lighting) >>>
-device.present() >>>
+material := ren.material_3d(fm.vec3(0.5, 0.15, 0.05), 0.0, 0.4, fm.vec3(0.0, 0.0, 0.0)) or >>
+source := light_data.directional(fm.vec3(0.5, 1.0, 1.0), fm.vec3(4.0, 4.0, 4.0)) or >>
+lighting := light_data.environment(fm.vec3(0.03, 0.03, 0.03), camera_position, 1.0, [source]) or >>
+scene.set_material(&tree, object, material) or >>
+device.begin(background) or >>
+scene.draw_lit($&device, &tree, view_projection, &lighting) or >>
+device.present() or >>
 ```
 
 材质的 base 为线性 RGB 0...1、metallic 为 0...1、roughness 为 0.045...1、emission 为线性 RGB 0...16。
@@ -655,11 +667,11 @@ make demo-textures3d
 images #"github.com/xulang-org/nexus/assets/image"
 image_render #"github.com/xulang-org/nexus/integration/image_render/three_d"
 
-image := images.load_png("base-color.png") >>>
+image := images.load_png("base-color.png") or >>
 // 参数依次为：sRGB、线性过滤、重复寻址；这里使用 sRGB + linear + repeat。
-$texture := image_render.upload_image_3d(&device, &image, true, true, true) >>>
-textured := material.with_base_texture(&texture) >>>
-scene.set_material(&tree, object, textured) >>>
+$texture := image_render.upload_image_3d(&device, &image, true, true, true) or >>
+textured := material.with_base_texture(&texture) or >>
+scene.set_material(&tree, object, textured) or >>
 // texture 保持存活直到使用该材质的绘制结束；without_base_texture() 返回移除贴图的材质副本。
 ```
 
@@ -711,10 +723,10 @@ sampling := ren.TextureSampling3D{
     repeat_u: true, repeat_v: false,
     mip_filter: ren.MIP_LINEAR,
 }
-$texture := image_render.upload_image_3d_sampled(&device, &image, true, sampling) >>>
+$texture := image_render.upload_image_3d_sampled(&device, &image, true, sampling) or >>
 // 也可使用 device.texture_rgba_sampled(width, height, &pixels, srgb, sampling)。
-levels := texture.mip_levels() >>>
-texel_bytes := texture.storage_bytes() >>>
+levels := texture.mip_levels() or >>
+texel_bytes := texture.storage_bytes() or >>
 ```
 
 `TextureSampling3D` 只描述上传时的采样策略，不是单独的 GPU 资源所有者；纹理继续拥有图像和采样器。
@@ -754,12 +766,12 @@ make demo-material-maps
 
 ```xu
 // CPU 图片和加载入口保持原有分层；ORM 用 srgb=false 上传。
-$orm_texture := image_render.upload_image_3d_sampled(&device, &orm_image, false, sampling) >>>
-$emission_texture := image_render.upload_image_3d_sampled(&device, &emission_image, true, sampling) >>>
-color_material := material.with_base_texture(&base_texture) >>>
-orm_material := color_material.with_orm_texture(&orm_texture, 1.0) >>>
-mapped := orm_material.with_emission_texture(&emission_texture) >>>
-scene.set_material(&tree, object, mapped) >>>
+$orm_texture := image_render.upload_image_3d_sampled(&device, &orm_image, false, sampling) or >>
+$emission_texture := image_render.upload_image_3d_sampled(&device, &emission_image, true, sampling) or >>
+color_material := material.with_base_texture(&base_texture) or >>
+orm_material := color_material.with_orm_texture(&orm_texture, 1.0) or >>
+mapped := orm_material.with_emission_texture(&emission_texture) or >>
+scene.set_material(&tree, object, mapped) or >>
 ```
 
 贴图计算在 GPU 线性空间内进行，数据通道约定参考 [glTF 材质规范](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#materials)。
@@ -804,10 +816,10 @@ make demo-normal-maps
 
 ```xu
 // 切线 XYZ 为沿纹理 U 的方向，W 为手性 ±1；法线和切线在构建时归一化。
-data.vertex_tangent(position, color, normal, uv, fm.vec4(tx, ty, tz, 1.0)) >>>
-$normal_texture := image_render.upload_image_3d_sampled(&device, &normal_image, false, sampling) >>>
-mapped := material.with_normal_texture(&normal_texture, 1.0) >>>
-scene.set_material(&tree, object, mapped) >>>
+data.vertex_tangent(position, color, normal, uv, fm.vec4(tx, ty, tz, 1.0)) or >>
+$normal_texture := image_render.upload_image_3d_sampled(&device, &normal_image, false, sampling) or >>
+mapped := material.with_normal_texture(&normal_texture, 1.0) or >>
+scene.set_material(&tree, object, mapped) or >>
 ```
 
 `vertex_tangent` 要求不透明顶点色、有限非零法线/切线 XYZ、二者垂直、W 精确为 -1 或 +1；UV 预算沿用既有约定。
@@ -826,8 +838,8 @@ meshes #"github.com/xulang-org/nexus/resources/mesh"
 
 $source := meshes.new_mesh_data_3d()
 // vertex_lit_uv(...) 填充每个顶点的 position / normal / UV，再添加 triangle(...)。
-added_vertices := source.generate_tangents() >>>
-$uploaded := device.upload(&source) >>>
+added_vertices := source.generate_tangents() or >>
+$uploaded := device.upload(&source) or >>
 ```
 
 算法按三角形 UV 梯度和顶点夹角加权，正交化到已有法线；按原顶点索引累积，不焊接独立 UV/法线接缝。
@@ -888,9 +900,9 @@ GLB 继续使用 `assets/gltf` 的层级/材质接口，没有压成单一网格
 ```xu
 mesh_files #"github.com/xulang-org/nexus/assets/mesh"
 
-data := mesh_files.load("assets/model.obj") >>>
-mesh := device.upload(&data) >>>
-scene.attach_mesh(&tree, node, &mesh) >>>
+data := mesh_files.load("assets/model.obj") or >>
+mesh := device.upload(&data) or >>
+scene.attach_mesh(&tree, node, &mesh) or >>
 // 调用方持有 mesh 的生命周期；场景仅保存弱引用。
 ```
 
@@ -932,11 +944,11 @@ IEEE 位转换复用标准 `math.float32_from_bits`，GLB/WAV 自行检查有限
 assets #"github.com/xulang-org/nexus/assets/gltf"
 glb #"github.com/xulang-org/nexus/integration/gltf_render"
 
-asset := assets.load_glb_geometry("model.glb") >>>
+asset := assets.load_glb_geometry("model.glb") or >>
 root := tree.root()
-instance := assets.instantiate(&asset, $&tree, root, "Model") >>>
-$model := glb.upload_unlit(&device, &asset) >>>
-model.bind($&scene, &tree, &instance) >>>
+instance := assets.instantiate(&asset, $&tree, root, "Model") or >>
+$model := glb.upload_unlit(&device, &asset) or >>
+model.bind($&scene, &tree, &instance) or >>
 // 此后通过 scene.draw 绘制；model 保持存活直到这些绑定停止使用。
 ```
 
@@ -987,8 +999,8 @@ GPU 上传同时受全局 512 活动网格和每设备 64 MiB 预算限制；也
 
 ```xu
 // asset / tree / instance 的创建与几何示例相同。
-$model := glb.upload_model(&device, &asset) >>>
-model.bind($&scene, &tree, &instance) >>>
+$model := glb.upload_model(&device, &asset) or >>
+model.bind($&scene, &tree, &instance) or >>
 // 每帧使用 scene.draw_lit；model 拥有网格和图片，须保持存活。
 ```
 
@@ -1055,12 +1067,12 @@ make external-model-test
 最多 128 片段、每片段 4,096 通道/采样器，累计 262,144 个输出键；输入时间有限、非负、严格递增，输出数量/形状和旋转单位长度均检查。单 skin 最多 256 关节、每资产最多 128 skin；联合检查节点、逆绑定矩阵、四个索引/权重及权重总和。
 
 ```xu
-$player := glb.upload_animated(&device, &asset) >>>
+$player := glb.upload_animated(&device, &asset) or >>
 // 每帧 begin 之前显式采样。instance 为 assets/gltf.instantiate 的结果。
-player.sample(&device, $&scene, $&tree, &asset, &instance, clip_index, seconds) >>>
-device.begin(background) >>>
-scene.draw_lit($&device, &tree, view_projection, &lighting) >>>
-device.present() >>>
+player.sample(&device, $&scene, $&tree, &asset, &instance, clip_index, seconds) or >>
+device.begin(background) or >>
+scene.draw_lit($&device, &tree, view_projection, &lighting) or >>
+device.present() or >>
 ```
 
 `GlbAnimated3D` 为各实例持有独立姿态网格，先准备全部 CPU 姿态和 GPU 网格，再校验节点/绑定并发布；坏片段、失效/待删除节点和上传失败保留上一轮已接受的姿态。CPU 线性混合蒙皮使用 `inverse(meshWorld) * jointWorld * inverseBind`，同时变换位置、法线与切线，更新后的包围盒参与现有视锥/光源筛选。
@@ -1124,14 +1136,14 @@ RGB 4:4:4、4:2:0、灰度和奇数尺寸结果与独立 libjpeg/Pillow 比较�
 files #"github.com/xulang-org/nexus/integration/scene"
 camera_data #"github.com/xulang-org/nexus/resources/camera"
 
-lens := camera_data.perspective(0.94, 0.2, 96.0) >>>
-tree.set_camera_3d(camera_node, lens) >>>
-document := files.capture_nodes(&tree, subtree_root) >>>
-files.save("world.xuscene", &document) >>>
-loaded := files.load("world.xuscene") >>>
-packed := files.to_packed(&loaded) >>>
+lens := camera_data.perspective(0.94, 0.2, 96.0) or >>
+tree.set_camera_3d(camera_node, lens) or >>
+document := files.capture_nodes(&tree, subtree_root) or >>
+files.save("world.xuscene", &document) or >>
+loaded := files.load("world.xuscene") or >>
+packed := files.to_packed(&loaded) or >>
 parent := tree.root()
-instance := packed.instantiate($&tree, parent, "Loaded") >>>
+instance := packed.instantiate($&tree, parent, "Loaded") or >>
 // 只实例化一次时，也可 files.instantiate(&loaded, $&tree, parent, "Loaded")。
 ```
 
@@ -1177,12 +1189,12 @@ GLB 来源和表面附件见下节；静态 GLB 项目级 UID 索引和增量重
 ```xu
 loader #"github.com/xulang-org/nexus/integration/scene_render"
 
-$models := loader.load(&device, "world.xuscene") >>>
+$models := loader.load(&device, "world.xuscene") or >>
 parent := tree.root()
-instance := models.instantiate($&scene, $&tree, parent, "World") >>>
+instance := models.instantiate($&scene, $&tree, parent, "World") or >>
 // 读取活动相机的世界位置，在 scene.draw_lit 前调用 scene.select_lods。
 // models 必须在这些弱引用绘制期间存活。
-models.save("saved.xuscene", &tree, instance) >>>
+models.save("saved.xuscene", &tree, instance) or >>
 ```
 
 资源声明示例（省略节点数组）：
@@ -1304,12 +1316,12 @@ CPU 与真实 GPU 回归用两个场景共享一个 GLB，同时保留第三个�
 worlds #"github.com/xulang-org/nexus/integration/scene_audio"
 audio #"github.com/xulang-org/nexus/audio"
 
-$world := worlds.load("audio.xuscene", 48000) >>>
-$output := audio.open_output(world.sample_rate()) >>>
-world.pump(&output, 2048, 512) >>>
-output.pause(false) >>>
+$world := worlds.load("audio.xuscene", 48000) or >>
+$output := audio.open_output(world.sample_rate()) or >>
+world.pump(&output, 2048, 512) or >>
+output.pause(false) or >>
 // 游戏循环持续调用 world.pump；编辑 world.tree 中的节点位姿/处理模式。
-world.save("saved.xuscene") >>>
+world.save("saved.xuscene") or >>
 // 退出时先 pause/clear/close 外部 output，再关闭 world。
 ```
 
@@ -1336,10 +1348,10 @@ world.save("saved.xuscene") >>>
 同时含音频和表面的文件需要显式组合两类服务，避免漏掉另一类附件：
 
 ```xu
-$world := worlds.load_audio("av.xuscene", 48000) >>>
-document := world.capture() >>>
-$models := loader.prepare_surfaces(&device, document, world.base_directory()) >>>
-models.bind($&scene, &world.tree, world.root()) >>>
+$world := worlds.load_audio("av.xuscene", 48000) or >>
+document := world.capture() or >>
+$models := loader.prepare_surfaces(&device, document, world.base_directory()) or >>
+models.bind($&scene, &world.tree, world.root()) or >>
 // GPU 资源也准备成功后再开启输出；使用同一 world.tree 绘制和同步声音。
 ```
 
@@ -1368,13 +1380,13 @@ make demo-scene-av
 ```xu
 scripting #"github.com/xulang-org/nexus/integration/scene_script"
 
-$scripts := scripting.load("scripts.xuscene") >>>
+$scripts := scripting.load("scripts.xuscene") or >>
 parent := tree.root()
-instance := scripts.instantiate($&tree, parent, "Level") >>>
-movement := scripts.physics_process(&tree, 0, delta, axis) >>>
-report := scripts.dispatch(&tree, 64) >>>
+instance := scripts.instantiate($&tree, parent, "Level") or >>
+movement := scripts.physics_process(&tree, 0, delta, axis) or >>
+report := scripts.dispatch(&tree, 64) or >>
 // movement 由应用显式用于更新节点；VM 内部没有持有可变引擎对象。
-scripts.save("saved.xuscene", &tree) >>>
+scripts.save("saved.xuscene", &tree) or >>
 ```
 
 每个脚本附件声明节点索引、资源 ID 和初始字段覆盖；字段使用 schema 稳定 ID。
@@ -1390,7 +1402,7 @@ scripts.save("saved.xuscene", &tree) >>>
 热重载是显式的本地候选激活，运行时不引入编译器：
 
 ```xu
-changed := scripts.reload_from(&tree, resource_uid, "updates/mover.xubc") >>>
+changed := scripts.reload_from(&tree, resource_uid, "updates/mover.xubc") or >>
 ```
 
 候选先通过字节码、模块/类身份和场景契约检查，再复制管理器槽位（含字段值、退役 ID 历史和待发信号），
@@ -1435,14 +1447,14 @@ audio #"github.com/xulang-org/nexus/audio"
 mix #"github.com/xulang-org/nexus/audio/mixer"
 assets #"github.com/xulang-org/nexus/assets/audio"
 
-clip := assets.load_wav("examples/audio/assets/chime.wav") >>>
-$mixer := mix.new_mixer(48000, 32) >>>
-music := mixer.add_bus(0, "Music", 0.5) >>>
-clip_id := mixer.add_clip(clip) >>>
-voice := mixer.play(clip_id, music, 0.35, 0.0, true) >>>
-$output := audio.open_output(48000) >>>
-audio.pump(&output, $&mixer, 2048, 512) >>>
-output.pause(false) >>>
+clip := assets.load_wav("examples/audio/assets/chime.wav") or >>
+$mixer := mix.new_mixer(48000, 32) or >>
+music := mixer.add_bus(0, "Music", 0.5) or >>
+clip_id := mixer.add_clip(clip) or >>
+voice := mixer.play(clip_id, music, 0.35, 0.0, true) or >>
+$output := audio.open_output(48000) or >>
+audio.pump(&output, $&mixer, 2048, 512) or >>
+output.pause(false) or >>
 // 游戏循环每隔数毫秒调用 pump；输出速度由音频设备消费决定。
 // mixer.set_volume / set_pan / pause_voice / stop 控制这次播放。
 ```
@@ -1495,10 +1507,10 @@ make audio-smoke      # 默认设备运行静态/流式示例；无设备时明�
 ```xu
 music #"github.com/xulang-org/nexus/integration/audio_stream"
 
-$track := music.open($&mixer, "music.wav", 8192, true) >>>
-track.refill($&mixer, 4096) >>>
-voice := mixer.play_stream(track.source_id(), music_bus, 0.0, 0.0) >>>
-mixer.fade_volume(voice, 0.5, 4800, false) >>>
+$track := music.open($&mixer, "music.wav", 8192, true) or >>
+track.refill($&mixer, 4096) or >>
+voice := mixer.play_stream(track.source_id(), music_bus, 0.0, 0.0) or >>
+mixer.fade_volume(voice, 0.5, 4800, false) or >>
 // 循环中先 refill，再 audio.pump；48 kHz 输出下 4800 帧为 0.1 秒。
 // 离开时 track.close(mixer)，释放源缓冲并关闭文件。
 ```
@@ -1527,10 +1539,10 @@ mixer.fade_volume(voice, 0.5, 4800, false) >>>
 失败保留原 PCM、逻辑文件游标、播放状态、淡化和有效预览块。已打开的描述符仍固定，定位不会重新打开路径。
 
 ```xu
-actual_frame := track.seek_seconds($&mixer, 0.5) >>>
-position := track.position_seconds(&mixer) >>>
+actual_frame := track.seek_seconds($&mixer, 0.5) or >>
+position := track.position_seconds(&mixer) or >>
 duration := track.duration_seconds()
-track.restart($&mixer) >>>
+track.restart($&mixer) or >>
 ```
 
 - 定位范围包含文件末尾，时间按源采样率舍入到最近帧（中点取偶数）；方法返回实际目标源帧。循环音源定位到末尾会规范化为帧零。
@@ -1659,12 +1671,12 @@ NodeScript 必须始终配合同一棵树使用，尚无跨世界 NodeRef、完�
 同节点卸载并重新挂脚本后也会生成不同 ID。ID 仅属于当前管理器，管理器始终配合同一 SceneTree、同一 owner 线程使用。
 
 ```xu
-$scripts := host.new_scene_scripts(8) >>>
-source := scripts.attach(&tree, actor, player_program) >>>
-receiver := scripts.attach(&tree, indicator, indicator_program) >>>
-scripts.connect(&tree, source, "moved", receiver, "on_moved") >>>
-scripts.physics_process(&tree, source, delta, axis) >>>
-report := scripts.dispatch(&tree, host.DEFAULT_DISPATCH_LIMIT) >>>
+$scripts := host.new_scene_scripts(8) or >>
+source := scripts.attach(&tree, actor, player_program) or >>
+receiver := scripts.attach(&tree, indicator, indicator_program) or >>
+scripts.connect(&tree, source, "moved", receiver, "on_moved") or >>
+scripts.physics_process(&tree, source, delta, axis) or >>
+report := scripts.dispatch(&tree, host.DEFAULT_DISPATCH_LIMIT) or >>
 ```
 
 处理函数仍使用 Xu 方法语法，例如 `fn (self $&Indicator) on_moved(value f64) f64`。
@@ -1709,7 +1721,7 @@ report := scripts.dispatch(&tree, host.DEFAULT_DISPATCH_LIMIT) >>>
 ```yaml
 module: example/my_game
 version: !ver 0.1.0
-xu: !ver 0.14.1
+xu: !ver 0.14.2-dev.2
 require:
   "github.com/xulang-org/nexus": file:/path/to/nexus
 ```
@@ -1723,10 +1735,10 @@ controls #"github.com/xulang-org/nexus/input"
 timing #"github.com/xulang-org/nexus/timing"
 physics #"github.com/xulang-org/nexus/physics2d"
 
-$tree := scene.new_scene_tree("World", 128) >>>
-player := tree.add_child(tree.root(), "Player") >>>
-tree.set_position(player, fm.vec2(64.0, 64.0)) >>>
-$clock := timing.new_clock(60, 8) >>>
+$tree := scene.new_scene_tree("World", 128) or >>
+player := tree.add_child(tree.root(), "Player") or >>
+tree.set_position(player, fm.vec2(64.0, 64.0)) or >>
+$clock := timing.new_clock(60, 8) or >>
 $input := controls.new_input_map()
 // 主循环读取平台事件，通过 integration/input 更新 input，
 // 用 clock.advance 安排固定步进，physics.move_and_slide 计算位移，
@@ -1837,8 +1849,8 @@ while !quit {
         ctrl.poll($&tree, $&input)
         if ctrl.screenshot_requested() {
             shot_path := "build/shot.png"
-            renderer.capture(shot_path + "") >>>
-            ctrl.fulfill_screenshot(renderer.width() >>>, renderer.height() >>>, shot_path)
+            renderer.capture(shot_path + "") or >>
+            ctrl.fulfill_screenshot(renderer.width() or >>, renderer.height() or >>, shot_path)
         }
     }
     // ... 原有事件轮询、物理步进与渲染流程 ...
@@ -1878,13 +1890,13 @@ sprite_anim #"github.com/xulang-org/nexus/animation/sprite"
 images #"github.com/xulang-org/nexus/assets/image"
 image_render #"github.com/xulang-org/nexus/integration/image_render/two_d"
 
-camera := nexus.new_camera_2d(960.0, 640.0) >>>
-view := camera.view_transform(f64(width), f64(height)) >>>
-viewport := camera.viewport(f64(width), f64(height)) >>>
-image := images.load_png("assets/player.png") >>>
-$atlas := image_render.upload_image_2d(&renderer, &image, false) >>>
-clip := sprite_anim.new_atlas_animation(4, 1, 0, 4, 8.0, true) >>>
-$animator := sprite_anim.new_sprite_animator(clip) >>>
+camera := nexus.new_camera_2d(960.0, 640.0) or >>
+view := camera.view_transform(f64(width), f64(height)) or >>
+viewport := camera.viewport(f64(width), f64(height)) or >>
+image := images.load_png("assets/player.png") or >>
+$atlas := image_render.upload_image_2d(&renderer, &image, false) or >>
+clip := sprite_anim.new_atlas_animation(4, 1, 0, 4, 8.0, true) or >>
+$animator := sprite_anim.new_sprite_animator(clip) or >>
 ```
 
 在固定更新中调用 `animator.advance(delta_seconds)`，绘制前将 `animator.region()` 赋给
@@ -2036,7 +2048,7 @@ MSL、GLSL、HLSL 源码与独立 shader 准备工具均已提供；本机真实
 ## 标准窗口输入与引擎动作示例
 
 ```sh
-NEXUS_XU_SDK=/path/to/xu-0.14.1
+NEXUS_XU_SDK=/path/to/xu-dev
 XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" XUPATH="$NEXUS_XU_SDK/src" XU="$NEXUS_XU_SDK/bin/xu" make window-input-smoke
 ./build/window-input --frames 600
 ```
@@ -2078,12 +2090,12 @@ lights #"github.com/xulang-org/nexus/resources/lighting"
 light_scene #"github.com/xulang-org/nexus/integration/lighting"
 
 $world := light_scene.new_scene_lights_3d()
-source := lights.point(fm.vec3(0.0, 0.0, 0.0), fm.vec3(12.0, 2.0, 1.0), 8.0) >>>
-world.attach(&tree, light_node, source) >>>
+source := lights.point(fm.vec3(0.0, 0.0, 0.0), fm.vec3(12.0, 2.0, 1.0), 8.0) or >>
+world.attach(&tree, light_node, source) or >>
 // 修改 Node3D 的变换/可见性后重新收集；不创建 GPU 资源。
-sources := world.gather(&tree) >>>
-environment := lights.environment(fm.vec3(0.02, 0.02, 0.02), camera_position, 1.0, sources) >>>
-scene.draw_lit($&device, &tree, view_projection, &environment) >>>
+sources := world.gather(&tree) or >>
+environment := lights.environment(fm.vec3(0.02, 0.02, 0.02), camera_position, 1.0, sources) or >>
+scene.draw_lit($&device, &tree, view_projection, &environment) or >>
 ```
 
 - `directional(toward_light, radiance)`：方向为表面指向光源，归一化后使用。
@@ -2112,17 +2124,17 @@ D/P/S 分别切换方向光/点光/聚光，方向键环绕，Space 暂停光源
 
 ```xu
 // 方向光：固定世界覆盖体，朝向光源的方向与环境中相应灯一致。
-description := shadow.directional(center, toward_light, 4.0, 16.0, 1024) >>>
+description := shadow.directional(center, toward_light, 4.0, 16.0, 1024) or >>
 // 聚光灯使用 shadow.spot(source, 0.1, 1024)。
 // 点光源使用 shadow.point(source, 0.1, 512)。source 是对应 Light3D。
-program := shaders.load_shadow("build/mesh-shaders") >>>
-$shadow_map := device.shadow_map(description, &program) >>>
+program := shaders.load_shadow("build/mesh-shaders") or >>
+$shadow_map := device.shadow_map(description, &program) or >>
 // 每帧先应用动画/LOD，在主帧 begin 前更新全部投影。
-casters := scene.shadow_casters(&tree) >>>
-submitted_triangles := shadow_map.render(&device, &casters, description) >>>
-device.begin(255) >>>
-scene.draw_lit_shadowed($&device, &tree, view_projection, &environment, &shadow_map, 0) >>>
-device.present() >>>
+casters := scene.shadow_casters(&tree) or >>
+submitted_triangles := shadow_map.render(&device, &casters, description) or >>
+device.begin(255) or >>
+scene.draw_lit_shadowed($&device, &tree, view_projection, &environment, &shadow_map, 0) or >>
+device.present() or >>
 ```
 
 `directional(center,toward_light,half_extent,depth,resolution)` 使用 texel 对齐的正交 Reverse-Z 覆盖体；`spot(source,near,resolution)` 从聚光灯的位置、发射方向、影响半径和外锥余弦生成透视投影。
@@ -2156,12 +2168,12 @@ make shadow-core-test shadow-gpu-test gpu-failure-test
 `shadow.cascade_camera(view,projection)` 接受仿射世界到相机矩阵与居中的有限 Reverse-Z 投影，支持透视和正交镜头。`integration/rendering/three_d.cascade_scene_camera` 从 Node3D 当前镜头及父级世界变换取得两种投影。显式透视相机可继续使用 `cascade_camera` 或 `cascade_node_camera`。偏轴和抖动投影仍待支持。
 
 ```xu
-shadow_camera := scene_render.cascade_scene_camera(&tree, camera_node, aspect) >>>
+shadow_camera := scene_render.cascade_scene_camera(&tree, camera_node, aspect) or >>
 $settings := shadow.default_cascades()
 settings.count=4
 settings.distance=50.0
-description := shadow.cascaded(directional_light,shadow_camera,settings) >>>
-$shadow_map := device.shadow_map(description,&program) >>>
+description := shadow.cascaded(directional_light,shadow_camera,settings) or >>
+$shadow_map := device.shadow_map(description,&program) or >>
 // 相机、镜头或光源方向变化后，重新构造 description 并在主帧外 render。
 ```
 
@@ -2238,12 +2250,12 @@ light_files #"github.com/xulang-org/nexus/integration/scene_lighting"
 files #"github.com/xulang-org/nexus/integration/scene"
 
 // 显式捕获节点和当前局部光源，不推断其它服务附件。
-document := light_files.capture_nodes(&world, &tree, light_root) >>>
-files.save("lights.xuscene", &document) >>>
+document := light_files.capture_nodes(&world, &tree, light_root) or >>
+files.save("lights.xuscene", &document) or >>
 
-restored := files.load("lights.xuscene") >>>
+restored := files.load("lights.xuscene") or >>
 parent := target.root()
-root := light_files.instantiate(&restored, $&target_lights, $&target, parent, "Lights") >>>
+root := light_files.instantiate(&restored, $&target_lights, $&target, parent, "Lights") or >>
 ```
 
 `instantiate` 在目标树变更前检查光源容量，并复用 PackedScene 的名称/节点容量预检；`bind(document, world, tree, root)` 用于已建立的混合服务场景，按完整拓扑匹配后整批预检。任何预期绑定错误均不发布部分替换；文件未声明的既有绑定保持不变，移除时显式 `detach`。
@@ -2269,11 +2281,11 @@ make scene-lighting-test scene-lighting-services-test lighting-demo-test
 
 ```xu
 // 纯 CPU 查询：不依赖 Mesh3D、SceneTree、GPU 或窗口。
-selected := environment.for_bounds(world_box) >>>
+selected := environment.for_bounds(world_box) or >>
 assert(selected.source_count() <= lights.MAX_LIGHTS)
 
 // 绘制后读取当前/最后一帧的 CPU 录制计数。
-stats := device.lighting_stats() >>>
+stats := device.lighting_stats() or >>
 println("candidates=" + str(stats.candidates) + " selected=" + str(stats.selected))
 ```
 
@@ -2296,10 +2308,10 @@ make light-culling-core-test light-culling-gpu-test lighting-demo-test
 触碰边界、乘加消减、binary32 舍入或计算溢出引起的不确定情况会保留。基础数学 `Aabb3.intersects_clip(matrix, relative_error, absolute_error)` 可独立于场景/设备使用；渲染层负责选择浮点容差与 GPU 量化策略。
 
 ```xu
-device.begin(background) >>>
-report := scene.draw_lit($&device, &tree, view_projection, &environment) >>>
+device.begin(background) or >>
+report := scene.draw_lit($&device, &tree, view_projection, &environment) or >>
 println("submitted=" + str(report.instances) + " culled=" + str(report.culled_instances))
-device.present() >>>
+device.present() or >>
 ```
 
 离屏网格仍校验弱资源、材质贴图及原有变换/标量约束；关闭/跨设备资源、奇异法线变换或超出 ±1e9 的 GPU 标量不会被剔除隐藏。全场景无提交时仍要求有效且未 readback 封闭的活动帧。隐藏/排队删除节点沿用原有跳过规则。
@@ -2322,13 +2334,13 @@ make frustum-core-test frustum-gpu-test lighting-demo-test
 ```xu
 lod_data #"github.com/xulang-org/nexus/resources/lod"
 
-policy := lod_data.distance_lod([12.0, 22.0], 0.1) >>>
-scene.attach_lods(&tree, node, [high.reference(), medium.reference(), low.reference()], &policy) >>>
+policy := lod_data.distance_lod([12.0, 22.0], 0.1) or >>
+scene.attach_lods(&tree, node, [high.reference(), medium.reference(), low.reference()], &policy) or >>
 // 每次相机/节点变换更新后、绘制前显式选择。
-selection := scene.select_lods(&tree, camera_position) >>>
-device.begin(background) >>>
-report := scene.draw_lit($&device, &tree, view_projection, &environment) >>>
-device.present() >>>
+selection := scene.select_lods(&tree, camera_position) or >>
+device.begin(background) or >>
+report := scene.draw_lit($&device, &tree, view_projection, &environment) or >>
+device.present() or >>
 ```
 
 距离为相机位置到 Node3D 世界原点的欧氏距离，包含祖先平移；网格尺寸或节点缩放不会自动改变阈值。策略不解析投影矩阵，也不使用光照眼点隐式切换。多相机若需独立滞回历史，使用独立 Scene3D 绑定集合，GPU 网格所有者可共享。

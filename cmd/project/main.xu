@@ -1,7 +1,10 @@
 @main
 
 proj #"github.com/xulang-org/nexus/integration/project"
+bm #"github.com/xulang-org/nexus/integration/bundle"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
 #os
+#strconv
 #errors
 
 fn print_help() {
@@ -10,6 +13,8 @@ fn print_help() {
     println("  scene <name> --output <dir>")
     println("  register <project.json> <source>")
     println("  relocate <project.json> <uid> <source>")
+    println("  bundle-pack <project.json> --output <dir> --bundle-id <id> --sequence <N> --key <secret>")
+    println("  bundle-verify <bundle_dir> --key <secret>")
 }
 
 fn has_help_flag(args &[]string, start int) bool {
@@ -34,23 +39,23 @@ fn run_build(args &[]string) int {
         arg := args[i] + ""
         if arg == "--output" {
             i = i + 1
-            if i >= args.len { >>> errors.new("missing value for --output") }
+            if i >= args.len { >> errors.new("missing value for --output") }
             output_dir = args[i] + ""
         } else if arg == "--validator" {
             i = i + 1
-            if i >= args.len { >>> errors.new("missing value for --validator") }
+            if i >= args.len { >> errors.new("missing value for --validator") }
             validator = args[i] + ""
         } else if project_path.len == 0 {
             project_path = arg
         } else {
-            >>> errors.new("unexpected argument: " + arg)
+            >> errors.new("unexpected argument: " + arg)
         }
         i = i + 1
     }
     if project_path.len == 0 || output_dir.len == 0 {
-        >>> errors.new("usage: nexus-project build <project.json> --output <dir> [--validator <bin>]")
+        >> errors.new("usage: nexus-project build <project.json> --output <dir> [--validator <bin>]")
     }
-    res := proj.publish(project_path, output_dir, validator) >>>
+    res := proj.publish(project_path, output_dir, validator) or >>
     println(res.generation + " rebuilt=" + str(res.rebuilt_assets) + " reused=" + str(res.reused_assets))
     << 0
 }
@@ -67,19 +72,19 @@ fn run_scene(args &[]string) int {
         arg := args[i] + ""
         if arg == "--output" {
             i = i + 1
-            if i >= args.len { >>> errors.new("missing value for --output") }
+            if i >= args.len { >> errors.new("missing value for --output") }
             output_dir = args[i] + ""
         } else if name.len == 0 {
             name = arg
         } else {
-            >>> errors.new("unexpected argument: " + arg)
+            >> errors.new("unexpected argument: " + arg)
         }
         i = i + 1
     }
     if name.len == 0 || output_dir.len == 0 {
-        >>> errors.new("usage: nexus-project scene <name> --output <dir>")
+        >> errors.new("usage: nexus-project scene <name> --output <dir>")
     }
-    resolved := proj.published_scene(output_dir, name) >>>
+    resolved := proj.published_scene(output_dir, name) or >>
     println(resolved)
     << 0
 }
@@ -90,9 +95,9 @@ fn run_register(args &[]string) int {
         << 0
     }
     if args.len != 4 {
-        >>> errors.new("usage: nexus-project register <project.json> <source>")
+        >> errors.new("usage: nexus-project register <project.json> <source>")
     }
-    uid := proj.register_asset(args[2] + "", args[3] + "") >>>
+    uid := proj.register_asset(args[2] + "", args[3] + "") or >>
     println(uid)
     << 0
 }
@@ -103,10 +108,94 @@ fn run_relocate(args &[]string) int {
         << 0
     }
     if args.len != 5 {
-        >>> errors.new("usage: nexus-project relocate <project.json> <uid> <source>")
+        >> errors.new("usage: nexus-project relocate <project.json> <uid> <source>")
     }
-    proj.relocate_asset(args[2] + "", args[3] + "", args[4] + "") >>>
+    proj.relocate_asset(args[2] + "", args[3] + "", args[4] + "") or >>
     println(args[3] + "")
+    << 0
+}
+
+fn run_bundle_pack(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project bundle-pack <project.json> --output <dir> --bundle-id <id> --sequence <N> --key <secret>")
+        << 0
+    }
+    $project_path := ""
+    $output_dir := ""
+    $bundle_id := ""
+    $seq_str := ""
+    $signing_key := ""
+    $i := 2
+    while i < args.len {
+        arg := args[i] + ""
+        if arg == "--output" && i + 1 < args.len {
+            output_dir = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--bundle-id" && i + 1 < args.len {
+            bundle_id = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--sequence" && i + 1 < args.len {
+            seq_str = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--key" && i + 1 < args.len {
+            signing_key = args[i + 1] + ""
+            i = i + 2
+        } else if project_path.len == 0 {
+            project_path = arg
+            i = i + 1
+        } else {
+            >> errors.new("unexpected argument in bundle-pack: " + arg)
+        }
+    }
+    if project_path.len == 0 || output_dir.len == 0 || bundle_id.len == 0 || seq_str.len == 0 || signing_key.len == 0 {
+        >> errors.new("usage: nexus-project bundle-pack <project.json> --output <dir> --bundle-id <id> --sequence <N> --key <secret>")
+    }
+    seq := strconv.atoi(&seq_str) or >>
+    project := proj.load_project(project_path + "") or >>
+    $sources := []bm.BundleSource{}
+    proj_bytes := snapshot.read(project.path + "", bm.MAX_ASSET_BYTES) or >>
+    sources.push(bm.BundleSource{key: "project", rel_path: "project.json", bytes: proj_bytes})
+    for si in 0:project.scenes.len {
+        ent := &project.scenes[si]
+        raw := snapshot.read(ent.resolved + "", bm.MAX_ASSET_BYTES) or >>
+        sources.push(bm.BundleSource{key: "scene:" + ent.key, rel_path: ent.path + "", bytes: raw})
+    }
+    for ai in 0:project.assets.len {
+        ent := &project.assets[ai]
+        raw := snapshot.read(ent.resolved + "", bm.MAX_ASSET_BYTES) or >>
+        sources.push(bm.BundleSource{key: "asset:" + ent.key, rel_path: ent.path + "", bytes: raw})
+    }
+    manifest := bm.pack_bundle(output_dir + "", bundle_id + "", seq, &sources, &signing_key) or >>
+    println("PACKED " + manifest.bundle_id + " seq=" + str(manifest.sequence) + " entries=" + str(manifest.entries.len))
+    << 0
+}
+
+fn run_bundle_verify(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project bundle-verify <bundle_dir> --key <secret>")
+        << 0
+    }
+    $bundle_dir := ""
+    $signing_key := ""
+    $i := 2
+    while i < args.len {
+        arg := args[i] + ""
+        if arg == "--key" && i + 1 < args.len {
+            signing_key = args[i + 1] + ""
+            i = i + 2
+        } else if bundle_dir.len == 0 {
+            bundle_dir = arg
+            i = i + 1
+        } else {
+            >> errors.new("unexpected argument in bundle-verify: " + arg)
+        }
+    }
+    if bundle_dir.len == 0 || signing_key.len == 0 {
+        >> errors.new("usage: nexus-project bundle-verify <bundle_dir> --key <secret>")
+    }
+    $mount := bm.new_mount()
+    mount.verify_and_stage(bundle_dir + "", &signing_key) or >>
+    println("VERIFIED " + mount.manifest.bundle_id + " seq=" + str(mount.manifest.sequence) + " entries=" + str(mount.manifest.entries.len))
     << 0
 }
 
@@ -118,23 +207,29 @@ fn run() int {
     }
     sub := args[1] + ""
     if sub == "build" || sub == "publish" {
-        << run_build(&args) >>>
+        << run_build(&args) or >>
     }
     if sub == "scene" {
-        << run_scene(&args) >>>
+        << run_scene(&args) or >>
     }
     if sub == "register" {
-        << run_register(&args) >>>
+        << run_register(&args) or >>
     }
     if sub == "relocate" {
-        << run_relocate(&args) >>>
+        << run_relocate(&args) or >>
     }
-    >>> errors.new("unknown subcommand: " + sub)
+    if sub == "bundle-pack" {
+        << run_bundle_pack(&args) or >>
+    }
+    if sub == "bundle-verify" {
+        << run_bundle_verify(&args) or >>
+    }
+    >> errors.new("unknown subcommand: " + sub)
     << 1
 }
 
 fn main() int {
-    << run() >>> (err) {
+    << run() or (err) {
         eprintln(err.msg())
         << 1
     }

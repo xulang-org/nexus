@@ -57,14 +57,14 @@ body=b'WAVE'+fmt_chunk+fmt_chunk+base[36:]
 body=b'WAVE'+fmt_chunk+base[36:]+base[36:]
 (out/'duplicate-data.wav').write_bytes(b'RIFF'+struct.pack('<I',len(body))+body);wrong['duplicate-data.wav']=b''
 lines=['@main','', 'assets #"github.com/xulang-org/nexus/assets/audio"', '#os', '',
-'fn rejected(name string) bool { assets.load_wav("build/audio-fixtures/" + name) >>> (err) { << true }', '    << false }', 'fn run() int {']
+'fn rejected(name string) bool { assets.load_wav("build/audio-fixtures/" + name) or (err) { << true }', '    << false }', 'fn run() int {']
 for name,expected in valid.items():
     var=name.split('.')[0]
-    lines += [f'    {var} := assets.load_wav("build/audio-fixtures/{name}") >>>',f'    assert({var}.sample_count() == {len(expected)} && {var}.sample_rate() == 24000)']
+    lines += [f'    {var} := assets.load_wav("build/audio-fixtures/{name}") or >>',f'    assert({var}.sample_count() == {len(expected)} && {var}.sample_rate() == 24000)']
     channels=2 if name=='stereo.wav' else 1
-    for i,sample in enumerate(expected): lines += [f'    assert(({var}.sample({i//channels}, {i%channels}) >>>) == {sample})']
+    for i,sample in enumerate(expected): lines += [f'    assert(({var}.sample({i//channels}, {i%channels}) or >>) == {sample})']
 for name in wrong: lines += [f'    assert(rejected("{name}"))']
-lines += [f'    println("PASS: PCM8/16/24/32, float WAV, stereo, odd/unknown chunks and order; {len(wrong)} malformed/unsupported WAV cases")','    << 0','}', 'fn main() int { << run() >>> (err) { eprintln(err.msg())','    << 1 } }']
+lines += [f'    println("PASS: PCM8/16/24/32, float WAV, stereo, odd/unknown chunks and order; {len(wrong)} malformed/unsupported WAV cases")','    << 0','}', 'fn main() int { << run() or (err) { eprintln(err.msg())','    << 1 } }']
 (Path(__file__).resolve().parent/'wav_checks.xu').write_text('\n'.join(lines)+'\n')
 print(f'WAV fixtures: {len(valid)} valid profiles, {len(wrong)} rejection cases')
 

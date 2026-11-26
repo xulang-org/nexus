@@ -27,7 +27,7 @@ pub fn (device &Device3D) reference() DeviceRef3D {
     if !device.is_gpu() {
         << DeviceRef3D{device: gpu.DeviceRef{},has_gpu: false,device_id: device.device_id}
     }
-    dev := device.gpu_device() >>> (err){ << DeviceRef3D{device: gpu.DeviceRef{},has_gpu: true,device_id: -1} }
+    dev := device.gpu_device() or(err){ << DeviceRef3D{device: gpu.DeviceRef{},has_gpu: true,device_id: -1} }
     << DeviceRef3D{device: dev.reference(),has_gpu: true,device_id: 0}
 }
 pub fn (mesh &Mesh3D) reference() MeshRef3D {
@@ -61,36 +61,36 @@ pub fn (reference &DeviceRef3D) matches(device &Device3D) bool {
     if device.closed { << false }
     if reference.has_gpu!=device.is_gpu() { << false }
     if !reference.has_gpu { << reference.device_id==device.device_id }
-    dev := device.gpu_device() >>> (err){ << false }
+    dev := device.gpu_device() or(err){ << false }
     << reference.device.same(dev.reference())
 }
 pub fn (reference &DeviceRef3D) validate_mesh(mesh MeshRef3D, normals bool) int {
-    if reference.has_gpu!=mesh.has_gpu { >>> errors.new("nexus 3D: mesh belongs to another backend mode") }
+    if reference.has_gpu!=mesh.has_gpu { >> errors.new("nexus 3D: mesh belongs to another backend mode") }
     if reference.has_gpu {
-        reference.device.validate_buffer(mesh.vertices) >>>
-        reference.device.validate_buffer(mesh.indices) >>>
+        reference.device.validate_buffer(mesh.vertices) or >>
+        reference.device.validate_buffer(mesh.indices) or >>
     } else {
-        mesh.soft_vertices.validate(reference.device_id) >>>
-        mesh.soft_indices.validate(reference.device_id) >>>
+        mesh.soft_vertices.validate(reference.device_id) or >>
+        mesh.soft_indices.validate(reference.device_id) or >>
     }
-    if normals && !mesh.normals { >>> errors.new("nexus 3D: material mesh requires normals on every vertex") }
+    if normals && !mesh.normals { >> errors.new("nexus 3D: material mesh requires normals on every vertex") }
     << 0
 }
 pub fn (device $&Device3D) draw_reference(mesh MeshRef3D, model_view_projection fm.Mat4) int {
-    device.drawing() >>>
-    device.reference().validate_mesh(mesh,false) >>>
-    $matrices := matrix_words(model_view_projection) >>>
+    device.drawing() or >>
+    device.reference().validate_mesh(mesh,false) or >>
+    $matrices := matrix_words(model_view_projection) or >>
     if !device.is_gpu() {
-        empty_mat := material_3d(fm.vec3(1.0,1.0,1.0),0.0,1.0,fm.vec3(0.0,0.0,0.0)) >>>
-        empty_light := light_data.environment(fm.vec3(0.0,0.0,0.0),fm.vec3(0.0,0.0,1.0),1.0,[]light_data.Light3D{}) >>>
+        empty_mat := material_3d(fm.vec3(1.0,1.0,1.0),0.0,1.0,fm.vec3(0.0,0.0,0.0)) or >>
+        empty_light := light_data.environment(fm.vec3(0.0,0.0,0.0),fm.vec3(0.0,0.0,1.0),1.0,[]light_data.Light3D{}) or >>
         id := fm.identity_3d()
         sw := device.target_width*device.render_scale
         sh := device.target_height*device.render_scale
-        triangles := soft_draw_triangles(device,sw,sh,&mesh,&model_view_projection,&id,&id,false,0,1.0,&empty_mat,&empty_light) >>>
+        triangles := soft_draw_triangles(device,sw,sh,&mesh,&model_view_projection,&id,&id,false,0,1.0,&empty_mat,&empty_light) or >>
         device.draw_count += 1
         << triangles
     }
-    identity := matrix_words(fm.identity_3d()) >>>
+    identity := matrix_words(fm.identity_3d()) or >>
     for i in 0:2 { for word in identity { matrices.push(word) } }
     $parameters := []int{}
     for i in 0:20 { parameters.push(0) }
@@ -102,38 +102,38 @@ pub fn (device $&Device3D) draw_reference(mesh MeshRef3D, model_view_projection 
     for i in 0:(lighting_uniform_size()/4) { illumination.push(0) }
     maps := [no_texture(),no_texture(),no_texture(),no_texture(),no_texture()]
     empty := no_shadow_binding()
-    << device.record_draw(mesh,&matrices,&parameters,&illumination,&maps,&empty,-1) >>>
+    << device.record_draw(mesh,&matrices,&parameters,&illumination,&maps,&empty,-1) or >>
 }
 pub fn (device $&Device3D) draw_material_reference(mesh MeshRef3D, world fm.Mat4, view_projection fm.Mat4,
     material &Material3D, lighting &light_data.Environment3D) int {
     empty := no_shadow_binding()
-    << device.draw_material_shadowed_reference(mesh,world,view_projection,material,lighting,&empty) >>>
+    << device.draw_material_shadowed_reference(mesh,world,view_projection,material,lighting,&empty) or >>
 }
 pub fn (device $&Device3D) draw_material_shadowed_reference(mesh MeshRef3D,world fm.Mat4,view_projection fm.Mat4,
     material &Material3D,lighting &light_data.Environment3D,shadow &ShadowBinding3D) int {
-    device.drawing() >>>
-    device.reference().validate_material(mesh,material) >>>
-    matrices := lit_matrix_words(world,view_projection) >>>
-    sign := view_projection.multiply(world).determinant_sign() >>>
+    device.drawing() or >>
+    device.reference().validate_material(mesh,material) or >>
+    matrices := lit_matrix_words(world,view_projection) or >>
+    sign := view_projection.multiply(world).determinant_sign() or >>
     $orientation := 1.0
     if sign<0 { orientation=-1.0 }
-    parameters := material_words(material,orientation) >>>
-    bounds := world_bounds(mesh.bounds,world) >>>
-    selected := lighting.for_bounds(bounds) >>>
-    illumination := lighting_words(&selected) >>>
+    parameters := material_words(material,orientation) or >>
+    bounds := world_bounds(mesh.bounds,world) or >>
+    selected := lighting.for_bounds(bounds) or >>
+    illumination := lighting_words(&selected) or >>
     maps := material.maps()
     $index := -1
     if shadow.present {
-        shadow.validate_camera(view_projection) >>>
-        source := lighting.source(shadow.source) >>>
-        if !(shadow.description.matches_source(&source) >>>) { >>> errors.new("nexus shadow: lighting source changed since binding") }
-        index=lighting.selected_source_index(bounds,shadow.source) >>>
+        shadow.validate_camera(view_projection) or >>
+        source := lighting.source(shadow.source) or >>
+        if !(shadow.description.matches_source(&source) or >>) { >> errors.new("nexus shadow: lighting source changed since binding") }
+        index=lighting.selected_source_index(bounds,shadow.source) or >>
     }
     $triangles := 0
     if device.is_gpu() {
-        triangles = device.record_draw(mesh,&matrices,&parameters,&illumination,&maps,shadow,index) >>>
+        triangles = device.record_draw(mesh,&matrices,&parameters,&illumination,&maps,shadow,index) or >>
     } else {
-        inverse := world.affine_inverse() >>>
+        inverse := world.affine_inverse() or >>
         normals_mat := inverse.transposed()
         mvp := view_projection.multiply(world)
         $cull_mode := 0
@@ -142,7 +142,7 @@ pub fn (device $&Device3D) draw_material_shadowed_reference(mesh MeshRef3D,world
         }
         sw := device.target_width*device.render_scale
         sh := device.target_height*device.render_scale
-        triangles = soft_draw_triangles(device,sw,sh,&mesh,&mvp,&world,&normals_mat,true,cull_mode,orientation,material,&selected) >>>
+        triangles = soft_draw_triangles(device,sw,sh,&mesh,&mvp,&world,&normals_mat,true,cull_mode,orientation,material,&selected) or >>
         device.draw_count += 1
     }
     device.lit_draws+=1

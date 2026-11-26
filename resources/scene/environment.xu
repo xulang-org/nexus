@@ -1,0 +1,109 @@
+@"github.com/xulang-org/nexus/resources/scene"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+
+pub const MAX_SCENE_ENVIRONMENTS = 8
+pub const SKY_SOLID = 0
+pub const SKY_ATMOSPHERE = 1
+
+pub struct EnvironmentAttachment {
+    pub node int
+    pub sky_mode int
+    pub sun_dir fm.Vec3
+    pub sun_intensity f64
+    pub turbidity f64
+    pub ambient fm.Vec3
+    pub exposure f64
+    pub fog_density f64
+    pub fog_scattering f64
+    pub bloom_enabled bool
+    pub bloom_threshold f64
+    pub bloom_intensity f64
+    pub gtao_enabled bool
+    pub ssr_enabled bool
+    pub taa_enabled bool
+    pub ibl_strength f64
+    pub ddgi_enabled bool
+    pub ddgi_origin fm.Vec3
+    pub ddgi_spacing f64
+}
+
+pub fn default_environment_attachment(node int) EnvironmentAttachment {
+    << EnvironmentAttachment{
+        node: node,
+        sky_mode: SKY_ATMOSPHERE,
+        sun_dir: fm.vec3(0.45, 0.78, 0.42),
+        sun_intensity: 2.2,
+        turbidity: 2.5,
+        ambient: fm.vec3(0.16, 0.20, 0.28),
+        exposure: 1.0,
+        fog_density: 0.012,
+        fog_scattering: 0.55,
+        bloom_enabled: true,
+        bloom_threshold: 1.0,
+        bloom_intensity: 0.35,
+        gtao_enabled: true,
+        ssr_enabled: false,
+        taa_enabled: true,
+        ibl_strength: 1.0,
+        ddgi_enabled: true,
+        ddgi_origin: fm.vec3(-16.0, 0.0, -16.0),
+        ddgi_spacing: 4.0
+    }
+}
+
+fn valid_vec3_finite(v fm.Vec3) bool {
+    << fm.finite(v.x) && fm.finite(v.y) && fm.finite(v.z)
+}
+
+pub fn (e &EnvironmentAttachment) validate() int {
+    if e.sky_mode != SKY_SOLID && e.sky_mode != SKY_ATMOSPHERE {
+        >> errors.new("nexus scene: unsupported environment sky mode")
+    }
+    if !valid_vec3_finite(e.sun_dir) || !valid_vec3_finite(e.ambient) || !valid_vec3_finite(e.ddgi_origin) {
+        >> errors.new("nexus scene: environment vectors must be finite")
+    }
+    if e.sun_dir.length() <= 1e-6 {
+        >> errors.new("nexus scene: environment sun_dir must be non-zero")
+    }
+    if !fm.finite(e.sun_intensity) || e.sun_intensity < 0.0 ||
+        !fm.finite(e.turbidity) || e.turbidity < 1.0 || e.turbidity > 20.0 ||
+        !fm.finite(e.exposure) || e.exposure <= 0.0 ||
+        !fm.finite(e.fog_density) || e.fog_density < 0.0 ||
+        !fm.finite(e.fog_scattering) || e.fog_scattering < 0.0 ||
+        !fm.finite(e.bloom_threshold) || e.bloom_threshold < 0.0 ||
+        !fm.finite(e.bloom_intensity) || e.bloom_intensity < 0.0 ||
+        !fm.finite(e.ibl_strength) || e.ibl_strength < 0.0 ||
+        !fm.finite(e.ddgi_spacing) || e.ddgi_spacing <= 0.0 {
+        >> errors.new("nexus scene: environment parameter outside valid range")
+    }
+    if e.ambient.x < 0.0 || e.ambient.y < 0.0 || e.ambient.z < 0.0 {
+        >> errors.new("nexus scene: environment ambient cannot be negative")
+    }
+    << 0
+}
+
+fn validate_environments(document &Document, envs &[]EnvironmentAttachment) int {
+    if envs.len > MAX_SCENE_ENVIRONMENTS {
+        >> errors.new("nexus scene: environment attachment count exceeds 8")
+    }
+    $occupied := map[int]bool{}
+    for env in envs {
+        if env.node < 0 || env.node >= document.nodes.len || document.nodes[env.node].kind != NODE_3D || occupied.has(env.node) {
+            >> errors.new("nexus scene: environment requires a unique Node3D index")
+        }
+        env.validate() or >>
+        occupied[env.node] = true
+    }
+    << 0
+}
+
+pub fn (document &Document) environment_count() int { << document.environments.len }
+
+pub fn (document &Document) environment(index int) EnvironmentAttachment {
+    if index < 0 || index >= document.environments.len {
+        >> errors.new("nexus scene: environment index outside document")
+    }
+    << document.environments[index]
+}

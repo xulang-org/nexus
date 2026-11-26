@@ -1,0 +1,587 @@
+@main
+
+#errors
+#gpu
+#math
+#os
+#strconv
+#strings
+#time
+#ui/layout
+widgets #ui/widgets
+#window
+wev #window/events
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+scene_fmt #"github.com/xulang-org/nexus/formats/scene"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+terr #"github.com/xulang-org/nexus/resources/terrain"
+pcm #"github.com/xulang-org/nexus/resources/audio"
+mixer #"github.com/xulang-org/nexus/audio/mixer"
+phys #"github.com/xulang-org/nexus/physics3d"
+nav #"github.com/xulang-org/nexus/navigation"
+anim #"github.com/xulang-org/nexus/animation/skeletal"
+vfx #"github.com/xulang-org/nexus/vfx"
+inp #"github.com/xulang-org/nexus/input"
+bc #"github.com/xulang-org/nexus/script/bytecode"
+host #"github.com/xulang-org/nexus/script/host"
+rt #"github.com/xulang-org/nexus/integration/script_runtime"
+tbridge #"github.com/xulang-org/nexus/integration/terrain"
+scenes #"github.com/xulang-org/nexus/scene"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+ren2 #"github.com/xulang-org/nexus/rendering/two_d"
+shd #"github.com/xulang-org/nexus/assets/shaders/three_d"
+shd2 #"github.com/xulang-org/nexus/assets/shaders/two_d"
+modern #"github.com/xulang-org/nexus/integration/rendering/three_d"
+ui_bridge #"github.com/xulang-org/nexus/integration/ui"
+diag #"github.com/xulang-org/nexus/integration/diagnostics"
+
+struct SandboxOptions {
+    scene string
+    script string
+    frames int
+    autoplay bool
+    hidden bool
+    capture string
+    backend string
+}
+
+fn parse_options() SandboxOptions {
+    args := os.args()
+    $out := SandboxOptions{
+        scene: "examples/modern_sandbox/assets/world.xuscene",
+        script: "examples/modern_sandbox/assets/beacon.xubc",
+        frames: 0,
+        autoplay: false,
+        hidden: false,
+        capture: "",
+        backend: "auto"
+    }
+    $i := 1
+    while i < args.len {
+        arg := args[i] + ""
+        if arg == "--autoplay" {
+            out.autoplay = true
+            i = i + 1
+        } else if arg == "--hidden" {
+            out.hidden = true
+            i = i + 1
+        } else if i + 1 < args.len {
+            val := args[i + 1] + ""
+            if arg == "--scene" { out.scene = val }
+            else if arg == "--script" { out.script = val }
+            else if arg == "--capture" { out.capture = val }
+            else if arg == "--backend" { out.backend = val }
+            else if arg == "--frames" {
+                out.frames = strconv.atoi(&val) or >>
+                if out.frames < 1 || out.frames > 3600 { >> errors.new("modern_sandbox: invalid --frames") }
+            } else {
+                >> errors.new("modern_sandbox: unknown flag " + arg)
+            }
+            i = i + 2
+        } else {
+            >> errors.new("modern_sandbox: missing value for " + arg)
+        }
+    }
+    << out
+}
+
+fn make_box_mesh(hx f64, hy f64, hz f64, color int) meshes.MeshData3D {
+    $d := meshes.new_mesh_data_3d()
+    p0 := fm.vec3(-hx, -hy, hz)
+    p1 := fm.vec3(hx, -hy, hz)
+    p2 := fm.vec3(hx, hy, hz)
+    p3 := fm.vec3(-hx, hy, hz)
+    p4 := fm.vec3(-hx, -hy, -hz)
+    p5 := fm.vec3(hx, -hy, -hz)
+    p6 := fm.vec3(hx, hy, -hz)
+    p7 := fm.vec3(-hx, hy, -hz)
+    faces := [
+        p0, p1, p2, p3, fm.vec3(0.0, 0.0, 1.0),
+        p5, p4, p7, p6, fm.vec3(0.0, 0.0, -1.0),
+        p1, p5, p6, p2, fm.vec3(1.0, 0.0, 0.0),
+        p4, p0, p3, p7, fm.vec3(-1.0, 0.0, 0.0),
+        p3, p2, p6, p7, fm.vec3(0.0, 1.0, 0.0),
+        p4, p5, p1, p0, fm.vec3(0.0, -1.0, 0.0)
+    ]
+    for f in 0:6 {
+        base := d.vertices.len
+        fi := f * 5
+        n := faces[fi + 4]
+        pts := [faces[fi], faces[fi + 1], faces[fi + 2], faces[fi + 3]]
+        uvs := [fm.vec2(0.0, 0.0), fm.vec2(1.0, 0.0), fm.vec2(1.0, 1.0), fm.vec2(0.0, 1.0)]
+        for k in 0:4 {
+            d.vertices.push(meshes.Vertex3D{
+                position: pts[k],
+                color: color,
+                normal: n,
+                uv: uvs[k],
+                tangent: fm.vec4(0.0, 0.0, 0.0, 0.0),
+                has_uv: true,
+                has_tangent: false
+            })
+        }
+        d.triangle(base, base + 1, base + 2) or >>
+        d.triangle(base, base + 2, base + 3) or >>
+    }
+    d.validate() or >>
+    << d
+}
+
+fn add_nav_quad(verts $&[]fm.Vec3, idxs $&[]int, areas $&[]int, flags $&[]int,
+        x0 f64, z0 f64, x1 f64, z1 f64) {
+    b := verts.len
+    verts.push(fm.vec3(x0, 0.0, z0))
+    verts.push(fm.vec3(x0, 0.0, z1))
+    verts.push(fm.vec3(x1, 0.0, z1))
+    verts.push(fm.vec3(x1, 0.0, z0))
+    idxs.push(b)
+    idxs.push(b + 1)
+    idxs.push(b + 2)
+    areas.push(0)
+    flags.push(1)
+    idxs.push(b)
+    idxs.push(b + 2)
+    idxs.push(b + 3)
+    areas.push(0)
+    flags.push(1)
+}
+
+fn build_terrain(rows int, cols int, cell f64, hscale f64) terr.HeightmapTerrain {
+    half_x := -0.5 * f64(rows - 1) * cell
+    half_z := -0.5 * f64(cols - 1) * cell
+    tcfg := terr.TerrainConfig{
+        width: rows,
+        depth: cols,
+        origin: fm.vec3(half_x, 0.0, half_z),
+        cell_size: cell,
+        height_scale: 1.0
+    }
+    $heights := []f64{}
+    for iz in 0:cols {
+        wz := half_z + f64(iz) * cell
+        for ix in 0:rows {
+            wx := half_x + f64(ix) * cell
+            $h := 0.0
+            dist2 := wx * wx + wz * wz
+            if dist2 > 80.0 {
+                h = (0.35 * math.sin(wx * 0.25) + 0.35 * math.cos(wz * 0.25)) * hscale
+            }
+            heights.push(h)
+        }
+    }
+    $t := terr.new_heightmap_terrain(tcfg, heights) or >>
+    t.auto_generate_splat(-0.5, 1.5, 0.45) or >>
+    << t
+}
+
+fn mat4_from_pos_quat(pos fm.Vec3, q fm.Vec4, scale fm.Vec3) fm.Mat4 {
+    rot := fm.rotation_y(anim.quat_yaw(q))
+    << fm.translation_3d(pos).multiply(rot).multiply(fm.scale_3d(scale))
+}
+
+fn make_win_opts(w int, h int, hidden bool) window.Options {
+    << window.Options{
+        title: "Nexus Modern Sandbox (v9 + ModernPipeline3D + UiControlTree + Telemetry)",
+        width: w,
+        height: h,
+        resizable: false,
+        high_pixel_density: false,
+        hidden: hidden
+    }
+}
+
+fn open_sandbox_dev(w int, h int, hidden bool, backend string, mesh_prog &ren.ShaderProgram3D) ren.Device3D {
+    if backend == "software" {
+        << ren.open_3d_software(make_win_opts(w, h, hidden)) or >>
+    }
+    if backend == "gpu" {
+        << ren.open_3d_window(make_win_opts(w, h, hidden), gpu.AUTO, mesh_prog) or >>
+    }
+    << ren.open_3d_window_adaptive(make_win_opts(w, h, hidden), gpu.AUTO, mesh_prog) or >>
+}
+
+fn run() int {
+    opts := parse_options() or >>
+
+    // 1. Decode Scene v9 manifest & construct runtime SceneTree.
+    scene_raw := snapshot.read(opts.scene + "", scene_fmt.MAX_BYTES) or >>
+    doc9 := scene_fmt.decode(&scene_raw) or >>
+    v9_env := doc9.environment(0) or >>
+    v9_terr := doc9.terrain(0) or >>
+    v9_env_cnt := doc9.environment_count()
+    v9_rb_cnt := doc9.rigid_body_3d_count()
+    v9_terr_cnt := doc9.terrain_count()
+    v9_vfx_cnt := doc9.particle_emitter_3d_count()
+
+    $tree := scenes.new_scene_tree_3d("ModernSandbox", 64) or >>
+    hero_node := tree.add_child_3d(tree.root(), "Hero") or >>
+    car_node := tree.add_child_3d(tree.root(), "Vehicle") or >>
+    nav_node := tree.add_child_3d(tree.root(), "NavAgent") or >>
+    beacon_node := tree.add_child_3d(tree.root(), "Beacon") or >>
+    terr_node := tree.add_child_3d(tree.root(), "Terrain") or >>
+
+    // 2. Terrain heightfield + Physics3D (Character capsule + 4-wheel Vehicle).
+    terrain := build_terrain(v9_terr.grid_x, v9_terr.grid_z, v9_terr.cell_size, v9_terr.height_scale)
+    terr_mesh_cpu := terrain.build_chunk_mesh(terr.TerrainChunkSpec{
+        chunk_x: 0, chunk_z: 0, start_x: 0, start_z: 0,
+        cells_x: v9_terr.grid_x - 1, cells_z: v9_terr.grid_z - 1,
+        lod: 0, skirt_depth: 0.0, bake_splat_tint: true
+    }) or >>
+
+    floor_box := fm.aabb3(fm.vec3(-25.0, -1.0, -25.0), fm.vec3(25.0, 0.0, 25.0)) or >>
+    ramp_box := fm.aabb3(fm.vec3(3.0, 0.0, -5.0), fm.vec3(7.0, 1.0, 1.0)) or >>
+    char_world := phys.new_capsule_world(
+        [phys.StaticBox3D{bounds: floor_box, layer: 1, trigger: false}],
+        [phys.StaticRamp3D{bounds: ramp_box, direction: phys.RAMP_NEGATIVE_Z, layer: 1}]
+    ) or >>
+    char_policy := phys.CapsuleController3D{
+        solid_mask: 1,
+        trigger_mask: 0,
+        step_height: 0.4,
+        ground_snap: 0.08,
+        min_floor_y: 0.7
+    }
+    $hero_body := phys.capsule_3d(fm.vec3(-3.5, 1.5, 3.0), 0.35, 0.55) or >>
+
+    gravity := fm.vec3(0.0, -9.81, 0.0)
+    $veh_world := phys.new_jointed_world_3d(gravity, 0.02, 0.05, &[floor_box], &[1], &[]phys.StaticTriangle3D{}) or >>
+    ident_q := fm.quaternion(0.0, 0.0, 0.0, 1.0)
+    car_he := fm.vec3(0.9, 0.4, 1.8)
+    car_id := veh_world.add_body(fm.vec3(0.0, 1.2, 6.0), ident_q, car_he, 1200.0, 0.05, 0.6, 1, 1) or >>
+    $car := phys.default_four_wheel_car_3d(car_id, car_he, 1200.0) or >>
+
+    // 3. NavMesh + RVO Crowd3D agent.
+    $nverts := []fm.Vec3{}
+    $nidxs := []int{}
+    $nareas := []int{}
+    $nflags := []int{}
+    add_nav_quad($&nverts, $&nidxs, $&nareas, $&nflags, -10.0, -10.0, 10.0, 10.0)
+    nav_mesh := nav.build_navmesh(&nverts, &nidxs, 0.78, &nareas, &nflags) or >>
+    $crowd := nav.new_crowd_solver_3d()
+    costs := [1.0]
+    $nav_goal_b := true
+    nav_agent := crowd.add_agent(&nav_mesh, fm.vec3(4.5, 0.0, 4.0), 0.4, 3.2, 12.0, 1, &costs) or >>
+    crowd.set_agent_target(&nav_mesh, nav_agent, fm.vec3(6.5, 0.0, -5.0)) or >>
+
+    // 4. Precompiled XuScript bytecode + Coroutine scheduler + Offline Audio DSP mixer + 2D VFX mirror.
+    script_raw := snapshot.read(opts.script + "", bc.MAX_BYTES) or >>
+    prog := bc.decode(&script_raw) or >>
+    $scripts := host.new_scene_scripts(8) or >>
+    beacon_sid := scripts.attach(&tree, beacon_node, prog) or >>
+    $sched := host.new_coroutine_scheduler()
+    _cid := sched.spawn($&scripts, &tree, beacon_sid, "beacon_pulse", 1.0) or >>
+    $imap := inp.new_input_map()
+
+    $aud := mixer.new_mixer(48000, 4) or >>
+    $pcm_samples := []int{}
+    for si in 0:1024 {
+        pcm_samples.push(int(math.sin(f64(si) * 0.14) * 9000.0))
+    }
+    _ := aud.add_clip(pcm.pcm16(48000, 1, pcm_samples) or >>) or >>
+    _ := aud.play(0, 0, 0.5, 0.0, true) or >>
+
+    $vfx2 := vfx.new_particle_system_2d(64, 9, vfx.default_emitter_2d(fm.vec2(0.0, 0.0))) or >>
+    $sctx := rt.new_script_host_context()
+    $rigid_stub := phys.new_rigid_world(gravity, []phys.StaticBox3D{}, []phys.StaticRamp3D{}, []phys.StaticTriangle3D{}) or >>
+
+    // 5. Open 3D window/renderer (respecting --backend auto|gpu|software).
+    mesh_prog := shd.load_mesh("build/mesh-shaders") or >>
+    canvas_prog := shd2.load_canvas("build/canvas-shaders") or >>
+    sdf_prog := shd2.load_ui_sdf("build/canvas-shaders") or >>
+    text_prog := shd2.load_ui_text("build/canvas-shaders") or >>
+
+    w := 640
+    h := 400
+    $dev := open_sandbox_dev(w, h, opts.hidden, opts.backend + "", &mesh_prog) or >>
+
+    $overlay := ren2.open_overlay(dev.present_session() or >>, &canvas_prog, &sdf_prog) or >>
+    overlay.enable_text(dev.present_session() or >>, &text_prog) or >>
+
+    $has_modern := false
+    $mp_list := []modern.ModernPipeline3D{}
+    if dev.is_gpu() {
+        cprog := shd.load_clustered_program("build/mesh-shaders") or >>
+        iprog := shd.load_indirect_program("build/mesh-shaders") or >>
+        pprog := shd.load_postprocess_program("build/mesh-shaders") or >>
+        mp := modern.new_modern_pipeline_3d(&dev, &cprog, &iprog, &pprog) or >>
+        mp_list.push(mp)
+        has_modern = true
+    }
+
+    // Upload meshes and bind fallback software Scene3D.
+    $terr_gpu := dev.upload(&terr_mesh_cpu) or >>
+    white := 4294967295
+    hero_cpu := make_box_mesh(0.35, 0.75, 0.35, white)
+    car_cpu := make_box_mesh(car_he.x, car_he.y, car_he.z, white)
+    nav_cpu := make_box_mesh(0.32, 0.55, 0.32, white)
+    beacon_cpu := make_box_mesh(0.45, 1.4, 0.45, white)
+
+    $hero_gpu := dev.upload(&hero_cpu) or >>
+    $car_gpu := dev.upload(&car_cpu) or >>
+    $nav_gpu := dev.upload(&nav_cpu) or >>
+    $beacon_gpu := dev.upload(&beacon_cpu) or >>
+
+    $sc := modern.new_scene_3d(&dev) or >>
+    sc.attach_mesh(&tree, terr_node, &terr_gpu) or >>
+    sc.attach_mesh(&tree, hero_node, &hero_gpu) or >>
+    sc.attach_mesh(&tree, car_node, &car_gpu) or >>
+    sc.attach_mesh(&tree, nav_node, &nav_gpu) or >>
+    sc.attach_mesh(&tree, beacon_node, &beacon_gpu) or >>
+
+    terr_mat := ren.material_3d(fm.vec3(0.45, 0.62, 0.40), 0.0, 0.85, fm.vec3(0.0, 0.0, 0.0)) or >>
+    hero_mat := ren.material_3d(fm.vec3(0.24, 0.58, 0.94), 0.15, 0.45, fm.vec3(0.0, 0.0, 0.0)) or >>
+    car_mat := ren.material_3d(fm.vec3(0.88, 0.22, 0.16), 0.25, 0.35, fm.vec3(0.0, 0.0, 0.0)) or >>
+    nav_mat := ren.material_3d(fm.vec3(0.24, 0.84, 0.48), 0.1, 0.5, fm.vec3(0.02, 0.08, 0.04)) or >>
+    beacon_mat := ren.material_3d(fm.vec3(0.95, 0.85, 0.70), 0.0, 0.4, fm.vec3(1.8, 1.1, 0.3)) or >>
+
+    sc.set_material(&tree, terr_node, terr_mat) or >>
+    sc.set_material(&tree, hero_node, hero_mat) or >>
+    sc.set_material(&tree, car_node, car_mat) or >>
+    sc.set_material(&tree, nav_node, nav_mat) or >>
+    sc.set_material(&tree, beacon_node, beacon_mat) or >>
+
+    // 6. Setup UiControlTree HUD & EngineTelemetry.
+    styles := widgets.dark_styles()
+    $hud := ui_bridge.new_ui_frame(&styles) or >>
+    $ui_tree := ui_bridge.new_control_tree()
+    $router := ui_bridge.new_hud_router()
+    $bridge := ui_bridge.default_input_bridge()
+
+    panel := ui_tree.add_panel(-1, layout.Rect{x: 12.0, y: 12.0, width: 224.0, height: 158.0},
+        ui_bridge.UI_LAYOUT_COLUMN, 10.0, 8.0) or >>
+    _hdr := ui_tree.add_label(panel, layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 20.0},
+        "MODERN SANDBOX (v9)") or >>
+    btn_mode := ui_tree.add_button(panel, layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 30.0},
+        "Mode: Character [V]", 1) or >>
+    tgl_bloom := ui_tree.add_toggle(panel, layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 26.0},
+        "HDR Bloom", v9_env.bloom_enabled, 2) or >>
+    sli_exp := ui_tree.add_slider(panel, layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 36.0},
+        "Exposure", 0.5, 2.0, v9_env.exposure, 3) or >>
+    ui_tree.compute_layout(f64(w), f64(h)) or >>
+
+    $tel := diag.new_engine_telemetry()
+    tel.set_assets(diag.AssetResidencyCounters{
+        meshes: 5,
+        textures: 1,
+        shaders: 45,
+        audio_clips: 1,
+        bundle_assets: 1,
+        gpu_memory_bytes: 0
+    })
+
+    $pp_cfg := ren.post_process_defaults_3d()
+    pp_cfg.bloom_enabled = v9_env.bloom_enabled
+    pp_cfg.bloom_threshold = v9_env.bloom_threshold
+    pp_cfg.bloom_intensity = v9_env.bloom_intensity
+    pp_cfg.exposure = v9_env.exposure
+    pp_cfg.ao_enabled = false
+    pp_cfg.ssr_enabled = false
+    pp_cfg.taa_enabled = false
+
+    $vehicle_mode := false
+    $mode_switches := 0
+    $frame_idx := 0
+    $running := true
+    $sim_t := 0.0
+    $coro_bursts := 0
+
+    while running && (opts.frames <= 0 || frame_idx < opts.frames) {
+        tel.begin_frame()
+        dt := 1.0 / 60.0
+        sim_t = sim_t + dt
+
+        ui_tree.sync_hud_router($&router) or >>
+        for {
+            ev := dev.poll()
+            if ev.kind == wev.EVENT_NONE { <- }
+            if ev.kind == wev.EVENT_CLOSE_REQUESTED {
+                running = false
+                <-
+            }
+            act := ui_tree.handle_event(&ev)
+            if act.kind == ui_bridge.UI_ACTION_CLICK && act.node_id == btn_mode {
+                vehicle_mode = !vehicle_mode
+                mode_switches = mode_switches + 1
+            } else if act.kind == ui_bridge.UI_ACTION_TOGGLE && act.node_id == tgl_bloom {
+                pp_cfg.bloom_enabled = act.checked
+            } else if act.kind == ui_bridge.UI_ACTION_SLIDE && act.node_id == sli_exp {
+                pp_cfg.exposure = act.value
+            }
+            dec := router.route_event($&bridge, &ev)
+            if !act.consumed && dec.to_game {
+                if ev.kind == wev.EVENT_KEY_DOWN && ev.physical_key == wev.KEY_V {
+                    vehicle_mode = !vehicle_mode
+                    mode_switches = mode_switches + 1
+                }
+            }
+        }
+        if !running { <- }
+
+        if opts.autoplay && opts.frames >= 10 && frame_idx == opts.frames / 2 {
+            vehicle_mode = !vehicle_mode
+            mode_switches = mode_switches + 1
+        }
+        if vehicle_mode {
+            ui_tree.set_label(btn_mode, "Mode: Vehicle [V]") or >>
+        } else {
+            ui_tree.set_label(btn_mode, "Mode: Character [V]") or >>
+        }
+
+        // Simulation scopes: Physics3D, NavMesh Crowd, Skeletal, Script, Audio DSP.
+        tel.begin_scope("physics")
+        $char_dir := fm.vec3(0.0, 0.0, 0.0)
+        $throttle := 0.0
+        $steer := 0.0
+        if opts.autoplay {
+            if !vehicle_mode {
+                char_dir = fm.vec3(math.cos(sim_t * 1.6), 0.0, math.sin(sim_t * 1.6))
+            } else {
+                throttle = 0.75
+                steer = 0.35 * math.sin(sim_t * 1.2)
+            }
+        }
+        char_move := fm.vec3(char_dir.x * 3.2 * dt, -3.5 * dt, char_dir.z * 3.2 * dt)
+        cres := char_world.move_capsule(hero_body, char_move, char_policy) or >>
+        hero_body = cres.body
+
+        _ := car.step($&veh_world, dt, throttle, 0.0, steer, false) or >>
+        veh_world.step(dt, 4, 4) or >>
+        _ := tel.end_scope()
+
+        tel.begin_scope("ai_script")
+        crowd.step(dt, &nav_mesh) or >>
+        if crowd.agent_arrived(nav_agent) or >> {
+            nav_goal_b = !nav_goal_b
+            if nav_goal_b { crowd.set_agent_target(&nav_mesh, nav_agent, fm.vec3(6.5, 0.0, -5.0)) or >> }
+            else { crowd.set_agent_target(&nav_mesh, nav_agent, fm.vec3(3.5, 0.0, 4.5)) or >> }
+        }
+        nav_pos := crowd.agent_position(nav_agent) or >>
+
+        // Skeletal quaternion slerp pose for hero rotation + arm sway.
+        q_idle := anim.quat_identity()
+        q_turn := anim.quat_from_axis_angle(fm.vec3(0.0, 1.0, 0.0), sim_t * 1.5)
+        $slerp_t := 0.25
+        if !vehicle_mode { slerp_t = 0.85 }
+        hero_q := anim.quat_slerp(q_idle, q_turn, slerp_t)
+
+        _ := sctx.run_physics_process($&scripts, $&tree, beacon_sid, dt, 0.4, &imap,
+            false, $&rigid_stub, true, $&aud, true, &nav_mesh, true, $&vfx2) or >>
+        sctx.tick_coroutines($&sched, $&scripts, $&tree, dt, &imap,
+            false, $&rigid_stub, true, $&aud, true, &nav_mesh, true, $&vfx2) or >>
+        vevs := sctx.drain_vfx_events()
+        coro_bursts = coro_bursts + vevs.len
+        vfx2.step(dt) or >>
+        _mix_samples := aud.render(256) or >>
+        _ := tel.end_scope()
+
+        // Sync SceneTree transforms.
+        hero_world := mat4_from_pos_quat(hero_body.center, hero_q, fm.vec3(1.0, 1.0, 1.0))
+        car_world := veh_world.transform_matrix(car_id) or >>
+        nav_world := fm.translation_3d(nav_pos.add(fm.vec3(0.0, 0.55, 0.0)))
+        beacon_world := fm.translation_3d(fm.vec3(0.0, 1.4 + 0.15 * math.sin(sim_t * 3.0), -4.5))
+        terr_world := fm.identity_3d()
+
+        tree.set_transform_3d(hero_node, hero_world) or >>
+        tree.set_transform_3d(car_node, car_world) or >>
+        tree.set_transform_3d(nav_node, nav_world) or >>
+        tree.set_transform_3d(beacon_node, beacon_world) or >>
+        tree.set_transform_3d(terr_node, terr_world) or >>
+
+        // Camera & lights driven from v9 EnvironmentAttachment.
+        $focus_pos := hero_body.center
+        if vehicle_mode { focus_pos = car_world.c3.xyz() }
+        eye := focus_pos.add(fm.vec3(4.5, 4.8, 9.5))
+        view := scenes.look_at_3d(eye, focus_pos.add(fm.vec3(0.0, 0.6, 0.0)), fm.vec3(0.0, 1.0, 0.0)) or >>
+        z_near := 0.2
+        z_far := 120.0
+        proj := scenes.perspective_3d(0.85, f64(w) / f64(h), z_near, z_far) or >>
+        vp := proj.multiply(view)
+
+        sun_dir := v9_env.sun_dir.normalized() or >>
+        sun := lights.directional(sun_dir, fm.vec3(v9_env.sun_intensity, v9_env.sun_intensity * 0.92, v9_env.sun_intensity * 0.85)) or >>
+        beacon_lt := lights.point(fm.vec3(0.0, 2.8, -4.5), fm.vec3(8.0, 5.2, 2.2), 14.0) or >>
+        scene_lights := [sun, beacon_lt]
+        light_cnt := scene_lights.len
+        lighting := lights.environment(v9_env.ambient, eye, pp_cfg.exposure, [sun, beacon_lt]) or >>
+
+        tel.begin_scope("render3d")
+        if has_modern {
+            mp := $&mp_list[0]
+            mp.prepare_lights(&dev, v9_env.ambient, eye, pp_cfg.exposure, &scene_lights, view, proj, z_near, z_far) or >>
+            refs := [terr_gpu.reference(), hero_gpu.reference(), car_gpu.reference(), nav_gpu.reference(), beacon_gpu.reference()]
+            worlds := [terr_world, hero_world, car_world, nav_world, beacon_world]
+            mats := [terr_mat, hero_mat, car_mat, nav_mat, beacon_mat]
+            _ := mp.render_clustered_hdr_frame($&dev, &refs, &worlds, &mats, view, proj, z_near, z_far, 354497535, &pp_cfg) or >>
+            if opts.capture.len > 0 && frame_idx + 1 == opts.frames {
+                dev.capture(opts.capture + "") or >>
+            }
+        } else {
+            dev.begin(354497535) or >>
+            _ := sc.draw_lit($&dev, &tree, vp, &lighting) or >>
+        }
+
+        // Render UiControlTree + EngineTelemetry HUD into Overlay2D.
+        hud.begin() or >>
+        ui_tree.render($&hud) or >>
+        tel.set_scene_counts(5, 5, light_cnt)
+        if dev.is_gpu() {
+            snap := diag.sample_gpu_device(dev.gpu_device() or >>)
+            tel.update_gpu(snap)
+        }
+        tel_rect := layout.Rect{x: f64(w) - 312.0, y: 12.0, width: 300.0, height: 108.0}
+        tel.render_telemetry_hud($&hud, &tel_rect) or >>
+        overlay.clear() or >>
+        hud.flush_overlay(dev.present_session() or >>, $&overlay) or >>
+
+        if dev.is_gpu() {
+            $pf := dev.begin_present_frame() or >>
+            overlay.flush_gpu_frame(dev.gpu_device() or >>, $&pf, w, h, gpu.LOAD, 0) or >>
+            dev.finish_present_frame($&pf) or >>
+        } else {
+            dev.software_prepare_present() or >>
+            overlay.flush_software(dev.software_pixels_mut() or >>, w, h, false, 0) or >>
+            if opts.capture.len > 0 && frame_idx + 1 == opts.frames {
+                sess_cap := dev.present_session() or >>
+                sess_cap.capture_software_png(opts.capture + "") or >>
+            }
+            dev.present_software_frame() or >>
+        }
+        _ := tel.end_scope()
+        _ := tel.end_frame()
+        frame_idx = frame_idx + 1
+    }
+
+    sum := tel.profiler.summary()
+    mode_name := dev.mode_name() or >>
+    if has_modern {
+        mp := $&mp_list[0]
+        mp.close() or >>
+    }
+    overlay.close() or >>
+    beacon_gpu.close() or >>
+    nav_gpu.close() or >>
+    car_gpu.close() or >>
+    hero_gpu.close() or >>
+    terr_gpu.close() or >>
+    dev.close() or >>
+
+    avg_s := strconv.format_float(sum.avg_ms, 102, 2) or >>
+    println("PASS: modern_sandbox frames=" + str(frame_idx) +
+        " backend=" + mode_name +
+        " modern=" + str(has_modern) +
+        " mode_switches=" + str(mode_switches) +
+        " v9=(" + str(v9_env_cnt) + "," + str(v9_rb_cnt) + "," + str(v9_terr_cnt) + "," + str(v9_vfx_cnt) + ")" +
+        " coro_bursts=" + str(coro_bursts) +
+        " avg_ms=" + avg_s)
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln("FAIL: modern_sandbox: " + err.msg())
+        << 1
+    }
+}

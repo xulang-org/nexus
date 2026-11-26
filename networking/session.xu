@@ -53,13 +53,13 @@ fn (s &ServerSession) find_entity_idx(net_id int) int {
 
 pub fn (s $&ServerSession) add_peer(peer_id int, interest InterestConfig) int {
     if peer_id <= 0 {
-        >>> errors.new("nexus net: peer_id must be > 0")
+        >> errors.new("nexus net: peer_id must be > 0")
     }
     if s.find_peer_idx(peer_id) >= 0 {
-        >>> errors.new("nexus net: duplicate peer_id")
+        >> errors.new("nexus net: duplicate peer_id")
     }
     idx := s.peers.len
-    im := new_interest_manager(interest) >>>
+    im := new_interest_manager(interest) or >>
     s.peers.push(ServerPeerState{
         peer_id: peer_id,
         channel: new_reliable_channel(),
@@ -74,7 +74,7 @@ pub fn (s $&ServerSession) add_peer(peer_id int, interest InterestConfig) int {
 
 pub fn (s $&ServerSession) spawn_entity(ent NetEntityState) int {
     if s.find_entity_idx(ent.net_id) >= 0 {
-        >>> errors.new("nexus net: duplicate entity net_id")
+        >> errors.new("nexus net: duplicate entity net_id")
     }
     idx := s.entities.len
     s.entities.push(ent)
@@ -83,14 +83,14 @@ pub fn (s $&ServerSession) spawn_entity(ent NetEntityState) int {
 
 pub fn (s $&ServerSession) update_entity(ent NetEntityState) int {
     idx := s.find_entity_idx(ent.net_id)
-    if idx < 0 { >>> errors.new("nexus net: entity not found") }
+    if idx < 0 { >> errors.new("nexus net: entity not found") }
     s.entities[idx] = ent
     << 0
 }
 
 pub fn (s $&ServerSession) remove_entity(net_id int) int {
     idx := s.find_entity_idx(net_id)
-    if idx < 0 { >>> errors.new("nexus net: entity not found") }
+    if idx < 0 { >> errors.new("nexus net: entity not found") }
     $next := []NetEntityState{}
     for i in 0:s.entities.len {
         if i != idx { next.push(s.entities[i]) }
@@ -101,7 +101,7 @@ pub fn (s $&ServerSession) remove_entity(net_id int) int {
 
 pub fn (s &ServerSession) entity(net_id int) NetEntityState {
     idx := s.find_entity_idx(net_id)
-    if idx < 0 { >>> errors.new("nexus net: entity not found") }
+    if idx < 0 { >> errors.new("nexus net: entity not found") }
     << s.entities[idx]
 }
 
@@ -113,29 +113,29 @@ pub fn (s &ServerSession) entities_snapshot() []NetEntityState {
 
 fn encode_input_batch_payload(last_snap_tick int, inputs &[]PlayerInputCmd) []u8 {
     $bw := new_bit_writer()
-    bw.write_u8(MSG_INPUT_BATCH) >>>
-    bw.write_u32(last_snap_tick) >>>
+    bw.write_u8(MSG_INPUT_BATCH) or >>
+    bw.write_u32(last_snap_tick) or >>
     $cnt := inputs.len
     if cnt > 4 { cnt = 4 }
-    bw.write_u8(cnt) >>>
+    bw.write_u8(cnt) or >>
     for i in 0:cnt {
-        write_input_cmd($&bw, &inputs[i]) >>>
+        write_input_cmd($&bw, &inputs[i]) or >>
     }
     << bw.finish()
 }
 
 fn encode_rpc_payload(event_id int, payload &[]u8) []u8 {
     $bw := new_bit_writer()
-    bw.write_u8(MSG_RPC_EVENT) >>>
-    bw.write_u32(event_id) >>>
-    bw.write_bytes(payload) >>>
+    bw.write_u8(MSG_RPC_EVENT) or >>
+    bw.write_u32(event_id) or >>
+    bw.write_bytes(payload) or >>
     << bw.finish()
 }
 
 fn (s $&ServerSession) apply_peer_input_batch(pidx int, peer_id int, br $&BitReader) int {
-    ack_snap_tick := br.read_u32() >>>
-    cnt := br.read_u8() >>>
-    if cnt > 8 { >>> errors.new("nexus net: malformed input batch count") }
+    ack_snap_tick := br.read_u32() or >>
+    cnt := br.read_u8() or >>
+    if cnt > 8 { >> errors.new("nexus net: malformed input batch count") }
 
     // Promote acked snapshot from sent history to baseline.
     if ack_snap_tick > 0 {
@@ -152,7 +152,7 @@ fn (s $&ServerSession) apply_peer_input_batch(pidx int, peer_id int, br $&BitRea
     }
 
     for _ in 0:cnt {
-        cmd := read_input_cmd(br) >>>
+        cmd := read_input_cmd(br) or >>
         if cmd.seq > s.peers[pidx].last_input_seq {
             s.peers[pidx].last_input_seq = cmd.seq
             for ei in 0:s.entities.len {
@@ -180,20 +180,20 @@ fn (s $&ServerSession) apply_peer_input_batch(pidx int, peer_id int, br $&BitRea
 
 pub fn (s $&ServerSession) on_packet_from_peer(peer_id int, raw &[]u8, now_ms f64) []NetRpcEvent {
     pidx := s.find_peer_idx(peer_id)
-    if pidx < 0 { >>> errors.new("nexus net: unknown peer_id") }
+    if pidx < 0 { >> errors.new("nexus net: unknown peer_id") }
     ch := $&s.peers[pidx].channel
-    msgs := ch.on_receive(raw, now_ms) >>>
+    msgs := ch.on_receive(raw, now_ms) or >>
     $rpcs := []NetRpcEvent{}
     for i in 0:msgs.len {
         m := &msgs[i]
         if m.kind != PKT_DATA || m.payload.len == 0 { -> }
         $br := new_bit_reader(&m.payload)
-        tag := br.read_u8() >>>
+        tag := br.read_u8() or >>
         if tag == MSG_INPUT_BATCH {
-            s.apply_peer_input_batch(pidx, peer_id, $&br) >>>
+            s.apply_peer_input_batch(pidx, peer_id, $&br) or >>
         } else if tag == MSG_RPC_EVENT {
-            ev_id := br.read_u32() >>>
-            ev_data := br.read_bytes(1024) >>>
+            ev_id := br.read_u32() or >>
+            ev_data := br.read_bytes(1024) or >>
             rpcs.push(NetRpcEvent{sender_peer: peer_id, event_id: ev_id, payload: ev_data})
         }
     }
@@ -207,10 +207,10 @@ pub fn (s $&ServerSession) build_outbound_for_peer(
     now_ms f64
 ) []NetPacket {
     pidx := s.find_peer_idx(peer_id)
-    if pidx < 0 { >>> errors.new("nexus net: unknown peer_id") }
+    if pidx < 0 { >> errors.new("nexus net: unknown peer_id") }
 
     ch0 := $&s.peers[pidx].channel
-    $out := ch0.poll_retransmits(now_ms) >>>
+    $out := ch0.poll_retransmits(now_ms) or >>
 
     ack_seq := s.peers[pidx].last_input_seq
     im := $&s.peers[pidx].interest
@@ -227,28 +227,28 @@ pub fn (s $&ServerSession) build_outbound_for_peer(
         s.peers[pidx].sent_history = trimmed
     }
 
-    delta := encode_snapshot_delta(&snap, &s.peers[pidx].baseline, s.peers[pidx].has_baseline, &s.bounds) >>>
+    delta := encode_snapshot_delta(&snap, &s.peers[pidx].baseline, s.peers[pidx].has_baseline, &s.bounds) or >>
     $bw := new_bit_writer()
-    bw.write_u8(MSG_SNAPSHOT) >>>
-    bw.write_bytes(&delta) >>>
+    bw.write_u8(MSG_SNAPSHOT) or >>
+    bw.write_bytes(&delta) or >>
     snap_payload := bw.finish()
     ch1 := $&s.peers[pidx].channel
-    pkt := ch1.send(CHANNEL_UNRELIABLE, PKT_DATA, &snap_payload, now_ms) >>>
+    pkt := ch1.send(CHANNEL_UNRELIABLE, PKT_DATA, &snap_payload, now_ms) or >>
     out.push(NetPacket{data: pkt})
     << out
 }
 
 pub fn (s $&ServerSession) send_rpc_to_peer(peer_id int, event_id int, payload &[]u8, now_ms f64) []u8 {
     pidx := s.find_peer_idx(peer_id)
-    if pidx < 0 { >>> errors.new("nexus net: unknown peer_id") }
-    rpc_bytes := encode_rpc_payload(event_id, payload) >>>
+    if pidx < 0 { >> errors.new("nexus net: unknown peer_id") }
+    rpc_bytes := encode_rpc_payload(event_id, payload) or >>
     ch := $&s.peers[pidx].channel
-    << ch.send(CHANNEL_RELIABLE_ORDERED, PKT_DATA, &rpc_bytes, now_ms) >>>
+    << ch.send(CHANNEL_RELIABLE_ORDERED, PKT_DATA, &rpc_bytes, now_ms) or >>
 }
 
 pub fn (s &ServerSession) peer_stats(peer_id int) ChannelStats {
     pidx := s.find_peer_idx(peer_id)
-    if pidx < 0 { >>> errors.new("nexus net: unknown peer_id") }
+    if pidx < 0 { >> errors.new("nexus net: unknown peer_id") }
     << s.peers[pidx].channel.stats()
 }
 
@@ -312,9 +312,9 @@ pub fn (cs $&ClientSession) step_local_input(cmd PlayerInputCmd, now_ms f64) []u
     }
     $ack_tick := 0
     if cs.has_baseline { ack_tick = cs.baseline.tick }
-    payload := encode_input_batch_payload(ack_tick, &cs.recent_inputs) >>>
+    payload := encode_input_batch_payload(ack_tick, &cs.recent_inputs) or >>
     ch := $&cs.channel
-    << ch.send(CHANNEL_UNRELIABLE, PKT_DATA, &payload, now_ms) >>>
+    << ch.send(CHANNEL_UNRELIABLE, PKT_DATA, &payload, now_ms) or >>
 }
 
 fn (cs $&ClientSession) push_remote_state(ent &NetEntityState, tick int, time_s f64) {
@@ -327,7 +327,7 @@ fn (cs $&ClientSession) push_remote_state(ent &NetEntityState, tick int, time_s 
     }
     if idx < 0 {
         idx = cs.remotes.len
-        interp := new_entity_interpolator(cs.interp_delay_s, cs.max_extrap_s) >>> (err) { << }
+        interp := new_entity_interpolator(cs.interp_delay_s, cs.max_extrap_s) or (err) { << }
         cs.remotes.push(RemoteInterpEntry{net_id: ent.net_id, interp: interp})
     }
     itp := $&cs.remotes[idx].interp
@@ -343,16 +343,16 @@ fn (cs $&ClientSession) push_remote_state(ent &NetEntityState, tick int, time_s 
 
 pub fn (cs $&ClientSession) on_packet_from_server(raw &[]u8, now_ms f64, client_time_s f64) int {
     ch := $&cs.channel
-    msgs := ch.on_receive(raw, now_ms) >>>
+    msgs := ch.on_receive(raw, now_ms) or >>
     $snaps_applied := 0
     for i in 0:msgs.len {
         m := &msgs[i]
         if m.kind != PKT_DATA || m.payload.len == 0 { -> }
         $br := new_bit_reader(&m.payload)
-        tag := br.read_u8() >>>
+        tag := br.read_u8() or >>
         if tag == MSG_SNAPSHOT {
-            snap_bytes := br.read_bytes(1350) >>>
-            snap := decode_snapshot_delta(&snap_bytes, &cs.baseline, &cs.bounds) >>>
+            snap_bytes := br.read_bytes(1350) or >>
+            snap := decode_snapshot_delta(&snap_bytes, &cs.baseline, &cs.bounds) or >>
             if !cs.has_baseline || snap.tick > cs.baseline.tick {
                 cs.baseline = clone_snapshot(&snap)
                 cs.has_baseline = true
@@ -386,8 +386,8 @@ pub fn (cs $&ClientSession) on_packet_from_server(raw &[]u8, now_ms f64, client_
                 cs.remotes = kept_remotes
             }
         } else if tag == MSG_RPC_EVENT {
-            ev_id := br.read_u32() >>>
-            ev_data := br.read_bytes(1024) >>>
+            ev_id := br.read_u32() or >>
+            ev_data := br.read_bytes(1024) or >>
             cs.rpcs.push(NetRpcEvent{sender_peer: 0, event_id: ev_id, payload: ev_data})
         }
     }
@@ -440,13 +440,13 @@ pub fn (cs $&ClientSession) pop_rpcs() []NetRpcEvent {
 
 pub fn (cs $&ClientSession) poll_retransmits(now_ms f64) []NetPacket {
     ch := $&cs.channel
-    << ch.poll_retransmits(now_ms) >>>
+    << ch.poll_retransmits(now_ms) or >>
 }
 
 pub fn (cs $&ClientSession) send_rpc(event_id int, payload &[]u8, now_ms f64) []u8 {
-    rpc_bytes := encode_rpc_payload(event_id, payload) >>>
+    rpc_bytes := encode_rpc_payload(event_id, payload) or >>
     ch := $&cs.channel
-    << ch.send(CHANNEL_RELIABLE_ORDERED, PKT_DATA, &rpc_bytes, now_ms) >>>
+    << ch.send(CHANNEL_RELIABLE_ORDERED, PKT_DATA, &rpc_bytes, now_ms) or >>
 }
 
 pub fn (cs &ClientSession) remote_entity_count() int { << cs.remotes.len }

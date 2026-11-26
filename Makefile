@@ -2,7 +2,7 @@ XU ?= xu
 PYTHON ?= python3
 export XU
 
-.PHONY: scene-soa-test ecs-parallel-test navigation-test networking-test audio-dsp-test script-aot-test script-host-coroutines-test physics3d-joints-ragdoll-test physics3d-advanced-test gpu-skinning-test skeletal-animation-test particles-vfx-gpu-test terrain-foliage-gpu-test decals-atmosphere-gpu-test ddgi-gi-gpu-test engine-integration-gpu-test all-modern-tests clustered-lighting-gpu-test indirect-cull-hiz-gpu-test hdr-postprocess-gpu-test meshlet-visbuffer-gpu-test transparent-pbr-gpu-test streaming-lru-gpu-test xacp-test lighting-demo-test demo-lighting lighting-core-test lighting-gpu-test gpu-failure-test present-fallback-test text-2d-test ui-hud-test demo-ui-hud mesh-shaders canvas-shaders native-image window-input-smoke gpu-surface-smoke sdk gpu-compute-smoke native-probe gpu-offscreen-smoke gpu-transfer-smoke check-core test-core mesh-core-test audio-core-test audio-device-test native native-audio audio-fixtures audio-test audio-smoke demo-audio demo-audio-stream demo-audio-seek check layers test demo demo2d demo3d demo-glb demo-script demo-materials demo-textures3d demo-mipmaps3d demo-material-maps demo-normal-maps demo-generated-tangents demo-glb-materials smoke gpu-smoke gpu3d-smoke image-fixtures glb-fixtures script-tool script-fixtures script-live-smoke glb-material-fixtures scene-fixtures demo-scene-file scene-asset-fixtures demo-scene-assets scene-audio-fixtures demo-scene-audio demo-scene-av scene-script-assets scene-script-fixtures demo-scene-scripts
+.PHONY: prefab-runtime-test ai-bt-nav-test input-replay-timing-test timeline-test project-bundle-cli-test ui-tree-test profiler-test bundle-test shader-cross-backend-test scene-v9-test scene-soa-test ecs-parallel-test navigation-test networking-test audio-dsp-test script-aot-test script-host-coroutines-test physics3d-joints-ragdoll-test physics3d-advanced-test gpu-skinning-test skeletal-animation-test particles-vfx-gpu-test terrain-foliage-gpu-test decals-atmosphere-gpu-test ddgi-gi-gpu-test engine-integration-gpu-test all-modern-tests clustered-lighting-gpu-test indirect-cull-hiz-gpu-test hdr-postprocess-gpu-test meshlet-visbuffer-gpu-test transparent-pbr-gpu-test streaming-lru-gpu-test xacp-test lighting-demo-test demo-lighting lighting-core-test lighting-gpu-test gpu-failure-test present-fallback-test text-2d-test ui-hud-test demo-ui-hud mesh-shaders canvas-shaders native-image window-input-smoke gpu-surface-smoke sdk gpu-compute-smoke native-probe gpu-offscreen-smoke gpu-transfer-smoke check-core test-core mesh-core-test audio-core-test audio-device-test native native-audio audio-fixtures audio-test audio-smoke demo-audio demo-audio-stream demo-audio-seek check layers test demo demo2d demo3d demo-glb demo-script demo-materials demo-textures3d demo-mipmaps3d demo-material-maps demo-normal-maps demo-generated-tangents demo-glb-materials smoke gpu-smoke gpu3d-smoke image-fixtures glb-fixtures script-tool script-fixtures script-live-smoke glb-material-fixtures scene-fixtures demo-scene-file scene-asset-fixtures demo-scene-assets scene-audio-fixtures demo-scene-audio demo-scene-av scene-script-assets scene-script-fixtures demo-scene-scripts
 xacp-test: sdk
 	mkdir -p build
 	$(XU) build tests/xacp_checks.xu -o build/xacp-tests
@@ -68,6 +68,7 @@ check: layers native canvas-shaders mesh-shaders
 	$(XU) check examples/normal_maps/main.xu
 	$(XU) check examples/generated_tangents/main.xu
 	$(XU) check examples/scene_scripts/main.xu
+	$(XU) check examples/modern_sandbox/main.xu
 	$(XU) check examples/scene_audio/main.xu
 	$(XU) check examples/scene_av/main.xu
 	$(XU) check examples/scene_assets/main.xu
@@ -206,7 +207,7 @@ check-core: layers sdk
 
 # Pure Xu validation stays usable while a compiler/platform backend is incomplete.
 # The aggregate check/test/gpu targets still fail on real device build failures.
-test-core: scene-soa-test ecs-parallel-test navigation-test audio-dsp-test script-aot-test 25d-core-test shadow-core-test gltf-animation-test mesh-format-core-test lod-core-test frustum-core-test physics3d-test scene-lighting-test lighting-core-test check-core mesh-core-test glb-fixtures glb-material-fixtures script-fixtures audio-core-test scene-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
+test-core: prefab-runtime-test ai-bt-nav-test input-replay-timing-test timeline-test project-bundle-cli-test ui-tree-test profiler-test bundle-test shader-cross-backend-test scene-v9-test scene-soa-test ecs-parallel-test navigation-test audio-dsp-test script-aot-test 25d-core-test shadow-core-test gltf-animation-test mesh-format-core-test lod-core-test frustum-core-test physics3d-test scene-lighting-test lighting-core-test check-core mesh-core-test glb-fixtures glb-material-fixtures script-fixtures audio-core-test scene-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
 	mkdir -p build
 	$(PYTHON) tests/layer_rules_checks.py
 	$(PYTHON) tests/layer_headless_checks.py
@@ -297,6 +298,54 @@ physics3d-test: sdk
 	./build/physics3d-bvh-sap
 	$(XU) build tests/physics3d_xpbd_checks.xu -o build/physics3d-xpbd
 	./build/physics3d-xpbd
+
+scene-v9-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/scene_v9_modern_checks.xu -o build/scene-v9-tests
+	./build/scene-v9-tests
+
+shader-cross-backend-test: sdk
+	python3 tests/shader_cross_backend_checks.py
+
+ui-tree-test: layers sdk canvas-shaders mesh-shaders
+	mkdir -p build
+	$(XU) build tests/ui_tree_focus_checks.xu -o build/ui-tree-checks
+	./build/ui-tree-checks
+
+profiler-test: layers sdk canvas-shaders
+	mkdir -p build
+	$(XU) build tests/profiler_telemetry_checks.xu -o build/profiler-checks
+	./build/profiler-checks
+
+bundle-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/bundle_hotreload_checks.xu -o build/bundle-checks
+	./build/bundle-checks
+
+prefab-runtime-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/scene_prefab_runtime_checks.xu -o build/prefab-runtime-checks
+	./build/prefab-runtime-checks
+
+ai-bt-nav-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/ai_bt_nav_checks.xu -o build/ai-bt-nav-checks
+	./build/ai-bt-nav-checks
+
+input-replay-timing-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/input_replay_timing_checks.xu -o build/input-replay-timing-checks
+	./build/input-replay-timing-checks
+
+timeline-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/animation_timeline_checks.xu -o build/animation-timeline-checks
+	./build/animation-timeline-checks
+
+project-bundle-cli-test: layers sdk project-cli
+	mkdir -p build
+	$(XU) build tests/project_bundle_cli_checks.xu -o build/project-bundle-cli-checks
+	./build/project-bundle-cli-checks
 
 scene-soa-test: sdk
 	mkdir -p build
@@ -919,8 +968,19 @@ engine-integration-gpu-test: layers mesh-shaders
 	$(XU) build tests/engine_full_integration_gpu_checks.xu -o build/engine-integration-gpu-checks
 	./build/engine-integration-gpu-checks
 
-all-modern-tests: engine-integration-gpu-test ddgi-gi-gpu-test physics3d-advanced-test networking-test decals-atmosphere-gpu-test terrain-foliage-gpu-test script-host-coroutines-test particles-vfx-gpu-test skeletal-animation-test transparent-pbr-gpu-test
+all-modern-tests: modern-sandbox-test engine-integration-gpu-test ddgi-gi-gpu-test physics3d-advanced-test networking-test decals-atmosphere-gpu-test terrain-foliage-gpu-test script-host-coroutines-test particles-vfx-gpu-test skeletal-animation-test transparent-pbr-gpu-test
 	@echo "ALL MODERN ENGINE TESTS PASSED"
+
+.PHONY: modern-sandbox demo-modern-sandbox modern-sandbox-test
+modern-sandbox: mesh-shaders canvas-shaders native-image script-tool
+	$(XU) build examples/modern_sandbox/main.xu -o build/nexus-modern-sandbox
+
+demo-modern-sandbox: modern-sandbox
+	./build/nexus-modern-sandbox
+
+modern-sandbox-test: modern-sandbox
+	./build/nexus-modern-sandbox --hidden --frames 60 --autoplay --capture build/modern-sandbox.png
+	test -s build/modern-sandbox.png
 
 networking-test: sdk
 	mkdir -p build

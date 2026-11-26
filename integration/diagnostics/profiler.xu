@@ -1,0 +1,208 @@
+@"github.com/xulang-org/nexus/integration/diagnostics"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+timing #"github.com/xulang-org/nexus/timing"
+ui_bridge #"github.com/xulang-org/nexus/integration/ui"
+#gpu
+#ui/draw
+#ui/layout
+#strconv
+#strings
+
+pub struct GpuTelemetrySnapshot {
+    pub buffer_count int
+    pub buffer_bytes int
+    pub texture_count int
+    pub texture_bytes int
+    pub pipeline_count int
+    pub compute_pipeline_count int
+    pub render_pass_count int
+    pub compute_pass_count int
+    pub submission_count int
+    pub staging_bytes int
+    pub frame_count int
+}
+
+pub struct AssetResidencyCounters {
+    pub meshes int
+    pub textures int
+    pub shaders int
+    pub audio_clips int
+    pub bundle_assets int
+    pub gpu_memory_bytes int
+}
+
+pub struct EngineTelemetry {
+    pub profiler timing.FrameProfiler
+    pub gpu GpuTelemetrySnapshot
+    pub assets AssetResidencyCounters
+    pub draw_calls int
+    pub active_entities int
+    pub active_lights int
+}
+
+pub fn empty_gpu_snapshot() GpuTelemetrySnapshot {
+    << GpuTelemetrySnapshot{
+        buffer_count: 0,
+        buffer_bytes: 0,
+        texture_count: 0,
+        texture_bytes: 0,
+        pipeline_count: 0,
+        compute_pipeline_count: 0,
+        render_pass_count: 0,
+        compute_pass_count: 0,
+        submission_count: 0,
+        staging_bytes: 0,
+        frame_count: 0
+    }
+}
+
+pub fn snapshot_gpu_stats(stats &gpu.Stats) GpuTelemetrySnapshot {
+    << GpuTelemetrySnapshot{
+        buffer_count: stats.buffer_count,
+        buffer_bytes: stats.buffer_bytes,
+        texture_count: stats.texture_count,
+        texture_bytes: stats.texture_bytes,
+        pipeline_count: stats.pipeline_count,
+        compute_pipeline_count: stats.compute_pipeline_count,
+        render_pass_count: stats.render_pass_count,
+        compute_pass_count: stats.compute_pass_count,
+        submission_count: stats.submission_count,
+        staging_bytes: stats.staging_bytes,
+        frame_count: stats.frame_count
+    }
+}
+
+pub fn sample_gpu_device(device &gpu.Device) GpuTelemetrySnapshot {
+    stats := device.stats()
+    << snapshot_gpu_stats(&stats)
+}
+
+pub fn new_engine_telemetry() EngineTelemetry {
+    << EngineTelemetry{
+        profiler: timing.new_frame_profiler(),
+        gpu: empty_gpu_snapshot(),
+        assets: AssetResidencyCounters{
+            meshes: 0,
+            textures: 0,
+            shaders: 0,
+            audio_clips: 0,
+            bundle_assets: 0,
+            gpu_memory_bytes: 0
+        },
+        draw_calls: 0,
+        active_entities: 0,
+        active_lights: 0
+    }
+}
+
+pub fn (t $&EngineTelemetry) begin_frame() {
+    p := $&t.profiler
+    p.begin_frame()
+}
+
+pub fn (t $&EngineTelemetry) end_frame() f64 {
+    p := $&t.profiler
+    << p.end_frame()
+}
+
+pub fn (t $&EngineTelemetry) record_frame_ms(ms f64) {
+    p := $&t.profiler
+    p.record_frame_ms(ms)
+}
+
+pub fn (t $&EngineTelemetry) begin_scope(name string) {
+    p := $&t.profiler
+    p.begin_scope(name)
+}
+
+pub fn (t $&EngineTelemetry) end_scope() f64 {
+    p := $&t.profiler
+    << p.end_scope()
+}
+
+pub fn (t $&EngineTelemetry) record_scope_ms(name string, ms f64) {
+    p := $&t.profiler
+    p.record_scope_ms(name, ms)
+}
+
+pub fn (t $&EngineTelemetry) set_counter(name string, value int) {
+    p := $&t.profiler
+    p.set_counter(name, value)
+}
+
+pub fn (t $&EngineTelemetry) add_counter(name string, delta int) {
+    p := $&t.profiler
+    p.add_counter(name, delta)
+}
+
+pub fn (t $&EngineTelemetry) update_gpu(snap GpuTelemetrySnapshot) {
+    t.gpu = snap
+    t.assets.gpu_memory_bytes = snap.buffer_bytes + snap.texture_bytes
+}
+
+pub fn (t $&EngineTelemetry) set_assets(assets AssetResidencyCounters) {
+    t.assets = assets
+}
+
+pub fn (t $&EngineTelemetry) set_scene_counts(draws int, entities int, lights int) {
+    t.draw_calls = draws
+    t.active_entities = entities
+    t.active_lights = lights
+}
+
+fn fmt_mb(bytes int) string {
+    mb := f64(bytes) / (1024.0 * 1024.0)
+    << strconv.format_float(mb, 102, 2) or (err) { << "0.00" }
+}
+
+pub fn (t &EngineTelemetry) hud_lines() []string {
+    $lines := t.profiler.summary_lines()
+    lines.push("GPU bufs:" + str(t.gpu.buffer_count) + " tex:" + str(t.gpu.texture_count) +
+        " pipes:" + str(t.gpu.pipeline_count) + " mem:" + fmt_mb(t.assets.gpu_memory_bytes) + "MB")
+    lines.push("Scene draws:" + str(t.draw_calls) + " ents:" + str(t.active_entities) +
+        " lights:" + str(t.active_lights) + " bundles:" + str(t.assets.bundle_assets))
+    << lines
+}
+
+pub fn (t &EngineTelemetry) to_json() string {
+    $b := strings.new_byte_builder(768)
+    b.write_str("{\"profiler\":" + t.profiler.to_json() +
+        ",\"gpu\":{\"buffer_count\":" + str(t.gpu.buffer_count) +
+        ",\"buffer_bytes\":" + str(t.gpu.buffer_bytes) +
+        ",\"texture_count\":" + str(t.gpu.texture_count) +
+        ",\"texture_bytes\":" + str(t.gpu.texture_bytes) +
+        ",\"pipeline_count\":" + str(t.gpu.pipeline_count) +
+        ",\"compute_pipeline_count\":" + str(t.gpu.compute_pipeline_count) +
+        ",\"render_pass_count\":" + str(t.gpu.render_pass_count) +
+        ",\"compute_pass_count\":" + str(t.gpu.compute_pass_count) +
+        ",\"submission_count\":" + str(t.gpu.submission_count) +
+        ",\"staging_bytes\":" + str(t.gpu.staging_bytes) +
+        ",\"frame_count\":" + str(t.gpu.frame_count) +
+        "},\"assets\":{\"meshes\":" + str(t.assets.meshes) +
+        ",\"textures\":" + str(t.assets.textures) +
+        ",\"shaders\":" + str(t.assets.shaders) +
+        ",\"audio_clips\":" + str(t.assets.audio_clips) +
+        ",\"bundle_assets\":" + str(t.assets.bundle_assets) +
+        ",\"gpu_memory_bytes\":" + str(t.assets.gpu_memory_bytes) +
+        "},\"scene\":{\"draw_calls\":" + str(t.draw_calls) +
+        ",\"active_entities\":" + str(t.active_entities) +
+        ",\"active_lights\":" + str(t.active_lights) + "}}")
+    << b.to_string()
+}
+
+pub fn (t &EngineTelemetry) render_telemetry_hud(frame $&ui_bridge.UiFrame, bounds &layout.Rect) int {
+    frame.draw_panel(bounds, 8.0, draw.rgba(16, 20, 28, 218), draw.rgba(84, 118, 168, 220), 1.0) or >>
+    lines := t.hud_lines()
+    $y := bounds.y + 8.0
+    max_y := bounds.y + bounds.height - 16.0
+    for i in 0:lines.len {
+        if y > max_y { <- }
+        row := layout.Rect{x: bounds.x + 10.0, y: y, width: bounds.width - 20.0, height: 15.0}
+        $col := draw.rgb(220, 232, 248)
+        if i == 0 { col = draw.rgb(122, 224, 178) }
+        frame.draw_label(&row, &lines[i], col, 11.5, 0.0, 0.5) or >>
+        y = y + 16.0
+    }
+    << 0
+}

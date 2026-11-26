@@ -31,12 +31,12 @@ pub fn new_modern_pipeline_3d(
     iprog &ren.IndirectProgram3D,
     pprog &ren.PostProcessProgram3D
 ) ModernPipeline3D {
-    device.alive() >>>
-    if !device.is_gpu() { >>> errors.new("nexus modern: ModernPipeline3D requires GPU backend") }
-    $clustered := device.clustered_renderer(cprog) >>>
-    $hiz := device.hiz_pyramid(iprog) >>>
-    $hdr := device.hdr_target(pprog) >>>
-    $pp := device.postprocess_pipeline(pprog) >>>
+    device.alive() or >>
+    if !device.is_gpu() { >> errors.new("nexus modern: ModernPipeline3D requires GPU backend") }
+    $clustered := device.clustered_renderer(cprog) or >>
+    $hiz := device.hiz_pyramid(iprog) or >>
+    $hdr := device.hdr_target(pprog) or >>
+    $pp := device.postprocess_pipeline(pprog) or >>
     << ModernPipeline3D{
         owner: device.reference(),
         clustered: clustered,
@@ -59,10 +59,10 @@ pub fn (mp $&ModernPipeline3D) prepare_lights(
     z_far f64
 ) int {
     if mp.closed || !mp.owner.matches(device) {
-        >>> errors.new("nexus modern: closed or foreign ModernPipeline3D")
+        >> errors.new("nexus modern: closed or foreign ModernPipeline3D")
     }
     cl := $&mp.clustered
-    << cl.bin_lights(device, ambient, eye, exposure, lights, view, proj, z_near, z_far, 0) >>>
+    << cl.bin_lights(device, ambient, eye, exposure, lights, view, proj, z_near, z_far, 0) or >>
 }
 
 fn (mp $&ModernPipeline3D) render_unified_core(
@@ -93,18 +93,18 @@ fn (mp $&ModernPipeline3D) render_unified_core(
     pp_cfg &ren.PostProcessConfig3D
 ) ModernFrameStats3D {
     if mp.closed || !mp.owner.matches(device) {
-        >>> errors.new("nexus modern: closed or foreign ModernPipeline3D")
+        >> errors.new("nexus modern: closed or foreign ModernPipeline3D")
     }
     if skinned_refs.len != skinned_worlds.len || skinned_refs.len != skinned_mats.len {
-        >>> errors.new("nexus modern: skinned mesh/world/material arrays length mismatch")
+        >> errors.new("nexus modern: skinned mesh/world/material arrays length mismatch")
     }
     vp := proj.multiply(view)
 
     // 1. Cull meshlets via Frustum + Normal Cone + optional previous-frame Hi-Z.
     if use_hiz_cull {
-        meshlets.cull_with_hiz(device, &mp.hiz, eye, vp, enable_cone_cull, 0.0001) >>>
+        meshlets.cull_with_hiz(device, &mp.hiz, eye, vp, enable_cone_cull, 0.0001) or >>
     } else {
-        meshlets.cull(device, eye, vp, enable_cone_cull) >>>
+        meshlets.cull(device, eye, vp, enable_cone_cull) or >>
     }
 
     // 2. Render Visibility Buffer + decoupled Clustered/GI/Shadow/IBL Compute Shading into shared HdrTarget3D.
@@ -113,42 +113,42 @@ fn (mp $&ModernPipeline3D) render_unified_core(
         meshlets.render_and_shade_pbr(
             device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength,
             has_shadow, shadow, use_ibl, ibl, view, vp, sky_linear, false
-        ) >>>
+        ) or >>
     } else {
-        meshlets.render_and_shade_into(device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength, view, vp, sky_linear, false) >>>
+        meshlets.render_and_shade_into(device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength, view, vp, sky_linear, false) or >>
     }
 
     // 3. Draw visible GPU-skinned dynamic meshes using conservative joint bounds into the loaded HDR+Depth target!
     $visible_skinned := 0
     if skinned_refs.len > 0 {
-        hdr_ref.begin_overlay(device) >>>
+        hdr_ref.begin_overlay(device) or >>
         for i in 0:skinned_refs.len {
             mref := skinned_refs[i]
             w := skinned_worlds[i]
             mvp := vp.multiply(w)
             // Conservative skinning bounds culling before HDR overlay submission.
-            if !(mp.owner.mesh_in_view(mref, mvp) >>>) { -> }
+            if !(mp.owner.mesh_in_view(mref, mvp) or >>) { -> }
             if use_gi {
-                hdr_ref.draw_clustered_gi(device, &mp.clustered, irr, gi_strength, mref, w, view, vp, &skinned_mats[i]) >>>
+                hdr_ref.draw_clustered_gi(device, &mp.clustered, irr, gi_strength, mref, w, view, vp, &skinned_mats[i]) or >>
             } else {
-                hdr_ref.draw_clustered(device, &mp.clustered, mref, w, view, vp, &skinned_mats[i]) >>>
+                hdr_ref.draw_clustered(device, &mp.clustered, mref, w, view, vp, &skinned_mats[i]) or >>
             }
             visible_skinned += 1
         }
-        hdr_ref.end() >>>
+        hdr_ref.end() or >>
     }
 
     // 4. Optional back-to-front sorted alpha-blended transparent queue into loaded HDR+Depth target.
     $tstats := ren.TransparentSortStats3D{submitted: 0, visible: 0, frustum_culled: 0}
     if has_transparent {
-        tstats = transparent.flush_into_hdr(device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength, view, vp) >>>
+        tstats = transparent.flush_into_hdr(device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength, view, vp) or >>
     }
 
     // 5. Hi-Z rebuild + GTAO + Hi-Z SSR + Bloom + TAA + ACES composite onto Device3D target.
-    device.begin(clear_rgba) >>>
+    device.begin(clear_rgba) or >>
     pp_ref := $&mp.pp
     hiz_ref := $&mp.hiz
-    pp_ref.apply(device, hdr_ref, hiz_ref, view, proj, z_near, z_far, pp_cfg) >>>
+    pp_ref.apply(device, hdr_ref, hiz_ref, view, proj, z_near, z_far, pp_cfg) or >>
     << ModernFrameStats3D{
         skinned_visible: visible_skinned,
         transparent_visible: tstats.visible,
@@ -183,17 +183,17 @@ fn (mp $&ModernPipeline3D) render_unified_pbr_vfx_core(
     pp_cfg &ren.PostProcessConfig3D
 ) ModernFrameStats3D {
     if mp.closed || !mp.owner.matches(device) {
-        >>> errors.new("nexus modern: closed or foreign ModernPipeline3D")
+        >> errors.new("nexus modern: closed or foreign ModernPipeline3D")
     }
     if skinned_refs.len != skinned_worlds.len || skinned_refs.len != skinned_mats.len {
-        >>> errors.new("nexus modern: skinned mesh/world/material arrays length mismatch")
+        >> errors.new("nexus modern: skinned mesh/world/material arrays length mismatch")
     }
     vp := proj.multiply(view)
 
     if use_hiz_cull {
-        meshlets.cull_with_hiz(device, &mp.hiz, eye, vp, enable_cone_cull, 0.0001) >>>
+        meshlets.cull_with_hiz(device, &mp.hiz, eye, vp, enable_cone_cull, 0.0001) or >>
     } else {
-        meshlets.cull(device, eye, vp, enable_cone_cull) >>>
+        meshlets.cull(device, eye, vp, enable_cone_cull) or >>
     }
 
     hdr_ref := $&mp.hdr
@@ -201,36 +201,36 @@ fn (mp $&ModernPipeline3D) render_unified_pbr_vfx_core(
         meshlets.render_and_shade_pbr(
             device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength,
             has_shadow, shadow, use_ibl, ibl, view, vp, sky_linear, false
-        ) >>>
+        ) or >>
     } else {
-        meshlets.render_and_shade_into(device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength, view, vp, sky_linear, false) >>>
+        meshlets.render_and_shade_into(device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength, view, vp, sky_linear, false) or >>
     }
 
     $visible_skinned := 0
     if skinned_refs.len > 0 {
-        hdr_ref.begin_overlay(device) >>>
+        hdr_ref.begin_overlay(device) or >>
         for i in 0:skinned_refs.len {
             mref := skinned_refs[i]
             w := skinned_worlds[i]
             mvp := vp.multiply(w)
-            if !(mp.owner.mesh_in_view(mref, mvp) >>>) { -> }
+            if !(mp.owner.mesh_in_view(mref, mvp) or >>) { -> }
             if use_gi {
-                hdr_ref.draw_clustered_gi(device, &mp.clustered, irr, gi_strength, mref, w, view, vp, &skinned_mats[i]) >>>
+                hdr_ref.draw_clustered_gi(device, &mp.clustered, irr, gi_strength, mref, w, view, vp, &skinned_mats[i]) or >>
             } else {
-                hdr_ref.draw_clustered(device, &mp.clustered, mref, w, view, vp, &skinned_mats[i]) >>>
+                hdr_ref.draw_clustered(device, &mp.clustered, mref, w, view, vp, &skinned_mats[i]) or >>
             }
             visible_skinned += 1
         }
-        hdr_ref.end() >>>
+        hdr_ref.end() or >>
     }
 
-    tstats := transparent.flush_into_hdr(device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength, view, vp) >>>
-    particles.draw_into_hdr(device, hdr_ref, view, proj) >>>
+    tstats := transparent.flush_into_hdr(device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength, view, vp) or >>
+    particles.draw_into_hdr(device, hdr_ref, view, proj) or >>
 
-    device.begin(clear_rgba) >>>
+    device.begin(clear_rgba) or >>
     pp_ref := $&mp.pp
     hiz_ref := $&mp.hiz
-    pp_ref.apply(device, hdr_ref, hiz_ref, view, proj, z_near, z_far, pp_cfg) >>>
+    pp_ref.apply(device, hdr_ref, hiz_ref, view, proj, z_near, z_far, pp_cfg) or >>
     << ModernFrameStats3D{
         skinned_visible: visible_skinned,
         transparent_visible: tstats.visible,
@@ -270,7 +270,7 @@ pub fn (mp $&ModernPipeline3D) render_unified_frame(
         false, &empty_t,
         eye, view, proj, z_near, z_far, sky_linear, clear_rgba,
         use_hiz_cull, enable_cone_cull, pp_cfg
-    ) >>>
+    ) or >>
     << stats.skinned_visible
 }
 
@@ -306,7 +306,7 @@ pub fn (mp $&ModernPipeline3D) render_unified_pbr_frame(
         false, &empty_t,
         eye, view, proj, z_near, z_far, sky_linear, clear_rgba,
         use_hiz_cull, enable_cone_cull, pp_cfg
-    ) >>>
+    ) or >>
     << stats.skinned_visible
 }
 
@@ -342,7 +342,7 @@ pub fn (mp $&ModernPipeline3D) render_unified_pbr_transparent_frame(
         true, transparent,
         eye, view, proj, z_near, z_far, sky_linear, clear_rgba,
         use_hiz_cull, enable_cone_cull, pp_cfg
-    ) >>>
+    ) or >>
 }
 
 pub fn (mp $&ModernPipeline3D) render_unified_pbr_vfx_frame(
@@ -378,7 +378,7 @@ pub fn (mp $&ModernPipeline3D) render_unified_pbr_vfx_frame(
         transparent, particles,
         eye, view, proj, z_near, z_far, sky_linear, clear_rgba,
         use_hiz_cull, enable_cone_cull, pp_cfg
-    ) >>>
+    ) or >>
 }
 
 pub fn (mp $&ModernPipeline3D) render_terrain_foliage_frame(
@@ -407,30 +407,30 @@ pub fn (mp $&ModernPipeline3D) render_terrain_foliage_frame(
     pp_cfg &ren.PostProcessConfig3D
 ) int {
     if mp.closed || !mp.owner.matches(device) {
-        >>> errors.new("nexus modern: closed or foreign ModernPipeline3D")
+        >> errors.new("nexus modern: closed or foreign ModernPipeline3D")
     }
     vp := proj.multiply(view)
     hdr_ref := $&mp.hdr
     tris := terrain_ren.draw_chunks_into_hdr(
         device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength,
         chunk_refs, chunk_worlds, view, vp, terrain_mat, true, clear_rgba
-    ) >>>
+    ) or >>
     if has_foliage {
         foliage.draw_into_hdr(
             device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength,
             eye, view, vp, wind, foliage_mat
-        ) >>>
+        ) or >>
     }
     if has_transparent {
-        _ := transparent.flush_into_hdr(device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength, view, vp) >>>
+        _ := transparent.flush_into_hdr(device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength, view, vp) or >>
     }
     if has_particles {
-        particles.draw_into_hdr(device, hdr_ref, view, proj) >>>
+        particles.draw_into_hdr(device, hdr_ref, view, proj) or >>
     }
-    device.begin(clear_rgba) >>>
+    device.begin(clear_rgba) or >>
     pp_ref := $&mp.pp
     hiz_ref := $&mp.hiz
-    pp_ref.apply(device, hdr_ref, hiz_ref, view, proj, z_near, z_far, pp_cfg) >>>
+    pp_ref.apply(device, hdr_ref, hiz_ref, view, proj, z_near, z_far, pp_cfg) or >>
     << tris
 }
 
@@ -461,41 +461,73 @@ pub fn (mp $&ModernPipeline3D) render_unified_atmosphere_frame(
     pp_cfg &ren.PostProcessConfig3D
 ) int {
     if mp.closed || !mp.owner.matches(device) {
-        >>> errors.new("nexus modern: closed or foreign ModernPipeline3D")
+        >> errors.new("nexus modern: closed or foreign ModernPipeline3D")
     }
     if opaque_refs.len != opaque_worlds.len || opaque_refs.len != opaque_mats.len {
-        >>> errors.new("nexus modern: opaque mesh/world/material arrays length mismatch")
+        >> errors.new("nexus modern: opaque mesh/world/material arrays length mismatch")
     }
     vp := proj.multiply(view)
     hdr_ref := $&mp.hdr
 
-    hdr_ref.begin(device, clear_rgba) >>>
+    hdr_ref.begin(device, clear_rgba) or >>
     for i in 0:opaque_refs.len {
         if use_gi {
-            hdr_ref.draw_clustered_gi(device, &mp.clustered, irr, gi_strength, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) >>>
+            hdr_ref.draw_clustered_gi(device, &mp.clustered, irr, gi_strength, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) or >>
         } else {
-            hdr_ref.draw_clustered(device, &mp.clustered, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) >>>
+            hdr_ref.draw_clustered(device, &mp.clustered, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) or >>
         }
     }
-    hdr_ref.end() >>>
+    hdr_ref.end() or >>
 
     if has_decals {
-        _ := decals_ren.draw_into_hdr(device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength, decals_queue, view, vp) >>>
+        _ := decals_ren.draw_into_hdr(device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength, decals_queue, view, vp) or >>
     }
     if has_atmosphere {
-        _ := atm_ren.apply_into_hdr(device, hdr_ref, &mp.clustered, eye, view, proj, atm_cfg) >>>
+        _ := atm_ren.apply_into_hdr(device, hdr_ref, &mp.clustered, eye, view, proj, atm_cfg) or >>
     }
     if has_transparent {
-        _ := transparent.flush_into_hdr(device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength, view, vp) >>>
+        _ := transparent.flush_into_hdr(device, hdr_ref, &mp.clustered, use_gi, irr, gi_strength, view, vp) or >>
     }
     if has_particles {
-        particles.draw_into_hdr(device, hdr_ref, view, proj) >>>
+        particles.draw_into_hdr(device, hdr_ref, view, proj) or >>
     }
 
-    device.begin(clear_rgba) >>>
+    device.begin(clear_rgba) or >>
     pp_ref := $&mp.pp
     hiz_ref := $&mp.hiz
-    pp_ref.apply(device, hdr_ref, hiz_ref, view, proj, z_near, z_far, pp_cfg) >>>
+    pp_ref.apply(device, hdr_ref, hiz_ref, view, proj, z_near, z_far, pp_cfg) or >>
+    << opaque_refs.len
+}
+
+pub fn (mp $&ModernPipeline3D) render_clustered_hdr_frame(
+    device $&ren.Device3D,
+    opaque_refs &[]ren.MeshRef3D,
+    opaque_worlds &[]fm.Mat4,
+    opaque_mats &[]ren.Material3D,
+    view fm.Mat4,
+    proj fm.Mat4,
+    z_near f64,
+    z_far f64,
+    clear_rgba int,
+    pp_cfg &ren.PostProcessConfig3D
+) int {
+    if mp.closed || !mp.owner.matches(device) {
+        >> errors.new("nexus modern: closed or foreign ModernPipeline3D")
+    }
+    if opaque_refs.len != opaque_worlds.len || opaque_refs.len != opaque_mats.len {
+        >> errors.new("nexus modern: opaque mesh/world/material arrays length mismatch")
+    }
+    vp := proj.multiply(view)
+    hdr_ref := $&mp.hdr
+    hdr_ref.begin(device, clear_rgba) or >>
+    for i in 0:opaque_refs.len {
+        hdr_ref.draw_clustered(device, &mp.clustered, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) or >>
+    }
+    hdr_ref.end() or >>
+    device.begin(clear_rgba) or >>
+    pp_ref := $&mp.pp
+    hiz_ref := $&mp.hiz
+    pp_ref.apply(device, hdr_ref, hiz_ref, view, proj, z_near, z_far, pp_cfg) or >>
     << opaque_refs.len
 }
 
@@ -504,9 +536,9 @@ pub fn (mp $&ModernPipeline3D) update_ddgi(
     ddgi $&ren.DdgiVolume3D
 ) int {
     if mp.closed || !mp.owner.matches(device) {
-        >>> errors.new("nexus modern: closed or foreign ModernPipeline3D")
+        >> errors.new("nexus modern: closed or foreign ModernPipeline3D")
     }
-    << ddgi.update(device, &mp.clustered) >>>
+    << ddgi.update(device, &mp.clustered) or >>
 }
 
 pub fn (mp $&ModernPipeline3D) render_unified_ddgi_frame(
@@ -533,45 +565,45 @@ pub fn (mp $&ModernPipeline3D) render_unified_ddgi_frame(
     pp_cfg &ren.PostProcessConfig3D
 ) int {
     if mp.closed || !mp.owner.matches(device) {
-        >>> errors.new("nexus modern: closed or foreign ModernPipeline3D")
+        >> errors.new("nexus modern: closed or foreign ModernPipeline3D")
     }
     if opaque_refs.len != opaque_worlds.len || opaque_refs.len != opaque_mats.len {
-        >>> errors.new("nexus modern: opaque mesh/world/material arrays length mismatch")
+        >> errors.new("nexus modern: opaque mesh/world/material arrays length mismatch")
     }
     if update_ddgi {
-        _ := ddgi.update(device, &mp.clustered) >>>
+        _ := ddgi.update(device, &mp.clustered) or >>
     }
 
     vp := proj.multiply(view)
     hdr_ref := $&mp.hdr
 
-    hdr_ref.begin(device, clear_rgba) >>>
+    hdr_ref.begin(device, clear_rgba) or >>
     for i in 0:opaque_refs.len {
         if apply_chebyshev_pass {
-            hdr_ref.draw_clustered(device, &mp.clustered, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) >>>
+            hdr_ref.draw_clustered(device, &mp.clustered, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) or >>
         } else {
-            hdr_ref.draw_clustered_ddgi(device, &mp.clustered, ddgi, gi_strength, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) >>>
+            hdr_ref.draw_clustered_ddgi(device, &mp.clustered, ddgi, gi_strength, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) or >>
         }
     }
-    hdr_ref.end() >>>
+    hdr_ref.end() or >>
 
     if apply_chebyshev_pass {
-        ddgi.apply_into_hdr(device, hdr_ref, eye, view, proj, gi_strength, albedo_tint, use_chebyshev) >>>
+        ddgi.apply_into_hdr(device, hdr_ref, eye, view, proj, gi_strength, albedo_tint, use_chebyshev) or >>
     }
     if has_transparent {
-        empty_irr := ren.irradiance_grid_3d(fm.vec3(0.0, 0.0, 0.0), fm.vec3(1.0, 1.0, 1.0), 1, 1, 1) >>>
-        $tmp_irr := empty_irr.upload(device) >>>
-        _ := transparent.flush_into_hdr(device, hdr_ref, &mp.clustered, false, &tmp_irr, gi_strength, view, vp) >>>
-        tmp_irr.close() >>>
+        empty_irr := ren.irradiance_grid_3d(fm.vec3(0.0, 0.0, 0.0), fm.vec3(1.0, 1.0, 1.0), 1, 1, 1) or >>
+        $tmp_irr := empty_irr.upload(device) or >>
+        _ := transparent.flush_into_hdr(device, hdr_ref, &mp.clustered, false, &tmp_irr, gi_strength, view, vp) or >>
+        tmp_irr.close() or >>
     }
     if has_particles {
-        particles.draw_into_hdr(device, hdr_ref, view, proj) >>>
+        particles.draw_into_hdr(device, hdr_ref, view, proj) or >>
     }
 
-    device.begin(clear_rgba) >>>
+    device.begin(clear_rgba) or >>
     pp_ref := $&mp.pp
     hiz_ref := $&mp.hiz
-    pp_ref.apply(device, hdr_ref, hiz_ref, view, proj, z_near, z_far, pp_cfg) >>>
+    pp_ref.apply(device, hdr_ref, hiz_ref, view, proj, z_near, z_far, pp_cfg) or >>
     << opaque_refs.len
 }
 
@@ -647,14 +679,14 @@ pub fn (mp $&ModernPipeline3D) render_master_world_frame(
     opts &MasterFrameOptions3D
 ) MasterFrameStats3D {
     if mp.closed || !mp.owner.matches(device) {
-        >>> errors.new("nexus modern: closed or foreign ModernPipeline3D")
+        >> errors.new("nexus modern: closed or foreign ModernPipeline3D")
     }
     if opaque_refs.len != opaque_worlds.len || opaque_refs.len != opaque_mats.len {
-        >>> errors.new("nexus modern: opaque mesh/world/material arrays length mismatch")
+        >> errors.new("nexus modern: opaque mesh/world/material arrays length mismatch")
     }
 
     if opts.has_ddgi && opts.update_ddgi {
-        _ := ddgi.update(device, &mp.clustered) >>>
+        _ := ddgi.update(device, &mp.clustered) or >>
     }
 
     vp := proj.multiply(view)
@@ -665,39 +697,39 @@ pub fn (mp $&ModernPipeline3D) render_master_world_frame(
         terrain_tris = terrain_ren.draw_chunks_into_hdr(
             device, hdr_ref, &mp.clustered, opts.use_static_gi, static_irr, opts.gi_strength,
             terrain_chunks, terrain_worlds, view, vp, terrain_mat, true, opts.clear_rgba
-        ) >>>
+        ) or >>
     }
 
     if !opts.has_terrain || opaque_refs.len > 0 {
         if opts.has_terrain {
-            hdr_ref.begin_overlay(device) >>>
+            hdr_ref.begin_overlay(device) or >>
         } else {
-            hdr_ref.begin(device, opts.clear_rgba) >>>
+            hdr_ref.begin(device, opts.clear_rgba) or >>
         }
         for i in 0:opaque_refs.len {
             if opts.has_ddgi && !opts.apply_ddgi_chebyshev {
-                hdr_ref.draw_clustered_ddgi(device, &mp.clustered, ddgi, opts.gi_strength, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) >>>
+                hdr_ref.draw_clustered_ddgi(device, &mp.clustered, ddgi, opts.gi_strength, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) or >>
             } else if opts.use_static_gi {
-                hdr_ref.draw_clustered_gi(device, &mp.clustered, static_irr, opts.gi_strength, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) >>>
+                hdr_ref.draw_clustered_gi(device, &mp.clustered, static_irr, opts.gi_strength, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) or >>
             } else {
-                hdr_ref.draw_clustered(device, &mp.clustered, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) >>>
+                hdr_ref.draw_clustered(device, &mp.clustered, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) or >>
             }
         }
-        hdr_ref.end() >>>
+        hdr_ref.end() or >>
     }
 
     if opts.has_foliage {
         foliage.draw_into_hdr(
             device, hdr_ref, &mp.clustered, opts.use_static_gi, static_irr, opts.gi_strength,
             eye, view, vp, wind, foliage_mat
-        ) >>>
+        ) or >>
     }
 
     if opts.has_ddgi && opts.apply_ddgi_chebyshev {
         ddgi.apply_into_hdr(
             device, hdr_ref, eye, view, proj,
             opts.gi_strength, opts.ddgi_albedo_tint, opts.ddgi_use_chebyshev
-        ) >>>
+        ) or >>
     }
 
     $decals_drawn := 0
@@ -705,29 +737,29 @@ pub fn (mp $&ModernPipeline3D) render_master_world_frame(
         decals_drawn = decals_ren.draw_into_hdr(
             device, hdr_ref, &mp.clustered, opts.use_static_gi, static_irr, opts.gi_strength,
             decals_queue, view, vp
-        ) >>>
+        ) or >>
     }
 
     if opts.has_atmosphere {
-        _ := atm_ren.apply_into_hdr(device, hdr_ref, &mp.clustered, eye, view, proj, atm_cfg) >>>
+        _ := atm_ren.apply_into_hdr(device, hdr_ref, &mp.clustered, eye, view, proj, atm_cfg) or >>
     }
 
     $trans_vis := 0
     if opts.has_transparent {
         tstats := transparent.flush_into_hdr(
             device, hdr_ref, &mp.clustered, opts.use_static_gi, static_irr, opts.gi_strength, view, vp
-        ) >>>
+        ) or >>
         trans_vis = tstats.visible
     }
 
     if opts.has_particles {
-        particles.draw_into_hdr(device, hdr_ref, view, proj) >>>
+        particles.draw_into_hdr(device, hdr_ref, view, proj) or >>
     }
 
-    device.begin(opts.clear_rgba) >>>
+    device.begin(opts.clear_rgba) or >>
     pp_ref := $&mp.pp
     hiz_ref := $&mp.hiz
-    pp_ref.apply(device, hdr_ref, hiz_ref, view, proj, z_near, z_far, pp_cfg) >>>
+    pp_ref.apply(device, hdr_ref, hiz_ref, view, proj, z_near, z_far, pp_cfg) or >>
 
     << MasterFrameStats3D{
         terrain_triangles: terrain_tris,
@@ -740,17 +772,17 @@ pub fn (mp $&ModernPipeline3D) render_master_world_frame(
 pub fn (mp $&ModernPipeline3D) close() int {
     if mp.closed { << 0 }
     pp := $&mp.pp
-    pp.close() >>>
+    pp.close() or >>
     hdr := $&mp.hdr
-    hdr.close() >>>
+    hdr.close() or >>
     hiz := $&mp.hiz
-    hiz.close() >>>
+    hiz.close() or >>
     cl := $&mp.clustered
-    cl.close() >>>
+    cl.close() or >>
     mp.closed = true
     << 0
 }
 
 fn (mp $&ModernPipeline3D) drop() {
-    mp.close() >>> (err) { << }
+    mp.close() or (err) { << }
 }

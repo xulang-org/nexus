@@ -6,161 +6,161 @@ music #"github.com/xulang-org/nexus/integration/audio_stream"
 assets #"github.com/xulang-org/nexus/assets/audio"
 #os
 
-fn feed_rejected(mixer $&mix.Mixer, id int, samples &[]int) bool { mixer.feed_stream(id, samples, false) >>> (err) { << true }
+fn feed_rejected(mixer $&mix.Mixer, id int, samples &[]int) bool { mixer.feed_stream(id, samples, false) or (err) { << true }
     << false }
-fn commit_rejected(mixer $&mix.Mixer, block &mix.MixBlock) bool { mixer.commit(block) >>> (err) { << true }
+fn commit_rejected(mixer $&mix.Mixer, block &mix.MixBlock) bool { mixer.commit(block) or (err) { << true }
     << false }
-fn refill_rejected(stream $&music.MusicStream, mixer $&mix.Mixer) bool { stream.refill(mixer, 1) >>> (err) { << true }
+fn refill_rejected(stream $&music.MusicStream, mixer $&mix.Mixer) bool { stream.refill(mixer, 1) or (err) { << true }
     << false }
-fn reader_rejected(reader &assets.WavReader) bool { reader.read_frames(0, 1) >>> (err) { << true }
+fn reader_rejected(reader &assets.WavReader) bool { reader.read_frames(0, 1) or (err) { << true }
     << false }
-fn open_rejected(mixer $&mix.Mixer) bool { mixer.open_stream(48000, 2, 65536) >>> (err) { << true }
+fn open_rejected(mixer $&mix.Mixer) bool { mixer.open_stream(48000, 2, 65536) or (err) { << true }
     << false }
-fn consumer_rejected(mixer $&mix.Mixer, source int) bool { mixer.play_stream(source, 0, 1.0, 0.0) >>> (err) { << true }
+fn consumer_rejected(mixer $&mix.Mixer, source int) bool { mixer.play_stream(source, 0, 1.0, 0.0) or (err) { << true }
     << false }
 fn run() int {
-    $mixer := mix.new_mixer(48000, 4) >>>
-    source := mixer.open_stream(24000, 1, 2) >>>
+    $mixer := mix.new_mixer(48000, 4) or >>
+    source := mixer.open_stream(24000, 1, 2) or >>
     first := [0, 10000]
-    mixer.feed_stream(source, &first, false) >>>
-    voice := mixer.play_stream(source, 0, 1.0, 0.0) >>>
-    pending := mixer.prepare(4) >>>
+    mixer.feed_stream(source, &first, false) or >>
+    voice := mixer.play_stream(source, 0, 1.0, 0.0) or >>
+    pending := mixer.prepare(4) or >>
     assert(pending.samples[0] == 0 && pending.samples[2] == 5000 && pending.samples[4] == 10000 && pending.samples[6] == 0)
-    assert(pending.underruns == 1 && (mixer.stream_info(source) >>>).consumed_frames == 0)
-    assert((mixer.position_frames(voice) >>>) == 0.0)
+    assert(pending.underruns == 1 && (mixer.stream_info(source) or >>).consumed_frames == 0)
+    assert((mixer.position_frames(voice) or >>) == 0.0)
     assert(consumer_rejected($&mixer, source))
-    mixer.commit(&pending) >>>
-    assert((mixer.position_frames(voice) >>>) == 1.5 && (mixer.stream_info(source) >>>).room_frames == 1)
+    mixer.commit(&pending) or >>
+    assert((mixer.position_frames(voice) or >>) == 1.5 && (mixer.stream_info(source) or >>).room_frames == 1)
     second := [20000]
-    mixer.feed_stream(source, &second, false) >>>
-    next := mixer.render(2) >>>
+    mixer.feed_stream(source, &second, false) or >>
+    next := mixer.render(2) or >>
     assert(next[0] == 15000 && next[2] == 20000)
     tail := [30000]
-    mixer.feed_stream(source, &tail, true) >>>
-    final := mixer.render(4) >>>
+    mixer.feed_stream(source, &tail, true) or >>
+    final := mixer.render(4) or >>
     assert(final[0] == 25000 && final[2] == 30000 && final[4] == 30000 && final[6] == 0)
-    assert(!(mixer.is_playing(voice) >>>))
-    mixer.close_stream(source) >>>
-    fresh := mixer.open_stream(48000, 1, 4) >>>
+    assert(!(mixer.is_playing(voice) or >>))
+    mixer.close_stream(source) or >>
+    fresh := mixer.open_stream(48000, 1, 4) or >>
     assert(source != fresh && !mixer.is_stream(source))
     bad := [-40000]
-    before := mixer.prepare(1) >>>
+    before := mixer.prepare(1) or >>
     assert(feed_rejected($&mixer, fresh, &bad))
-    mixer.commit(&before) >>>
-    stale := mixer.prepare(1) >>>
+    mixer.commit(&before) or >>
+    stale := mixer.prepare(1) or >>
     pair := [100, -200]
-    mixer.feed_stream(fresh, &pair, false) >>>
+    mixer.feed_stream(fresh, &pair, false) or >>
     assert(commit_rejected($&mixer, &stale))
-    streamed := mixer.play_stream(fresh, 0, 1.0, 0.0) >>>
-    initial := mixer.render(2) >>>
+    streamed := mixer.play_stream(fresh, 0, 1.0, 0.0) or >>
+    initial := mixer.render(2) or >>
     assert(initial[0] == 100 && initial[2] == -200)
     for i in 0:100 {
-        mixer.feed_stream(fresh, &pair, false) >>>
-        block := mixer.render(2) >>>
-        assert(block[0] == 100 && block[2] == -200 && (mixer.stream_info(fresh) >>>).room_frames == 4)
+        mixer.feed_stream(fresh, &pair, false) or >>
+        block := mixer.render(2) or >>
+        assert(block[0] == 100 && block[2] == -200 && (mixer.stream_info(fresh) or >>).room_frames == 4)
     }
     empty := []int{}
-    mixer.feed_stream(fresh, &empty, true) >>>
-    mixer.render(1) >>>
-    assert(!(mixer.is_playing(streamed) >>>))
-    mixer.close_stream(fresh) >>>
+    mixer.feed_stream(fresh, &empty, true) or >>
+    mixer.render(1) or >>
+    assert(!(mixer.is_playing(streamed) or >>))
+    mixer.close_stream(fresh) or >>
     // Fades advance only on committed, unpaused source frames.
-    clip_data := pcm.pcm16(48000, 1, [1000]) >>>
-    clip := mixer.add_clip(clip_data) >>>
-    fading := mixer.play(clip, 0, 1.0, 0.0, true) >>>
-    mixer.fade_volume(fading, 0.0, 4, true) >>>
-    preview := mixer.prepare(2) >>>
-    assert(preview.samples[0] == 750 && preview.samples[2] == 500 && (mixer.volume(fading) >>>) == 1.0)
-    mixer.commit(&preview) >>>
-    assert((mixer.volume(fading) >>>) == 0.5)
-    mixer.pause_voice(fading, true) >>>
-    mixer.render(8) >>>
-    assert((mixer.volume(fading) >>>) == 0.5)
-    mixer.pause_voice(fading, false) >>>
-    faded := mixer.render(2) >>>
-    assert(faded[0] == 250 && faded[2] == 0 && !(mixer.is_playing(fading) >>>))
-    old := mixer.play(clip, 0, 1.0, 0.0, true) >>>
-    new := mixer.play(clip, 0, 0.0, 0.0, true) >>>
-    mixer.crossfade(old, new, 4, 1.0) >>>
-    for i in 0:4 { sample := mixer.render(1) >>>
+    clip_data := pcm.pcm16(48000, 1, [1000]) or >>
+    clip := mixer.add_clip(clip_data) or >>
+    fading := mixer.play(clip, 0, 1.0, 0.0, true) or >>
+    mixer.fade_volume(fading, 0.0, 4, true) or >>
+    preview := mixer.prepare(2) or >>
+    assert(preview.samples[0] == 750 && preview.samples[2] == 500 && (mixer.volume(fading) or >>) == 1.0)
+    mixer.commit(&preview) or >>
+    assert((mixer.volume(fading) or >>) == 0.5)
+    mixer.pause_voice(fading, true) or >>
+    mixer.render(8) or >>
+    assert((mixer.volume(fading) or >>) == 0.5)
+    mixer.pause_voice(fading, false) or >>
+    faded := mixer.render(2) or >>
+    assert(faded[0] == 250 && faded[2] == 0 && !(mixer.is_playing(fading) or >>))
+    old := mixer.play(clip, 0, 1.0, 0.0, true) or >>
+    new := mixer.play(clip, 0, 0.0, 0.0, true) or >>
+    mixer.crossfade(old, new, 4, 1.0) or >>
+    for i in 0:4 { sample := mixer.render(1) or >>
         assert(sample[0] == 1000) }
-    assert(!(mixer.is_playing(old) >>>) && (mixer.is_playing(new) >>>) && (mixer.volume(new) >>>) == 1.0)
-    mixer.stop(new) >>>
+    assert(!(mixer.is_playing(old) or >>) && (mixer.is_playing(new) or >>) && (mixer.volume(new) or >>) == 1.0)
+    mixer.stop(new) or >>
     // Stream starvation freezes only that source and its fade; other voices mix.
-    waiting := mixer.open_stream(48000, 1, 2) >>>
-    silent_voice := mixer.play_stream(waiting, 0, 0.0, 0.0) >>>
-    mixer.fade_volume(silent_voice, 1.0, 4, false) >>>
-    background := mixer.play(clip, 0, 1.0, 0.0, true) >>>
-    starved := mixer.prepare(2) >>>
+    waiting := mixer.open_stream(48000, 1, 2) or >>
+    silent_voice := mixer.play_stream(waiting, 0, 0.0, 0.0) or >>
+    mixer.fade_volume(silent_voice, 1.0, 4, false) or >>
+    background := mixer.play(clip, 0, 1.0, 0.0, true) or >>
+    starved := mixer.prepare(2) or >>
     assert(starved.underruns == 1 && starved.samples[0] == 1000)
-    mixer.commit(&starved) >>>
-    assert((mixer.volume(silent_voice) >>>) == 0.0 && (mixer.position_frames(silent_voice) >>>) == 0.0)
+    mixer.commit(&starved) or >>
+    assert((mixer.volume(silent_voice) or >>) == 0.0 && (mixer.position_frames(silent_voice) or >>) == 0.0)
     constant := [1000, 1000]
-    mixer.feed_stream(waiting, &constant, false) >>>
-    blended := mixer.render(2) >>>
-    assert(blended[0] == 1250 && blended[2] == 1500 && (mixer.volume(silent_voice) >>>) == 0.5)
-    mixer.stop(background) >>>
-    frozen := mixer.render(2) >>>
-    assert(frozen[0] == 0 && (mixer.volume(silent_voice) >>>) == 0.5)
-    mixer.feed_stream(waiting, &constant, true) >>>
-    resumed := mixer.render(2) >>>
+    mixer.feed_stream(waiting, &constant, false) or >>
+    blended := mixer.render(2) or >>
+    assert(blended[0] == 1250 && blended[2] == 1500 && (mixer.volume(silent_voice) or >>) == 0.5)
+    mixer.stop(background) or >>
+    frozen := mixer.render(2) or >>
+    assert(frozen[0] == 0 && (mixer.volume(silent_voice) or >>) == 0.5)
+    mixer.feed_stream(waiting, &constant, true) or >>
+    resumed := mixer.render(2) or >>
     assert(resumed[0] == 750 && resumed[2] == 1000)
-    mixer.close_stream(waiting) >>>
+    mixer.close_stream(waiting) or >>
     // The shared ring budget is reclaimed on close, rather than per-file sized.
     $large_sources := []int{}
-    for i in 0:4 { large_sources.push(mixer.open_stream(48000, 2, 65536) >>>) }
+    for i in 0:4 { large_sources.push(mixer.open_stream(48000, 2, 65536) or >>) }
     assert(open_rejected($&mixer))
-    for id in large_sources { mixer.close_stream(id) >>> }
-    reclaimed := mixer.open_stream(48000, 2, 65536) >>>
-    mixer.close_stream(reclaimed) >>>
+    for id in large_sources { mixer.close_stream(id) or >> }
+    reclaimed := mixer.open_stream(48000, 2, 65536) or >>
+    mixer.close_stream(reclaimed) or >>
     // Read and normalize far ends without loading the 48 MB source.
-    $reader := assets.open_wav_reader("build/audio-fixtures/large.wav") >>>
+    $reader := assets.open_wav_reader("build/audio-fixtures/large.wav") or >>
     assert(reader.frame_count() == 12000000)
-    start := reader.read_frames(0, 1) >>>
-    end := reader.read_frames(11999998, 2) >>>
+    start := reader.read_frames(0, 1) or >>
+    end := reader.read_frames(11999998, 2) or >>
     assert(start[0] == 11 && start[1] == -11 && end[0] == 1000 && end[3] == -2000)
-    reader.close() >>>
+    reader.close() or >>
     assert(reader_rejected(&reader))
     $zero := assets.WavReader{}
     assert(reader_rejected(&zero))
-    zero.close() >>>
+    zero.close() or >>
     // Rejected reads/decodes preserve producer and mixer cursors.
-    raw := os.read("build/audio-fixtures/pcm16.wav") >>>
-    write_file("build/audio-fixtures/live.wav", raw + "") >>>
-    $file_stream := music.open($&mixer, "build/audio-fixtures/live.wav", 8, false) >>>
-    assert((file_stream.refill($&mixer, 1) >>>) == 1 && file_stream.read_position() == 1)
-    write_file("build/audio-fixtures/live.wav", "truncated") >>>
+    raw := os.read("build/audio-fixtures/pcm16.wav") or >>
+    write_file("build/audio-fixtures/live.wav", raw + "") or >>
+    $file_stream := music.open($&mixer, "build/audio-fixtures/live.wav", 8, false) or >>
+    assert((file_stream.refill($&mixer, 1) or >>) == 1 && file_stream.read_position() == 1)
+    write_file("build/audio-fixtures/live.wav", "truncated") or >>
     assert(refill_rejected($&file_stream, $&mixer) && file_stream.read_position() == 1)
-    assert((mixer.stream_info(file_stream.source_id()) >>>).written_frames == 1)
-    write_file("build/audio-fixtures/live.wav", raw + "") >>>
-    assert((file_stream.refill($&mixer, 1) >>>) == 1 && file_stream.read_position() == 2)
-    file_stream.close($&mixer) >>>
-    file_stream.close($&mixer) >>>
-    $invalid := music.open($&mixer, "build/audio-fixtures/nan.wav", 8, false) >>>
+    assert((mixer.stream_info(file_stream.source_id()) or >>).written_frames == 1)
+    write_file("build/audio-fixtures/live.wav", raw + "") or >>
+    assert((file_stream.refill($&mixer, 1) or >>) == 1 && file_stream.read_position() == 2)
+    file_stream.close($&mixer) or >>
+    file_stream.close($&mixer) or >>
+    $invalid := music.open($&mixer, "build/audio-fixtures/nan.wav", 8, false) or >>
     assert(refill_rejected($&invalid, $&mixer) && invalid.read_position() == 0)
-    assert((mixer.stream_info(invalid.source_id()) >>>).written_frames == 0)
-    invalid.close($&mixer) >>>
+    assert((mixer.stream_info(invalid.source_id()) or >>).written_frames == 0)
+    invalid.close($&mixer) or >>
     // Tiny loop assets fill one whole block from a bounded cache, without a
     // file seek for every one/two sample cycle.
-    $tiny := music.open($&mixer, "build/audio-fixtures/order.wav", 16, true) >>>
-    assert((tiny.refill($&mixer, 16) >>>) == 16)
-    tiny_voice := mixer.play_stream(tiny.source_id(), 0, 1.0, 0.0) >>>
-    tiny_block := mixer.prepare(16) >>>
+    $tiny := music.open($&mixer, "build/audio-fixtures/order.wav", 16, true) or >>
+    assert((tiny.refill($&mixer, 16) or >>) == 16)
+    tiny_voice := mixer.play_stream(tiny.source_id(), 0, 1.0, 0.0) or >>
+    tiny_block := mixer.prepare(16) or >>
     assert(tiny_block.underruns == 0 && tiny_block.samples[0] == 100 && tiny_block.samples[2] == 150 && tiny_block.samples[4] == 200)
-    mixer.commit(&tiny_block) >>>
-    assert((mixer.is_playing(tiny_voice) >>>))
-    tiny.close($&mixer) >>>
+    mixer.commit(&tiny_block) or >>
+    assert((mixer.is_playing(tiny_voice) or >>))
+    tiny.close($&mixer) or >>
     // Replacing a pathname must not silently switch the existing descriptor.
-    write_file("build/audio-fixtures/pinned.wav", raw + "") >>>
-    $pinned := assets.open_wav_reader("build/audio-fixtures/pinned.wav") >>>
-    alternate := os.read("build/audio-fixtures/order.wav") >>>
-    write_file("build/audio-fixtures/replacement.wav", alternate) >>>
-    os.rename("build/audio-fixtures/replacement.wav", "build/audio-fixtures/pinned.wav") >>>
-    original := pinned.read_frames(0, 1) >>>
+    write_file("build/audio-fixtures/pinned.wav", raw + "") or >>
+    $pinned := assets.open_wav_reader("build/audio-fixtures/pinned.wav") or >>
+    alternate := os.read("build/audio-fixtures/order.wav") or >>
+    write_file("build/audio-fixtures/replacement.wav", alternate) or >>
+    os.rename("build/audio-fixtures/replacement.wav", "build/audio-fixtures/pinned.wav") or >>
+    original := pinned.read_frames(0, 1) or >>
     assert(original[0] == -32768 && pinned.frame_count() == 3)
-    pinned.close() >>>
+    pinned.close() or >>
     println("PASS: bounded WAV/ring streaming, cross-block resampling, starvation, EOF, 100 wraps, stale receipts, failure recovery, fades/crossfade and pinned descriptor")
     << 0
 }
-fn main() int { << run() >>> (err) { eprintln(err.msg())
+fn main() int { << run() or (err) { eprintln(err.msg())
     << 1 } }

@@ -27,7 +27,7 @@ pub fn surface(node int, resource_uid string, primitive int) Surface {
 pub fn (surface &Surface) distance_policy() lod.DistanceLod {
     $thresholds := []f64{}
     for level in surface.levels { thresholds.push(level.distance) }
-    << lod.distance_lod(thresholds, surface.hysteresis) >>>
+    << lod.distance_lod(thresholds, surface.hysteresis) or >>
 }
 pub fn valid_resource_id(value &string) bool {
     << lower_hex(value, 32) && *value != "00000000000000000000000000000000"
@@ -46,16 +46,20 @@ fn relative_path(value &string) bool {
 }
 fn validate_primitive(kinds &map[string]string, uid string, primitive int) int {
     if primitive < 0 || primitive >= 1024 || !kinds.has(uid + "") || kinds[uid] != "glb_model" {
-        >>> errors.new("nexus scene: invalid surface resource/primitive")
+        >> errors.new("nexus scene: invalid surface resource/primitive")
     }
     << 0
 }
 pub fn with_attachments(document &Document, references []ResourceReference, surfaces []Surface, buses []AudioBus, emitters []AudioEmitter, scripts []ScriptAttachment, connections []ScriptConnection, lights []LightAttachment) Document {
-    << with_all_attachments(document, references, surfaces, buses, emitters, scripts, connections, lights, []Sprite3DAttachment{}, []TileMap2DAttachment{}) >>>
+    << with_all_attachments(document, references, surfaces, buses, emitters, scripts, connections, lights, []Sprite3DAttachment{}, []TileMap2DAttachment{}) or >>
 }
 pub fn with_all_attachments(document &Document, references []ResourceReference, surfaces []Surface, buses []AudioBus, emitters []AudioEmitter, scripts []ScriptAttachment, connections []ScriptConnection, lights []LightAttachment, sprites_3d []Sprite3DAttachment, tilemaps_2d []TileMap2DAttachment) Document {
+    << with_modern_attachments(document, references, surfaces, buses, emitters, scripts, connections, lights, sprites_3d, tilemaps_2d,
+        []EnvironmentAttachment{}, []RigidBody3DAttachment{}, []Joint3DAttachment{}, []TerrainAttachment{}, []ParticleEmitter3DAttachment{}, []PrefabInstanceAttachment{}) or >>
+}
+pub fn with_modern_attachments(document &Document, references []ResourceReference, surfaces []Surface, buses []AudioBus, emitters []AudioEmitter, scripts []ScriptAttachment, connections []ScriptConnection, lights []LightAttachment, sprites_3d []Sprite3DAttachment, tilemaps_2d []TileMap2DAttachment, environments []EnvironmentAttachment, rigid_bodies_3d []RigidBody3DAttachment, joints_3d []Joint3DAttachment, terrains []TerrainAttachment, particles_3d []ParticleEmitter3DAttachment, prefab_instances []PrefabInstanceAttachment) Document {
     if document.nodes.len < 1 || references.len > MAX_RESOURCES || surfaces.len > MAX_SURFACES {
-        >>> errors.new("nexus scene: attachment counts outside profile")
+        >> errors.new("nexus scene: attachment counts outside profile")
     }
     $paths := map[string]bool{}
     $kinds := map[string]string{}
@@ -64,10 +68,10 @@ pub fn with_all_attachments(document &Document, references []ResourceReference, 
         uid := reference.uid + ""
         path := reference.path + ""
         hash := reference.content_hash + ""
-        if !valid_resource_id(&uid) || !lower_hex(&hash, 64) || !relative_path(&path) || (reference.kind != "glb_model" && reference.kind != "wav_clip" && reference.kind != "xu_bytecode" && reference.kind != "image_rgba") {
-            >>> errors.new("nexus scene: invalid resource identity/path/hash/kind")
+        if !valid_resource_id(&uid) || !lower_hex(&hash, 64) || !relative_path(&path) || (reference.kind != "glb_model" && reference.kind != "wav_clip" && reference.kind != "xu_bytecode" && reference.kind != "image_rgba" && reference.kind != "scene_file") {
+            >> errors.new("nexus scene: invalid resource identity/path/hash/kind")
         }
-        if kinds.has(uid + "") || paths.has(path + "") { >>> errors.new("nexus scene: duplicate resource identity or path") }
+        if kinds.has(uid + "") || paths.has(path + "") { >> errors.new("nexus scene: duplicate resource identity or path") }
         kinds[uid] = reference.kind + ""
         paths[path] = true
     }
@@ -75,41 +79,47 @@ pub fn with_all_attachments(document &Document, references []ResourceReference, 
     $occupied := map[int]bool{}
     for surface in surfaces {
         if surface.node < 0 || surface.node >= document.nodes.len || document.nodes[surface.node].kind != NODE_3D {
-            >>> errors.new("nexus scene: invalid surface node")
+            >> errors.new("nexus scene: invalid surface node")
         }
-        if occupied.has(surface.node) { >>> errors.new("nexus scene: duplicate surface node") }
-        validate_primitive(&kinds, surface.resource_uid + "", surface.primitive) >>>
+        if occupied.has(surface.node) { >> errors.new("nexus scene: duplicate surface node") }
+        validate_primitive(&kinds, surface.resource_uid + "", surface.primitive) or >>
         if surface.levels.len > 0 || surface.hysteresis != 0.0 {
             if surface.levels.len == 0 || surface.levels.len >= lod.MAX_LEVELS {
-                >>> errors.new("nexus scene: invalid LOD surface level count")
+                >> errors.new("nexus scene: invalid LOD surface level count")
             }
-            surface.distance_policy() >>>
+            surface.distance_policy() or >>
         }
         occupied[surface.node] = true
         used[surface.resource_uid + ""] = true
         for level in surface.levels {
-            validate_primitive(&kinds, level.resource_uid + "", level.primitive) >>>
+            validate_primitive(&kinds, level.resource_uid + "", level.primitive) or >>
             used[level.resource_uid + ""] = true
         }
     }
-    validate_audio(document, &buses, &emitters, &kinds, $&used) >>>
-    validate_scripts(document, &scripts, &connections, &kinds, $&used) >>>
-    validate_lights(document, &lights) >>>
-    validate_sprites_3d(document, &sprites_3d, &kinds, $&used) >>>
-    validate_tilemaps_2d(document, &tilemaps_2d, &kinds, $&used) >>>
-    if used.len() != references.len { >>> errors.new("nexus scene: unreferenced resource") }
+    validate_audio(document, &buses, &emitters, &kinds, $&used) or >>
+    validate_scripts(document, &scripts, &connections, &kinds, $&used) or >>
+    validate_lights(document, &lights) or >>
+    validate_sprites_3d(document, &sprites_3d, &kinds, $&used) or >>
+    validate_tilemaps_2d(document, &tilemaps_2d, &kinds, $&used) or >>
+    validate_environments(document, &environments) or >>
+    validate_rigid_bodies_3d(document, &rigid_bodies_3d) or >>
+    validate_joints_3d(document, &joints_3d) or >>
+    validate_terrains(document, &terrains) or >>
+    validate_particles_3d(document, &particles_3d) or >>
+    validate_prefab_instances(document, &prefab_instances, &kinds, $&used) or >>
+    if used.len() != references.len { >> errors.new("nexus scene: unreferenced resource") }
     $nodes := []NodeData{}
-    for i in 0:document.node_count() { nodes.push(document.describe_node(i) >>>) }
-    << Document{nodes: nodes, references: references, surfaces: surfaces, buses: buses, emitters: emitters, scripts: scripts, connections: connections, lights: lights, sprites_3d: sprites_3d, tilemaps_2d: tilemaps_2d}
+    for i in 0:document.node_count() { nodes.push(document.describe_node(i) or >>) }
+    << Document{nodes: nodes, references: references, surfaces: surfaces, buses: buses, emitters: emitters, scripts: scripts, connections: connections, lights: lights, sprites_3d: sprites_3d, tilemaps_2d: tilemaps_2d, environments: environments, rigid_bodies_3d: rigid_bodies_3d, joints_3d: joints_3d, terrains: terrains, particles_3d: particles_3d, prefab_instances: prefab_instances}
 }
 pub fn (document &Document) resource_count() int { << document.references.len }
 pub fn (document &Document) surface_count() int { << document.surfaces.len }
 pub fn (document &Document) resource(index int) ResourceReference {
-    if index < 0 || index >= document.references.len { >>> errors.new("nexus scene: resource index outside document") }
+    if index < 0 || index >= document.references.len { >> errors.new("nexus scene: resource index outside document") }
     << document.references[index]
 }
 pub fn (document &Document) surface(index int) Surface {
-    if index < 0 || index >= document.surfaces.len { >>> errors.new("nexus scene: surface index outside document") }
+    if index < 0 || index >= document.surfaces.len { >> errors.new("nexus scene: surface index outside document") }
     saved := &document.surfaces[index]
     $levels := []SurfaceLevel{}
     for level in saved.levels {

@@ -1,0 +1,264 @@
+@"github.com/xulang-org/nexus/resources/bundle"
+
+#crypto/hmac
+#crypto/sha256
+#encoding/json
+#errors
+#strconv
+#strings
+
+pub const FORMAT = "nexus.bundle"
+pub const VERSION = 1
+pub const MAX_BYTES = 4194304
+pub const MAX_ENTRIES = 16384
+
+pub struct BundleEntry {
+    pub key string
+    pub rel_path string
+    pub sha256 string
+    pub byte_len int
+}
+
+pub struct BundleManifest {
+    pub format string
+    pub version int
+    pub bundle_id string
+    pub sequence int
+    pub entries []BundleEntry
+    pub signature string
+}
+
+pub fn (m &BundleManifest) clone() BundleManifest {
+    $copied := []BundleEntry{}
+    for i in 0:m.entries.len {
+        e := &m.entries[i]
+        copied.push(BundleEntry{
+            key: e.key + "",
+            rel_path: e.rel_path + "",
+            sha256: e.sha256 + "",
+            byte_len: e.byte_len
+        })
+    }
+    << BundleManifest{
+        format: m.format + "",
+        version: m.version,
+        bundle_id: m.bundle_id + "",
+        sequence: m.sequence,
+        entries: copied,
+        signature: m.signature + ""
+    }
+}
+
+fn is_lower_hex(s string, expected_len int) bool {
+    if s.len != expected_len { << false }
+    for i in 0:s.len {
+        b := s[i] & 255
+        ok := (b >= 48 && b <= 57) || (b >= 97 && b <= 102)
+        if !ok { << false }
+    }
+    << true
+}
+
+pub fn validate_key(key string) int {
+    if key.len == 0 || key.len > 256 { >> errors.new("nexus bundle: invalid asset key length") }
+    for i in 0:key.len {
+        b := key[i] & 255
+        if b < 32 || b == 124 || b == 92 { >> errors.new("nexus bundle: illegal character in key") }
+    }
+    << 0
+}
+
+pub fn validate_rel_path(path string) int {
+    if path.len == 0 || path.len > 512 { >> errors.new("nexus bundle: empty or oversized path") }
+    if (path[0] & 255) == 47 { >> errors.new("nexus bundle: path must be relative") }
+    for i in 0:path.len {
+        b := path[i] & 255
+        if b < 32 || b == 92 || b == 124 { >> errors.new("nexus bundle: illegal character in relative path") }
+    }
+    if strings.contains(path, "..") {
+        // Check exact path segments for parent traversal.
+        parts := strings.split(path, "/")
+        for p in parts {
+            if p == ".." || p == "." || p.len == 0 {
+                >> errors.new("nexus bundle: path traversal is forbidden")
+            }
+        }
+    } else {
+        parts := strings.split(path, "/")
+        for p in parts {
+            if p == "." || p.len == 0 {
+                >> errors.new("nexus bundle: empty or dot path segment")
+            }
+        }
+    }
+    << 0
+}
+
+pub fn (m &BundleManifest) validate() int {
+    if m.format != FORMAT || m.version != VERSION {
+        >> errors.new("nexus bundle: unsupported manifest format or version")
+    }
+    if m.bundle_id.len == 0 || m.bundle_id.len > 128 {
+        >> errors.new("nexus bundle: invalid bundle_id")
+    }
+    if m.sequence < 1 {
+        >> errors.new("nexus bundle: sequence must be >= 1")
+    }
+    if m.entries.len > MAX_ENTRIES {
+        >> errors.new("nexus bundle: entry limit exceeded")
+    }
+    for i in 0:m.entries.len {
+        e := m.entries[i]
+        validate_key(e.key) or >>
+        validate_rel_path(e.rel_path) or >>
+        if !is_lower_hex(e.sha256, 64) {
+            >> errors.new("nexus bundle: entry sha256 must be 64-char lowercase hex")
+        }
+        if e.byte_len < 0 || e.byte_len > 67108864 {
+            >> errors.new("nexus bundle: invalid entry byte_len")
+        }
+        for j in 0:i {
+            if m.entries[j].key == e.key {
+                >> errors.new("nexus bundle: duplicate entry key: " + e.key)
+            }
+        }
+    }
+    << 0
+}
+
+fn str_gt(a &string, b &string) bool {
+    $n := a.len
+    if b.len < n { n = b.len }
+    for i in 0:n {
+        ab := a[i] & 255
+        bb := b[i] & 255
+        if ab != bb { << ab > bb }
+    }
+    << a.len > b.len
+}
+
+fn sorted_entry_indices(entries &[]BundleEntry) []int {
+    $idx := []int{}
+    for i in 0:entries.len { idx.push(i) }
+    for i in 1:idx.len {
+        key_idx := idx[i]
+        key_str := entries[key_idx].key + ""
+        $j := i - 1
+        while j >= 0 {
+            prev_idx := idx[j]
+            if str_gt(&entries[prev_idx].key, &key_str) {
+                idx[j + 1] = prev_idx
+                j = j - 1
+            } else {
+                <-
+            }
+        }
+        idx[j + 1] = key_idx
+    }
+    << idx
+}
+
+pub fn (m &BundleManifest) canonical_payload() string {
+    m.validate() or >>
+    order := sorted_entry_indices(&m.entries)
+    $b := strings.new_byte_builder(512)
+    b.write_str("format=" + m.format + "\n")
+    b.write_str("version=" + str(m.version) + "\n")
+    b.write_str("bundle_id=" + m.bundle_id + "\n")
+    b.write_str("sequence=" + str(m.sequence) + "\n")
+    b.write_str("count=" + str(order.len) + "\n")
+    for idx in order {
+        e := m.entries[idx]
+        b.write_str(e.key + "|" + e.rel_path + "|" + e.sha256 + "|" + str(e.byte_len) + "\n")
+    }
+    << b.to_string()
+}
+
+pub fn (m $&BundleManifest) sign(key &string) int {
+    if key.len == 0 { >> errors.new("nexus bundle: signing key must not be empty") }
+    payload := m.canonical_payload() or >>
+    m.signature = hmac.sum256(key, &payload)
+    << 0
+}
+
+pub fn (m &BundleManifest) verify(key &string) bool {
+    if key.len == 0 || m.signature.len != 64 { << false }
+    payload := m.canonical_payload() or (err) { << false }
+    expected := hmac.sum256(key, &payload)
+    << hmac.equal(&m.signature, &expected)
+}
+
+pub fn (m &BundleManifest) encode() string {
+    m.validate() or >>
+    order := sorted_entry_indices(&m.entries)
+    $b := strings.new_byte_builder(1024)
+    fmt_s := m.format + ""
+    bid_s := m.bundle_id + ""
+    sig_s := m.signature + ""
+    b.write_str("{\"format\":" + json.quote(&fmt_s) +
+        ",\"version\":" + str(m.version) +
+        ",\"bundle_id\":" + json.quote(&bid_s) +
+        ",\"sequence\":" + str(m.sequence) +
+        ",\"signature\":" + json.quote(&sig_s) +
+        ",\"entries\":[")
+    for oi in 0:order.len {
+        if oi > 0 { b.write_str(",") }
+        e := m.entries[order[oi]]
+        k := e.key + ""
+        rp := e.rel_path + ""
+        sh := e.sha256 + ""
+        b.write_str("{\"key\":" + json.quote(&k) +
+            ",\"rel_path\":" + json.quote(&rp) +
+            ",\"sha256\":" + json.quote(&sh) +
+            ",\"byte_len\":" + str(e.byte_len) + "}")
+    }
+    b.write_str("]}")
+    << b.to_string()
+}
+
+pub fn decode(raw &string) BundleManifest {
+    if raw.len < 2 || raw.len > MAX_BYTES {
+        >> errors.new("nexus bundle: manifest size out of bounds")
+    }
+    doc := json.parse_max(raw, MAX_BYTES)
+    if !doc.ok() { >> errors.new("nexus bundle JSON: " + doc.error()) }
+    root := doc.root()
+    if !doc.is_dict(root) { >> errors.new("nexus bundle: manifest root must be object") }
+    if !doc.has(root, "format") || !doc.has(root, "version") || !doc.has(root, "bundle_id") ||
+       !doc.has(root, "sequence") || !doc.has(root, "signature") || !doc.has(root, "entries") {
+        >> errors.new("nexus bundle: missing required manifest field")
+    }
+    format := doc.as_string(doc.get(root, "format")) or >>
+    version := doc.as_int(doc.get(root, "version")) or >>
+    bundle_id := doc.as_string(doc.get(root, "bundle_id")) or >>
+    sequence := doc.as_int(doc.get(root, "sequence")) or >>
+    signature := doc.as_string(doc.get(root, "signature")) or >>
+    elist := doc.get(root, "entries")
+    if elist < 0 || !doc.is_list(elist) {
+        >> errors.new("nexus bundle: entries must be array")
+    }
+    $entries := []BundleEntry{}
+    for i in 0:doc.count(elist) {
+        node := doc.at(elist, i)
+        if !doc.is_dict(node) || !doc.has(node, "key") || !doc.has(node, "rel_path") ||
+           !doc.has(node, "sha256") || !doc.has(node, "byte_len") {
+            >> errors.new("nexus bundle: invalid entry object")
+        }
+        entries.push(BundleEntry{
+            key: doc.as_string(doc.get(node, "key")) or >>,
+            rel_path: doc.as_string(doc.get(node, "rel_path")) or >>,
+            sha256: doc.as_string(doc.get(node, "sha256")) or >>,
+            byte_len: doc.as_int(doc.get(node, "byte_len")) or >>
+        })
+    }
+    m := BundleManifest{
+        format: format,
+        version: version,
+        bundle_id: bundle_id,
+        sequence: sequence,
+        entries: entries,
+        signature: signature
+    }
+    m.validate() or >>
+    << m
+}

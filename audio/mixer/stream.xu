@@ -42,17 +42,17 @@ pub fn (mixer &Mixer) is_stream(id int) bool {
     << slot < mixer.streams.len && mixer.streams[slot].open && mixer.streams[slot].generation == (id - 1) / MAX_STREAMS
 }
 fn (mixer &Mixer) stream_index(id int) int {
-    if !mixer.is_stream(id) { >>> errors.new("nexus mixer: stale or invalid stream") }
+    if !mixer.is_stream(id) { >> errors.new("nexus mixer: stale or invalid stream") }
     << (id - 1) % MAX_STREAMS
 }
 pub fn (mixer $&Mixer) open_stream(rate int, channels int, capacity_frames int) int {
-    mixer.valid() >>>
+    mixer.valid() or >>
     if rate < 8000 || rate > 192000 || channels < 1 || channels > 2 || capacity_frames < 2 || capacity_frames > MAX_STREAM_CAPACITY_FRAMES ||
-        capacity_frames * channels > MAX_STREAM_BUFFER_SAMPLES - mixer.stream_samples { >>> errors.new("nexus mixer: invalid stream format or buffer budget") }
+        capacity_frames * channels > MAX_STREAM_BUFFER_SAMPLES - mixer.stream_samples { >> errors.new("nexus mixer: invalid stream format or buffer budget") }
     for i in 0:mixer.streams.len {
         if !mixer.streams[i].open {
             generation := mixer.streams[i].generation + 1
-            if generation > 1000000000 { >>> errors.new("nexus mixer: stream generation exhausted") }
+            if generation > 1000000000 { >> errors.new("nexus mixer: stream generation exhausted") }
             $samples := []int{}
             for j in 0:capacity_frames * channels { samples.push(0) }
             mixer.streams[i] = PcmStream{generation: generation, open: true, rate: rate, channels: channels, capacity: capacity_frames,
@@ -62,33 +62,33 @@ pub fn (mixer $&Mixer) open_stream(rate int, channels int, capacity_frames int) 
             << generation * MAX_STREAMS + i + 1
         }
     }
-    >>> errors.new("nexus mixer: stream capacity exceeded")
+    >> errors.new("nexus mixer: stream capacity exceeded")
 }
 pub fn (mixer &Mixer) stream_info(id int) StreamInfo {
-    index := mixer.stream_index(id) >>>
+    index := mixer.stream_index(id) or >>
     source := &mixer.streams[index]
     buffered := source.write_frame - source.read_frame
     rate := mixer.rate
-    if rate == 0 { >>> errors.new("nexus mixer: zero mixer rate") }
+    if rate == 0 { >> errors.new("nexus mixer: zero mixer rate") }
     << StreamInfo{sample_rate: source.rate, channels: source.channels, capacity_frames: source.capacity,
         buffered_frames: buffered, room_frames: source.capacity - buffered, written_frames: source.write_frame,
         consumed_frames: source.read_frame, eof: source.eof, consumer_voice: source.consumer, position_frames: f64(source.position) / f64(rate)}
 }
 pub fn (mixer $&Mixer) feed_stream(id int, samples &[]int, finished bool) int {
-    index := mixer.stream_index(id) >>>
+    index := mixer.stream_index(id) or >>
     source := $&mixer.streams[index]
     channels := source.channels
-    if channels == 0 { >>> errors.new("nexus mixer: zero stream channels") }
+    if channels == 0 { >> errors.new("nexus mixer: zero stream channels") }
     frames := samples.len / channels
     if source.eof || samples.len % channels != 0 || frames > MAX_FEED_FRAMES ||
         frames > source.capacity - (source.write_frame - source.read_frame) || (frames == 0 && !finished) || source.write_frame > 1000000000000 - frames {
-        >>> errors.new("nexus mixer: invalid stream feed, EOF or full buffer")
+        >> errors.new("nexus mixer: invalid stream feed, EOF or full buffer")
     }
     $digest := "EOF"
-    if frames > 0 { digest = pcm.fingerprint_pcm16(source.rate, channels, samples) >>> }
+    if frames > 0 { digest = pcm.fingerprint_pcm16(source.rate, channels, samples) or >> }
     next_digest := sha256.sum256(source.digest + ":" + digest + ":" + str(flag(finished)))
     capacity := source.capacity
-    if capacity == 0 { >>> errors.new("nexus mixer: zero stream capacity") }
+    if capacity == 0 { >> errors.new("nexus mixer: zero stream capacity") }
     // All validation precedes writes; a rejected block preserves the ring/state.
     for frame in 0:frames {
         slot := (source.write_frame + frame) % capacity
@@ -101,19 +101,19 @@ pub fn (mixer $&Mixer) feed_stream(id int, samples &[]int, finished bool) int {
     << frames
 }
 pub fn (mixer $&Mixer) play_stream(id int, bus int, volume f64, pan f64) int {
-    index := mixer.stream_index(id) >>>
+    index := mixer.stream_index(id) or >>
     consumer := mixer.streams[index].consumer
-    if mixer.is_voice(consumer) && (mixer.is_playing(consumer) >>>) { >>> errors.new("nexus mixer: stream already has a consumer") }
+    if mixer.is_voice(consumer) && (mixer.is_playing(consumer) or >>) { >> errors.new("nexus mixer: stream already has a consumer") }
     phase := mixer.streams[index].read_frame * mixer.rate
-    voice := mixer.allocate(-id - 1, bus, volume, pan, false, phase) >>>
+    voice := mixer.allocate(-id - 1, bus, volume, pan, false, phase) or >>
     mixer.streams[index].consumer = voice
     mixer.streams[index].position = phase
     << voice
 }
 pub fn (mixer $&Mixer) close_stream(id int) int {
-    index := mixer.stream_index(id) >>>
+    index := mixer.stream_index(id) or >>
     consumer := mixer.streams[index].consumer
-    if mixer.is_voice(consumer) { mixer.stop(consumer) >>> }
+    if mixer.is_voice(consumer) { mixer.stop(consumer) or >> }
     mixer.stream_samples = mixer.stream_samples - mixer.streams[index].capacity * mixer.streams[index].channels
     generation := mixer.streams[index].generation
     mixer.streams[index] = empty_stream(generation)
@@ -123,9 +123,9 @@ pub fn (mixer $&Mixer) close_stream(id int) int {
 fn (mixer &Mixer) stream_sample(index int, frame int, channel int) int {
     source := &mixer.streams[index]
     capacity := source.capacity
-    if capacity == 0 { >>> errors.new("nexus mixer: closed stream buffer") }
+    if capacity == 0 { >> errors.new("nexus mixer: closed stream buffer") }
     if frame < source.read_frame || frame >= source.write_frame || channel < 0 || channel >= source.channels {
-        >>> errors.new("nexus mixer: sample outside buffered stream")
+        >> errors.new("nexus mixer: sample outside buffered stream")
     }
     << source.samples[(frame % capacity) * source.channels + channel]
 }
@@ -140,14 +140,14 @@ fn (mixer &Mixer) source_info(source int) SourceInfo {
         clip := &mixer.clips[source]
         << SourceInfo{rate: clip.sample_rate(), channels: clip.channel_count(), frames: clip.frame_count(), streaming: false, eof: true}
     }
-    index := mixer.stream_index(-source - 1) >>>
+    index := mixer.stream_index(-source - 1) or >>
     stream := &mixer.streams[index]
     << SourceInfo{rate: stream.rate, channels: stream.channels, frames: stream.write_frame, streaming: true, eof: stream.eof}
 }
 fn (mixer &Mixer) source_sample(source int, frame int, channel int) int {
-    if source >= 0 { << mixer.clips[source].sample(frame, channel) >>> }
-    index := mixer.stream_index(-source - 1) >>>
-    << mixer.stream_sample(index, frame, channel) >>>
+    if source >= 0 { << mixer.clips[source].sample(frame, channel) or >> }
+    index := mixer.stream_index(-source - 1) or >>
+    << mixer.stream_sample(index, frame, channel) or >>
 }
 fn (mixer $&Mixer) consume_streams() {
     rate := mixer.rate
@@ -171,18 +171,18 @@ fn wrap_phase(phase int, period int) int { if period == 0 { << phase }
 // This is a producer operation: data/format validation precedes every mutation.
 // An empty non-final window is allowed for asynchronous producers, unlike feed.
 pub fn (mixer $&Mixer) reset_stream(id int, samples &[]int, finished bool, resume bool) int {
-    index := mixer.stream_index(id) >>>
+    index := mixer.stream_index(id) or >>
     channels := mixer.streams[index].channels
-    if channels == 0 { >>> errors.new("nexus mixer: zero stream channels") }
+    if channels == 0 { >> errors.new("nexus mixer: zero stream channels") }
     frames := samples.len / channels
     if samples.len % channels != 0 || frames > MAX_FEED_FRAMES || frames > mixer.streams[index].capacity {
-        >>> errors.new("nexus mixer: invalid replacement stream window")
+        >> errors.new("nexus mixer: invalid replacement stream window")
     }
     consumer := mixer.streams[index].consumer
     live := mixer.is_voice(consumer)
-    if resume && !live { >>> errors.new("nexus mixer: restarting a stream requires a live consumer") }
+    if resume && !live { >> errors.new("nexus mixer: restarting a stream requires a live consumer") }
     $digest := "EMPTY"
-    if frames > 0 { digest = pcm.fingerprint_pcm16(mixer.streams[index].rate, channels, samples) >>> }
+    if frames > 0 { digest = pcm.fingerprint_pcm16(mixer.streams[index].rate, channels, samples) or >> }
     next_digest := sha256.sum256(mixer.streams[index].digest + ":reset:" + digest + ":" + str(flag(finished)))
     source := $&mixer.streams[index]
     for i in 0:samples.len { source.samples[i] = samples[i] }

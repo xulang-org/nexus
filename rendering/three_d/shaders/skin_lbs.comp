@@ -1,0 +1,81 @@
+#version 450
+
+struct SkinInfluence {
+    uvec4 joints;
+    vec4 weights;
+};
+
+layout(set = 2, binding = 0, std140) uniform SkinParams {
+    uint vertex_count;
+    uint bone_count;
+    uint has_normals;
+    uint has_tangents;
+} params;
+
+layout(set = 0, binding = 0, std430) readonly buffer RestVertsBuf { float rest_verts[]; };
+layout(set = 0, binding = 1, std430) readonly buffer InfluencesBuf { SkinInfluence influences[]; };
+layout(set = 0, binding = 2, std430) readonly buffer PaletteBuf { vec4 joint_palette[]; };
+layout(set = 1, binding = 0, std430) writeonly buffer OutVertsBuf { float out_verts[]; };
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= params.vertex_count) return;
+    uint base = gid * 16u;
+    SkinInfluence inf = influences[gid];
+    vec4 r0 = vec4(0.0), r1 = vec4(0.0), r2 = vec4(0.0);
+    for (int k = 0; k < 4; ++k) {
+        uint ji = inf.joints[k];
+        float w = inf.weights[k];
+        if (w > 0.0 && ji < params.bone_count) {
+            uint b = ji * 3u;
+            r0 += joint_palette[b + 0u] * w;
+            r1 += joint_palette[b + 1u] * w;
+            r2 += joint_palette[b + 2u] * w;
+        }
+    }
+    vec4 p4 = vec4(rest_verts[base + 0u], rest_verts[base + 1u], rest_verts[base + 2u], 1.0);
+    out_verts[base + 0u] = dot(r0, p4);
+    out_verts[base + 1u] = dot(r1, p4);
+    out_verts[base + 2u] = dot(r2, p4);
+    out_verts[base + 3u] = rest_verts[base + 3u];
+    out_verts[base + 4u] = rest_verts[base + 4u];
+    out_verts[base + 5u] = rest_verts[base + 5u];
+    out_verts[base + 6u] = rest_verts[base + 6u];
+
+    vec3 m0 = r0.xyz, m1 = r1.xyz, m2 = r2.xyz;
+    vec3 c0 = cross(m1, m2), c1 = cross(m2, m0), c2 = cross(m0, m1);
+    float det = dot(m0, c0);
+    float det_sign = det < 0.0 ? -1.0 : 1.0;
+
+    vec3 nrm = vec3(rest_verts[base + 7u], rest_verts[base + 8u], rest_verts[base + 9u]);
+    if (params.has_normals != 0u) {
+        float inv_det = (abs(det) > 1e-20) ? (1.0 / det) : det_sign;
+        vec3 invt = vec3(dot(c0, nrm), dot(c1, nrm), dot(c2, nrm)) * inv_det;
+        float nlen = length(invt);
+        nrm = (nlen > 0.0) ? (invt / nlen) : vec3(0.0, 1.0, 0.0);
+    }
+    out_verts[base + 7u] = nrm.x;
+    out_verts[base + 8u] = nrm.y;
+    out_verts[base + 9u] = nrm.z;
+    out_verts[base + 10u] = rest_verts[base + 10u];
+    out_verts[base + 11u] = rest_verts[base + 11u];
+
+    if (params.has_tangents != 0u) {
+        vec3 tin = vec3(rest_verts[base + 12u], rest_verts[base + 13u], rest_verts[base + 14u]);
+        vec3 tw = vec3(dot(m0, tin), dot(m1, tin), dot(m2, tin));
+        vec3 ortho = tw - nrm * dot(tw, nrm);
+        float olen = length(ortho);
+        vec3 unit_t = (olen > 0.0) ? (ortho / olen) : vec3(1.0, 0.0, 0.0);
+        out_verts[base + 12u] = unit_t.x;
+        out_verts[base + 13u] = unit_t.y;
+        out_verts[base + 14u] = unit_t.z;
+        out_verts[base + 15u] = rest_verts[base + 15u] * det_sign;
+    } else {
+        out_verts[base + 12u] = rest_verts[base + 12u];
+        out_verts[base + 13u] = rest_verts[base + 13u];
+        out_verts[base + 14u] = rest_verts[base + 14u];
+        out_verts[base + 15u] = rest_verts[base + 15u];
+    }
+}

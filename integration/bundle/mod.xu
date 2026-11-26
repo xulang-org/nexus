@@ -1,0 +1,152 @@
+@"github.com/xulang-org/nexus/integration/bundle"
+
+bres #"github.com/xulang-org/nexus/resources/bundle"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#crypto/sha256
+#errors
+#os
+#path/filepath
+#strings
+
+pub const MAX_ASSET_BYTES = 33554432
+
+pub struct BundleSource {
+    pub key string
+    pub rel_path string
+    pub bytes string
+}
+
+// Staged asset bundle mount with strict HMAC signature, SHA-256 content
+// verification, anti-rollback sequence checking, and atomic swap/rollback.
+pub struct BundleMount {
+    pub root_dir string
+    pub manifest bres.BundleManifest
+    pub active bool
+    pub generation int
+    prev_root string
+    prev_manifest bres.BundleManifest
+    has_prev bool
+}
+
+fn empty_manifest() bres.BundleManifest {
+    << bres.BundleManifest{
+        format: bres.FORMAT,
+        version: bres.VERSION,
+        bundle_id: "unmounted",
+        sequence: 1,
+        entries: []bres.BundleEntry{},
+        signature: ""
+    }
+}
+
+pub fn new_mount() BundleMount {
+    << BundleMount{
+        root_dir: "",
+        manifest: empty_manifest(),
+        active: false,
+        generation: 0,
+        prev_root: "",
+        prev_manifest: empty_manifest(),
+        has_prev: false
+    }
+}
+
+pub fn pack_bundle(root_dir string, bundle_id string, sequence int,
+        sources &[]BundleSource, signing_key &string) bres.BundleManifest {
+    os.mkdir_all(root_dir + "") or >>
+    $entries := []bres.BundleEntry{}
+    for i in 0:sources.len {
+        src := &sources[i]
+        bres.validate_key(src.key + "") or >>
+        bres.validate_rel_path(src.rel_path + "") or >>
+        dest := filepath.join([root_dir + "", src.rel_path + ""])
+        parent := filepath.dir(dest)
+        os.mkdir_all(parent) or >>
+        snapshot.write_atomic(dest + "", &src.bytes) or >>
+        digest := sha256.sum256(src.bytes + "")
+        entries.push(bres.BundleEntry{
+            key: src.key + "",
+            rel_path: src.rel_path + "",
+            sha256: digest,
+            byte_len: src.bytes.len
+        })
+    }
+    $manifest := bres.BundleManifest{
+        format: bres.FORMAT,
+        version: bres.VERSION,
+        bundle_id: bundle_id,
+        sequence: sequence,
+        entries: entries,
+        signature: ""
+    }
+    manifest.sign(signing_key) or >>
+    raw := manifest.encode() or >>
+    snapshot.write_atomic(filepath.join([root_dir + "", "manifest.json"]), &raw) or >>
+    << manifest
+}
+
+pub fn (m $&BundleMount) verify_and_stage(bundle_dir string, signing_key &string) int {
+    manifest_path := filepath.join([bundle_dir + "", "manifest.json"])
+    raw := snapshot.read(manifest_path, bres.MAX_BYTES) or >>
+    next := bres.decode(&raw) or >>
+    if !next.verify(signing_key) {
+        >> errors.new("nexus bundle: HMAC signature verification failed")
+    }
+    if m.active && next.sequence <= m.manifest.sequence {
+        >> errors.new("nexus bundle: anti-rollback rejected stale or replayed sequence")
+    }
+    for i in 0:next.entries.len {
+        e := next.entries[i]
+        asset_path := filepath.join([bundle_dir + "", e.rel_path + ""])
+        data := snapshot.read(asset_path, MAX_ASSET_BYTES) or >>
+        if data.len != e.byte_len {
+            >> errors.new("nexus bundle: asset byte_len mismatch for " + e.key)
+        }
+        digest := sha256.sum256(data + "")
+        if digest != e.sha256 {
+            >> errors.new("nexus bundle: asset sha256 mismatch for " + e.key)
+        }
+    }
+    // Commit atomically only after every signature, sequence, and hash check succeeds.
+    if m.active {
+        m.prev_root = m.root_dir + ""
+        m.prev_manifest = m.manifest.clone()
+        m.has_prev = true
+    }
+    m.root_dir = bundle_dir + ""
+    m.manifest = next
+    m.active = true
+    m.generation = m.generation + 1
+    << 0
+}
+
+pub fn (m $&BundleMount) rollback() int {
+    if !m.has_prev {
+        >> errors.new("nexus bundle: no previous verified bundle generation to roll back to")
+    }
+    cur_root := m.root_dir + ""
+    cur_manifest := m.manifest.clone()
+    m.root_dir = m.prev_root + ""
+    m.manifest = m.prev_manifest.clone()
+    m.prev_root = cur_root
+    m.prev_manifest = cur_manifest
+    m.active = true
+    m.generation = m.generation + 1
+    << 0
+}
+
+pub fn (m &BundleMount) resolve_asset(key string) string {
+    if !m.active { >> errors.new("nexus bundle: no active bundle mounted") }
+    for i in 0:m.manifest.entries.len {
+        e := &m.manifest.entries[i]
+        if e.key == key {
+            << filepath.join([m.root_dir + "", e.rel_path + ""])
+        }
+    }
+    >> errors.new("nexus bundle: asset key not found: " + key)
+}
+
+pub fn (m &BundleMount) read_asset(key string) string {
+    path := m.resolve_asset(key) or >>
+    << snapshot.read(path, MAX_ASSET_BYTES) or >>
+}

@@ -68,16 +68,16 @@ fn empty_geometry(source_hash string) GlbGeometry {
         indices: []int{}, nodes: []GlbNode{}, order: []int{}, joints: []JointWeights{}, skins: []SkinDescription{}, animations: []AnimationDescription{}}
 }
 fn header_word(raw &string, offset int) int {
-    if offset < 0 || offset > raw.len - 4 { >>> errors.new("nexus GLB: truncated header") }
+    if offset < 0 || offset > raw.len - 4 { >> errors.new("nexus GLB: truncated header") }
     bytes := [raw[offset] & 255, raw[offset + 1] & 255, raw[offset + 2] & 255, raw[offset + 3] & 255]
-    << binary.little_endian().get_u32(&bytes, 0) >>>
+    << binary.little_endian().get_u32(&bytes, 0) or >>
 }
 pub fn decode_glb_geometry(raw &string) GlbGeometry {
-    if raw.len < 28 || raw.len > MAX_GLB_BYTES { >>> errors.new("nexus GLB: file size outside profile") }
-    magic := header_word(raw, 0) >>>
-    version := header_word(raw, 4) >>>
-    length := header_word(raw, 8) >>>
-    if magic != 1179937895 || version != 2 || length != raw.len { >>> errors.new("nexus GLB: invalid magic/version/length") }
+    if raw.len < 28 || raw.len > MAX_GLB_BYTES { >> errors.new("nexus GLB: file size outside profile") }
+    magic := header_word(raw, 0) or >>
+    version := header_word(raw, 4) or >>
+    length := header_word(raw, 8) or >>
+    if magic != 1179937895 || version != 2 || length != raw.len { >> errors.new("nexus GLB: invalid magic/version/length") }
     $offset := 12
     $json_text := ""
     $binary_bytes := []int{}
@@ -85,66 +85,66 @@ pub fn decode_glb_geometry(raw &string) GlbGeometry {
     $seen_json := false
     $seen_bin := false
     while offset < raw.len {
-        if offset > raw.len - 8 { >>> errors.new("nexus GLB: truncated chunk header") }
-        size := header_word(raw, offset) >>>
-        kind := header_word(raw, offset + 4) >>>
+        if offset > raw.len - 8 { >> errors.new("nexus GLB: truncated chunk header") }
+        size := header_word(raw, offset) or >>
+        kind := header_word(raw, offset + 4) or >>
         offset = offset + 8
-        if size % 4 != 0 || size > raw.len - offset { >>> errors.new("nexus GLB: unaligned or truncated chunk") }
+        if size % 4 != 0 || size > raw.len - offset { >> errors.new("nexus GLB: unaligned or truncated chunk") }
         if kind == 1313821514 {
-            if chunks != 0 || seen_json || size < 4 || size > MAX_JSON_BYTES { >>> errors.new("nexus GLB: invalid JSON chunk") }
+            if chunks != 0 || seen_json || size < 4 || size > MAX_JSON_BYTES { >> errors.new("nexus GLB: invalid JSON chunk") }
             json_text = raw[offset:offset + size] + ""
             seen_json = true
         } else if kind == 5130562 {
-            if chunks != 1 || !seen_json || seen_bin || size < 1 || size > MAX_BIN_BYTES { >>> errors.new("nexus GLB: invalid BIN chunk") }
+            if chunks != 1 || !seen_json || seen_bin || size < 1 || size > MAX_BIN_BYTES { >> errors.new("nexus GLB: invalid BIN chunk") }
             for i in offset:offset + size { binary_bytes.push(raw[i] & 255) }
             seen_bin = true
-        } else if chunks == 0 { >>> errors.new("nexus GLB: first chunk must be JSON") }
+        } else if chunks == 0 { >> errors.new("nexus GLB: first chunk must be JSON") }
         // Unknown trailing chunk types are skipped, as required by GLB 2.0.
         offset = offset + size
         chunks = chunks + 1
     }
-    if !seen_json || !seen_bin { >>> errors.new("nexus GLB: profile requires JSON and embedded BIN chunks") }
+    if !seen_json || !seen_bin { >> errors.new("nexus GLB: profile requires JSON and embedded BIN chunks") }
     doc := json.parse_max(&json_text, MAX_JSON_BYTES)
-    if !doc.ok() { >>> errors.new("nexus GLB JSON: " + doc.error()) }
-    if doc.kinds.len > 32768 { >>> errors.new("nexus GLB: JSON node budget exceeded") }
-    root := object(&doc, doc.root(), "glTF root") >>>
+    if !doc.ok() { >> errors.new("nexus GLB JSON: " + doc.error()) }
+    if doc.kinds.len > 32768 { >> errors.new("nexus GLB: JSON node budget exceeded") }
+    root := object(&doc, doc.root(), "glTF root") or >>
     allowed := ["asset", "buffers", "bufferViews", "accessors", "meshes", "nodes", "scenes", "scene", "extensionsUsed", "extensionsRequired", "materials", "textures", "samplers", "images", "skins", "animations"]
-    fields(&doc, root, &allowed) >>>
+    fields(&doc, root, &allowed) or >>
     // fields() rejects extensions on schema objects, including unused objects.
     // Arbitrary extras metadata is not interpreted as glTF schema.
     for key in ["extensionsUsed", "extensionsRequired"] {
         value := doc.get(root, key)
         if value >= 0 {
-            for item in list(&doc, value, 0, 2) >>> {
-                name := doc.as_string(item) >>>
-                if name!="KHR_texture_transform" && name!="KHR_materials_unlit" { >>> errors.new("nexus GLB: unsupported extension "+name) }
+            for item in list(&doc, value, 0, 2) or >> {
+                name := doc.as_string(item) or >>
+                if name!="KHR_texture_transform" && name!="KHR_materials_unlit" { >> errors.new("nexus GLB: unsupported extension "+name) }
             }
         }
     }
-    asset := required(&doc, root, "asset") >>>
+    asset := required(&doc, root, "asset") or >>
     asset_fields := ["version", "minVersion", "generator", "copyright"]
-    fields(&doc, asset, &asset_fields) >>>
-    asset_version := text(&doc, asset, "version", "") >>>
-    minimum := text(&doc, asset, "minVersion", "2.0") >>>
-    if asset_version != "2.0" || minimum != "2.0" { >>> errors.new("nexus GLB: only glTF asset version 2.0 is supported") }
-    buffers := array_property(&doc, root, "buffers", 1, 1) >>>
+    fields(&doc, asset, &asset_fields) or >>
+    asset_version := text(&doc, asset, "version", "") or >>
+    minimum := text(&doc, asset, "minVersion", "2.0") or >>
+    if asset_version != "2.0" || minimum != "2.0" { >> errors.new("nexus GLB: only glTF asset version 2.0 is supported") }
+    buffers := array_property(&doc, root, "buffers", 1, 1) or >>
     buffer_fields := ["byteLength", "name"]
-    fields(&doc, buffers[0], &buffer_fields) >>>
-    buffer_length := integer(&doc, buffers[0], "byteLength", -1, 1, MAX_BIN_BYTES) >>>
+    fields(&doc, buffers[0], &buffer_fields) or >>
+    buffer_length := integer(&doc, buffers[0], "byteLength", -1, 1, MAX_BIN_BYTES) or >>
     if buffer_length < 1 || buffer_length > binary_bytes.len || binary_bytes.len - buffer_length > 3 {
-        >>> errors.new("nexus GLB: invalid embedded buffer length")
+        >> errors.new("nexus GLB: invalid embedded buffer length")
     }
-    for i in buffer_length:binary_bytes.len { if binary_bytes[i] != 0 { >>> errors.new("nexus GLB: BIN padding must be zero") } }
+    for i in buffer_length:binary_bytes.len { if binary_bytes[i] != 0 { >> errors.new("nexus GLB: BIN padding must be zero") } }
     $parser := new_glb_parser(doc, binary_bytes, buffer_length)
-    parser.read_views(root) >>>
-    parser.read_accessors(root) >>>
+    parser.read_views(root) or >>
+    parser.read_accessors(root) or >>
     source_hash := sha256.sum256(*raw + "")
     $geometry := empty_geometry(source_hash)
-    parser.read_material_data(root, $&geometry) >>>
-    parser.read_meshes(root, $&geometry) >>>
-    read_nodes(&parser.doc, root, $&geometry) >>>
-    parser.read_skins(root,$&geometry) >>>
-    parser.read_animations(root,$&geometry) >>>
+    parser.read_material_data(root, $&geometry) or >>
+    parser.read_meshes(root, $&geometry) or >>
+    read_nodes(&parser.doc, root, $&geometry) or >>
+    parser.read_skins(root,$&geometry) or >>
+    parser.read_animations(root,$&geometry) or >>
     << geometry
 }
 pub fn (asset &GlbGeometry) content_hash() string { << asset.resolved_hash + "" }
@@ -152,39 +152,39 @@ pub fn (asset &GlbGeometry) mesh_count() int { << asset.meshes.len }
 pub fn (asset &GlbGeometry) primitive_count() int { << asset.primitives.len }
 pub fn (asset &GlbGeometry) node_count() int { << asset.nodes.len }
 fn (asset &GlbGeometry) primitive(index int) GlbPrimitive {
-    if index < 0 || index >= asset.primitives.len { >>> errors.new("nexus GLB: primitive index out of range") }
+    if index < 0 || index >= asset.primitives.len { >> errors.new("nexus GLB: primitive index out of range") }
     << asset.primitives[index]
 }
-pub fn (asset &GlbGeometry) vertex_count(primitive int) int { item := asset.primitive(primitive) >>>
+pub fn (asset &GlbGeometry) vertex_count(primitive int) int { item := asset.primitive(primitive) or >>
     << item.vertex_count }
-pub fn (asset &GlbGeometry) index_count(primitive int) int { item := asset.primitive(primitive) >>>
+pub fn (asset &GlbGeometry) index_count(primitive int) int { item := asset.primitive(primitive) or >>
     << item.index_count }
 fn (asset &GlbGeometry) vertex_index(primitive int, index int) int {
-    item := asset.primitive(primitive) >>>
-    if index < 0 || index >= item.vertex_count { >>> errors.new("nexus GLB: vertex index out of range") }
+    item := asset.primitive(primitive) or >>
+    if index < 0 || index >= item.vertex_count { >> errors.new("nexus GLB: vertex index out of range") }
     << item.first_vertex + index
 }
-pub fn (asset &GlbGeometry) position(primitive int, index int) fm.Vec3 { at := asset.vertex_index(primitive, index) >>>
+pub fn (asset &GlbGeometry) position(primitive int, index int) fm.Vec3 { at := asset.vertex_index(primitive, index) or >>
     << asset.positions[at] }
-pub fn (asset &GlbGeometry) normal(primitive int, index int) fm.Vec3 { at := asset.vertex_index(primitive, index) >>>
-    if !asset.primitives[primitive].normals { >>> errors.new("nexus GLB: primitive has no normals") }
+pub fn (asset &GlbGeometry) normal(primitive int, index int) fm.Vec3 { at := asset.vertex_index(primitive, index) or >>
+    if !asset.primitives[primitive].normals { >> errors.new("nexus GLB: primitive has no normals") }
     << asset.normals[at] }
-pub fn (asset &GlbGeometry) uv(primitive int, index int) fm.Vec2 { at := asset.vertex_index(primitive, index) >>>
-    if !asset.primitives[primitive].uvs { >>> errors.new("nexus GLB: primitive has no UVs") }
+pub fn (asset &GlbGeometry) uv(primitive int, index int) fm.Vec2 { at := asset.vertex_index(primitive, index) or >>
+    if !asset.primitives[primitive].uvs { >> errors.new("nexus GLB: primitive has no UVs") }
     << asset.uvs[at] }
-pub fn (asset &GlbGeometry) tangent(primitive int, index int) fm.Vec4 { at := asset.vertex_index(primitive, index) >>>
-    if !asset.primitives[primitive].tangents { >>> errors.new("nexus GLB: primitive has no tangents") }
+pub fn (asset &GlbGeometry) tangent(primitive int, index int) fm.Vec4 { at := asset.vertex_index(primitive, index) or >>
+    if !asset.primitives[primitive].tangents { >> errors.new("nexus GLB: primitive has no tangents") }
     << asset.tangents[at] }
-pub fn (asset &GlbGeometry) has_tangents(primitive int) bool { item := asset.primitive(primitive) >>>
+pub fn (asset &GlbGeometry) has_tangents(primitive int) bool { item := asset.primitive(primitive) or >>
     << item.tangents }
-pub fn (asset &GlbGeometry) color(primitive int, index int) int { at := asset.vertex_index(primitive, index) >>>
+pub fn (asset &GlbGeometry) color(primitive int, index int) int { at := asset.vertex_index(primitive, index) or >>
     << asset.colors[at] }
-pub fn (asset &GlbGeometry) has_normals(primitive int) bool { item := asset.primitive(primitive) >>>
+pub fn (asset &GlbGeometry) has_normals(primitive int) bool { item := asset.primitive(primitive) or >>
     << item.normals }
-pub fn (asset &GlbGeometry) has_uvs(primitive int) bool { item := asset.primitive(primitive) >>>
+pub fn (asset &GlbGeometry) has_uvs(primitive int) bool { item := asset.primitive(primitive) or >>
     << item.uvs }
 pub fn (asset &GlbGeometry) index(primitive int, index int) int {
-    item := asset.primitive(primitive) >>>
-    if index < 0 || index >= item.index_count { >>> errors.new("nexus GLB: index offset out of range") }
+    item := asset.primitive(primitive) or >>
+    if index < 0 || index >= item.index_count { >> errors.new("nexus GLB: index offset out of range") }
     << asset.indices[item.first_index + index]
 }
