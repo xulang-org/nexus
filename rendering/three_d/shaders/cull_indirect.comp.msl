@@ -1,0 +1,185 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct CullParams {
+    float4x4 view_proj;
+    float4 info;        // x=instance_count, y=hiz_enabled, z=hiz_levels, w=depth_epsilon
+    float4 mip_sizes[8];
+};
+
+struct InstanceGpu {
+    float4x4 model;
+    float4x4 normals;
+    float4 bounds_min;  // xyz, w=orientation
+    float4 bounds_max;  // xyz, w=pad
+    uint4 draw_info;    // x=index_count, y=first_index, z=vertex_offset, w=material_index
+};
+
+struct IndexedIndirectCmd {
+    uint num_indices;
+    uint num_instances;
+    uint first_index;
+    int vertex_offset;
+    uint first_instance;
+};
+
+static inline float sample_hiz_level(
+    int lvl, float2 uv,
+    texture2d<float> h0, texture2d<float> h1, texture2d<float> h2, texture2d<float> h3,
+    texture2d<float> h4, texture2d<float> h5, texture2d<float> h6, texture2d<float> h7,
+    sampler s0, sampler s1, sampler s2, sampler s3,
+    sampler s4, sampler s5, sampler s6, sampler s7
+) {
+    if (lvl == 0) return h0.sample(s0, uv, level(0.0)).r;
+    if (lvl == 1) return h1.sample(s1, uv, level(0.0)).r;
+    if (lvl == 2) return h2.sample(s2, uv, level(0.0)).r;
+    if (lvl == 3) return h3.sample(s3, uv, level(0.0)).r;
+    if (lvl == 4) return h4.sample(s4, uv, level(0.0)).r;
+    if (lvl == 5) return h5.sample(s5, uv, level(0.0)).r;
+    if (lvl == 6) return h6.sample(s6, uv, level(0.0)).r;
+    return h7.sample(s7, uv, level(0.0)).r;
+}
+
+kernel void main0(
+    texture2d<float> hiz0 [[texture(0)]],
+    texture2d<float> hiz1 [[texture(1)]],
+    texture2d<float> hiz2 [[texture(2)]],
+    texture2d<float> hiz3 [[texture(3)]],
+    texture2d<float> hiz4 [[texture(4)]],
+    texture2d<float> hiz5 [[texture(5)]],
+    texture2d<float> hiz6 [[texture(6)]],
+    texture2d<float> hiz7 [[texture(7)]],
+    sampler s0 [[sampler(0)]],
+    sampler s1 [[sampler(1)]],
+    sampler s2 [[sampler(2)]],
+    sampler s3 [[sampler(3)]],
+    sampler s4 [[sampler(4)]],
+    sampler s5 [[sampler(5)]],
+    sampler s6 [[sampler(6)]],
+    sampler s7 [[sampler(7)]],
+    constant CullParams& params [[buffer(0)]],
+    device const InstanceGpu* instances [[buffer(1)]],
+    device IndexedIndirectCmd* commands [[buffer(2)]],
+    device uint* results [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint count = uint(params.info.x);
+    if (gid >= count) return;
+
+    InstanceGpu inst = instances[gid];
+    float3 bmin = inst.bounds_min.xyz;
+    float3 bmax = inst.bounds_max.xyz;
+    float4x4 mvp = params.view_proj * inst.model;
+
+    uint out_left = 1u;
+    uint out_right = 1u;
+    uint out_bottom = 1u;
+    uint out_top = 1u;
+    uint out_far = 1u;
+    uint out_near = 1u;
+    uint all_behind = 1u;
+    uint any_near_straddle = 0u;
+
+    float min_nx = 1e30;
+    float max_nx = -1e30;
+    float min_ny = 1e30;
+    float max_ny = -1e30;
+    float max_nz = -1e30;
+
+    for (uint corner = 0u; corner < 8u; ++corner) {
+        float3 p = float3(
+            (corner & 1u) != 0u ? bmax.x : bmin.x,
+            (corner & 2u) != 0u ? bmax.y : bmin.y,
+            (corner & 4u) != 0u ? bmax.z : bmin.z
+        );
+        float4 c = mvp * float4(p, 1.0);
+        if (c.x + c.w >= 0.0) out_left = 0u;
+        if (-c.x + c.w >= 0.0) out_right = 0u;
+        if (c.y + c.w >= 0.0) out_bottom = 0u;
+        if (-c.y + c.w >= 0.0) out_top = 0u;
+        if (c.z >= 0.0) out_far = 0u;
+        if (c.w - c.z >= 0.0) out_near = 0u;
+        if (c.w > 0.0) all_behind = 0u;
+
+        if (c.w <= 1e-5) {
+            any_near_straddle = 1u;
+        } else {
+            float inv_w = 1.0 / c.w;
+            float nx = c.x * inv_w;
+            float ny = c.y * inv_w;
+            float nz = c.z * inv_w;
+            min_nx = min(min_nx, nx);
+            max_nx = max(max_nx, nx);
+            min_ny = min(min_ny, ny);
+            max_ny = max(max_ny, ny);
+            max_nz = max(max_nz, nz);
+        }
+    }
+
+    if ((out_left | out_right | out_bottom | out_top | out_far | out_near | all_behind) != 0u) {
+        commands[gid].num_indices = 0u;
+        commands[gid].num_instances = 0u;
+        commands[gid].first_index = inst.draw_info.y;
+        commands[gid].vertex_offset = int(inst.draw_info.z);
+        commands[gid].first_instance = gid;
+        results[gid] = 2u; // frustum culled
+        return;
+    }
+
+    if (params.info.y > 0.5 && any_near_straddle == 0u && max_nz <= 1.0) {
+        int levels = clamp(int(params.info.z), 1, 8);
+        float u0 = clamp(min_nx * 0.5 + 0.5, 0.0, 1.0);
+        float u1 = clamp(max_nx * 0.5 + 0.5, 0.0, 1.0);
+        float v0 = clamp(0.5 - max_ny * 0.5, 0.0, 1.0);
+        float v1 = clamp(0.5 - min_ny * 0.5, 0.0, 1.0);
+
+        int chosen = levels - 1;
+        for (int k = 0; k < levels; ++k) {
+            float mw = params.mip_sizes[k].x;
+            float mh = params.mip_sizes[k].y;
+            if ((u1 - u0) * mw <= 3.0 && (v1 - v0) * mh <= 3.0) {
+                chosen = k;
+                break;
+            }
+        }
+
+        float mw = params.mip_sizes[chosen].x;
+        float mh = params.mip_sizes[chosen].y;
+        int tx0 = clamp(int(floor(u0 * mw)), 0, int(mw) - 1);
+        int tx1 = clamp(int(floor(max(u1 * mw - 1e-5, u0 * mw))), tx0, int(mw) - 1);
+        int ty0 = clamp(int(floor(v0 * mh)), 0, int(mh) - 1);
+        int ty1 = clamp(int(floor(max(v1 * mh - 1e-5, v0 * mh))), ty0, int(mh) - 1);
+
+        float hiz_min = 1.0;
+        float2 inv_m = float2(1.0 / mw, 1.0 / mh);
+        int max_x = min(tx1, tx0 + 15);
+        int max_y = min(ty1, ty0 + 15);
+        for (int y = ty0; y <= max_y; ++y) {
+            for (int x = tx0; x <= max_x; ++x) {
+                float2 uv = (float2(float(x), float(y)) + 0.5) * inv_m;
+                float d = sample_hiz_level(chosen, uv, hiz0, hiz1, hiz2, hiz3, hiz4, hiz5, hiz6, hiz7,
+                    s0, s1, s2, s3, s4, s5, s6, s7);
+                hiz_min = min(hiz_min, d);
+            }
+        }
+
+        // Reverse-Z: larger depth is closer. If instance's nearest Z is strictly behind Hi-Z min Z, cull.
+        float obj_nearest_z = clamp(max_nz, 0.0, 1.0);
+        if (obj_nearest_z + params.info.w < hiz_min) {
+            commands[gid].num_indices = 0u;
+            commands[gid].num_instances = 0u;
+            commands[gid].first_index = inst.draw_info.y;
+            commands[gid].vertex_offset = int(inst.draw_info.z);
+            commands[gid].first_instance = gid;
+            results[gid] = 3u; // Hi-Z occluded
+            return;
+        }
+    }
+
+    commands[gid].num_indices = inst.draw_info.x;
+    commands[gid].num_instances = 1u;
+    commands[gid].first_index = inst.draw_info.y;
+    commands[gid].vertex_offset = int(inst.draw_info.z);
+    commands[gid].first_instance = gid;
+    results[gid] = 1u; // visible
+}

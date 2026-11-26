@@ -1,10 +1,12 @@
 @main
 
 codec #"github.com/xulang-org/nexus/formats/scene"
+fm #"github.com/xulang-org/nexus/foundation/math"
 snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
 resource #"github.com/xulang-org/nexus/resources/scene"
 #errors
 #path/filepath
+#strings
 
 const MAX_HISTORY = 32
 
@@ -48,7 +50,11 @@ fn save_stroke(draft $&TileDraft, index int, layer &resource.TileMap2DAttachment
         else { layers.push(before.tilemap_2d(i) >>>) }
     }
     document := resource.with_tilemaps_2d(&before, refs, layers) >>>
-    next := codec.encode(&document) >>>
+    << draft.replace_document(&document) >>>
+}
+
+fn (draft $&TileDraft) replace_document(document &resource.Document) bool {
+    next := codec.encode(document) >>>
     if next == draft.current { << false }
     $history := []string{}
     $start := 0
@@ -59,6 +65,46 @@ fn save_stroke(draft $&TileDraft, index int, layer &resource.TileMap2DAttachment
     draft.redo = []string{}
     draft.current = next
     << true
+}
+
+fn exit_node(document &resource.Document) int {
+    for i in 1:document.node_count() {
+        node := document.describe_node(i) >>>
+        if node.parent == 0 && node.kind == resource.NODE_2D && strings.has_prefix(&node.name, "Exit_") { << i }
+    }
+    << -1
+}
+
+fn layer_to_map(document &resource.Document, layer_node int) fm.Transform2D {
+    $transform := fm.identity()
+    $index := layer_node
+    while index > 0 {
+        node := document.describe_node(index) >>>
+        if node.kind == resource.NODE_3D { >>> errors.new("exit editing requires a 2D layer hierarchy") }
+        if node.kind == resource.NODE_2D { transform = node.local.multiply(transform) }
+        index = node.parent
+    }
+    << transform
+}
+
+fn place_exit(draft $&TileDraft, index int, position fm.Vec2) bool {
+    original := draft.document() >>>
+    $nodes := []resource.NodeData{}
+    $references := []resource.ResourceReference{}
+    for i in 0:original.node_count() {
+        $node := original.describe_node(i) >>>
+        if i == index {
+            $pose := node.local
+            pose.tx = position.x
+            pose.ty = position.y
+            node.local = pose
+        }
+        nodes.push(node)
+    }
+    for i in 0:original.resource_count() { references.push(original.resource(i) >>>) }
+    tree := resource.make_document(nodes) >>>
+    next := resource.with_references(&original, &tree, references) >>>
+    << draft.replace_document(&next) >>>
 }
 
 fn (draft $&TileDraft) undo_edit() bool {

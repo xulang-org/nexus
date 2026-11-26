@@ -1,0 +1,195 @@
+@"github.com/xulang-org/nexus/vfx"
+
+#errors
+#math
+
+pub struct GradientStop {
+    pub t f64
+    pub r f64
+    pub g f64
+    pub b f64
+    pub a f64
+}
+
+pub struct ColorGradient {
+    stops []GradientStop
+}
+
+pub struct CurveKey {
+    pub t f64
+    pub value f64
+}
+
+pub struct FloatCurve {
+    keys []CurveKey
+}
+
+pub struct VfxRng {
+    state int
+}
+
+fn clamp_01(v f64) f64 {
+    if v < 0.0 { << 0.0 }
+    if v > 1.0 { << 1.0 }
+    << v
+}
+
+fn lerp_scalar(a f64, b f64, t f64) f64 {
+    << a + (b - a) * t
+}
+
+fn valid_f(v f64) bool {
+    << !math.is_nan(v) && !math.is_inf(v)
+}
+
+pub fn pack_rgba8(r f64, g f64, b f64, a f64) int {
+    ri := int(math.round(clamp_01(r) * 255.0))
+    gi := int(math.round(clamp_01(g) * 255.0))
+    bi := int(math.round(clamp_01(b) * 255.0))
+    ai := int(math.round(clamp_01(a) * 255.0))
+    << (ri << 24) | (gi << 16) | (bi << 8) | ai
+}
+
+pub fn new_color_gradient() ColorGradient {
+    << ColorGradient{stops: []GradientStop{}}
+}
+
+pub fn (grad $&ColorGradient) add_stop(t f64, r f64, g f64, b f64, a f64) int {
+    if !valid_f(t) || t < 0.0 || t > 1.0 ||
+        !valid_f(r) || r < 0.0 || r > 100.0 ||
+        !valid_f(g) || g < 0.0 || g > 100.0 ||
+        !valid_f(b) || b < 0.0 || b > 100.0 ||
+        !valid_f(a) || a < 0.0 || a > 1.0 {
+        >>> errors.new("nexus vfx: invalid gradient stop values")
+    }
+    grad.stops.push(GradientStop{t: t, r: r, g: g, b: b, a: a})
+    $i := grad.stops.len - 1
+    while i > 0 {
+        j := i - 1
+        if grad.stops[j].t <= grad.stops[i].t { <- }
+        tmp := grad.stops[i]
+        grad.stops[i] = grad.stops[j]
+        grad.stops[j] = tmp
+        i -= 1
+    }
+    << grad.stops.len
+}
+
+pub fn (grad &ColorGradient) stop_count() int {
+    << grad.stops.len
+}
+
+pub fn (grad &ColorGradient) evaluate(t f64) []f64 {
+    if !valid_f(t) { >>> errors.new("nexus vfx: non-finite gradient parameter") }
+    if grad.stops.len == 0 { << [1.0, 1.0, 1.0, 1.0] }
+    u := clamp_01(t)
+    if grad.stops.len == 1 || u <= grad.stops[0].t {
+        s := &grad.stops[0]
+        << [s.r, s.g, s.b, s.a]
+    }
+    last := grad.stops.len - 1
+    if u >= grad.stops[last].t {
+        s := &grad.stops[last]
+        << [s.r, s.g, s.b, s.a]
+    }
+    for i in 0:last {
+        s0 := &grad.stops[i]
+        ni := i + 1
+        s1 := &grad.stops[ni]
+        if u <= s1.t {
+            span := s1.t - s0.t
+            $f := 0.0
+            if span > 1e-9 { f = (u - s0.t) / span }
+            << [lerp_scalar(s0.r, s1.r, f), lerp_scalar(s0.g, s1.g, f), lerp_scalar(s0.b, s1.b, f), lerp_scalar(s0.a, s1.a, f)]
+        }
+    }
+    << [1.0, 1.0, 1.0, 1.0]
+}
+
+pub fn (grad &ColorGradient) evaluate_rgba8(t f64) int {
+    c := grad.evaluate(t) >>>
+    << pack_rgba8(c[0], c[1], c[2], c[3])
+}
+
+pub fn (grad &ColorGradient) bake_4_stops() []f64 {
+    ts := [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]
+    $out := []f64{}
+    for t in ts {
+        c := grad.evaluate(t) >>>
+        for j in 0:4 { out.push(c[j]) }
+    }
+    << out
+}
+
+pub fn new_float_curve() FloatCurve {
+    << FloatCurve{keys: []CurveKey{}}
+}
+
+pub fn (curve $&FloatCurve) add_key(t f64, value f64) int {
+    if !valid_f(t) || t < 0.0 || t > 1.0 || !valid_f(value) {
+        >>> errors.new("nexus vfx: invalid float curve key")
+    }
+    curve.keys.push(CurveKey{t: t, value: value})
+    $i := curve.keys.len - 1
+    while i > 0 {
+        j := i - 1
+        if curve.keys[j].t <= curve.keys[i].t { <- }
+        tmp := curve.keys[i]
+        curve.keys[i] = curve.keys[j]
+        curve.keys[j] = tmp
+        i -= 1
+    }
+    << curve.keys.len
+}
+
+pub fn (curve &FloatCurve) key_count() int {
+    << curve.keys.len
+}
+
+pub fn (curve &FloatCurve) evaluate(t f64) f64 {
+    if !valid_f(t) { >>> errors.new("nexus vfx: non-finite curve parameter") }
+    if curve.keys.len == 0 { << 1.0 }
+    u := clamp_01(t)
+    if curve.keys.len == 1 || u <= curve.keys[0].t { << curve.keys[0].value }
+    last := curve.keys.len - 1
+    if u >= curve.keys[last].t { << curve.keys[last].value }
+    for i in 0:last {
+        k0 := &curve.keys[i]
+        ni := i + 1
+        k1 := &curve.keys[ni]
+        if u <= k1.t {
+            span := k1.t - k0.t
+            $f := 0.0
+            if span > 1e-9 { f = (u - k0.t) / span }
+            << lerp_scalar(k0.value, k1.value, f)
+        }
+    }
+    << curve.keys[last].value
+}
+
+pub fn new_vfx_rng(seed int) VfxRng {
+    $s := seed & 2147483647
+    if s == 0 { s = 1234567 }
+    << VfxRng{state: s}
+}
+
+pub fn (rng $&VfxRng) next_u32() int {
+    // 31-bit LCG/Xorshift deterministic stream safe in signed 64-bit ints.
+    $x := rng.state & 2147483647
+    if x == 0 { x = 246353424 }
+    x = (x * 1103515245 + 12345) & 2147483647
+    rng.state = x
+    << x
+}
+
+pub fn (rng $&VfxRng) next_f01() f64 {
+    u := rng.next_u32()
+    << f64(u & 16777215) / 16777216.0
+}
+
+pub fn (rng $&VfxRng) range(lo f64, hi f64) f64 {
+    if !valid_f(lo) || !valid_f(hi) || hi < lo {
+        >>> errors.new("nexus vfx: invalid RNG range")
+    }
+    << lo + (hi - lo) * rng.next_f01()
+}

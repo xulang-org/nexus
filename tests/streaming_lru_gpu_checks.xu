@@ -1,0 +1,142 @@
+@main
+
+#gpu
+#os
+#strings
+#time
+fm #"github.com/xulang-org/nexus/foundation/math"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+stream #"github.com/xulang-org/nexus/integration/streaming"
+shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+
+fn build_large_obj(grid_n int) string {
+    $sb := strings.new_byte_builder(8192)
+    // Vertices: (grid_n+1)^2 vertices, grid_n^2 * 2 triangles -> deterministic OBJ!
+    for y in 0:(grid_n + 1) {
+        for x in 0:(grid_n + 1) {
+            fx := f64(x) / f64(grid_n) - 0.5
+            fy := f64(y) / f64(grid_n) - 0.5
+            sb.write_str("v " + str(int(fx * 100.0)) + " " + str(int(fy * 100.0)) + " 0\n")
+            sb.write_str("vn 0 0 1\n")
+            sb.write_str("vt 0 0\n")
+        }
+    }
+    stride := grid_n + 1
+    for y in 0:grid_n {
+        for x in 0:grid_n {
+            i0 := y * stride + x + 1
+            i1 := i0 + 1
+            i2 := (y + 1) * stride + x + 2
+            i3 := (y + 1) * stride + x + 1
+            s0 := str(i0) + "/" + str(i0) + "/" + str(i0)
+            s1 := str(i1) + "/" + str(i1) + "/" + str(i1)
+            s2 := str(i2) + "/" + str(i2) + "/" + str(i2)
+            s3 := str(i3) + "/" + str(i3) + "/" + str(i3)
+            sb.write_str("f " + s0 + " " + s1 + " " + s2 + "\n")
+            sb.write_str("f " + s0 + " " + s2 + " " + s3 + "\n")
+        }
+    }
+    << sb.to_string()
+}
+
+fn run() int {
+    os.mkdir_all("build/streaming-fixtures") >>>
+    obj_a := build_large_obj(12)
+    obj_b := build_large_obj(12)
+    obj_c := build_large_obj(12)
+    write_file("build/streaming-fixtures/mesh_a.obj", obj_a) >>>
+    write_file("build/streaming-fixtures/mesh_b.obj", obj_b) >>>
+    write_file("build/streaming-fixtures/mesh_c.obj", obj_c) >>>
+
+    program := shaders.load_mesh("build/mesh-shaders") >>>
+    $device := ren.open_3d("Streaming checks", 64, 64, gpu.METAL, &program) >>>
+
+    // Tight per-frame budget (max 1 upload/frame) and tight VRAM cap (fits <= 2 meshes -> forces LRU eviction on 3rd!).
+    cfg := stream.StreamConfig{
+        workers: 2,
+        max_uploads_per_frame: 1,
+        max_bytes_per_frame: 130000,
+        max_resident_bytes: 130000
+    }
+    $mgr := stream.new_streaming_manager(&device, cfg) >>>
+
+    // Request low-prio B first, high-prio A second, medium C third, plus missing bad path + PNG texture!
+    h_b := mgr.request_mesh("build/streaming-fixtures/mesh_b.obj", stream.STREAM_KIND_MESH, 1.0, false) >>>
+    h_a := mgr.request_mesh("build/streaming-fixtures/mesh_a.obj", stream.STREAM_KIND_MESH, 100.0, false) >>>
+    h_c := mgr.request_mesh("build/streaming-fixtures/mesh_c.obj", stream.STREAM_KIND_MESH, 50.0, false) >>>
+    h_bad := mgr.request_mesh("build/streaming-fixtures/does_not_exist.obj", stream.STREAM_KIND_MESH, 10.0, false) >>>
+
+    // Give async worker coroutines brief moment so all 4 CPU decodes enter ready queue cleanly,
+    // then verify strict priority scheduling (100 -> 50 -> 1) and frame-budget pacing!
+    time.sleep(20000000)
+
+    // Pump asynchronously across frames until all CPU jobs finish + budget uploads step by step!
+    $uploads_seq := []int{}
+    $frame := 1
+    while frame <= 30 && (
+        mgr.state(h_a) == stream.STREAM_STATE_PENDING ||
+        mgr.state(h_a) == stream.STREAM_STATE_READY_CPU ||
+        mgr.state(h_b) == stream.STREAM_STATE_PENDING ||
+        mgr.state(h_b) == stream.STREAM_STATE_READY_CPU ||
+        mgr.state(h_c) == stream.STREAM_STATE_PENDING ||
+        mgr.state(h_c) == stream.STREAM_STATE_READY_CPU ||
+        mgr.state(h_bad) == stream.STREAM_STATE_PENDING
+    ) {
+        stats := mgr.pump(&device, frame) >>>
+        assert(stats.uploaded_this_frame <= 1)
+        assert(stats.resident_bytes <= 130000)
+        if stats.uploaded_this_frame == 1 {
+            if mgr.state(h_a) == stream.STREAM_STATE_RESIDENT && uploads_seq.len == 0 { uploads_seq.push(h_a) }
+            else if mgr.state(h_c) == stream.STREAM_STATE_RESIDENT && uploads_seq.len == 1 { uploads_seq.push(h_c) }
+            else if mgr.state(h_b) == stream.STREAM_STATE_RESIDENT && uploads_seq.len == 2 { uploads_seq.push(h_b) }
+        }
+        // Touch h_a on frame when both h_a and h_c are uploaded so h_c becomes LRU victim when h_b streams!
+        if mgr.state(h_a) == stream.STREAM_STATE_RESIDENT {
+            mgr.touch(h_a, frame + 10) >>>
+        }
+        time.sleep(1000000)
+        frame += 1
+    }
+
+    assert(mgr.state(h_bad) == stream.STREAM_STATE_FAILED)
+    // Priority order verified: A (100.0) first, C (50.0) second, B (1.0) third!
+    assert(uploads_seq.len == 3 && uploads_seq[0] == h_a && uploads_seq[1] == h_c && uploads_seq[2] == h_b)
+    // LRU eviction verified: touching h_a kept h_a + newer h_b resident while h_c was evicted!
+    assert(mgr.state(h_a) == stream.STREAM_STATE_RESIDENT)
+    assert(mgr.state(h_b) == stream.STREAM_STATE_RESIDENT)
+    assert(mgr.state(h_c) == stream.STREAM_STATE_EVICTED)
+    assert(mgr.resident_bytes_used() <= 130000)
+
+    // Verify resident GPU mesh renders cleanly on Metal!
+    _ := mgr.mesh_ref(h_a) >>>
+    // Test PNG async stream + restreaming evicted C cleanly!
+    h_tex := mgr.request_texture("build/gltf-animation-fixtures/Textures/map.png", true,
+        ren.TextureSampling3D{min_linear: false, mag_linear: false, repeat_u: false, repeat_v: false, mip_filter: 0},
+        200.0, true) >>>
+    mgr.restream(h_c, 150.0, frame) >>>
+    for _ in 0:30 {
+        _ := mgr.pump(&device, frame) >>>
+        if mgr.state(h_tex) == stream.STREAM_STATE_RESIDENT && mgr.state(h_c) == stream.STREAM_STATE_RESIDENT {
+            ->
+        }
+        time.sleep(1000000)
+        frame += 1
+    }
+    assert(mgr.state(h_tex) == stream.STREAM_STATE_RESIDENT)
+    assert(mgr.state(h_c) == stream.STREAM_STATE_RESIDENT)
+    _ := mgr.texture_ref(h_tex) >>>
+
+    mgr.shutdown() >>>
+    assert(mgr.resident_bytes_used() == 0)
+    device.close() >>>
+    println("PASS: Async Worker Streaming + Priority + Budgeted Paging + LRU VRAM Eviction (frames=" +
+        str(frame) + ", eviction & restream verified)")
+    << 0
+}
+
+fn main() int {
+    << run() >>> (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

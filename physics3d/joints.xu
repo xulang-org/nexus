@@ -1,0 +1,1386 @@
+@"github.com/xulang-org/nexus/physics3d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const JOINT_BALL_SOCKET = 1
+pub const JOINT_HINGE = 2
+
+pub struct BodyRayHit3D {
+    pub body_id int
+    pub distance f64
+    pub point fm.Vec3
+    pub normal fm.Vec3
+}
+
+struct JointConstraint3D {
+    kind int
+    a int
+    b int
+    anchor_a fm.Vec3
+    anchor_b fm.Vec3
+    axis_a fm.Vec3     // hinge axis or swing reference dir on body A (local)
+    axis_b fm.Vec3     // hinge axis or swing reference dir on body B (local)
+    perp_a fm.Vec3     // orthogonal angle reference on body A (local)
+    perp_b fm.Vec3     // orthogonal angle reference on body B (local)
+    min_angle f64
+    max_angle f64
+    compliance f64
+    swing_limit f64
+    motor_enabled bool
+    motor_has_target_angle bool
+    motor_target_vel f64
+    motor_target_angle f64
+    motor_compliance f64
+    motor_max_impulse f64
+    collide_connected bool
+}
+
+// XPBD Articulated Rigid Body Simulator supporting:
+// - Full 6-DOF linear & quaternion rotational dynamics
+// - Ball-Socket joints with Cone-Swing limits (Ragdolls)
+// - Rotational Hinge joints with signed angle limits [min, max]
+// - Incremental DynamicBvh3D broadphase + StaticBvh3D terrain contacts
+pub struct JointedWorld3D {
+    gravity fm.Vec3
+    linear_damping f64
+    angular_damping f64
+    static_boxes []fm.Aabb3
+    static_box_layers []int
+    box_bvh StaticBvh3D
+    static_triangles []StaticTriangle3D
+    tri_bounds []fm.Aabb3
+    tri_bvh StaticBvh3D
+    dyn_bvh DynamicBvh3D
+    proxy_ids []int
+    // Per-body state
+    positions []fm.Vec3
+    prev_positions []fm.Vec3
+    orientations []fm.Quaternion
+    prev_orientations []fm.Quaternion
+    lin_vels []fm.Vec3
+    ang_vels []fm.Vec3
+    inv_mass []f64
+    inv_inertia []fm.Vec3
+    half_extents []fm.Vec3
+    restitutions []f64
+    frictions []f64
+    layers []int
+    masks []int
+    joints []JointConstraint3D
+}
+
+fn q_ident() fm.Quaternion { << fm.quaternion(0.0, 0.0, 0.0, 1.0) }
+
+fn q_conj(q fm.Quaternion) fm.Quaternion { << fm.quaternion(-q.x, -q.y, -q.z, q.w) }
+
+fn q_mul(a fm.Quaternion, b fm.Quaternion) fm.Quaternion {
+    << fm.quaternion(
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+    )
+}
+
+fn q_rotate(q fm.Quaternion, v fm.Vec3) fm.Vec3 {
+    qv := fm.quaternion(v.x, v.y, v.z, 0.0)
+    res := q_mul(q_mul(q, qv), q_conj(q))
+    << fm.vec3(res.x, res.y, res.z)
+}
+
+fn q_rotate_inv(q fm.Quaternion, v fm.Vec3) fm.Vec3 {
+    << q_rotate(q_conj(q), v)
+}
+
+fn q_integrate(q fm.Quaternion, delta_axis fm.Vec3) fm.Quaternion {
+    dq := fm.quaternion(delta_axis.x * 0.5, delta_axis.y * 0.5, delta_axis.z * 0.5, 0.0)
+    sum := q_mul(dq, q)
+    raw := fm.quaternion(q.x + sum.x, q.y + sum.y, q.z + sum.z, q.w + sum.w)
+    l2 := raw.x * raw.x + raw.y * raw.y + raw.z * raw.z + raw.w * raw.w
+    if l2 <= 1e-24 { << q }
+    inv_l := 1.0 / math.sqrt(l2)
+    << fm.quaternion(raw.x * inv_l, raw.y * inv_l, raw.z * inv_l, raw.w * inv_l)
+}
+
+pub fn quaternion_from_mat4(m fm.Mat4) fm.Quaternion {
+    m00 := m.c0.x
+    m10 := m.c0.y
+    m20 := m.c0.z
+    m01 := m.c1.x
+    m11 := m.c1.y
+    m21 := m.c1.z
+    m02 := m.c2.x
+    m12 := m.c2.y
+    m22 := m.c2.z
+    // Normalize basis columns to handle scaled skeleton matrices safely.
+    c0l := math.sqrt(m00 * m00 + m10 * m10 + m20 * m20)
+    c1l := math.sqrt(m01 * m01 + m11 * m11 + m21 * m21)
+    c2l := math.sqrt(m02 * m02 + m12 * m12 + m22 * m22)
+    $r00 := 1.0
+    $r10 := 0.0
+    $r20 := 0.0
+    $r01 := 0.0
+    $r11 := 1.0
+    $r21 := 0.0
+    $r02 := 0.0
+    $r12 := 0.0
+    $r22 := 1.0
+    if c0l > 1e-9 {
+        r00 = m00 / c0l
+        r10 = m10 / c0l
+        r20 = m20 / c0l
+    }
+    if c1l > 1e-9 {
+        r01 = m01 / c1l
+        r11 = m11 / c1l
+        r21 = m21 / c1l
+    }
+    if c2l > 1e-9 {
+        r02 = m02 / c2l
+        r12 = m12 / c2l
+        r22 = m22 / c2l
+    }
+    tr := r00 + r11 + r22
+    if tr > 0.0 {
+        s := math.sqrt(tr + 1.0) * 2.0
+        << fm.quaternion((r21 - r12) / s, (r02 - r20) / s, (r10 - r01) / s, 0.25 * s).normalized() >>>
+    } else if r00 > r11 && r00 > r22 {
+        s := math.sqrt(math.max(1e-12, 1.0 + r00 - r11 - r22)) * 2.0
+        << fm.quaternion(0.25 * s, (r01 + r10) / s, (r02 + r20) / s, (r21 - r12) / s).normalized() >>>
+    } else if r11 > r22 {
+        s := math.sqrt(math.max(1e-12, 1.0 + r11 - r00 - r22)) * 2.0
+        << fm.quaternion((r01 + r10) / s, 0.25 * s, (r12 + r21) / s, (r02 - r20) / s).normalized() >>>
+    } else {
+        s := math.sqrt(math.max(1e-12, 1.0 + r22 - r00 - r11)) * 2.0
+        << fm.quaternion((r02 + r20) / s, (r12 + r21) / s, 0.25 * s, (r10 - r01) / s).normalized() >>>
+    }
+}
+
+fn ortho_perp(axis fm.Vec3) fm.Vec3 {
+    $ref := fm.vec3(1.0, 0.0, 0.0)
+    if math.abs(axis.x) > 0.85 { ref = fm.vec3(0.0, 1.0, 0.0) }
+    p := axis.cross(ref)
+    l := p.length()
+    if l <= 1e-12 { << fm.vec3(0.0, 0.0, 1.0) }
+    << p.scaled(1.0 / l)
+}
+
+pub fn new_jointed_world_3d(
+    gravity fm.Vec3,
+    linear_damping f64,
+    angular_damping f64,
+    solids &[]fm.Aabb3,
+    solid_layers &[]int,
+    triangles &[]StaticTriangle3D
+) JointedWorld3D {
+    if !gravity.is_finite() || !fm.finite(linear_damping) || linear_damping < 0.0 || linear_damping > 20.0 ||
+        !fm.finite(angular_damping) || angular_damping < 0.0 || angular_damping > 20.0 {
+        >>> errors.new("nexus joints: invalid gravity or damping")
+    }
+    if solids.len != solid_layers.len || solids.len > MAX_COLLIDERS || triangles.len > MAX_COLLIDERS {
+        >>> errors.new("nexus joints: static geometry budget exceeded or mismatched")
+    }
+    check_solids(solids) >>>
+    $sboxes := []fm.Aabb3{}
+    $slayers := []int{}
+    for i in 0:solids.len {
+        if solid_layers[i] <= 0 { >>> errors.new("nexus joints: solid layer must be positive") }
+        sboxes.push(solids[i])
+        slayers.push(solid_layers[i])
+    }
+    $tris := []StaticTriangle3D{}
+    $tbounds := []fm.Aabb3{}
+    for i in 0:triangles.len {
+        check_triangle(triangles[i]) >>>
+        tris.push(triangles[i])
+        tbounds.push(triangle_bounds_unchecked(triangles[i]))
+    }
+    bbvh := build_static_bvh(&sboxes)
+    tbvh := build_static_bvh(&tbounds)
+    << JointedWorld3D{
+        gravity: gravity,
+        linear_damping: linear_damping,
+        angular_damping: angular_damping,
+        static_boxes: sboxes,
+        static_box_layers: slayers,
+        box_bvh: bbvh,
+        static_triangles: tris,
+        tri_bounds: tbounds,
+        tri_bvh: tbvh,
+        dyn_bvh: new_dynamic_bvh_3d(),
+        proxy_ids: []int{},
+        positions: []fm.Vec3{},
+        prev_positions: []fm.Vec3{},
+        orientations: []fm.Quaternion{},
+        prev_orientations: []fm.Quaternion{},
+        lin_vels: []fm.Vec3{},
+        ang_vels: []fm.Vec3{},
+        inv_mass: []f64{},
+        inv_inertia: []fm.Vec3{},
+        half_extents: []fm.Vec3{},
+        restitutions: []f64{},
+        frictions: []f64{},
+        layers: []int{},
+        masks: []int{},
+        joints: []JointConstraint3D{}
+    }
+}
+
+fn (world &JointedWorld3D) body_world_aabb(id int) fm.Aabb3 {
+    p := world.positions[id]
+    q := world.orientations[id]
+    he := world.half_extents[id]
+    m := q.rotation_matrix() >>>
+    ex := math.abs(m.c0.x) * he.x + math.abs(m.c1.x) * he.y + math.abs(m.c2.x) * he.z
+    ey := math.abs(m.c0.y) * he.x + math.abs(m.c1.y) * he.y + math.abs(m.c2.y) * he.z
+    ez := math.abs(m.c0.z) * he.x + math.abs(m.c1.z) * he.y + math.abs(m.c2.z) * he.z
+    r := fm.vec3(ex, ey, ez)
+    << fm.Aabb3{minimum: p.sub(r), maximum: p.add(r)}
+}
+
+pub fn (world $&JointedWorld3D) add_body(
+    position fm.Vec3,
+    orientation fm.Quaternion,
+    half_extents fm.Vec3,
+    mass f64,
+    restitution f64,
+    friction f64,
+    layer int,
+    mask int
+) int {
+    if !valid_point(position) || !half_extents.is_finite() ||
+        half_extents.x <= 0.0 || half_extents.y <= 0.0 || half_extents.z <= 0.0 ||
+        !fm.finite(mass) || mass < 0.0 ||
+        !fm.finite(restitution) || restitution < 0.0 || restitution > 1.0 ||
+        !fm.finite(friction) || friction < 0.0 || friction > 4.0 ||
+        layer <= 0 || mask < 0 {
+        >>> errors.new("nexus joints: invalid rigid body parameters")
+    }
+    if world.positions.len >= XPBD_MAX_BODIES {
+        >>> errors.new("nexus joints: body limit exceeded")
+    }
+    norm_q := orientation.normalized() >>>
+    id := world.positions.len
+    $im := 0.0
+    $ii := fm.vec3(0.0, 0.0, 0.0)
+    if mass > 0.0 {
+        im = 1.0 / mass
+        fx := 2.0 * half_extents.x
+        fy := 2.0 * half_extents.y
+        fz := 2.0 * half_extents.z
+        ix := (mass / 12.0) * (fy * fy + fz * fz)
+        iy := (mass / 12.0) * (fx * fx + fz * fz)
+        iz := (mass / 12.0) * (fx * fx + fy * fy)
+        ii = fm.vec3(1.0 / math.max(ix, 1e-6), 1.0 / math.max(iy, 1e-6), 1.0 / math.max(iz, 1e-6))
+    }
+    world.positions.push(position)
+    world.prev_positions.push(position)
+    world.orientations.push(norm_q)
+    world.prev_orientations.push(norm_q)
+    world.lin_vels.push(fm.vec3(0.0, 0.0, 0.0))
+    world.ang_vels.push(fm.vec3(0.0, 0.0, 0.0))
+    world.inv_mass.push(im)
+    world.inv_inertia.push(ii)
+    world.half_extents.push(half_extents)
+    world.restitutions.push(restitution)
+    world.frictions.push(friction)
+    world.layers.push(layer)
+    world.masks.push(mask)
+    bb := world.body_world_aabb(id)
+    bvh := $&world.dyn_bvh
+    pid := bvh.create_proxy(bb, id) >>>
+    world.proxy_ids.push(pid)
+    << id
+}
+
+pub fn (world $&JointedWorld3D) set_body_pose(id int, pos fm.Vec3, orient fm.Quaternion) int {
+    if id < 0 || id >= world.positions.len || !valid_point(pos) {
+        >>> errors.new("nexus joints: invalid body id or position")
+    }
+    nq := orient.normalized() >>>
+    old_p := world.positions[id]
+    world.positions[id] = pos
+    world.prev_positions[id] = pos
+    world.orientations[id] = nq
+    world.prev_orientations[id] = nq
+    world.lin_vels[id] = fm.vec3(0.0, 0.0, 0.0)
+    world.ang_vels[id] = fm.vec3(0.0, 0.0, 0.0)
+    bb := world.body_world_aabb(id)
+    pid := world.proxy_ids[id]
+    disp := pos.sub(old_p)
+    bvh := $&world.dyn_bvh
+    _ := bvh.move_proxy(pid, bb, disp) >>>
+    << 0
+}
+
+pub fn (world $&JointedWorld3D) add_ball_socket_joint(
+    a int,
+    b int,
+    anchor_world fm.Vec3,
+    swing_dir_world fm.Vec3,
+    swing_limit_rad f64,
+    compliance f64
+) int {
+    if a < 0 || a >= world.positions.len || b < 0 || b >= world.positions.len || a == b {
+        >>> errors.new("nexus joints: invalid body pair for ball-socket joint")
+    }
+    if !valid_point(anchor_world) || !swing_dir_world.is_finite() || !fm.finite(swing_limit_rad) || swing_limit_rad <= 0.0 ||
+        !fm.finite(compliance) || compliance < 0.0 {
+        >>> errors.new("nexus joints: invalid ball-socket joint arguments")
+    }
+    if world.joints.len >= XPBD_MAX_CONSTRAINTS {
+        >>> errors.new("nexus joints: joint limit exceeded")
+    }
+    la := q_rotate_inv(world.orientations[a], anchor_world.sub(world.positions[a]))
+    lb := q_rotate_inv(world.orientations[b], anchor_world.sub(world.positions[b]))
+    sdir := swing_dir_world.normalized() >>>
+    ax_a := q_rotate_inv(world.orientations[a], sdir)
+    ax_b := q_rotate_inv(world.orientations[b], sdir)
+    id := world.joints.len
+    world.joints.push(JointConstraint3D{
+        kind: JOINT_BALL_SOCKET,
+        a: a, b: b,
+        anchor_a: la, anchor_b: lb,
+        axis_a: ax_a, axis_b: ax_b,
+        perp_a: fm.vec3(0.0, 0.0, 0.0), perp_b: fm.vec3(0.0, 0.0, 0.0),
+        min_angle: -3.15, max_angle: 3.15,
+        compliance: compliance,
+        swing_limit: swing_limit_rad,
+        motor_enabled: false,
+        motor_has_target_angle: false,
+        motor_target_vel: 0.0,
+        motor_target_angle: 0.0,
+        motor_compliance: 0.0,
+        motor_max_impulse: 1000.0,
+        collide_connected: false
+    })
+    << id
+}
+
+pub fn (world $&JointedWorld3D) add_hinge_joint(
+    a int,
+    b int,
+    anchor_world fm.Vec3,
+    axis_world fm.Vec3,
+    min_angle f64,
+    max_angle f64,
+    compliance f64
+) int {
+    if a < 0 || a >= world.positions.len || b < 0 || b >= world.positions.len || a == b {
+        >>> errors.new("nexus joints: invalid body pair for hinge joint")
+    }
+    if !valid_point(anchor_world) || !axis_world.is_finite() ||
+        !fm.finite(min_angle) || !fm.finite(max_angle) || min_angle > max_angle ||
+        !fm.finite(compliance) || compliance < 0.0 {
+        >>> errors.new("nexus joints: invalid hinge joint arguments")
+    }
+    if world.joints.len >= XPBD_MAX_CONSTRAINTS {
+        >>> errors.new("nexus joints: joint limit exceeded")
+    }
+    h_w := axis_world.normalized() >>>
+    p_w := ortho_perp(h_w)
+    la := q_rotate_inv(world.orientations[a], anchor_world.sub(world.positions[a]))
+    lb := q_rotate_inv(world.orientations[b], anchor_world.sub(world.positions[b]))
+    id := world.joints.len
+    world.joints.push(JointConstraint3D{
+        kind: JOINT_HINGE,
+        a: a, b: b,
+        anchor_a: la, anchor_b: lb,
+        axis_a: q_rotate_inv(world.orientations[a], h_w),
+        axis_b: q_rotate_inv(world.orientations[b], h_w),
+        perp_a: q_rotate_inv(world.orientations[a], p_w),
+        perp_b: q_rotate_inv(world.orientations[b], p_w),
+        min_angle: min_angle,
+        max_angle: max_angle,
+        compliance: compliance,
+        swing_limit: 3.15,
+        motor_enabled: false,
+        motor_has_target_angle: false,
+        motor_target_vel: 0.0,
+        motor_target_angle: 0.0,
+        motor_compliance: 0.0,
+        motor_max_impulse: 1000.0,
+        collide_connected: false
+    })
+    << id
+}
+
+pub fn (world $&JointedWorld3D) set_hinge_motor(
+    joint_id int,
+    enabled bool,
+    target_vel f64,
+    max_torque f64
+) int {
+    if joint_id < 0 || joint_id >= world.joints.len || world.joints[joint_id].kind != JOINT_HINGE {
+        >>> errors.new("nexus joints: motor requires a valid hinge joint")
+    }
+    if !fm.finite(target_vel) || !fm.finite(max_torque) || max_torque < 0.0 {
+        >>> errors.new("nexus joints: invalid hinge motor parameters")
+    }
+    world.joints[joint_id].motor_enabled = enabled
+    world.joints[joint_id].motor_has_target_angle = false
+    world.joints[joint_id].motor_target_vel = target_vel
+    world.joints[joint_id].motor_max_impulse = max_torque
+    << 0
+}
+
+pub fn (world $&JointedWorld3D) set_hinge_servo(
+    joint_id int,
+    enabled bool,
+    target_angle f64,
+    compliance f64,
+    max_torque f64
+) int {
+    if joint_id < 0 || joint_id >= world.joints.len || world.joints[joint_id].kind != JOINT_HINGE {
+        >>> errors.new("nexus joints: servo requires a valid hinge joint")
+    }
+    if !fm.finite(target_angle) || !fm.finite(compliance) || compliance < 0.0 || !fm.finite(max_torque) || max_torque < 0.0 {
+        >>> errors.new("nexus joints: invalid hinge servo parameters")
+    }
+    world.joints[joint_id].motor_enabled = enabled
+    world.joints[joint_id].motor_has_target_angle = true
+    world.joints[joint_id].motor_target_angle = target_angle
+    world.joints[joint_id].motor_compliance = compliance
+    world.joints[joint_id].motor_max_impulse = max_torque
+    << 0
+}
+
+pub fn (world $&JointedWorld3D) set_joint_collide_connected(joint_id int, enabled bool) int {
+    if joint_id < 0 || joint_id >= world.joints.len {
+        >>> errors.new("nexus joints: invalid joint id")
+    }
+    world.joints[joint_id].collide_connected = enabled
+    << 0
+}
+
+fn vec3_hadamard(a fm.Vec3, b fm.Vec3) fm.Vec3 {
+    << fm.vec3(a.x * b.x, a.y * b.y, a.z * b.z)
+}
+
+fn (world &JointedWorld3D) rotational_gen_mass(body int, world_axis fm.Vec3) f64 {
+    if world.inv_mass[body] <= 0.0 { << 0.0 }
+    local_ax := q_rotate_inv(world.orientations[body], world_axis)
+    ii := world.inv_inertia[body]
+    << local_ax.x * local_ax.x * ii.x + local_ax.y * local_ax.y * ii.y + local_ax.z * local_ax.z * ii.z
+}
+
+fn (world $&JointedWorld3D) apply_angular_delta(body int, world_torque_dir fm.Vec3, d_lambda f64) {
+    if world.inv_mass[body] <= 0.0 { << }
+    imp := world_torque_dir.scaled(d_lambda)
+    local_imp := q_rotate_inv(world.orientations[body], imp)
+    local_rot := vec3_hadamard(local_imp, world.inv_inertia[body])
+    world_rot := q_rotate(world.orientations[body], local_rot)
+    world.orientations[body] = q_integrate(world.orientations[body], world_rot)
+}
+
+fn (world $&JointedWorld3D) apply_positional_correction(
+    a int, r_a fm.Vec3,
+    b int, r_b fm.Vec3,
+    corr_vec fm.Vec3,
+    compliance f64,
+    inv_h2 f64
+) {
+    c := corr_vec.length()
+    if c <= 1e-12 { << }
+    n := corr_vec.scaled(1.0 / c)
+    $wa := 0.0
+    $wb := 0.0
+    if world.inv_mass[a] > 0.0 {
+        ax := r_a.cross(n)
+        wa = world.inv_mass[a] + world.rotational_gen_mass(a, ax)
+    }
+    if b >= 0 && world.inv_mass[b] > 0.0 {
+        bx := r_b.cross(n)
+        wb = world.inv_mass[b] + world.rotational_gen_mass(b, bx)
+    }
+    wsum := wa + wb + compliance * inv_h2
+    if wsum <= 1e-18 { << }
+    d_lambda := -c / wsum
+    p := n.scaled(d_lambda)
+    if world.inv_mass[a] > 0.0 {
+        world.positions[a] = world.positions[a].add(p.scaled(world.inv_mass[a]))
+        world.apply_angular_delta(a, r_a.cross(p), 1.0)
+    }
+    if b >= 0 && world.inv_mass[b] > 0.0 {
+        world.positions[b] = world.positions[b].sub(p.scaled(world.inv_mass[b]))
+        world.apply_angular_delta(b, r_b.cross(p), -1.0)
+    }
+}
+
+struct HingeState3D {
+    valid bool
+    axis fm.Vec3
+    angle f64
+}
+
+fn (world &JointedWorld3D) eval_hinge_state(j &JointConstraint3D) HingeState3D {
+    ha_raw := q_rotate(world.orientations[j.a], j.axis_a)
+    hl := ha_raw.length()
+    $ha := fm.vec3(0.0, 0.0, 1.0)
+    if hl > 1e-12 { ha = ha_raw.scaled(1.0 / hl) }
+    pa_w := q_rotate(world.orientations[j.a], j.perp_a)
+    pb_w := q_rotate(world.orientations[j.b], j.perp_b)
+    pa_p := pa_w.sub(ha.scaled(pa_w.dot(ha)))
+    pb_p := pb_w.sub(ha.scaled(pb_w.dot(ha)))
+    la := pa_p.length()
+    lb := pb_p.length()
+    if la <= 1e-6 || lb <= 1e-6 {
+        << HingeState3D{valid: false, axis: ha, angle: 0.0}
+    }
+    ua := pa_p.scaled(1.0 / la)
+    ub := pb_p.scaled(1.0 / lb)
+    theta := math.atan2(ua.cross(ub).dot(ha), math.max(-1.0, math.min(1.0, ua.dot(ub))))
+    << HingeState3D{valid: true, axis: ha, angle: theta}
+}
+
+fn (world $&JointedWorld3D) solve_angular_pair_clamped(
+    a int, b int, axis_world fm.Vec3, angle_err f64, compliance f64, inv_h2 f64, max_impulse f64
+) {
+    if math.abs(angle_err) <= 1e-10 { << }
+    wa := world.rotational_gen_mass(a, axis_world)
+    wb := world.rotational_gen_mass(b, axis_world)
+    wsum := wa + wb + compliance * inv_h2
+    if wsum <= 1e-18 { << }
+    $d_lambda := -angle_err / wsum
+    if max_impulse >= 0.0 {
+        cap := max_impulse / math.max(1.0, inv_h2)
+        if d_lambda > cap { d_lambda = cap }
+        if d_lambda < -cap { d_lambda = -cap }
+    }
+    world.apply_angular_delta(a, axis_world, d_lambda)
+    world.apply_angular_delta(b, axis_world, -d_lambda)
+}
+
+fn (world $&JointedWorld3D) solve_angular_pair(a int, b int, axis_world fm.Vec3, angle_err f64, compliance f64, inv_h2 f64) {
+    world.solve_angular_pair_clamped(a, b, axis_world, angle_err, compliance, inv_h2, -1.0)
+}
+
+fn (world $&JointedWorld3D) solve_joint(j JointConstraint3D, inv_h2 f64) {
+    ra := q_rotate(world.orientations[j.a], j.anchor_a)
+    rb := q_rotate(world.orientations[j.b], j.anchor_b)
+    pa := world.positions[j.a].add(ra)
+    pb := world.positions[j.b].add(rb)
+    world.apply_positional_correction(j.a, ra, j.b, rb, pa.sub(pb), j.compliance, inv_h2)
+
+    if j.kind == JOINT_BALL_SOCKET {
+        if j.swing_limit < 3.1 {
+            ua := q_rotate(world.orientations[j.a], j.axis_a)
+            ub := q_rotate(world.orientations[j.b], j.axis_b)
+            dp := math.max(-1.0, math.min(1.0, ua.dot(ub)))
+            ang := math.acos(dp)
+            if ang > j.swing_limit {
+                ax_raw := ua.cross(ub)
+                l := ax_raw.length()
+                if l > 1e-9 {
+                    // Push ua and ub closer (rotate b toward a).
+                    world.solve_angular_pair(j.a, j.b, ax_raw.scaled(1.0 / l), -(ang - j.swing_limit), j.compliance * 0.1, inv_h2)
+                }
+            }
+        }
+        <<
+    }
+
+    // Hinge axis alignment constraint: align world axis_a with axis_b.
+    ha := q_rotate(world.orientations[j.a], j.axis_a)
+    hb := q_rotate(world.orientations[j.b], j.axis_b)
+    align_cross := ha.cross(hb)
+    al := align_cross.length()
+    if al > 1e-9 {
+        sin_theta := math.min(1.0, al)
+        $ang := math.asin(sin_theta)
+        if ha.dot(hb) < 0.0 { ang = 3.141592653589793 - ang }
+        world.solve_angular_pair(j.a, j.b, align_cross.scaled(1.0 / al), -ang, j.compliance, inv_h2)
+    }
+
+    // Hinge angular limit and angular servo motor constraints around shared axis ha.
+    has_limits := j.min_angle > -3.14 || j.max_angle < 3.14
+    has_servo := j.motor_enabled && j.motor_has_target_angle
+    if has_limits || has_servo {
+        hs := world.eval_hinge_state(&j)
+        if hs.valid {
+            $theta := hs.angle
+            if has_servo {
+                $target := j.motor_target_angle
+                if has_limits {
+                    target = math.max(j.min_angle, math.min(j.max_angle, target))
+                }
+                diff := target - theta
+                err := math.atan2(math.sin(diff), math.cos(diff))
+                world.solve_angular_pair_clamped(
+                    j.a, j.b, hs.axis, err, j.motor_compliance, inv_h2, j.motor_max_impulse
+                )
+            }
+            if has_limits {
+                hs2 := world.eval_hinge_state(&j)
+                if hs2.valid {
+                    if hs2.angle < j.min_angle {
+                        world.solve_angular_pair(j.a, j.b, hs2.axis, j.min_angle - hs2.angle, j.compliance, inv_h2)
+                    } else if hs2.angle > j.max_angle {
+                        world.solve_angular_pair(j.a, j.b, hs2.axis, j.max_angle - hs2.angle, j.compliance, inv_h2)
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct ContactList3D {
+    keys []int
+    a []int
+    b []int
+    la []fm.Vec3
+    lb []fm.Vec3
+    ns []fm.Vec3
+}
+
+fn new_contact_list_3d() ContactList3D {
+    << ContactList3D{
+        keys: []int{},
+        a: []int{},
+        b: []int{},
+        la: []fm.Vec3{},
+        lb: []fm.Vec3{},
+        ns: []fm.Vec3{}
+    }
+}
+
+fn (cl $&ContactList3D) record(
+    key int,
+    a int,
+    b int,
+    la fm.Vec3,
+    lb fm.Vec3,
+    nrm fm.Vec3
+) {
+    for ki in 0:cl.keys.len {
+        if cl.keys[ki] == key {
+            cl.la[ki] = la
+            cl.lb[ki] = lb
+            cl.ns[ki] = nrm
+            <<
+        }
+    }
+    cl.keys.push(key)
+    cl.a.push(a)
+    cl.b.push(b)
+    cl.la.push(la)
+    cl.lb.push(lb)
+    cl.ns.push(nrm)
+}
+
+fn box_corner_local(he fm.Vec3, ci int) fm.Vec3 {
+    $lx := -he.x
+    $ly := -he.y
+    $lz := -he.z
+    if (ci & 1) != 0 { lx = he.x }
+    if (ci & 2) != 0 { ly = he.y }
+    if (ci & 4) != 0 { lz = he.z }
+    << fm.vec3(lx, ly, lz)
+}
+
+fn obb_proj_radius(q fm.Quaternion, he fm.Vec3, axis fm.Vec3) f64 {
+    local_ax := q_rotate_inv(q, axis)
+    << he.x * math.abs(local_ax.x) + he.y * math.abs(local_ax.y) + he.z * math.abs(local_ax.z)
+}
+
+fn (world $&JointedWorld3D) solve_static_box_corners(
+    id int,
+    box fm.Aabb3,
+    inv_h2 f64,
+    cl $&ContactList3D
+) {
+    he := world.half_extents[id]
+    zero_v := fm.vec3(0.0, 0.0, 0.0)
+    // Test 8 box corners against static box, refreshing p/q per corner to avoid multi-corner over-correction.
+    for ci in 0:8 {
+        p := world.positions[id]
+        q := world.orientations[id]
+        local_corner := box_corner_local(he, ci)
+        r := q_rotate(q, local_corner)
+        wp := p.add(r)
+        if wp.x >= box.minimum.x && wp.x <= box.maximum.x &&
+           wp.y >= box.minimum.y && wp.y <= box.maximum.y &&
+           wp.z >= box.minimum.z && wp.z <= box.maximum.z {
+            d_min_x := wp.x - box.minimum.x
+            d_max_x := box.maximum.x - wp.x
+            d_min_y := wp.y - box.minimum.y
+            d_max_y := box.maximum.y - wp.y
+            d_min_z := wp.z - box.minimum.z
+            d_max_z := box.maximum.z - wp.z
+            $pen := d_max_y
+            $corr := fm.vec3(0.0, d_max_y, 0.0)
+            if d_min_y < pen {
+                pen = d_min_y
+                corr = fm.vec3(0.0, -d_min_y, 0.0)
+            }
+            if d_min_x < pen {
+                pen = d_min_x
+                corr = fm.vec3(-d_min_x, 0.0, 0.0)
+            }
+            if d_max_x < pen {
+                pen = d_max_x
+                corr = fm.vec3(d_max_x, 0.0, 0.0)
+            }
+            if d_min_z < pen {
+                pen = d_min_z
+                corr = fm.vec3(0.0, 0.0, -d_min_z)
+            }
+            if d_max_z < pen {
+                pen = d_max_z
+                corr = fm.vec3(0.0, 0.0, d_max_z)
+            }
+            // Note corr = desired displacement, apply_positional_correction pushes along -corr_vec!
+            world.apply_positional_correction(id, r, -1, zero_v, corr.scaled(-1.0), 0.0, inv_h2)
+            if pen > 1e-9 {
+                cl.record(id * 16 + ci, id, -1, local_corner, zero_v, corr.scaled(1.0 / pen))
+            }
+        }
+    }
+}
+
+fn (world $&JointedWorld3D) solve_static_triangle(
+    id int,
+    tri StaticTriangle3D,
+    inv_h2 f64,
+    cl $&ContactList3D
+) int {
+    tri_n := tri.normal() >>>
+    he := world.half_extents[id]
+    min_he := math.min(he.x, math.min(he.y, he.z))
+    thick := math.max(0.25, min_he * 1.5)
+    zero_v := fm.vec3(0.0, 0.0, 0.0)
+    for ci in 0:8 {
+        p := world.positions[id]
+        q := world.orientations[id]
+        local_corner := box_corner_local(he, ci)
+        r := q_rotate(q, local_corner)
+        wc := p.add(r)
+        cp := closest_on_triangle(wc, tri.a, tri.b, tri.c)
+        diff := wc.sub(cp)
+        sd := diff.dot(tri_n)
+        // Guard against ghost edge snagging: push along triangle normal when corner sits under triangle face.
+        if sd < 0.0 && sd >= -thick && p.sub(cp).dot(tri_n) >= -thick * 0.5 {
+            tang := diff.sub(tri_n.scaled(sd))
+            if tang.length() <= 0.05 {
+                pen := -sd
+                corr := tri_n.scaled(pen)
+                world.apply_positional_correction(id, r, -1, zero_v, corr.scaled(-1.0), 0.0, inv_h2)
+                if pen > 1e-9 {
+                    cl.record(1000000 + id * 16 + ci, id, -1, local_corner, zero_v, tri_n)
+                }
+            }
+        }
+    }
+    << 0
+}
+
+fn edge_segment_midpoint(p1 fm.Vec3, q1 fm.Vec3, p2 fm.Vec3, q2 fm.Vec3) fm.Vec3 {
+    d1 := q1.sub(p1)
+    d2 := q2.sub(p2)
+    r := p1.sub(p2)
+    a := d1.dot(d1)
+    e := d2.dot(d2)
+    f := d2.dot(r)
+    $s := 0.5
+    $t := 0.5
+    if a > 1e-12 && e > 1e-12 {
+        c := d1.dot(r)
+        b := d1.dot(d2)
+        denom := a * e - b * b
+        if denom > 1e-12 {
+            s = math.max(0.0, math.min(1.0, (b * f - c * e) / denom))
+        } else {
+            s = 0.0
+        }
+        t = (b * s + f) / e
+        if t < 0.0 {
+            t = 0.0
+            s = math.max(0.0, math.min(1.0, -c / a))
+        } else if t > 1.0 {
+            t = 1.0
+            s = math.max(0.0, math.min(1.0, (b - c) / a))
+        }
+    }
+    c1 := p1.add(d1.scaled(s))
+    c2 := p2.add(d2.scaled(t))
+    << c1.add(c2).scaled(0.5)
+}
+
+fn support_edge_endpoints(
+    center fm.Vec3,
+    axes &[]fm.Vec3,
+    he &[]f64,
+    edge_axis int,
+    dir fm.Vec3
+) []fm.Vec3 {
+    $c := center
+    for k in 0:3 {
+        if k == edge_axis { -> }
+        $sgn := 1.0
+        if axes[k].dot(dir) < 0.0 { sgn = -1.0 }
+        c = c.add(axes[k].scaled(he[k] * sgn))
+    }
+    span := axes[edge_axis].scaled(he[edge_axis])
+    << [c.sub(span), c.add(span)]
+}
+
+fn (world $&JointedWorld3D) solve_dynamic_obb_pair(
+    a int,
+    b int,
+    inv_h2 f64,
+    cl $&ContactList3D
+) int {
+    pa := world.positions[a]
+    pb := world.positions[b]
+    qa := world.orientations[a]
+    qb := world.orientations[b]
+    hea := world.half_extents[a]
+    heb := world.half_extents[b]
+    ma := qa.rotation_matrix() >>>
+    mb := qb.rotation_matrix() >>>
+    ua := [ma.c0.xyz(), ma.c1.xyz(), ma.c2.xyz()]
+    vb := [mb.c0.xyz(), mb.c1.xyz(), mb.c2.xyz()]
+    ha_arr := [hea.x, hea.y, hea.z]
+    hb_arr := [heb.x, heb.y, heb.z]
+    d := pa.sub(pb) // points B -> A
+
+    $best_pen := 1e30
+    $best_eff := 1e30
+    $best_idx := -1
+    $best_n := fm.vec3(0.0, 1.0, 0.0)
+
+    for idx in 0:15 {
+        $ax := fm.vec3(0.0, 0.0, 0.0)
+        if idx < 3 {
+            ax = ua[idx]
+        } else if idx < 6 {
+            ax = vb[idx - 3]
+        } else {
+            ei := (idx - 6) / 3
+            ej := (idx - 6) % 3
+            cr := ua[ei].cross(vb[ej])
+            clen := cr.length()
+            if clen <= 1e-6 { -> }
+            ax = cr.scaled(1.0 / clen)
+        }
+        ra := ha_arr[0] * math.abs(ua[0].dot(ax)) + ha_arr[1] * math.abs(ua[1].dot(ax)) + ha_arr[2] * math.abs(ua[2].dot(ax))
+        rb := hb_arr[0] * math.abs(vb[0].dot(ax)) + hb_arr[1] * math.abs(vb[1].dot(ax)) + hb_arr[2] * math.abs(vb[2].dot(ax))
+        pen := (ra + rb) - math.abs(d.dot(ax))
+        if pen <= 0.0 { << 0 }
+        $eff := pen
+        if idx >= 6 { eff = pen * 1.005 }
+        if eff < best_eff {
+            best_eff = eff
+            best_pen = pen
+            best_idx = idx
+            if d.dot(ax) < 0.0 {
+                best_n = ax.scaled(-1.0)
+            } else {
+                best_n = ax
+            }
+        }
+    }
+    if best_idx < 0 || best_pen <= 1e-9 { << 0 }
+
+    base_key := 2000000 + (a * 1024 + b) * 32
+    if best_idx >= 6 {
+        ei := (best_idx - 6) / 3
+        ej := (best_idx - 6) % 3
+        ea := support_edge_endpoints(pa, &ua, &ha_arr, ei, best_n.scaled(-1.0))
+        eb := support_edge_endpoints(pb, &vb, &hb_arr, ej, best_n)
+        pt := edge_segment_midpoint(ea[0], ea[1], eb[0], eb[1])
+        r_a := pt.sub(pa)
+        r_b := pt.sub(pb)
+        world.apply_positional_correction(a, r_a, b, r_b, best_n.scaled(-best_pen), 0.0, inv_h2)
+        cl.record(base_key, a, b, q_rotate_inv(qa, r_a), q_rotate_inv(qb, r_b), best_n)
+        << 1
+    }
+
+    // Collect penetrating corners of A in B and B in A for stable multi-point support.
+    $c_is_a := []bool{}
+    $c_local := []fm.Vec3{}
+    tol := 0.002
+    for ci in 0:8 {
+        lc_a := box_corner_local(hea, ci)
+        wc_a := pa.add(q_rotate(qa, lc_a))
+        in_b := q_rotate_inv(qb, wc_a.sub(pb))
+        if math.abs(in_b.x) <= heb.x + tol && math.abs(in_b.y) <= heb.y + tol && math.abs(in_b.z) <= heb.z + tol {
+            c_is_a.push(true)
+            c_local.push(lc_a)
+        }
+        lc_b := box_corner_local(heb, ci)
+        wc_b := pb.add(q_rotate(qb, lc_b))
+        in_a := q_rotate_inv(qa, wc_b.sub(pa))
+        if math.abs(in_a.x) <= hea.x + tol && math.abs(in_a.y) <= hea.y + tol && math.abs(in_a.z) <= hea.z + tol {
+            c_is_a.push(false)
+            c_local.push(lc_b)
+        }
+    }
+
+    if c_local.len == 0 {
+        sa := obb_proj_radius(qa, hea, best_n)
+        sb := obb_proj_radius(qb, heb, best_n)
+        p_a_surf := pa.sub(best_n.scaled(sa))
+        p_b_surf := pb.add(best_n.scaled(sb))
+        pt := p_a_surf.add(p_b_surf).scaled(0.5)
+        r_a := pt.sub(pa)
+        r_b := pt.sub(pb)
+        world.apply_positional_correction(a, r_a, b, r_b, best_n.scaled(-best_pen), 0.0, inv_h2)
+        cl.record(base_key, a, b, q_rotate_inv(qa, r_a), q_rotate_inv(qb, r_b), best_n)
+        << 1
+    }
+
+    $applied := 0
+    for k in 0:c_local.len {
+        cur_pa := world.positions[a]
+        cur_qa := world.orientations[a]
+        cur_pb := world.positions[b]
+        cur_qb := world.orientations[b]
+        $wc := fm.vec3(0.0, 0.0, 0.0)
+        $depth := 0.0
+        if c_is_a[k] {
+            wc = cur_pa.add(q_rotate(cur_qa, c_local[k]))
+            sb := cur_pb.dot(best_n) + obb_proj_radius(cur_qb, heb, best_n)
+            depth = math.min(best_pen, sb - wc.dot(best_n))
+        } else {
+            wc = cur_pb.add(q_rotate(cur_qb, c_local[k]))
+            sa_neg := cur_pa.dot(best_n) - obb_proj_radius(cur_qa, hea, best_n)
+            depth = math.min(best_pen, wc.dot(best_n) - sa_neg)
+        }
+        if depth > 1e-6 {
+            r_a := wc.sub(cur_pa)
+            r_b := wc.sub(cur_pb)
+            world.apply_positional_correction(a, r_a, b, r_b, best_n.scaled(-depth), 0.0, inv_h2)
+            cl.record(base_key + k + 1, a, b, q_rotate_inv(world.orientations[a], wc.sub(world.positions[a])), q_rotate_inv(world.orientations[b], wc.sub(world.positions[b])), best_n)
+            applied += 1
+        }
+    }
+    << applied
+}
+
+fn (world $&JointedWorld3D) apply_velocity_impulse(body_id int, r fm.Vec3, j_imp fm.Vec3) {
+    if body_id < 0 || world.inv_mass[body_id] <= 0.0 { << }
+    world.lin_vels[body_id] = world.lin_vels[body_id].add(j_imp.scaled(world.inv_mass[body_id]))
+    local_t := q_rotate_inv(world.orientations[body_id], r.cross(j_imp))
+    ang_delta := q_rotate(world.orientations[body_id], vec3_hadamard(local_t, world.inv_inertia[body_id]))
+    world.ang_vels[body_id] = world.ang_vels[body_id].add(ang_delta)
+}
+
+fn (world &JointedWorld3D) contact_point_velocity(body_id int, r fm.Vec3, lins &[]fm.Vec3, angs &[]fm.Vec3) fm.Vec3 {
+    if body_id < 0 || world.inv_mass[body_id] <= 0.0 {
+        << fm.vec3(0.0, 0.0, 0.0)
+    }
+    << lins[body_id].add(angs[body_id].cross(r))
+}
+
+fn (world $&JointedWorld3D) solve_contact_velocities(
+    cl &ContactList3D,
+    pre_lin &[]fm.Vec3,
+    pre_ang &[]fm.Vec3
+) {
+    zero_v := fm.vec3(0.0, 0.0, 0.0)
+    for iter_v in 0:3 {
+        for k in 0:cl.a.len {
+            a := cl.a[k]
+            b := cl.b[k]
+            ima := world.inv_mass[a]
+            $imb := 0.0
+            if b >= 0 { imb = world.inv_mass[b] }
+            if ima <= 0.0 && imb <= 0.0 { -> }
+
+            ra := q_rotate(world.orientations[a], cl.la[k])
+            $rb := zero_v
+            if b >= 0 { rb = q_rotate(world.orientations[b], cl.lb[k]) }
+            n := cl.ns[k]
+
+            va := world.contact_point_velocity(a, ra, &world.lin_vels, &world.ang_vels)
+            vb := world.contact_point_velocity(b, rb, &world.lin_vels, &world.ang_vels)
+            v_rel := va.sub(vb)
+            vn := v_rel.dot(n)
+
+            va_pre := world.contact_point_velocity(a, ra, pre_lin, pre_ang)
+            vb_pre := world.contact_point_velocity(b, rb, pre_lin, pre_ang)
+            v_pre_n := va_pre.sub(vb_pre).dot(n)
+
+            $e := world.restitutions[a]
+            if b >= 0 { e = math.max(e, world.restitutions[b]) }
+            $bounce_vn := 0.0
+            if v_pre_n < -0.25 {
+                bounce_vn = -e * v_pre_n
+            }
+            $dv_n := 0.0
+            if v_pre_n < -0.25 && e > 0.0 {
+                dv_n = bounce_vn - vn
+            } else {
+                allowed_vn := math.max(v_pre_n, bounce_vn)
+                if vn > allowed_vn {
+                    dv_n = allowed_vn - vn
+                } else if vn < 0.0 {
+                    dv_n = -vn
+                }
+            }
+            $wn := 0.0
+            if ima > 0.0 { wn += ima + world.rotational_gen_mass(a, ra.cross(n)) }
+            if imb > 0.0 { wn += imb + world.rotational_gen_mass(b, rb.cross(n)) }
+            if math.abs(dv_n) > 1e-8 && wn > 1e-18 {
+                j_imp := n.scaled(dv_n / wn)
+                world.apply_velocity_impulse(a, ra, j_imp)
+                if b >= 0 { world.apply_velocity_impulse(b, rb, j_imp.scaled(-1.0)) }
+            }
+
+            // Apply physically scaled Coulomb tangential friction on the first velocity pass.
+            if iter_v == 0 && wn > 1e-18 {
+                $pair_cnt := 0
+                for j in 0:cl.a.len {
+                    if cl.a[j] == a && cl.b[j] == b { pair_cnt += 1 }
+                }
+                if pair_cnt < 1 { pair_cnt = 1 }
+                jn_mag := math.max(0.0, (vn + dv_n - v_pre_n) / wn) / f64(pair_cnt)
+                va_after := world.contact_point_velocity(a, ra, &world.lin_vels, &world.ang_vels)
+                vb_after := world.contact_point_velocity(b, rb, &world.lin_vels, &world.ang_vels)
+                v_after := va_after.sub(vb_after)
+                vt := v_after.sub(n.scaled(v_after.dot(n)))
+                vt_len := vt.length()
+                if vt_len > 1e-6 && jn_mag > 0.0 {
+                    $mu := world.frictions[a]
+                    if b >= 0 { mu = math.sqrt(mu * world.frictions[b]) }
+                    t_dir := vt.scaled(1.0 / vt_len)
+                    $wt := 0.0
+                    if ima > 0.0 { wt += ima + world.rotational_gen_mass(a, ra.cross(t_dir)) }
+                    if imb > 0.0 { wt += imb + world.rotational_gen_mass(b, rb.cross(t_dir)) }
+                    if wt > 1e-18 {
+                        req_jt := vt_len / wt
+                        jt_mag := math.min(req_jt, mu * jn_mag)
+                        j_t := t_dir.scaled(-jt_mag)
+                        world.apply_velocity_impulse(a, ra, j_t)
+                        if b >= 0 { world.apply_velocity_impulse(b, rb, j_t.scaled(-1.0)) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn (world $&JointedWorld3D) solve_hinge_motor_velocities(h f64) {
+    for ji in 0:world.joints.len {
+        j := &world.joints[ji]
+        if j.kind != JOINT_HINGE || !j.motor_enabled || j.motor_has_target_angle { -> }
+        ha_raw := q_rotate(world.orientations[j.a], j.axis_a)
+        hl := ha_raw.length()
+        if hl <= 1e-12 { -> }
+        ha := ha_raw.scaled(1.0 / hl)
+        wa_dot := world.ang_vels[j.a].dot(ha)
+        wb_dot := world.ang_vels[j.b].dot(ha)
+        dv := j.motor_target_vel - (wb_dot - wa_dot)
+        wsum := world.rotational_gen_mass(j.a, ha) + world.rotational_gen_mass(j.b, ha)
+        if wsum <= 1e-18 { -> }
+        max_imp := j.motor_max_impulse * h
+        $d_imp := dv / wsum
+        if d_imp > max_imp { d_imp = max_imp }
+        if d_imp < -max_imp { d_imp = -max_imp }
+        if math.abs(d_imp) <= 1e-12 { -> }
+        imp_vec := ha.scaled(d_imp)
+        if world.inv_mass[j.a] > 0.0 {
+            loc_a := q_rotate_inv(world.orientations[j.a], imp_vec.scaled(-1.0))
+            world.ang_vels[j.a] = world.ang_vels[j.a].add(
+                q_rotate(world.orientations[j.a], vec3_hadamard(loc_a, world.inv_inertia[j.a]))
+            )
+        }
+        if world.inv_mass[j.b] > 0.0 {
+            loc_b := q_rotate_inv(world.orientations[j.b], imp_vec)
+            world.ang_vels[j.b] = world.ang_vels[j.b].add(
+                q_rotate(world.orientations[j.b], vec3_hadamard(loc_b, world.inv_inertia[j.b]))
+            )
+        }
+    }
+}
+
+fn (world $&JointedWorld3D) solve_all_static_geometry(
+    inv_h2 f64,
+    cl $&ContactList3D
+) int {
+    has_boxes := world.static_boxes.len > 0
+    has_tris := world.static_triangles.len > 0
+    if !has_boxes && !has_tris { << 0 }
+    for i in 0:world.positions.len {
+        if world.inv_mass[i] <= 0.0 { -> }
+        bb := world.body_world_aabb(i) >>>
+        if has_boxes {
+            hits := world.box_bvh.query_aabb(bb, &world.static_boxes)
+            for bi in hits {
+                if (world.masks[i] & world.static_box_layers[bi]) != 0 {
+                    world.solve_static_box_corners(i, world.static_boxes[bi], inv_h2, cl)
+                }
+            }
+        }
+        if has_tris {
+            thits := world.tri_bvh.query_aabb(bb, &world.tri_bounds)
+            for ti in thits {
+                tri := world.static_triangles[ti]
+                if (world.masks[i] & tri.layer) != 0 {
+                    _ := world.solve_static_triangle(i, tri, inv_h2, cl) >>>
+                }
+            }
+        }
+    }
+    << 0
+}
+
+fn (world &JointedWorld3D) pair_connected_no_collide(a int, b int) bool {
+    for ji in 0:world.joints.len {
+        j := &world.joints[ji]
+        if j.collide_connected { -> }
+        if (j.a == a && j.b == b) || (j.a == b && j.b == a) {
+            << true
+        }
+    }
+    << false
+}
+
+fn (world &JointedWorld3D) collect_dynamic_candidates() []int {
+    $pairs := []int{}
+    n := world.positions.len
+    if n < 2 { << pairs }
+    pad := fm.vec3(0.05, 0.05, 0.05)
+    for a in 0:n {
+        bb := world.body_world_aabb(a) >>>
+        qbox := fm.Aabb3{minimum: bb.minimum.sub(pad), maximum: bb.maximum.add(pad)}
+        hits := world.dyn_bvh.query_aabb(qbox) >>>
+        for b in hits {
+            if b <= a { -> }
+            if world.inv_mass[a] <= 0.0 && world.inv_mass[b] <= 0.0 { -> }
+            if (world.layers[a] & world.masks[b]) == 0 || (world.layers[b] & world.masks[a]) == 0 { -> }
+            if world.pair_connected_no_collide(a, b) { -> }
+            pairs.push(a)
+            pairs.push(b)
+        }
+    }
+    << pairs
+}
+
+pub fn (world $&JointedWorld3D) step(dt f64, substeps int, solver_iters int) int {
+    if !fm.finite(dt) || dt <= 0.0 || dt > 0.25 || substeps < 1 || substeps > 64 || solver_iters < 1 || solver_iters > 32 {
+        >>> errors.new("nexus joints: invalid dt, substeps or solver_iters")
+    }
+    n := world.positions.len
+    if n == 0 { << 0 }
+    h := dt / f64(substeps)
+    inv_h2 := 1.0 / (h * h)
+    lin_damp := math.max(0.0, 1.0 - world.linear_damping * h)
+    ang_damp := math.max(0.0, 1.0 - world.angular_damping * h)
+
+    // Pre-resolve any initial/spawn static overlaps purely positionally so (pos - prev_pos)/h never explodes.
+    if world.static_boxes.len > 0 || world.static_triangles.len > 0 {
+        $dummy_cl := new_contact_list_3d()
+        for _ in 0:4 {
+            world.solve_all_static_geometry(inv_h2, $&dummy_cl) >>>
+            for ji in 0:world.joints.len {
+                world.solve_joint(world.joints[ji], inv_h2)
+            }
+        }
+        world.solve_all_static_geometry(inv_h2, $&dummy_cl) >>>
+    }
+
+    for _ in 0:substeps {
+        $pre_lin := []fm.Vec3{}
+        $pre_ang := []fm.Vec3{}
+        for i in 0:n {
+            world.prev_positions[i] = world.positions[i]
+            world.prev_orientations[i] = world.orientations[i]
+            if world.inv_mass[i] > 0.0 {
+                world.lin_vels[i] = world.lin_vels[i].add(world.gravity.scaled(h)).scaled(lin_damp)
+                world.ang_vels[i] = world.ang_vels[i].scaled(ang_damp)
+                world.positions[i] = world.positions[i].add(world.lin_vels[i].scaled(h))
+                world.orientations[i] = q_integrate(world.orientations[i], world.ang_vels[i].scaled(h))
+            }
+            bb := world.body_world_aabb(i) >>>
+            pid := world.proxy_ids[i]
+            disp := world.positions[i].sub(world.prev_positions[i])
+            bvh := $&world.dyn_bvh
+            _ := bvh.move_proxy(pid, bb, disp) >>>
+            pre_lin.push(world.lin_vels[i])
+            pre_ang.push(world.ang_vels[i])
+        }
+
+        dyn_pairs := world.collect_dynamic_candidates() >>>
+        pair_count := dyn_pairs.len / 2
+        $cl := new_contact_list_3d()
+        for _ in 0:solver_iters {
+            for ji in 0:world.joints.len {
+                j := world.joints[ji]
+                world.solve_joint(j, inv_h2)
+            }
+            for pi in 0:pair_count {
+                _ := world.solve_dynamic_obb_pair(dyn_pairs[pi * 2], dyn_pairs[pi * 2 + 1], inv_h2, $&cl) >>>
+            }
+            world.solve_all_static_geometry(inv_h2, $&cl) >>>
+        }
+
+        for i in 0:n {
+            if world.inv_mass[i] > 0.0 {
+                world.lin_vels[i] = world.positions[i].sub(world.prev_positions[i]).scaled(1.0 / h)
+                dq := q_mul(world.orientations[i], q_conj(world.prev_orientations[i]))
+                $s := 2.0 / h
+                if dq.w < 0.0 { s = -s }
+                world.ang_vels[i] = fm.vec3(dq.x * s, dq.y * s, dq.z * s)
+            }
+            bb := world.body_world_aabb(i) >>>
+            pid := world.proxy_ids[i]
+            disp := world.positions[i].sub(world.prev_positions[i])
+            bvh := $&world.dyn_bvh
+            _ := bvh.move_proxy(pid, bb, disp) >>>
+        }
+        world.solve_hinge_motor_velocities(h)
+        if cl.a.len > 0 {
+            world.solve_contact_velocities(&cl, &pre_lin, &pre_ang)
+        }
+    }
+    << n
+}
+
+pub fn (world $&JointedWorld3D) apply_impulse_at_point(id int, impulse fm.Vec3, world_point fm.Vec3) int {
+    if id < 0 || id >= world.positions.len || !impulse.is_finite() || !valid_point(world_point) {
+        >>> errors.new("nexus joints: invalid body impulse parameters")
+    }
+    if world.inv_mass[id] <= 0.0 { << 0 }
+    r := world_point.sub(world.positions[id])
+    world.apply_velocity_impulse(id, r, impulse)
+    << 1
+}
+
+fn ray_intersect_obb(
+    origin fm.Vec3,
+    dir fm.Vec3,
+    max_dist f64,
+    pos fm.Vec3,
+    q fm.Quaternion,
+    he fm.Vec3
+) BodyRayHit3D {
+    lo := q_rotate_inv(q, origin.sub(pos))
+    ld := q_rotate_inv(q, dir)
+    o_c := [lo.x, lo.y, lo.z]
+    d_c := [ld.x, ld.y, ld.z]
+    h_c := [he.x, he.y, he.z]
+    $tmin := 0.0
+    $tmax := max_dist
+    $hit_axis := -1
+    $hit_sign := 0.0
+    for k in 0:3 {
+        if math.abs(d_c[k]) <= 1e-12 {
+            if o_c[k] < -h_c[k] || o_c[k] > h_c[k] {
+                << BodyRayHit3D{body_id: -1, distance: max_dist, point: origin, normal: fm.vec3(0.0, 0.0, 0.0)}
+            }
+        } else {
+            inv_d := 1.0 / d_c[k]
+            $t1 := (-h_c[k] - o_c[k]) * inv_d
+            $t2 := (h_c[k] - o_c[k]) * inv_d
+            $sgn := -1.0
+            if t1 > t2 {
+                tmp := t1
+                t1 = t2
+                t2 = tmp
+                sgn = 1.0
+            }
+            if t1 > tmin {
+                tmin = t1
+                hit_axis = k
+                hit_sign = sgn
+            }
+            if t2 < tmax { tmax = t2 }
+            if tmin > tmax {
+                << BodyRayHit3D{body_id: -1, distance: max_dist, point: origin, normal: fm.vec3(0.0, 0.0, 0.0)}
+            }
+        }
+    }
+    if tmin < 0.0 || tmin > max_dist {
+        << BodyRayHit3D{body_id: -1, distance: max_dist, point: origin, normal: fm.vec3(0.0, 0.0, 0.0)}
+    }
+    $local_n := fm.vec3(0.0, 1.0, 0.0)
+    if hit_axis == 0 {
+        local_n = fm.vec3(hit_sign, 0.0, 0.0)
+    } else if hit_axis == 1 {
+        local_n = fm.vec3(0.0, hit_sign, 0.0)
+    } else if hit_axis == 2 {
+        local_n = fm.vec3(0.0, 0.0, hit_sign)
+    }
+    wn := q_rotate(q, local_n)
+    << BodyRayHit3D{body_id: 0, distance: tmin, point: origin.add(dir.scaled(tmin)), normal: wn}
+}
+
+pub fn (world &JointedWorld3D) raycast_bodies(origin fm.Vec3, dir fm.Vec3, max_dist f64) BodyRayHit3D {
+    if !valid_point(origin) || !dir.is_finite() || !fm.finite(max_dist) || max_dist <= 0.0 {
+        >>> errors.new("nexus joints: invalid raycast parameters")
+    }
+    ndir := dir.normalized() >>>
+    motion := ndir.scaled(max_dist)
+    cands := world.dyn_bvh.query_ray(origin, motion) >>>
+    $best := BodyRayHit3D{body_id: -1, distance: max_dist, point: origin.add(motion), normal: fm.vec3(0.0, 0.0, 0.0)}
+    for id in cands {
+        h := ray_intersect_obb(origin, ndir, best.distance, world.positions[id], world.orientations[id], world.half_extents[id])
+        if h.body_id >= 0 && h.distance < best.distance {
+            best = BodyRayHit3D{body_id: id, distance: h.distance, point: h.point, normal: h.normal}
+        }
+    }
+    << best
+}
+
+pub fn (world &JointedWorld3D) position(id int) fm.Vec3 {
+    if id < 0 || id >= world.positions.len { >>> errors.new("nexus joints: invalid body id") }
+    << world.positions[id]
+}
+
+pub fn (world &JointedWorld3D) orientation(id int) fm.Quaternion {
+    if id < 0 || id >= world.orientations.len { >>> errors.new("nexus joints: invalid body id") }
+    << world.orientations[id]
+}
+
+pub fn (world &JointedWorld3D) linear_velocity(id int) fm.Vec3 {
+    if id < 0 || id >= world.lin_vels.len { >>> errors.new("nexus joints: invalid body id") }
+    << world.lin_vels[id]
+}
+
+pub fn (world &JointedWorld3D) angular_velocity(id int) fm.Vec3 {
+    if id < 0 || id >= world.ang_vels.len { >>> errors.new("nexus joints: invalid body id") }
+    << world.ang_vels[id]
+}
+
+pub fn (world &JointedWorld3D) hinge_angle(ji int) f64 {
+    if ji < 0 || ji >= world.joints.len || world.joints[ji].kind != JOINT_HINGE {
+        >>> errors.new("nexus joints: invalid hinge joint id")
+    }
+    hs := world.eval_hinge_state(&world.joints[ji])
+    if !hs.valid { << 0.0 }
+    << hs.angle
+}
+
+pub fn (world &JointedWorld3D) transform_matrix(id int) fm.Mat4 {
+    p := world.position(id) >>>
+    q := world.orientation(id) >>>
+    r := q.rotation_matrix() >>>
+    << fm.Mat4{c0: r.c0, c1: r.c1, c2: r.c2, c3: fm.vec4(p.x, p.y, p.z, 1.0)}
+}
+
+pub fn (world &JointedWorld3D) joint_anchor_error(ji int) f64 {
+    if ji < 0 || ji >= world.joints.len { >>> errors.new("nexus joints: invalid joint id") }
+    j := &world.joints[ji]
+    pa := world.positions[j.a].add(q_rotate(world.orientations[j.a], j.anchor_a))
+    pb := world.positions[j.b].add(q_rotate(world.orientations[j.b], j.anchor_b))
+    << pa.sub(pb).length()
+}
+
+pub fn (world &JointedWorld3D) query_bodies_ray(origin fm.Vec3, motion fm.Vec3) []int {
+    << world.dyn_bvh.query_ray(origin, motion) >>>
+}
+
+pub fn (world &JointedWorld3D) query_bodies_aabb(box fm.Aabb3) []int {
+    << world.dyn_bvh.query_aabb(box) >>>
+}
+
+pub fn (world &JointedWorld3D) dynamic_bvh_height() int {
+    << world.dyn_bvh.tree_height()
+}
+
+pub fn (world &JointedWorld3D) body_count() int { << world.positions.len }
+pub fn (world &JointedWorld3D) joint_count() int { << world.joints.len }

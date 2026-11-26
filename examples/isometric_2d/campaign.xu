@@ -1,0 +1,62 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+files #"github.com/xulang-org/nexus/internal/file_snapshot"
+resource #"github.com/xulang-org/nexus/resources/scene"
+nexus #"github.com/xulang-org/nexus/scene"
+#encoding/json
+#errors
+#os
+#path/filepath
+#strings
+
+struct Gate {
+    map_name string
+    position fm.Vec2
+}
+
+fn map_name_valid(name &string) bool {
+    if name.len < 9 || name.len > 72 || !strings.ends_with(name, ".xuscene") { << false }
+    for i in 0:(name.len - 8) {
+        c := name[i]
+        alpha_num := (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+        if !alpha_num && (i == 0 || (c != 45 && c != 95)) { << false }
+    }
+    << true
+}
+
+fn map_path(directory &string, name &string) string {
+    if !map_name_valid(name) { >>> errors.new("Isometric: invalid map name") }
+    << filepath.join([*directory, *name])
+}
+
+fn map_exists(path &string) bool {
+    info := os.stat(*path) >>> (err) { << false }
+    << !info.is_dir
+}
+
+fn checkpoint_map(path &string) string {
+    raw := files.read(*path, 1024) >>> (err) { << "" }
+    data := json.parse_max(&raw, 1024)
+    if !data.ok() || !data.is_dict(data.root()) { << "" }
+    value := data.get(data.root(), "map")
+    if value < 0 { << "" }
+    name := data.as_string(value) >>> (err) { << "" }
+    if !map_name_valid(&name) { << "" }
+    << name
+}
+
+fn scene_gates(document &resource.Document, tree &nexus.SceneTree, instance int, directory &string) []Gate {
+    $gates := []Gate{}
+    for i in 1:document.node_count() {
+        node := document.describe_node(i) >>>
+        if node.parent != 0 || node.kind != resource.NODE_2D || !strings.has_prefix(&node.name, "Exit_") { -> }
+        target := strings.trim_prefix(&node.name, "Exit_") + ".xuscene"
+        path := map_path(directory, &target) >>>
+        if !map_exists(&path) { >>> errors.new("Isometric: missing exit map " + target) }
+        id := tree.find_node(instance, node.name + "") >>>
+        pose := tree.global_transform(id) >>>
+        gates.push(Gate{map_name: target, position: fm.vec2(pose.tx, pose.ty)})
+    }
+    << gates
+}

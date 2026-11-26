@@ -25,7 +25,7 @@
 涉及 WebGL 时还须用 Node.js 运行 `make miniprogram-test douyin-test webgl-3d-test`，并记录对应开发者工具或真机的验证结果。
 平台支持结论须有对应系统的真实 GPU 证据。
 
-`assets/design/xu-ui-tokens.json` 是 XUUI Design System `0.1.1-dev.4` 的 MIT 许可原始令牌。Tk 工作区通过 `tools/editor_theme.py` 使用 Light（Paper）配色、字体与尺寸，原生视口的 `EDITOR_*` 颜色也取自同一份令牌。编辑器测试会核对工作区主色、视口令牌和最窄窗口布局。 [设计令牌来源](https://github.com/xulang-org/xu-ui-design/blob/3203d371d0add6320ebc2c1e0e2c6b9b65388908/tokens/tokens.json)
+`assets/design/xu-ui-tokens.json` 是 XUUI Design System `0.1.1-dev.4` 的 MIT 许可原始令牌。原生 XUUI 场景编辑器（`cmd/project_editor/theme.xu`）使用 Light（Paper）配色、字体与尺寸，原生视口的 `EDITOR_*` 颜色也取自同一份令牌。编辑器测试会核对工作区主色、视口令牌和最窄窗口布局。 [设计令牌来源](https://github.com/xulang-org/xu-ui-design/blob/3203d371d0add6320ebc2c1e0e2c6b9b65388908/tokens/tokens.json)
 本机测试、研发文档、日志、缓存、截图和编译产物保持忽略，不提交。
 
 原生桥接只能负责 ABI、平台事件与 GPU/音频设备、资源和数据传输；场景、输入动作、变换、碰撞、

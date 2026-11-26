@@ -1,0 +1,374 @@
+@"github.com/xulang-org/nexus/networking"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub struct PlayerInputCmd {
+    pub seq int
+    pub tick int
+    pub move_x f64
+    pub move_z f64
+    pub yaw f64
+    pub jump bool
+    pub sprint bool
+    pub dt f64
+}
+
+pub struct PredictedBodyState {
+    pub position fm.Vec3
+    pub velocity fm.Vec3
+    pub grounded bool
+    pub yaw f64
+}
+
+pub fn default_player_input(seq int, tick int, dt f64) PlayerInputCmd {
+    << PlayerInputCmd{
+        seq: seq,
+        tick: tick,
+        move_x: 0.0,
+        move_z: 0.0,
+        yaw: 0.0,
+        jump: false,
+        sprint: false,
+        dt: dt
+    }
+}
+
+pub fn initial_body_state(pos fm.Vec3, yaw f64) PredictedBodyState {
+    << PredictedBodyState{
+        position: pos,
+        velocity: fm.vec3(0.0, 0.0, 0.0),
+        grounded: true,
+        yaw: yaw
+    }
+}
+
+pub fn write_input_cmd(bw $&BitWriter, cmd &PlayerInputCmd) int {
+    bw.write_u32(cmd.seq) >>>
+    bw.write_u32(cmd.tick) >>>
+    bw.write_quantized_f64(cmd.move_x, -1.0, 1.0, 8) >>>
+    bw.write_quantized_f64(cmd.move_z, -1.0, 1.0, 8) >>>
+    bw.write_angle_rad(cmd.yaw, 12) >>>
+    bw.write_bool(cmd.jump) >>>
+    bw.write_bool(cmd.sprint) >>>
+    << bw.write_quantized_f64(cmd.dt, 0.0, 0.1, 10) >>>
+}
+
+pub fn read_input_cmd(br $&BitReader) PlayerInputCmd {
+    seq := br.read_u32() >>>
+    tick := br.read_u32() >>>
+    mx := br.read_quantized_f64(-1.0, 1.0, 8) >>>
+    mz := br.read_quantized_f64(-1.0, 1.0, 8) >>>
+    yaw := br.read_angle_rad(12) >>>
+    jump := br.read_bool() >>>
+    sprint := br.read_bool() >>>
+    dt := br.read_quantized_f64(0.0, 0.1, 10) >>>
+    << PlayerInputCmd{
+        seq: seq,
+        tick: tick,
+        move_x: mx,
+        move_z: mz,
+        yaw: yaw,
+        jump: jump,
+        sprint: sprint,
+        dt: dt
+    }
+}
+
+pub fn encode_input_cmd(cmd &PlayerInputCmd) []u8 {
+    $bw := new_bit_writer()
+    write_input_cmd($&bw, cmd) >>>
+    << bw.finish()
+}
+
+pub fn decode_input_cmd(raw &[]u8) PlayerInputCmd {
+    $br := new_bit_reader(raw)
+    << read_input_cmd($&br) >>>
+}
+
+fn clamp_f_net(v f64, lo f64, hi f64) f64 {
+    if v < lo { << lo }
+    if v > hi { << hi }
+    << v
+}
+
+pub fn simulate_player_tick(state PredictedBodyState, cmd &PlayerInputCmd) PredictedBodyState {
+    dt := clamp_f_net(cmd.dt, 0.0, 0.1)
+    $mx := clamp_f_net(cmd.move_x, -1.0, 1.0)
+    $mz := clamp_f_net(cmd.move_z, -1.0, 1.0)
+    mlen := math.sqrt(mx * mx + mz * mz)
+    if mlen > 1.0 {
+        mx /= mlen
+        mz /= mlen
+    }
+
+    $speed := 5.5
+    if cmd.sprint { speed = 9.0 }
+
+    $vx := mx * speed
+    $vz := mz * speed
+    $vy := state.velocity.y
+    $grounded := state.grounded
+
+    if grounded && cmd.jump {
+        vy = 7.2
+        grounded = false
+    }
+    vy -= 18.0 * dt
+
+    $nx := clamp_f_net(state.position.x + vx * dt, -500.0, 500.0)
+    $ny := state.position.y + vy * dt
+    $nz := clamp_f_net(state.position.z + vz * dt, -500.0, 500.0)
+    if ny <= 0.0 {
+        ny = 0.0
+        if vy < 0.0 { vy = 0.0 }
+        grounded = true
+    } else {
+        grounded = false
+    }
+
+    << PredictedBodyState{
+        position: fm.vec3(nx, ny, nz),
+        velocity: fm.vec3(vx, vy, vz),
+        grounded: grounded,
+        yaw: wrap_angle_rad(cmd.yaw)
+    }
+}
+
+// --- Client-Side Prediction + Authoritative Server Reconciliation ---
+pub struct ReconcileReport {
+    pub error_distance f64
+    pub snapped bool
+    pub replayed_inputs int
+    pub remaining_pending int
+}
+
+pub struct ClientPredictor {
+    current PredictedBodyState
+    pending []PlayerInputCmd
+    visual_error fm.Vec3
+    last_ack_seq int
+}
+
+pub fn new_client_predictor(initial PredictedBodyState) ClientPredictor {
+    << ClientPredictor{
+        current: initial,
+        pending: []PlayerInputCmd{},
+        visual_error: fm.vec3(0.0, 0.0, 0.0),
+        last_ack_seq: 0
+    }
+}
+
+pub fn (cp $&ClientPredictor) record_and_predict(cmd PlayerInputCmd) PredictedBodyState {
+    cp.pending.push(cmd)
+    if cp.pending.len > 128 {
+        $trimmed := []PlayerInputCmd{}
+        for i in (cp.pending.len - 128):cp.pending.len {
+            trimmed.push(cp.pending[i])
+        }
+        cp.pending = trimmed
+    }
+    cp.current = simulate_player_tick(cp.current, &cmd)
+    << cp.current
+}
+
+pub fn (cp $&ClientPredictor) reconcile(
+    auth_state PredictedBodyState,
+    ack_input_seq int,
+    snap_threshold f64
+) ReconcileReport {
+    if ack_input_seq > cp.last_ack_seq {
+        cp.last_ack_seq = ack_input_seq
+    }
+    $kept := []PlayerInputCmd{}
+    for i in 0:cp.pending.len {
+        if cp.pending[i].seq > cp.last_ack_seq {
+            kept.push(cp.pending[i])
+        }
+    }
+    cp.pending = kept
+
+    old_pos := cp.current.position
+    $replayed := auth_state
+    for i in 0:cp.pending.len {
+        c := &cp.pending[i]
+        replayed = simulate_player_tick(replayed, c)
+    }
+
+    err_vec := old_pos.sub(replayed.position)
+    err_dist := err_vec.length()
+    $snapped := false
+    if err_dist > snap_threshold {
+        snapped = true
+        cp.visual_error = fm.vec3(0.0, 0.0, 0.0)
+    } else if err_dist > 0.002 {
+        cp.visual_error = cp.visual_error.add(err_vec)
+    }
+    cp.current = replayed
+
+    << ReconcileReport{
+        error_distance: err_dist,
+        snapped: snapped,
+        replayed_inputs: cp.pending.len,
+        remaining_pending: cp.pending.len
+    }
+}
+
+pub fn (cp $&ClientPredictor) advance_visual_smoothing(dt f64) fm.Vec3 {
+    if dt > 0.0 {
+        decay := math.exp(-16.0 * dt)
+        cp.visual_error = cp.visual_error.scaled(decay)
+        if cp.visual_error.length() < 0.0005 {
+            cp.visual_error = fm.vec3(0.0, 0.0, 0.0)
+        }
+    }
+    << cp.current.position.add(cp.visual_error)
+}
+
+pub fn (cp &ClientPredictor) state() PredictedBodyState { << cp.current }
+pub fn (cp &ClientPredictor) pending_count() int { << cp.pending.len }
+
+// --- Remote Entity Interpolation (Cubic Hermite + Shortest-Arc Yaw + Bounded Extrapolation) ---
+pub struct InterpSample {
+    pub tick int
+    pub time_s f64
+    pub position fm.Vec3
+    pub velocity fm.Vec3
+    pub yaw f64
+    pub pitch f64
+}
+
+pub struct InterpResult {
+    pub valid bool
+    pub extrapolated bool
+    pub position fm.Vec3
+    pub yaw f64
+    pub pitch f64
+}
+
+pub struct EntityInterpolator {
+    interp_delay_s f64
+    max_extrap_s f64
+    samples []InterpSample
+}
+
+pub fn new_entity_interpolator(interp_delay_s f64, max_extrap_s f64) EntityInterpolator {
+    if !fm.finite(interp_delay_s) || interp_delay_s < 0.0 ||
+        !fm.finite(max_extrap_s) || max_extrap_s < 0.0 {
+        >>> errors.new("nexus net: invalid EntityInterpolator timings")
+    }
+    << EntityInterpolator{
+        interp_delay_s: interp_delay_s,
+        max_extrap_s: max_extrap_s,
+        samples: []InterpSample{}
+    }
+}
+
+pub fn lerp_angle_shortest(a f64, b f64, t f64) f64 {
+    diff := wrap_angle_rad(b - a)
+    << wrap_angle_rad(a + diff * t)
+}
+
+pub fn (ei $&EntityInterpolator) push_sample(sample InterpSample) {
+    if ei.samples.len > 0 {
+        li := ei.samples.len - 1
+        last := &ei.samples[li]
+        if sample.tick <= last.tick && sample.time_s <= last.time_s {
+            <<
+        }
+    }
+    ei.samples.push(sample)
+    if ei.samples.len > 32 {
+        $trimmed := []InterpSample{}
+        for i in (ei.samples.len - 32):ei.samples.len {
+            trimmed.push(ei.samples[i])
+        }
+        ei.samples = trimmed
+    }
+}
+
+pub fn (ei &EntityInterpolator) sample_count() int { << ei.samples.len }
+
+pub fn (ei &EntityInterpolator) sample(client_time_s f64) InterpResult {
+    n := ei.samples.len
+    if n == 0 {
+        << InterpResult{
+            valid: false,
+            extrapolated: false,
+            position: fm.vec3(0.0, 0.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0
+        }
+    }
+    render_t := client_time_s - ei.interp_delay_s
+    first := &ei.samples[0]
+    if n == 1 || render_t <= first.time_s {
+        << InterpResult{
+            valid: true,
+            extrapolated: false,
+            position: first.position,
+            yaw: wrap_angle_rad(first.yaw),
+            pitch: wrap_angle_rad(first.pitch)
+        }
+    }
+
+    li := n - 1
+    last := &ei.samples[li]
+    if render_t >= last.time_s {
+        $ext_dt := render_t - last.time_s
+        if ext_dt > ei.max_extrap_s { ext_dt = ei.max_extrap_s }
+        pos := last.position.add(last.velocity.scaled(ext_dt))
+        << InterpResult{
+            valid: true,
+            extrapolated: ext_dt > 0.0001,
+            position: pos,
+            yaw: wrap_angle_rad(last.yaw),
+            pitch: wrap_angle_rad(last.pitch)
+        }
+    }
+
+    // Find bracket [i, i+1] where s0.time_s <= render_t <= s1.time_s.
+    $idx := 0
+    for i in 0:(n - 1) {
+        if ei.samples[i + 1].time_s >= render_t {
+            idx = i
+            <-
+        }
+    }
+    ni := idx + 1
+    s0 := &ei.samples[idx]
+    s1 := &ei.samples[ni]
+    span := s1.time_s - s0.time_s
+    if span <= 1e-6 {
+        << InterpResult{
+            valid: true,
+            extrapolated: false,
+            position: s1.position,
+            yaw: wrap_angle_rad(s1.yaw),
+            pitch: wrap_angle_rad(s1.pitch)
+        }
+    }
+
+    t := clamp_f_net((render_t - s0.time_s) / span, 0.0, 1.0)
+    t2 := t * t
+    t3 := t2 * t
+    h00 := 2.0 * t3 - 3.0 * t2 + 1.0
+    h10 := t3 - 2.0 * t2 + t
+    h01 := -2.0 * t3 + 3.0 * t2
+    h11 := t3 - t2
+
+    m0 := s0.velocity.scaled(span)
+    m1 := s1.velocity.scaled(span)
+    pos := s0.position.scaled(h00).add(m0.scaled(h10)).add(s1.position.scaled(h01)).add(m1.scaled(h11))
+    yaw := lerp_angle_shortest(s0.yaw, s1.yaw, t)
+    pitch := lerp_angle_shortest(s0.pitch, s1.pitch, t)
+
+    << InterpResult{
+        valid: true,
+        extrapolated: false,
+        position: pos,
+        yaw: yaw,
+        pitch: pitch
+    }
+}

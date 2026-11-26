@@ -1,0 +1,622 @@
+@"github.com/xulang-org/nexus/rendering/three_d"
+
+#gpu
+layout #gpu/layout
+#encoding/binary
+#errors
+#math
+fm #"github.com/xulang-org/nexus/foundation/math"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+
+pub const MAX_FOLIAGE_INSTANCES = 65536
+
+pub struct FoliageProgram3D {
+    pub format int
+    pub entrypoint string
+    pub cull_compute []u8
+    pub vertex []u8
+    pub fragment []u8
+}
+
+pub fn empty_foliage_program_3d() FoliageProgram3D {
+    << FoliageProgram3D{
+        format: 0,
+        entrypoint: "",
+        cull_compute: []u8{},
+        vertex: []u8{},
+        fragment: []u8{}
+    }
+}
+
+pub struct FoliageInstance3D {
+    pub position fm.Vec3
+    pub yaw f64
+    pub scale f64
+    pub height_scale f64
+    pub bend_phase f64
+    pub tint fm.Vec3
+    pub variation f64
+}
+
+pub struct FoliageWindConfig3D {
+    pub direction_x f64
+    pub direction_z f64
+    pub strength f64
+    pub time f64
+    pub frequency f64
+    pub spatial_frequency f64
+    pub gust_strength f64
+    pub gust_frequency f64
+    pub stiffness f64
+}
+
+pub fn default_foliage_wind_3d() FoliageWindConfig3D {
+    << FoliageWindConfig3D{
+        direction_x: 1.0,
+        direction_z: 0.35,
+        strength: 0.25,
+        time: 0.0,
+        frequency: 2.2,
+        spatial_frequency: 0.45,
+        gust_strength: 0.12,
+        gust_frequency: 0.85,
+        stiffness: 1.0
+    }
+}
+
+pub fn (w &FoliageWindConfig3D) validate() int {
+    if !fm.finite(w.direction_x) || !fm.finite(w.direction_z) ||
+        w.direction_x * w.direction_x + w.direction_z * w.direction_z <= 1e-12 {
+        >>> errors.new("nexus foliage 3D: wind direction must be non-zero finite XZ")
+    }
+    if !fm.finite(w.strength) || w.strength < 0.0 || w.strength > 10.0 ||
+        !fm.finite(w.time) || !fm.finite(w.frequency) || w.frequency < 0.0 ||
+        !fm.finite(w.spatial_frequency) || w.spatial_frequency < 0.0 ||
+        !fm.finite(w.gust_strength) || w.gust_strength < 0.0 ||
+        !fm.finite(w.gust_frequency) || w.gust_frequency < 0.0 ||
+        !fm.finite(w.stiffness) || w.stiffness < 0.25 || w.stiffness > 16.0 {
+        >>> errors.new("nexus foliage 3D: invalid wind configuration")
+    }
+    << 0
+}
+
+pub struct FoliageMaterial3D {
+    pub base_tint fm.Vec3
+    pub tip_tint fm.Vec3
+    pub roughness f64
+    pub translucency f64
+    pub alpha_cutoff f64
+    pub root_ao f64
+    pub dither_fade bool
+    pub texture TextureRef3D
+}
+
+pub fn default_foliage_material_3d() FoliageMaterial3D {
+    << FoliageMaterial3D{
+        base_tint: fm.vec3(0.75, 0.82, 0.65),
+        tip_tint: fm.vec3(1.15, 1.25, 0.85),
+        roughness: 0.72,
+        translucency: 0.85,
+        alpha_cutoff: 0.0,
+        root_ao: 0.45,
+        dither_fade: true,
+        texture: no_texture()
+    }
+}
+
+pub fn (mat &FoliageMaterial3D) validate(device &Device3D) int {
+    if !mat.base_tint.is_finite() || mat.base_tint.x < 0.0 || mat.base_tint.y < 0.0 || mat.base_tint.z < 0.0 ||
+        !mat.tip_tint.is_finite() || mat.tip_tint.x < 0.0 || mat.tip_tint.y < 0.0 || mat.tip_tint.z < 0.0 {
+        >>> errors.new("nexus foliage 3D: non-finite or negative tint color")
+    }
+    if !fm.finite(mat.roughness) || mat.roughness < 0.045 || mat.roughness > 1.0 ||
+        !fm.finite(mat.translucency) || mat.translucency < 0.0 || mat.translucency > 8.0 ||
+        !fm.finite(mat.alpha_cutoff) || mat.alpha_cutoff < 0.0 || mat.alpha_cutoff > 1.0 ||
+        !fm.finite(mat.root_ao) || mat.root_ao < 0.0 || mat.root_ao > 1.0 {
+        >>> errors.new("nexus foliage 3D: invalid material scalars")
+    }
+    if mat.texture.present {
+        dev := device.gpu_device() >>>
+        dev_ref := dev.reference()
+        dev_ref.validate_texture(mat.texture.image) >>>
+        dev_ref.validate_sampler(mat.texture.sampler) >>>
+    }
+    << 0
+}
+
+pub struct FoliageCullStats3D {
+    pub total int
+    pub visible int
+    pub frustum_culled int
+    pub distance_culled int
+}
+
+pub struct GpuFoliageBatch3D {
+    owner DeviceRef3D
+    compute []gpu.ComputePipeline
+    pipelines []gpu.GraphicsPipeline // [0]=HDR MRT (CULL_NONE), [1]=Device3D (CULL_NONE)
+    // [0]=VB, [1]=IB, [2]=instances(48B*N), [3]=visible_indices(4B*N), [4]=indirect_state(32B), [5]=dummy_probe(64B)
+    buffers []gpu.Buffer
+    count int
+    index_count int
+    bound_radius f64
+    bound_half_y f64
+    inv_mesh_height f64
+    last_fade_start f64
+    last_max_dist f64
+    culled bool
+    closed bool
+}
+
+fn push_fol_word(dst $&[]int, val f64) int {
+    w := scalar_word(val) >>>
+    dst.push(w)
+    << 0
+}
+
+pub fn (device &Device3D) foliage_batch(
+    program &FoliageProgram3D,
+    mesh &meshes.MeshData3D,
+    instances &[]FoliageInstance3D
+) GpuFoliageBatch3D {
+    device.alive() >>>
+    if device.active { >>> errors.new("nexus foliage 3D: create GpuFoliageBatch3D outside a frame") }
+    if !device.is_gpu() { >>> errors.new("nexus foliage 3D: requires GPU backend") }
+    if instances.len < 1 || instances.len > MAX_FOLIAGE_INSTANCES {
+        >>> errors.new("nexus foliage 3D: instance count must be in 1..65536")
+    }
+    bounds := mesh.bounds() >>>
+    dev := device.gpu_device() >>>
+    if (dev.shader_formats() & program.format) == 0 || program.entrypoint.len == 0 ||
+        program.cull_compute.len == 0 || program.vertex.len == 0 || program.fragment.len == 0 {
+        >>> errors.new("nexus foliage 3D: invalid or unsupported foliage shader program")
+    }
+
+    vb_len := mesh.vertices.len * 64
+    ib_len := mesh.indices.len * 4
+    inst_len := instances.len * 48
+    vis_len := instances.len * 4
+    state_len := 32
+    probe_len := 64
+    total_bytes := vb_len + ib_len + inst_len + vis_len + state_len + probe_len
+
+    stats := dev.stats() >>>
+    if stats.buffer_count + 6 > 1024 || total_bytes > 67108864 - stats.buffer_bytes {
+        >>> errors.new("nexus foliage 3D: exceeds 1024-buffer or 64 MiB VRAM budget")
+    }
+
+    // Pack VB & IB
+    $vb_bytes := zero_bytes(vb_len)
+    $ib_bytes := zero_bytes(ib_len)
+    order := binary.little_endian()
+    for i in 0:mesh.vertices.len {
+        v := &mesh.vertices[i]
+        vals := [v.position.x, v.position.y, v.position.z, f64((v.color >> 24) & 255) / 255.0, f64((v.color >> 16) & 255) / 255.0, f64((v.color >> 8) & 255) / 255.0, f64(v.color & 255) / 255.0, v.normal.x, v.normal.y, v.normal.z, v.uv.x, v.uv.y, v.tangent.x, v.tangent.y, v.tangent.z, v.tangent.w]
+        for j in 0:16 { put_scalar($&vb_bytes, i * 64 + j * 4, vals[j]) >>> }
+    }
+    for i in 0:mesh.indices.len {
+        order.put_u32_bytes($&ib_bytes, i * 4, mesh.indices[i]) >>>
+    }
+
+    // Pack 48B FoliageInstanceGpu structs
+    $inst_words := []int{}
+    for i in 0:instances.len {
+        it := &instances[i]
+        if !it.position.is_finite() || !fm.finite(it.yaw) || !fm.finite(it.scale) || it.scale <= 0.0 ||
+            !fm.finite(it.height_scale) || it.height_scale <= 0.0 || !fm.finite(it.bend_phase) ||
+            !it.tint.is_finite() || !fm.finite(it.variation) {
+            >>> errors.new("nexus foliage 3D: invalid instance field")
+        }
+        cy := math.cos(it.yaw)
+        sy := math.sin(it.yaw)
+        push_fol_word($&inst_words, it.position.x) >>>
+        push_fol_word($&inst_words, it.position.y) >>>
+        push_fol_word($&inst_words, it.position.z) >>>
+        push_fol_word($&inst_words, it.scale) >>>
+        push_fol_word($&inst_words, cy) >>>
+        push_fol_word($&inst_words, sy) >>>
+        push_fol_word($&inst_words, it.bend_phase) >>>
+        push_fol_word($&inst_words, it.height_scale) >>>
+        push_fol_word($&inst_words, it.tint.x) >>>
+        push_fol_word($&inst_words, it.tint.y) >>>
+        push_fol_word($&inst_words, it.tint.z) >>>
+        push_fol_word($&inst_words, it.variation) >>>
+    }
+    inst_bytes := word_bytes(&inst_words) >>>
+
+    $vb := dev.buffer(vb_len, gpu.BUFFER_VERTEX) >>>
+    $ib := dev.buffer(ib_len, gpu.BUFFER_INDEX) >>>
+    $inst_buf := dev.buffer(inst_len, gpu.BUFFER_COMPUTE_STORAGE_READ | gpu.BUFFER_GRAPHICS_STORAGE_READ) >>>
+    $vis_buf := dev.buffer(vis_len, gpu.BUFFER_COMPUTE_STORAGE_WRITE | gpu.BUFFER_GRAPHICS_STORAGE_READ) >>>
+    $state_buf := dev.buffer(state_len, gpu.BUFFER_INDIRECT | gpu.BUFFER_COMPUTE_STORAGE_WRITE) >>>
+    $probe_buf := dev.buffer(probe_len, gpu.BUFFER_GRAPHICS_STORAGE_READ) >>>
+
+    $uv := dev.upload(&vb, 0, &vb_bytes) >>>
+    uv.close() >>>
+    $ui := dev.upload(&ib, 0, &ib_bytes) >>>
+    ui.close() >>>
+    $uin := dev.upload(&inst_buf, 0, &inst_bytes) >>>
+    uin.close() >>>
+    zeros := zero_bytes(probe_len)
+    $up := dev.upload(&probe_buf, 0, &zeros) >>>
+    up.close() >>>
+
+    cdesc := gpu.ComputeResourcesDesc{
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 0,
+        read_textures: 0,
+        read_buffers: 1,
+        write_textures: 0,
+        write_buffers: 2,
+        uniform_sizes: [112],
+        threads_x: 64,
+        threads_y: 1,
+        threads_z: 1
+    }
+    $cpipe := dev.compute_pipeline_with_resources(&cdesc, &program.cull_compute) >>>
+
+    vs_desc := gpu.ShaderResourcesDesc{
+        stage: gpu.VERTEX,
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 0,
+        storage_textures: 0,
+        storage_buffers: 2,
+        uniform_sizes: [192]
+    }
+    fs_desc := gpu.ShaderResourcesDesc{
+        stage: gpu.FRAGMENT,
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 1,
+        storage_textures: 0,
+        storage_buffers: 4,
+        uniform_sizes: [48, 80, 48]
+    }
+    $vs := dev.shader_with_resources(&vs_desc, &program.vertex) >>>
+    $fs := dev.shader_with_resources(&fs_desc, &program.fragment) >>>
+
+    $pdesc := mesh_pipeline()
+    pdesc.cull = gpu.CULL_NONE
+    mrt := [gpu.ColorTargetDesc{format: layout.RGBA16_FLOAT, blend: gpu.BLEND_DISABLED}, gpu.ColorTargetDesc{format: layout.RGBA16_FLOAT, blend: gpu.BLEND_DISABLED}]
+    $p_hdr := dev.graphics_pipeline_targets(&vs, &fs, &pdesc, &mrt) >>>
+    $p_dev := dev.graphics_pipeline(&vs, &fs, &pdesc) >>>
+    vs.close() >>>
+    fs.close() >>>
+
+    half_ext := bounds.maximum.sub(bounds.minimum).scaled(0.5)
+    b_radius := half_ext.length()
+    h_span := math.max(bounds.maximum.y - bounds.minimum.y, 0.05)
+
+    << GpuFoliageBatch3D{
+        owner: device.reference(),
+        compute: [cpipe],
+        pipelines: [p_hdr, p_dev],
+        buffers: [vb, ib, inst_buf, vis_buf, state_buf, probe_buf],
+        count: instances.len,
+        index_count: mesh.indices.len,
+        bound_radius: math.max(b_radius, 0.25),
+        bound_half_y: math.max(half_ext.y, 0.15),
+        inv_mesh_height: 1.0 / h_span,
+        last_fade_start: 50.0,
+        last_max_dist: 80.0,
+        culled: false,
+        closed: false
+    }
+}
+
+fn build_foliage_state_reset(index_count int) []u8 {
+    order := binary.little_endian()
+    $raw := zero_bytes(32)
+    order.put_u32_bytes($&raw, 0, index_count) >>>
+    << raw
+}
+
+fn build_foliage_cull_params(
+    batch &GpuFoliageBatch3D,
+    camera_pos fm.Vec3,
+    view_proj fm.Mat4,
+    fade_start f64,
+    max_dist f64
+) []u8 {
+    $words := []int{}
+    vp_w := matrix_words(view_proj) >>>
+    for w in vp_w { words.push(w) }
+    push_fol_word($&words, camera_pos.x) >>>
+    push_fol_word($&words, camera_pos.y) >>>
+    push_fol_word($&words, camera_pos.z) >>>
+    push_fol_word($&words, f64(batch.count)) >>>
+    push_fol_word($&words, max_dist) >>>
+    push_fol_word($&words, fade_start) >>>
+    push_fol_word($&words, batch.bound_radius) >>>
+    push_fol_word($&words, batch.bound_half_y) >>>
+    push_fol_word($&words, 0.35) >>>
+    push_fol_word($&words, 0.0) >>>
+    push_fol_word($&words, 0.0) >>>
+    push_fol_word($&words, 0.0) >>>
+    << word_bytes(&words) >>>
+}
+
+pub fn (batch $&GpuFoliageBatch3D) cull(
+    device &Device3D,
+    camera_pos fm.Vec3,
+    view_projection fm.Mat4,
+    fade_start f64,
+    max_draw_distance f64
+) int {
+    device.alive() >>>
+    if device.active { >>> errors.new("nexus foliage 3D: run cull outside a frame") }
+    if batch.closed || !batch.owner.matches(device) {
+        >>> errors.new("nexus foliage 3D: closed or foreign GpuFoliageBatch3D")
+    }
+    if !camera_pos.is_finite() || !view_projection.is_finite() ||
+        !fm.finite(fade_start) || fade_start < 0.0 ||
+        !fm.finite(max_draw_distance) || max_draw_distance <= 0.1 || fade_start > max_draw_distance {
+        >>> errors.new("nexus foliage 3D: invalid camera or draw distance parameters")
+    }
+
+    dev := device.gpu_device() >>>
+    reset_bytes := build_foliage_state_reset(batch.index_count) >>>
+    $up := dev.upload(&batch.buffers[4], 0, &reset_bytes) >>>
+    up.close() >>>
+
+    params := build_foliage_cull_params(batch, camera_pos, view_projection, fade_start, max_draw_distance) >>>
+    $enc := dev.command_encoder() >>>
+    tw_empty := []gpu.StorageTextureWrite{}
+    // CRITICAL: cycle=false preserves reset indirect command and compacts into visible_indices!
+    bw := [gpu.write_buffer(&batch.buffers[3], false), gpu.write_buffer(&batch.buffers[4], false)]
+    $pass := enc.begin_compute_with_resources(&tw_empty, &bw) >>>
+    pass.pipeline(&batch.compute[0]) >>>
+    pass.read_buffer(0, &batch.buffers[2]) >>>
+    pass.uniform(0, &params) >>>
+    groups := (batch.count + 63) / 64
+    pass.dispatch(groups, 1, 1) >>>
+    pass.end() >>>
+    $fence := enc.submit() >>>
+    fence.wait() >>>
+    fence.close() >>>
+
+    batch.last_fade_start = fade_start
+    batch.last_max_dist = max_draw_distance
+    batch.culled = true
+    << 0
+}
+
+pub fn (batch &GpuFoliageBatch3D) readback_stats(device &Device3D) FoliageCullStats3D {
+    device.alive() >>>
+    if device.active { >>> errors.new("nexus foliage 3D: readback_stats must run outside a frame") }
+    if batch.closed || !batch.culled || !batch.owner.matches(device) {
+        >>> errors.new("nexus foliage 3D: closed, unculled or foreign GpuFoliageBatch3D")
+    }
+    dev := device.gpu_device() >>>
+    $rb := dev.download(&batch.buffers[4], 0, 32) >>>
+    rb.wait() >>>
+    $raw := zero_bytes(32)
+    rb.read($&raw) >>>
+    rb.close() >>>
+    order := binary.little_endian()
+    vis := order.get_u32_bytes(&raw, 4) >>>
+    f_culled := order.get_u32_bytes(&raw, 20) >>>
+    d_culled := order.get_u32_bytes(&raw, 24) >>>
+    << FoliageCullStats3D{
+        total: batch.count,
+        visible: vis,
+        frustum_culled: f_culled,
+        distance_culled: d_culled
+    }
+}
+
+fn build_foliage_vert_bytes(
+    batch &GpuFoliageBatch3D,
+    camera_pos fm.Vec3,
+    view fm.Mat4,
+    view_proj fm.Mat4,
+    wind &FoliageWindConfig3D
+) []u8 {
+    $words := []int{}
+    vp_w := matrix_words(view_proj) >>>
+    for w in vp_w { words.push(w) }
+    v_w := matrix_words(view) >>>
+    for w in v_w { words.push(w) }
+
+    push_fol_word($&words, wind.direction_x) >>>
+    push_fol_word($&words, wind.direction_z) >>>
+    push_fol_word($&words, wind.strength) >>>
+    push_fol_word($&words, wind.time) >>>
+
+    push_fol_word($&words, wind.frequency) >>>
+    push_fol_word($&words, wind.spatial_frequency) >>>
+    push_fol_word($&words, wind.gust_strength) >>>
+    push_fol_word($&words, wind.gust_frequency) >>>
+
+    push_fol_word($&words, camera_pos.x) >>>
+    push_fol_word($&words, camera_pos.y) >>>
+    push_fol_word($&words, camera_pos.z) >>>
+    push_fol_word($&words, batch.last_fade_start) >>>
+
+    push_fol_word($&words, batch.last_max_dist) >>>
+    push_fol_word($&words, batch.inv_mesh_height) >>>
+    push_fol_word($&words, wind.stiffness) >>>
+    push_fol_word($&words, 0.0) >>>
+    << word_bytes(&words) >>>
+}
+
+fn build_foliage_mat_bytes(mat &FoliageMaterial3D, out_mode f64) []u8 {
+    $words := []int{}
+    push_fol_word($&words, mat.base_tint.x) >>>
+    push_fol_word($&words, mat.base_tint.y) >>>
+    push_fol_word($&words, mat.base_tint.z) >>>
+    push_fol_word($&words, mat.roughness) >>>
+    push_fol_word($&words, mat.tip_tint.x) >>>
+    push_fol_word($&words, mat.tip_tint.y) >>>
+    push_fol_word($&words, mat.tip_tint.z) >>>
+    push_fol_word($&words, mat.translucency) >>>
+    $dither := 0.0
+    if mat.dither_fade { dither = 1.0 }
+    push_fol_word($&words, mat.alpha_cutoff) >>>
+    push_fol_word($&words, mat.root_ao) >>>
+    push_fol_word($&words, dither) >>>
+    push_fol_word($&words, out_mode) >>>
+    << word_bytes(&words) >>>
+}
+
+fn (batch &GpuFoliageBatch3D) record_draw(
+    device &Device3D,
+    pass $&gpu.RenderPass,
+    pipe_idx int,
+    clustered &ClusteredRenderer3D,
+    probe_buf &gpu.Buffer,
+    irr_bytes &[]u8,
+    light_bytes &[]u8,
+    vert_bytes &[]u8,
+    mat_bytes &[]u8,
+    mat &FoliageMaterial3D
+) int {
+    pass.pipeline(&batch.pipelines[pipe_idx]) >>>
+    pass.vertex_buffer(0, &batch.buffers[0], 0) >>>
+    pass.index_buffer(&batch.buffers[1], 0, gpu.INDEX32) >>>
+    pass.uniform(gpu.VERTEX, 0, vert_bytes) >>>
+    pass.storage_buffer(gpu.VERTEX, 0, &batch.buffers[2]) >>>
+    pass.storage_buffer(gpu.VERTEX, 1, &batch.buffers[3]) >>>
+    if mat.texture.present {
+        pass.sampler_ref(gpu.FRAGMENT, 0, mat.texture.image, mat.texture.sampler) >>>
+    } else {
+        pass.sampler(gpu.FRAGMENT, 0, &device.whites[0], &device.white_samplers[0]) >>>
+    }
+    pass.uniform(gpu.FRAGMENT, 0, mat_bytes) >>>
+    pass.uniform(gpu.FRAGMENT, 1, light_bytes) >>>
+    pass.uniform(gpu.FRAGMENT, 2, irr_bytes) >>>
+    pass.storage_buffer(gpu.FRAGMENT, 0, &clustered.buffers[0]) >>>
+    pass.storage_buffer(gpu.FRAGMENT, 1, &clustered.buffers[1]) >>>
+    pass.storage_buffer(gpu.FRAGMENT, 2, &clustered.buffers[2]) >>>
+    pass.storage_buffer(gpu.FRAGMENT, 3, probe_buf) >>>
+    pass.draw_indexed_indirect(&batch.buffers[4], 0, 1) >>>
+    << 0
+}
+
+pub fn (batch &GpuFoliageBatch3D) draw_into_hdr(
+    device &Device3D,
+    hdr $&HdrTarget3D,
+    clustered &ClusteredRenderer3D,
+    use_gi bool,
+    irr &IrradianceGpu3D,
+    gi_strength f64,
+    camera_pos fm.Vec3,
+    view fm.Mat4,
+    view_projection fm.Mat4,
+    wind &FoliageWindConfig3D,
+    mat &FoliageMaterial3D
+) int {
+    device.alive() >>>
+    if device.active { >>> errors.new("nexus foliage 3D: end Device3D frame before draw_into_hdr") }
+    if batch.closed || !batch.culled || !batch.owner.matches(device) {
+        >>> errors.new("nexus foliage 3D: closed, unculled or foreign GpuFoliageBatch3D")
+    }
+    if hdr.closed || hdr.active || !hdr.owner.matches(device) || hdr.textures.len < 3 {
+        >>> errors.new("nexus foliage 3D: invalid, closed or active HdrTarget3D")
+    }
+    if clustered.closed || !clustered.owner.matches(device) || !clustered.ready {
+        >>> errors.new("nexus foliage 3D: requires binned ClusteredRenderer3D")
+    }
+    if use_gi && (irr.closed || !irr.owner.matches(device)) {
+        >>> errors.new("nexus foliage 3D: closed or foreign irradiance grid")
+    }
+    if !camera_pos.is_finite() || !view.is_affine() || !view_projection.is_finite() {
+        >>> errors.new("nexus foliage 3D: invalid camera transform")
+    }
+    wind.validate() >>>
+    mat.validate(device) >>>
+
+    vert_bytes := build_foliage_vert_bytes(batch, camera_pos, view, view_projection, wind) >>>
+    mat_bytes := build_foliage_mat_bytes(mat, 0.0) >>>
+    light_bytes := clustered.lighting_uniform_bytes() >>>
+    irr_bytes := build_terrain_irr_bytes(use_gi, irr, gi_strength) >>>
+
+    dev := device.gpu_device() >>>
+    $enc := dev.command_encoder() >>>
+    c0 := gpu.ColorAttachment{view: hdr.textures[0].view(0) >>>, load: gpu.LOAD, store: gpu.STORE, clear: gpu.Color{r: 0.0, g: 0.0, b: 0.0, a: 0.0}}
+    c1 := gpu.ColorAttachment{view: hdr.textures[1].view(0) >>>, load: gpu.LOAD, store: gpu.STORE, clear: gpu.Color{r: 0.0, g: 0.0, b: 0.0, a: 0.0}}
+    cols := [c0, c1]
+    dep := gpu.depth_attachment(&hdr.textures[2], gpu.LOAD, gpu.STORE, 0.0)
+    $pass := enc.begin_render_targets(&cols, dep) >>>
+
+    $probe_buf := &batch.buffers[5]
+    if use_gi { probe_buf = &irr.buffers[0] }
+
+    batch.record_draw(
+        device, $&pass, 0, clustered, probe_buf, &irr_bytes, &light_bytes, &vert_bytes, &mat_bytes, mat
+    ) >>>
+
+    pass.end() >>>
+    $fence := enc.submit() >>>
+    fence.wait() >>>
+    fence.close() >>>
+    hdr.ready = true
+    << 0
+}
+
+pub fn (batch &GpuFoliageBatch3D) draw_into_device(
+    device $&Device3D,
+    clustered &ClusteredRenderer3D,
+    camera_pos fm.Vec3,
+    view fm.Mat4,
+    view_projection fm.Mat4,
+    wind &FoliageWindConfig3D,
+    mat &FoliageMaterial3D
+) int {
+    device.drawing() >>>
+    if batch.closed || !batch.culled || !batch.owner.matches(device) {
+        >>> errors.new("nexus foliage 3D: closed, unculled or foreign GpuFoliageBatch3D")
+    }
+    if clustered.closed || !clustered.owner.matches(device) || !clustered.ready {
+        >>> errors.new("nexus foliage 3D: requires binned ClusteredRenderer3D")
+    }
+    if !camera_pos.is_finite() || !view.is_affine() || !view_projection.is_finite() {
+        >>> errors.new("nexus foliage 3D: invalid camera transform")
+    }
+    wind.validate() >>>
+    mat.validate(device) >>>
+
+    vert_bytes := build_foliage_vert_bytes(batch, camera_pos, view, view_projection, wind) >>>
+    mat_bytes := build_foliage_mat_bytes(mat, 1.0) >>>
+    light_bytes := clustered.lighting_uniform_bytes() >>>
+    empty_irr := zero_bytes(48)
+
+    pass := $&device.passes[0]
+    batch.record_draw(
+        device, pass, 1, clustered, &batch.buffers[5], &empty_irr, &light_bytes, &vert_bytes, &mat_bytes, mat
+    ) >>>
+    device.cached = false
+    device.draw_count += 1
+    device.lit_draws += 1
+    << 0
+}
+
+pub fn (batch &GpuFoliageBatch3D) instance_count() int { << batch.count }
+
+pub fn (batch $&GpuFoliageBatch3D) close() int {
+    if batch.closed { << 0 }
+    for i in 0:batch.compute.len {
+        c := $&batch.compute[i]
+        c.close() >>>
+    }
+    for i in 0:batch.pipelines.len {
+        p := $&batch.pipelines[i]
+        p.close() >>>
+    }
+    for i in 0:batch.buffers.len {
+        b := $&batch.buffers[i]
+        b.close() >>>
+    }
+    batch.compute = []gpu.ComputePipeline{}
+    batch.pipelines = []gpu.GraphicsPipeline{}
+    batch.buffers = []gpu.Buffer{}
+    batch.culled = false
+    batch.closed = true
+    << 0
+}
+
+fn (batch $&GpuFoliageBatch3D) drop() {
+    batch.close() >>> (err) { << }
+}

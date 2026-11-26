@@ -1,0 +1,360 @@
+@"github.com/xulang-org/nexus/audio/mixer"
+
+#errors
+#math
+
+pub const DSP_FILTER_NONE = 0
+pub const DSP_FILTER_LOWPASS = 1
+pub const DSP_FILTER_HIGHPASS = 2
+pub const DSP_FILTER_BANDPASS = 3
+pub const MAX_DELAY_FRAMES = 96000
+
+struct BiquadState {
+    mode int
+    b0 f64
+    b1 f64
+    b2 f64
+    a1 f64
+    a2 f64
+    z1_l f64
+    z2_l f64
+    z1_r f64
+    z2_r f64
+}
+
+struct DelayState {
+    enabled bool
+    samples int
+    feedback f64
+    wet f64
+    cursor int
+    buf_l []f64
+    buf_r []f64
+}
+
+struct CombBank {
+    sizes []int
+    cursors []int
+    lp []f64
+    buf []f64
+    offsets []int
+}
+
+struct ReverbState {
+    enabled bool
+    feedback f64
+    damp f64
+    wet f64
+    comb_l CombBank
+    comb_r CombBank
+    ap_l CombBank
+    ap_r CombBank
+}
+
+struct BusDsp {
+    filter BiquadState
+    delay DelayState
+    reverb ReverbState
+    epoch int
+}
+
+fn empty_comb_bank() CombBank {
+    << CombBank{sizes: []int{}, cursors: []int{}, lp: []f64{}, buf: []f64{}, offsets: []int{}}
+}
+
+fn clone_comb_bank(src &CombBank) CombBank {
+    $sizes := []int{}
+    $cursors := []int{}
+    $offsets := []int{}
+    $lp := []f64{}
+    $buf := []f64{}
+    for v in src.sizes { sizes.push(v) }
+    for v in src.cursors { cursors.push(v) }
+    for v in src.offsets { offsets.push(v) }
+    for v in src.lp { lp.push(v) }
+    for v in src.buf { buf.push(v) }
+    << CombBank{sizes: sizes, cursors: cursors, lp: lp, buf: buf, offsets: offsets}
+}
+
+fn new_comb_bank(base_sizes &[]int, rate int, spread int) CombBank {
+    scale := f64(rate) / 44100.0
+    $sizes := []int{}
+    $cursors := []int{}
+    $offsets := []int{}
+    $lp := []f64{}
+    $total := 0
+    for s in base_sizes {
+        $n := int(math.round_to_even(f64(s + spread) * scale))
+        if n < 8 { n = 8 }
+        sizes.push(n)
+        cursors.push(0)
+        offsets.push(total)
+        lp.push(0.0)
+        total += n
+    }
+    $buf := []f64{}
+    for _ in 0:total { buf.push(0.0) }
+    << CombBank{sizes: sizes, cursors: cursors, lp: lp, buf: buf, offsets: offsets}
+}
+
+fn default_bus_dsp() BusDsp {
+    << BusDsp{
+        filter: BiquadState{mode: DSP_FILTER_NONE, b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0, z1_l: 0.0, z2_l: 0.0, z1_r: 0.0, z2_r: 0.0},
+        delay: DelayState{enabled: false, samples: 0, feedback: 0.0, wet: 0.0, cursor: 0, buf_l: []f64{}, buf_r: []f64{}},
+        reverb: ReverbState{enabled: false, feedback: 0.84, damp: 0.35, wet: 0.0,
+            comb_l: empty_comb_bank(), comb_r: empty_comb_bank(),
+            ap_l: empty_comb_bank(), ap_r: empty_comb_bank()},
+        epoch: 0
+    }
+}
+
+fn clone_bus_dsp(src &BusDsp) BusDsp {
+    $bl := []f64{}
+    $br := []f64{}
+    for v in src.delay.buf_l { bl.push(v) }
+    for v in src.delay.buf_r { br.push(v) }
+    << BusDsp{
+        filter: src.filter,
+        delay: DelayState{enabled: src.delay.enabled, samples: src.delay.samples, feedback: src.delay.feedback, wet: src.delay.wet, cursor: src.delay.cursor, buf_l: bl, buf_r: br},
+        reverb: ReverbState{
+            enabled: src.reverb.enabled, feedback: src.reverb.feedback, damp: src.reverb.damp, wet: src.reverb.wet,
+            comb_l: clone_comb_bank(&src.reverb.comb_l), comb_r: clone_comb_bank(&src.reverb.comb_r),
+            ap_l: clone_comb_bank(&src.reverb.ap_l), ap_r: clone_comb_bank(&src.reverb.ap_r)
+        },
+        epoch: src.epoch
+    }
+}
+
+fn (d &BusDsp) active() bool {
+    << d.filter.mode != DSP_FILTER_NONE || d.delay.enabled || d.reverb.enabled
+}
+
+fn (d &BusDsp) stamp() string {
+    << str(d.epoch) + ":" + str(d.filter.mode) + "," + str(flag(d.delay.enabled)) + "," + str(d.delay.cursor) + "," + str(flag(d.reverb.enabled))
+}
+
+fn make_biquad(mode int, rate int, cutoff_hz f64, q f64) BiquadState {
+    if math.is_nan(cutoff_hz) || math.is_inf(cutoff_hz) || math.is_nan(q) || math.is_inf(q) ||
+        cutoff_hz < 20.0 || cutoff_hz > f64(rate) * 0.45 || q < 0.1 || q > 20.0 {
+        >>> errors.new("nexus mixer: invalid filter cutoff frequency or resonance Q")
+    }
+    w0 := 6.283185307179586 * cutoff_hz / f64(rate)
+    cos_w := math.cos(w0)
+    alpha := math.sin(w0) / (2.0 * q)
+    a0 := 1.0 + alpha
+    $b0 := 0.0
+    $b1 := 0.0
+    $b2 := 0.0
+    if mode == DSP_FILTER_LOWPASS {
+        b0 = (1.0 - cos_w) * 0.5 / a0
+        b1 = (1.0 - cos_w) / a0
+        b2 = b0
+    } else if mode == DSP_FILTER_HIGHPASS {
+        b0 = (1.0 + cos_w) * 0.5 / a0
+        b1 = -(1.0 + cos_w) / a0
+        b2 = b0
+    } else if mode == DSP_FILTER_BANDPASS {
+        b0 = alpha / a0
+        b1 = 0.0
+        b2 = -alpha / a0
+    } else {
+        >>> errors.new("nexus mixer: unknown biquad filter mode")
+    }
+    a1 := (-2.0 * cos_w) / a0
+    a2 := (1.0 - alpha) / a0
+    << BiquadState{mode: mode, b0: b0, b1: b1, b2: b2, a1: a1, a2: a2, z1_l: 0.0, z2_l: 0.0, z1_r: 0.0, z2_r: 0.0}
+}
+
+fn comb_bank_tick(bank $&CombBank, input f64, fb f64, damp f64) f64 {
+    $sum := 0.0
+    for i in 0:bank.sizes.len {
+        idx := bank.offsets[i] + bank.cursors[i]
+        out := bank.buf[idx]
+        filt := out * (1.0 - damp) + bank.lp[i] * damp
+        bank.lp[i] = filt
+        bank.buf[idx] = input + filt * fb
+        $next_c := bank.cursors[i] + 1
+        if next_c >= bank.sizes[i] { next_c = 0 }
+        bank.cursors[i] = next_c
+        sum += out
+    }
+    << sum
+}
+
+fn allpass_bank_tick(bank $&CombBank, input f64) f64 {
+    $cur := input
+    for i in 0:bank.sizes.len {
+        idx := bank.offsets[i] + bank.cursors[i]
+        bufout := bank.buf[idx]
+        out := -cur + bufout
+        bank.buf[idx] = cur + bufout * 0.5
+        $next_c := bank.cursors[i] + 1
+        if next_c >= bank.sizes[i] { next_c = 0 }
+        bank.cursors[i] = next_c
+        cur = out
+    }
+    << cur
+}
+
+fn process_bus_dsp(dsp $&BusDsp, left $&[]f64, right $&[]f64, frames int) {
+    if dsp.filter.mode != DSP_FILTER_NONE {
+        f := $&dsp.filter
+        for i in 0:frames {
+            xl := left[i]
+            yl := f.b0 * xl + f.z1_l
+            f.z1_l = f.b1 * xl - f.a1 * yl + f.z2_l
+            f.z2_l = f.b2 * xl - f.a2 * yl
+            left[i] = yl
+
+            xr := right[i]
+            yr := f.b0 * xr + f.z1_r
+            f.z1_r = f.b1 * xr - f.a1 * yr + f.z2_r
+            f.z2_r = f.b2 * xr - f.a2 * yr
+            right[i] = yr
+        }
+    }
+    if dsp.delay.enabled && dsp.delay.samples > 0 {
+        d := $&dsp.delay
+        n := d.samples
+        fb := d.feedback
+        wet := d.wet
+        dry_mix := 1.0 - wet * 0.25
+        for i in 0:frames {
+            cur := d.cursor
+            dl := d.buf_l[cur]
+            dr := d.buf_r[cur]
+            xl := left[i]
+            xr := right[i]
+            d.buf_l[cur] = xl + dl * fb
+            d.buf_r[cur] = xr + dr * fb
+            $next_c := cur + 1
+            if next_c >= n { next_c = 0 }
+            d.cursor = next_c
+            left[i] = xl * dry_mix + dl * wet
+            right[i] = xr * dry_mix + dr * wet
+        }
+    }
+    if dsp.reverb.enabled {
+        rv := $&dsp.reverb
+        fb := rv.feedback
+        damp := rv.damp
+        wet := rv.wet
+        dry_mix := 1.0 - wet * 0.35
+        for i in 0:frames {
+            xl := left[i]
+            xr := right[i]
+            cl := comb_bank_tick($&rv.comb_l, xl * 0.15, fb, damp)
+            cr := comb_bank_tick($&rv.comb_r, xr * 0.15, fb, damp)
+            al := allpass_bank_tick($&rv.ap_l, cl)
+            ar := allpass_bank_tick($&rv.ap_r, cr)
+            left[i] = xl * dry_mix + al * wet
+            right[i] = xr * dry_mix + ar * wet
+        }
+    }
+}
+
+pub fn (mixer $&Mixer) enable_bus_lowpass(bus int, cutoff_hz f64, q f64) int {
+    mixer.bus_index(bus) >>>
+    flt := make_biquad(DSP_FILTER_LOWPASS, mixer.rate, cutoff_hz, q) >>>
+    mixer.buses[bus].dsp.filter = flt
+    mixer.buses[bus].dsp.epoch += 1
+    mixer.revision += 1
+    << 0
+}
+
+pub fn (mixer $&Mixer) enable_bus_highpass(bus int, cutoff_hz f64, q f64) int {
+    mixer.bus_index(bus) >>>
+    flt := make_biquad(DSP_FILTER_HIGHPASS, mixer.rate, cutoff_hz, q) >>>
+    mixer.buses[bus].dsp.filter = flt
+    mixer.buses[bus].dsp.epoch += 1
+    mixer.revision += 1
+    << 0
+}
+
+pub fn (mixer $&Mixer) enable_bus_bandpass(bus int, center_hz f64, q f64) int {
+    mixer.bus_index(bus) >>>
+    flt := make_biquad(DSP_FILTER_BANDPASS, mixer.rate, center_hz, q) >>>
+    mixer.buses[bus].dsp.filter = flt
+    mixer.buses[bus].dsp.epoch += 1
+    mixer.revision += 1
+    << 0
+}
+
+pub fn (mixer $&Mixer) disable_bus_filter(bus int) int {
+    mixer.bus_index(bus) >>>
+    mixer.buses[bus].dsp.filter = BiquadState{mode: DSP_FILTER_NONE, b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0, z1_l: 0.0, z2_l: 0.0, z1_r: 0.0, z2_r: 0.0}
+    mixer.buses[bus].dsp.epoch += 1
+    mixer.revision += 1
+    << 0
+}
+
+pub fn (mixer $&Mixer) enable_bus_delay(bus int, delay_seconds f64, feedback f64, wet f64) int {
+    mixer.bus_index(bus) >>>
+    if math.is_nan(delay_seconds) || math.is_inf(delay_seconds) || math.is_nan(feedback) || math.is_inf(feedback) ||
+        math.is_nan(wet) || math.is_inf(wet) || delay_seconds <= 0.0 || delay_seconds > 2.0 ||
+        feedback < 0.0 || feedback > 0.92 || wet < 0.0 || wet > 1.0 {
+        >>> errors.new("nexus mixer: invalid delay time, feedback or wet mix")
+    }
+    $n := int(math.round_to_even(delay_seconds * f64(mixer.rate)))
+    if n < 1 { n = 1 }
+    if n > MAX_DELAY_FRAMES { >>> errors.new("nexus mixer: delay buffer exceeds 96000 frames") }
+    $bl := []f64{}
+    $br := []f64{}
+    for _ in 0:n {
+        bl.push(0.0)
+        br.push(0.0)
+    }
+    mixer.buses[bus].dsp.delay = DelayState{enabled: true, samples: n, feedback: feedback, wet: wet, cursor: 0, buf_l: bl, buf_r: br}
+    mixer.buses[bus].dsp.epoch += 1
+    mixer.revision += 1
+    << 0
+}
+
+pub fn (mixer $&Mixer) disable_bus_delay(bus int) int {
+    mixer.bus_index(bus) >>>
+    mixer.buses[bus].dsp.delay = DelayState{enabled: false, samples: 0, feedback: 0.0, wet: 0.0, cursor: 0, buf_l: []f64{}, buf_r: []f64{}}
+    mixer.buses[bus].dsp.epoch += 1
+    mixer.revision += 1
+    << 0
+}
+
+pub fn (mixer $&Mixer) enable_bus_reverb(bus int, room_size f64, damping f64, wet f64) int {
+    mixer.bus_index(bus) >>>
+    if math.is_nan(room_size) || math.is_inf(room_size) || math.is_nan(damping) || math.is_inf(damping) ||
+        math.is_nan(wet) || math.is_inf(wet) || room_size < 0.05 || room_size > 0.95 ||
+        damping < 0.0 || damping > 1.0 || wet < 0.0 || wet > 1.0 {
+        >>> errors.new("nexus mixer: invalid reverb room, damping or wet mix")
+    }
+    comb_taps := [1557, 1617, 1491, 1422]
+    ap_taps := [556, 441]
+    fb := 0.70 + room_size * 0.25
+    mixer.buses[bus].dsp.reverb = ReverbState{
+        enabled: true,
+        feedback: fb,
+        damp: damping,
+        wet: wet,
+        comb_l: new_comb_bank(&comb_taps, mixer.rate, 0),
+        comb_r: new_comb_bank(&comb_taps, mixer.rate, 23),
+        ap_l: new_comb_bank(&ap_taps, mixer.rate, 0),
+        ap_r: new_comb_bank(&ap_taps, mixer.rate, 23)
+    }
+    mixer.buses[bus].dsp.epoch += 1
+    mixer.revision += 1
+    << 0
+}
+
+pub fn (mixer $&Mixer) disable_bus_reverb(bus int) int {
+    mixer.bus_index(bus) >>>
+    mixer.buses[bus].dsp.reverb = ReverbState{enabled: false, feedback: 0.84, damp: 0.35, wet: 0.0,
+        comb_l: empty_comb_bank(), comb_r: empty_comb_bank(), ap_l: empty_comb_bank(), ap_r: empty_comb_bank()}
+    mixer.buses[bus].dsp.epoch += 1
+    mixer.revision += 1
+    << 0
+}
+
+pub fn (mixer $&Mixer) clear_bus_dsp(bus int) int {
+    mixer.bus_index(bus) >>>
+    mixer.buses[bus].dsp = default_bus_dsp()
+    mixer.revision += 1
+    << 0
+}

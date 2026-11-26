@@ -1,0 +1,288 @@
+@main
+
+resource #"github.com/xulang-org/nexus/resources/scene"
+#ui
+#ui/draw
+#ui/layout
+widgets #ui/widgets
+#math
+#path/filepath
+#strconv
+#strings
+#time
+
+pub fn collect_glb_indices(project &Project) []int {
+    $out := []int{}
+    for i in 0:project.assets.len {
+        ext := strings.to_lower(&filepath.ext(&project.assets[i].path))
+        if ext == ".glb" {
+            out.push(i)
+        }
+    }
+    << out
+}
+
+pub fn make_process_labels(context &draw.Context, lang int) []widgets.StyledLabel {
+    $names := ["Proc: Inherit", "Proc: Pausable", "Proc: Always", "Proc: When Paused", "Proc: Disabled"]
+    if lang == LANG_ZH {
+        names = ["运行: 继承", "运行: 可暂停", "运行: 始终", "运行: 仅暂停", "运行: 禁用"]
+    }
+    $labels := []widgets.StyledLabel{}
+    for i in 0:names.len {
+        labels.push(widgets.styled_label(context, &names[i]))
+    }
+    << labels
+}
+
+pub fn make_surface_asset_labels(context &draw.Context, project &Project, glb_indices &[]int, zero_label string) []widgets.StyledLabel {
+    $labels := [widgets.styled_label(context, &zero_label)]
+    n := min_int_val(glb_indices.len, 63)
+    for i in 0:n {
+        idx := glb_indices[i]
+        b := filepath.base(&project.assets[idx].path)
+        labels.push(widgets.styled_label(context, &b))
+    }
+    << labels
+}
+
+pub fn asset_name_for_uid(project &Project, uid &string) string {
+    for i in 0:project.assets.len {
+        if project.assets[i].key == *uid {
+            << filepath.base(&project.assets[i].path)
+        }
+    }
+    << *uid
+}
+
+pub fn find_node_surface(doc &resource.Document, node_idx int) resource.Surface {
+    for i in 0:doc.surface_count() {
+        s := doc.surface(i) >>> (err) { << resource.surface(-1, "", 0) }
+        if s.node == node_idx {
+            << s
+        }
+    }
+    << resource.surface(-1, "", 0)
+}
+
+fn clone_surface_levels(src &[]resource.SurfaceLevel) []resource.SurfaceLevel {
+    $out := []resource.SurfaceLevel{}
+    for i in 0:src.len {
+        lv := &src[i]
+        out.push(resource.SurfaceLevel{
+            distance: lv.distance,
+            resource_uid: lv.resource_uid + "",
+            primitive: lv.primitive
+        })
+    }
+    << out
+}
+
+pub fn format_lod_summary(project &Project, surf &resource.Surface, lang int) string {
+    if surf.node < 0 {
+        << tr(lang, "LOD: bind a surface first", "LOD：请先绑定主表面")
+    }
+    if surf.levels.len == 0 {
+        << tr(lang, "LOD: 0 levels · hyst ", "LOD：0 级 · 滞后 ") + fmt_coord(surf.hysteresis)
+    }
+    $parts := []string{}
+    for i in 0:surf.levels.len {
+        lv := &surf.levels[i]
+        nm := asset_name_for_uid(project, &lv.resource_uid)
+        parts.push("L" + str(i + 1) + "@" + fmt_coord(lv.distance) + "=" + nm + "#" + str(lv.primitive))
+    }
+    << strings.join(parts, ", ") + tr(lang, " · hyst ", " · 滞后 ") + fmt_coord(surf.hysteresis)
+}
+
+pub fn sync_surface_inspector(ed $&Editor, doc &resource.Document, is_3d bool) {
+    $cur_surf := find_node_surface(doc, ed.selected_node)
+    has_glb := ed.glb_indices.len > 0
+    has_surf := cur_surf.node >= 0
+    has_lod := has_surf && cur_surf.levels.len > 0
+    set_sel_enabled($&ed.surf_asset_select, is_3d)
+    set_btn_enabled($&ed.surf_bind_btn, is_3d && has_glb)
+    set_btn_enabled($&ed.surf_clear_btn, is_3d && has_surf)
+    enable_field($&ed.surf_prim_field, is_3d)
+    enable_field($&ed.lod_hyst_field, is_3d && has_surf)
+    enable_field($&ed.lod_dist_field, is_3d && has_surf)
+    enable_field($&ed.lod_prim_field, is_3d && has_surf)
+    set_sel_enabled($&ed.lod_asset_select, is_3d && has_surf)
+    set_btn_enabled($&ed.lod_add_btn, is_3d && has_surf)
+    set_btn_enabled($&ed.lod_pop_btn, is_3d && has_lod)
+
+    if cur_surf.node >= 0 {
+        $sel_pos := 0
+        for i in 0:ed.glb_indices.len {
+            ai := ed.glb_indices[i]
+            if ed.project.assets[ai].key == cur_surf.resource_uid {
+                sel_pos = i + 1
+                <-
+            }
+        }
+        set_sel_selected($&ed.surf_asset_select, sel_pos)
+        set_field_val($&ed.surf_prim_field, &str(cur_surf.primitive))
+        set_field_val($&ed.lod_hyst_field, &fmt_coord(cur_surf.hysteresis))
+    } else {
+        set_sel_selected($&ed.surf_asset_select, 0)
+        set_field_val($&ed.surf_prim_field, &"0")
+        set_field_val($&ed.lod_hyst_field, &"0")
+    }
+    set_sel_selected($&ed.lod_asset_select, 0)
+    lod_txt := format_lod_summary(&ed.project, &cur_surf, ed.lang)
+    ed.lod_text = lod_txt + ""
+    set_text_val($&ed.lod_info_txt, &lod_txt)
+}
+
+pub fn (ed $&Editor) do_bind_surface(view $&widgets.View) {
+    sel_opt := ed.surf_asset_select.selected()
+    if sel_opt <= 0 {
+        ed.do_clear_surface(view)
+        <<
+    }
+    g_idx := sel_opt - 1
+    if g_idx < 0 || g_idx >= ed.glb_indices.len {
+        ed.set_status(STATUS_ERR, tr(ed.lang, "Select a GLB asset to bind", "请选择要绑定的 GLB 资源"), view)
+        <<
+    }
+    prim_txt := strings.trim_space(&ed.surf_prim_field.value())
+    prim := strconv.atoi(&prim_txt) >>> (err) {
+        ed.set_status(STATUS_ERR, tr(ed.lang, "Surface primitive must be a non-negative integer", "表面图元索引必须为非负整数"), view)
+        <<
+    }
+    if prim < 0 {
+        ed.set_status(STATUS_ERR, tr(ed.lang, "Surface primitive must be a non-negative integer", "表面图元索引必须为非负整数"), view)
+        <<
+    }
+    hyst_txt := strings.trim_space(&ed.lod_hyst_field.value())
+    $hyst := 0.0
+    if hyst_txt.len > 0 {
+        hyst = parse_f64_or(&hyst_txt, tr(ed.lang, "LOD hysteresis", "LOD 滞后")) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            <<
+        }
+    }
+    doc := ed.draft.document() >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        <<
+    }
+    cur_surf := find_node_surface(&doc, ed.selected_node)
+    cur_levels := clone_surface_levels(&cur_surf.levels)
+    uid := ed.project.assets[ed.glb_indices[g_idx]].key + ""
+    proj := clone_project(&ed.project)
+    sel_node := ed.selected_node
+    d := $&ed.draft
+    d.set_node_surface(&proj, sel_node, uid, prim, cur_levels, hyst) >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        <<
+    }
+    ed.refresh_after_document_change(false, view)
+    ed.set_status(STATUS_OK, tr(ed.lang, "Bound GLB surface (prim ", "已绑定 GLB 表面（图元 ") + str(prim) + tr(ed.lang, ")", "）"), view)
+}
+
+pub fn (ed $&Editor) do_clear_surface(view $&widgets.View) {
+    sel_node := ed.selected_node
+    d := $&ed.draft
+    d.clear_node_surface(sel_node) >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        <<
+    }
+    ed.refresh_after_document_change(false, view)
+    ed.set_status(STATUS_OK, tr(ed.lang, "Cleared GLB surface", "已清除 GLB 表面"), view)
+}
+
+pub fn (ed $&Editor) do_add_lod_level(view $&widgets.View) {
+    doc := ed.draft.document() >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        <<
+    }
+    $surf := find_node_surface(&doc, ed.selected_node)
+    if surf.node < 0 {
+        ed.set_status(STATUS_ERR, tr(ed.lang, "Bind a base GLB surface before adding LOD levels", "请先绑定主 GLB 表面后再添加 LOD 级别"), view)
+        <<
+    }
+    dist := parse_f64_or(&ed.lod_dist_field.value(), tr(ed.lang, "LOD distance", "LOD 距离")) >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        <<
+    }
+    lprim_txt := strings.trim_space(&ed.lod_prim_field.value())
+    lprim := strconv.atoi(&lprim_txt) >>> (err) {
+        ed.set_status(STATUS_ERR, tr(ed.lang, "LOD primitive must be a non-negative integer", "LOD 图元索引必须为非负整数"), view)
+        <<
+    }
+    $hyst := surf.hysteresis
+    hyst_txt := strings.trim_space(&ed.lod_hyst_field.value())
+    if hyst_txt.len > 0 {
+        hyst = parse_f64_or(&hyst_txt, tr(ed.lang, "LOD hysteresis", "LOD 滞后")) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            <<
+        }
+    }
+    $luid := surf.resource_uid + ""
+    lsel := ed.lod_asset_select.selected()
+    if lsel > 0 && (lsel - 1) < ed.glb_indices.len {
+        luid = ed.project.assets[ed.glb_indices[lsel - 1]].key + ""
+    }
+    $next_levels := clone_surface_levels(&surf.levels)
+    next_levels.push(resource.SurfaceLevel{
+        distance: dist,
+        resource_uid: luid,
+        primitive: lprim
+    })
+    proj := clone_project(&ed.project)
+    sel_node := ed.selected_node
+    base_uid := surf.resource_uid + ""
+    base_prim := surf.primitive
+    d := $&ed.draft
+    d.set_node_surface(&proj, sel_node, base_uid, base_prim, next_levels, hyst) >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        <<
+    }
+    ed.refresh_after_document_change(false, view)
+    ed.set_status(STATUS_OK, tr(ed.lang, "Added LOD level @ ", "已添加 LOD 级别 @ ") + fmt_coord(dist), view)
+}
+
+pub fn (ed $&Editor) do_pop_lod_level(view $&widgets.View) {
+    doc := ed.draft.document() >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        <<
+    }
+    surf := find_node_surface(&doc, ed.selected_node)
+    if surf.node < 0 || surf.levels.len == 0 {
+        ed.set_status(STATUS_ERR, tr(ed.lang, "No LOD level to remove", "没有可移除的 LOD 级别"), view)
+        <<
+    }
+    $next_levels := []resource.SurfaceLevel{}
+    for i in 0:(surf.levels.len - 1) {
+        lv := &surf.levels[i]
+        next_levels.push(resource.SurfaceLevel{
+            distance: lv.distance,
+            resource_uid: lv.resource_uid + "",
+            primitive: lv.primitive
+        })
+    }
+    proj := clone_project(&ed.project)
+    sel_node := ed.selected_node
+    base_uid := surf.resource_uid + ""
+    base_prim := surf.primitive
+    hyst := surf.hysteresis
+    d := $&ed.draft
+    d.set_node_surface(&proj, sel_node, base_uid, base_prim, next_levels, hyst) >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        <<
+    }
+    ed.refresh_after_document_change(false, view)
+    ed.set_status(STATUS_OK, tr(ed.lang, "Removed last LOD level", "已移除末级 LOD"), view)
+}
+
+pub fn update_insp_scroll_extent(ed $&Editor, view $&widgets.View) {
+    scb := view.node_bounds(ed.id_insp_scroll) >>> (err) { << }
+    tail := view.node_bounds(ed.comp.id_tilemap_row) >>> (err) { << }
+    cur_off := ed.insp_scroll.offset()
+    content_h := math.max(scb.height, (tail.y + tail.height + cur_off) - scb.y + 12.0)
+    st := ed.styles.clone()
+    sc := $&ed.insp_scroll
+    _ := sc.set_bounds(&layout.Rect{x: 0.0, y: 0.0, width: scb.width, height: scb.height}) >>> (err) { << }
+    _ := sc.set_content_extent(content_h) >>> (err) { << }
+    _ := sc.apply_styles(&st) >>> (err) { << }
+    scroll_y := ed.insp_scroll.offset()
+    _ := view.set_scroll(ed.id_insp_scroll, 0.0, scroll_y) >>> (err) { << }
+}

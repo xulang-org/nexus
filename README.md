@@ -3,44 +3,51 @@
 Nexus Engine 是独立的 Xu 游戏引擎库，模块为 `github.com/xulang-org/nexus`，当前开发版本 `0.1.1-dev.16`。
 场景树、可复用场景、变换、相机、图集动画、输入、时钟、碰撞、画布和精灵逻辑使用 Xu。
 3D 向量、矩阵、透视相机、网格构建、父子变换、材质参数和场景绘制同样使用 Xu。
-音频资源、重采样、声像、总线混音和节点播放状态也由 Xu 实现；设备提交使用独立音频 C ABI。
+音频资源、重采样、声像、IMA ADPCM（`0x0011`）编解码、每总线 DSP 效果架（RBJ Biquad 低通/高通/带通滤波、回声延迟与 Schroeder/Moorer 立体声混响）、总线混音和节点播放状态也由 Xu 实现；设备提交使用独立音频 C ABI。
 2D/3D 都通过 Xu 标准 `gpu` / `window` 管理设备、资源、绘制、事件和呈现；nexus 不再维护 GPU 原生桥接。
 
 参考 Godot 的 [Node / SceneTree](https://docs.godotengine.org/en/stable/tutorials/scripting/scene_tree.html)
 和 [Resource](https://docs.godotengine.org/en/stable/tutorials/scripting/resources.html) 分工。
 Xu 侧使用组合与显式生命周期通知，不依赖类继承。目前已有 2D 库、3D 节点/相机/网格场景、受限 GLB 静态几何与不透明 PBR 材质导入、受限 OBJ 和 ASCII/二进制 STL 静态网格导入，
-WAV/总线/声源的场景恢复，以及沿用 Xu 语法的开发态标量脚本 VM、保留状态热重载、脚本处理函数和延迟节点信号。
-GLB 已支持受限 TRS 动画采样、CPU 四权重线性蒙皮和相对路径 PNG，真实人物/动物/植物素材验收见下文。
-3D 已加入带法线/切线/UV 的金属度/粗糙度直接光材质、基础颜色/ORM/自发光/法线/独立 AO 纹理与 mipmap、单双面渲染、最多 256 个候选方向光/点光/聚光、每网格最多 16 源、场景光源绑定、自发光和曝光。
-3D 可选择 GPU 2× 超采样（四个源像素合成一个输出像素）和方向/聚光/点光 3×3 PCF 阴影及 2–4 级 CSM，图片已接通标准库的受限 baseline JPEG 解码。静态 GLB 项目支持增量重导入、基础场景编辑及原生预览；3D 物理已支持任意三角面碰撞、胶囊体扫掠与平移式动态刚体冲量求解。完整 glTF 材质/纹理、IBL、完整脚本类型/绑定/协程、生产更新分发、压缩音频/异步解码与 DSP、刚体转动/关节约束、用户材质着色器、GPU 粒子和计算纹理仍待实现。
+WAV/IMA ADPCM/总线 DSP/声源的场景恢复，以及沿用 Xu 语法的开发态零分配寄存器复用标量脚本 VM（`vm.Instance`）、保留状态热重载、脚本处理函数、延迟节点信号与 `script/aot`（`cmd/scriptc aot-c`）双轨 C99/Xu AOT 编译器（`AotBundle` / `DualTrackRunner`，支持指令预算、除零回滚与热重载无缝退回 VM）。
+GLB 已支持受限 TRS 动画采样、双动画剪辑 TRS/SLERP 姿态融合（`sample_blended_pose`）、GPU 计算着色器 3×4 仿射线性蒙皮（保留 CPU 蒙皮兼容路径）、保守骨骼包围体及相对路径 PNG，真实人物/动物/植物素材验收见下文。
+3D 已加入带法线/切线/UV 的金属度/粗糙度直接光材质、基础颜色/ORM/自发光/法线/独立 AO 纹理与 mipmap、单双面渲染、传统前向每网格 16 光源与新分簇前向着色（Clustered Forward `16×16×24`，最高 1024 动态光源）、Split-Sum GGX 环境光 IBL 烘焙（`EnvironmentIbl3D`：64×64 BRDF DFG LUT + 5 级预过滤环境贴图）、30-bit Morton 空间排序 Meshlet（`MeshletVisRenderer3D`：64 顶点/124 三角面簇 + 保守法线锥背面剔除 + Reverse-Z 7 级 `R32_FLOAT` Hi-Z 遮挡剔除 + `R32_UINT` Visibility Buffer 解耦计算着色，含解析屏幕空间重心/UV 梯度纹理采样与方向/级联阴影）、GPU `draw_indexed_indirect` 间接绘制、`RGBA16_FLOAT` 线性 HDR + L1 球谐 3D 辐照度探针网格（`IrradianceGrid3D`）、GTAO 环境光遮蔽（含双边滤波）、Hi-Z 加速屏幕空间反射（SSR）、多级 HDR Bloom、ACES Filmic 色调映射与 TAA 历史混合后处理管线，并由 `ModernPipeline3D`（`integration/rendering/three_d/modern_frame3d.xu`）统一串联静态 Meshlet VisBuffer、Split-Sum IBL 与 GPU 蒙皮网格单帧合成。
+3D 场景树与核心服务已加入脏标记拓扑 SoA 变换缓存（`SceneTree`）、静态三角面/AABB/斜坡 BVH、1D X-axis SAP 与增量式 SAH+AVL 平衡动态包围体树（`DynamicBvh3D`）、扩展位置动力学求解器（`XPBD`：15 轴动态 OBB 间互碰与静态三角面库仑摩擦/恢复求解、柔度距离/牵引约束、8×8 布料网格、刚体堆叠与 6 自由度四元数转动 `JointedWorld3D` 球铰链/摆锤/带伺服电机与限位铰链关节，配合 `SkeletonRagdoll3D` 与动画权重平滑融合并驱动 GPU 蒙皮骨骼布娃娃）、3D 导航网格与人群避障（`navigation`：斜率过滤、拓扑边缝合、`A*` 区域代价与 XZ Funnel 路径拉直 + RVO 互惠人群避障）、基于连续分块 SoA 与常驻协程工作池（`ecs.EcsWorkerPool`）的无锁并发 Archetype `ecs` 模块，以及后台解码 + 帧预算分片上传 + LRU 显存淘汰的异步资源流式管理器（`integration/streaming`）；可选择 GPU 2× 超采样（四个源像素合成一个输出像素）和方向/聚光/点光 3×3 PCF 阴影及 2–4 级 CSM，图片已接通标准库的受限 baseline JPEG 解码。静态 GLB 项目支持增量重导入、基础场景编辑及原生预览；3D 物理已支持任意三角面碰撞、胶囊体扫掠、动态刚体互碰摩擦、射线检测与伺服电机关节约束/布娃娃求解。完整 glTF PBR 材质扩展、完整脚本类型/协程、异步流式解码与生产更新分发以及 Vulkan/DXIL 新计算管线着色器（目前新增 `.msl` 计算/VisBuffer/IBL 着色器仅在 macOS arm64 / Metal 验证，本机未安装 `glslangValidator`/`glslc`/`dxc`/`spirv-cross`）仍待继续扩展。
 
-当前使用 Xu **0.13.1**（[官方发行标签 `v0.13.1`](https://github.com/xulang-org/xu/releases/tag/v0.13.1)）。该 SDK 包含 Phone game 对象对原生导入的支持，并随生成工程导出原生归档与 C 桥接。编译器、标准库、native/phone 工具必须来自同一 SDK。两个移动示例此前使用 Xu 0.12.7-dev.1 在 Sony XQ-BE72（Android 13）上运行，并完成 iOS 应用构建。iPhone 8（iOS 16.7.16）的真机结果来自 Xu 0.12.5 构建。
+当前使用 Xu **0.14.1**（基于官方 `origin/release/0.14.1` 并合入 Nexus 所需图形/计算存储缓冲区、计算采样器/读写存储纹理、`R32_UINT` 及 `draw_indexed_indirect` 等扩展的独立 worktree `../.worktrees/xu-0.14.1`，待上游合入）。该 SDK 包含 Phone game 对象对原生导入的支持，并随生成工程导出原生归档与 C 桥接。编译器、标准库、native/phone 工具必须来自同一 SDK。两个移动示例此前使用 Xu 0.12.7-dev.1 在 Sony XQ-BE72（Android 13）上运行，并完成 iOS 应用构建。iPhone 8（iOS 16.7.16）的真机结果来自 Xu 0.12.5 构建。
 
 ## 构建所需的 Xu SDK
 
-使用官方发布的 Xu **0.13.1** 工具链（或从对应提交 `d42741510be92c1f888a3e872b6b13867305a430` / 标签 `v0.13.1` 构建）：
+使用 Xu **0.14.1** 工具链（仓库内可直接复用基于 `origin/release/0.14.1` 自举构建的 `../.worktrees/xu-0.14.1` 或已配置对应扩展的 0.14.1 SDK）：
 
 ```sh
-# 1. 若已通过官方 0.13.1 安装包安装到 ~/.xu，先激活环境：
+# 1. 若已将带 Nexus 扩展的 0.14.1 SDK 安装到 ~/.xu 或设置 env，先激活环境：
 source ~/.xu/env.sh
 make sdk
 
-# 2. 或从固定标签 v0.13.1（macOS arm64）自举源码构建：
-git clone https://github.com/xulang-org/xu.git ../xu-nexus-sdk
-NEXUS_XU_SDK="$(cd ../xu-nexus-sdk && pwd)"
-(
-  cd "$NEXUS_XU_SDK" || exit
-  git fetch origin tag v0.13.1 &&
-    git checkout --detach v0.13.1 &&
-    python3 scripts/restore_product_seed.py --target macos-arm64 --version 0.12.6 --destination build/seed/xu &&
-    XU_SEED="$PWD/build/seed/xu" XU_SKIP_CROSS=1 make xu
-)
+# 2. 或从 xu 0.14.1 worktree 源码自举构建（macOS arm64）：
+NEXUS_XU_SDK="$(cd ../.worktrees/xu-0.14.1 && pwd)"
 export NEXUS_XU_SDK
-export XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" XU="$NEXUS_XU_SDK/bin/xu"
+export XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" XUPATH="$NEXUS_XU_SDK/src" XU="$NEXUS_XU_SDK/bin/xu"
 make sdk
 ```
 
-`make sdk` 应输出 `PASS: Xu SDK 0.13.1`。平台名可用 `python3 scripts/restore_product_seed.py --help` 查询。已有同一版本 SDK 时，直接设置上述环境变量或执行 `source /path/to/xu/env.sh` 即可。 [Xu SDK 源码](https://github.com/xulang-org/xu/tree/v0.13.1)
+`make sdk` 应输出 `PASS: Xu SDK 0.14.1`。已有同一版本 SDK 时，直接设置上述环境变量或执行 `source /path/to/xu/env.sh` 即可。
+
+核心引擎突破与专项测试目标：
+- `make scene-soa-test`：验证 `SceneTree` 拓扑序脏标记 SoA 全局变换缓存。
+- `make ecs-parallel-test`：验证 Archetype Chunk 分块 ECS 与常驻工作池 `EcsWorkerPool` 无锁并发调度。
+- `make script-aot-test`：验证 `script/aot`（`cmd/scriptc aot-c`）双轨 C99/Xu AOT 语义一致、指令预算/除零回滚与热重载 VM 回退。
+- `make physics3d-test`：含 `physics3d_bvh_sap_checks` 与 `physics3d_xpbd_checks`，验证 3D 静态 BVH、1D SAP 宽相碰撞及 XPBD 绳链/布料/刚体堆叠求解器。
+- `make physics3d-joints-ragdoll-test`：验证增量式 `DynamicBvh3D`、15-axis 动态 OBB 互碰/静态三角面摩擦求解、6-DOF `JointedWorld3D` 球铰链/伺服电机与限位铰链关节、`SkeletonRagdoll3D` GPU 蒙皮布娃娃坍塌与姿态混合（macOS Arm64 / Metal）。
+- `make navigation-test`：验证 3D 导航网格构建、斜率过滤、`A*` 区域寻路、XZ Funnel 路径拉直与 RVO 互惠人群避障。
+- `make audio-dsp-test`：验证 IMA ADPCM（`0x0011`）4:1 编解码、每总线 Biquad/Delay/Reverb 效果架与 glTF 双剪辑 TRS/SLERP 姿态融合。
+- `make gpu-skinning-test`：验证 GPU Compute 3×4 仿射线性蒙皮（含非一致缩放/负行列式反射与保守骨骼包围盒）。
+- `make clustered-lighting-gpu-test`：验证 `16×16×24` Clustered Forward Shading（打破 16/256 光源限制，单网格 513 光源实时着色）。
+- `make indirect-cull-hiz-gpu-test`：验证 GPU 视锥剔除 + 7 级 `R32_FLOAT` Hi-Z 遮挡剔除 + 单次 `draw_indexed_indirect` 间接绘制。
+- `make hdr-postprocess-gpu-test`：验证 `RGBA16_FLOAT` HDR MRT、3D `IrradianceGrid3D` SH 探针、GTAO 环境光遮蔽、Hi-Z SSR 反射、Bloom、ACES 与 TAA 后处理链路。
+- `make meshlet-visbuffer-gpu-test`：验证 Meshlet（64v/124t + 保守法线锥剔除 + Reverse-Z Hi-Z）+ Split-Sum IBL + `R32_UINT` Visibility Buffer（含解析屏幕空间 UV 梯度纹理采样与方向阴影）与 `ModernPipeline3D` 统一单帧渲染（macOS Arm64 / Metal）。
+- `make streaming-lru-gpu-test`：验证后台协程解码、优先级调度、每帧预算分片上传与 LRU 显存淘汰恢复。
 
 ## Phone 原生 2D / 3D 示例
 
@@ -52,7 +59,7 @@ make sdk
 - `examples/hd2d_scene`：浮动摇杆移动，左上角切换正交与透视镜头，右上角暂停。窄屏保留横向取景。画布 HUD 以输出分辨率合成，3D 内部分辨率最多 921,600 像素，单张阴影或单级级联最多 256×256。
 
 ```sh
-NEXUS_PHONE_SDK=/path/to/xu-0.13.1
+NEXUS_PHONE_SDK=/path/to/xu-0.14.1
 export XU_ROOT="$NEXUS_PHONE_SDK" XU_STDLIB_ROOT="$NEXUS_PHONE_SDK/src"
 python3 tools/build_phone.py --xu "$NEXUS_PHONE_SDK/bin/xu" \
   --example phone_arena --target ios-arm64 --sdl-source /path/to/SDL-3.4.14 \
@@ -118,7 +125,7 @@ make webgl-3d-test
 | --- | --- | --- |
 | 场景/对象 | 混合 2D/3D 树、变换、分组、生命周期、PackedScene、2D 相机与 3D 透视/正交镜头持久化、GLB/音频/脚本/光源/Sprite3D/TileMap2D 附件、方向光 CSM 与点光/聚光阴影配置、初始字段和稳定信号路由 | 实例覆盖、跨世界引用 |
 | 2D 渲染 | GPU 批次、精灵、PNG/图集、裁剪、透明、相机、位图/TrueType 文本、SDF 图元、正交/菱形等距/交错等距 TileMap、跨图集 Y 排序、视差和地面格拾取 | 2D 光照/阴影、粒子、画布特效 |
-| 2.5D 渲染 | 等距瓦片场景、HD-2D 图集精灵、3D 深度遮挡、方向光照与轮廓阴影、正交/透视切换 | 透明混合精灵、编辑器和移动端集成 |
+| 2.5D 渲染 | 等距瓦片场景、HD-2D 图集精灵、3D 深度遮挡、方向光照与轮廓阴影、正交/透视切换、瓦片编辑器、iOS 与 Android 原生运行 | 透明混合精灵、通用 2.5D 场景属性编辑 |
 | 标准 GPU | 独立设备/缓冲传输、纹理/mip、采样器、Shader、图形管线、深度/索引/实例化命令、离屏像素读回、缓冲区计算管线/dispatch、独立窗口/键鼠文本/多点触摸队列与 SDR Surface/Frame | 自绘 IME 候选/剪贴板/手柄、HDR 呈现、计算采样/纹理、间接 dispatch、立方体/3D 纹理、MRT/MSAA/存储绑定及其它高级渲染能力 |
 | 3D 渲染 | 网格/相机、Reverse-Z、法线/UV、程序网格切线生成、256 候选/每网格 16 源方向/点/聚光材质、范围/锥体剔除、场景网格视锥剔除、距离 LOD/滞回与场景保存、GPU 2× 超采样、方向/聚光/点光 3×3 PCF 阴影及 2–4 级 CSM、节点光源收集与持久化、五槽贴图、单双面、mipmap 与三线性采样 | glTF MikkTSpace 切线生成、IBL、HDR、后处理、MSAA/TAA/FXAA、屏幕误差 LOD/自动简化、级间渐变、遮挡剔除、分簇光照 |
 | 资源管线 | PNG/baseline JPEG、受限 GLB 几何/PBR/图片/采样器、受限 OBJ、ASCII/二进制 STL、实例共享、静态 GLB 项目 UID 与依赖索引、增量导入和多场景发布回滚 | 完整材质、更多模型格式、异步加载、更多项目资源类型、资源分包与运行时热替换 |
@@ -245,7 +252,7 @@ PNG 文件上传、最近邻/线性采样、透明混合、GPU 裁剪、有序�
 
 ## 运行
 
-需要 **Xu 0.13.1**、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
+需要 **Xu 0.14.1**、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
 默认通过 `pkg-config sdl3` 查找头文件；Windows 可显式传入包含 `SDL3/SDL.h` 的目录。
 桥接在运行时加载 SDL，不把 SDL 源码或二进制复制进本库。
 
@@ -298,13 +305,13 @@ make demo-glb-materials
 ./build/glb-materials --frames 120 --capture build/glb-materials.png
 ```
 
-`make sdk` 核对实际编译器版本。默认使用 PATH 中的 `xu`，也可用 `XU` 选择完整的 Xu 0.13.1 SDK。
+`make sdk` 核对实际编译器版本。默认使用 PATH 中的 `xu`，也可用 `XU` 选择完整的 Xu 0.14.1 SDK。
 修复内容属于编译器：解析 native 模块、校验归档/目标/ABI、生成 C 调用适配和链接，调用所选 SDK 的配套工具，
 并为资源所有者及资源数组生成自动析构。标准库新增 `gpu/layout` 统一纹理格式、mip 链、行 pitch 与 mip offset 的受检计算，UI 图片上传与引擎 2D/3D 纹理共用；标准 `gpu` 已提供无窗口设备、缓冲区与异步传输、fence/读回、纹理/采样器、Shader/Pipeline 和离屏 render pass，以及 compact `[]u8` 借用 ABI。标准窗口/呈现已补齐，2D/3D 均已迁移标准事件、资源和绘制命令；PBR、场景和游戏预算仍在引擎。
 完整 SDK 的编译器、标准库和包搜索路径必须一致：
 
 ```sh
-NEXUS_XU_SDK=/path/to/xu-0.13.1
+NEXUS_XU_SDK=/path/to/xu-0.14.1
 XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" \
 XUPATH="$NEXUS_XU_SDK/src:$NEXUS_XU_SDK/packages" XU="$NEXUS_XU_SDK/bin/xu" \
 make native-probe check test gpu-smoke smoke script-live-smoke
@@ -369,6 +376,42 @@ python3 tools/build_phone.py --example isometric_2d --target android-arm64 \
 ```
 
 加上 `--scene build/isometric-edit/world.xuscene` 可打包编辑后的场景。构建器校对 PNG 图集哈希，并保留 `.xuscene` 中的相对图集路径。改用 `--target ios-arm64` 生成 iOS 工程。`make phone-isometric-test` 从独立目录读取打包结构并验证竖屏控件、瓦片碰撞和存档。桌面可通过 `./build/isometric-2d --touch` 检查竖屏布局。
+
+应用退出时保存角色位置、镜头位置和暂停状态。Android 重建 Activity 后从同一场景的私有存档继续。场景更换或存档位置与实心瓦片重叠时，使用场景的初始状态。
+
+### 等距两图项目
+
+`examples/isometric_2d/project.json` 注册两张地图和共用图集。先把项目复制到可写目录，再从项目清单打开要改的场景。
+
+```sh
+make tilemap-editor isometric-2d project-validator
+mkdir -p build/isometric-campaign/assets
+cp -n examples/isometric_2d/project.json build/isometric-campaign/
+cp -n examples/isometric_2d/assets/* build/isometric-campaign/assets/
+./build/nexus-tilemap-editor --project build/isometric-campaign/project.json world.xuscene
+```
+
+第一张地图的青色菱形是出口。点击 **Move Exit**，再点击地图上的落点。移动出口和画瓦片共用撤销与重做历史。保存后重新发布，并从发布结果运行。
+
+```sh
+make project-cli project-validator
+./build/nexus-project build build/isometric-campaign/project.json --output build/isometric-published --validator build/nexus-project-validate
+./build/isometric-2d --campaign --scene "$(./build/nexus-project scene world.xuscene --output build/isometric-published)" \
+  --data build/isometric-campaign-save.json
+```
+
+角色走到 `Exit_grove` 节点附近会进入同一项目中的 `grove.xuscene`，以目标地图的角色和镜头初始位置开始。其他出口使用根节点下的 `Exit_<目标场景名去掉扩展名>` 型 Node2D。新地图出帧后原子写入关卡、角色和镜头存档。移动期间定期保存，松手或暂停时提交当次进度。`make isometric-campaign-test` 验证编辑出口、发布、过图，以及结束进程后恢复第二张地图。
+
+用同一份项目清单导出 Android。改用 `--target ios-arm64` 和独立输出目录可生成 iOS 工程。
+
+```sh
+python3 tools/build_phone.py --example isometric_2d --project build/isometric-campaign/project.json \
+  --target android-arm64 --sdl-source /path/to/SDL-3.4.14 --output build/isometric-campaign-android \
+  --bundle-id org.xulang.nexus.isometric.campaign
+./build/isometric-campaign-android/build.sh
+```
+
+`--entry` 可选择项目中的入口场景，默认 `world.xuscene`。导出校验出口目的地并将多个关卡的共用图集打包一次。
 
 ### Phone HD-2D 场景
 
@@ -729,7 +772,7 @@ scene.set_material(&tree, object, mapped) >>>
 | 粗糙度/金属度 | `max(0.045, material.roughness × G)` 与 `material.metallic × B`；贴图乘以原有材质参数 |
 | 遮蔽 | 有限 strength 0...1；`1 + strength × (R - 1)` 只调制现有漫反射环境项，不影响方向光或自发光。strength=0 不会关闭 G/B 的作用 |
 | 自发光 | `with_emission_texture`；采样 RGB × 线性 emission，不乘 base/顶点颜色；emission=0 时不发光 |
-| 颜色空间 | 基础颜色/自发光通常按 sRGB 上传，也允许显式线性图像；ORM 只接受线性。`texture.is_srgb() >>>` 可查询实际资源格式，关闭后报错 |
+| 颜色空间 | 基础颜色/自发光通常按 sRGB 上传，也允许显式线性图像；ORM 只接受线性。`texture.is_srgb() or >>` 可查询实际资源格式，关闭后报错 |
 | Alpha | 三个槽均忽略图片 alpha，输出仍不透明；没有新增透明/裁剪模式 |
 
 `has_base_texture` / `has_orm_texture` / `has_emission_texture` 与 `has_textures` 查询绑定。
@@ -776,7 +819,7 @@ CPU 构建统一从 `meshes #"github.com/xulang-org/nexus/resources/mesh"` 导�
 `Vertex3D`、`new_mesh_data_3d` 和 `sphere_mesh_3d`。渲染包只拥有上传后的 `Mesh3D` 设备资源。
 公开顶点和索引可编辑；`validate()` 检查数量/索引、有限坐标、单位法线/切线、UV/颜色和手性，上传前也会重新校验。
 
-程序网格可显式调用 `mesh.generate_tangents() >>>`，无需手填切线：
+程序网格可显式调用 `mesh.generate_tangents() or >>`，无需手填切线：
 
 ```xu
 meshes #"github.com/xulang-org/nexus/resources/mesh"
@@ -1197,12 +1240,12 @@ GLB 表面、音频、脚本和 2D/3D 相机可保存到场景文件，实例覆
 
 ## 项目资源索引与场景编辑
 
-`project.json` 使用 `format: "nexus.project"`、`version: 1`、`assets` 与 `scenes`。资产表把固定的 128 位 UID 映射到项目内 GLB 路径；场景表把输出文件名映射到项目内的 `.xuscene` 源文件。场景表面通过 UID 引用资产。新场景可以复用同一 UID。
+`project.json` 使用 `format: "nexus.project"`、`version: 1`、`assets` 与 `scenes`。资产表把固定的 128 位 UID 映射到项目内 GLB 或 PNG 路径。场景表把输出文件名映射到项目内的 `.xuscene` 源文件。网格表面、瓦片和 Sprite3D 图集可通过 UID 引用资产。多个场景可以复用同一 UID。
 
 ```sh
-make project-validator project-preview
-python3 tools/project.py build examples/scene_assets/project.json --output build/project-gallery
-./build/nexus-project-preview --scene "$(python3 tools/project.py scene gallery.xuscene --output build/project-gallery)"
+make project-cli project-validator project-preview
+./build/nexus-project build examples/scene_assets/project.json --output build/project-gallery --validator build/nexus-project-validate
+./build/nexus-project-preview --scene "$(./build/nexus-project scene gallery.xuscene --output build/project-gallery)"
 ```
 
 `register <project.json> <source-relative.glb>` 分配 ID。移动源文件后，用 `relocate <project.json> <uid> <new-relative.glb>` 更新位置。后续运行 `build` 时，改名不改变场景引用；素材修改只重新验证该内容及依赖它的场景。变更依据为 SHA-256，换用验证器时重新验证缓存。导入复用 Xu 场景解码、GLB PBR 校验和图片解码，范围为带内嵌图片的静态 GLB。
@@ -1214,7 +1257,7 @@ make demo-project-editor
 make demo-course-editor
 ```
 
-编辑器需要支持 Tk 8.6 及以上的 Python 3.9+。本机使用 `EDITOR_PYTHON='uv run --isolated --python 3.12 python'` 验收。示例命令编辑 `build/` 内的可写副本。工作区、吸附设置和原生 3D 视口使用 XUUI Light（Paper）浅色令牌。拖动分隔条可调整场景树、俯视图与检查器的宽度。
+桌面编辑器（`cmd/project_editor`）与项目构建器（`cmd/project`）均使用纯 Xu 实现（原生 XUUI 桌面界面），无需 Python/Tk 运行时。示例命令编辑 `build/` 内的可写副本。工作区、吸附设置和原生 3D 视口使用 XUUI Light（Paper）浅色令牌。拖动分隔条可调整场景树、俯视图与检查器的宽度。
 
 - 左侧从 **Scene Tree** 选节点，在 **Assets** 选择 GLB 后点击 **Place GLB**，再在俯视图中放置。按 Esc 结束放置。
 - 中间在 **Top View** 用滚轮围绕指针缩放，右键拖动平移，点击 **Fit** 或聚焦画布后按 `F` 框入节点。用 **3D View** 打开透视视口。
@@ -1666,7 +1709,7 @@ report := scripts.dispatch(&tree, host.DEFAULT_DISPATCH_LIMIT) >>>
 ```yaml
 module: example/my_game
 version: !ver 0.1.0
-xu: !ver 0.13.1
+xu: !ver 0.14.1
 require:
   "github.com/xulang-org/nexus": file:/path/to/nexus
 ```
@@ -1993,7 +2036,7 @@ MSL、GLSL、HLSL 源码与独立 shader 准备工具均已提供；本机真实
 ## 标准窗口输入与引擎动作示例
 
 ```sh
-NEXUS_XU_SDK=/path/to/xu-0.13.1
+NEXUS_XU_SDK=/path/to/xu-0.14.1
 XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" XUPATH="$NEXUS_XU_SDK/src" XU="$NEXUS_XU_SDK/bin/xu" make window-input-smoke
 ./build/window-input --frames 600
 ```

@@ -1,0 +1,645 @@
+@"github.com/xulang-org/nexus/networking"
+
+#encoding/binary
+#errors
+#math
+#net
+#time
+
+pub const NET_MAGIC = 20056 // 0x4E58 ("NX")
+pub const MAX_PACKET_BYTES = 1400
+pub const HEADER_BYTES = 14
+
+pub const CHANNEL_UNRELIABLE = 0
+pub const CHANNEL_RELIABLE_ORDERED = 1
+pub const CHANNEL_RELIABLE_UNORDERED = 2
+
+pub const PKT_DATA = 1
+pub const PKT_HEARTBEAT = 2
+pub const PKT_CONNECT = 3
+pub const PKT_ACCEPT = 4
+pub const PKT_DISCONNECT = 5
+
+pub struct NetPacket {
+    pub data []u8
+}
+
+pub struct PacketHeader {
+    pub channel int
+    pub kind int
+    pub sequence int
+    pub ack int
+    pub ack_bits int
+    pub reliable_seq int
+}
+
+pub struct DecodedPacket {
+    pub header PacketHeader
+    pub payload []u8
+}
+
+pub struct DeliveredMessage {
+    pub channel int
+    pub kind int
+    pub sequence int
+    pub reliable_seq int
+    pub payload []u8
+}
+
+pub struct ChannelStats {
+    pub packets_sent int
+    pub packets_received int
+    pub packets_acked int
+    pub retransmits int
+    pub duplicates_dropped int
+    pub srtt_ms f64
+    pub rtt_var_ms f64
+}
+
+pub fn seq_greater(s1 int, s2 int) bool {
+    a := s1 & 65535
+    b := s2 & 65535
+    << ((a > b) && (a - b <= 32768)) || ((a < b) && (b - a > 32768))
+}
+
+pub fn seq_diff(newer int, older int) int {
+    a := newer & 65535
+    b := older & 65535
+    $d := (a - b + 65536) % 65536
+    if d >= 32768 { d -= 65536 }
+    << d
+}
+
+pub fn encode_packet(hdr PacketHeader, payload &[]u8) []u8 {
+    if hdr.channel < 0 || hdr.channel > 2 || hdr.kind < 1 || hdr.kind > 5 {
+        >>> errors.new("nexus net: invalid packet channel or kind")
+    }
+    if HEADER_BYTES + payload.len > MAX_PACKET_BYTES {
+        >>> errors.new("nexus net: packet exceeds MAX_PACKET_BYTES (1400)")
+    }
+    order := binary.little_endian()
+    $out := zero_bytes_net(HEADER_BYTES + payload.len)
+    order.put_u16_bytes($&out, 0, NET_MAGIC) >>>
+    out[2] = u8(hdr.channel & 255)
+    out[3] = u8(hdr.kind & 255)
+    order.put_u16_bytes($&out, 4, hdr.sequence & 65535) >>>
+    order.put_u16_bytes($&out, 6, hdr.ack & 65535) >>>
+    order.put_u32_bytes($&out, 8, hdr.ack_bits) >>>
+    order.put_u16_bytes($&out, 12, hdr.reliable_seq & 65535) >>>
+    for i in 0:payload.len {
+        out[HEADER_BYTES + i] = payload[i]
+    }
+    << out
+}
+
+pub fn decode_packet(raw &[]u8) DecodedPacket {
+    if raw.len < HEADER_BYTES || raw.len > MAX_PACKET_BYTES {
+        >>> errors.new("nexus net: invalid packet length")
+    }
+    order := binary.little_endian()
+    magic := order.get_u16_bytes(raw, 0) >>>
+    if magic != NET_MAGIC {
+        >>> errors.new("nexus net: bad packet magic")
+    }
+    ch := int(raw[2])
+    kind := int(raw[3])
+    if ch < 0 || ch > 2 || kind < 1 || kind > 5 {
+        >>> errors.new("nexus net: invalid header channel or kind")
+    }
+    seq := order.get_u16_bytes(raw, 4) >>>
+    ack := order.get_u16_bytes(raw, 6) >>>
+    ack_bits := order.get_u32_bytes(raw, 8) >>>
+    rseq := order.get_u16_bytes(raw, 12) >>>
+    $payload := []u8{}
+    for i in HEADER_BYTES:raw.len {
+        payload.push(raw[i])
+    }
+    << DecodedPacket{
+        header: PacketHeader{
+            channel: ch,
+            kind: kind,
+            sequence: seq,
+            ack: ack,
+            ack_bits: ack_bits,
+            reliable_seq: rseq
+        },
+        payload: payload
+    }
+}
+
+struct PendingReliable {
+    seq int
+    reliable_seq int
+    channel int
+    kind int
+    payload []u8
+    first_sent_ms f64
+    last_sent_ms f64
+    rto_ms f64
+    attempts int
+}
+
+struct BufferedOrdered {
+    reliable_seq int
+    kind int
+    sequence int
+    payload []u8
+}
+
+pub struct ReliableChannel {
+    next_send_seq int
+    next_send_reliable_seq int
+    has_remote_seq bool
+    remote_seq int
+    remote_ack_bits int
+    next_recv_reliable_seq int
+    pending []PendingReliable
+    ordered_buf []BufferedOrdered
+    srtt_ms f64
+    rtt_var_ms f64
+    has_rtt bool
+    packets_sent int
+    packets_received int
+    packets_acked int
+    retransmits int
+    duplicates_dropped int
+}
+
+pub fn new_reliable_channel() ReliableChannel {
+    << ReliableChannel{
+        next_send_seq: 1,
+        next_send_reliable_seq: 0,
+        has_remote_seq: false,
+        remote_seq: 0,
+        remote_ack_bits: 0,
+        next_recv_reliable_seq: 0,
+        pending: []PendingReliable{},
+        ordered_buf: []BufferedOrdered{},
+        srtt_ms: 80.0,
+        rtt_var_ms: 20.0,
+        has_rtt: false,
+        packets_sent: 0,
+        packets_received: 0,
+        packets_acked: 0,
+        retransmits: 0,
+        duplicates_dropped: 0
+    }
+}
+
+fn (ch &ReliableChannel) current_ack_state() []int {
+    if !ch.has_remote_seq {
+        << [0, 0]
+    }
+    << [ch.remote_seq, ch.remote_ack_bits]
+}
+
+fn (ch $&ReliableChannel) initial_rto_ms() f64 {
+    rto := ch.srtt_ms + math.max(20.0, 4.0 * ch.rtt_var_ms)
+    if rto < 45.0 { << 45.0 }
+    if rto > 400.0 { << 400.0 }
+    << rto
+}
+
+pub fn (ch $&ReliableChannel) send(channel int, kind int, payload &[]u8, now_ms f64) []u8 {
+    seq := ch.next_send_seq
+    ch.next_send_seq = (ch.next_send_seq + 1) % 65536
+    $rseq := 0
+    if channel == CHANNEL_RELIABLE_ORDERED {
+        rseq = ch.next_send_reliable_seq
+        ch.next_send_reliable_seq = (ch.next_send_reliable_seq + 1) % 65536
+    } else if channel == CHANNEL_RELIABLE_UNORDERED {
+        rseq = seq
+    }
+
+    ack_st := ch.current_ack_state()
+    hdr := PacketHeader{
+        channel: channel,
+        kind: kind,
+        sequence: seq,
+        ack: ack_st[0],
+        ack_bits: ack_st[1],
+        reliable_seq: rseq
+    }
+    wire := encode_packet(hdr, payload) >>>
+    if channel == CHANNEL_RELIABLE_ORDERED || channel == CHANNEL_RELIABLE_UNORDERED {
+        rto := ch.initial_rto_ms()
+        ch.pending.push(PendingReliable{
+            seq: seq,
+            reliable_seq: rseq,
+            channel: channel,
+            kind: kind,
+            payload: clone_bytes(payload),
+            first_sent_ms: now_ms,
+            last_sent_ms: now_ms,
+            rto_ms: rto,
+            attempts: 1
+        })
+    }
+    ch.packets_sent += 1
+    << wire
+}
+
+fn (ch $&ReliableChannel) update_rtt(sample_ms f64) {
+    $s := sample_ms
+    if s < 1.0 { s = 1.0 }
+    if s > 2000.0 { s = 2000.0 }
+    if !ch.has_rtt {
+        ch.srtt_ms = s
+        ch.rtt_var_ms = s * 0.5
+        ch.has_rtt = true
+        <<
+    }
+    diff := math.abs(ch.srtt_ms - s)
+    ch.rtt_var_ms = 0.75 * ch.rtt_var_ms + 0.25 * diff
+    ch.srtt_ms = 0.875 * ch.srtt_ms + 0.125 * s
+}
+
+fn (ch $&ReliableChannel) process_acks(ack int, ack_bits int, now_ms f64) {
+    if ack == 0 && ack_bits == 0 { << }
+    $kept := []PendingReliable{}
+    for i in 0:ch.pending.len {
+        p := &ch.pending[i]
+        diff := seq_diff(ack, p.seq)
+        $is_acked := false
+        if diff == 0 {
+            is_acked = true
+        } else if diff > 0 && diff <= 32 {
+            bit := diff - 1
+            if ((ack_bits >> bit) & 1) != 0 {
+                is_acked = true
+            }
+        }
+        if is_acked {
+            if p.attempts == 1 {
+                ch.update_rtt(now_ms - p.first_sent_ms)
+            }
+            ch.packets_acked += 1
+        } else {
+            kept.push(PendingReliable{
+                seq: p.seq,
+                reliable_seq: p.reliable_seq,
+                channel: p.channel,
+                kind: p.kind,
+                payload: clone_bytes(&p.payload),
+                first_sent_ms: p.first_sent_ms,
+                last_sent_ms: p.last_sent_ms,
+                rto_ms: p.rto_ms,
+                attempts: p.attempts
+            })
+        }
+    }
+    ch.pending = kept
+}
+
+fn (ch $&ReliableChannel) record_remote_seq(seq int) bool {
+    if !ch.has_remote_seq {
+        ch.has_remote_seq = true
+        ch.remote_seq = seq
+        ch.remote_ack_bits = 0
+        << true
+    }
+    diff := seq_diff(seq, ch.remote_seq)
+    if diff == 0 {
+        << false // Duplicate latest sequence
+    }
+    if diff > 0 {
+        if diff >= 32 {
+            ch.remote_ack_bits = 0
+        } else {
+            // Shift old window and set bit (diff - 1) for previous remote_seq.
+            ch.remote_ack_bits = (ch.remote_ack_bits << diff) | (1 << (diff - 1))
+        }
+        ch.remote_seq = seq
+        << true
+    }
+    // Older sequence within 32-packet window.
+    age := -diff
+    if age > 32 {
+        << false
+    }
+    bit := age - 1
+    if ((ch.remote_ack_bits >> bit) & 1) != 0 {
+        << false // Duplicate within bitfield window
+    }
+    ch.remote_ack_bits = ch.remote_ack_bits | (1 << bit)
+    << true
+}
+
+fn (ch $&ReliableChannel) push_ordered_message(rseq int, kind int, seq int, payload &[]u8) {
+    // Drop if already delivered or already buffered.
+    if seq_diff(rseq, ch.next_recv_reliable_seq) < 0 {
+        ch.duplicates_dropped += 1
+        <<
+    }
+    for i in 0:ch.ordered_buf.len {
+        if ch.ordered_buf[i].reliable_seq == rseq {
+            ch.duplicates_dropped += 1
+            <<
+        }
+    }
+    ch.ordered_buf.push(BufferedOrdered{
+        reliable_seq: rseq,
+        kind: kind,
+        sequence: seq,
+        payload: clone_bytes(payload)
+    })
+}
+
+fn (ch $&ReliableChannel) flush_ordered(out $&[]DeliveredMessage) {
+    $progressed := true
+    while progressed {
+        progressed = false
+        $found_idx := -1
+        for i in 0:ch.ordered_buf.len {
+            if ch.ordered_buf[i].reliable_seq == ch.next_recv_reliable_seq {
+                found_idx = i
+                <-
+            }
+        }
+        if found_idx >= 0 {
+            b := &ch.ordered_buf[found_idx]
+            out.push(DeliveredMessage{
+                channel: CHANNEL_RELIABLE_ORDERED,
+                kind: b.kind,
+                sequence: b.sequence,
+                reliable_seq: b.reliable_seq,
+                payload: clone_bytes(&b.payload)
+            })
+            $next_buf := []BufferedOrdered{}
+            for i in 0:ch.ordered_buf.len {
+                if i != found_idx {
+                    e := &ch.ordered_buf[i]
+                    next_buf.push(BufferedOrdered{
+                        reliable_seq: e.reliable_seq,
+                        kind: e.kind,
+                        sequence: e.sequence,
+                        payload: clone_bytes(&e.payload)
+                    })
+                }
+            }
+            ch.ordered_buf = next_buf
+            ch.next_recv_reliable_seq = (ch.next_recv_reliable_seq + 1) % 65536
+            progressed = true
+        }
+    }
+}
+
+pub fn (ch $&ReliableChannel) on_receive(raw &[]u8, now_ms f64) []DeliveredMessage {
+    pkt := decode_packet(raw) >>>
+    ch.packets_received += 1
+    ch.process_acks(pkt.header.ack, pkt.header.ack_bits, now_ms)
+
+    fresh := ch.record_remote_seq(pkt.header.sequence)
+    if !fresh {
+        ch.duplicates_dropped += 1
+        << []DeliveredMessage{}
+    }
+
+    $out := []DeliveredMessage{}
+    if pkt.header.channel == CHANNEL_RELIABLE_ORDERED {
+        ch.push_ordered_message(pkt.header.reliable_seq, pkt.header.kind, pkt.header.sequence, &pkt.payload)
+        ch.flush_ordered($&out)
+        << out
+    }
+    if pkt.header.kind == PKT_DATA || pkt.header.kind == PKT_CONNECT ||
+        pkt.header.kind == PKT_ACCEPT || pkt.header.kind == PKT_DISCONNECT {
+        out.push(DeliveredMessage{
+            channel: pkt.header.channel,
+            kind: pkt.header.kind,
+            sequence: pkt.header.sequence,
+            reliable_seq: pkt.header.reliable_seq,
+            payload: clone_bytes(&pkt.payload)
+        })
+    }
+    << out
+}
+
+fn retransmit_wire_if_due(p &PendingReliable, new_seq int, ack_st &[]int, now_ms f64) []u8 {
+    if now_ms - p.last_sent_ms < p.rto_ms {
+        << []u8{}
+    }
+    hdr := PacketHeader{
+        channel: p.channel,
+        kind: p.kind,
+        sequence: new_seq,
+        ack: ack_st[0],
+        ack_bits: ack_st[1],
+        reliable_seq: p.reliable_seq
+    }
+    << encode_packet(hdr, &p.payload) >>>
+}
+
+pub fn (ch $&ReliableChannel) poll_retransmits(now_ms f64) []NetPacket {
+    $out := []NetPacket{}
+    ack_st := ch.current_ack_state()
+    for i in 0:ch.pending.len {
+        new_seq := ch.next_send_seq
+        wire := retransmit_wire_if_due(&ch.pending[i], new_seq, &ack_st, now_ms) >>>
+        if wire.len > 0 {
+            ch.next_send_seq = (ch.next_send_seq + 1) % 65536
+            ch.pending[i].seq = new_seq
+            ch.pending[i].last_sent_ms = now_ms
+            ch.pending[i].attempts += 1
+            ch.pending[i].rto_ms = math.min(ch.pending[i].rto_ms * 1.75, 1000.0)
+            ch.retransmits += 1
+            ch.packets_sent += 1
+            out.push(NetPacket{data: clone_bytes(&wire)})
+        }
+    }
+    << out
+}
+
+pub fn (ch &ReliableChannel) unacked_count() int { << ch.pending.len }
+
+pub fn (ch &ReliableChannel) stats() ChannelStats {
+    << ChannelStats{
+        packets_sent: ch.packets_sent,
+        packets_received: ch.packets_received,
+        packets_acked: ch.packets_acked,
+        retransmits: ch.retransmits,
+        duplicates_dropped: ch.duplicates_dropped,
+        srtt_ms: ch.srtt_ms,
+        rtt_var_ms: ch.rtt_var_ms
+    }
+}
+
+// --- Real OS IPv4 UDP Socket Transport ---
+pub struct UdpDatagram {
+    pub received bool
+    pub from string
+    pub data []u8
+}
+
+pub struct UdpTransport {
+    conns []net.PacketConn
+    closed bool
+}
+
+pub fn bind_udp(addr string) UdpTransport {
+    laddr := net.resolve_udp_addr("udp4", addr) >>>
+    conn := net.listen_udp("udp4", laddr) >>>
+    << UdpTransport{conns: [conn], closed: false}
+}
+
+pub fn (u &UdpTransport) local_addr() string {
+    if u.closed || u.conns.len == 0 { >>> errors.new("nexus net: closed UdpTransport") }
+    << u.conns[0].local_addr()
+}
+
+pub fn (u &UdpTransport) send_to(peer_addr string, payload &[]u8) int {
+    if u.closed || u.conns.len == 0 { >>> errors.new("nexus net: closed UdpTransport") }
+    if payload.len > MAX_PACKET_BYTES { >>> errors.new("nexus net: UDP payload exceeds 1400 bytes") }
+    dest := net.resolve_udp_addr("udp4", peer_addr) >>>
+    wire := bytes_to_wire(payload)
+    << u.conns[0].write_to(&wire, &dest) >>>
+}
+
+pub fn (u $&UdpTransport) recv_from(timeout_ms int) UdpDatagram {
+    if u.closed || u.conns.len == 0 { >>> errors.new("nexus net: closed UdpTransport") }
+    c := $&u.conns[0]
+    if timeout_ms >= 0 {
+        deadline := time.now() + timeout_ms * 1000000
+        c.set_read_deadline(deadline) >>>
+    } else {
+        c.set_read_deadline(0) >>>
+    }
+    pkt := c.read_from(MAX_PACKET_BYTES + 64) >>> (err) {
+        << UdpDatagram{received: false, from: "", data: []u8{}}
+    }
+    << UdpDatagram{
+        received: true,
+        from: pkt.addr.to_string(),
+        data: wire_to_bytes(&pkt.data)
+    }
+}
+
+pub fn (u $&UdpTransport) close() int {
+    if u.closed { << 0 }
+    for i in 0:u.conns.len {
+        c := $&u.conns[i]
+        c.close() >>>
+    }
+    u.conns = []net.PacketConn{}
+    u.closed = true
+    << 0
+}
+
+fn (u $&UdpTransport) drop() {
+    u.close() >>> (err) { << }
+}
+
+// --- Deterministic Loss / Jitter / Reordering / Duplication Link Simulator ---
+pub struct SimLinkConfig {
+    pub seed int
+    pub latency_ms f64
+    pub jitter_ms f64
+    pub loss_rate f64
+    pub duplicate_rate f64
+    pub reorder_rate f64
+}
+
+pub fn default_sim_link_config(seed int) SimLinkConfig {
+    << SimLinkConfig{
+        seed: seed,
+        latency_ms: 35.0,
+        jitter_ms: 8.0,
+        loss_rate: 0.0,
+        duplicate_rate: 0.0,
+        reorder_rate: 0.0
+    }
+}
+
+struct QueuedDatagram {
+    deliver_at_ms f64
+    data []u8
+}
+
+pub struct SimulatedLink {
+    cfg SimLinkConfig
+    rng_state int
+    a_to_b []QueuedDatagram
+    b_to_a []QueuedDatagram
+    pub total_sent int
+    pub total_dropped int
+    pub total_duplicated int
+}
+
+pub fn new_simulated_link(cfg SimLinkConfig) SimulatedLink {
+    if cfg.loss_rate < 0.0 || cfg.loss_rate >= 1.0 ||
+        cfg.latency_ms < 0.0 || cfg.jitter_ms < 0.0 ||
+        cfg.duplicate_rate < 0.0 || cfg.reorder_rate < 0.0 {
+        >>> errors.new("nexus net: invalid SimulatedLink configuration")
+    }
+    $s := cfg.seed
+    if s == 0 { s = 1234567 }
+    << SimulatedLink{
+        cfg: cfg,
+        rng_state: s & 0x7fffffff,
+        a_to_b: []QueuedDatagram{},
+        b_to_a: []QueuedDatagram{},
+        total_sent: 0,
+        total_dropped: 0,
+        total_duplicated: 0
+    }
+}
+
+fn (link $&SimulatedLink) rand01() f64 {
+    link.rng_state = (link.rng_state * 1103515245 + 12345) & 0x7fffffff
+    << f64(link.rng_state) / 2147483647.0
+}
+
+fn (link $&SimulatedLink) enqueue(queue $&[]QueuedDatagram, data &[]u8, now_ms f64) {
+    link.total_sent += 1
+    if link.rand01() < link.cfg.loss_rate {
+        link.total_dropped += 1
+        <<
+    }
+    jit := (link.rand01() * 2.0 - 1.0) * link.cfg.jitter_ms
+    $extra := 0.0
+    if link.rand01() < link.cfg.reorder_rate {
+        extra = link.cfg.latency_ms * (0.4 + link.rand01() * 0.8)
+    }
+    deliver_t := now_ms + math.max(0.0, link.cfg.latency_ms + jit + extra)
+    queue.push(QueuedDatagram{deliver_at_ms: deliver_t, data: clone_bytes(data)})
+
+    if link.rand01() < link.cfg.duplicate_rate {
+        link.total_duplicated += 1
+        dup_t := deliver_t + 2.0 + link.rand01() * 12.0
+        queue.push(QueuedDatagram{deliver_at_ms: dup_t, data: clone_bytes(data)})
+    }
+}
+
+fn drain_ready_split(queue &[]QueuedDatagram, now_ms f64, ready $&[]NetPacket) []QueuedDatagram {
+    $remain := []QueuedDatagram{}
+    for i in 0:queue.len {
+        q := &queue[i]
+        if q.deliver_at_ms <= now_ms {
+            ready.push(NetPacket{data: clone_bytes(&q.data)})
+        } else {
+            remain.push(QueuedDatagram{deliver_at_ms: q.deliver_at_ms, data: clone_bytes(&q.data)})
+        }
+    }
+    << remain
+}
+
+pub fn (link $&SimulatedLink) send_a_to_b(data &[]u8, now_ms f64) {
+    link.enqueue($&link.a_to_b, data, now_ms)
+}
+
+pub fn (link $&SimulatedLink) send_b_to_a(data &[]u8, now_ms f64) {
+    link.enqueue($&link.b_to_a, data, now_ms)
+}
+
+pub fn (link $&SimulatedLink) recv_for_b(now_ms f64) []NetPacket {
+    $ready := []NetPacket{}
+    rem := drain_ready_split(&link.a_to_b, now_ms, $&ready)
+    link.a_to_b = rem
+    << ready
+}
+
+pub fn (link $&SimulatedLink) recv_for_a(now_ms f64) []NetPacket {
+    $ready := []NetPacket{}
+    rem := drain_ready_split(&link.b_to_a, now_ms, $&ready)
+    link.b_to_a = rem
+    << ready
+}

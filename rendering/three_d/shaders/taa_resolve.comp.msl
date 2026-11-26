@@ -1,0 +1,61 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct TaaParams {
+    float4x4 reproj; // prev_view_proj * inv_curr_view_proj
+    float4 info;     // x=width, y=height, z=blend, w=valid_history
+};
+
+kernel void main0(
+    texture2d<float> curr_hdr [[texture(0)]],
+    texture2d<float> prev_history [[texture(1)]],
+    depth2d<float> src_depth [[texture(2)]],
+    texture2d<float, access::write> dst_history [[texture(3)]],
+    sampler curr_sampler [[sampler(0)]],
+    sampler prev_sampler [[sampler(1)]],
+    sampler depth_sampler [[sampler(2)]],
+    constant TaaParams& params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint w = uint(params.info.x);
+    uint h = uint(params.info.y);
+    if (gid.x >= w || gid.y >= h) return;
+
+    float2 inv_res = float2(1.0 / params.info.x, 1.0 / params.info.y);
+    float2 uv = (float2(gid) + 0.5) * inv_res;
+    float3 curr = curr_hdr.sample(curr_sampler, uv, level(0.0)).rgb;
+
+    if (params.info.w < 0.5) {
+        dst_history.write(float4(curr, 1.0), gid);
+        return;
+    }
+
+    float d = src_depth.sample(depth_sampler, uv);
+    float4 clip_curr = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
+    float4 clip_prev = params.reproj * clip_curr;
+    if (clip_prev.w <= 1e-5) {
+        dst_history.write(float4(curr, 1.0), gid);
+        return;
+    }
+    float2 ndc_prev = clip_prev.xy / clip_prev.w;
+    float2 prev_uv = float2(ndc_prev.x * 0.5 + 0.5, 0.5 - ndc_prev.y * 0.5);
+    if (prev_uv.x <= 0.0 || prev_uv.x >= 1.0 || prev_uv.y <= 0.0 || prev_uv.y >= 1.0) {
+        dst_history.write(float4(curr, 1.0), gid);
+        return;
+    }
+
+    float3 box_min = curr;
+    float3 box_max = curr;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            float2 suv = clamp(uv + float2(float(dx), float(dy)) * inv_res, float2(0.0001), float2(0.9999));
+            float3 n = curr_hdr.sample(curr_sampler, suv, level(0.0)).rgb;
+            box_min = min(box_min, n);
+            box_max = max(box_max, n);
+        }
+    }
+
+    float3 hist = clamp(prev_history.sample(prev_sampler, prev_uv, level(0.0)).rgb, box_min, box_max);
+    float3 resolved = mix(curr, hist, clamp(params.info.z, 0.0, 0.95));
+    dst_history.write(float4(resolved, 1.0), gid);
+}

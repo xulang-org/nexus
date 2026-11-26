@@ -1,0 +1,527 @@
+@"github.com/xulang-org/nexus/physics3d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const XPBD_MAX_TET_CONSTRAINTS = 8192
+pub const XPBD_MAX_BEND_CONSTRAINTS = 8192
+pub const XPBD_MAX_AERO_TRIANGLES = 8192
+
+struct XpbdTetVolumeConstraint {
+    p0 int
+    p1 int
+    p2 int
+    p3 int
+    rest_volume f64
+    compliance f64
+}
+
+struct XpbdDihedralBendConstraint {
+    p0 int
+    p1 int
+    p2 int
+    p3 int
+    rest_angle f64
+    compliance f64
+}
+
+struct XpbdAeroTriangle {
+    a int
+    b int
+    c int
+    drag f64
+    lift f64
+}
+
+pub struct SoftBodyHandle3D {
+    pub particle_ids []int
+    pub tet_ids []int
+    pub rest_volume f64
+}
+
+fn tet_signed_volume(p0 fm.Vec3, p1 fm.Vec3, p2 fm.Vec3, p3 fm.Vec3) f64 {
+    e1 := p1.sub(p0)
+    e2 := p2.sub(p0)
+    e3 := p3.sub(p0)
+    << e1.cross(e2).dot(e3) / 6.0
+}
+
+fn wrap_angle_pi(a f64) f64 {
+    pi := math.pi()
+    tau := 2.0 * pi
+    $x := a
+    while x > pi { x -= tau }
+    while x < -pi { x += tau }
+    << x
+}
+
+fn dihedral_angle_rad(p0 fm.Vec3, p1 fm.Vec3, p2 fm.Vec3, p3 fm.Vec3) f64 {
+    e := p1.sub(p0)
+    elen := e.length()
+    if elen <= 1e-10 { << 0.0 }
+    e_unit := e.scaled(1.0 / elen)
+    c1 := e.cross(p2.sub(p0))
+    c2 := p3.sub(p0).cross(e)
+    l1 := c1.length()
+    l2 := c2.length()
+    if l1 <= 1e-10 || l2 <= 1e-10 { << 0.0 }
+    n1 := c1.scaled(1.0 / l1)
+    n2 := c2.scaled(1.0 / l2)
+    cos_a := clamp_f(n1.dot(n2), -1.0, 1.0)
+    sin_a := n1.cross(n2).dot(e_unit)
+    << math.atan2(sin_a, cos_a)
+}
+
+fn solve_tet_volume_constraint(
+    world $&XpbdWorld3D,
+    ci int,
+    lambdas $&[]f64,
+    inv_h2 f64
+) {
+    c := world.tet_constraints[ci]
+    w0 := world.inv_mass[c.p0]
+    w1 := world.inv_mass[c.p1]
+    w2 := world.inv_mass[c.p2]
+    w3 := world.inv_mass[c.p3]
+    if w0 + w1 + w2 + w3 <= 0.0 { << }
+
+    p0 := world.positions[c.p0]
+    p1 := world.positions[c.p1]
+    p2 := world.positions[c.p2]
+    p3 := world.positions[c.p3]
+    e1 := p1.sub(p0)
+    e2 := p2.sub(p0)
+    e3 := p3.sub(p0)
+
+    inv6 := 1.0 / 6.0
+    g1 := e2.cross(e3).scaled(inv6)
+    g2 := e3.cross(e1).scaled(inv6)
+    g3 := e1.cross(e2).scaled(inv6)
+    g0 := g1.add(g2).add(g3).scaled(-1.0)
+
+    wsum := w0 * g0.dot(g0) + w1 * g1.dot(g1) + w2 * g2.dot(g2) + w3 * g3.dot(g3)
+    if wsum <= 1e-16 { << }
+
+    vol := e1.cross(e2).dot(e3) * inv6
+    err_v := vol - c.rest_volume
+    alpha_tilde := c.compliance * inv_h2
+    d_lambda := (-err_v - alpha_tilde * lambdas[ci]) / (wsum + alpha_tilde)
+    lambdas[ci] += d_lambda
+
+    if w0 > 0.0 { world.positions[c.p0] = p0.add(g0.scaled(d_lambda * w0)) }
+    if w1 > 0.0 { world.positions[c.p1] = p1.add(g1.scaled(d_lambda * w1)) }
+    if w2 > 0.0 { world.positions[c.p2] = p2.add(g2.scaled(d_lambda * w2)) }
+    if w3 > 0.0 { world.positions[c.p3] = p3.add(g3.scaled(d_lambda * w3)) }
+}
+
+fn solve_dihedral_bend_constraint(
+    world $&XpbdWorld3D,
+    ci int,
+    lambdas $&[]f64,
+    inv_h2 f64
+) {
+    c := world.bend_constraints[ci]
+    w0 := world.inv_mass[c.p0]
+    w1 := world.inv_mass[c.p1]
+    w2 := world.inv_mass[c.p2]
+    w3 := world.inv_mass[c.p3]
+    if w0 + w1 + w2 + w3 <= 0.0 { << }
+
+    p0 := world.positions[c.p0]
+    p1 := world.positions[c.p1]
+    p2 := world.positions[c.p2]
+    p3 := world.positions[c.p3]
+
+    e := p1.sub(p0)
+    elen2 := e.dot(e)
+    if elen2 <= 1e-14 { << }
+    elen := math.sqrt(elen2)
+    e_unit := e.scaled(1.0 / elen)
+
+    p2_rel := p2.sub(p0)
+    p3_rel := p3.sub(p0)
+    c1 := e.cross(p2_rel)
+    c2 := p3_rel.cross(e)
+    l1 := c1.length()
+    l2 := c2.length()
+    if l1 <= 1e-10 || l2 <= 1e-10 { << }
+
+    n1 := c1.scaled(1.0 / l1)
+    n2 := c2.scaled(1.0 / l2)
+    cos_a := clamp_f(n1.dot(n2), -1.0, 1.0)
+    sin_a := n1.cross(n2).dot(e_unit)
+    phi := math.atan2(sin_a, cos_a)
+    err_phi := wrap_angle_pi(phi - c.rest_angle)
+
+    q2 := n1.scaled(-elen / l1)
+    q3 := n2.scaled(-elen / l2)
+    u2 := p2_rel.dot(e) / elen2
+    u3 := p3_rel.dot(e) / elen2
+    q1 := q2.scaled(-u2).sub(q3.scaled(u3))
+    q0 := q1.add(q2).add(q3).scaled(-1.0)
+
+    wsum := w0 * q0.dot(q0) + w1 * q1.dot(q1) + w2 * q2.dot(q2) + w3 * q3.dot(q3)
+    if wsum <= 1e-14 { << }
+
+    alpha_tilde := c.compliance * inv_h2
+    d_lambda := (-err_phi - alpha_tilde * lambdas[ci]) / (wsum + alpha_tilde)
+    lambdas[ci] += d_lambda
+
+    if w0 > 0.0 { world.positions[c.p0] = p0.add(q0.scaled(d_lambda * w0)) }
+    if w1 > 0.0 { world.positions[c.p1] = p1.add(q1.scaled(d_lambda * w1)) }
+    if w2 > 0.0 { world.positions[c.p2] = p2.add(q2.scaled(d_lambda * w2)) }
+    if w3 > 0.0 { world.positions[c.p3] = p3.add(q3.scaled(d_lambda * w3)) }
+}
+
+fn apply_aero_forces(world $&XpbdWorld3D, h f64) {
+    max_dv := 25.0 * h
+    for ti in 0:world.aero_triangles.len {
+        at := world.aero_triangles[ti]
+        wa := world.inv_mass[at.a]
+        wb := world.inv_mass[at.b]
+        wc := world.inv_mass[at.c]
+        if wa + wb + wc <= 0.0 { -> }
+
+        pa := world.positions[at.a]
+        pb := world.positions[at.b]
+        pc := world.positions[at.c]
+        cr := pb.sub(pa).cross(pc.sub(pa))
+        cr_len := cr.length()
+        if cr_len <= 1e-10 { -> }
+        area := 0.5 * cr_len
+        $n := cr.scaled(1.0 / cr_len)
+
+        v_tri := world.velocities[at.a].add(world.velocities[at.b]).add(world.velocities[at.c]).scaled(1.0 / 3.0)
+        v_rel := v_tri.sub(world.wind_velocity)
+        speed := v_rel.length()
+        if speed <= 1e-9 { -> }
+
+        $vn := v_rel.dot(n)
+        if vn < 0.0 {
+            n = n.scaled(-1.0)
+            vn = -vn
+        }
+        q_dyn := 0.5 * world.air_density * area * speed
+        f_drag := n.scaled(-q_dyn * at.drag * vn)
+        v_tan := v_rel.sub(n.scaled(vn))
+        f_lift := v_tan.scaled(-q_dyn * at.lift * 0.25)
+        f_node := f_drag.add(f_lift).scaled(1.0 / 3.0)
+
+        ids := [at.a, at.b, at.c]
+        ws := [wa, wb, wc]
+        for k in 0:3 {
+            wik := ws[k]
+            if wik > 0.0 {
+                $dv := f_node.scaled(wik * h)
+                dvl := dv.length()
+                if dvl > max_dv { dv = dv.scaled(max_dv / dvl) }
+                pid := ids[k]
+                world.velocities[pid] = world.velocities[pid].add(dv)
+            }
+        }
+    }
+}
+
+pub fn (world $&XpbdWorld3D) set_wind(wind_velocity fm.Vec3, air_density f64) int {
+    if !wind_velocity.is_finite() || !fm.finite(air_density) || air_density < 0.0 || air_density > 50.0 {
+        >>> errors.new("nexus xpbd: invalid wind velocity or air density")
+    }
+    world.wind_velocity = wind_velocity
+    world.air_density = air_density
+    << 0
+}
+
+pub fn (world $&XpbdWorld3D) add_tet_volume_constraint(
+    p0 int, p1 int, p2 int, p3 int, compliance f64
+) int {
+    n := world.positions.len
+    if p0 < 0 || p0 >= n || p1 < 0 || p1 >= n || p2 < 0 || p2 >= n || p3 < 0 || p3 >= n {
+        >>> errors.new("nexus xpbd: invalid tetrahedron vertex indices")
+    }
+    if p0 == p1 || p0 == p2 || p0 == p3 || p1 == p2 || p1 == p3 || p2 == p3 {
+        >>> errors.new("nexus xpbd: tetrahedron vertices must be distinct")
+    }
+    if !fm.finite(compliance) || compliance < 0.0 {
+        >>> errors.new("nexus xpbd: invalid tetrahedron compliance")
+    }
+    if world.tet_constraints.len >= XPBD_MAX_TET_CONSTRAINTS {
+        >>> errors.new("nexus xpbd: tetrahedron constraint budget exceeded")
+    }
+    $a2 := p2
+    $a3 := p3
+    $vol := tet_signed_volume(world.positions[p0], world.positions[p1], world.positions[a2], world.positions[a3])
+    if vol < 0.0 {
+        tmp := a2
+        a2 = a3
+        a3 = tmp
+        vol = -vol
+    }
+    if vol <= 1e-12 {
+        >>> errors.new("nexus xpbd: degenerate zero-volume tetrahedron")
+    }
+    id := world.tet_constraints.len
+    world.tet_constraints.push(XpbdTetVolumeConstraint{
+        p0: p0, p1: p1, p2: a2, p3: a3,
+        rest_volume: vol,
+        compliance: compliance
+    })
+    << id
+}
+
+pub fn (world $&XpbdWorld3D) add_dihedral_bend_constraint(
+    p0 int, p1 int, p2 int, p3 int, compliance f64
+) int {
+    n := world.positions.len
+    if p0 < 0 || p0 >= n || p1 < 0 || p1 >= n || p2 < 0 || p2 >= n || p3 < 0 || p3 >= n {
+        >>> errors.new("nexus xpbd: invalid dihedral bend vertex indices")
+    }
+    if p0 == p1 || p2 == p3 || p0 == p2 || p0 == p3 || p1 == p2 || p1 == p3 {
+        >>> errors.new("nexus xpbd: dihedral bend vertices must be distinct")
+    }
+    if !fm.finite(compliance) || compliance < 0.0 {
+        >>> errors.new("nexus xpbd: invalid dihedral bend compliance")
+    }
+    if world.bend_constraints.len >= XPBD_MAX_BEND_CONSTRAINTS {
+        >>> errors.new("nexus xpbd: dihedral bend constraint budget exceeded")
+    }
+    angle := dihedral_angle_rad(world.positions[p0], world.positions[p1], world.positions[p2], world.positions[p3])
+    id := world.bend_constraints.len
+    world.bend_constraints.push(XpbdDihedralBendConstraint{
+        p0: p0, p1: p1, p2: p2, p3: p3,
+        rest_angle: angle,
+        compliance: compliance
+    })
+    << id
+}
+
+pub fn (world $&XpbdWorld3D) add_aero_triangle(a int, b int, c int, drag f64, lift f64) int {
+    n := world.positions.len
+    if a < 0 || a >= n || b < 0 || b >= n || c < 0 || c >= n || a == b || a == c || b == c {
+        >>> errors.new("nexus xpbd: invalid aerodynamic triangle vertex indices")
+    }
+    if !fm.finite(drag) || drag < 0.0 || !fm.finite(lift) || lift < 0.0 {
+        >>> errors.new("nexus xpbd: aerodynamic drag/lift coefficients must be non-negative")
+    }
+    if world.aero_triangles.len >= XPBD_MAX_AERO_TRIANGLES {
+        >>> errors.new("nexus xpbd: aerodynamic triangle budget exceeded")
+    }
+    id := world.aero_triangles.len
+    world.aero_triangles.push(XpbdAeroTriangle{a: a, b: b, c: c, drag: drag, lift: lift})
+    << id
+}
+
+// Builds an aerodynamic cloth patch with structural/shear stretch, isometric dihedral bending across adjacent triangles,
+// and triangle aero lift/drag patches. Optionally pins the c==0 edge vertically as a flag or banner.
+pub fn (world $&XpbdWorld3D) add_aerodynamic_cloth(
+    origin fm.Vec3,
+    step_u fm.Vec3,
+    step_v fm.Vec3,
+    cols int,
+    rows int,
+    radius f64,
+    particle_mass f64,
+    stretch_compliance f64,
+    dihedral_compliance f64,
+    drag f64,
+    lift f64,
+    pin_left_edge bool,
+    layer int,
+    mask int
+) []int {
+    if cols < 2 || rows < 2 || cols * rows > 1024 ||
+        !valid_point(origin) || !step_u.is_finite() || !step_v.is_finite() ||
+        !fm.finite(particle_mass) || particle_mass <= 0.0 {
+        >>> errors.new("nexus xpbd: invalid aerodynamic cloth grid dimensions or parameters")
+    }
+    $ids := []int{}
+    for r in 0:rows {
+        for c in 0:cols {
+            p := origin.add(step_u.scaled(f64(c))).add(step_v.scaled(f64(r)))
+            $m := particle_mass
+            if pin_left_edge && c == 0 {
+                m = 0.0
+            } else if !pin_left_edge && r == 0 && (c == 0 || c == cols - 1) {
+                m = 0.0
+            }
+            id := world.add_particle(p, radius, m, 0.05, 0.4, layer, mask) >>>
+            ids.push(id)
+        }
+    }
+    du := step_u.length()
+    dv := step_v.length()
+    dd := math.sqrt(du * du + dv * dv)
+    for r in 0:rows {
+        for c in 0:cols {
+            p00 := ids[r * cols + c]
+            if c + 1 < cols {
+                p10 := ids[r * cols + c + 1]
+                world.add_distance_constraint(p00, p10, du, stretch_compliance) >>>
+            }
+            if r + 1 < rows {
+                p01 := ids[(r + 1) * cols + c]
+                world.add_distance_constraint(p00, p01, dv, stretch_compliance) >>>
+            }
+            if c + 1 < cols && r + 1 < rows {
+                p10 := ids[r * cols + c + 1]
+                p01 := ids[(r + 1) * cols + c]
+                p11 := ids[(r + 1) * cols + c + 1]
+                world.add_distance_constraint(p00, p11, dd, stretch_compliance) >>>
+                world.add_distance_constraint(p10, p01, dd, stretch_compliance) >>>
+
+                // Quad split into 2 triangles along (p00, p11):
+                // T1=(p00, p10, p11), T2=(p00, p11, p01), plus dihedral bend along diagonal (p00, p11).
+                world.add_aero_triangle(p00, p10, p11, drag, lift) >>>
+                world.add_aero_triangle(p00, p11, p01, drag, lift) >>>
+                world.add_dihedral_bend_constraint(p00, p11, p10, p01, dihedral_compliance) >>>
+
+                // Interior quad-to-quad horizontal hinge bend along vertical edge (p10, p11):
+                if c + 2 < cols {
+                    p21 := ids[(r + 1) * cols + c + 2]
+                    world.add_dihedral_bend_constraint(p10, p11, p00, p21, dihedral_compliance) >>>
+                }
+                // Interior quad-to-quad vertical hinge bend along horizontal edge (p01, p11):
+                if r + 2 < rows {
+                    p12 := ids[(r + 2) * cols + c + 1]
+                    world.add_dihedral_bend_constraint(p01, p11, p00, p12, dihedral_compliance) >>>
+                }
+            }
+        }
+    }
+    << ids
+}
+
+fn soft_try_add_edge(world $&XpbdWorld3D, seen $&[]int, stride int, a int, b int, compliance f64) int {
+    $lo := a
+    $hi := b
+    if lo > hi {
+        tmp := lo
+        lo = hi
+        hi = tmp
+    }
+    key := lo * stride + hi
+    for k in seen {
+        if k == key { << -1 }
+    }
+    seen.push(key)
+    d := world.positions[lo].sub(world.positions[hi]).length()
+    << world.add_distance_constraint(lo, hi, d, compliance) >>>
+}
+
+// Builds a tetrahedralized soft-body box with 5-tet alternating parity decomposition per voxel cell,
+// structural/diagonal edges, and volumetric XPBD tetrahedral volume preservation constraints.
+pub fn (world $&XpbdWorld3D) add_soft_tetra_box(
+    origin fm.Vec3,
+    size fm.Vec3,
+    nx int,
+    ny int,
+    nz int,
+    node_radius f64,
+    node_mass f64,
+    edge_compliance f64,
+    volume_compliance f64,
+    layer int,
+    mask int
+) SoftBodyHandle3D {
+    if nx < 1 || ny < 1 || nz < 1 || (nx + 1) * (ny + 1) * (nz + 1) > 1024 ||
+        !valid_point(origin) || !size.is_finite() || size.x <= 0.0 || size.y <= 0.0 || size.z <= 0.0 ||
+        !fm.finite(node_mass) || node_mass <= 0.0 {
+        >>> errors.new("nexus xpbd: invalid soft-body tetrahedral box parameters")
+    }
+    sx := nx + 1
+    sy := ny + 1
+    sz := nz + 1
+    total_v := sx * sy * sz
+    dx := size.x / f64(nx)
+    dy := size.y / f64(ny)
+    dz := size.z / f64(nz)
+
+    $pids := []int{}
+    for iz in 0:sz {
+        for iy in 0:sy {
+            for ix in 0:sx {
+                p := fm.vec3(origin.x + f64(ix) * dx, origin.y + f64(iy) * dy, origin.z + f64(iz) * dz)
+                id := world.add_particle(p, node_radius, node_mass, 0.1, 0.5, layer, mask) >>>
+                pids.push(id)
+            }
+        }
+    }
+
+    $seen_edges := []int{}
+    $tet_ids := []int{}
+    $rest_vol := 0.0
+
+    for iz in 0:nz {
+        for iy in 0:ny {
+            for ix in 0:nx {
+                v000 := pids[(iz * sy + iy) * sx + ix]
+                v100 := pids[(iz * sy + iy) * sx + (ix + 1)]
+                v010 := pids[(iz * sy + (iy + 1)) * sx + ix]
+                v110 := pids[(iz * sy + (iy + 1)) * sx + (ix + 1)]
+                v001 := pids[((iz + 1) * sy + iy) * sx + ix]
+                v101 := pids[((iz + 1) * sy + iy) * sx + (ix + 1)]
+                v011 := pids[((iz + 1) * sy + (iy + 1)) * sx + ix]
+                v111 := pids[((iz + 1) * sy + (iy + 1)) * sx + (ix + 1)]
+
+                parity := (ix + iy + iz) & 1
+                $tets := []int{}
+                if parity == 0 {
+                    tets = [v000, v100, v110, v101, v000, v110, v010, v011, v000, v001, v101, v011, v111, v110, v101, v011, v000, v110, v101, v011]
+                } else {
+                    tets = [v100, v110, v010, v111, v000, v100, v010, v001, v100, v101, v001, v111, v010, v011, v001, v111, v100, v010, v001, v111]
+                }
+                for ti in 0:5 {
+                    base := ti * 4
+                    a := tets[base]
+                    b := tets[base + 1]
+                    c := tets[base + 2]
+                    d := tets[base + 3]
+                    _ := soft_try_add_edge(world, $&seen_edges, total_v + world.positions.len, a, b, edge_compliance) >>>
+                    _ := soft_try_add_edge(world, $&seen_edges, total_v + world.positions.len, a, c, edge_compliance) >>>
+                    _ := soft_try_add_edge(world, $&seen_edges, total_v + world.positions.len, a, d, edge_compliance) >>>
+                    _ := soft_try_add_edge(world, $&seen_edges, total_v + world.positions.len, b, c, edge_compliance) >>>
+                    _ := soft_try_add_edge(world, $&seen_edges, total_v + world.positions.len, b, d, edge_compliance) >>>
+                    _ := soft_try_add_edge(world, $&seen_edges, total_v + world.positions.len, c, d, edge_compliance) >>>
+                    if volume_compliance < 1e9 {
+                        tid := world.add_tet_volume_constraint(a, b, c, d, volume_compliance) >>>
+                        tet_ids.push(tid)
+                        rest_vol += world.tet_constraints[tid].rest_volume
+                    }
+                }
+            }
+        }
+    }
+
+    << SoftBodyHandle3D{
+        particle_ids: pids,
+        tet_ids: tet_ids,
+        rest_volume: rest_vol
+    }
+}
+
+pub fn (world &XpbdWorld3D) current_soft_volume(handle &SoftBodyHandle3D) f64 {
+    $sum := 0.0
+    for tid in handle.tet_ids {
+        if tid < 0 || tid >= world.tet_constraints.len {
+            >>> errors.new("nexus xpbd: invalid soft-body tetrahedron handle")
+        }
+        tc := world.tet_constraints[tid]
+        sum += tet_signed_volume(world.positions[tc.p0], world.positions[tc.p1], world.positions[tc.p2], world.positions[tc.p3])
+    }
+    << sum
+}
+
+pub fn (world &XpbdWorld3D) soft_center_of_mass(handle &SoftBodyHandle3D) fm.Vec3 {
+    if handle.particle_ids.len == 0 {
+        >>> errors.new("nexus xpbd: empty soft-body handle")
+    }
+    $sum := zero()
+    for pid in handle.particle_ids {
+        sum = sum.add(world.positions[pid])
+    }
+    << sum.scaled(1.0 / f64(handle.particle_ids.len))
+}
+
+pub fn (world &XpbdWorld3D) tet_constraint_count() int { << world.tet_constraints.len }
+pub fn (world &XpbdWorld3D) bend_constraint_count() int { << world.bend_constraints.len }
+pub fn (world &XpbdWorld3D) aero_triangle_count() int { << world.aero_triangles.len }

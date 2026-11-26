@@ -1,0 +1,428 @@
+@"github.com/xulang-org/nexus/vfx"
+
+#errors
+#math
+fm #"github.com/xulang-org/nexus/foundation/math"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+
+pub const SHAPE_2D_POINT = 0
+pub const SHAPE_2D_CIRCLE = 1
+pub const SHAPE_2D_RING = 2
+pub const SHAPE_2D_BOX = 3
+pub const SHAPE_2D_CONE = 4
+
+pub struct EmitterConfig2D {
+    pub origin fm.Vec2
+    pub direction fm.Vec2
+    pub base_velocity fm.Vec2
+    pub shape int
+    pub shape_param0 f64
+    pub shape_param1 f64
+    pub emit_rate f64
+    pub emitting bool
+    pub speed_min f64
+    pub speed_max f64
+    pub spread_angle f64
+    pub life_min f64
+    pub life_max f64
+    pub size_start_min f64
+    pub size_start_max f64
+    pub size_end_scale f64
+    pub stretch_factor f64
+    pub rotation_range f64
+    pub angular_vel_min f64
+    pub angular_vel_max f64
+    pub gravity fm.Vec2
+    pub wind fm.Vec2
+    pub drag f64
+    pub turbulence_strength f64
+    pub turbulence_freq f64
+    pub vortex_center fm.Vec2
+    pub vortex_strength f64
+    pub floor_enabled bool
+    pub floor_y f64
+    pub floor_restitution f64
+    pub floor_friction f64
+    pub atlas_cols int
+    pub atlas_rows int
+    pub atlas_cycles f64
+}
+
+pub struct Particle2D {
+    pub pos fm.Vec2
+    pub vel fm.Vec2
+    pub age f64
+    pub lifetime f64
+    pub base_size f64
+    pub rotation f64
+    pub angular_vel f64
+    pub alive bool
+}
+
+pub struct ParticleSystem2D {
+    particles []Particle2D
+    config EmitterConfig2D
+    gradient ColorGradient
+    size_curve FloatCurve
+    has_size_curve bool
+    rng VfxRng
+    capacity int
+    emit_accum f64
+    pending_burst int
+    elapsed f64
+    alive int
+    collisions int
+}
+
+fn pi_f() f64 { << 3.141592653589793 }
+
+pub fn default_emitter_2d(origin fm.Vec2) EmitterConfig2D {
+    << EmitterConfig2D{
+        origin: origin,
+        direction: fm.vec2(0.0, -1.0),
+        base_velocity: fm.vec2(0.0, 0.0),
+        shape: SHAPE_2D_CONE,
+        shape_param0: 4.0,
+        shape_param1: 4.0,
+        emit_rate: 60.0,
+        emitting: true,
+        speed_min: 40.0,
+        speed_max: 90.0,
+        spread_angle: 0.4,
+        life_min: 0.6,
+        life_max: 1.2,
+        size_start_min: 6.0,
+        size_start_max: 12.0,
+        size_end_scale: 0.25,
+        stretch_factor: 0.0,
+        rotation_range: pi_f(),
+        angular_vel_min: -2.0,
+        angular_vel_max: 2.0,
+        gravity: fm.vec2(0.0, 120.0),
+        wind: fm.vec2(0.0, 0.0),
+        drag: 0.1,
+        turbulence_strength: 0.0,
+        turbulence_freq: 0.05,
+        vortex_center: origin,
+        vortex_strength: 0.0,
+        floor_enabled: false,
+        floor_y: 120.0,
+        floor_restitution: 0.6,
+        floor_friction: 0.2,
+        atlas_cols: 1,
+        atlas_rows: 1,
+        atlas_cycles: 1.0
+    }
+}
+
+fn vec2_valid(v fm.Vec2) bool {
+    << fm.finite(v.x) && fm.finite(v.y) && math.abs(v.x) <= 1000000.0 && math.abs(v.y) <= 1000000.0
+}
+
+pub fn (cfg &EmitterConfig2D) validate() int {
+    if !vec2_valid(cfg.origin) || !vec2_valid(cfg.direction) || !vec2_valid(cfg.base_velocity) ||
+        !vec2_valid(cfg.gravity) || !vec2_valid(cfg.wind) || !vec2_valid(cfg.vortex_center) {
+        >>> errors.new("nexus vfx: non-finite 2D emitter vector")
+    }
+    if cfg.direction.dot(cfg.direction) <= 1e-12 {
+        >>> errors.new("nexus vfx: 2D emitter direction cannot be zero")
+    }
+    if cfg.shape < 0 || cfg.shape > 4 ||
+        !valid_f(cfg.shape_param0) || cfg.shape_param0 < 0.0 ||
+        !valid_f(cfg.shape_param1) || cfg.shape_param1 < 0.0 {
+        >>> errors.new("nexus vfx: invalid 2D emitter shape")
+    }
+    if !valid_f(cfg.emit_rate) || cfg.emit_rate < 0.0 || cfg.emit_rate > 100000.0 ||
+        !valid_f(cfg.speed_min) || !valid_f(cfg.speed_max) || cfg.speed_max < cfg.speed_min ||
+        !valid_f(cfg.spread_angle) || cfg.spread_angle < 0.0 ||
+        !valid_f(cfg.life_min) || !valid_f(cfg.life_max) || cfg.life_min <= 0.0 || cfg.life_max < cfg.life_min ||
+        !valid_f(cfg.size_start_min) || !valid_f(cfg.size_start_max) || cfg.size_start_min <= 0.0 || cfg.size_start_max < cfg.size_start_min ||
+        !valid_f(cfg.size_end_scale) || cfg.size_end_scale < 0.0 ||
+        !valid_f(cfg.stretch_factor) || cfg.stretch_factor < 0.0 ||
+        !valid_f(cfg.rotation_range) || cfg.rotation_range < 0.0 ||
+        !valid_f(cfg.angular_vel_min) || !valid_f(cfg.angular_vel_max) || cfg.angular_vel_max < cfg.angular_vel_min ||
+        !valid_f(cfg.drag) || cfg.drag < 0.0 ||
+        !valid_f(cfg.turbulence_strength) || cfg.turbulence_strength < 0.0 || !valid_f(cfg.turbulence_freq) || cfg.turbulence_freq < 0.0 ||
+        !valid_f(cfg.vortex_strength) ||
+        !valid_f(cfg.floor_y) || !valid_f(cfg.floor_restitution) || cfg.floor_restitution < 0.0 || cfg.floor_restitution > 1.5 ||
+        !valid_f(cfg.floor_friction) || cfg.floor_friction < 0.0 || cfg.floor_friction > 1.0 ||
+        cfg.atlas_cols < 1 || cfg.atlas_cols > 64 || cfg.atlas_rows < 1 || cfg.atlas_rows > 64 ||
+        !valid_f(cfg.atlas_cycles) || cfg.atlas_cycles <= 0.0 {
+        >>> errors.new("nexus vfx: invalid 2D emitter parameter")
+    }
+    << 0
+}
+
+fn safe_norm_2(v fm.Vec2, fb fm.Vec2) fm.Vec2 {
+    if v.dot(v) <= 1e-12 { << fb }
+    << v.normalized() >>>
+}
+
+pub fn new_particle_system_2d(capacity int, seed int, config EmitterConfig2D) ParticleSystem2D {
+    if capacity < 1 || capacity > 65536 {
+        >>> errors.new("nexus vfx: 2D particle capacity must be in 1..65536")
+    }
+    config.validate() >>>
+    $particles := []Particle2D{}
+    for _ in 0:capacity {
+        particles.push(Particle2D{
+            pos: fm.vec2(0.0, 0.0),
+            vel: fm.vec2(0.0, 0.0),
+            age: 0.0,
+            lifetime: 0.0,
+            base_size: 1.0,
+            rotation: 0.0,
+            angular_vel: 0.0,
+            alive: false
+        })
+    }
+    $grad := new_color_gradient()
+    grad.add_stop(0.0, 1.0, 0.95, 0.6, 1.0) >>>
+    grad.add_stop(0.5, 1.0, 0.45, 0.1, 0.85) >>>
+    grad.add_stop(1.0, 0.3, 0.05, 0.02, 0.0) >>>
+    << ParticleSystem2D{
+        particles: particles,
+        config: config,
+        gradient: grad,
+        size_curve: new_float_curve(),
+        has_size_curve: false,
+        rng: new_vfx_rng(seed),
+        capacity: capacity,
+        emit_accum: 0.0,
+        pending_burst: 0,
+        elapsed: 0.0,
+        alive: 0,
+        collisions: 0
+    }
+}
+
+pub fn (sys $&ParticleSystem2D) set_config(config EmitterConfig2D) int {
+    config.validate() >>>
+    sys.config = config
+    << 0
+}
+
+pub fn (sys $&ParticleSystem2D) set_color_gradient(grad ColorGradient) {
+    sys.gradient = grad
+}
+
+pub fn (sys $&ParticleSystem2D) set_size_curve(curve FloatCurve) {
+    has_keys := curve.key_count() > 0
+    sys.size_curve = curve
+    sys.has_size_curve = has_keys
+}
+
+pub fn (sys $&ParticleSystem2D) burst(count int) int {
+    if count < 0 || count > 65536 { >>> errors.new("nexus vfx: invalid 2D burst count") }
+    sys.pending_burst += count
+    << 0
+}
+
+pub fn (sys $&ParticleSystem2D) clear() {
+    for i in 0:sys.particles.len {
+        sys.particles[i].alive = false
+        sys.particles[i].age = 0.0
+    }
+    sys.emit_accum = 0.0
+    sys.pending_burst = 0
+    sys.alive = 0
+    sys.collisions = 0
+}
+
+pub fn (sys &ParticleSystem2D) alive_count() int { << sys.alive }
+
+pub fn (sys &ParticleSystem2D) collision_count() int { << sys.collisions }
+
+pub fn (sys &ParticleSystem2D) particle_at(index int) Particle2D {
+    if index < 0 || index >= sys.particles.len { >>> errors.new("nexus vfx: 2D particle index out of range") }
+    << sys.particles[index]
+}
+
+fn spawn_one_2d(rng $&VfxRng, cfg &EmitterConfig2D) Particle2D {
+    axis := safe_norm_2(cfg.direction, fm.vec2(0.0, -1.0)) >>>
+    base_angle := math.atan2(axis.y, axis.x)
+    $offset := fm.vec2(0.0, 0.0)
+    $dir := axis
+
+    if cfg.shape == SHAPE_2D_CIRCLE {
+        ang := rng.range(0.0, 2.0 * pi_f()) >>>
+        rad := math.sqrt(rng.next_f01()) * cfg.shape_param0
+        radial := fm.vec2(math.cos(ang), math.sin(ang))
+        offset = radial.scaled(rad)
+        dir = radial
+    } else if cfg.shape == SHAPE_2D_RING {
+        ang := rng.range(0.0, 2.0 * pi_f()) >>>
+        radial := fm.vec2(math.cos(ang), math.sin(ang))
+        offset = radial.scaled(cfg.shape_param0)
+        dir = radial
+    } else if cfg.shape == SHAPE_2D_BOX {
+        ox := rng.range(-cfg.shape_param0, cfg.shape_param0) >>>
+        oy := rng.range(-cfg.shape_param1, cfg.shape_param1) >>>
+        offset = fm.vec2(ox, oy)
+    } else if cfg.shape == SHAPE_2D_CONE {
+        spread := rng.range(-cfg.spread_angle, cfg.spread_angle) >>>
+        a := base_angle + spread
+        dir = fm.vec2(math.cos(a), math.sin(a))
+    }
+
+    if cfg.shape != SHAPE_2D_CONE && cfg.spread_angle > 0.0 {
+        cur_a := math.atan2(dir.y, dir.x)
+        jit := rng.range(-cfg.spread_angle, cfg.spread_angle) >>>
+        a := cur_a + jit
+        dir = fm.vec2(math.cos(a), math.sin(a))
+    }
+
+    speed := rng.range(cfg.speed_min, cfg.speed_max) >>>
+    life := rng.range(cfg.life_min, cfg.life_max) >>>
+    sz := rng.range(cfg.size_start_min, cfg.size_start_max) >>>
+    rot := rng.range(-cfg.rotation_range, cfg.rotation_range) >>>
+    ang_v := rng.range(cfg.angular_vel_min, cfg.angular_vel_max) >>>
+
+    << Particle2D{
+        pos: cfg.origin.add(offset),
+        vel: cfg.base_velocity.add(dir.scaled(speed)),
+        age: 0.0,
+        lifetime: life,
+        base_size: sz,
+        rotation: rot,
+        angular_vel: ang_v,
+        alive: true
+    }
+}
+
+pub fn (sys $&ParticleSystem2D) step(dt f64) int {
+    if !valid_f(dt) || dt < 0.0 || dt > 1.0 {
+        >>> errors.new("nexus vfx: 2D particle dt must be in 0..1")
+    }
+    sys.config.validate() >>>
+    cfg := &sys.config
+
+    $to_spawn := sys.pending_burst
+    sys.pending_burst = 0
+    if cfg.emitting && cfg.emit_rate > 0.0 && dt > 0.0 {
+        sys.emit_accum += cfg.emit_rate * dt
+        n := int(math.floor(sys.emit_accum))
+        if n > 0 {
+            sys.emit_accum -= f64(n)
+            to_spawn += n
+        }
+    }
+    sys.elapsed += dt
+    sys.collisions = 0
+    $alive_n := 0
+    gw := cfg.gravity.add(cfg.wind)
+
+    for i in 0:sys.particles.len {
+        if sys.particles[i].alive {
+            p := $&sys.particles[i]
+            p.age += dt
+            if p.age >= p.lifetime {
+                p.alive = false
+            } else {
+                p.vel = p.vel.add(gw.scaled(dt))
+                if cfg.turbulence_strength > 0.0 {
+                    tx := math.sin(p.pos.y * cfg.turbulence_freq + sys.elapsed * 2.1)
+                    ty := math.cos(p.pos.x * cfg.turbulence_freq - sys.elapsed * 1.7)
+                    p.vel = p.vel.add(fm.vec2(tx, ty).scaled(cfg.turbulence_strength * dt))
+                }
+                if cfg.vortex_strength != 0.0 {
+                    rel := p.pos.sub(cfg.vortex_center)
+                    rlen := rel.length()
+                    if rlen > 1e-4 {
+                        tang := fm.vec2(-rel.y / rlen, rel.x / rlen)
+                        p.vel = p.vel.add(tang.scaled(cfg.vortex_strength * dt))
+                    }
+                }
+                if cfg.drag > 0.0 {
+                    p.vel = p.vel.scaled(math.exp(-cfg.drag * dt))
+                }
+                p.pos = p.pos.add(p.vel.scaled(dt))
+                p.rotation += p.angular_vel * dt
+
+                if cfg.floor_enabled && p.pos.y > cfg.floor_y {
+                    p.pos = fm.vec2(p.pos.x, cfg.floor_y)
+                    if p.vel.y > 0.0 {
+                        p.vel = fm.vec2(
+                            p.vel.x * math.max(0.0, 1.0 - cfg.floor_friction),
+                            -p.vel.y * cfg.floor_restitution
+                        )
+                        sys.collisions += 1
+                    }
+                }
+                alive_n += 1
+            }
+        }
+        if !sys.particles[i].alive && to_spawn > 0 {
+            sys.particles[i] = spawn_one_2d($&sys.rng, cfg) >>>
+            to_spawn -= 1
+            alive_n += 1
+        }
+    }
+    sys.alive = alive_n
+    << alive_n
+}
+
+pub fn (sys &ParticleSystem2D) emit_batch(batch $&canvas.Batch2D) int {
+    cfg := &sys.config
+    $emitted := 0
+    total_frames := cfg.atlas_cols * cfg.atlas_rows
+    for i in 0:sys.particles.len {
+        p := &sys.particles[i]
+        if !p.alive { -> }
+        t := clamp_01(p.age / math.max(p.lifetime, 1e-5))
+        color := sys.gradient.evaluate_rgba8(t) >>>
+
+        $scale := lerp_scalar(1.0, cfg.size_end_scale, t)
+        if sys.has_size_curve { scale = math.max(0.0, sys.size_curve.evaluate(t) >>>) }
+        $half_w := p.base_size * scale * 0.5
+        $half_h := half_w
+        if half_w <= 1e-4 { -> }
+
+        $rx := math.cos(p.rotation)
+        $ry := math.sin(p.rotation)
+        if cfg.stretch_factor > 0.0 && p.vel.dot(p.vel) > 1e-6 {
+            vlen := p.vel.length()
+            vdir := p.vel.scaled(1.0 / vlen)
+            rx = vdir.x
+            ry = vdir.y
+            half_w = half_w * (1.0 + vlen * cfg.stretch_factor)
+        }
+        ux := -ry
+        uy := rx
+
+        v_r := fm.vec2(rx * half_w, ry * half_w)
+        v_u := fm.vec2(ux * half_h, uy * half_h)
+
+        c0 := p.pos.sub(v_r).sub(v_u)
+        c1 := p.pos.add(v_r).sub(v_u)
+        c2 := p.pos.add(v_r).add(v_u)
+        c3 := p.pos.sub(v_r).add(v_u)
+
+        $u0 := 0.0
+        $v0 := 0.0
+        $u1 := 1.0
+        $v1 := 1.0
+        if total_frames > 1 {
+            $cols := cfg.atlas_cols
+            $rows := cfg.atlas_rows
+            if cols < 1 { cols = 1 }
+            if rows < 1 { rows = 1 }
+            phase := t * cfg.atlas_cycles
+            frac := phase - math.floor(phase)
+            $fid := int(math.floor(frac * f64(total_frames)))
+            if fid < 0 { fid = 0 }
+            if fid >= total_frames { fid = total_frames - 1 }
+            cx := fid % cols
+            cy := fid / cols
+            u0 = f64(cx) / f64(cols)
+            v0 = f64(cy) / f64(rows)
+            u1 = f64(cx + 1) / f64(cols)
+            v1 = f64(cy + 1) / f64(rows)
+        }
+
+        batch.triangle_uv(c0, c1, c2, color, color, color, fm.vec2(u0, v0), fm.vec2(u1, v0), fm.vec2(u1, v1)) >>>
+        batch.triangle_uv(c0, c2, c3, color, color, color, fm.vec2(u0, v0), fm.vec2(u1, v1), fm.vec2(u0, v1)) >>>
+        emitted += 1
+    }
+    << emitted
+}

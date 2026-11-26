@@ -1,0 +1,294 @@
+@main
+
+#gpu
+#math
+fm #"github.com/xulang-org/nexus/foundation/math"
+mesh #"github.com/xulang-org/nexus/resources/mesh"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+nexus #"github.com/xulang-org/nexus/scene"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+shd #"github.com/xulang-org/nexus/assets/shaders/three_d"
+modern #"github.com/xulang-org/nexus/integration/rendering/three_d"
+
+fn quad_xy(w f64, h f64, normal fm.Vec3) mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    for xy in [fm.vec2(-w, -h), fm.vec2(w, -h), fm.vec2(w, h), fm.vec2(-w, h)] {
+        d.vertex_lit(fm.vec3(xy.x, xy.y, 0.0), 4294967295, normal) >>>
+    }
+    d.triangle(0, 1, 2) >>>
+    d.triangle(0, 2, 3) >>>
+    d.validate() >>>
+    << d
+}
+
+fn quad_xy_uv(w f64, h f64, color int) mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    n := fm.vec3(0.0, 0.0, 1.0)
+    d.vertex_lit_uv(fm.vec3(-w, -h, 0.0), color, n, fm.vec2(0.0, 1.0)) >>>
+    d.vertex_lit_uv(fm.vec3(w, -h, 0.0), color, n, fm.vec2(1.0, 1.0)) >>>
+    d.vertex_lit_uv(fm.vec3(w, h, 0.0), color, n, fm.vec2(1.0, 0.0)) >>>
+    d.vertex_lit_uv(fm.vec3(-w, h, 0.0), color, n, fm.vec2(0.0, 0.0)) >>>
+    d.triangle(0, 1, 2) >>>
+    d.triangle(0, 2, 3) >>>
+    d.validate() >>>
+    << d
+}
+
+fn ch_r(c int) int { << (c >> 24) & 255 }
+fn ch_g(c int) int { << (c >> 16) & 255 }
+fn ch_b(c int) int { << (c >> 8) & 255 }
+fn abs_i(v int) int { if v < 0 { << -v } << v }
+
+fn luma(c int) int {
+    << (ch_r(c) * 3 + ch_g(c) * 6 + ch_b(c)) / 10
+}
+
+fn render_hdr_and_transparent(
+    device $&ren.Device3D,
+    hdr $&ren.HdrTarget3D,
+    hiz $&ren.HizPyramid3D,
+    pp $&ren.PostProcessPipeline3D,
+    clustered &ren.ClusteredRenderer3D,
+    irr &ren.IrradianceGpu3D,
+    opaque_ref ren.MeshRef3D,
+    opaque_world fm.Mat4,
+    opaque_mat &ren.Material3D,
+    queue &ren.TransparentQueue3D,
+    view fm.Mat4,
+    proj fm.Mat4,
+    vp fm.Mat4,
+    z_near f64,
+    z_far f64,
+    cfg &ren.PostProcessConfig3D
+) int {
+    hdr.begin(device, 255) >>>
+    hdr.draw_clustered(device, clustered, opaque_ref, opaque_world, view, vp, opaque_mat) >>>
+    hdr.end() >>>
+
+    queue.flush_into_hdr(device, hdr, clustered, false, irr, 0.0, view, vp) >>>
+
+    device.begin(255) >>>
+    pp.apply(device, hdr, hiz, view, proj, z_near, z_far, cfg) >>>
+    px := device.read_pixel(64, 64) >>>
+    device.present() >>>
+    << px
+}
+
+fn render_single_hdr(
+    device $&ren.Device3D,
+    hdr $&ren.HdrTarget3D,
+    hiz $&ren.HizPyramid3D,
+    pp $&ren.PostProcessPipeline3D,
+    clustered &ren.ClusteredRenderer3D,
+    mesh_ref ren.MeshRef3D,
+    world fm.Mat4,
+    mat &ren.Material3D,
+    view fm.Mat4,
+    proj fm.Mat4,
+    vp fm.Mat4,
+    z_near f64,
+    z_far f64,
+    cfg &ren.PostProcessConfig3D
+) int {
+    hdr.begin(device, 255) >>>
+    hdr.draw_clustered(device, clustered, mesh_ref, world, view, vp, mat) >>>
+    hdr.end() >>>
+
+    device.begin(255) >>>
+    pp.apply(device, hdr, hiz, view, proj, z_near, z_far, cfg) >>>
+    px := device.read_pixel(64, 64) >>>
+    device.present() >>>
+    << px
+}
+
+fn run() int {
+    program := shd.load_mesh("build/mesh-shaders") >>>
+    cprog := shd.load_clustered_program("build/mesh-shaders") >>>
+    iprog := shd.load_indirect_program("build/mesh-shaders") >>>
+    pprog := shd.load_postprocess_program("build/mesh-shaders") >>>
+    mprog := shd.load_meshlet_program("build/mesh-shaders") >>>
+    ibl_prog := shd.load_ibl_program("build/mesh-shaders") >>>
+    sprog := shd.load_shadow("build/mesh-shaders") >>>
+
+    $device := ren.open_3d("Transparent + Extended PBR checks", 128, 128, gpu.METAL, &program) >>>
+    $clustered := device.clustered_renderer(&cprog) >>>
+    $hiz := device.hiz_pyramid(&iprog) >>>
+    $hdr := device.hdr_target(&pprog) >>>
+    $pp := device.postprocess_pipeline(&pprog) >>>
+
+    grid := ren.irradiance_grid_3d(fm.vec3(-4.0, -4.0, -4.0), fm.vec3(4.0, 4.0, 4.0), 2, 2, 2) >>>
+    $irr_gpu := grid.upload(&device) >>>
+
+    $qdata := quad_xy(1.8, 1.8, fm.vec3(0.0, 0.0, 1.0)) >>>
+    $qmesh := device.upload(&qdata) >>>
+    $bdata := quad_xy(4.0, 4.0, fm.vec3(0.0, 0.0, 1.0)) >>>
+    $bmesh := device.upload(&bdata) >>>
+
+    $cfg := ren.post_process_defaults_3d()
+    cfg.ao_enabled = false
+    cfg.ssr_enabled = false
+    cfg.bloom_enabled = false
+    cfg.taa_enabled = false
+    cfg.taa_blend = 0.0
+
+    eye := fm.vec3(0.0, 0.0, 2.5)
+    view := nexus.look_at_3d(eye, fm.vec3(0.0, 0.0, -2.0), fm.vec3(0.0, 1.0, 0.0)) >>>
+    z_near := 0.25
+    z_far := 40.0
+    proj := nexus.perspective_3d(0.9, 1.0, z_near, z_far) >>>
+    vp := proj.multiply(view)
+
+    sun := lights.directional(fm.vec3(0.0, 0.15, 0.988).normalized() >>>, fm.vec3(2.2, 2.2, 2.2)) >>>
+    clustered.bin_lights(&device, fm.vec3(0.35, 0.35, 0.35), eye, 1.0, &[sun], view, proj, z_near, z_far, 0) >>>
+
+    backdrop_mat := ren.material_3d(fm.vec3(0.15, 0.15, 0.15), 0.0, 0.9, fm.vec3(0.0, 0.0, 0.0)) >>>
+    red_base := ren.material_3d(fm.vec3(0.95, 0.06, 0.06), 0.0, 0.85, fm.vec3(0.0, 0.0, 0.0)) >>>
+    red_a := red_base.with_alpha(0.55) >>>
+    red_glass := red_a.with_alpha_blend(true) >>>
+    blue_base := ren.material_3d(fm.vec3(0.06, 0.06, 0.95), 0.0, 0.85, fm.vec3(0.0, 0.0, 0.0)) >>>
+    blue_a := blue_base.with_alpha(0.55) >>>
+    blue_glass := blue_a.with_alpha_blend(true) >>>
+
+    // 1. Back-to-Front sorting check: submit NEAR red FIRST (-1.0), FAR blue SECOND (-3.0)!
+    $tq1 := ren.new_transparent_queue_3d()
+    tq1.submit(qmesh.reference(), fm.translation_3d(fm.vec3(0.0, 0.0, -1.0)), red_glass, 0.0) >>>
+    tq1.submit(qmesh.reference(), fm.translation_3d(fm.vec3(0.0, 0.0, -3.0)), blue_glass, 0.0) >>>
+    order1 := tq1.sorted_indices(view) >>>
+    assert(order1.len == 2 && order1[0] == 1 && order1[1] == 0)
+
+    // Tie-break check by order_bias.
+    $tq_tie := ren.new_transparent_queue_3d()
+    tq_tie.submit(qmesh.reference(), fm.translation_3d(fm.vec3(0.0, 0.0, -2.0)), red_glass, 2.0) >>>
+    tq_tie.submit(qmesh.reference(), fm.translation_3d(fm.vec3(0.0, 0.0, -2.0)), blue_glass, 1.0) >>>
+    order_tie := tq_tie.sorted_indices(view) >>>
+    assert(order_tie.len == 2 && order_tie[0] == 1 && order_tie[1] == 0)
+
+    px_red_front := render_hdr_and_transparent(
+        $&device, $&hdr, $&hiz, $&pp, &clustered, &irr_gpu,
+        bmesh.reference(), fm.translation_3d(fm.vec3(0.0, 0.0, -5.0)), &backdrop_mat,
+        &tq1, view, proj, vp, z_near, z_far, &cfg
+    ) >>>
+    assert(ch_r(px_red_front) > ch_b(px_red_front) + 20)
+
+    // Swap depths (FAR red at -3.0 submitted SECOND, NEAR blue at -1.0 submitted FIRST): blue must dominate!
+    $tq2 := ren.new_transparent_queue_3d()
+    tq2.submit(qmesh.reference(), fm.translation_3d(fm.vec3(0.0, 0.0, -1.0)), blue_glass, 0.0) >>>
+    tq2.submit(qmesh.reference(), fm.translation_3d(fm.vec3(0.0, 0.0, -3.0)), red_glass, 0.0) >>>
+    px_blue_front := render_hdr_and_transparent(
+        $&device, $&hdr, $&hiz, $&pp, &clustered, &irr_gpu,
+        bmesh.reference(), fm.translation_3d(fm.vec3(0.0, 0.0, -5.0)), &backdrop_mat,
+        &tq2, view, proj, vp, z_near, z_far, &cfg
+    ) >>>
+    assert(ch_b(px_blue_front) > ch_r(px_blue_front) + 20)
+
+    // 2. Depth test against opaque blocker (depth_write=false): green glass at -3.5 behind opaque blocker at -2.0 must be rejected!
+    blocker_mat := ren.material_3d(fm.vec3(0.45, 0.45, 0.45), 0.0, 0.9, fm.vec3(0.0, 0.0, 0.0)) >>>
+    green_base := ren.material_3d(fm.vec3(0.05, 0.98, 0.05), 0.0, 0.85, fm.vec3(0.0, 0.0, 0.0)) >>>
+    green_a := green_base.with_alpha(0.85) >>>
+    green_glass := green_a.with_alpha_blend(true) >>>
+    $tq_occ := ren.new_transparent_queue_3d()
+    tq_occ.submit(qmesh.reference(), fm.translation_3d(fm.vec3(0.0, 0.0, -3.5)), green_glass, 0.0) >>>
+    px_occ := render_hdr_and_transparent(
+        $&device, $&hdr, $&hiz, $&pp, &clustered, &irr_gpu,
+        qmesh.reference(), fm.translation_3d(fm.vec3(0.0, 0.0, -2.0)), &blocker_mat,
+        &tq_occ, view, proj, vp, z_near, z_far, &cfg
+    ) >>>
+    assert(abs_i(ch_g(px_occ) - ch_r(px_occ)) <= 8 && abs_i(ch_g(px_occ) - ch_b(px_occ)) <= 8)
+
+    // 3. Extended PBR (Clearcoat + High IOR + Grazing Sheen):
+    spec_light := lights.directional(fm.vec3(0.0, 0.0, 1.0), fm.vec3(3.5, 3.5, 3.5)) >>>
+    clustered.bin_lights(&device, fm.vec3(0.02, 0.02, 0.02), eye, 1.0, &[spec_light], view, proj, z_near, z_far, 0) >>>
+
+    // 3A. Clearcoat over dark rough base produces crisp white coat specular highlight.
+    mat_coat_off := ren.material_3d(fm.vec3(0.06, 0.06, 0.06), 0.0, 0.95, fm.vec3(0.0, 0.0, 0.0)) >>>
+    mat_coat_on := mat_coat_off.with_clearcoat(1.0, 0.05) >>>
+    px_coat_off := render_single_hdr($&device, $&hdr, $&hiz, $&pp, &clustered, qmesh.reference(), fm.identity_3d(), &mat_coat_off, view, proj, vp, z_near, z_far, &cfg) >>>
+    px_coat_on := render_single_hdr($&device, $&hdr, $&hiz, $&pp, &clustered, qmesh.reference(), fm.identity_3d(), &mat_coat_on, view, proj, vp, z_near, z_far, &cfg) >>>
+    assert(luma(px_coat_on) > luma(px_coat_off) + 30)
+
+    // 3B. High IOR (2.4 vs 1.5) increases dielectric Fresnel F0 (0.17 vs 0.04) without ACES highlight saturation.
+    mat_ior_base := ren.material_3d(fm.vec3(0.03, 0.03, 0.03), 0.0, 0.55, fm.vec3(0.0, 0.0, 0.0)) >>>
+    mat_ior_low := mat_ior_base.with_ior(1.5) >>>
+    mat_ior_high := mat_ior_low.with_ior(2.4) >>>
+    px_ior_low := render_single_hdr($&device, $&hdr, $&hiz, $&pp, &clustered, qmesh.reference(), fm.identity_3d(), &mat_ior_low, view, proj, vp, z_near, z_far, &cfg) >>>
+    px_ior_high := render_single_hdr($&device, $&hdr, $&hiz, $&pp, &clustered, qmesh.reference(), fm.identity_3d(), &mat_ior_high, view, proj, vp, z_near, z_far, &cfg) >>>
+    assert(luma(px_ior_high) > luma(px_ior_low) + 15)
+
+    // 3C. Grazing Sheen (KHR_materials_sheen) retro-reflection lifts grazing magenta edges.
+    grazing_eye := fm.vec3(2.4, 0.0, 0.95)
+    grazing_view := nexus.look_at_3d(grazing_eye, fm.vec3(0.0, 0.0, 0.0), fm.vec3(0.0, 1.0, 0.0)) >>>
+    grazing_vp := proj.multiply(grazing_view)
+    sheen_light := lights.directional(fm.vec3(0.85, 0.1, 0.52).normalized() >>>, fm.vec3(3.2, 3.2, 3.2)) >>>
+    clustered.bin_lights(&device, fm.vec3(0.12, 0.12, 0.12), grazing_eye, 1.0, &[sheen_light], grazing_view, proj, z_near, z_far, 0) >>>
+
+    mat_velvet_off := ren.material_3d(fm.vec3(0.05, 0.05, 0.05), 0.0, 0.95, fm.vec3(0.0, 0.0, 0.0)) >>>
+    mat_velvet_on := mat_velvet_off.with_sheen(fm.vec3(1.0, 0.08, 1.0), 0.75) >>>
+    px_sh_off := render_single_hdr($&device, $&hdr, $&hiz, $&pp, &clustered, qmesh.reference(), fm.identity_3d(), &mat_velvet_off, grazing_view, proj, grazing_vp, z_near, z_far, &cfg) >>>
+    px_sh_on := render_single_hdr($&device, $&hdr, $&hiz, $&pp, &clustered, qmesh.reference(), fm.identity_3d(), &mat_velvet_on, grazing_view, proj, grazing_vp, z_near, z_far, &cfg) >>>
+    assert(ch_r(px_sh_on) > ch_r(px_sh_off) + 15 && ch_b(px_sh_on) > ch_b(px_sh_off) + 15 && ch_r(px_sh_on) > ch_g(px_sh_on) + 15)
+
+    // 4. Unified ModernPipeline3D.render_unified_pbr_transparent_frame (Meshlet VisBuffer + Clustered + Sorted Transparent + Cull):
+    hdr.close() >>>
+    pp.close() >>>
+    hiz.close() >>>
+    clustered.close() >>>
+
+    $mp := modern.new_modern_pipeline_3d(&device, &cprog, &iprog, &pprog) >>>
+    $mvis := device.meshlet_vis_renderer(&mprog) >>>
+    bg_mesh_data := quad_xy_uv(3.5, 3.5, 4294967295) >>>
+    m_bg := mvis.add_mesh(&bg_mesh_data) >>>
+    _ := mvis.add_instance(m_bg, fm.translation_3d(fm.vec3(0.0, 0.0, -5.0)), &backdrop_mat) >>>
+    mvis.commit(&device) >>>
+
+    $ibl := device.environment_ibl(&ibl_prog) >>>
+    ibl_sun_dir := fm.vec3(0.0, 0.2, 0.98).normalized() >>>
+    ibl.bake(&device, fm.vec3(0.15, 0.2, 0.25), fm.vec3(0.2, 0.25, 0.3), fm.vec3(0.1, 0.1, 0.1),
+        ibl_sun_dir, fm.vec3(1.0, 1.0, 1.0), 0.4) >>>
+    _ := sprog
+
+    mp.prepare_lights(&device, fm.vec3(0.35, 0.35, 0.35), eye, 1.0, &[sun], view, proj, z_near, z_far) >>>
+
+    $tq_mod := ren.new_transparent_queue_3d()
+    tq_mod.submit(qmesh.reference(), fm.translation_3d(fm.vec3(0.0, 0.0, -1.0)), red_glass, 0.0) >>>
+    tq_mod.submit(qmesh.reference(), fm.translation_3d(fm.vec3(0.0, 0.0, -3.0)), blue_glass, 0.0) >>>
+    tq_mod.submit(qmesh.reference(), fm.translation_3d(fm.vec3(60.0, 0.0, -2.0)), green_glass, 0.0) >>> // outside frustum!
+
+    empty_refs := []ren.MeshRef3D{}
+    empty_mats_4 := []fm.Mat4{}
+    empty_mats_m := []ren.Material3D{}
+    no_shad := ren.no_shadow_binding()
+    mstats := mp.render_unified_pbr_transparent_frame(
+        $&device, $&mvis, false, &irr_gpu, 0.0,
+        false, &no_shad, true, &ibl,
+        &empty_refs, &empty_mats_4, &empty_mats_m,
+        &tq_mod, eye, view, proj, z_near, z_far, fm.vec3(0.02, 0.02, 0.03), 255, false, false, &cfg
+    ) >>>
+    px_unified := device.read_pixel(64, 64) >>>
+    device.present() >>>
+    assert(mstats.transparent_visible == 2 && mstats.transparent_culled == 1)
+    assert(ch_r(px_unified) > ch_b(px_unified) + 20)
+
+    ibl.close() >>>
+    mvis.close() >>>
+    mp.close() >>>
+    irr_gpu.close() >>>
+    qmesh.close() >>>
+    bmesh.close() >>>
+    device.close() >>>
+
+    println("PASS: Back-to-Front Transparent Queue + Extended PBR (red_front=(" +
+        str(ch_r(px_red_front)) + "," + str(ch_b(px_red_front)) +
+        "), blue_front=(" + str(ch_r(px_blue_front)) + "," + str(ch_b(px_blue_front)) +
+        "), coat=" + str(luma(px_coat_off)) + "->" + str(luma(px_coat_on)) +
+        ", ior=" + str(luma(px_ior_low)) + "->" + str(luma(px_ior_high)) +
+        ", sheen_r=" + str(ch_r(px_sh_off)) + "->" + str(ch_r(px_sh_on)) +
+        ", unified_vis=" + str(mstats.transparent_visible) + "/culled=" + str(mstats.transparent_culled) + ")")
+    << 0
+}
+
+fn main() int {
+    << run() >>> (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

@@ -22,17 +22,37 @@ pub struct Instance {
     retired []int
     retired_signals []int
     retired_handlers []int
+    retired_coroutines []int
     signals []SignalEvent
     epoch int
     calls int
+    scratch_regs []f64
+    scratch_stamps []int
+    reg_stamp int
+    scratch_state []f64
+}
+fn init_scratch_regs(count int) []f64 {
+    $out := []f64{}
+    for _ in 0:count { out.push(0.0) }
+    << out
+}
+fn init_scratch_stamps(count int) []int {
+    $out := []int{}
+    for _ in 0:count { out.push(0) }
+    << out
 }
 pub fn instantiate(program bc.Module) Instance {
     program.check() >>>
     $values := []f64{}
+    $s_state := []f64{}
     for i in 0:program.field_count() { field := program.field(i) >>>
-        values.push(field.initial) }
-    << Instance{program: program, values: values, retired: []int{}, retired_signals: []int{}, retired_handlers: []int{},
-        signals: []SignalEvent{}, epoch: 1, calls: 0}
+        values.push(field.initial)
+        s_state.push(field.initial) }
+    reg_n := program.register_count()
+    << Instance{program: program, values: values, retired: []int{}, retired_signals: []int{}, retired_handlers: []int{}, retired_coroutines: []int{},
+        signals: []SignalEvent{}, epoch: 1, calls: 0,
+        scratch_regs: init_scratch_regs(reg_n), scratch_stamps: init_scratch_stamps(reg_n),
+        reg_stamp: 0, scratch_state: s_state}
 }
 pub fn (instance &Instance) epoch() int { << instance.epoch }
 pub fn (instance &Instance) calls() int { << instance.calls }
@@ -42,6 +62,8 @@ pub fn (instance &Instance) has_signal(id int) bool { << instance.program.signal
 pub fn (instance &Instance) signal_id(name string) int { << instance.program.signal_id(name) >>> }
 pub fn (instance &Instance) has_handler(id int) bool { << instance.program.handler_index(id) >= 0 }
 pub fn (instance &Instance) handler_id(name string) int { << instance.program.handler_id(name) >>> }
+pub fn (instance &Instance) has_coroutine(id int) bool { << instance.program.coroutine_index(id) >= 0 }
+pub fn (instance &Instance) coroutine_id(name string) int { << instance.program.coroutine_id(name) >>> }
 pub fn (instance &Instance) pending_signals() int { << instance.signals.len }
 // Draining transfers committed events exactly once. The caller owns delivery.
 pub fn (instance $&Instance) drain_signals() []SignalEvent {
@@ -76,19 +98,27 @@ pub fn (instance $&Instance) reload(candidate bc.Module) int {
     $retired := []int{}
     $retired_signals := []int{}
     $retired_handlers := []int{}
+    $retired_coroutines := []int{}
     for id in instance.retired { retired.push(id) }
     for id in instance.retired_signals { retired_signals.push(id) }
     for id in instance.retired_handlers { retired_handlers.push(id) }
+    for id in instance.retired_coroutines { retired_coroutines.push(id) }
     for i in 0:candidate.function_count() {
         f := candidate.function(i) >>>
-        if f.kind != bc.SIGNAL_FUNCTION { -> }
-        for id in instance.retired_handlers {
-            if id == f.id { >>> errors.new("XuScript: retired handler ID cannot be reused") }
+        if f.kind == bc.SIGNAL_FUNCTION {
+            for id in instance.retired_handlers {
+                if id == f.id { >>> errors.new("XuScript: retired handler ID cannot be reused") }
+            }
+        } else if f.kind == bc.COROUTINE_FUNCTION {
+            for id in instance.retired_coroutines {
+                if id == f.id { >>> errors.new("XuScript: retired coroutine ID cannot be reused") }
+            }
         }
     }
     for i in 0:instance.program.function_count() {
         f := instance.program.function(i) >>>
         if f.kind == bc.SIGNAL_FUNCTION && candidate.handler_index(f.id) < 0 { retired_handlers.push(f.id) }
+        if f.kind == bc.COROUTINE_FUNCTION && candidate.coroutine_index(f.id) < 0 { retired_coroutines.push(f.id) }
     }
     for i in 0:candidate.signal_count() {
         signal := candidate.signal(i) >>>
@@ -110,21 +140,38 @@ pub fn (instance $&Instance) reload(candidate bc.Module) int {
         field := instance.program.field(i) >>>
         if candidate.field_index(field.id) < 0 { retired.push(field.id) }
     }
-    if retired.len > MAX_RETIRED_IDS || retired_signals.len > MAX_RETIRED_IDS || retired_handlers.len > MAX_RETIRED_IDS {
+    if retired.len > MAX_RETIRED_IDS || retired_signals.len > MAX_RETIRED_IDS ||
+        retired_handlers.len > MAX_RETIRED_IDS || retired_coroutines.len > MAX_RETIRED_IDS {
         >>> errors.new("XuScript: field/signal/handler retirement history limit exceeded") }
     instance.program = candidate
     instance.values = next
     instance.retired = retired
     instance.retired_signals = retired_signals
     instance.retired_handlers = retired_handlers
+    instance.retired_coroutines = retired_coroutines
     instance.epoch = instance.epoch + 1
+    req_regs := instance.program.register_count()
+    while instance.scratch_regs.len < req_regs {
+        instance.scratch_regs.push(0.0)
+        instance.scratch_stamps.push(0)
+    }
+    while instance.scratch_state.len < instance.values.len {
+        instance.scratch_state.push(0.0)
+    }
     << 1
 }
 fn failure(program &bc.Module, instruction bc.Instruction, message string) string {
     << "XuScript " + program.name() + ":" + str(instruction.line) + ":" + str(instruction.col) + ": " + message
 }
-fn read(registers &[]f64, initialized &[]bool, index int, program &bc.Module, instruction bc.Instruction) f64 {
-    if !initialized[index] { >>> errors.new(failure(program, instruction, "read of uninitialized register")) }
+fn read_stamped(
+    registers &[]f64,
+    stamps &[]int,
+    stamp int,
+    index int,
+    program &bc.Module,
+    instruction bc.Instruction
+) f64 {
+    if stamps[index] != stamp { >>> errors.new(failure(program, instruction, "read of uninitialized register")) }
     << registers[index]
 }
 pub fn (instance $&Instance) execute(delta f64, axis f64, budget int, result_limit f64) f64 {
@@ -145,20 +192,32 @@ fn (instance $&Instance) execute_entry(index int, argument_a f64, argument_b f64
         !bc.valid_scalar(result_limit) || result_limit <= 0.0 {
         >>> errors.new("XuScript: invalid callback arguments/budget/result bound")
     }
-    $registers := []f64{}
-    $initialized := []bool{}
-    for i in 0:instance.program.register_count() { registers.push(0.0)
-        initialized.push(false) }
-    function := instance.program.function(index) >>>
-    registers[0] = argument_a
-    initialized[0] = true
-    if function.kind == bc.PHYSICS_FUNCTION {
-        registers[1] = argument_b
-        initialized[1] = true
+    req_regs := instance.program.register_count()
+    while instance.scratch_regs.len < req_regs {
+        instance.scratch_regs.push(0.0)
+        instance.scratch_stamps.push(0)
     }
-    $state := []f64{}
+    state_len := instance.values.len
+    while instance.scratch_state.len < state_len {
+        instance.scratch_state.push(0.0)
+    }
+    if instance.reg_stamp >= 2000000000 {
+        for i in 0:instance.scratch_stamps.len { instance.scratch_stamps[i] = 0 }
+        instance.reg_stamp = 0
+    }
+    instance.reg_stamp += 1
+    stamp := instance.reg_stamp
+    function := instance.program.function(index) >>>
+    instance.scratch_regs[0] = argument_a
+    instance.scratch_stamps[0] = stamp
+    if function.kind == bc.PHYSICS_FUNCTION {
+        instance.scratch_regs[1] = argument_b
+        instance.scratch_stamps[1] = stamp
+    }
+    for i in 0:state_len {
+        instance.scratch_state[i] = instance.values[i]
+    }
     $signals := []SignalEvent{}
-    for value in instance.values { state.push(value) }
     $pc := function.entry
     $remaining := budget
     while true {
@@ -171,17 +230,17 @@ fn (instance $&Instance) execute_entry(index int, argument_a f64, argument_b f64
         if op == bc.JUMP { pc = instruction.dst
             -> }
         if op == bc.BRANCH_FALSE {
-            condition := read(&registers, &initialized, instruction.a, &instance.program, instruction) >>>
+            condition := read_stamped(&instance.scratch_regs, &instance.scratch_stamps, stamp, instruction.a, &instance.program, instruction) >>>
             if condition == 0.0 { pc = instruction.dst }
             ->
         }
         if op == bc.RETURN {
-            result := read(&registers, &initialized, instruction.a, &instance.program, instruction) >>>
+            result := read_stamped(&instance.scratch_regs, &instance.scratch_stamps, stamp, instruction.a, &instance.program, instruction) >>>
             if !bc.valid_scalar(result) || math.abs(result) > result_limit {
                 >>> errors.new(failure(&instance.program, instruction, "callback result outside host bound"))
             }
             if instance.calls >= 9223372036854775806 { >>> errors.new("XuScript: callback counter exhausted") }
-            instance.values = state
+            for i in 0:state_len { instance.values[i] = instance.scratch_state[i] }
             instance.calls = instance.calls + 1
             for event in signals { instance.signals.push(event) }
             << result
@@ -190,27 +249,43 @@ fn (instance $&Instance) execute_entry(index int, argument_a f64, argument_b f64
             if signals.len >= MAX_SIGNALS_PER_CALL || instance.signals.len + signals.len >= MAX_PENDING_SIGNALS {
                 >>> errors.new(failure(&instance.program, instruction, "signal outbox limit exceeded"))
             }
-            value := read(&registers, &initialized, instruction.a, &instance.program, instruction) >>>
+            value := read_stamped(&instance.scratch_regs, &instance.scratch_stamps, stamp, instruction.a, &instance.program, instruction) >>>
             signal := instance.program.signal(instruction.dst) >>>
             signals.push(SignalEvent{id: signal.id, value: value, epoch: instance.epoch, call: instance.calls + 1})
             ->
         }
         if op == bc.STORE_FIELD {
-            value := read(&registers, &initialized, instruction.a, &instance.program, instruction) >>>
-            state[instruction.dst] = value
+            value := read_stamped(&instance.scratch_regs, &instance.scratch_stamps, stamp, instruction.a, &instance.program, instruction) >>>
+            instance.scratch_state[instruction.dst] = value
             ->
         }
         $value := 0.0
         if op == bc.CONSTANT { value = instance.program.constant(instruction.a) >>>
         } else if op == bc.BOOLEAN { value = f64(instruction.a)
-        } else if op == bc.LOAD_FIELD { value = state[instruction.a]
+        } else if op == bc.LOAD_FIELD { value = instance.scratch_state[instruction.a]
+        } else if op == bc.MATH_UNARY {
+            x := read_stamped(&instance.scratch_regs, &instance.scratch_stamps, stamp, instruction.b, &instance.program, instruction) >>>
+            if instruction.a == bc.MATH_ABS { value = math.abs(x)
+            } else if instruction.a == bc.MATH_SQRT {
+                if x < 0.0 { >>> errors.new(failure(&instance.program, instruction, "sqrt of negative scalar")) }
+                value = math.sqrt(x)
+            } else if instruction.a == bc.MATH_SIN { value = math.sin(x)
+            } else if instruction.a == bc.MATH_COS { value = math.cos(x)
+            } else if instruction.a == bc.MATH_FLOOR { value = math.floor(x)
+            } else if instruction.a == bc.MATH_CEIL { value = math.ceil(x) }
+        } else if op == bc.MIN || op == bc.MAX {
+            a := read_stamped(&instance.scratch_regs, &instance.scratch_stamps, stamp, instruction.a, &instance.program, instruction) >>>
+            b := read_stamped(&instance.scratch_regs, &instance.scratch_stamps, stamp, instruction.b, &instance.program, instruction) >>>
+            if op == bc.MIN { value = math.min(a, b) } else { value = math.max(a, b) }
+        } else if op >= bc.HOST_ARG {
+            >>> errors.new(failure(&instance.program, instruction, "host calls and coroutines require fiber runtime"))
         } else {
-            a := read(&registers, &initialized, instruction.a, &instance.program, instruction) >>>
+            a := read_stamped(&instance.scratch_regs, &instance.scratch_stamps, stamp, instruction.a, &instance.program, instruction) >>>
             if op == bc.MOVE { value = a
             } else if op == bc.NEGATE { value = -a
             } else if op == bc.NOT { if a == 0.0 { value = 1.0 }
             } else {
-                b := read(&registers, &initialized, instruction.b, &instance.program, instruction) >>>
+                b := read_stamped(&instance.scratch_regs, &instance.scratch_stamps, stamp, instruction.b, &instance.program, instruction) >>>
                 if op == bc.ADD { value = a + b
                 } else if op == bc.SUBTRACT { value = a - b
                 } else if op == bc.MULTIPLY { value = a * b
@@ -226,8 +301,8 @@ fn (instance $&Instance) execute_entry(index int, argument_a f64, argument_b f64
             }
         }
         if !bc.valid_scalar(value) { >>> errors.new(failure(&instance.program, instruction, "non-finite or out-of-range scalar result")) }
-        registers[instruction.dst] = value
-        initialized[instruction.dst] = true
+        instance.scratch_regs[instruction.dst] = value
+        instance.scratch_stamps[instruction.dst] = stamp
     }
     >>> errors.new("XuScript: callback did not return")
 }

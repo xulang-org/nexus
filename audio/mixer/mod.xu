@@ -31,7 +31,8 @@ struct Bus { parent int
     gain int
     muted bool
     paused bool
-    name string }
+    name string
+    dsp BusDsp }
 pub struct Mixer {
     rate int
     voices []Voice
@@ -52,6 +53,7 @@ pub struct MixBlock {
     playing []bool
     frames int
     fade_positions []int
+    dsp_next []BusDsp
     pub underruns int
 }
 pub fn new_mixer(rate int, capacity int) Mixer {
@@ -61,7 +63,7 @@ pub fn new_mixer(rate int, capacity int) Mixer {
         gain: 1000, pan: 0, paused: false, looping: false, fade_start: 1000, fade_target: 1000, fade_total: 0, fade_position: 0, fade_stop: false, fade_hold: false}) }
     $streams := []PcmStream{}
     for i in 0:MAX_STREAMS { streams.push(empty_stream(0)) }
-    << Mixer{rate: rate, voices: voices, buses: [Bus{parent: -1, gain: 1000, muted: false, paused: false, name: "Master"}],
+    << Mixer{rate: rate, voices: voices, buses: [Bus{parent: -1, gain: 1000, muted: false, paused: false, name: "Master", dsp: default_bus_dsp()}],
         clips: []pcm.Clip{}, bank_samples: 0, revision: 0, streams: streams, stream_samples: 0}
 }
 fn control(value f64, minimum f64, maximum f64) int {
@@ -101,7 +103,7 @@ pub fn (mixer $&Mixer) add_bus(parent int, name string, volume f64) int {
     if name.len < 1 || name.len > 63 || mixer.buses.len >= MAX_BUSES { >>> errors.new("nexus mixer: invalid bus name or capacity") }
     for i in 0:mixer.buses.len { if mixer.buses[i].name == name { >>> errors.new("nexus mixer: duplicate bus name") } }
     index := mixer.buses.len
-    mixer.buses.push(Bus{parent: parent, gain: gain, muted: false, paused: false, name: name})
+    mixer.buses.push(Bus{parent: parent, gain: gain, muted: false, paused: false, name: name, dsp: default_bus_dsp()})
     mixer.revision = mixer.revision + 1
     << index
 }
@@ -183,6 +185,12 @@ pub fn (mixer $&Mixer) set_pan(id int, pan f64) int {
     mixer.revision = mixer.revision + 1
     << 0
 }
+fn (mixer &Mixer) any_bus_dsp_active() bool {
+    for i in 0:mixer.buses.len {
+        if mixer.buses[i].dsp.active() { << true }
+    }
+    << false
+}
 fn (mixer &Mixer) state_stamp() string {
     $stamp := str(mixer.rate) + ":" + str(mixer.revision) + ":" + str(mixer.voices.len)
     for i in 0:mixer.clips.len { stamp = stamp + ":c" + mixer.clips[i].fingerprint() }
@@ -193,7 +201,7 @@ fn (mixer &Mixer) state_stamp() string {
     }
     for i in 0:mixer.buses.len {
         bus := &mixer.buses[i]
-        stamp = stamp + ":b" + str(bus.parent) + "," + str(bus.gain) + "," + str(flag(bus.muted)) + "," + str(flag(bus.paused))
+        stamp = stamp + ":b" + str(bus.parent) + "," + str(bus.gain) + "," + str(flag(bus.muted)) + "," + str(flag(bus.paused)) + "," + bus.dsp.stamp()
     }
     for i in 0:mixer.voices.len {
         v := &mixer.voices[i]
@@ -218,80 +226,175 @@ fn (mixer &Mixer) bus_state(index int) BusState {
     << BusState{gain: gain, paused: paused}
 }
 fn quantize(value f64) int { << int(math.round_to_even(math.max(-32768.0, math.min(32767.0, value)))) }
+struct VoiceRenderOutcome {
+    phase int
+    active bool
+    fade_position int
+    underrun bool
+}
+fn (mixer &Mixer) mix_voice_into(
+    voice &Voice,
+    bus_gain f64,
+    frames int,
+    rate int,
+    left $&[]f64,
+    right $&[]f64
+) VoiceRenderOutcome {
+    source := mixer.source_info(voice.clip) >>>
+    if rate < 1 { >>> errors.new("nexus mixer: zero output rate") }
+    period := source.frames * rate
+    if !source.streaming && period == 0 { >>> errors.new("nexus mixer: empty clip period") }
+    $phase := voice.phase
+    $active := true
+    $fade_position := voice.fade_position
+    $underrun := false
+    balance_left := 1.0 - math.max(f64(voice.pan) / 1000.0, 0.0)
+    balance_right := 1.0 + math.min(f64(voice.pan) / 1000.0, 0.0)
+    for frame in 0:frames {
+        if !source.streaming && phase >= period {
+            if voice.looping { phase = wrap_phase(phase, period)
+            } else { active = false
+                <- }
+        }
+        at := phase / rate
+        if source.streaming && at >= source.frames {
+            if source.eof { active = false } else { underrun = true }
+            <-
+        }
+        weight := f64(phase % rate) / f64(rate)
+        $next := at + 1
+        if next >= source.frames {
+            if source.streaming && !source.eof && weight > 0.0 {
+                underrun = true
+                <-
+            }
+            if !source.streaming && voice.looping { next = 0 } else { next = at }
+        }
+        a := mixer.source_sample(voice.clip, at, 0) >>>
+        b := mixer.source_sample(voice.clip, next, 0) >>>
+        l := f64(a) + f64(b - a) * weight
+        $r := l
+        if source.channels == 2 {
+            c := mixer.source_sample(voice.clip, at, 1) >>>
+            d := mixer.source_sample(voice.clip, next, 1) >>>
+            r = f64(c) + f64(d - c) * weight
+        }
+        if !voice.fade_hold && fade_position < voice.fade_total { fade_position = fade_position + 1 }
+        gain := bus_gain * gain_at(voice, fade_position) / 1000.0
+        left[frame] = left[frame] + l * gain * balance_left
+        right[frame] = right[frame] + r * gain * balance_right
+        phase = phase + source.rate
+        if voice.fade_stop && voice.fade_total > 0 && fade_position >= voice.fade_total {
+            active = false
+            <-
+        }
+    }
+    if !source.streaming && voice.looping { phase = wrap_phase(phase, period)
+    } else if source.eof && phase >= period { active = false }
+    << VoiceRenderOutcome{phase: phase, active: active, fade_position: fade_position, underrun: underrun}
+}
 pub fn (mixer &Mixer) prepare(frames int) MixBlock {
     mixer.valid() >>>
     if frames < 1 || frames > MAX_BLOCK_FRAMES { >>> errors.new("nexus mixer: invalid block frame count") }
     rate := mixer.rate
     if rate == 0 { >>> errors.new("nexus mixer: zero output rate") }
-    $left := []f64{}
-    $right := []f64{}
-    for i in 0:frames { left.push(0.0)
-        right.push(0.0) }
+    dsp_mode := mixer.any_bus_dsp_active()
     $phases := []int{}
     $playing := []bool{}
     $fade_positions := []int{}
     $underruns := 0
-    for i in 0:mixer.voices.len {
-        voice := &mixer.voices[i]
-        $phase := voice.phase
-        $active := voice.playing
-        $fade_position := voice.fade_position
-        if active {
-            state := mixer.bus_state(voice.bus)
-            if !voice.paused && !state.paused {
-                source := mixer.source_info(voice.clip) >>>
-                period := source.frames * rate
-                if !source.streaming && period == 0 { >>> errors.new("nexus mixer: empty clip period") }
-                balance_left := 1.0 - math.max(f64(voice.pan) / 1000.0, 0.0)
-                balance_right := 1.0 + math.min(f64(voice.pan) / 1000.0, 0.0)
-                for frame in 0:frames {
-                    if !source.streaming && phase >= period {
-                        if voice.looping { phase = wrap_phase(phase, period)
-                        } else { active = false
-                            <- }
-                    }
-                    at := phase / rate
-                    if source.streaming && at >= source.frames {
-                        if source.eof { active = false } else { underruns = underruns + 1 }
-                        <-
-                    }
-                    weight := f64(phase % rate) / f64(rate)
-                    $next := at + 1
-                    if next >= source.frames {
-                        if source.streaming && !source.eof && weight > 0.0 { underruns = underruns + 1
-                            <- }
-                        if !source.streaming && voice.looping { next = 0 } else { next = at }
-                    }
-                    a := mixer.source_sample(voice.clip, at, 0) >>>
-                    b := mixer.source_sample(voice.clip, next, 0) >>>
-                    l := f64(a) + f64(b - a) * weight
-                    $r := l
-                    if source.channels == 2 {
-                        c := mixer.source_sample(voice.clip, at, 1) >>>
-                        d := mixer.source_sample(voice.clip, next, 1) >>>
-                        r = f64(c) + f64(d - c) * weight
-                    }
-                    if !voice.fade_hold && fade_position < voice.fade_total { fade_position = fade_position + 1 }
-                    gain := state.gain * gain_at(voice, fade_position) / 1000.0
-                    left[frame] = left[frame] + l * gain * balance_left
-                    right[frame] = right[frame] + r * gain * balance_right
-                    phase = phase + source.rate
-                    if voice.fade_stop && voice.fade_total > 0 && fade_position >= voice.fade_total { active = false
-                        <- }
-                }
-                if !source.streaming && voice.looping { phase = wrap_phase(phase, period)
-                } else if source.eof && phase >= period { active = false }
-            }
-        }
-        phases.push(phase)
-        playing.push(active)
-        fade_positions.push(fade_position)
-    }
     $samples := []int{}
-    for i in 0:frames { samples.push(quantize(left[i]))
-        samples.push(quantize(right[i])) }
+    $dsp_next := []BusDsp{}
+
+    if !dsp_mode {
+        $left := []f64{}
+        $right := []f64{}
+        for _ in 0:frames {
+            left.push(0.0)
+            right.push(0.0)
+        }
+        for i in 0:mixer.voices.len {
+            voice := &mixer.voices[i]
+            $phase := voice.phase
+            $active := voice.playing
+            $fade_position := voice.fade_position
+            if active {
+                state := mixer.bus_state(voice.bus)
+                if !voice.paused && !state.paused {
+                    out := mixer.mix_voice_into(voice, state.gain, frames, rate, $&left, $&right) >>>
+                    phase = out.phase
+                    active = out.active
+                    fade_position = out.fade_position
+                    if out.underrun { underruns += 1 }
+                }
+            }
+            phases.push(phase)
+            playing.push(active)
+            fade_positions.push(fade_position)
+        }
+        for i in 0:frames {
+            samples.push(quantize(left[i]))
+            samples.push(quantize(right[i]))
+        }
+    } else {
+        $bus_l := [][]f64{}
+        $bus_r := [][]f64{}
+        for b in 0:mixer.buses.len {
+            $bl := []f64{}
+            $br := []f64{}
+            for _ in 0:frames {
+                bl.push(0.0)
+                br.push(0.0)
+            }
+            bus_l.push(bl)
+            bus_r.push(br)
+            dsp_next.push(clone_bus_dsp(&mixer.buses[b].dsp))
+        }
+        for i in 0:mixer.voices.len {
+            voice := &mixer.voices[i]
+            $phase := voice.phase
+            $active := voice.playing
+            $fade_position := voice.fade_position
+            if active {
+                state := mixer.bus_state(voice.bus)
+                if !voice.paused && !state.paused {
+                    vb := voice.bus
+                    out := mixer.mix_voice_into(voice, 1.0, frames, rate, $&bus_l[vb], $&bus_r[vb]) >>>
+                    phase = out.phase
+                    active = out.active
+                    fade_position = out.fade_position
+                    if out.underrun { underruns += 1 }
+                }
+            }
+            phases.push(phase)
+            playing.push(active)
+            fade_positions.push(fade_position)
+        }
+        // Topological fold from child buses up to Master (parent index strictly < child index).
+        $rev := mixer.buses.len - 1
+        while rev >= 0 {
+            if !mixer.bus_state(rev).paused {
+                process_bus_dsp($&dsp_next[rev], $&bus_l[rev], $&bus_r[rev], frames)
+            }
+            $bgain := f64(mixer.buses[rev].gain) / 1000.0
+            if mixer.buses[rev].muted { bgain = 0.0 }
+            parent := mixer.buses[rev].parent
+            if parent >= 0 {
+                for f in 0:frames {
+                    bus_l[parent][f] += bus_l[rev][f] * bgain
+                    bus_r[parent][f] += bus_r[rev][f] * bgain
+                }
+            } else {
+                for f in 0:frames {
+                    samples.push(quantize(bus_l[0][f] * bgain))
+                    samples.push(quantize(bus_r[0][f] * bgain))
+                }
+            }
+            rev -= 1
+        }
+    }
     << MixBlock{samples: samples, stamp: mixer.state_stamp(), phases: phases, playing: playing, frames: frames,
-        fade_positions: fade_positions, underruns: underruns}
+        fade_positions: fade_positions, dsp_next: dsp_next, underruns: underruns}
 }
 pub fn (block &MixBlock) frame_count() int { << block.frames }
 pub fn (mixer $&Mixer) commit(block &MixBlock) int {
@@ -301,6 +404,11 @@ pub fn (mixer $&Mixer) commit(block &MixBlock) int {
     for i in 0:mixer.voices.len { mixer.voices[i].phase = block.phases[i]
         mixer.voices[i].playing = block.playing[i]
         mixer.voices[i].fade_position = block.fade_positions[i] }
+    if block.dsp_next.len == mixer.buses.len {
+        for b in 0:mixer.buses.len {
+            mixer.buses[b].dsp = clone_bus_dsp(&block.dsp_next[b])
+        }
+    }
     mixer.consume_streams()
     mixer.revision = mixer.revision + 1
     << 0

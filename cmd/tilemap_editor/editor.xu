@@ -38,6 +38,9 @@ struct TileEditor {
     changed bool
     panning bool
     status string
+    exit_index int
+    exit_local fm.Vec2
+    placing_exit bool
 }
 
 fn load_atlas(context &draw.Context, path &string, document &resource.Document, uid &string) draw.Image {
@@ -66,7 +69,9 @@ fn open_editor(context &draw.Context, draft TileDraft, width f64, height f64) Ti
     atlas := load_atlas(context, &draft.path, &document, &layer.resource_uid) >>>
     $editor := TileEditor{draft: draft, layer: layer, layer_names: names, atlas: atlas, order: order,
         index: 0, layer_scroll: 0, tile: 0, page: 0, erasing: false, zoom: 1.0, center: fm.vec2(0.0, 0.0),
-        size: fm.vec2(width, height), pointer: fm.vec2(-1.0, -1.0), stroke: false, changed: false, panning: false, status: ""}
+        size: fm.vec2(width, height), pointer: fm.vec2(-1.0, -1.0), stroke: false, changed: false, panning: false, status: "",
+        exit_index: -1, exit_local: fm.vec2(0.0, 0.0), placing_exit: false}
+    editor.refresh_exit(&document) >>>
     editor.fit() >>>
     << editor
 }
@@ -113,6 +118,32 @@ fn (editor $&TileEditor) fit() int {
 fn (editor $&TileEditor) refresh_layer() int {
     document := editor.draft.document() >>>
     editor.layer = document.tilemap_2d(editor.index) >>>
+    editor.refresh_exit(&document) >>>
+    << 0
+}
+
+fn (editor $&TileEditor) refresh_exit(document &resource.Document) int {
+    editor.exit_index = exit_node(document) >>>
+    if editor.exit_index >= 0 {
+        layer := layer_to_map(document, editor.layer.node) >>>
+        inverse := layer.inverse() >>>
+        gate := document.describe_node(editor.exit_index) >>>
+        editor.exit_local = inverse.point(fm.vec2(gate.local.tx, gate.local.ty))
+    }
+    << 0
+}
+
+fn (editor $&TileEditor) move_exit(point fm.Vec2) int {
+    local := editor.local(point)
+    cell := editor.layer.grid.point_to_cell(local) >>>
+    if !editor.layer.grid.in_bounds(cell.col, cell.row) { << 0 }
+    document := editor.draft.document() >>>
+    layer := layer_to_map(&document, editor.layer.node) >>>
+    index := editor.exit_index
+    place_exit($&editor.draft, index, layer.point(local)) >>>
+    editor.exit_local = local
+    editor.placing_exit = false
+    editor.status = "Exit moved"
     << 0
 }
 
@@ -134,6 +165,7 @@ fn (editor $&TileEditor) select_layer(context &draw.Context, index int) int {
     editor.index = index
     editor.layer = layer
     editor.order = order
+    editor.refresh_exit(&document) >>>
     if editor.tile >= editor.layer.grid.tileset.tile_count() { editor.tile = 0 }
     capacity := editor.palette_capacity()
     if capacity > 0 { editor.page = editor.tile / capacity }
@@ -184,6 +216,7 @@ fn (editor $&TileEditor) commit() int {
 fn (editor $&TileEditor) cancel_stroke() int {
     editor.panning = false
     editor.stroke = false
+    editor.placing_exit = false
     if editor.changed {
         editor.refresh_layer() >>>
         editor.changed = false
@@ -232,6 +265,7 @@ fn (editor $&TileEditor) scroll_layers(delta int) {
 }
 
 fn toolbar_button(width f64, id int) fm.Rect2 {
+    if id == 4 { << fm.rect2(width - 340.0, 10.0, 80.0, 30.0) }
     if id == 0 { << fm.rect2(width - 252.0, 10.0, 58.0, 30.0) }
     if id == 1 { << fm.rect2(width - 188.0, 10.0, 58.0, 30.0) }
     if id == 2 { << fm.rect2(width - 124.0, 10.0, 44.0, 30.0) }
@@ -258,6 +292,10 @@ fn (editor &TileEditor) palette_control(id int) fm.Rect2 {
 
 fn (editor $&TileEditor) click(context &draw.Context, point fm.Vec2) int {
     if point.y < f64(TOP) {
+        if editor.exit_index >= 0 && toolbar_button(editor.size.x, 4).contains(point) {
+            editor.placing_exit = !editor.placing_exit
+            editor.status = ""
+        }
         if toolbar_button(editor.size.x, 0).contains(point) { editor.history(false) >>> }
         if toolbar_button(editor.size.x, 1).contains(point) { editor.history(true) >>> }
         if toolbar_button(editor.size.x, 2).contains(point) { editor.fit() >>> }
@@ -271,6 +309,7 @@ fn (editor $&TileEditor) click(context &draw.Context, point fm.Vec2) int {
             }
         }
     } else if editor.canvas().contains(point) {
+        if editor.placing_exit { << editor.move_exit(point) >>> }
         editor.stroke = true
         editor.paint_cell(point) >>>
     } else if point.x >= editor.size.x - f64(RIGHT) {

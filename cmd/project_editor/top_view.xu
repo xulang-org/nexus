@@ -1,20 +1,62 @@
 @main
 
 resource #"github.com/xulang-org/nexus/resources/scene"
+lights #"github.com/xulang-org/nexus/resources/lighting"
 fm #"github.com/xulang-org/nexus/foundation/math"
 #ui/draw
 #ui/layout
 #math
 #strings
 
+pub const STAGE_XZ = 0
+pub const STAGE_XY = 1
+
 pub struct StagePoint {
     pub index int
     pub name string
     pub x f64
+    pub y f64
     pub z f64
+    pub kind int
     pub visible bool
     pub has_surface bool
+    pub has_light bool
+    pub has_camera bool
+    pub has_script bool
+    pub has_audio bool
+    pub has_sprite bool
+    pub has_tilemap bool
+    pub light_radius f64
     pub is_root bool
+}
+
+pub fn make_stage_point(
+    index int,
+    name string,
+    x f64,
+    z f64,
+    visible bool,
+    has_surface bool,
+    is_root bool
+) StagePoint {
+    << StagePoint{
+        index: index,
+        name: name + "",
+        x: x,
+        y: 0.0,
+        z: z,
+        kind: resource.NODE_3D,
+        visible: visible,
+        has_surface: has_surface,
+        has_light: false,
+        has_camera: false,
+        has_script: false,
+        has_audio: false,
+        has_sprite: false,
+        has_tilemap: false,
+        light_radius: 0.0,
+        is_root: is_root
+    }
 }
 
 pub fn clone_stage_points(pts &[]StagePoint) []StagePoint {
@@ -25,9 +67,18 @@ pub fn clone_stage_points(pts &[]StagePoint) []StagePoint {
             index: p.index,
             name: p.name + "",
             x: p.x,
+            y: p.y,
             z: p.z,
+            kind: p.kind,
             visible: p.visible,
             has_surface: p.has_surface,
+            has_light: p.has_light,
+            has_camera: p.has_camera,
+            has_script: p.has_script,
+            has_audio: p.has_audio,
+            has_sprite: p.has_sprite,
+            has_tilemap: p.has_tilemap,
+            light_radius: p.light_radius,
             is_root: p.is_root
         })
     }
@@ -35,6 +86,7 @@ pub fn clone_stage_points(pts &[]StagePoint) []StagePoint {
 }
 
 pub struct TopViewState {
+    pub axis_mode int
     pub center_x f64
     pub center_z f64
     pub scale f64
@@ -43,6 +95,17 @@ pub struct TopViewState {
     pub pan_start_y f64
     pub pan_origin_cx f64
     pub pan_origin_cz f64
+    pub dragging_nodes bool
+    pub drag_pending bool
+    pub drag_start_sx f64
+    pub drag_start_sy f64
+    pub drag_dx f64
+    pub drag_dv f64
+    pub marquee_active bool
+    pub marquee_start_sx f64
+    pub marquee_start_sy f64
+    pub marquee_cur_sx f64
+    pub marquee_cur_sy f64
     pub hover_x f64
     pub hover_z f64
     pub has_hover bool
@@ -52,6 +115,7 @@ pub struct TopViewState {
 
 pub fn default_top_view() TopViewState {
     << TopViewState{
+        axis_mode: STAGE_XZ,
         center_x: 0.0,
         center_z: 0.0,
         scale: 28.0,
@@ -60,12 +124,40 @@ pub fn default_top_view() TopViewState {
         pan_start_y: 0.0,
         pan_origin_cx: 0.0,
         pan_origin_cz: 0.0,
+        dragging_nodes: false,
+        drag_pending: false,
+        drag_start_sx: 0.0,
+        drag_start_sy: 0.0,
+        drag_dx: 0.0,
+        drag_dv: 0.0,
+        marquee_active: false,
+        marquee_start_sx: 0.0,
+        marquee_start_sy: 0.0,
+        marquee_cur_sx: 0.0,
+        marquee_cur_sy: 0.0,
         hover_x: 0.0,
         hover_z: 0.0,
         has_hover: false,
         hover_node: -1,
         placed_labels: []layout.Rect{}
     }
+}
+
+pub fn is_selected_node(selected_nodes &[]int, idx int) bool {
+    for i in 0:selected_nodes.len {
+        if selected_nodes[i] == idx { << true }
+    }
+    << false
+}
+
+pub fn stage_point_v(p &StagePoint, axis_mode int) f64 {
+    if axis_mode == STAGE_XY { << p.y }
+    << p.z
+}
+
+pub fn snap_coord(val f64, step f64) f64 {
+    if step <= 0.0 || !fm.finite(step) { << val }
+    << math.floor(val / step + 0.5) * step
 }
 
 pub fn extract_stage_points(doc &resource.Document) []StagePoint {
@@ -78,6 +170,39 @@ pub fn extract_stage_points(doc &resource.Document) []StagePoint {
         s := doc.surface(i) >>> (err) { << []StagePoint{} }
         has_surf[s.node] = true
     }
+    $has_light := map[int]bool{}
+    $light_rad := map[int]f64{}
+    for i in 0:doc.light_count() {
+        lt := doc.light(i) >>> (err) { << []StagePoint{} }
+        has_light[lt.node] = true
+        $rad := 0.0
+        k := lt.source.kind()
+        if k == lights.POINT || k == lights.SPOT {
+            rad = lt.source.radius()
+        }
+        light_rad[lt.node] = rad
+    }
+    $has_script := map[int]bool{}
+    for i in 0:doc.script_count() {
+        sc := doc.script(i) >>> (err) { << []StagePoint{} }
+        has_script[sc.node] = true
+    }
+    $has_audio := map[int]bool{}
+    for i in 0:doc.audio_count() {
+        au := doc.audio_emitter(i) >>> (err) { << []StagePoint{} }
+        has_audio[au.node] = true
+    }
+    $has_sprite := map[int]bool{}
+    for i in 0:doc.sprite_3d_count() {
+        sp := doc.sprite_3d(i) >>> (err) { << []StagePoint{} }
+        has_sprite[sp.node] = true
+    }
+    $has_tilemap := map[int]bool{}
+    for i in 0:doc.tilemap_2d_count() {
+        tm := doc.tilemap_2d(i) >>> (err) { << []StagePoint{} }
+        has_tilemap[tm.node] = true
+    }
+
     $eff_vis := []bool{}
     $world_mats := []fm.Mat4{}
     for i in 0:nodes.len {
@@ -98,18 +223,32 @@ pub fn extract_stage_points(doc &resource.Document) []StagePoint {
     for i in 0:nodes.len {
         n := &nodes[i]
         $wx := world_mats[i].c3.x
+        $wy := world_mats[i].c3.y
         $wz := world_mats[i].c3.z
         if n.kind == resource.NODE_2D {
             wx = wx + n.local.tx
+            wy = wy + n.local.ty
             wz = wz + n.local.ty
         }
+        has_cam := n.camera.is_set() || n.orthographic.is_set() || n.camera_2d.is_set()
+        $lrad := 0.0
+        if light_rad.has(i) { lrad = light_rad[i] }
         pts.push(StagePoint{
             index: i,
             name: n.name + "",
             x: wx,
+            y: wy,
             z: wz,
+            kind: n.kind,
             visible: eff_vis[i],
             has_surface: has_surf.has(i),
+            has_light: has_light.has(i),
+            has_camera: has_cam,
+            has_script: has_script.has(i),
+            has_audio: has_audio.has(i),
+            has_sprite: has_sprite.has(i),
+            has_tilemap: has_tilemap.has(i),
+            light_radius: lrad,
             is_root: i == 0
         })
     }
@@ -145,6 +284,21 @@ pub fn screen_to_world_z(view &TopViewState, bounds &layout.Rect, sy f64) f64 {
     << view.center_z + (sy - (bounds.y + bounds.height * 0.5)) / math.max(view.scale, 0.001)
 }
 
+fn disp_world_x(view &TopViewState, p &StagePoint, selected_nodes &[]int) f64 {
+    if view.dragging_nodes && !p.is_root && is_selected_node(selected_nodes, p.index) {
+        << p.x + view.drag_dx
+    }
+    << p.x
+}
+
+fn disp_world_v(view &TopViewState, p &StagePoint, selected_nodes &[]int) f64 {
+    v := stage_point_v(p, view.axis_mode)
+    if view.dragging_nodes && !p.is_root && is_selected_node(selected_nodes, p.index) {
+        << v + view.drag_dv
+    }
+    << v
+}
+
 pub fn (view $&TopViewState) fit_points(pts &[]StagePoint, bounds &layout.Rect) {
     if pts.len == 0 || bounds.width < 16.0 || bounds.height < 16.0 {
         view.center_x = 0.0
@@ -154,14 +308,15 @@ pub fn (view $&TopViewState) fit_points(pts &[]StagePoint, bounds &layout.Rect) 
     }
     $min_x := pts[0].x
     $max_x := pts[0].x
-    $min_z := pts[0].z
-    $max_z := pts[0].z
+    $min_z := stage_point_v(&pts[0], view.axis_mode)
+    $max_z := min_z
     for i in 1:pts.len {
         p := &pts[i]
+        pv := stage_point_v(p, view.axis_mode)
         if p.x < min_x { min_x = p.x }
         if p.x > max_x { max_x = p.x }
-        if p.z < min_z { min_z = p.z }
-        if p.z > max_z { max_z = p.z }
+        if pv < min_z { min_z = pv }
+        if pv > max_z { max_z = pv }
     }
     view.center_x = (min_x + max_x) * 0.5
     view.center_z = (min_z + max_z) * 0.5
@@ -213,13 +368,22 @@ pub fn (view $&TopViewState) end_pan() {
     view.panning = false
 }
 
+pub fn (view $&TopViewState) cancel_node_interactions() {
+    view.drag_pending = false
+    view.dragging_nodes = false
+    view.drag_dx = 0.0
+    view.drag_dv = 0.0
+    view.marquee_active = false
+}
+
 pub fn pick_stage_node(view &TopViewState, bounds &layout.Rect, pts &[]StagePoint, mx f64, my f64) int {
     $best := -1
     $best_d2 := 16.0 * 16.0
     for i in 0:pts.len {
         p := &pts[i]
+        pv := stage_point_v(p, view.axis_mode)
         sx := world_to_screen_x(view, bounds, p.x)
-        sy := world_to_screen_y(view, bounds, p.z)
+        sy := world_to_screen_y(view, bounds, pv)
         dx := sx - mx
         dy := sy - my
         d2 := dx * dx + dy * dy
@@ -229,6 +393,33 @@ pub fn pick_stage_node(view &TopViewState, bounds &layout.Rect, pts &[]StagePoin
         }
     }
     << best
+}
+
+pub fn pick_stage_marquee(
+    view &TopViewState,
+    bounds &layout.Rect,
+    pts &[]StagePoint,
+    x0 f64,
+    y0 f64,
+    x1 f64,
+    y1 f64
+) []int {
+    min_x := math.min(x0, x1) - 4.0
+    max_x := math.max(x0, x1) + 4.0
+    min_y := math.min(y0, y1) - 4.0
+    max_y := math.max(y0, y1) + 4.0
+    $out := []int{}
+    for i in 0:pts.len {
+        p := &pts[i]
+        if p.is_root { -> }
+        pv := stage_point_v(p, view.axis_mode)
+        sx := world_to_screen_x(view, bounds, p.x)
+        sy := world_to_screen_y(view, bounds, pv)
+        if sx >= min_x && sx <= max_x && sy >= min_y && sy <= max_y {
+            out.push(p.index)
+        }
+    }
+    << out
 }
 
 pub fn rects_overlap(a &layout.Rect, b &layout.Rect) bool {
@@ -275,19 +466,21 @@ pub fn choose_label_rect(
     << layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 0.0}
 }
 
-pub fn compute_placed_labels(
+pub fn compute_placed_labels_multi(
     view &TopViewState,
     bounds &layout.Rect,
     pts &[]StagePoint,
-    selected_idx int
+    selected_idx int,
+    selected_nodes &[]int
 ) []layout.Rect {
     $placed := []layout.Rect{}
-    // Reserve node marker discs so labels avoid covering adjacent markers.
     $markers := []layout.Rect{}
     for i in 0:pts.len {
         p := &pts[i]
-        sx := world_to_screen_x(view, bounds, p.x)
-        sy := world_to_screen_y(view, bounds, p.z)
+        dx := disp_world_x(view, p, selected_nodes)
+        dv := disp_world_v(view, p, selected_nodes)
+        sx := world_to_screen_x(view, bounds, dx)
+        sy := world_to_screen_y(view, bounds, dv)
         if sx >= bounds.x - 12.0 && sx <= bounds.x + bounds.width + 12.0 &&
             sy >= bounds.y - 12.0 && sy <= bounds.y + bounds.height + 12.0 {
             markers.push(layout.Rect{x: sx - 8.0, y: sy - 8.0, width: 16.0, height: 16.0})
@@ -297,7 +490,6 @@ pub fn compute_placed_labels(
     for i in 0:pts.len {
         out.push(layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 0.0})
     }
-    // Place selected node label first, then root, then remaining nodes.
     $order := []int{}
     for i in 0:pts.len {
         if pts[i].index == selected_idx {
@@ -305,18 +497,25 @@ pub fn compute_placed_labels(
         }
     }
     for i in 0:pts.len {
-        if pts[i].index != selected_idx {
+        if pts[i].index != selected_idx && is_selected_node(selected_nodes, pts[i].index) {
+            order.push(i)
+        }
+    }
+    for i in 0:pts.len {
+        if pts[i].index != selected_idx && !is_selected_node(selected_nodes, pts[i].index) {
             order.push(i)
         }
     }
     for o in order {
         p := &pts[o]
-        sx := world_to_screen_x(view, bounds, p.x)
-        sy := world_to_screen_y(view, bounds, p.z)
+        dx := disp_world_x(view, p, selected_nodes)
+        dv := disp_world_v(view, p, selected_nodes)
+        sx := world_to_screen_x(view, bounds, dx)
+        sy := world_to_screen_y(view, bounds, dv)
         if sx < bounds.x || sx > bounds.x + bounds.width || sy < bounds.y || sy > bounds.y + bounds.height {
             ->
         }
-        w := math.min(180.0, math.max(38.0, f64(p.name.len) * 7.4 + 12.0))
+        w := math.min(180.0, math.max(38.0, approx_label_width(&p.name, 7.2) + 12.0))
         h := 18.0
         $obstacles := []layout.Rect{}
         for m in 0:markers.len { obstacles.push(markers[m]) }
@@ -330,6 +529,44 @@ pub fn compute_placed_labels(
     << out
 }
 
+pub fn compute_placed_labels(
+    view &TopViewState,
+    bounds &layout.Rect,
+    pts &[]StagePoint,
+    selected_idx int
+) []layout.Rect {
+    empty := []int{}
+    << compute_placed_labels_multi(view, bounds, pts, selected_idx, &empty)
+}
+
+fn draw_diamond(frame $&draw.Frame, sx f64, sy f64, r f64, col draw.Color, filled bool, bg draw.Color) int {
+    if filled {
+        frame.fill_round_rect(sx - r * 0.65, sy - r * 0.65, r * 1.3, r * 1.3, 2.0, col) >>>
+    } else {
+        frame.fill_round_rect(sx - r * 0.65, sy - r * 0.65, r * 1.3, r * 1.3, 2.0, bg) >>>
+    }
+    frame.line(sx, sy - r, sx + r, sy, col, 1.8) >>>
+    frame.line(sx + r, sy, sx, sy + r, col, 1.8) >>>
+    frame.line(sx, sy + r, sx - r, sy, col, 1.8) >>>
+    frame.line(sx - r, sy, sx, sy - r, col, 1.8) >>>
+    << 0
+}
+
+fn draw_camera_glyph(frame $&draw.Frame, sx f64, sy f64, r f64, col draw.Color, visible bool, bg draw.Color) int {
+    if visible {
+        frame.fill_round_rect(sx - r, sy - r * 0.72, r * 1.4, r * 1.44, 2.5, col) >>>
+    } else {
+        frame.fill_round_rect(sx - r, sy - r * 0.72, r * 1.4, r * 1.44, 2.5, bg) >>>
+        frame.stroke_round_rect(sx - r, sy - r * 0.72, r * 1.4, r * 1.44, 2.5, col, 1.8) >>>
+    }
+    fx := sx + r * 0.45
+    tx := sx + r * 1.35
+    frame.line(fx, sy, tx, sy - r * 0.75, col, 1.6) >>>
+    frame.line(tx, sy - r * 0.75, tx, sy + r * 0.75, col, 1.6) >>>
+    frame.line(tx, sy + r * 0.75, fx, sy, col, 1.6) >>>
+    << 0
+}
+
 pub fn paint_top_view(
     view $&TopViewState,
     context &draw.Context,
@@ -337,8 +574,10 @@ pub fn paint_top_view(
     bounds &layout.Rect,
     pts &[]StagePoint,
     selected_idx int,
+    selected_nodes &[]int,
     placing_mode bool,
-    pal &PaperPalette
+    pal &PaperPalette,
+    lang int
 ) int {
     _ := context
     frame.push() >>>
@@ -377,46 +616,89 @@ pub fn paint_top_view(
         iz = iz + 1
     }
 
-    // Origin axes: +X (red), +Z (blue).
+    // Origin axes: +X (red), +Z or +Y (blue/green).
     ox := world_to_screen_x(view, bounds, 0.0)
     oz := world_to_screen_y(view, bounds, 0.0)
     if oz >= bounds.y && oz <= bounds.y + bounds.height {
         frame.line(bounds.x, oz, bounds.x + bounds.width, oz, pal.axis_x, 1.5) >>>
     }
     if ox >= bounds.x && ox <= bounds.x + bounds.width {
-        frame.line(ox, bounds.y, ox, bounds.y + bounds.height, pal.axis_z, 1.5) >>>
+        $v_col := pal.axis_z
+        if view.axis_mode == STAGE_XY { v_col = pal.success }
+        frame.line(ox, bounds.y, ox, bounds.y + bounds.height, v_col, 1.5) >>>
     }
 
-    // Node markers + selection halo.
+    // Node markers + selection halos + light radii + distinct glyphs.
     for i in 0:pts.len {
         p := &pts[i]
-        sx := world_to_screen_x(view, bounds, p.x)
-        sy := world_to_screen_y(view, bounds, p.z)
-        if sx < bounds.x - 24.0 || sx > bounds.x + bounds.width + 24.0 ||
-            sy < bounds.y - 24.0 || sy > bounds.y + bounds.height + 24.0 {
+        dx := disp_world_x(view, p, selected_nodes)
+        dv := disp_world_v(view, p, selected_nodes)
+        sx := world_to_screen_x(view, bounds, dx)
+        sy := world_to_screen_y(view, bounds, dv)
+        if sx < bounds.x - 48.0 || sx > bounds.x + bounds.width + 48.0 ||
+            sy < bounds.y - 48.0 || sy > bounds.y + bounds.height + 48.0 {
             ->
         }
         $radius := 5.5
         if p.is_root { radius = 6.5 }
-        $dot_col := pal.info
-        if p.has_surface { dot_col = pal.brand }
-        if p.is_root { dot_col = pal.muted }
+        is_primary := p.index == selected_idx
+        is_sel := is_primary || is_selected_node(selected_nodes, p.index)
 
-        if p.index == selected_idx {
-            frame.stroke_circle(sx, sy, radius + 4.5, pal.focus, 2.0) >>>
+        if p.has_light && p.light_radius > 0.0 && is_sel {
+            r_px := math.min(bounds.width, p.light_radius * view.scale)
+            if r_px > 6.0 {
+                frame.stroke_circle(sx, sy, r_px, pal.warning, 1.0) >>>
+            }
+        }
+
+        if is_primary {
+            frame.stroke_circle(sx, sy, radius + 5.0, pal.focus, 2.2) >>>
+        } else if is_sel {
+            frame.stroke_circle(sx, sy, radius + 4.5, pal.focus, 1.5) >>>
         } else if !placing_mode && p.index == view.hover_node {
             frame.stroke_circle(sx, sy, radius + 3.5, pal.control_border, 1.5) >>>
         }
-        if p.visible {
-            frame.fill_circle(sx, sy, radius, dot_col) >>>
+
+        if p.has_camera {
+            draw_camera_glyph(frame, sx, sy, 6.0, pal.focus, p.visible, pal.surface) >>>
+        } else if p.has_light {
+            draw_diamond(frame, sx, sy, 6.5, pal.warning, p.visible, pal.surface) >>>
+        } else if p.kind == resource.NODE_2D || p.has_tilemap {
+            rcol := pal.success
+            if p.visible {
+                frame.fill_round_rect(sx - 5.5, sy - 5.5, 11.0, 11.0, 2.5, rcol) >>>
+            } else {
+                frame.fill_round_rect(sx - 5.5, sy - 5.5, 11.0, 11.0, 2.5, pal.surface) >>>
+                frame.stroke_round_rect(sx - 5.5, sy - 5.5, 11.0, 11.0, 2.5, rcol, 1.8) >>>
+            }
+        } else if p.has_sprite {
+            draw_diamond(frame, sx, sy, 6.0, draw.rgb(124, 58, 237), p.visible, pal.surface) >>>
         } else {
-            frame.fill_circle(sx, sy, radius, pal.surface) >>>
-            frame.stroke_circle(sx, sy, radius, dot_col, 2.0) >>>
+            $dot_col := pal.info
+            if p.has_surface { dot_col = pal.brand }
+            if p.is_root { dot_col = pal.muted }
+            if p.visible {
+                frame.fill_circle(sx, sy, radius, dot_col) >>>
+            } else {
+                frame.fill_circle(sx, sy, radius, pal.surface) >>>
+                frame.stroke_circle(sx, sy, radius, dot_col, 2.0) >>>
+            }
+        }
+    }
+
+    // Marquee selection box.
+    if view.marquee_active {
+        mx0 := math.min(view.marquee_start_sx, view.marquee_cur_sx)
+        my0 := math.min(view.marquee_start_sy, view.marquee_cur_sy)
+        mw := math.abs(view.marquee_cur_sx - view.marquee_start_sx)
+        mh := math.abs(view.marquee_cur_sy - view.marquee_start_sy)
+        if mw >= 2.0 && mh >= 2.0 {
+            frame.stroke_rect(bounds.x + mx0, bounds.y + my0, mw, mh, pal.focus, 1.5) >>>
         }
     }
 
     // Compute and draw non-overlapping node labels.
-    labels := compute_placed_labels(view, bounds, pts, selected_idx)
+    labels := compute_placed_labels_multi(view, bounds, pts, selected_idx, selected_nodes)
     view.placed_labels = labels
     for i in 0:pts.len {
         r := &view.placed_labels[i]
@@ -425,7 +707,7 @@ pub fn paint_top_view(
         $bg := pal.surface
         $fg := pal.text
         $bd := pal.border
-        if p.index == selected_idx {
+        if p.index == selected_idx || is_selected_node(selected_nodes, p.index) {
             bg = pal.elevated
             bd = pal.focus
         } else if !p.visible {
@@ -440,7 +722,8 @@ pub fn paint_top_view(
     if placing_mode {
         banner_w := math.min(bounds.width - 20.0, 320.0)
         frame.fill_round_rect(bounds.x + 10.0, bounds.y + 10.0, banner_w, 26.0, 6.0, pal.brand) >>>
-        frame.text(bounds.x + 20.0, bounds.y + 15.0, 12.0, draw.rgb(255, 255, 255), &"Click Top View to place GLB (Esc cancels)") >>>
+        place_tip := tr(lang, "Click Top View to place GLB (Esc cancels)", "点击舞台放置 GLB（按 Esc 取消）")
+        frame.text(bounds.x + 20.0, bounds.y + 15.0, 12.0, draw.rgb(255, 255, 255), &place_tip) >>>
         if view.has_hover {
             hsx := world_to_screen_x(view, bounds, view.hover_x)
             hsy := world_to_screen_y(view, bounds, view.hover_z)
@@ -451,13 +734,14 @@ pub fn paint_top_view(
     }
 
     // Corner HUD badges: scale step and axis legend.
-    grid_lbl := fmt_coord(step) + " units / grid"
-    badge_w := math.max(118.0, f64(grid_lbl.len) * 7.2 + 16.0)
+    grid_lbl := fmt_coord(step) + tr(lang, " units / grid", " 单位/格")
+    badge_w := math.max(108.0, approx_label_width(&grid_lbl, 7.0) + 16.0)
     frame.fill_round_rect(bounds.x + 10.0, bounds.y + bounds.height - 32.0, badge_w, 22.0, 5.0, pal.elevated) >>>
     frame.stroke_round_rect(bounds.x + 10.0, bounds.y + bounds.height - 32.0, badge_w, 22.0, 5.0, pal.border, 1.0) >>>
     frame.text(bounds.x + 18.0, bounds.y + bounds.height - 28.0, 11.5, pal.muted, &grid_lbl) >>>
 
-    legend := "X →   Z ↓"
+    $legend := "X →   Z ↓"
+    if view.axis_mode == STAGE_XY { legend = "X →   Y ↓" }
     lw := 94.0
     frame.fill_round_rect(bounds.x + bounds.width - lw - 10.0, bounds.y + bounds.height - 32.0, lw, 22.0, 5.0, pal.elevated) >>>
     frame.stroke_round_rect(bounds.x + bounds.width - lw - 10.0, bounds.y + bounds.height - 32.0, lw, 22.0, 5.0, pal.border, 1.0) >>>

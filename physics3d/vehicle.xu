@@ -1,0 +1,538 @@
+@"github.com/xulang-org/nexus/physics3d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub struct StaticRayHit3D {
+    pub hit bool
+    pub distance f64
+    pub point fm.Vec3
+    pub normal fm.Vec3
+    pub is_triangle bool
+    pub index int
+}
+
+fn veh_safe_norm(v fm.Vec3, fallback fm.Vec3) fm.Vec3 {
+    << v.normalized() >>> (err) { << fallback }
+}
+
+fn ray_hit_aabb(origin fm.Vec3, dir fm.Vec3, max_dist f64, box fm.Aabb3) StaticRayHit3D {
+    oc := [origin.x, origin.y, origin.z]
+    dc := [dir.x, dir.y, dir.z]
+    bmin := [box.minimum.x, box.minimum.y, box.minimum.z]
+    bmax := [box.maximum.x, box.maximum.y, box.maximum.z]
+    $tmin := 0.0
+    $tmax := max_dist
+    $hit_axis := -1
+    $hit_sign := 0.0
+    for k in 0:3 {
+        if math.abs(dc[k]) <= 1e-12 {
+            if oc[k] < bmin[k] || oc[k] > bmax[k] {
+                << StaticRayHit3D{hit: false, distance: max_dist, point: origin, normal: zero(), is_triangle: false, index: -1}
+            }
+        } else {
+            inv := 1.0 / dc[k]
+            $t1 := (bmin[k] - oc[k]) * inv
+            $t2 := (bmax[k] - oc[k]) * inv
+            $sgn := -1.0
+            if t1 > t2 {
+                tmp := t1
+                t1 = t2
+                t2 = tmp
+                sgn = 1.0
+            }
+            if t1 > tmin {
+                tmin = t1
+                hit_axis = k
+                hit_sign = sgn
+            }
+            if t2 < tmax { tmax = t2 }
+            if tmin > tmax {
+                << StaticRayHit3D{hit: false, distance: max_dist, point: origin, normal: zero(), is_triangle: false, index: -1}
+            }
+        }
+    }
+    if tmin < 0.0 || tmin > max_dist {
+        << StaticRayHit3D{hit: false, distance: max_dist, point: origin, normal: zero(), is_triangle: false, index: -1}
+    }
+    $n := fm.vec3(0.0, 1.0, 0.0)
+    if hit_axis == 0 {
+        n = fm.vec3(hit_sign, 0.0, 0.0)
+    } else if hit_axis == 1 {
+        n = fm.vec3(0.0, hit_sign, 0.0)
+    } else if hit_axis == 2 {
+        n = fm.vec3(0.0, 0.0, hit_sign)
+    }
+    << StaticRayHit3D{
+        hit: true,
+        distance: tmin,
+        point: origin.add(dir.scaled(tmin)),
+        normal: n,
+        is_triangle: false,
+        index: 0
+    }
+}
+
+fn ray_hit_triangle(origin fm.Vec3, dir fm.Vec3, max_dist f64, tri StaticTriangle3D) StaticRayHit3D {
+    e1 := tri.b.sub(tri.a)
+    e2 := tri.c.sub(tri.a)
+    pvec := dir.cross(e2)
+    det := e1.dot(pvec)
+    if math.abs(det) < 1e-10 {
+        << StaticRayHit3D{hit: false, distance: max_dist, point: origin, normal: zero(), is_triangle: true, index: -1}
+    }
+    inv_det := 1.0 / det
+    tvec := origin.sub(tri.a)
+    u := tvec.dot(pvec) * inv_det
+    if u < -1e-6 || u > 1.000001 {
+        << StaticRayHit3D{hit: false, distance: max_dist, point: origin, normal: zero(), is_triangle: true, index: -1}
+    }
+    qvec := tvec.cross(e1)
+    v := dir.dot(qvec) * inv_det
+    if v < -1e-6 || u + v > 1.000002 {
+        << StaticRayHit3D{hit: false, distance: max_dist, point: origin, normal: zero(), is_triangle: true, index: -1}
+    }
+    t := e2.dot(qvec) * inv_det
+    if t < 0.0 || t > max_dist {
+        << StaticRayHit3D{hit: false, distance: max_dist, point: origin, normal: zero(), is_triangle: true, index: -1}
+    }
+    $n := veh_safe_norm(e1.cross(e2), fm.vec3(0.0, 1.0, 0.0))
+    if n.dot(dir) > 0.0 { n = n.scaled(-1.0) }
+    << StaticRayHit3D{
+        hit: true,
+        distance: t,
+        point: origin.add(dir.scaled(t)),
+        normal: n,
+        is_triangle: true,
+        index: 0
+    }
+}
+
+pub fn (world &JointedWorld3D) raycast_static(
+    origin fm.Vec3,
+    dir fm.Vec3,
+    max_dist f64,
+    mask int
+) StaticRayHit3D {
+    if !valid_point(origin) || !dir.is_finite() || !fm.finite(max_dist) || max_dist <= 0.0 {
+        >>> errors.new("nexus vehicle: invalid raycast_static arguments")
+    }
+    ndir := dir.normalized() >>>
+    motion := ndir.scaled(max_dist)
+    $best := StaticRayHit3D{
+        hit: false,
+        distance: max_dist,
+        point: origin.add(motion),
+        normal: fm.vec3(0.0, 1.0, 0.0),
+        is_triangle: false,
+        index: -1
+    }
+
+    if world.static_boxes.len > 0 {
+        bhits := world.box_bvh.query_ray(origin, motion)
+        for bi in bhits {
+            if (world.static_box_layers[bi] & mask) == 0 { -> }
+            rh := ray_hit_aabb(origin, ndir, best.distance, world.static_boxes[bi])
+            if rh.hit && rh.distance < best.distance {
+                best = StaticRayHit3D{
+                    hit: true,
+                    distance: rh.distance,
+                    point: rh.point,
+                    normal: rh.normal,
+                    is_triangle: false,
+                    index: bi
+                }
+            }
+        }
+    }
+
+    if world.static_triangles.len > 0 {
+        thits := world.tri_bvh.query_ray(origin, motion)
+        for ti in thits {
+            tri := world.static_triangles[ti]
+            if (tri.layer & mask) == 0 { -> }
+            rh := ray_hit_triangle(origin, ndir, best.distance, tri)
+            if rh.hit && rh.distance < best.distance {
+                best = StaticRayHit3D{
+                    hit: true,
+                    distance: rh.distance,
+                    point: rh.point,
+                    normal: rh.normal,
+                    is_triangle: true,
+                    index: ti
+                }
+            }
+        }
+    }
+    << best
+}
+
+pub struct WheelConfig3D {
+    pub chassis_offset fm.Vec3
+    pub rest_length f64
+    pub wheel_radius f64
+    pub suspension_stiffness f64
+    pub suspension_damping f64
+    pub max_suspension_force f64
+    pub is_steerable bool
+    pub is_driven bool
+    pub handbrake_affected bool
+    pub peak_friction f64
+    pub pacejka_b f64
+    pub pacejka_c f64
+    pub pacejka_e f64
+    pub rolling_resistance f64
+    pub roll_influence f64
+}
+
+pub struct WheelState3D {
+    pub grounded bool
+    pub compression f64
+    pub prev_compression f64
+    pub suspension_force f64
+    pub steer_angle f64
+    pub spin_angle f64
+    pub angular_velocity f64
+    pub slip_angle f64
+    pub long_force f64
+    pub lat_force f64
+    pub contact_point fm.Vec3
+    pub contact_normal fm.Vec3
+    pub world_center fm.Vec3
+}
+
+pub struct AntiRollPair3D {
+    pub left_wheel int
+    pub right_wheel int
+    pub stiffness f64
+}
+
+pub struct RaycastVehicle3D {
+    pub chassis_id int
+    pub wheels []WheelConfig3D
+    pub states []WheelState3D
+    pub anti_roll_pairs []AntiRollPair3D
+    pub collision_mask int
+    pub max_steer_angle f64
+    pub wheelbase f64
+    pub track_width f64
+    pub engine_force f64
+    pub brake_force f64
+    pub handbrake_force f64
+}
+
+pub fn pacejka_magic_formula(slip f64, b f64, c f64, d f64, e f64) f64 {
+    bx := b * slip
+    inner := bx - e * (bx - math.atan(bx))
+    << d * math.sin(c * math.atan(inner))
+}
+
+fn empty_wheel_state() WheelState3D {
+    << WheelState3D{
+        grounded: false,
+        compression: 0.0,
+        prev_compression: 0.0,
+        suspension_force: 0.0,
+        steer_angle: 0.0,
+        spin_angle: 0.0,
+        angular_velocity: 0.0,
+        slip_angle: 0.0,
+        long_force: 0.0,
+        lat_force: 0.0,
+        contact_point: zero(),
+        contact_normal: fm.vec3(0.0, 1.0, 0.0),
+        world_center: zero()
+    }
+}
+
+pub fn default_four_wheel_car_3d(
+    chassis_id int,
+    half_extents fm.Vec3,
+    mass f64
+) RaycastVehicle3D {
+    if chassis_id < 0 || !half_extents.is_finite() ||
+        half_extents.x <= 0.1 || half_extents.y <= 0.1 || half_extents.z <= 0.2 ||
+        !fm.finite(mass) || mass <= 1.0 {
+        >>> errors.new("nexus vehicle: invalid chassis parameters")
+    }
+    rest_len := 0.48
+    wheel_rad := 0.36
+    // Settle around 45% compression under static vehicle weight.
+    corner_weight := (mass * 9.81) * 0.25
+    k_spring := corner_weight / (rest_len * 0.45)
+    c_damp := 2.0 * 0.65 * math.sqrt(k_spring * (mass * 0.25))
+    max_f := corner_weight * 4.5
+
+    wx := half_extents.x * 0.90
+    wy := -half_extents.y * 0.42
+    wz := half_extents.z * 0.72
+
+    $wheels := []WheelConfig3D{}
+    $states := []WheelState3D{}
+    offsets := [fm.vec3(-wx, wy, -wz), fm.vec3(wx, wy, -wz), fm.vec3(-wx, wy, wz), fm.vec3(wx, wy, wz)]
+    for i in 0:4 {
+        front := i < 2
+        wheels.push(WheelConfig3D{
+            chassis_offset: offsets[i],
+            rest_length: rest_len,
+            wheel_radius: wheel_rad,
+            suspension_stiffness: k_spring,
+            suspension_damping: c_damp,
+            max_suspension_force: max_f,
+            is_steerable: front,
+            is_driven: !front,
+            handbrake_affected: !front,
+            peak_friction: 1.05,
+            pacejka_b: 9.0,
+            pacejka_c: 1.85,
+            pacejka_e: 0.95,
+            rolling_resistance: 0.015,
+            roll_influence: 0.25
+        })
+        states.push(empty_wheel_state())
+    }
+    arbs := [AntiRollPair3D{left_wheel: 0, right_wheel: 1, stiffness: k_spring * 0.65}, AntiRollPair3D{left_wheel: 2, right_wheel: 3, stiffness: k_spring * 0.65}]
+    << RaycastVehicle3D{
+        chassis_id: chassis_id,
+        wheels: wheels,
+        states: states,
+        anti_roll_pairs: arbs,
+        collision_mask: 0x7fffffff,
+        max_steer_angle: 0.56,
+        wheelbase: wz * 2.0,
+        track_width: wx * 2.0,
+        engine_force: mass * 9.5,
+        brake_force: mass * 16.0,
+        handbrake_force: mass * 20.0
+    }
+}
+
+fn compute_ackermann_angles(
+    steer_input f64,
+    max_steer f64,
+    wheelbase f64,
+    track f64,
+    is_left bool
+) f64 {
+    s := clamp_value(steer_input, -1.0, 1.0)
+    if math.abs(s) <= 1e-6 { << 0.0 }
+    // Compute turning radius R at average steer angle; inner wheel turns sharper than outer.
+    base_ang := math.abs(s) * max_steer
+    tan_a := math.tan(base_ang)
+    if tan_a <= 1e-6 { << 0.0 }
+    turn_r := wheelbase / tan_a
+    half_t := track * 0.5
+    $inner := false
+    if (s > 0.0 && !is_left) || (s < 0.0 && is_left) { inner = true }
+    $r_wheel := turn_r + half_t
+    if inner { r_wheel = math.max(turn_r - half_t, 0.35) }
+    mag := math.atan2(wheelbase, r_wheel)
+    if s < 0.0 { << -mag }
+    << mag
+}
+
+pub fn (veh $&RaycastVehicle3D) step(
+    world $&JointedWorld3D,
+    dt f64,
+    throttle f64,
+    brake f64,
+    steer_input f64,
+    handbrake bool
+) int {
+    id := veh.chassis_id
+    if id < 0 || id >= world.positions.len {
+        >>> errors.new("nexus vehicle: chassis_id out of range")
+    }
+    if !fm.finite(dt) || dt <= 0.0 || dt > 0.25 {
+        >>> errors.new("nexus vehicle: invalid dt")
+    }
+    im := world.inv_mass[id]
+    if im <= 0.0 || veh.wheels.len == 0 { << 0 }
+
+    thr := clamp_value(throttle, -1.0, 1.0)
+    brk := clamp_value(brake, 0.0, 1.0)
+    wcount := veh.wheels.len
+    mass := 1.0 / im
+
+    c_pos := world.positions[id]
+    c_quat := world.orientations[id]
+    c_right := q_rotate(c_quat, fm.vec3(1.0, 0.0, 0.0))
+    c_up := q_rotate(c_quat, fm.vec3(0.0, 1.0, 0.0))
+    c_fwd := q_rotate(c_quat, fm.vec3(0.0, 0.0, -1.0))
+    down_dir := c_up.scaled(-1.0)
+
+    $susp_forces := []f64{}
+    $driven_count := 0
+    $grounded_cnt := 0
+
+    // Pass 1: Raycast each wheel, compute suspension compression & Ackermann steering angle.
+    for wi in 0:wcount {
+        cfg := veh.wheels[wi]
+        if cfg.is_driven { driven_count += 1 }
+        prev_comp := veh.states[wi].compression
+        $st := empty_wheel_state()
+        st.prev_compression = prev_comp
+        st.spin_angle = veh.states[wi].spin_angle
+        if cfg.is_steerable {
+            is_left := cfg.chassis_offset.x < 0.0
+            st.steer_angle = compute_ackermann_angles(steer_input, veh.max_steer_angle, veh.wheelbase, veh.track_width, is_left)
+        }
+
+        hardpoint := c_pos.add(q_rotate(c_quat, cfg.chassis_offset))
+        ray_len := cfg.rest_length + cfg.wheel_radius
+        rh := world.raycast_static(hardpoint, down_dir, ray_len, veh.collision_mask) >>>
+        $fn_val := 0.0
+        if rh.hit {
+            st.grounded = true
+            grounded_cnt += 1
+            comp := clamp_value(ray_len - rh.distance, 0.0, cfg.rest_length)
+            st.compression = comp
+            st.contact_point = rh.point
+            st.contact_normal = rh.normal
+            st.world_center = hardpoint.add(down_dir.scaled(rh.distance - cfg.wheel_radius))
+            comp_vel := (comp - prev_comp) / dt
+            raw_f := cfg.suspension_stiffness * comp + cfg.suspension_damping * comp_vel
+            fn_val = clamp_value(raw_f, 0.0, cfg.max_suspension_force)
+        } else {
+            st.world_center = hardpoint.add(down_dir.scaled(cfg.rest_length))
+        }
+        st.suspension_force = fn_val
+        susp_forces.push(fn_val)
+        veh.states[wi] = st
+    }
+
+    // Pass 2: Anti-Roll Bar load transfer per axle.
+    for pi in 0:veh.anti_roll_pairs.len {
+        arb := veh.anti_roll_pairs[pi]
+        lw := arb.left_wheel
+        rw := arb.right_wheel
+        if lw >= 0 && lw < wcount && rw >= 0 && rw < wcount {
+            lg := veh.states[lw].grounded
+            rg := veh.states[rw].grounded
+            if lg && rg {
+                delta_f := arb.stiffness * (veh.states[lw].compression - veh.states[rw].compression)
+                fl_new := math.max(0.0, susp_forces[lw] + delta_f)
+                fr_new := math.max(0.0, susp_forces[rw] - delta_f)
+                susp_forces[lw] = fl_new
+                susp_forces[rw] = fr_new
+                veh.states[lw].suspension_force = fl_new
+                veh.states[rw].suspension_force = fr_new
+            }
+        }
+    }
+
+    // Pass 3: Suspension normal + Pacejka tire friction impulses.
+    if grounded_cnt == 0 { << 0 }
+    m_wheel_eff := mass / f64(grounded_cnt)
+    lin_v := world.lin_vels[id]
+    ang_v := world.ang_vels[id]
+
+    for wi in 0:wcount {
+        if !veh.states[wi].grounded { -> }
+        cfg := veh.wheels[wi]
+        fn_val := susp_forces[wi]
+        if fn_val <= 0.0 { -> }
+
+        c_pt := veh.states[wi].contact_point
+        n_hit := veh.states[wi].contact_normal
+
+        // Normal suspension impulse at contact point.
+        world.apply_impulse_at_point(id, n_hit.scaled(fn_val * dt), c_pt) >>>
+
+        // Steered wheel basis projected onto road contact plane.
+        ang := veh.states[wi].steer_angle
+        cos_s := math.cos(ang)
+        sin_s := math.sin(ang)
+        raw_fwd := c_fwd.scaled(cos_s).add(c_right.scaled(sin_s))
+        raw_right := c_right.scaled(cos_s).sub(c_fwd.scaled(sin_s))
+        fwd_w := veh_safe_norm(raw_fwd.sub(n_hit.scaled(raw_fwd.dot(n_hit))), c_fwd)
+        right_w := veh_safe_norm(raw_right.sub(n_hit.scaled(raw_right.dot(n_hit))), c_right)
+
+        r_c := c_pt.sub(c_pos)
+        v_c := lin_v.add(ang_v.cross(r_c))
+        v_long := v_c.dot(fwd_w)
+        v_lat := v_c.dot(right_w)
+
+        // Lateral Pacejka cornering force + low-speed lateral stabilization clamp.
+        slip_ang := math.atan2(-v_lat, math.max(math.abs(v_long), 1.4))
+        max_grip := cfg.peak_friction * fn_val
+        $f_lat := pacejka_magic_formula(slip_ang, cfg.pacejka_b, cfg.pacejka_c, max_grip, cfg.pacejka_e)
+        if math.abs(v_long) < 0.8 && math.abs(v_lat) > 0.001 {
+            // Static lateral friction assist near rest so parked car does not creep sideways.
+            $lat_sgn := 1.0
+            if v_lat > 0.0 { lat_sgn = -1.0 }
+            f_lat = lat_sgn * max_grip
+        }
+        max_lat_step := (math.abs(v_lat) * m_wheel_eff * 0.85) / dt
+        if math.abs(f_lat) > max_lat_step {
+            $ls := 1.0
+            if f_lat < 0.0 { ls = -1.0 }
+            f_lat = ls * max_lat_step
+        }
+
+        // Longitudinal traction (engine drive, brake/handbrake, rolling resistance).
+        $f_long := 0.0
+        if cfg.is_driven && driven_count > 0 {
+            f_long += (thr * veh.engine_force) / f64(driven_count)
+        }
+        $total_brk := brk * (veh.brake_force / f64(wcount))
+        if handbrake && cfg.handbrake_affected {
+            total_brk += veh.handbrake_force * 0.5
+        }
+        if total_brk > 0.0 && math.abs(v_long) > 0.005 {
+            $stop_sgn := -1.0
+            if v_long < 0.0 { stop_sgn = 1.0 }
+            max_brk_step := (math.abs(v_long) * m_wheel_eff * 0.90) / dt
+            eff_brk := math.min(total_brk, max_brk_step)
+            f_long += stop_sgn * eff_brk
+        } else if cfg.rolling_resistance > 0.0 && math.abs(v_long) > 0.02 {
+            $rr_sgn := -1.0
+            if v_long < 0.0 { rr_sgn = 1.0 }
+            f_long += rr_sgn * cfg.rolling_resistance * fn_val
+        }
+
+        // Combined Kamm's friction circle clamp.
+        comb_sq := f_long * f_long + f_lat * f_lat
+        if comb_sq > max_grip * max_grip && comb_sq > 1e-12 {
+            scale := max_grip / math.sqrt(comb_sq)
+            f_long *= scale
+            f_lat *= scale
+        }
+
+        tire_imp := fwd_w.scaled(f_long * dt).add(right_w.scaled(f_lat * dt))
+        roll_infl := clamp_value(cfg.roll_influence, 0.0, 1.0)
+        // Attenuate vertical lever arm via roll_influence while preserving full yaw moment arm.
+        up_arm := c_pos.sub(c_pt).dot(c_up)
+        tire_app_pt := c_pt.add(c_up.scaled(up_arm * (1.0 - roll_infl)))
+        world.apply_impulse_at_point(id, tire_imp, tire_app_pt) >>>
+
+        veh.states[wi].slip_angle = slip_ang
+        veh.states[wi].long_force = f_long
+        veh.states[wi].lat_force = f_lat
+        omega := v_long / cfg.wheel_radius
+        veh.states[wi].angular_velocity = omega
+        veh.states[wi].spin_angle += omega * dt
+    }
+    << grounded_cnt
+}
+
+pub fn (veh &RaycastVehicle3D) speed_mps(world &JointedWorld3D) f64 {
+    v := world.linear_velocity(veh.chassis_id) >>>
+    << v.length()
+}
+
+pub fn (veh &RaycastVehicle3D) forward_speed_mps(world &JointedWorld3D) f64 {
+    v := world.linear_velocity(veh.chassis_id) >>>
+    q := world.orientation(veh.chassis_id) >>>
+    fwd := q_rotate(q, fm.vec3(0.0, 0.0, -1.0))
+    << v.dot(fwd)
+}
+
+pub fn (veh &RaycastVehicle3D) grounded_wheel_count() int {
+    $c := 0
+    for s in veh.states {
+        if s.grounded { c += 1 }
+    }
+    << c
+}

@@ -1,0 +1,1610 @@
+@main
+
+resource #"github.com/xulang-org/nexus/resources/scene"
+light_data #"github.com/xulang-org/nexus/resources/lighting"
+sprite3d #"github.com/xulang-org/nexus/resources/sprite3d"
+#ui
+#ui/draw
+#ui/layout
+widgets #ui/widgets
+#math
+#path/filepath
+#strconv
+#strings
+#time
+#errors
+
+// Field indices
+const CF_CAM_F1 = 0
+const CF_CAM_F2 = 1
+const CF_CAM_F3 = 2
+const CF_LIGHT_R = 3
+const CF_LIGHT_G = 4
+const CF_LIGHT_B = 5
+const CF_LIGHT_RADIUS = 6
+const CF_LIGHT_IN = 7
+const CF_LIGHT_OUT = 8
+const CF_LIGHT_DX = 9
+const CF_LIGHT_DY = 10
+const CF_LIGHT_DZ = 11
+const CF_LIGHT_SRES = 12
+const CF_LIGHT_SDIST = 13
+const CF_SCRIPT_INIT = 14
+const CF_AUDIO_VOL = 15
+const CF_AUDIO_PAN = 16
+const CF_AUDIO_DIST = 17
+const CF_SPRITE_W = 18
+const CF_SPRITE_H = 19
+const CF_SPRITE_CUT = 20
+
+// Select indices
+const CS_CAM_PROJ = 0
+const CS_LIGHT_KIND = 1
+const CS_SCRIPT_ASSET = 2
+const CS_AUDIO_ASSET = 3
+const CS_AUDIO_BUS = 4
+const CS_AUDIO_SPATIAL = 5
+const CS_AUDIO_LISTENER = 6
+const CS_SPRITE_ASSET = 7
+const CS_SPRITE_BB = 8
+const CS_SPRITE_ALPHA = 9
+const CS_TILEMAP_ASSET = 10
+
+// Button indices
+const CB_CAM_APPLY = 0
+const CB_CAM_CLEAR = 1
+const CB_LIGHT_APPLY = 2
+const CB_LIGHT_CLEAR = 3
+const CB_SCRIPT_APPLY = 4
+const CB_SCRIPT_CLEAR = 5
+const CB_AUDIO_APPLY = 6
+const CB_AUDIO_CLEAR = 7
+const CB_SPRITE_APPLY = 8
+const CB_SPRITE_CLEAR = 9
+pub const CB_TILEMAP_EDIT = 10
+
+// Checkbox indices
+const CK_LIGHT_SHADOW = 0
+const CK_AUDIO_LOOP = 1
+const CK_AUDIO_AUTO = 2
+const CK_SPRITE_SHADED = 3
+
+pub struct ComponentInspector {
+    pub png_indices []int
+    pub wav_indices []int
+    pub xubc_indices []int
+    pub listener_candidates []int
+    pub pi_val_cache f64
+
+    // Layout node IDs preserved for external scroll extent / container styling
+    pub id_cam_div int
+    pub id_cam_hdr int
+    pub id_cam_row1 int
+    pub id_cam_row2 int
+    pub id_cam_row3 int
+
+    pub id_light_div int
+    pub id_light_hdr int
+    pub id_light_row1 int
+    pub id_light_row2 int
+    pub id_light_row3 int
+    pub id_light_row4 int
+    pub id_light_row5 int
+    pub id_light_row6 int
+
+    pub id_script_div int
+    pub id_script_hdr int
+    pub id_script_row1 int
+    pub id_script_row3 int
+
+    pub id_audio_div int
+    pub id_audio_hdr int
+    pub id_audio_row1 int
+    pub id_audio_row2 int
+    pub id_audio_row3 int
+    pub id_audio_row4 int
+    pub id_audio_row5 int
+
+    pub id_sprite_div int
+    pub id_sprite_hdr int
+    pub id_sprite_row1 int
+    pub id_sprite_row2 int
+    pub id_sprite_row3 int
+    pub id_sprite_row4 int
+
+    pub id_tilemap_div int
+    pub id_tilemap_hdr int
+    pub id_tilemap_info int
+    pub id_tilemap_row int
+
+    // Heap-backed widget slices (keeps sizeof(ComponentInspector) and worker stacks small)
+    pub fields []widgets.Field
+    pub field_ids []int
+    pub field_kinds []int
+
+    pub selects []widgets.Select
+    pub select_ids []int
+    pub select_kinds []int
+    pub select_origins []layout.Rect
+    pub select_labels [][]widgets.StyledLabel
+
+    pub buttons []widgets.Button
+    pub button_ids []int
+    pub button_kinds []int
+    pub button_labels []widgets.StyledLabel
+
+    pub checks []widgets.Checkbox
+    pub check_ids []int
+    pub check_kinds []int
+    pub check_labels []widgets.StyledLabel
+
+    pub divs []widgets.Divider
+    pub div_ids []int
+
+    pub tilemap_info_txts []widgets.SelectableText
+    pub empty_lbl widgets.StyledLabel
+}
+
+pub fn collect_ext_indices(project &Project, ext_dot string) []int {
+    want := strings.to_lower(&ext_dot)
+    $out := []int{}
+    for i in 0:project.assets.len {
+        ext := strings.to_lower(&filepath.ext(&project.assets[i].path))
+        if ext == want {
+            out.push(i)
+        }
+    }
+    << out
+}
+
+fn make_styled_labels(context &draw.Context, names &[]string) []widgets.StyledLabel {
+    $out := []widgets.StyledLabel{}
+    for i in 0:names.len {
+        nm := names[i] + ""
+        out.push(widgets.styled_label(context, &nm))
+    }
+    << out
+}
+
+fn push_comp_field(
+    c $&ComponentInspector,
+    view $&widgets.View,
+    parent int,
+    w f64,
+    kind int,
+    ctx &draw.Context,
+    id_ev &ui.CanvasEvent,
+    label string,
+    val string
+) int {
+    nid := add_interactive(view, parent, &leaf_box(w, 44.0), ui.CURSOR_TEXT, true)
+    view.set_capture_outside(nid, true) >>>
+    c.field_ids.push(nid)
+    c.field_kinds.push(kind)
+    c.fields.push(make_plain_field(ctx, id_ev, nid, label, val))
+    << nid
+}
+
+fn push_comp_select(
+    c $&ComponentInspector,
+    view $&widgets.View,
+    parent int,
+    w f64,
+    kind int,
+    id_ev &ui.CanvasEvent,
+    count int,
+    sel int,
+    labels []widgets.StyledLabel
+) int {
+    nid := add_interactive(view, parent, &leaf_box(w, 30.0), ui.CURSOR_HAND, true)
+    s := widgets.select_box(id_ev, nid, &zero_rect(), count, sel) >>>
+    c.select_ids.push(nid)
+    c.select_kinds.push(kind)
+    c.select_origins.push(zero_rect())
+    c.selects.push(s)
+    c.select_labels.push(labels)
+    << nid
+}
+
+fn push_comp_btn(
+    c $&ComponentInspector,
+    view $&widgets.View,
+    parent int,
+    w f64,
+    kind int,
+    ctx &draw.Context,
+    id_ev &ui.CanvasEvent,
+    title string
+) int {
+    nid := add_interactive(view, parent, &leaf_box(w, 28.0), ui.CURSOR_HAND, true)
+    b := widgets.button(id_ev, nid, &zero_rect()) >>>
+    c.button_ids.push(nid)
+    c.button_kinds.push(kind)
+    c.buttons.push(b)
+    c.button_labels.push(widgets.styled_label(ctx, &title))
+    << nid
+}
+
+fn push_comp_chk(
+    c $&ComponentInspector,
+    view $&widgets.View,
+    parent int,
+    w f64,
+    kind int,
+    ctx &draw.Context,
+    id_ev &ui.CanvasEvent,
+    title string,
+    init bool
+) int {
+    nid := add_interactive(view, parent, &leaf_box(w, 26.0), ui.CURSOR_HAND, true)
+    chk := widgets.checkbox(id_ev, nid, &zero_rect(), init) >>>
+    c.check_ids.push(nid)
+    c.check_kinds.push(kind)
+    c.checks.push(chk)
+    c.check_labels.push(widgets.styled_label(ctx, &title))
+    << nid
+}
+
+fn push_comp_div(c $&ComponentInspector, view $&widgets.View, id_scroll int, scroll_cw f64) int {
+    nid := add_box(view, id_scroll, &leaf_box(scroll_cw, 4.0))
+    dv := widgets.divider(&zero_rect(), widgets.AXIS_HORIZONTAL) >>>
+    c.div_ids.push(nid)
+    c.divs.push(dv)
+    << nid
+}
+
+fn init_comp_camera(c $&ComponentInspector, view $&widgets.View, id_scroll int, scroll_cw f64, tri_w f64, half_w f64, ctx &draw.Context, id_ev &ui.CanvasEvent) int {
+    c.id_cam_div = push_comp_div(c, view, id_scroll, scroll_cw) >>>
+    c.id_cam_hdr = add_box(view, id_scroll, &leaf_box(scroll_cw, 18.0))
+    c.id_cam_row1 = add_box(view, id_scroll, &row_box(scroll_cw, 30.0, 4.0))
+    lbls := make_styled_labels(ctx, &["Cam: None", "Cam: Perspective", "Cam: Orthographic", "Cam: View2D"])
+    _ := push_comp_select(c, view, c.id_cam_row1, scroll_cw, 0, id_ev, 4, 0, lbls) >>>
+    c.id_cam_row2 = add_box(view, id_scroll, &row_box(scroll_cw, 44.0, 4.0))
+    _ := push_comp_field(c, view, c.id_cam_row2, tri_w, 0, ctx, id_ev, "FOV/Sz/W", "60") >>>
+    _ := push_comp_field(c, view, c.id_cam_row2, tri_w, 0, ctx, id_ev, "Near/H", "0.1") >>>
+    _ := push_comp_field(c, view, c.id_cam_row2, tri_w, 0, ctx, id_ev, "Far/Zoom", "200") >>>
+    c.id_cam_row3 = add_box(view, id_scroll, &row_box(scroll_cw, 30.0, 4.0))
+    _ := push_comp_btn(c, view, c.id_cam_row3, half_w, 0, ctx, id_ev, "Apply Cam") >>>
+    _ := push_comp_btn(c, view, c.id_cam_row3, half_w, 1, ctx, id_ev, "Clear") >>>
+    << 0
+}
+
+fn init_comp_light(c $&ComponentInspector, view $&widgets.View, id_scroll int, scroll_cw f64, tri_w f64, half_w f64, ctx &draw.Context, id_ev &ui.CanvasEvent) int {
+    c.id_light_div = push_comp_div(c, view, id_scroll, scroll_cw) >>>
+    c.id_light_hdr = add_box(view, id_scroll, &leaf_box(scroll_cw, 18.0))
+    c.id_light_row1 = add_box(view, id_scroll, &row_box(scroll_cw, 30.0, 4.0))
+    lbls := make_styled_labels(ctx, &["Light: None", "Light: Directional", "Light: Point", "Light: Spot"])
+    _ := push_comp_select(c, view, c.id_light_row1, scroll_cw, 0, id_ev, 4, 0, lbls) >>>
+    c.id_light_row2 = add_box(view, id_scroll, &row_box(scroll_cw, 44.0, 4.0))
+    _ := push_comp_field(c, view, c.id_light_row2, tri_w, 0, ctx, id_ev, "R", "2.5") >>>
+    _ := push_comp_field(c, view, c.id_light_row2, tri_w, 0, ctx, id_ev, "G", "2.4") >>>
+    _ := push_comp_field(c, view, c.id_light_row2, tri_w, 0, ctx, id_ev, "B", "2.2") >>>
+    c.id_light_row3 = add_box(view, id_scroll, &row_box(scroll_cw, 44.0, 4.0))
+    _ := push_comp_field(c, view, c.id_light_row3, tri_w, 0, ctx, id_ev, "Radius", "12") >>>
+    _ := push_comp_field(c, view, c.id_light_row3, tri_w, 0, ctx, id_ev, "In deg", "15") >>>
+    _ := push_comp_field(c, view, c.id_light_row3, tri_w, 0, ctx, id_ev, "Out deg", "35") >>>
+    c.id_light_row4 = add_box(view, id_scroll, &row_box(scroll_cw, 44.0, 4.0))
+    _ := push_comp_field(c, view, c.id_light_row4, tri_w, 0, ctx, id_ev, "Dir X", "0.4") >>>
+    _ := push_comp_field(c, view, c.id_light_row4, tri_w, 0, ctx, id_ev, "Dir Y", "0.72") >>>
+    _ := push_comp_field(c, view, c.id_light_row4, tri_w, 0, ctx, id_ev, "Dir Z", "0.4") >>>
+    c.id_light_row5 = add_box(view, id_scroll, &row_box(scroll_cw, 44.0, 4.0))
+    _ := push_comp_chk(c, view, c.id_light_row5, tri_w, 0, ctx, id_ev, "Shadows", false) >>>
+    _ := push_comp_field(c, view, c.id_light_row5, tri_w, 0, ctx, id_ev, "Res", "512") >>>
+    _ := push_comp_field(c, view, c.id_light_row5, tri_w, 0, ctx, id_ev, "Dist", "80") >>>
+    c.id_light_row6 = add_box(view, id_scroll, &row_box(scroll_cw, 30.0, 4.0))
+    _ := push_comp_btn(c, view, c.id_light_row6, half_w, 0, ctx, id_ev, "Apply Light") >>>
+    _ := push_comp_btn(c, view, c.id_light_row6, half_w, 1, ctx, id_ev, "Clear") >>>
+    << 0
+}
+
+fn init_comp_script(c $&ComponentInspector, view $&widgets.View, id_scroll int, scroll_cw f64, half_w f64, ctx &draw.Context, id_ev &ui.CanvasEvent, project &Project) int {
+    c.id_script_div = push_comp_div(c, view, id_scroll, scroll_cw) >>>
+    c.id_script_hdr = add_box(view, id_scroll, &leaf_box(scroll_cw, 18.0))
+    c.id_script_row1 = add_box(view, id_scroll, &row_box(scroll_cw, 30.0, 4.0))
+    cnt := min_int_val(c.xubc_indices.len + 1, 64)
+    lbls := make_surface_asset_labels(ctx, project, &c.xubc_indices, "(No .xubc)")
+    _ := push_comp_select(c, view, c.id_script_row1, scroll_cw, 0, id_ev, cnt, 0, lbls) >>>
+    _ := push_comp_field(c, view, id_scroll, scroll_cw, 1, ctx, id_ev, "Initials (id=val, ...)", "") >>>
+    c.id_script_row3 = add_box(view, id_scroll, &row_box(scroll_cw, 30.0, 4.0))
+    _ := push_comp_btn(c, view, c.id_script_row3, half_w, 0, ctx, id_ev, "Bind Script") >>>
+    _ := push_comp_btn(c, view, c.id_script_row3, half_w, 1, ctx, id_ev, "Clear") >>>
+    << 0
+}
+
+fn init_comp_audio(c $&ComponentInspector, view $&widgets.View, id_scroll int, scroll_cw f64, tri_w f64, half_w f64, ctx &draw.Context, id_ev &ui.CanvasEvent, project &Project) int {
+    c.id_audio_div = push_comp_div(c, view, id_scroll, scroll_cw) >>>
+    c.id_audio_hdr = add_box(view, id_scroll, &leaf_box(scroll_cw, 18.0))
+    c.id_audio_row1 = add_box(view, id_scroll, &row_box(scroll_cw, 30.0, 4.0))
+    w_cnt := min_int_val(c.wav_indices.len + 1, 64)
+    a_lbls := make_surface_asset_labels(ctx, project, &c.wav_indices, "(No .wav)")
+    _ := push_comp_select(c, view, c.id_audio_row1, math.max(80.0, scroll_cw * 0.56), 1, id_ev, w_cnt, 0, a_lbls) >>>
+    _ := push_comp_select(c, view, c.id_audio_row1, math.max(60.0, scroll_cw * 0.44 - 4.0), 2, id_ev, 1, 0, make_styled_labels(ctx, &["Master"])) >>>
+    c.id_audio_row2 = add_box(view, id_scroll, &row_box(scroll_cw, 44.0, 4.0))
+    _ := push_comp_field(c, view, c.id_audio_row2, tri_w, 0, ctx, id_ev, "Vol", "1") >>>
+    _ := push_comp_field(c, view, c.id_audio_row2, tri_w, 0, ctx, id_ev, "Pan", "0") >>>
+    _ := push_comp_field(c, view, c.id_audio_row2, tri_w, 0, ctx, id_ev, "MaxD", "0") >>>
+    c.id_audio_row3 = add_box(view, id_scroll, &row_box(scroll_cw, 26.0, 4.0))
+    _ := push_comp_chk(c, view, c.id_audio_row3, half_w, 1, ctx, id_ev, "Loop", false) >>>
+    _ := push_comp_chk(c, view, c.id_audio_row3, half_w, 1, ctx, id_ev, "Auto", false) >>>
+    c.id_audio_row4 = add_box(view, id_scroll, &row_box(scroll_cw, 30.0, 4.0))
+    _ := push_comp_select(c, view, c.id_audio_row4, math.max(70.0, scroll_cw * 0.44), 3, id_ev, 3, 0, make_styled_labels(ctx, &["none", "2d", "3d"])) >>>
+    _ := push_comp_select(c, view, c.id_audio_row4, math.max(70.0, scroll_cw * 0.56 - 4.0), 4, id_ev, 1, 0, make_styled_labels(ctx, &["Listener: None"])) >>>
+    c.id_audio_row5 = add_box(view, id_scroll, &row_box(scroll_cw, 30.0, 4.0))
+    _ := push_comp_btn(c, view, c.id_audio_row5, half_w, 0, ctx, id_ev, "Bind Audio") >>>
+    _ := push_comp_btn(c, view, c.id_audio_row5, half_w, 1, ctx, id_ev, "Clear") >>>
+    << 0
+}
+
+fn init_comp_sprite(c $&ComponentInspector, view $&widgets.View, id_scroll int, scroll_cw f64, tri_w f64, half_w f64, ctx &draw.Context, id_ev &ui.CanvasEvent, project &Project) int {
+    c.id_sprite_div = push_comp_div(c, view, id_scroll, scroll_cw) >>>
+    c.id_sprite_hdr = add_box(view, id_scroll, &leaf_box(scroll_cw, 18.0))
+    c.id_sprite_row1 = add_box(view, id_scroll, &row_box(scroll_cw, 30.0, 4.0))
+    p_cnt := min_int_val(c.png_indices.len + 1, 64)
+    p_lbls := make_surface_asset_labels(ctx, project, &c.png_indices, "(No .png)")
+    _ := push_comp_select(c, view, c.id_sprite_row1, scroll_cw, 0, id_ev, p_cnt, 0, p_lbls) >>>
+    c.id_sprite_row2 = add_box(view, id_scroll, &row_box(scroll_cw, 44.0, 4.0))
+    _ := push_comp_field(c, view, c.id_sprite_row2, tri_w, 0, ctx, id_ev, "W", "1") >>>
+    _ := push_comp_field(c, view, c.id_sprite_row2, tri_w, 0, ctx, id_ev, "H", "1") >>>
+    _ := push_comp_field(c, view, c.id_sprite_row2, tri_w, 0, ctx, id_ev, "Cut", "0.5") >>>
+    c.id_sprite_row3 = add_box(view, id_scroll, &row_box(scroll_cw, 30.0, 4.0))
+    _ := push_comp_select(c, view, c.id_sprite_row3, half_w, 5, id_ev, 3, 2, make_styled_labels(ctx, &["BB: Off", "BB: Full", "BB: Y-Axis"])) >>>
+    _ := push_comp_select(c, view, c.id_sprite_row3, half_w, 5, id_ev, 2, 1, make_styled_labels(ctx, &["Opaque", "Cutout"])) >>>
+    c.id_sprite_row4 = add_box(view, id_scroll, &row_box(scroll_cw, 30.0, 4.0))
+    _ := push_comp_chk(c, view, c.id_sprite_row4, tri_w, 2, ctx, id_ev, "Shaded", true) >>>
+    _ := push_comp_btn(c, view, c.id_sprite_row4, tri_w, 2, ctx, id_ev, "Bind") >>>
+    _ := push_comp_btn(c, view, c.id_sprite_row4, tri_w, 3, ctx, id_ev, "Clear") >>>
+    << 0
+}
+
+fn init_comp_tilemap(c $&ComponentInspector, view $&widgets.View, id_scroll int, scroll_cw f64, ctx &draw.Context, id_ev &ui.CanvasEvent, project &Project) int {
+    c.id_tilemap_div = push_comp_div(c, view, id_scroll, scroll_cw) >>>
+    c.id_tilemap_hdr = add_box(view, id_scroll, &leaf_box(scroll_cw, 18.0))
+    id_info := add_interactive(view, id_scroll, &leaf_box(scroll_cw, 18.0), ui.CURSOR_TEXT, true)
+    view.set_capture_outside(id_info, true) >>>
+    c.id_tilemap_info = id_info
+    info_txt := widgets.selectable_text(ctx, id_ev, id_info, &zero_rect(), &"No TileMap2D") >>>
+    c.tilemap_info_txts.push(info_txt)
+    set_text_ellipsis($&c.tilemap_info_txts[0], true)
+
+    c.id_tilemap_row = add_box(view, id_scroll, &row_box(scroll_cw, 30.0, 4.0))
+    p_cnt := min_int_val(c.png_indices.len + 1, 64)
+    p_lbls := make_surface_asset_labels(ctx, project, &c.png_indices, "(No .png)")
+    _ := push_comp_select(c, view, c.id_tilemap_row, math.max(70.0, scroll_cw - 108.0), 6, id_ev, p_cnt, 0, p_lbls) >>>
+    _ := push_comp_btn(c, view, c.id_tilemap_row, 104.0, 4, ctx, id_ev, "TileMap Editor") >>>
+    << 0
+}
+
+pub fn create_comp_inspector(
+    view $&widgets.View,
+    id_scroll int,
+    scroll_cw f64,
+    context &draw.Context,
+    identity &ui.CanvasEvent,
+    project &Project,
+    styles &widgets.Styles
+) ComponentInspector {
+    tri_w := (scroll_cw - 8.0) / 3.0
+    half_w := (scroll_cw - 4.0) * 0.5
+    $comp := ComponentInspector{
+        png_indices: collect_ext_indices(project, ".png"),
+        wav_indices: collect_ext_indices(project, ".wav"),
+        xubc_indices: collect_ext_indices(project, ".xubc"),
+        listener_candidates: [-1],
+        pi_val_cache: 3.14159265358979323846,
+        id_cam_div: 0, id_cam_hdr: 0, id_cam_row1: 0, id_cam_row2: 0, id_cam_row3: 0,
+        id_light_div: 0, id_light_hdr: 0, id_light_row1: 0, id_light_row2: 0, id_light_row3: 0, id_light_row4: 0, id_light_row5: 0, id_light_row6: 0,
+        id_script_div: 0, id_script_hdr: 0, id_script_row1: 0, id_script_row3: 0,
+        id_audio_div: 0, id_audio_hdr: 0, id_audio_row1: 0, id_audio_row2: 0, id_audio_row3: 0, id_audio_row4: 0, id_audio_row5: 0,
+        id_sprite_div: 0, id_sprite_hdr: 0, id_sprite_row1: 0, id_sprite_row2: 0, id_sprite_row3: 0, id_sprite_row4: 0,
+        id_tilemap_div: 0, id_tilemap_hdr: 0, id_tilemap_info: 0, id_tilemap_row: 0,
+        fields: []widgets.Field{},
+        field_ids: []int{},
+        field_kinds: []int{},
+        selects: []widgets.Select{},
+        select_ids: []int{},
+        select_kinds: []int{},
+        select_origins: []layout.Rect{},
+        select_labels: [][]widgets.StyledLabel{},
+        buttons: []widgets.Button{},
+        button_ids: []int{},
+        button_kinds: []int{},
+        button_labels: []widgets.StyledLabel{},
+        checks: []widgets.Checkbox{},
+        check_ids: []int{},
+        check_kinds: []int{},
+        check_labels: []widgets.StyledLabel{},
+        divs: []widgets.Divider{},
+        div_ids: []int{},
+        tilemap_info_txts: []widgets.SelectableText{},
+        empty_lbl: widgets.styled_label(context, &"-")
+    }
+    init_comp_camera($&comp, view, id_scroll, scroll_cw, tri_w, half_w, context, identity) >>>
+    init_comp_light($&comp, view, id_scroll, scroll_cw, tri_w, half_w, context, identity) >>>
+    init_comp_script($&comp, view, id_scroll, scroll_cw, half_w, context, identity, project) >>>
+    init_comp_audio($&comp, view, id_scroll, scroll_cw, tri_w, half_w, context, identity, project) >>>
+    init_comp_sprite($&comp, view, id_scroll, scroll_cw, tri_w, half_w, context, identity, project) >>>
+    init_comp_tilemap($&comp, view, id_scroll, scroll_cw, context, identity, project) >>>
+    apply_comp_styles($&comp, styles)
+    << comp
+}
+
+pub fn apply_comp_styles(c $&ComponentInspector, styles &widgets.Styles) {
+    compact := compact_button_style(styles, widgets.BUTTON_SECONDARY)
+    subtle := compact_button_style(styles, widgets.BUTTON_SUBTLE)
+    cf := compact_field_style(styles)
+    cs := compact_select_style(styles)
+
+    for i in 0:c.buttons.len {
+        kind := c.button_kinds[i]
+        if kind == 1 || kind == 3 {
+            set_btn_style($&c.buttons[i], &subtle)
+        } else {
+            set_btn_style($&c.buttons[i], &compact)
+        }
+    }
+    for i in 0:c.fields.len {
+        set_field_style($&c.fields[i], &cf)
+    }
+    for i in 0:c.selects.len {
+        set_sel_style($&c.selects[i], &cs)
+    }
+}
+
+fn set_comp_field_label(f $&widgets.Field, lbl string) {
+    $dec := widgets.field_decoration(&lbl)
+    dec.reserve_helper = false
+    set_field_dec(f, &dec)
+}
+
+fn replace_static_select_labels(c $&ComponentInspector, sel_idx int, ctx &draw.Context, names &[]string) {
+    prev := c.selects[sel_idx].selected()
+    for i in 0:c.select_labels[sel_idx].len { dispose_label($&c.select_labels[sel_idx][i]) }
+    c.select_labels[sel_idx] = make_styled_labels(ctx, names)
+    cnt := min_int_val(c.select_labels[sel_idx].len, 64)
+    set_sel_count($&c.selects[sel_idx], cnt)
+    $next_sel := prev
+    if next_sel < 0 || next_sel >= cnt { next_sel = 0 }
+    set_sel_selected($&c.selects[sel_idx], next_sel)
+}
+
+pub fn comp_apply_lang(c $&ComponentInspector, ctx &draw.Context, project &Project, lang int) {
+    set_lbl_text($&c.button_labels[CB_CAM_APPLY], &tr(lang, "Apply Cam", "应用相机"))
+    set_lbl_text($&c.button_labels[CB_CAM_CLEAR], &tr(lang, "Clear", "清除"))
+    set_lbl_text($&c.button_labels[CB_LIGHT_APPLY], &tr(lang, "Apply Light", "应用光照"))
+    set_lbl_text($&c.button_labels[CB_LIGHT_CLEAR], &tr(lang, "Clear", "清除"))
+    set_lbl_text($&c.button_labels[CB_SCRIPT_APPLY], &tr(lang, "Bind Script", "绑定脚本"))
+    set_lbl_text($&c.button_labels[CB_SCRIPT_CLEAR], &tr(lang, "Clear", "清除"))
+    set_lbl_text($&c.button_labels[CB_AUDIO_APPLY], &tr(lang, "Bind Audio", "绑定音频"))
+    set_lbl_text($&c.button_labels[CB_AUDIO_CLEAR], &tr(lang, "Clear", "清除"))
+    set_lbl_text($&c.button_labels[CB_SPRITE_APPLY], &tr(lang, "Bind", "绑定"))
+    set_lbl_text($&c.button_labels[CB_SPRITE_CLEAR], &tr(lang, "Clear", "清除"))
+    set_lbl_text($&c.button_labels[CB_TILEMAP_EDIT], &tr(lang, "TileMap Editor", "瓦片编辑器"))
+
+    set_lbl_text($&c.check_labels[CK_LIGHT_SHADOW], &tr(lang, "Shadows", "阴影"))
+    set_lbl_text($&c.check_labels[CK_AUDIO_LOOP], &tr(lang, "Loop", "循环"))
+    set_lbl_text($&c.check_labels[CK_AUDIO_AUTO], &tr(lang, "Auto", "自动播放"))
+    set_lbl_text($&c.check_labels[CK_SPRITE_SHADED], &tr(lang, "Shaded", "受光照"))
+
+    set_comp_field_label($&c.fields[CF_CAM_F1], tr(lang, "FOV/Sz/W", "视角/高/宽"))
+    set_comp_field_label($&c.fields[CF_CAM_F2], tr(lang, "Near/H", "近面/高"))
+    set_comp_field_label($&c.fields[CF_CAM_F3], tr(lang, "Far/Zoom", "远面/缩放"))
+    set_comp_field_label($&c.fields[CF_LIGHT_RADIUS], tr(lang, "Radius", "半径"))
+    set_comp_field_label($&c.fields[CF_LIGHT_IN], tr(lang, "In deg", "内角"))
+    set_comp_field_label($&c.fields[CF_LIGHT_OUT], tr(lang, "Out deg", "外角"))
+    set_comp_field_label($&c.fields[CF_LIGHT_DX], tr(lang, "Dir X", "方向 X"))
+    set_comp_field_label($&c.fields[CF_LIGHT_DY], tr(lang, "Dir Y", "方向 Y"))
+    set_comp_field_label($&c.fields[CF_LIGHT_DZ], tr(lang, "Dir Z", "方向 Z"))
+    set_comp_field_label($&c.fields[CF_LIGHT_SRES], tr(lang, "Res", "分辨率"))
+    set_comp_field_label($&c.fields[CF_LIGHT_SDIST], tr(lang, "Dist", "距离"))
+    set_comp_field_label($&c.fields[CF_SCRIPT_INIT], tr(lang, "Initials (id=val, ...)", "初始参数 (id=val, ...)"))
+    set_comp_field_label($&c.fields[CF_AUDIO_VOL], tr(lang, "Vol", "音量"))
+    set_comp_field_label($&c.fields[CF_AUDIO_PAN], tr(lang, "Pan", "声相"))
+    set_comp_field_label($&c.fields[CF_AUDIO_DIST], tr(lang, "MaxD", "最大距"))
+    set_comp_field_label($&c.fields[CF_SPRITE_W], tr(lang, "W", "宽"))
+    set_comp_field_label($&c.fields[CF_SPRITE_H], tr(lang, "H", "高"))
+    set_comp_field_label($&c.fields[CF_SPRITE_CUT], tr(lang, "Cut", "阈值"))
+
+    if lang == LANG_ZH {
+        replace_static_select_labels(c, CS_CAM_PROJ, ctx, &["相机: 无", "相机: 透视", "相机: 正交", "相机: 2D 视图"])
+        replace_static_select_labels(c, CS_LIGHT_KIND, ctx, &["光源: 无", "光源: 平行光", "光源: 点光源", "光源: 聚光灯"])
+        replace_static_select_labels(c, CS_AUDIO_SPATIAL, ctx, &["无空间化", "2D 空间", "3D 空间"])
+        replace_static_select_labels(c, CS_SPRITE_BB, ctx, &["朝向: 无", "朝向: 完整", "朝向: Y 轴"])
+        replace_static_select_labels(c, CS_SPRITE_ALPHA, ctx, &["不透明", "镂空裁剪"])
+    } else {
+        replace_static_select_labels(c, CS_CAM_PROJ, ctx, &["Cam: None", "Cam: Perspective", "Cam: Orthographic", "Cam: View2D"])
+        replace_static_select_labels(c, CS_LIGHT_KIND, ctx, &["Light: None", "Light: Directional", "Light: Point", "Light: Spot"])
+        replace_static_select_labels(c, CS_AUDIO_SPATIAL, ctx, &["none", "2d", "3d"])
+        replace_static_select_labels(c, CS_SPRITE_BB, ctx, &["BB: Off", "BB: Full", "BB: Y-Axis"])
+        replace_static_select_labels(c, CS_SPRITE_ALPHA, ctx, &["Opaque", "Cutout"])
+    }
+    refresh_comp_asset_selectors(c, ctx, project, lang)
+}
+
+pub fn comp_dispose(c $&ComponentInspector) {
+    for i in 0:c.fields.len { dispose_field($&c.fields[i]) }
+    for i in 0:c.tilemap_info_txts.len { dispose_sel_text($&c.tilemap_info_txts[i]) }
+    for i in 0:c.button_labels.len { dispose_label($&c.button_labels[i]) }
+    for i in 0:c.check_labels.len { dispose_label($&c.check_labels[i]) }
+    dispose_label($&c.empty_lbl)
+    for i in 0:c.select_labels.len {
+        for j in 0:c.select_labels[i].len {
+            dispose_label($&c.select_labels[i][j])
+        }
+    }
+}
+
+pub fn sync_comp_layout(c &ComponentInspector, view $&widgets.View, scroll_cw f64) int {
+    tri_w := (scroll_cw - 8.0) / 3.0
+    half_w := (scroll_cw - 4.0) * 0.5
+
+    for i in 0:c.div_ids.len { view.set_style(c.div_ids[i], &leaf_box(scroll_cw, 4.0)) >>> }
+    view.set_style(c.id_cam_hdr, &leaf_box(scroll_cw, 18.0)) >>>
+    view.set_style(c.id_cam_row1, &row_box(scroll_cw, 30.0, 4.0)) >>>
+    view.set_style(c.id_cam_row2, &row_box(scroll_cw, 44.0, 4.0)) >>>
+    view.set_style(c.id_cam_row3, &row_box(scroll_cw, 30.0, 4.0)) >>>
+
+    view.set_style(c.id_light_hdr, &leaf_box(scroll_cw, 18.0)) >>>
+    view.set_style(c.id_light_row1, &row_box(scroll_cw, 30.0, 4.0)) >>>
+    view.set_style(c.id_light_row2, &row_box(scroll_cw, 44.0, 4.0)) >>>
+    view.set_style(c.id_light_row3, &row_box(scroll_cw, 44.0, 4.0)) >>>
+    view.set_style(c.id_light_row4, &row_box(scroll_cw, 44.0, 4.0)) >>>
+    view.set_style(c.id_light_row5, &row_box(scroll_cw, 44.0, 4.0)) >>>
+    view.set_style(c.id_light_row6, &row_box(scroll_cw, 30.0, 4.0)) >>>
+
+    view.set_style(c.id_script_hdr, &leaf_box(scroll_cw, 18.0)) >>>
+    view.set_style(c.id_script_row1, &row_box(scroll_cw, 30.0, 4.0)) >>>
+    view.set_style(c.id_script_row3, &row_box(scroll_cw, 30.0, 4.0)) >>>
+
+    view.set_style(c.id_audio_hdr, &leaf_box(scroll_cw, 18.0)) >>>
+    view.set_style(c.id_audio_row1, &row_box(scroll_cw, 30.0, 4.0)) >>>
+    view.set_style(c.id_audio_row2, &row_box(scroll_cw, 44.0, 4.0)) >>>
+    view.set_style(c.id_audio_row3, &row_box(scroll_cw, 26.0, 4.0)) >>>
+    view.set_style(c.id_audio_row4, &row_box(scroll_cw, 30.0, 4.0)) >>>
+    view.set_style(c.id_audio_row5, &row_box(scroll_cw, 30.0, 4.0)) >>>
+
+    view.set_style(c.id_sprite_hdr, &leaf_box(scroll_cw, 18.0)) >>>
+    view.set_style(c.id_sprite_row1, &row_box(scroll_cw, 30.0, 4.0)) >>>
+    view.set_style(c.id_sprite_row2, &row_box(scroll_cw, 44.0, 4.0)) >>>
+    view.set_style(c.id_sprite_row3, &row_box(scroll_cw, 30.0, 4.0)) >>>
+    view.set_style(c.id_sprite_row4, &row_box(scroll_cw, 30.0, 4.0)) >>>
+
+    view.set_style(c.id_tilemap_hdr, &leaf_box(scroll_cw, 18.0)) >>>
+    view.set_style(c.id_tilemap_info, &leaf_box(scroll_cw, 18.0)) >>>
+    view.set_style(c.id_tilemap_row, &row_box(scroll_cw, 30.0, 4.0)) >>>
+
+    for i in 0:c.field_ids.len {
+        $w := tri_w
+        if c.field_kinds[i] == 1 { w = scroll_cw }
+        view.set_style(c.field_ids[i], &leaf_box(w, 44.0)) >>>
+    }
+    for i in 0:c.select_ids.len {
+        sk := c.select_kinds[i]
+        $w := scroll_cw
+        if sk == 1 { w = math.max(80.0, scroll_cw * 0.56) }
+        else if sk == 2 { w = math.max(60.0, scroll_cw * 0.44 - 4.0) }
+        else if sk == 3 { w = math.max(70.0, scroll_cw * 0.44) }
+        else if sk == 4 { w = math.max(70.0, scroll_cw * 0.56 - 4.0) }
+        else if sk == 5 { w = half_w }
+        else if sk == 6 { w = math.max(70.0, scroll_cw - 108.0) }
+        view.set_style(c.select_ids[i], &leaf_box(w, 30.0)) >>>
+    }
+    for i in 0:c.button_ids.len {
+        bk := c.button_kinds[i]
+        $w := half_w
+        if bk == 2 || bk == 3 { w = tri_w }
+        else if bk == 4 { w = 104.0 }
+        view.set_style(c.button_ids[i], &leaf_box(w, 28.0)) >>>
+    }
+    for i in 0:c.check_ids.len {
+        ck := c.check_kinds[i]
+        $w := tri_w
+        if ck == 1 { w = half_w }
+        view.set_style(c.check_ids[i], &leaf_box(w, 26.0)) >>>
+    }
+    << 0
+}
+
+fn sync_div_bounds(view &widgets.View, id int, d $&widgets.Divider) int {
+    b := view.node_bounds(id) >>>
+    << d.set_bounds(&layout.Rect{x: 0.0, y: 0.0, width: b.width, height: b.height}) >>>
+}
+
+fn sync_chk_bounds(view &widgets.View, id int, chk $&widgets.Checkbox) int {
+    b := view.node_bounds(id) >>>
+    << chk.set_bounds(&layout.Rect{x: 0.0, y: 0.0, width: b.width, height: b.height}) >>>
+}
+
+pub fn place_comp_inspector(c $&ComponentInspector, view &widgets.View, st &widgets.Styles, vh f64, insp_vp &layout.Rect) int {
+    for i in 0:c.divs.len {
+        did := c.div_ids[i]
+        sync_div_bounds(view, did, $&c.divs[i]) >>>
+    }
+    for i in 0:c.selects.len {
+        sid := c.select_ids[i]
+        c.select_origins[i] = sync_local_box_select(view, sid, st, vh, $&c.selects[i]) >>>
+    }
+    for i in 0:c.fields.len {
+        fid := c.field_ids[i]
+        place_view_field(view, fid, st, insp_vp, $&c.fields[i]) >>>
+    }
+    for i in 0:c.checks.len {
+        cid := c.check_ids[i]
+        sync_chk_bounds(view, cid, $&c.checks[i]) >>>
+    }
+    for i in 0:c.buttons.len {
+        bid := c.button_ids[i]
+        sync_local_box_button(view, bid, $&c.buttons[i]) >>>
+    }
+    if c.tilemap_info_txts.len > 0 {
+        place_view_text(view, c.id_tilemap_info, insp_vp, $&c.tilemap_info_txts[0]) >>>
+    }
+    << 0
+}
+
+fn replace_select_labels(c $&ComponentInspector, sel_idx int, ctx &draw.Context, project &Project, indices &[]int, empty_txt string) {
+    prev := c.selects[sel_idx].selected()
+    for i in 0:c.select_labels[sel_idx].len { dispose_label($&c.select_labels[sel_idx][i]) }
+    c.select_labels[sel_idx] = make_surface_asset_labels(ctx, project, indices, empty_txt)
+    cnt := min_int_val(c.select_labels[sel_idx].len, 64)
+    set_sel_count($&c.selects[sel_idx], cnt)
+    $next_sel := prev
+    if next_sel < 0 || next_sel >= cnt { next_sel = 0 }
+    set_sel_selected($&c.selects[sel_idx], next_sel)
+}
+
+pub fn refresh_comp_asset_selectors(c $&ComponentInspector, ctx &draw.Context, project &Project, lang int) {
+    p_idx := collect_ext_indices(project, ".png")
+    w_idx := collect_ext_indices(project, ".wav")
+    x_idx := collect_ext_indices(project, ".xubc")
+
+    replace_select_labels(c, CS_SCRIPT_ASSET, ctx, project, &x_idx, tr(lang, "(No .xubc)", "(无 .xubc)"))
+    replace_select_labels(c, CS_AUDIO_ASSET, ctx, project, &w_idx, tr(lang, "(No .wav)", "(无 .wav)"))
+    replace_select_labels(c, CS_SPRITE_ASSET, ctx, project, &p_idx, tr(lang, "(No .png)", "(无 .png)"))
+    replace_select_labels(c, CS_TILEMAP_ASSET, ctx, project, &p_idx, tr(lang, "(No .png)", "(无 .png)"))
+    c.png_indices = p_idx
+    c.wav_indices = w_idx
+    c.xubc_indices = x_idx
+}
+
+fn find_asset_pos(indices &[]int, project &Project, uid &string) int {
+    for i in 0:indices.len {
+        ai := indices[i]
+        if ai >= 0 && ai < project.assets.len && project.assets[ai].key == *uid {
+            << i + 1
+        }
+    }
+    << 0
+}
+
+fn enable_chk(chk $&widgets.Checkbox, en bool) {
+    chk.set_enabled(en)
+}
+
+pub fn sync_comp_inspector(
+    c $&ComponentInspector,
+    ctx &draw.Context,
+    project &Project,
+    doc &resource.Document,
+    sel_idx int,
+    lang int
+) {
+    nd := doc.describe_node(sel_idx) >>> (err) { << }
+    is_3d := nd.kind == resource.NODE_3D
+    is_2d := nd.kind == resource.NODE_2D
+    can_cam := is_3d || is_2d
+    editable := sel_idx >= 0
+    has_xubc := c.xubc_indices.len > 0
+    has_wav := c.wav_indices.len > 0
+    has_png := c.png_indices.len > 0
+
+    // 1. Camera sync
+    set_sel_enabled($&c.selects[CS_CAM_PROJ], can_cam)
+    enable_field($&c.fields[CF_CAM_F1], can_cam)
+    enable_field($&c.fields[CF_CAM_F2], can_cam)
+    enable_field($&c.fields[CF_CAM_F3], can_cam)
+    set_btn_enabled($&c.buttons[CB_CAM_APPLY], can_cam)
+    set_btn_enabled($&c.buttons[CB_CAM_CLEAR], can_cam && (nd.camera.is_set() || nd.orthographic.is_set() || nd.camera_2d.is_set()))
+    if nd.camera.is_set() {
+        set_sel_selected($&c.selects[CS_CAM_PROJ], 1)
+        deg := nd.camera.vertical_fov() * 180.0 / c.pi_val_cache
+        set_field_val($&c.fields[CF_CAM_F1], &fmt_coord(deg))
+        set_field_val($&c.fields[CF_CAM_F2], &fmt_coord(nd.camera.near()))
+        set_field_val($&c.fields[CF_CAM_F3], &fmt_coord(nd.camera.far()))
+    } else if nd.orthographic.is_set() {
+        set_sel_selected($&c.selects[CS_CAM_PROJ], 2)
+        set_field_val($&c.fields[CF_CAM_F1], &fmt_coord(nd.orthographic.vertical_size()))
+        set_field_val($&c.fields[CF_CAM_F2], &fmt_coord(nd.orthographic.near()))
+        set_field_val($&c.fields[CF_CAM_F3], &fmt_coord(nd.orthographic.far()))
+    } else if nd.camera_2d.is_set() {
+        set_sel_selected($&c.selects[CS_CAM_PROJ], 3)
+        set_field_val($&c.fields[CF_CAM_F1], &fmt_coord(nd.camera_2d.width()))
+        set_field_val($&c.fields[CF_CAM_F2], &fmt_coord(nd.camera_2d.height()))
+        set_field_val($&c.fields[CF_CAM_F3], &fmt_coord(nd.camera_2d.zoom()))
+    } else {
+        set_sel_selected($&c.selects[CS_CAM_PROJ], 0)
+        if is_2d {
+            set_field_val($&c.fields[CF_CAM_F1], &"1280")
+            set_field_val($&c.fields[CF_CAM_F2], &"720")
+            set_field_val($&c.fields[CF_CAM_F3], &"1")
+        } else {
+            set_field_val($&c.fields[CF_CAM_F1], &"60")
+            set_field_val($&c.fields[CF_CAM_F2], &"0.1")
+            set_field_val($&c.fields[CF_CAM_F3], &"200")
+        }
+    }
+
+    // 2. Light sync
+    $has_light := false
+    $l_idx := -1
+    for i in 0:doc.light_count() {
+        lt := doc.light(i) >>> (err) { <- }
+        if lt.node == sel_idx {
+            has_light = true
+            l_idx = i
+            <-
+        }
+    }
+    set_sel_enabled($&c.selects[CS_LIGHT_KIND], is_3d)
+    for fi in CF_LIGHT_R:(CF_LIGHT_SDIST + 1) { enable_field($&c.fields[fi], is_3d) }
+    enable_chk($&c.checks[CK_LIGHT_SHADOW], is_3d)
+    set_btn_enabled($&c.buttons[CB_LIGHT_APPLY], is_3d)
+    set_btn_enabled($&c.buttons[CB_LIGHT_CLEAR], is_3d && has_light)
+    if has_light && l_idx >= 0 {
+        lt := doc.light(l_idx) >>> (err) { << }
+        k := lt.source.kind()
+        if k == light_data.DIRECTIONAL { set_sel_selected($&c.selects[CS_LIGHT_KIND], 1) }
+        else if k == light_data.POINT { set_sel_selected($&c.selects[CS_LIGHT_KIND], 2) }
+        else { set_sel_selected($&c.selects[CS_LIGHT_KIND], 3) }
+        rad := lt.source.radiance()
+        set_field_val($&c.fields[CF_LIGHT_R], &fmt_coord(rad.x))
+        set_field_val($&c.fields[CF_LIGHT_G], &fmt_coord(rad.y))
+        set_field_val($&c.fields[CF_LIGHT_B], &fmt_coord(rad.z))
+        set_field_val($&c.fields[CF_LIGHT_RADIUS], &fmt_coord(math.max(lt.source.radius(), 1.0)))
+        in_d := math.acos(math.min(1.0, math.max(-1.0, lt.source.inner_cosine()))) * 180.0 / c.pi_val_cache
+        out_d := math.acos(math.min(1.0, math.max(-1.0, lt.source.outer_cosine()))) * 180.0 / c.pi_val_cache
+        if k != light_data.SPOT {
+            set_field_val($&c.fields[CF_LIGHT_IN], &"15")
+            set_field_val($&c.fields[CF_LIGHT_OUT], &"35")
+        } else {
+            set_field_val($&c.fields[CF_LIGHT_IN], &fmt_coord(in_d))
+            set_field_val($&c.fields[CF_LIGHT_OUT], &fmt_coord(out_d))
+        }
+        dir := lt.source.direction()
+        if dir.length() < 0.0001 {
+            set_field_val($&c.fields[CF_LIGHT_DX], &"0.4")
+            set_field_val($&c.fields[CF_LIGHT_DY], &"0.72")
+            set_field_val($&c.fields[CF_LIGHT_DZ], &"0.4")
+        } else {
+            set_field_val($&c.fields[CF_LIGHT_DX], &fmt_coord(dir.x))
+            set_field_val($&c.fields[CF_LIGHT_DY], &fmt_coord(dir.y))
+            set_field_val($&c.fields[CF_LIGHT_DZ], &fmt_coord(dir.z))
+        }
+        sh_on := lt.cascades.enabled() || lt.punctual.enabled()
+        set_chk_val($&c.checks[CK_LIGHT_SHADOW], sh_on)
+        if lt.cascades.enabled() {
+            cs := lt.cascades.settings() >>> (err) { << }
+            set_field_val($&c.fields[CF_LIGHT_SRES], &str(cs.resolution))
+            set_field_val($&c.fields[CF_LIGHT_SDIST], &fmt_coord(cs.distance))
+        } else if lt.punctual.enabled() {
+            ps := lt.punctual.settings() >>> (err) { << }
+            set_field_val($&c.fields[CF_LIGHT_SRES], &str(ps.resolution))
+            set_field_val($&c.fields[CF_LIGHT_SDIST], &"80")
+        } else {
+            set_field_val($&c.fields[CF_LIGHT_SRES], &"512")
+            set_field_val($&c.fields[CF_LIGHT_SDIST], &"80")
+        }
+    } else {
+        set_sel_selected($&c.selects[CS_LIGHT_KIND], 0)
+        set_field_val($&c.fields[CF_LIGHT_R], &"2.5")
+        set_field_val($&c.fields[CF_LIGHT_G], &"2.4")
+        set_field_val($&c.fields[CF_LIGHT_B], &"2.2")
+        set_field_val($&c.fields[CF_LIGHT_RADIUS], &"12")
+        set_field_val($&c.fields[CF_LIGHT_IN], &"15")
+        set_field_val($&c.fields[CF_LIGHT_OUT], &"35")
+        set_field_val($&c.fields[CF_LIGHT_DX], &"0.4")
+        set_field_val($&c.fields[CF_LIGHT_DY], &"0.72")
+        set_field_val($&c.fields[CF_LIGHT_DZ], &"0.4")
+        set_chk_val($&c.checks[CK_LIGHT_SHADOW], false)
+        set_field_val($&c.fields[CF_LIGHT_SRES], &"512")
+        set_field_val($&c.fields[CF_LIGHT_SDIST], &"80")
+    }
+
+    // 3. Script sync
+    $has_scr := false
+    $sc_idx := -1
+    for i in 0:doc.script_count() {
+        sc := doc.script(i) >>> (err) { <- }
+        if sc.node == sel_idx {
+            has_scr = true
+            sc_idx = i
+            <-
+        }
+    }
+    set_sel_enabled($&c.selects[CS_SCRIPT_ASSET], editable)
+    enable_field($&c.fields[CF_SCRIPT_INIT], editable)
+    set_btn_enabled($&c.buttons[CB_SCRIPT_APPLY], editable && has_xubc)
+    set_btn_enabled($&c.buttons[CB_SCRIPT_CLEAR], editable && has_scr)
+    if has_scr && sc_idx >= 0 {
+        sc := doc.script(sc_idx) >>> (err) { << }
+        sc_pos := find_asset_pos(&c.xubc_indices, project, &sc.resource_uid)
+        set_sel_selected($&c.selects[CS_SCRIPT_ASSET], sc_pos)
+        set_field_val($&c.fields[CF_SCRIPT_INIT], &format_script_initials(&sc.initial))
+    } else {
+        set_sel_selected($&c.selects[CS_SCRIPT_ASSET], 0)
+        set_field_val($&c.fields[CF_SCRIPT_INIT], &"")
+    }
+
+    // 4. Audio sync (buses & listener candidates dynamic per doc)
+    for i in 0:c.select_labels[CS_AUDIO_BUS].len { dispose_label($&c.select_labels[CS_AUDIO_BUS][i]) }
+    c.select_labels[CS_AUDIO_BUS] = []widgets.StyledLabel{}
+    if doc.audio_bus_count() == 0 {
+        c.select_labels[CS_AUDIO_BUS].push(widgets.styled_label(ctx, &"Master"))
+        set_sel_count($&c.selects[CS_AUDIO_BUS], 1)
+    } else {
+        bn := min_int_val(doc.audio_bus_count(), 16)
+        for i in 0:bn {
+            b := doc.audio_bus(i) >>> (err) { <- }
+            c.select_labels[CS_AUDIO_BUS].push(widgets.styled_label(ctx, &b.name))
+        }
+        bus_cnt := c.select_labels[CS_AUDIO_BUS].len
+        set_sel_count($&c.selects[CS_AUDIO_BUS], bus_cnt)
+    }
+
+    for i in 0:c.select_labels[CS_AUDIO_LISTENER].len { dispose_label($&c.select_labels[CS_AUDIO_LISTENER][i]) }
+    lst_none := tr(lang, "Listener: None", "监听者: 无")
+    c.select_labels[CS_AUDIO_LISTENER] = [widgets.styled_label(ctx, &lst_none)]
+    c.listener_candidates = [-1]
+    for i in 0:doc.node_count() {
+        ln := doc.describe_node(i) >>> (err) { <- }
+        if ln.kind == resource.NODE_3D || ln.kind == resource.NODE_2D {
+            lbl_s := str(i) + ": " + ln.name
+            c.listener_candidates.push(i)
+            c.select_labels[CS_AUDIO_LISTENER].push(widgets.styled_label(ctx, &lbl_s))
+            if c.listener_candidates.len >= 64 { <- }
+        }
+    }
+    lst_cnt := c.select_labels[CS_AUDIO_LISTENER].len
+    set_sel_count($&c.selects[CS_AUDIO_LISTENER], lst_cnt)
+
+    $has_au := false
+    $au_idx := -1
+    for i in 0:doc.audio_count() {
+        au := doc.audio_emitter(i) >>> (err) { <- }
+        if au.node == sel_idx {
+            has_au = true
+            au_idx = i
+            <-
+        }
+    }
+    set_sel_enabled($&c.selects[CS_AUDIO_ASSET], editable)
+    set_sel_enabled($&c.selects[CS_AUDIO_BUS], editable)
+    enable_field($&c.fields[CF_AUDIO_VOL], editable)
+    enable_field($&c.fields[CF_AUDIO_PAN], editable)
+    enable_field($&c.fields[CF_AUDIO_DIST], editable)
+    enable_chk($&c.checks[CK_AUDIO_LOOP], editable)
+    enable_chk($&c.checks[CK_AUDIO_AUTO], editable)
+    set_sel_enabled($&c.selects[CS_AUDIO_SPATIAL], editable)
+    set_sel_enabled($&c.selects[CS_AUDIO_LISTENER], editable)
+    set_btn_enabled($&c.buttons[CB_AUDIO_APPLY], editable && has_wav)
+    set_btn_enabled($&c.buttons[CB_AUDIO_CLEAR], editable && has_au)
+    if has_au && au_idx >= 0 {
+        au := doc.audio_emitter(au_idx) >>> (err) { << }
+        au_pos := find_asset_pos(&c.wav_indices, project, &au.resource_uid)
+        set_sel_selected($&c.selects[CS_AUDIO_ASSET], au_pos)
+        bus_sel := min_int_val(au.bus, c.select_labels[CS_AUDIO_BUS].len - 1)
+        set_sel_selected($&c.selects[CS_AUDIO_BUS], bus_sel)
+        set_field_val($&c.fields[CF_AUDIO_VOL], &fmt_coord(au.volume))
+        set_field_val($&c.fields[CF_AUDIO_PAN], &fmt_coord(au.pan))
+        set_field_val($&c.fields[CF_AUDIO_DIST], &fmt_coord(au.max_distance))
+        set_chk_val($&c.checks[CK_AUDIO_LOOP], au.looping)
+        set_chk_val($&c.checks[CK_AUDIO_AUTO], au.autoplay)
+        $sp_idx := 0
+        if au.spatial == "2d" { sp_idx = 1 }
+        else if au.spatial == "3d" { sp_idx = 2 }
+        set_sel_selected($&c.selects[CS_AUDIO_SPATIAL], sp_idx)
+        $li_pos := 0
+        for i in 0:c.listener_candidates.len {
+            if c.listener_candidates[i] == au.listener {
+                li_pos = i
+                <-
+            }
+        }
+        set_sel_selected($&c.selects[CS_AUDIO_LISTENER], li_pos)
+    } else {
+        set_sel_selected($&c.selects[CS_AUDIO_ASSET], 0)
+        set_sel_selected($&c.selects[CS_AUDIO_BUS], 0)
+        set_field_val($&c.fields[CF_AUDIO_VOL], &"1")
+        set_field_val($&c.fields[CF_AUDIO_PAN], &"0")
+        set_field_val($&c.fields[CF_AUDIO_DIST], &"0")
+        set_chk_val($&c.checks[CK_AUDIO_LOOP], false)
+        set_chk_val($&c.checks[CK_AUDIO_AUTO], false)
+        set_sel_selected($&c.selects[CS_AUDIO_SPATIAL], 0)
+        set_sel_selected($&c.selects[CS_AUDIO_LISTENER], 0)
+    }
+
+    // 5. Sprite3D sync
+    $has_sp := false
+    $sp_idx := -1
+    for i in 0:doc.sprite_3d_count() {
+        sp := doc.sprite_3d(i) >>> (err) { <- }
+        if sp.node == sel_idx {
+            has_sp = true
+            sp_idx = i
+            <-
+        }
+    }
+    set_sel_enabled($&c.selects[CS_SPRITE_ASSET], is_3d)
+    enable_field($&c.fields[CF_SPRITE_W], is_3d)
+    enable_field($&c.fields[CF_SPRITE_H], is_3d)
+    enable_field($&c.fields[CF_SPRITE_CUT], is_3d)
+    set_sel_enabled($&c.selects[CS_SPRITE_BB], is_3d)
+    set_sel_enabled($&c.selects[CS_SPRITE_ALPHA], is_3d)
+    enable_chk($&c.checks[CK_SPRITE_SHADED], is_3d)
+    set_btn_enabled($&c.buttons[CB_SPRITE_APPLY], is_3d && has_png)
+    set_btn_enabled($&c.buttons[CB_SPRITE_CLEAR], is_3d && has_sp)
+    if has_sp && sp_idx >= 0 {
+        sp := doc.sprite_3d(sp_idx) >>> (err) { << }
+        sp_pos := find_asset_pos(&c.png_indices, project, &sp.resource_uid)
+        set_sel_selected($&c.selects[CS_SPRITE_ASSET], sp_pos)
+        set_field_val($&c.fields[CF_SPRITE_W], &fmt_coord(sp.sprite.size.x))
+        set_field_val($&c.fields[CF_SPRITE_H], &fmt_coord(sp.sprite.size.y))
+        set_field_val($&c.fields[CF_SPRITE_CUT], &fmt_coord(sp.sprite.alpha_cutoff))
+        set_sel_selected($&c.selects[CS_SPRITE_BB], min_int_val(sp.sprite.billboard, 2))
+        set_sel_selected($&c.selects[CS_SPRITE_ALPHA], min_int_val(sp.sprite.alpha_mode, 1))
+        set_chk_val($&c.checks[CK_SPRITE_SHADED], sp.sprite.shaded)
+    } else {
+        set_sel_selected($&c.selects[CS_SPRITE_ASSET], 0)
+        set_field_val($&c.fields[CF_SPRITE_W], &"1")
+        set_field_val($&c.fields[CF_SPRITE_H], &"1")
+        set_field_val($&c.fields[CF_SPRITE_CUT], &"0.5")
+        set_sel_selected($&c.selects[CS_SPRITE_BB], 2)
+        set_sel_selected($&c.selects[CS_SPRITE_ALPHA], 1)
+        set_chk_val($&c.checks[CK_SPRITE_SHADED], true)
+    }
+
+    // 6. TileMap2D sync
+    $has_tm := false
+    $tm_txt := tr(lang, "TileMap2D: select a Node2D", "TileMap2D：请选择 Node2D")
+    if is_2d {
+        tm_txt = tr(lang, "TileMap2D: none attached (choose PNG + click TileMap Editor)", "TileMap2D：未绑定（选择 PNG 后点击瓦片编辑器）")
+    }
+    $tm_uid := ""
+    for i in 0:doc.tilemap_2d_count() {
+        tm := doc.tilemap_2d(i) >>> (err) { <- }
+        if tm.node == sel_idx {
+            has_tm = true
+            tm_uid = tm.resource_uid + ""
+            aname := asset_name_for_uid(project, &tm_uid)
+            tm_txt = tr(lang, "TileMap2D: ", "瓦片地图: ") + str(tm.grid.width) + "x" + str(tm.grid.height) + " · " + aname
+            <-
+        }
+    }
+    set_text_val($&c.tilemap_info_txts[0], &tm_txt)
+    set_sel_enabled($&c.selects[CS_TILEMAP_ASSET], is_2d)
+    set_btn_enabled($&c.buttons[CB_TILEMAP_EDIT], is_2d && (has_tm || has_png))
+    if has_tm {
+        tm_pos := find_asset_pos(&c.png_indices, project, &tm_uid)
+        set_sel_selected($&c.selects[CS_TILEMAP_ASSET], tm_pos)
+    } else {
+        set_sel_selected($&c.selects[CS_TILEMAP_ASSET], 0)
+    }
+}
+
+pub fn draw_comp_node(c $&ComponentInspector, id int, frame $&draw.Frame, styles &widgets.Styles, pal &PaperPalette, lang int) bool {
+    if id == c.id_cam_hdr {
+        t := tr(lang, "Camera", "相机")
+        frame.text(0.0, 2.0, 12.0, pal.text, &t) >>>
+        << true
+    }
+    if id == c.id_light_hdr {
+        t := tr(lang, "Light & Shadow", "光照与阴影")
+        frame.text(0.0, 2.0, 12.0, pal.text, &t) >>>
+        << true
+    }
+    if id == c.id_script_hdr {
+        t := tr(lang, "Script (.xubc)", "脚本 (.xubc)")
+        frame.text(0.0, 2.0, 12.0, pal.text, &t) >>>
+        << true
+    }
+    if id == c.id_audio_hdr {
+        t := tr(lang, "Audio Emitter (.wav)", "音频发射器 (.wav)")
+        frame.text(0.0, 2.0, 12.0, pal.text, &t) >>>
+        << true
+    }
+    if id == c.id_sprite_hdr {
+        t := tr(lang, "Sprite3D (.png)", "3D 精灵 (.png)")
+        frame.text(0.0, 2.0, 12.0, pal.text, &t) >>>
+        << true
+    }
+    if id == c.id_tilemap_hdr {
+        t := tr(lang, "TileMap2D (.png)", "2D 瓦片地图 (.png)")
+        frame.text(0.0, 2.0, 12.0, pal.text, &t) >>>
+        << true
+    }
+    if id == c.id_tilemap_info && c.tilemap_info_txts.len > 0 {
+        paint_text_sel($&c.tilemap_info_txts[0], frame, styles) >>>
+        << true
+    }
+    for i in 0:c.div_ids.len {
+        if id == c.div_ids[i] {
+            c.divs[i].paint_styled(frame, styles) >>>
+            << true
+        }
+    }
+    for i in 0:c.field_ids.len {
+        if id == c.field_ids[i] {
+            paint_field($&c.fields[i], frame, styles) >>>
+            << true
+        }
+    }
+    for i in 0:c.select_ids.len {
+        if id == c.select_ids[i] {
+            s := c.selects[i].clone()
+            sel := s.selected()
+            if sel >= 0 && sel < c.select_labels[i].len {
+                s.paint_styled(frame, $&c.select_labels[i][sel], styles) >>>
+            } else {
+                s.paint_styled(frame, $&c.empty_lbl, styles) >>>
+            }
+            << true
+        }
+    }
+    for i in 0:c.button_ids.len {
+        if id == c.button_ids[i] {
+            b := c.buttons[i].clone()
+            b.paint_styled(frame, $&c.button_labels[i], styles) >>>
+            << true
+        }
+    }
+    for i in 0:c.check_ids.len {
+        if id == c.check_ids[i] {
+            chk := c.checks[i].clone()
+            chk.paint_styled(frame, $&c.check_labels[i], styles) >>>
+            << true
+        }
+    }
+    << false
+}
+
+pub fn draw_comp_overlay(c $&ComponentInspector, frame $&draw.Frame, styles &widgets.Styles) int {
+    for i in 0:c.selects.len {
+        s := c.selects[i].clone()
+        orig := copy_rect(&c.select_origins[i])
+        paint_select_popup(&s, $&c.select_labels[i], &orig, frame, styles) >>>
+    }
+    for i in 0:c.fields.len {
+        field_popup_paint($&c.fields[i], frame, styles) >>>
+    }
+    if c.tilemap_info_txts.len > 0 {
+        paint_text_popup($&c.tilemap_info_txts[0], frame, styles) >>>
+    }
+    << 0
+}
+
+pub fn comp_close_selects(c $&ComponentInspector) {
+    for i in 0:c.selects.len {
+        set_sel_open($&c.selects[i], false)
+    }
+}
+
+pub fn route_comp_input(c $&ComponentInspector, id int, kind int, input &ui.InputEvent) widgets.Action {
+    for i in 0:c.select_ids.len { if id == c.select_ids[i] { << route_sel($&c.selects[i], kind, input) } }
+    for i in 0:c.field_ids.len { if id == c.field_ids[i] { << route_field($&c.fields[i], kind, input) } }
+    for i in 0:c.button_ids.len { if id == c.button_ids[i] { << route_btn($&c.buttons[i], kind, input) } }
+    for i in 0:c.check_ids.len { if id == c.check_ids[i] { << route_chk($&c.checks[i], kind, input) } }
+    if id == c.id_tilemap_info && c.tilemap_info_txts.len > 0 {
+        << route_text($&c.tilemap_info_txts[0], kind, input)
+    }
+    << widgets.no_action(id, false)
+}
+
+fn check_open_sel(sel $&widgets.Select, orig &layout.Rect, input &ui.InputEvent, rid int, view $&widgets.View) bool {
+    if !sel.is_open() { << false }
+    o := copy_rect(orig)
+    act := route_open_select(sel, &o, input)
+    if act.consumed || (input.kind == ui.EV_KEY_DOWN && input.key == ui.KEY_ESCAPE) {
+        set_sel_open(sel, false)
+        repaint(view, rid)
+        << true
+    }
+    << false
+}
+
+pub fn comp_route_open_selects(ed $&Editor, input &ui.InputEvent, view $&widgets.View) bool {
+    rid := ed.id_root
+    c := $&ed.comp
+    for i in 0:c.selects.len {
+        orig := copy_rect(&c.select_origins[i])
+        if check_open_sel($&c.selects[i], &orig, input, rid, view) { << true }
+    }
+    << false
+}
+
+fn check_popup_field(view $&widgets.View, rid int, input &ui.InputEvent, f $&widgets.Field) bool {
+    << route_popup_field(view, rid, input, f) >>> (err) {
+        _ := err
+        << false
+    }
+}
+
+fn check_popup_text(view $&widgets.View, rid int, input &ui.InputEvent, s $&widgets.SelectableText) bool {
+    << route_popup_text(view, rid, input, s) >>> (err) {
+        _ := err
+        << false
+    }
+}
+
+pub fn comp_route_context_popups(c $&ComponentInspector, view $&widgets.View, rid int, input &ui.InputEvent) bool {
+    for i in 0:c.fields.len {
+        if check_popup_field(view, rid, input, $&c.fields[i]) { << true }
+    }
+    if c.tilemap_info_txts.len > 0 {
+        if check_popup_text(view, rid, input, $&c.tilemap_info_txts[0]) { << true }
+    }
+    << false
+}
+
+fn dispatch_comp_field(view $&widgets.View, rid int, event &ui.Event, f $&widgets.Field) {
+    _ := dispatch_field_text_event(view, rid, event, f) >>> (err) {
+        _ := err
+        <<
+    }
+}
+
+fn dispatch_comp_text(view $&widgets.View, event &ui.Event, s $&widgets.SelectableText) {
+    _ := dispatch_sel_text_event(view, event, s) >>> (err) {
+        _ := err
+        <<
+    }
+}
+
+pub fn comp_dispatch_text_or_request(c $&ComponentInspector, view $&widgets.View, rid int, event &ui.Event) {
+    for i in 0:c.fields.len {
+        dispatch_comp_field(view, rid, event, $&c.fields[i])
+    }
+    if c.tilemap_info_txts.len > 0 {
+        dispatch_comp_text(view, event, $&c.tilemap_info_txts[0])
+    }
+}
+
+pub fn comp_any_focused(c &ComponentInspector) bool {
+    for i in 0:c.fields.len {
+        if c.fields[i].is_focused() { << true }
+    }
+    << false
+}
+
+pub fn comp_blur_all(c $&ComponentInspector) {
+    for i in 0:c.fields.len {
+        focus_field($&c.fields[i], false)
+    }
+}
+
+pub fn comp_tick(c $&ComponentInspector, view $&widgets.View, now time.Instant, rm bool) {
+    for i in 0:c.fields.len {
+        fid := c.field_ids[i]
+        if tick_field($&c.fields[i], now, rm) { repaint(view, fid) }
+    }
+}
+
+pub fn comp_next_tick(c &ComponentInspector, now time.Instant, rm bool, cur time.Instant) time.Instant {
+    $deadline := cur
+    for i in 0:c.fields.len {
+        next := field_next_tick(&c.fields[i], now, rm)
+        if !next.is_zero() && (deadline.is_zero() || next.before(deadline)) {
+            deadline = next
+        }
+    }
+    << deadline
+}
+
+pub fn comp_has_any_popup_open(c &ComponentInspector) bool {
+    for i in 0:c.selects.len {
+        if c.selects[i].is_open() { << true }
+    }
+    for i in 0:c.fields.len {
+        if c.fields[i].has_popup_open() { << true }
+    }
+    if c.tilemap_info_txts.len > 0 && c.tilemap_info_txts[0].has_popup_open() { << true }
+    << false
+}
+
+pub fn comp_cursor(c &ComponentInspector, view &widgets.View, styles &widgets.Styles, x f64, y f64) int {
+    _ := styles
+    for i in 0:c.selects.len {
+        if c.selects[i].is_open() {
+            orig := &c.select_origins[i]
+            << c.selects[i].cursor_at(x - orig.x, y - orig.y)
+        }
+    }
+    for i in 0:c.fields.len {
+        pc := field_popup_cursor(&c.fields[i], x, y)
+        if pc >= 0 { << pc }
+    }
+    if c.tilemap_info_txts.len > 0 {
+        tc := text_popup_cursor(&c.tilemap_info_txts[0], x, y)
+        if tc >= 0 { << tc }
+    }
+    for i in 0:c.fields.len {
+        fc := field_hit_cursor(view, c.field_ids[i], &c.fields[i], x, y)
+        if fc >= 0 { << fc }
+    }
+    if c.tilemap_info_txts.len > 0 && node_contains(view, c.id_tilemap_info, x, y) {
+        << c.tilemap_info_txts[0].cursor_at(x, y)
+    }
+    for i in 0:c.selects.len {
+        sc := sel_hit_cursor(view, c.select_ids[i], &c.selects[i], x, y)
+        if sc >= 0 { << sc }
+    }
+    for i in 0:c.buttons.len {
+        bc := btn_hit_cursor(view, c.button_ids[i], &c.buttons[i], x, y)
+        if bc >= 0 { << bc }
+    }
+    for i in 0:c.checks.len {
+        if node_contains(view, c.check_ids[i], x, y) {
+            << c.checks[i].cursor()
+        }
+    }
+    << -1
+}
+
+fn draft_clear_cam(ed $&Editor, idx int) int {
+    d := $&ed.draft
+    << d.clear_node_camera(idx) >>>
+}
+fn draft_set_cam_persp(ed $&Editor, idx int, fov f64, near f64, far f64) int {
+    d := $&ed.draft
+    << d.set_node_camera_perspective(idx, fov, near, far) >>>
+}
+fn draft_set_cam_ortho(ed $&Editor, idx int, sz f64, near f64, far f64) int {
+    d := $&ed.draft
+    << d.set_node_camera_orthographic(idx, sz, near, far) >>>
+}
+fn draft_set_cam_2d(ed $&Editor, idx int, w f64, h f64, z f64) int {
+    d := $&ed.draft
+    << d.set_node_camera_2d(idx, w, h, z) >>>
+}
+fn draft_clear_light(ed $&Editor, idx int) int {
+    d := $&ed.draft
+    << d.clear_node_light(idx) >>>
+}
+fn draft_set_light(ed $&Editor, idx int, kind int, r f64, g f64, b f64, rad f64, ind f64, outd f64, dx f64, dy f64, dz f64, sh bool, sres int, sdist f64) int {
+    d := $&ed.draft
+    << d.set_node_light(idx, kind, r, g, b, rad, ind, outd, dx, dy, dz, sh, sres, sdist, 3) >>>
+}
+fn draft_clear_script(ed $&Editor, idx int) int {
+    d := $&ed.draft
+    << d.clear_node_script(idx) >>>
+}
+fn draft_set_script(ed $&Editor, proj &Project, idx int, uid string, inits []resource.ScriptInitial) int {
+    d := $&ed.draft
+    << d.set_node_script(proj, idx, uid, inits) >>>
+}
+fn draft_clear_audio(ed $&Editor, idx int) int {
+    d := $&ed.draft
+    << d.clear_node_audio_emitter(idx) >>>
+}
+fn draft_set_audio(ed $&Editor, proj &Project, idx int, uid string, bus int, vol f64, pan f64, lp bool, ap bool, sp string, lst int, dist f64) int {
+    d := $&ed.draft
+    << d.set_node_audio_emitter(proj, idx, uid, bus, vol, pan, lp, ap, sp, lst, dist) >>>
+}
+fn draft_clear_sprite(ed $&Editor, idx int) int {
+    d := $&ed.draft
+    << d.clear_node_sprite_3d(idx) >>>
+}
+fn draft_set_sprite(ed $&Editor, proj &Project, idx int, uid string, w f64, h f64, bb int, am int, cut f64, sh bool) int {
+    d := $&ed.draft
+    << d.set_node_sprite_3d(proj, idx, uid, w, h, bb, am, cut, sh, false, false) >>>
+}
+fn draft_ensure_tilemap(ed $&Editor, proj &Project, idx int, uid string) int {
+    d := $&ed.draft
+    << d.ensure_node_tilemap_2d(proj, idx, uid) >>>
+}
+
+pub fn handle_comp_action(ed $&Editor, a &widgets.Action, view $&widgets.View) bool {
+    if a.kind != widgets.ACTION_ACTIVATE { << false }
+    if a.id == ed.comp.button_ids[CB_CAM_APPLY] {
+        mode := ed.comp.selects[CS_CAM_PROJ].selected()
+        sel_node := ed.selected_node
+        if mode == 0 {
+            _ := draft_clear_cam(ed, sel_node) >>> (err) {
+                ed.set_status(STATUS_ERR, err.msg(), view)
+                << true
+            }
+            ed.refresh_after_document_change(false, view)
+            ed.set_status(STATUS_OK, tr(ed.lang, "Cleared camera", "已清除相机"), view)
+            << true
+        }
+        v1 := parse_f64_or(&ed.comp.fields[CF_CAM_F1].value(), "Camera param 1") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        v2 := parse_f64_or(&ed.comp.fields[CF_CAM_F2].value(), "Camera param 2") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        v3 := parse_f64_or(&ed.comp.fields[CF_CAM_F3].value(), "Camera param 3") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        if mode == 1 {
+            _ := draft_set_cam_persp(ed, sel_node, v1, v2, v3) >>> (err) {
+                ed.set_status(STATUS_ERR, err.msg(), view)
+                << true
+            }
+            ed.refresh_after_document_change(false, view)
+            ed.set_status(STATUS_OK, tr(ed.lang, "Applied Perspective camera", "已应用透视相机"), view)
+        } else if mode == 2 {
+            _ := draft_set_cam_ortho(ed, sel_node, v1, v2, v3) >>> (err) {
+                ed.set_status(STATUS_ERR, err.msg(), view)
+                << true
+            }
+            ed.refresh_after_document_change(false, view)
+            ed.set_status(STATUS_OK, tr(ed.lang, "Applied Orthographic camera", "已应用正交相机"), view)
+        } else {
+            _ := draft_set_cam_2d(ed, sel_node, v1, v2, v3) >>> (err) {
+                ed.set_status(STATUS_ERR, err.msg(), view)
+                << true
+            }
+            ed.refresh_after_document_change(false, view)
+            ed.set_status(STATUS_OK, tr(ed.lang, "Applied View2D camera", "已应用 2D 视图相机"), view)
+        }
+        << true
+    }
+    if a.id == ed.comp.button_ids[CB_CAM_CLEAR] {
+        sel_node := ed.selected_node
+        _ := draft_clear_cam(ed, sel_node) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        ed.refresh_after_document_change(false, view)
+        ed.set_status(STATUS_OK, tr(ed.lang, "Cleared camera", "已清除相机"), view)
+        << true
+    }
+
+    if a.id == ed.comp.button_ids[CB_LIGHT_APPLY] {
+        ksel := ed.comp.selects[CS_LIGHT_KIND].selected()
+        sel_node := ed.selected_node
+        if ksel <= 0 {
+            _ := draft_clear_light(ed, sel_node) >>> (err) {
+                ed.set_status(STATUS_ERR, err.msg(), view)
+                << true
+            }
+            ed.refresh_after_document_change(false, view)
+            ed.set_status(STATUS_OK, tr(ed.lang, "Cleared light", "已清除光源"), view)
+            << true
+        }
+        kind := ksel - 1
+        r := parse_f64_or(&ed.comp.fields[CF_LIGHT_R].value(), "Light R") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        g := parse_f64_or(&ed.comp.fields[CF_LIGHT_G].value(), "Light G") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        b := parse_f64_or(&ed.comp.fields[CF_LIGHT_B].value(), "Light B") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        rad := parse_f64_or(&ed.comp.fields[CF_LIGHT_RADIUS].value(), "Light Radius") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        ind := parse_f64_or(&ed.comp.fields[CF_LIGHT_IN].value(), "Inner angle") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        outd := parse_f64_or(&ed.comp.fields[CF_LIGHT_OUT].value(), "Outer angle") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        dx := parse_f64_or(&ed.comp.fields[CF_LIGHT_DX].value(), "Dir X") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        dy := parse_f64_or(&ed.comp.fields[CF_LIGHT_DY].value(), "Dir Y") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        dz := parse_f64_or(&ed.comp.fields[CF_LIGHT_DZ].value(), "Dir Z") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        sh_on := ed.comp.checks[CK_LIGHT_SHADOW].value()
+        sres_s := strings.trim_space(&ed.comp.fields[CF_LIGHT_SRES].value())
+        $sres := 512
+        if sres_s.len > 0 {
+            sres = strconv.atoi(&sres_s) >>> (err) {
+                _ := err
+                ed.set_status(STATUS_ERR, "Shadow resolution must be integer", view)
+                << true
+            }
+        }
+        $sdist := 80.0
+        sdist_s := strings.trim_space(&ed.comp.fields[CF_LIGHT_SDIST].value())
+        if sdist_s.len > 0 {
+            sdist = parse_f64_or(&sdist_s, "Shadow Dist") >>> (err) {
+                ed.set_status(STATUS_ERR, err.msg(), view)
+                << true
+            }
+        }
+        _ := draft_set_light(ed, sel_node, kind, r, g, b, rad, ind, outd, dx, dy, dz, sh_on, sres, sdist) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        ed.refresh_after_document_change(false, view)
+        ed.set_status(STATUS_OK, "Applied light & shadow", view)
+        << true
+    }
+    if a.id == ed.comp.button_ids[CB_LIGHT_CLEAR] {
+        sel_node := ed.selected_node
+        _ := draft_clear_light(ed, sel_node) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        ed.refresh_after_document_change(false, view)
+        ed.set_status(STATUS_OK, "Cleared light", view)
+        << true
+    }
+
+    if a.id == ed.comp.button_ids[CB_SCRIPT_APPLY] {
+        sel_node := ed.selected_node
+        sopt := ed.comp.selects[CS_SCRIPT_ASSET].selected()
+        if sopt <= 0 || (sopt - 1) >= ed.comp.xubc_indices.len {
+            _ := draft_clear_script(ed, sel_node) >>> (err) {
+                ed.set_status(STATUS_ERR, err.msg(), view)
+                << true
+            }
+            ed.refresh_after_document_change(false, view)
+            ed.set_status(STATUS_OK, "Cleared script", view)
+            << true
+        }
+        uid := ed.project.assets[ed.comp.xubc_indices[sopt - 1]].key + ""
+        inits := parse_script_initials(&ed.comp.fields[CF_SCRIPT_INIT].value()) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        proj := clone_project(&ed.project)
+        _ := draft_set_script(ed, &proj, sel_node, uid, inits) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        ed.refresh_after_document_change(false, view)
+        ed.set_status(STATUS_OK, "Bound script", view)
+        << true
+    }
+    if a.id == ed.comp.button_ids[CB_SCRIPT_CLEAR] {
+        sel_node := ed.selected_node
+        _ := draft_clear_script(ed, sel_node) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        ed.refresh_after_document_change(false, view)
+        ed.set_status(STATUS_OK, "Cleared script", view)
+        << true
+    }
+
+    if a.id == ed.comp.button_ids[CB_AUDIO_APPLY] {
+        sel_node := ed.selected_node
+        aopt := ed.comp.selects[CS_AUDIO_ASSET].selected()
+        if aopt <= 0 || (aopt - 1) >= ed.comp.wav_indices.len {
+            _ := draft_clear_audio(ed, sel_node) >>> (err) {
+                ed.set_status(STATUS_ERR, err.msg(), view)
+                << true
+            }
+            ed.refresh_after_document_change(false, view)
+            ed.set_status(STATUS_OK, "Cleared audio emitter", view)
+            << true
+        }
+        uid := ed.project.assets[ed.comp.wav_indices[aopt - 1]].key + ""
+        $bus := ed.comp.selects[CS_AUDIO_BUS].selected()
+        if bus < 0 { bus = 0 }
+        vol := parse_f64_or(&ed.comp.fields[CF_AUDIO_VOL].value(), "Audio Vol") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        pan := parse_f64_or(&ed.comp.fields[CF_AUDIO_PAN].value(), "Audio Pan") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        dist := parse_f64_or(&ed.comp.fields[CF_AUDIO_DIST].value(), "Audio MaxD") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        looping := ed.comp.checks[CK_AUDIO_LOOP].value()
+        autoplay := ed.comp.checks[CK_AUDIO_AUTO].value()
+        sp_sel := ed.comp.selects[CS_AUDIO_SPATIAL].selected()
+        $spatial := "none"
+        if sp_sel == 1 { spatial = "2d" } else if sp_sel == 2 { spatial = "3d" }
+        l_sel := ed.comp.selects[CS_AUDIO_LISTENER].selected()
+        $listener := -1
+        if l_sel >= 0 && l_sel < ed.comp.listener_candidates.len { listener = ed.comp.listener_candidates[l_sel] }
+        proj := clone_project(&ed.project)
+        _ := draft_set_audio(ed, &proj, sel_node, uid, bus, vol, pan, looping, autoplay, spatial, listener, dist) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        ed.refresh_after_document_change(false, view)
+        ed.set_status(STATUS_OK, "Bound audio emitter", view)
+        << true
+    }
+    if a.id == ed.comp.button_ids[CB_AUDIO_CLEAR] {
+        sel_node := ed.selected_node
+        _ := draft_clear_audio(ed, sel_node) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        ed.refresh_after_document_change(false, view)
+        ed.set_status(STATUS_OK, "Cleared audio emitter", view)
+        << true
+    }
+
+    if a.id == ed.comp.button_ids[CB_SPRITE_APPLY] {
+        sel_node := ed.selected_node
+        sopt := ed.comp.selects[CS_SPRITE_ASSET].selected()
+        if sopt <= 0 || (sopt - 1) >= ed.comp.png_indices.len {
+            _ := draft_clear_sprite(ed, sel_node) >>> (err) {
+                ed.set_status(STATUS_ERR, err.msg(), view)
+                << true
+            }
+            ed.refresh_after_document_change(false, view)
+            ed.set_status(STATUS_OK, "Cleared Sprite3D", view)
+            << true
+        }
+        uid := ed.project.assets[ed.comp.png_indices[sopt - 1]].key + ""
+        w := parse_f64_or(&ed.comp.fields[CF_SPRITE_W].value(), "Sprite W") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        h := parse_f64_or(&ed.comp.fields[CF_SPRITE_H].value(), "Sprite H") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        cut := parse_f64_or(&ed.comp.fields[CF_SPRITE_CUT].value(), "Sprite Cut") >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        $bb := ed.comp.selects[CS_SPRITE_BB].selected()
+        if bb < 0 { bb = sprite3d.BILLBOARD_Y_AXIS }
+        $am := ed.comp.selects[CS_SPRITE_ALPHA].selected()
+        if am < 0 { am = sprite3d.ALPHA_MODE_CUTOUT }
+        shaded := ed.comp.checks[CK_SPRITE_SHADED].value()
+        proj := clone_project(&ed.project)
+        _ := draft_set_sprite(ed, &proj, sel_node, uid, w, h, bb, am, cut, shaded) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        ed.refresh_after_document_change(false, view)
+        ed.set_status(STATUS_OK, "Bound Sprite3D", view)
+        << true
+    }
+    if a.id == ed.comp.button_ids[CB_SPRITE_CLEAR] {
+        sel_node := ed.selected_node
+        _ := draft_clear_sprite(ed, sel_node) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        ed.refresh_after_document_change(false, view)
+        ed.set_status(STATUS_OK, "Cleared Sprite3D", view)
+        << true
+    }
+
+    if a.id == ed.comp.button_ids[CB_TILEMAP_EDIT] {
+        sel_node := ed.selected_node
+        topt := ed.comp.selects[CS_TILEMAP_ASSET].selected()
+        $uid := ""
+        if topt > 0 && (topt - 1) < ed.comp.png_indices.len {
+            uid = ed.project.assets[ed.comp.png_indices[topt - 1]].key + ""
+        }
+        proj := clone_project(&ed.project)
+        _ := draft_ensure_tilemap(ed, &proj, sel_node, uid) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            << true
+        }
+        ed.refresh_after_document_change(false, view)
+        ed.req_launch_tilemap = true
+        << true
+    }
+    << false
+}

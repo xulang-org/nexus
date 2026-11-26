@@ -1,9 +1,8 @@
 XU ?= xu
 PYTHON ?= python3
-EDITOR_PYTHON ?= $(PYTHON)
 export XU
 
-.PHONY: xacp-test lighting-demo-test demo-lighting lighting-core-test lighting-gpu-test gpu-failure-test present-fallback-test text-2d-test ui-hud-test demo-ui-hud mesh-shaders canvas-shaders native-image window-input-smoke gpu-surface-smoke sdk gpu-compute-smoke native-probe gpu-offscreen-smoke gpu-transfer-smoke check-core test-core mesh-core-test audio-core-test audio-device-test native native-audio audio-fixtures audio-test audio-smoke demo-audio demo-audio-stream demo-audio-seek check layers test demo demo2d demo3d demo-glb demo-script demo-materials demo-textures3d demo-mipmaps3d demo-material-maps demo-normal-maps demo-generated-tangents demo-glb-materials smoke gpu-smoke gpu3d-smoke image-fixtures glb-fixtures script-tool script-fixtures script-live-smoke glb-material-fixtures scene-fixtures demo-scene-file scene-asset-fixtures demo-scene-assets scene-audio-fixtures demo-scene-audio demo-scene-av scene-script-assets scene-script-fixtures demo-scene-scripts
+.PHONY: scene-soa-test ecs-parallel-test navigation-test networking-test audio-dsp-test script-aot-test script-host-coroutines-test physics3d-joints-ragdoll-test physics3d-advanced-test gpu-skinning-test skeletal-animation-test particles-vfx-gpu-test terrain-foliage-gpu-test decals-atmosphere-gpu-test ddgi-gi-gpu-test engine-integration-gpu-test all-modern-tests clustered-lighting-gpu-test indirect-cull-hiz-gpu-test hdr-postprocess-gpu-test meshlet-visbuffer-gpu-test transparent-pbr-gpu-test streaming-lru-gpu-test xacp-test lighting-demo-test demo-lighting lighting-core-test lighting-gpu-test gpu-failure-test present-fallback-test text-2d-test ui-hud-test demo-ui-hud mesh-shaders canvas-shaders native-image window-input-smoke gpu-surface-smoke sdk gpu-compute-smoke native-probe gpu-offscreen-smoke gpu-transfer-smoke check-core test-core mesh-core-test audio-core-test audio-device-test native native-audio audio-fixtures audio-test audio-smoke demo-audio demo-audio-stream demo-audio-seek check layers test demo demo2d demo3d demo-glb demo-script demo-materials demo-textures3d demo-mipmaps3d demo-material-maps demo-normal-maps demo-generated-tangents demo-glb-materials smoke gpu-smoke gpu3d-smoke image-fixtures glb-fixtures script-tool script-fixtures script-live-smoke glb-material-fixtures scene-fixtures demo-scene-file scene-asset-fixtures demo-scene-assets scene-audio-fixtures demo-scene-audio demo-scene-av scene-script-assets scene-script-fixtures demo-scene-scripts
 xacp-test: sdk
 	mkdir -p build
 	$(XU) build tests/xacp_checks.xu -o build/xacp-tests
@@ -56,7 +55,11 @@ check: layers native canvas-shaders mesh-shaders
 	$(XU) check cmd/scriptc/main.xu
 	$(XU) check cmd/project_validate/main.xu
 	$(XU) check cmd/project_viewport
+	$(XU) check cmd/project
+	XU_UI_PACK=1 $(XU) check cmd/project_editor
 	$(XU) check cmd/tilemap_editor
+	$(XU) check tests/project_import_checks.xu
+	$(XU) check tests/project_editor_checks.xu
 	$(XU) check examples/script_reload/main.xu
 	$(XU) check examples/materials/main.xu
 	$(XU) check examples/textures3d/main.xu
@@ -83,9 +86,18 @@ project-validator: native-image
 	mkdir -p build
 	$(XU) build cmd/project_validate/main.xu -o build/nexus-project-validate
 
-.PHONY: project-test project-preview project-gpu-test
-project-test: project-validator
-	$(PYTHON) tests/project_import_checks.py --validator build/nexus-project-validate
+.PHONY: project-cli project-editor project-test project-preview project-gpu-test
+project-cli: sdk
+	mkdir -p build
+	$(XU) build cmd/project -o build/nexus-project
+
+project-editor: sdk
+	mkdir -p build
+	XU_UI_PACK=1 $(XU) build --desktop --no-webview cmd/project_editor -o build/nexus-project-editor
+
+project-test: project-cli project-validator
+	$(XU) build tests/project_import_checks.xu -o build/project-import-checks
+	./build/project-import-checks --validator build/nexus-project-validate --project-cli build/nexus-project
 
 project-preview: mesh-shaders native-image
 	$(XU) build examples/scene_assets/main.xu -o build/nexus-project-preview
@@ -94,8 +106,9 @@ project-preview: mesh-shaders native-image
 project-viewport: mesh-shaders canvas-shaders native-image
 	$(XU) build cmd/project_viewport -o build/nexus-project-viewport
 
-project-gpu-test: project-validator project-preview
-	$(PYTHON) tests/project_import_checks.py --validator build/nexus-project-validate --preview build/nexus-project-preview
+project-gpu-test: project-cli project-validator project-preview
+	$(XU) build tests/project_import_checks.xu -o build/project-import-checks
+	./build/project-import-checks --validator build/nexus-project-validate --project-cli build/nexus-project --preview build/nexus-project-preview
 
 .PHONY: project-picking-test
 project-picking-test: mesh-shaders native-image scene-asset-fixtures
@@ -103,20 +116,22 @@ project-picking-test: mesh-shaders native-image scene-asset-fixtures
 	./build/scene-picker-checks
 
 .PHONY: demo-project-editor demo-course-editor project-editor-test
-demo-project-editor: project-validator project-preview project-viewport
+demo-project-editor: project-cli project-editor project-validator project-preview project-viewport
 	mkdir -p build/project-example/assets
 	cp -n examples/scene_assets/project.json build/project-example/
 	cp -n examples/scene_assets/assets/world.xuscene examples/scene_assets/assets/panels.glb build/project-example/assets/
-	$(EDITOR_PYTHON) tools/project_editor.py build/project-example/project.json --output build/project-gallery
+	./build/nexus-project-editor build/project-example/project.json --output build/project-gallery
 
-demo-course-editor: project-validator character-course project-viewport
+demo-course-editor: project-cli project-editor project-validator character-course project-viewport
 	mkdir -p build/course-authoring/assets
 	cp -n examples/character_course/project.json build/course-authoring/
 	cp -n examples/character_course/assets/course.xuscene examples/character_course/assets/course.glb build/course-authoring/assets/
-	$(EDITOR_PYTHON) tools/project_editor.py build/course-authoring/project.json --output build/course-edits --preview build/nexus-character-course
+	./build/nexus-project-editor build/course-authoring/project.json --output build/course-edits --preview build/nexus-character-course
 
-project-editor-test: project-validator project-preview character-course project-viewport
-	$(EDITOR_PYTHON) tests/project_editor_checks.py
+project-editor-test: project-cli project-editor project-validator project-preview character-course project-viewport
+	XU_UI_SIM=1 XU_UI_PACK=1 $(XU) test cmd/project_editor/draft.xu cmd/project_editor/draft_components.xu cmd/project_editor/editor.xu cmd/project_editor/editor_components.xu cmd/project_editor/editor_i18n.xu cmd/project_editor/editor_icons.xu cmd/project_editor/editor_inspector.xu cmd/project_editor/editor_modals.xu cmd/project_editor/editor_panels.xu cmd/project_editor/project.xu cmd/project_editor/snap_modal.xu cmd/project_editor/theme.xu cmd/project_editor/top_view.xu cmd/project_editor/ui_checks.xu cmd/project_editor/test.editor.xu
+	$(XU) build tests/project_editor_checks.xu -o build/project-editor-checks
+	./build/project-editor-checks --editor build/nexus-project-editor --project-cli build/nexus-project --validator build/nexus-project-validate --preview build/nexus-project-preview --viewport build/nexus-project-viewport --course build/nexus-character-course
 
 .PHONY: tilemap-editor demo-tilemap-editor tilemap-editor-test
 tilemap-editor: sdk
@@ -134,6 +149,10 @@ tilemap-editor-test: tilemap-editor isometric-2d
 	cp examples/isometric_2d/assets/iso_tiles.png build/tilemap-editor-check/
 	./build/isometric-2d --scene build/tilemap-editor-check/edited.xuscene --frames 10 --autoplay --capture build/tilemap-editor-check/runtime.png
 
+.PHONY: isometric-campaign-test
+isometric-campaign-test: tilemap-editor isometric-2d project-validator
+	$(PYTHON) tests/isometric_campaign_checks.py
+
 .PHONY: character-course demo-character-course character-course-test
 character-course: mesh-shaders native-image
 	$(XU) build examples/character_course/main.xu -o build/nexus-character-course
@@ -145,8 +164,8 @@ character-course-test: character-course
 	./build/nexus-character-course --frames 240 --autoplay --capture build/character-course.png
 
 .PHONY: character-course-project benchmark-course benchmark-webgl
-character-course-project: project-validator
-	$(PYTHON) tools/project.py build examples/character_course/project.json --output build/character-course-project
+character-course-project: project-cli project-validator
+	./build/nexus-project build examples/character_course/project.json --output build/character-course-project --validator build/nexus-project-validate
 
 benchmark-course: character-course character-course-project
 	$(PYTHON) tools/benchmark_course.py --project-build build/character-course-project --output build/nexus-benchmark
@@ -187,7 +206,7 @@ check-core: layers sdk
 
 # Pure Xu validation stays usable while a compiler/platform backend is incomplete.
 # The aggregate check/test/gpu targets still fail on real device build failures.
-test-core: 25d-core-test shadow-core-test gltf-animation-test mesh-format-core-test lod-core-test frustum-core-test physics3d-test scene-lighting-test lighting-core-test check-core mesh-core-test glb-fixtures glb-material-fixtures script-fixtures audio-core-test scene-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
+test-core: scene-soa-test ecs-parallel-test navigation-test audio-dsp-test script-aot-test 25d-core-test shadow-core-test gltf-animation-test mesh-format-core-test lod-core-test frustum-core-test physics3d-test scene-lighting-test lighting-core-test check-core mesh-core-test glb-fixtures glb-material-fixtures script-fixtures audio-core-test scene-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
 	mkdir -p build
 	$(PYTHON) tests/layer_rules_checks.py
 	$(PYTHON) tests/layer_headless_checks.py
@@ -274,6 +293,30 @@ physics3d-test: sdk
 	./build/capsule3d-checks
 	$(XU) build tests/rigid3d_checks.xu -o build/rigid3d-checks
 	./build/rigid3d-checks
+	$(XU) build tests/physics3d_bvh_sap_checks.xu -o build/physics3d-bvh-sap
+	./build/physics3d-bvh-sap
+	$(XU) build tests/physics3d_xpbd_checks.xu -o build/physics3d-xpbd
+	./build/physics3d-xpbd
+
+scene-soa-test: sdk
+	mkdir -p build
+	$(XU) build tests/scene_soa_transform_checks.xu -o build/scene-soa-tests
+	./build/scene-soa-tests
+
+ecs-parallel-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/ecs_archetype_parallel_checks.xu -o build/ecs-parallel-checks
+	./build/ecs-parallel-checks
+
+navigation-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/navigation_checks.xu -o build/navigation-checks
+	./build/navigation-checks
+
+audio-dsp-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/audio_dsp_adpcm_checks.xu -o build/audio-dsp-checks
+	./build/audio-dsp-checks
 
 .PHONY: phone-frame-test phone-state-test phone-audio-test miniprogram miniprogram-test douyin douyin-test miniprogram-3d douyin-3d webgl-3d-test
 miniprogram: layers sdk
@@ -491,7 +534,7 @@ script-live-smoke: mesh-shaders canvas-shaders native script-tool
 	$(XU) build examples/script_reload/main.xu -o build/script-reload
 	$(PYTHON) tests/script_live_checks.py
 
-gpu-smoke: 25d-gpu-test present-fallback-test text-2d-test ui-hud-test scene-camera-gpu-test scene-lod-gpu-test physics3d-gpu-test project-gpu-test project-picking-test character-course-test shadow-gpu-test render-quality-test gltf-animation-gpu-test model-format-gpu-test lod-gpu-test lod-demo-test frustum-gpu-test scene-lighting-services-test lighting-demo-test lighting-gpu-test mesh-shaders canvas-shaders gpu-offscreen-smoke gpu-compute-smoke gpu-surface-smoke window-input-smoke native glb-fixtures glb-material-fixtures image-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
+gpu-smoke: 25d-gpu-test present-fallback-test text-2d-test ui-hud-test scene-camera-gpu-test scene-lod-gpu-test physics3d-gpu-test physics3d-joints-ragdoll-test project-gpu-test project-picking-test character-course-test shadow-gpu-test render-quality-test gltf-animation-gpu-test gpu-skinning-test clustered-lighting-gpu-test indirect-cull-hiz-gpu-test hdr-postprocess-gpu-test meshlet-visbuffer-gpu-test streaming-lru-gpu-test model-format-gpu-test lod-gpu-test lod-demo-test frustum-gpu-test scene-lighting-services-test lighting-demo-test lighting-gpu-test mesh-shaders canvas-shaders gpu-offscreen-smoke gpu-compute-smoke gpu-surface-smoke window-input-smoke native glb-fixtures glb-material-fixtures image-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
 	mkdir -p build
 	$(XU) build tests/gpu_smoke.xu -o build/gpu-smoke
 	./build/gpu-smoke
@@ -722,6 +765,65 @@ gltf-animation-gpu-test: mesh-shaders native-image gltf-animation-test
 	$(XU) build tests/gltf_animation_gpu_checks.xu -o build/gltf-animation-gpu
 	./build/gltf-animation-gpu
 
+gpu-skinning-test: mesh-shaders native-image gltf-animation-gpu-test
+	$(XU) build tests/gpu_skinning_checks.xu -o build/gpu-skinning-checks
+	./build/gpu-skinning-checks
+
+skeletal-animation-test: layers sdk mesh-shaders
+	mkdir -p build
+	$(XU) build tests/skeletal_animation_checks.xu -o build/skeletal-animation-checks
+	./build/skeletal-animation-checks
+
+particles-vfx-gpu-test: layers sdk mesh-shaders
+	mkdir -p build
+	$(XU) build tests/particles_vfx_gpu_checks.xu -o build/particles-vfx-checks
+	./build/particles-vfx-checks
+
+clustered-lighting-gpu-test: mesh-shaders lighting-core-test
+	$(XU) build tests/clustered_lighting_gpu_checks.xu -o build/clustered-lighting-checks
+	./build/clustered-lighting-checks
+
+indirect-cull-hiz-gpu-test: mesh-shaders lighting-core-test
+	$(XU) build tests/indirect_cull_hiz_gpu_checks.xu -o build/indirect-cull-hiz-checks
+	./build/indirect-cull-hiz-checks
+
+hdr-postprocess-gpu-test: mesh-shaders lighting-core-test
+	$(XU) build tests/hdr_postprocess_gpu_checks.xu -o build/hdr-postprocess-checks
+	./build/hdr-postprocess-checks
+
+meshlet-visbuffer-gpu-test: mesh-shaders lighting-core-test
+	mkdir -p build
+	$(XU) build tests/meshlet_visbuffer_gpu_checks.xu -o build/meshlet-visbuffer-checks
+	./build/meshlet-visbuffer-checks
+
+transparent-pbr-gpu-test: mesh-shaders lighting-core-test
+	mkdir -p build
+	$(XU) build tests/transparent_pbr_gpu_checks.xu -o build/transparent-pbr-checks
+	./build/transparent-pbr-checks
+
+physics3d-joints-ragdoll-test: mesh-shaders physics3d-test
+	mkdir -p build
+	$(XU) build tests/physics3d_joints_ragdoll_checks.xu -o build/physics3d-joints-ragdoll
+	./build/physics3d-joints-ragdoll
+
+physics3d-advanced-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/physics3d_advanced_checks.xu -o build/physics3d-advanced
+	./build/physics3d-advanced
+
+script-aot-test: script-tool
+	mkdir -p build
+	$(PYTHON) tests/script_aot_checks.py --xu "$(XU)"
+
+script-host-coroutines-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/script_host_coroutines_checks.xu -o build/script-host-coroutines-checks
+	./build/script-host-coroutines-checks
+
+streaming-lru-gpu-test: mesh-shaders native-image gltf-animation-test
+	$(XU) build tests/streaming_lru_gpu_checks.xu -o build/streaming-lru-checks
+	./build/streaming-lru-checks
+
 # Network downloads are explicit and never part of the default test targets.
 external-model-fixtures:
 	$(PYTHON) tests/fetch_external_models.py
@@ -796,3 +898,31 @@ shadow-gpu-test: mesh-shaders shadow-core-test
 	$(XU) build tests/cascade_gpu_checks.xu -o build/cascade-gpu-checks
 	./build/cascade-gpu-checks
 	$(PYTHON) tests/cascade_pixels.py
+
+terrain-foliage-gpu-test: mesh-shaders
+	mkdir -p build
+	$(XU) build tests/terrain_foliage_gpu_checks.xu -o build/terrain-foliage-gpu-checks
+	./build/terrain-foliage-gpu-checks
+
+decals-atmosphere-gpu-test: mesh-shaders
+	mkdir -p build
+	$(XU) build tests/decals_atmosphere_gpu_checks.xu -o build/decals-atmosphere-gpu-checks
+	./build/decals-atmosphere-gpu-checks
+
+ddgi-gi-gpu-test: mesh-shaders
+	mkdir -p build
+	$(XU) build tests/ddgi_gi_gpu_checks.xu -o build/ddgi-gi-gpu-checks
+	./build/ddgi-gi-gpu-checks
+
+engine-integration-gpu-test: layers mesh-shaders
+	mkdir -p build
+	$(XU) build tests/engine_full_integration_gpu_checks.xu -o build/engine-integration-gpu-checks
+	./build/engine-integration-gpu-checks
+
+all-modern-tests: engine-integration-gpu-test ddgi-gi-gpu-test physics3d-advanced-test networking-test decals-atmosphere-gpu-test terrain-foliage-gpu-test script-host-coroutines-test particles-vfx-gpu-test skeletal-animation-test transparent-pbr-gpu-test
+	@echo "ALL MODERN ENGINE TESTS PASSED"
+
+networking-test: sdk
+	mkdir -p build
+	$(XU) build tests/networking_multiplayer_checks.xu -o build/networking-multiplayer-checks
+	./build/networking-multiplayer-checks

@@ -1,0 +1,272 @@
+@"github.com/xulang-org/nexus/networking"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#encoding/binary
+#errors
+#math
+
+pub struct BitWriter {
+    bytes []u8
+    bit_pos int
+}
+
+pub struct BitReader {
+    bytes []u8
+    bit_pos int
+    total_bits int
+}
+
+fn pi_f() f64 { << 3.141592653589793 }
+fn two_pi_f() f64 { << 6.283185307179586 }
+
+pub fn new_bit_writer() BitWriter {
+    << BitWriter{bytes: []u8{}, bit_pos: 0}
+}
+
+pub fn new_bit_reader(data &[]u8) BitReader {
+    $copy := []u8{}
+    for i in 0:data.len { copy.push(data[i]) }
+    total := copy.len * 8
+    << BitReader{bytes: copy, bit_pos: 0, total_bits: total}
+}
+
+pub fn (w &BitWriter) bit_len() int { << w.bit_pos }
+
+pub fn (w &BitWriter) byte_len() int { << (w.bit_pos + 7) / 8 }
+
+pub fn (w $&BitWriter) write_bits(value int, bit_count int) int {
+    if bit_count < 1 || bit_count > 32 {
+        >>> errors.new("nexus net: write_bits count must be in 1..32")
+    }
+    $rem := bit_count
+    $v := value
+    while rem > 0 {
+        byte_idx := w.bit_pos / 8
+        bit_off := w.bit_pos % 8
+        if byte_idx >= w.bytes.len {
+            w.bytes.push(u8(0))
+        }
+        $avail := 8 - bit_off
+        $take := rem
+        if take > avail { take = avail }
+        mask := (1 << take) - 1
+        chunk := v & mask
+        cur := int(w.bytes[byte_idx])
+        w.bytes[byte_idx] = u8(cur | (chunk << bit_off))
+        v = v >> take
+        rem -= take
+        w.bit_pos += take
+    }
+    << 0
+}
+
+pub fn (w $&BitWriter) write_bool(v bool) int {
+    $b := 0
+    if v { b = 1 }
+    << w.write_bits(b, 1) >>>
+}
+
+pub fn (w $&BitWriter) write_u8(v int) int { << w.write_bits(v & 255, 8) >>> }
+pub fn (w $&BitWriter) write_u16(v int) int { << w.write_bits(v & 65535, 16) >>> }
+
+pub fn (w $&BitWriter) write_u32(v int) int {
+    w.write_bits(v & 65535, 16) >>>
+    << w.write_bits((v >> 16) & 65535, 16) >>>
+}
+
+pub fn (w $&BitWriter) write_i32(v int) int {
+    << w.write_u32(v) >>>
+}
+
+pub fn (w $&BitWriter) write_f32(v f64) int {
+    if !fm.finite(v) { >>> errors.new("nexus net: non-finite float32") }
+    bits := math.float32_bits(v)
+    << w.write_u32(bits) >>>
+}
+
+pub fn (w $&BitWriter) write_bytes(data &[]u8) int {
+    if data.len > 65535 {
+        >>> errors.new("nexus net: byte payload exceeds u16 limit")
+    }
+    w.write_u16(data.len) >>>
+    for i in 0:data.len {
+        w.write_u8(int(data[i])) >>>
+    }
+    << 0
+}
+
+pub fn (w $&BitWriter) write_quantized_f64(val f64, lo f64, hi f64, bits int) int {
+    if bits < 2 || bits > 24 || !fm.finite(val) || !fm.finite(lo) || !fm.finite(hi) || hi <= lo {
+        >>> errors.new("nexus net: invalid quantization parameters")
+    }
+    max_q := (1 << bits) - 1
+    $norm := (val - lo) / (hi - lo)
+    if norm < 0.0 { norm = 0.0 }
+    if norm > 1.0 { norm = 1.0 }
+    q := int(math.round(norm * f64(max_q)))
+    << w.write_bits(q, bits) >>>
+}
+
+pub fn (w $&BitWriter) write_vec3_quantized(v fm.Vec3, lo fm.Vec3, hi fm.Vec3, bits int) int {
+    w.write_quantized_f64(v.x, lo.x, hi.x, bits) >>>
+    w.write_quantized_f64(v.y, lo.y, hi.y, bits) >>>
+    << w.write_quantized_f64(v.z, lo.z, hi.z, bits) >>>
+}
+
+pub fn wrap_angle_rad(rad f64) f64 {
+    if !fm.finite(rad) { << 0.0 }
+    tp := two_pi_f()
+    p := pi_f()
+    $a := math.mod(rad + p, tp)
+    if a < 0.0 { a += tp }
+    << a - p
+}
+
+pub fn (w $&BitWriter) write_angle_rad(rad f64, bits int) int {
+    if bits < 2 || bits > 24 { >>> errors.new("nexus net: angle bit count must be in 2..24") }
+    a := wrap_angle_rad(rad)
+    max_q := 1 << bits
+    tp := two_pi_f()
+    $q := 0
+    if tp > 0.0 {
+        norm := (a + pi_f()) / tp
+        q = int(math.floor(norm * f64(max_q))) % max_q
+        if q < 0 { q += max_q }
+    }
+    << w.write_bits(q, bits) >>>
+}
+
+pub fn (w &BitWriter) finish() []u8 {
+    n := w.byte_len()
+    $out := []u8{}
+    for i in 0:n {
+        if i < w.bytes.len { out.push(w.bytes[i]) } else { out.push(u8(0)) }
+    }
+    << out
+}
+
+pub fn (r &BitReader) bits_remaining() int { << r.total_bits - r.bit_pos }
+
+pub fn (r $&BitReader) read_bits(bit_count int) int {
+    if bit_count < 1 || bit_count > 32 {
+        >>> errors.new("nexus net: read_bits count must be in 1..32")
+    }
+    if r.bit_pos + bit_count > r.total_bits {
+        >>> errors.new("nexus net: bitstream underflow")
+    }
+    $res := 0
+    $shift := 0
+    $rem := bit_count
+    while rem > 0 {
+        byte_idx := r.bit_pos / 8
+        bit_off := r.bit_pos % 8
+        avail := 8 - bit_off
+        $take := rem
+        if take > avail { take = avail }
+        mask := (1 << take) - 1
+        chunk := (int(r.bytes[byte_idx]) >> bit_off) & mask
+        res = res | (chunk << shift)
+        shift += take
+        rem -= take
+        r.bit_pos += take
+    }
+    << res
+}
+
+pub fn (r $&BitReader) read_bool() bool {
+    b := r.read_bits(1) >>>
+    << b != 0
+}
+
+pub fn (r $&BitReader) read_u8() int { << r.read_bits(8) >>> }
+pub fn (r $&BitReader) read_u16() int { << r.read_bits(16) >>> }
+
+pub fn (r $&BitReader) read_u32() int {
+    lo := r.read_bits(16) >>>
+    hi := r.read_bits(16) >>>
+    << lo | (hi << 16)
+}
+
+pub fn (r $&BitReader) read_i32() int {
+    raw := r.read_u32() >>>
+    if (raw & 2147483648) != 0 {
+        << raw - 4294967296
+    }
+    << raw
+}
+
+pub fn (r $&BitReader) read_f32() f64 {
+    bits := r.read_u32() >>>
+    v := math.float32_from_bits(bits)
+    if !fm.finite(v) { >>> errors.new("nexus net: non-finite float32 in stream") }
+    << v
+}
+
+pub fn (r $&BitReader) read_bytes(max_len int) []u8 {
+    n := r.read_u16() >>>
+    if n < 0 || n > max_len {
+        >>> errors.new("nexus net: byte payload exceeds max_len")
+    }
+    $out := []u8{}
+    for _ in 0:n {
+        bval := r.read_u8() >>>
+        out.push(u8(bval))
+    }
+    << out
+}
+
+pub fn (r $&BitReader) read_quantized_f64(lo f64, hi f64, bits int) f64 {
+    if bits < 2 || bits > 24 || hi <= lo {
+        >>> errors.new("nexus net: invalid dequantization parameters")
+    }
+    q := r.read_bits(bits) >>>
+    max_q := (1 << bits) - 1
+    t := f64(q) / f64(max_q)
+    << lo + t * (hi - lo)
+}
+
+pub fn (r $&BitReader) read_vec3_quantized(lo fm.Vec3, hi fm.Vec3, bits int) fm.Vec3 {
+    x := r.read_quantized_f64(lo.x, hi.x, bits) >>>
+    y := r.read_quantized_f64(lo.y, hi.y, bits) >>>
+    z := r.read_quantized_f64(lo.z, hi.z, bits) >>>
+    << fm.vec3(x, y, z)
+}
+
+pub fn (r $&BitReader) read_angle_rad(bits int) f64 {
+    if bits < 2 || bits > 24 { >>> errors.new("nexus net: angle bit count must be in 2..24") }
+    q := r.read_bits(bits) >>>
+    max_q := 1 << bits
+    << wrap_angle_rad((f64(q) / f64(max_q)) * two_pi_f() - pi_f())
+}
+
+pub fn bytes_to_wire(data &[]u8) string {
+    $out := ""
+    for i in 0:data.len {
+        out.push_byte(int(data[i]) & 255)
+    }
+    << out
+}
+
+pub fn wire_to_bytes(raw &string) []u8 {
+    $out := []u8{}
+    for i in 0:raw.len {
+        out.push(u8(raw[i] & 255))
+    }
+    << out
+}
+
+fn clone_bytes(src &[]u8) []u8 {
+    $out := []u8{}
+    for i in 0:src.len { out.push(src[i]) }
+    << out
+}
+
+fn zero_bytes_net(count int) []u8 {
+    $out := []u8{}
+    for _ in 0:count { out.push(u8(0)) }
+    << out
+}
+
+fn binary_order() binary.Endian {
+    << binary.little_endian()
+}

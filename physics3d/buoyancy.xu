@@ -1,0 +1,232 @@
+@"github.com/xulang-org/nexus/physics3d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub struct FluidVolume3D {
+    pub surface_y f64
+    pub density f64
+    pub linear_drag f64
+    pub angular_drag f64
+    pub quadratic_drag f64
+    pub flow_velocity fm.Vec3
+    pub wave_amplitude f64
+    pub wave_frequency f64
+    pub wave_speed f64
+    pub wave_dir_x f64
+    pub wave_dir_z f64
+    pub time f64
+}
+
+pub struct BuoyancyPontoon3D {
+    pub local_offset fm.Vec3
+    pub radius f64
+    pub volume f64
+}
+
+pub struct BuoyancyBody3D {
+    pub body_id int
+    pub pontoons []BuoyancyPontoon3D
+    pub submerged_ratio f64
+    pub displaced_volume f64
+}
+
+fn fluid_safe_norm(v fm.Vec3, fallback fm.Vec3) fm.Vec3 {
+    << v.normalized() >>> (err) { << fallback }
+}
+
+pub fn default_fluid_volume_3d(surface_y f64) FluidVolume3D {
+    << FluidVolume3D{
+        surface_y: surface_y,
+        density: 1000.0,
+        linear_drag: 2.2,
+        angular_drag: 2.4,
+        quadratic_drag: 0.45,
+        flow_velocity: zero(),
+        wave_amplitude: 0.0,
+        wave_frequency: 0.8,
+        wave_speed: 2.0,
+        wave_dir_x: 1.0,
+        wave_dir_z: 0.0,
+        time: 0.0
+    }
+}
+
+pub fn (fluid &FluidVolume3D) validate() int {
+    if !fm.finite(fluid.surface_y) || !fm.finite(fluid.density) || fluid.density <= 0.0 || fluid.density > 50000.0 ||
+        !fm.finite(fluid.linear_drag) || fluid.linear_drag < 0.0 || fluid.linear_drag > 100.0 ||
+        !fm.finite(fluid.angular_drag) || fluid.angular_drag < 0.0 || fluid.angular_drag > 100.0 ||
+        !fm.finite(fluid.quadratic_drag) || fluid.quadratic_drag < 0.0 || fluid.quadratic_drag > 100.0 ||
+        !fluid.flow_velocity.is_finite() {
+        >>> errors.new("nexus buoyancy: invalid fluid density, drag or flow parameters")
+    }
+    if !fm.finite(fluid.wave_amplitude) || fluid.wave_amplitude < 0.0 || fluid.wave_amplitude > 20.0 ||
+        !fm.finite(fluid.wave_frequency) || fluid.wave_frequency < 0.0 ||
+        !fm.finite(fluid.wave_speed) || !fm.finite(fluid.wave_dir_x) || !fm.finite(fluid.wave_dir_z) ||
+        !fm.finite(fluid.time) {
+        >>> errors.new("nexus buoyancy: invalid wave parameters")
+    }
+    << 0
+}
+
+pub fn (fluid $&FluidVolume3D) advance(dt f64) int {
+    if !fm.finite(dt) || dt < 0.0 {
+        >>> errors.new("nexus buoyancy: invalid wave advance timestep")
+    }
+    fluid.time += dt
+    << 0
+}
+
+pub fn (fluid &FluidVolume3D) surface_height_at(x f64, z f64) f64 {
+    if fluid.wave_amplitude <= 0.0 {
+        << fluid.surface_y
+    }
+    dl := math.sqrt(fluid.wave_dir_x * fluid.wave_dir_x + fluid.wave_dir_z * fluid.wave_dir_z)
+    $dx := 1.0
+    $dz := 0.0
+    if dl > 1e-8 {
+        dx = fluid.wave_dir_x / dl
+        dz = fluid.wave_dir_z / dl
+    }
+    phase := (x * dx + z * dz) * fluid.wave_frequency - fluid.time * fluid.wave_speed
+    << fluid.surface_y + fluid.wave_amplitude * math.sin(phase)
+}
+
+pub fn (fluid &FluidVolume3D) surface_normal_at(x f64, z f64) fm.Vec3 {
+    if fluid.wave_amplitude <= 0.0 || fluid.wave_frequency <= 0.0 {
+        << fm.vec3(0.0, 1.0, 0.0)
+    }
+    dl := math.sqrt(fluid.wave_dir_x * fluid.wave_dir_x + fluid.wave_dir_z * fluid.wave_dir_z)
+    $dx := 1.0
+    $dz := 0.0
+    if dl > 1e-8 {
+        dx = fluid.wave_dir_x / dl
+        dz = fluid.wave_dir_z / dl
+    }
+    phase := (x * dx + z * dz) * fluid.wave_frequency - fluid.time * fluid.wave_speed
+    slope := fluid.wave_amplitude * fluid.wave_frequency * math.cos(phase)
+    << fluid_safe_norm(fm.vec3(-dx * slope, 1.0, -dz * slope), fm.vec3(0.0, 1.0, 0.0))
+}
+
+pub fn buoyancy_pontoons_for_box(half_extents fm.Vec3, nx int, ny int, nz int) []BuoyancyPontoon3D {
+    if !half_extents.is_finite() || half_extents.x <= 0.0 || half_extents.y <= 0.0 || half_extents.z <= 0.0 ||
+        nx < 1 || ny < 1 || nz < 1 || nx * ny * nz > 128 {
+        >>> errors.new("nexus buoyancy: invalid box half extents or pontoon counts")
+    }
+    total_vol := 8.0 * half_extents.x * half_extents.y * half_extents.z
+    cnt := nx * ny * nz
+    p_vol := total_vol / f64(cnt)
+    p_rad := math.max(half_extents.y / f64(ny), 0.02)
+
+    $out := []BuoyancyPontoon3D{}
+    sx := (2.0 * half_extents.x) / f64(nx)
+    sy := (2.0 * half_extents.y) / f64(ny)
+    sz := (2.0 * half_extents.z) / f64(nz)
+    for iz in 0:nz {
+        for iy in 0:ny {
+            for ix in 0:nx {
+                ox := -half_extents.x + (f64(ix) + 0.5) * sx
+                oy := -half_extents.y + (f64(iy) + 0.5) * sy
+                oz := -half_extents.z + (f64(iz) + 0.5) * sz
+                out.push(BuoyancyPontoon3D{
+                    local_offset: fm.vec3(ox, oy, oz),
+                    radius: p_rad,
+                    volume: p_vol
+                })
+            }
+        }
+    }
+    << out
+}
+
+pub fn new_buoyancy_body_3d(body_id int, pontoons []BuoyancyPontoon3D) BuoyancyBody3D {
+    if body_id < 0 || pontoons.len == 0 {
+        >>> errors.new("nexus buoyancy: invalid body_id or empty pontoons")
+    }
+    for i in 0:pontoons.len {
+        p := &pontoons[i]
+        if !p.local_offset.is_finite() || !fm.finite(p.radius) || p.radius <= 0.0 ||
+            !fm.finite(p.volume) || p.volume <= 0.0 {
+            >>> errors.new("nexus buoyancy: invalid pontoon parameters")
+        }
+    }
+    << BuoyancyBody3D{
+        body_id: body_id,
+        pontoons: pontoons,
+        submerged_ratio: 0.0,
+        displaced_volume: 0.0
+    }
+}
+
+pub fn apply_buoyancy_to_jointed_world(
+    world $&JointedWorld3D,
+    fluid &FluidVolume3D,
+    bodies $&[]BuoyancyBody3D,
+    dt f64
+) int {
+    fluid.validate() >>>
+    if !fm.finite(dt) || dt <= 0.0 || dt > 0.25 {
+        >>> errors.new("nexus buoyancy: invalid timestep dt")
+    }
+    g := world.gravity.length()
+    up := fluid_safe_norm(world.gravity.scaled(-1.0), fm.vec3(0.0, 1.0, 0.0))
+
+    $active := 0
+    for bi in 0:bodies.len {
+        id := bodies[bi].body_id
+        if id < 0 || id >= world.positions.len {
+            >>> errors.new("nexus buoyancy: body_id out of range")
+        }
+        im := world.inv_mass[id]
+        if im <= 0.0 || bodies[bi].pontoons.len == 0 { -> }
+
+        mass := 1.0 / im
+        pcount := bodies[bi].pontoons.len
+        m_eff := mass / f64(pcount)
+        pos := world.positions[id]
+        q := world.orientations[id]
+        lin_v := world.lin_vels[id]
+        ang_v := world.ang_vels[id]
+
+        $displaced := 0.0
+        $total_vol := 0.0
+
+        for pi in 0:pcount {
+            pt := bodies[bi].pontoons[pi]
+            total_vol += pt.volume
+            r_world := q_rotate(q, pt.local_offset)
+            wp := pos.add(r_world)
+            h := fluid.surface_height_at(wp.x, wp.z)
+            depth := h - (wp.y - pt.radius)
+            raw_sub := clamp_value(depth / (2.0 * pt.radius), 0.0, 1.0)
+            if raw_sub <= 0.0 { -> }
+
+            sub := raw_sub * raw_sub * (3.0 - 2.0 * raw_sub)
+            displaced += pt.volume * sub
+
+            // Archimedes upward buoyancy impulse.
+            j_buoy := up.scaled(fluid.density * g * pt.volume * sub * dt)
+
+            // Hydrodynamic linear + quadratic drag relative to river/ocean flow.
+            v_pt := lin_v.add(ang_v.cross(r_world))
+            v_rel := v_pt.sub(fluid.flow_velocity)
+            rel_speed := v_rel.length()
+            drag_rate := (fluid.linear_drag + fluid.quadratic_drag * rel_speed) * sub
+            damp := clamp_value(drag_rate * dt, 0.0, 0.45)
+            j_drag := v_rel.scaled(-m_eff * damp)
+
+            total_imp := j_buoy.add(j_drag)
+            world.apply_impulse_at_point(id, total_imp, wp) >>>
+        }
+
+        $ratio := 0.0
+        if total_vol > 1e-12 { ratio = clamp_value(displaced / total_vol, 0.0, 1.0) }
+        ang_damp := math.max(0.0, 1.0 - fluid.angular_drag * ratio * dt)
+        world.ang_vels[id] = world.ang_vels[id].scaled(ang_damp)
+        bodies[bi].submerged_ratio = ratio
+        bodies[bi].displaced_volume = displaced
+        if ratio > 0.0 { active += 1 }
+    }
+    << active
+}

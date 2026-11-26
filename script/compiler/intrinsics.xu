@@ -1,0 +1,210 @@
+@"github.com/xulang-org/nexus/script/compiler"
+
+bc #"github.com/xulang-org/nexus/script/bytecode"
+#math
+#xu/ast
+#errors
+
+fn (compiler &Compiler) collect_call_args(head int, node int) []int {
+    $out := []int{}
+    $cur := head
+    while cur >= 0 {
+        if out.len >= 8 {
+            >>> errors.new(compiler.error(node, "call argument count exceeds scalar limit"))
+        }
+        out.push(cur)
+        cur = compiler.parser.nodes[cur].next
+    }
+    << out
+}
+
+fn lookup_host_intrinsic(name &string) []int {
+    if *name == "node_pos_x" { << [bc.HOST_NODE_POS_X, 0] }
+    if *name == "node_pos_y" { << [bc.HOST_NODE_POS_Y, 0] }
+    if *name == "node_pos_z" { << [bc.HOST_NODE_POS_Z, 0] }
+    if *name == "node_set_pos" { << [bc.HOST_NODE_SET_POS, 3] }
+    if *name == "node_translate" { << [bc.HOST_NODE_TRANSLATE, 3] }
+    if *name == "node_set_visible" { << [bc.HOST_NODE_SET_VISIBLE, 1] }
+    if *name == "node_is_visible" { << [bc.HOST_NODE_IS_VISIBLE, 0] }
+    if *name == "node_queue_free" { << [bc.HOST_NODE_QUEUE_FREE, 0] }
+    if *name == "node_pos_2d_x" { << [bc.HOST_NODE_POS_2D_X, 0] }
+    if *name == "node_pos_2d_y" { << [bc.HOST_NODE_POS_2D_Y, 0] }
+    if *name == "node_set_pos_2d" { << [bc.HOST_NODE_SET_POS_2D, 2] }
+    if *name == "input_pressed" { << [bc.HOST_INPUT_PRESSED, 1] }
+    if *name == "input_just_pressed" { << [bc.HOST_INPUT_JUST_PRESSED, 1] }
+    if *name == "input_axis" { << [bc.HOST_INPUT_AXIS, 2] }
+    if *name == "input_value" { << [bc.HOST_INPUT_VALUE, 1] }
+    if *name == "phys_raycast" { << [bc.HOST_PHYS_RAYCAST, 6] }
+    if *name == "phys_body_x" { << [bc.HOST_PHYS_BODY_X, 1] }
+    if *name == "phys_body_y" { << [bc.HOST_PHYS_BODY_Y, 1] }
+    if *name == "phys_body_z" { << [bc.HOST_PHYS_BODY_Z, 1] }
+    if *name == "phys_apply_impulse" { << [bc.HOST_PHYS_APPLY_IMPULSE, 4] }
+    if *name == "phys_set_vel" { << [bc.HOST_PHYS_SET_VEL, 4] }
+    if *name == "audio_play" { << [bc.HOST_AUDIO_PLAY, 3] }
+    if *name == "audio_stop" { << [bc.HOST_AUDIO_STOP, 1] }
+    if *name == "audio_set_bus_volume" { << [bc.HOST_AUDIO_SET_BUS_VOLUME, 2] }
+    if *name == "nav_path_length" { << [bc.HOST_NAV_PATH_LENGTH, 6] }
+    if *name == "nav_next_x" { << [bc.HOST_NAV_NEXT_X, 6] }
+    if *name == "nav_next_y" { << [bc.HOST_NAV_NEXT_Y, 6] }
+    if *name == "nav_next_z" { << [bc.HOST_NAV_NEXT_Z, 6] }
+    if *name == "vfx_burst" { << [bc.HOST_VFX_BURST, 2] }
+    if *name == "vfx_set_pos" { << [bc.HOST_VFX_SET_POS, 4] }
+    if *name == "bb_get" { << [bc.HOST_BB_GET, 1] }
+    if *name == "bb_set" { << [bc.HOST_BB_SET, 2] }
+    if *name == "time_elapsed" { << [bc.HOST_TIME_ELAPSED, 0] }
+    if *name == "time_delta" { << [bc.HOST_TIME_DELTA, 0] }
+    << [-1, 0]
+}
+
+fn (compiler &Compiler) literal_host_fn_id(node int) int {
+    n := compiler.syntax(node)
+    $v := -1
+    if n.kind == ast.NK_INT {
+        v = n.ival
+    } else if n.kind == ast.NK_FLOAT {
+        f := math.float64_from_bits(n.ival)
+        if bc.valid_scalar(f) && math.abs(f - math.round(f)) < 1e-9 {
+            v = int(math.round(f))
+        }
+    }
+    if v < 1 || v > bc.MAX_HOST_FN_ID {
+        >>> errors.new(compiler.error(node, "host_call first argument must be an integer constant ID in 1..4095"))
+    }
+    << v
+}
+
+fn (compiler $&Compiler) emit_host_call_sequence(fn_id int, arg_nodes &[]int, start_idx int, node int) int {
+    argc := arg_nodes.len - start_idx
+    if argc < 0 || argc > bc.MAX_HOST_ARGS {
+        >>> errors.new(compiler.error(node, "host call supports 0..6 scalar arguments"))
+    }
+    // Evaluate all argument expressions into local registers FIRST so nested
+    // host calls cannot overwrite staged host_args slots.
+    $arg_regs := []int{}
+    for k in start_idx:arg_nodes.len {
+        reg := compiler.expr(arg_nodes[k]) >>>
+        compiler.require_kind(reg, bc.F64, arg_nodes[k]) >>>
+        arg_regs.push(reg)
+    }
+    for slot in 0:arg_regs.len {
+        compiler.emit(bc.HOST_ARG, slot, arg_regs[slot], 0, arg_nodes[start_idx + slot]) >>>
+    }
+    dst := compiler.allocate(bc.F64, node) >>>
+    compiler.emit(bc.CALL_HOST, dst, fn_id, argc, node) >>>
+    << dst
+}
+
+fn (compiler $&Compiler) compile_call_expr(node int) int {
+    call := compiler.syntax(node)
+    if call.kind != ast.NK_CALL || call.b >= 0 {
+        >>> errors.new(compiler.error(node, "syntax is outside the scalar script profile"))
+    }
+    name := call.sval + ""
+    args := compiler.collect_call_args(call.a, node) >>>
+
+    $math_op := 0
+    if name == "abs" { math_op = bc.MATH_ABS
+    } else if name == "sqrt" { math_op = bc.MATH_SQRT
+    } else if name == "sin" { math_op = bc.MATH_SIN
+    } else if name == "cos" { math_op = bc.MATH_COS
+    } else if name == "floor" { math_op = bc.MATH_FLOOR
+    } else if name == "ceil" { math_op = bc.MATH_CEIL }
+    if math_op > 0 {
+        if args.len != 1 { >>> errors.new(compiler.error(node, name + " expects exactly 1 f64 argument")) }
+        r := compiler.expr(args[0]) >>>
+        compiler.require_kind(r, bc.F64, args[0]) >>>
+        dst := compiler.allocate(bc.F64, node) >>>
+        compiler.emit(bc.MATH_UNARY, dst, math_op, r, node) >>>
+        << dst
+    }
+
+    if name == "min" || name == "max" {
+        if args.len != 2 { >>> errors.new(compiler.error(node, name + " expects exactly 2 f64 arguments")) }
+        ra := compiler.expr(args[0]) >>>
+        rb := compiler.expr(args[1]) >>>
+        compiler.require_kind(ra, bc.F64, args[0]) >>>
+        compiler.require_kind(rb, bc.F64, args[1]) >>>
+        dst := compiler.allocate(bc.F64, node) >>>
+        $op := bc.MIN
+        if name == "max" { op = bc.MAX }
+        compiler.emit(op, dst, ra, rb, node) >>>
+        << dst
+    }
+
+    if name == "clamp" {
+        if args.len != 3 { >>> errors.new(compiler.error(node, "clamp expects exactly 3 f64 arguments (x, lo, hi)")) }
+        rx := compiler.expr(args[0]) >>>
+        rlo := compiler.expr(args[1]) >>>
+        rhi := compiler.expr(args[2]) >>>
+        compiler.require_kind(rx, bc.F64, args[0]) >>>
+        compiler.require_kind(rlo, bc.F64, args[1]) >>>
+        compiler.require_kind(rhi, bc.F64, args[2]) >>>
+        t := compiler.allocate(bc.F64, node) >>>
+        compiler.emit(bc.MIN, t, rx, rhi, node) >>>
+        dst := compiler.allocate(bc.F64, node) >>>
+        compiler.emit(bc.MAX, dst, rlo, t, node) >>>
+        << dst
+    }
+
+    if name == "host_call" {
+        if args.len < 1 || args.len > 1 + bc.MAX_HOST_ARGS {
+            >>> errors.new(compiler.error(node, "host_call expects (id, ...0..6 f64 args)"))
+        }
+        fn_id := compiler.literal_host_fn_id(args[0]) >>>
+        << compiler.emit_host_call_sequence(fn_id, &args, 1, node) >>>
+    }
+
+    if name == "yield_signal" {
+        if !compiler.in_coroutine {
+            >>> errors.new(compiler.error(node, "yield is only valid inside coroutine callbacks"))
+        }
+        if args.len != 1 { >>> errors.new(compiler.error(node, "yield_signal expects 1 f64 signal ID")) }
+        rsig := compiler.expr(args[0]) >>>
+        compiler.require_kind(rsig, bc.F64, args[0]) >>>
+        dst := compiler.allocate(bc.F64, node) >>>
+        compiler.emit(bc.YIELD_SIGNAL, dst, rsig, 0, node) >>>
+        << dst
+    }
+
+    spec := lookup_host_intrinsic(&name)
+    if spec[0] > 0 {
+        if args.len != spec[1] {
+            >>> errors.new(compiler.error(node, "host intrinsic " + name + " expects " + str(spec[1]) + " arguments"))
+        }
+        << compiler.emit_host_call_sequence(spec[0], &args, 0, node) >>>
+    }
+
+    >>> errors.new(compiler.error(node, "syntax is outside the scalar script profile"))
+}
+
+fn (compiler $&Compiler) compile_call_stmt(node int) int {
+    call := compiler.syntax(node)
+    if call.kind != ast.NK_CALL || call.b >= 0 {
+        >>> errors.new(compiler.error(node, "statement is outside the scalar script profile; expected emit_signal, host call or yield"))
+    }
+    name := call.sval + ""
+    if name == "emit_signal" {
+        << compiler.signal_statement(node) >>>
+    }
+    if name == "yield_frame" {
+        if !compiler.in_coroutine { >>> errors.new(compiler.error(node, "yield is only valid inside coroutine callbacks")) }
+        args := compiler.collect_call_args(call.a, node) >>>
+        if args.len != 0 { >>> errors.new(compiler.error(node, "yield_frame expects 0 arguments")) }
+        compiler.emit(bc.YIELD_FRAME, 0, 0, 0, node) >>>
+        << 0
+    }
+    if name == "yield_seconds" {
+        if !compiler.in_coroutine { >>> errors.new(compiler.error(node, "yield is only valid inside coroutine callbacks")) }
+        args := compiler.collect_call_args(call.a, node) >>>
+        if args.len != 1 { >>> errors.new(compiler.error(node, "yield_seconds expects 1 f64 seconds argument")) }
+        rdur := compiler.expr(args[0]) >>>
+        compiler.require_kind(rdur, bc.F64, args[0]) >>>
+        compiler.emit(bc.YIELD_SECONDS, 0, rdur, 0, node) >>>
+        << 0
+    }
+    if name == "yield_signal" || name == "host_call" || lookup_host_intrinsic(&name)[0] > 0 {
+        _ := compiler.compile_call_expr(node) >>>
+        << 0
+    }
+    >>> errors.new(compiler.error(node, "statement is outside the scalar script profile; expected emit_signal, host call or yield"))
+}

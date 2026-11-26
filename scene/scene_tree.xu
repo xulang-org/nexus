@@ -39,6 +39,11 @@ pub struct SceneTree {
     capacity int
     spatial_2d []Spatial2D
     spatial_3d []Spatial3D
+    world_2d []fm.Transform2D
+    dirty_2d []bool
+    world_3d []fm.Mat4
+    dirty_3d []bool
+    transforms_dirty bool
     free_2d int
     free_3d int
     pub paused bool
@@ -87,7 +92,10 @@ fn make_scene_tree(name string, capacity int, root_kind int) SceneTree {
     $slots := []NodeSlot{}
     slots.push(new_slot(name, -1, 0))
     $tree := SceneTree{slots: slots, free_head: -1, capacity: capacity, paused: false,
-        spatial_2d: []Spatial2D{}, spatial_3d: []Spatial3D{}, free_2d: -1, free_3d: -1}
+        spatial_2d: []Spatial2D{}, spatial_3d: []Spatial3D{},
+        world_2d: []fm.Transform2D{}, dirty_2d: []bool{},
+        world_3d: []fm.Mat4{}, dirty_3d: []bool{},
+        transforms_dirty: true, free_2d: -1, free_3d: -1}
     tree.allocate_spatial(0, root_kind)
     << tree
 }
@@ -211,6 +219,7 @@ fn (tree $&SceneTree) add_typed_child(parent_id int, name string, kind int) int 
     }
     tree.allocate_spatial(index, kind)
     tree.attach(index, parent)
+    if kind == NODE_2D || kind == NODE_3D { tree.transforms_dirty = true }
     << tree.node_id(index)
 }
 // Iterative pre-order traversal, bounded by the configured node capacity.
@@ -255,6 +264,7 @@ pub fn (tree $&SceneTree) set_transform(id int, value fm.Transform2D) int {
     component := tree.require_spatial(index, NODE_2D) >>>
     if !value.is_finite() { >>> errors.new("nexus: node transform must be finite") }
     tree.spatial_2d[component].local = value
+    tree.mark_dirty_subtree_2d(index)
     << 0
 }
 pub fn (tree $&SceneTree) set_position(id int, position fm.Vec2) int {
@@ -263,6 +273,7 @@ pub fn (tree $&SceneTree) set_position(id int, position fm.Vec2) int {
     if !fm.finite(position.x) || !fm.finite(position.y) { >>> errors.new("nexus: position must be finite") }
     tree.spatial_2d[component].local.tx = position.x
     tree.spatial_2d[component].local.ty = position.y
+    tree.mark_dirty_subtree_2d(index)
     << 0
 }
 pub fn (tree $&SceneTree) set_visible(id int, visible bool) int {
@@ -350,6 +361,14 @@ pub fn (tree $&SceneTree) reparent(id int, parent_id int, keep_global bool) int 
     tree.attach(index, parent)
     if keep_global && kind == NODE_2D { tree.spatial_2d[component].local = local_2d }
     if keep_global && kind == NODE_3D { tree.spatial_3d[component].local = local_3d }
+    if kind == NODE_2D {
+        tree.mark_dirty_subtree_2d(index)
+    } else if kind == NODE_3D {
+        tree.mark_dirty_subtree_3d(index)
+    } else {
+        tree.mark_dirty_subtree_2d(index)
+        tree.mark_dirty_subtree_3d(index)
+    }
     << 0
 }
 pub fn (tree $&SceneTree) queue_free(id int) int {

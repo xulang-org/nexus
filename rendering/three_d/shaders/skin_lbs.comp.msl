@@ -1,0 +1,87 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct SkinParams {
+    uint vertex_count;
+    uint bone_count;
+    uint has_normals;
+    uint has_tangents;
+};
+
+struct SkinInfluence {
+    uint4 joints;
+    float4 weights;
+};
+
+kernel void main0(
+    constant SkinParams& params [[buffer(0)]],
+    device const float* rest_verts [[buffer(1)]],
+    device const SkinInfluence* influences [[buffer(2)]],
+    device const float4* joint_palette [[buffer(3)]],
+    device float* out_verts [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.vertex_count) return;
+    uint base = gid * 16u;
+    SkinInfluence inf = influences[gid];
+    float4 r0 = float4(0.0);
+    float4 r1 = float4(0.0);
+    float4 r2 = float4(0.0);
+    for (int k = 0; k < 4; ++k) {
+        uint ji = inf.joints[k];
+        float w = inf.weights[k];
+        if (w > 0.0 && ji < params.bone_count) {
+            uint b = ji * 3u;
+            r0 += joint_palette[b + 0u] * w;
+            r1 += joint_palette[b + 1u] * w;
+            r2 += joint_palette[b + 2u] * w;
+        }
+    }
+    float4 p4 = float4(rest_verts[base + 0u], rest_verts[base + 1u], rest_verts[base + 2u], 1.0);
+    out_verts[base + 0u] = dot(r0, p4);
+    out_verts[base + 1u] = dot(r1, p4);
+    out_verts[base + 2u] = dot(r2, p4);
+    out_verts[base + 3u] = rest_verts[base + 3u];
+    out_verts[base + 4u] = rest_verts[base + 4u];
+    out_verts[base + 5u] = rest_verts[base + 5u];
+    out_verts[base + 6u] = rest_verts[base + 6u];
+
+    float3 m0 = r0.xyz;
+    float3 m1 = r1.xyz;
+    float3 m2 = r2.xyz;
+    float3 c0 = cross(m1, m2);
+    float3 c1 = cross(m2, m0);
+    float3 c2 = cross(m0, m1);
+    float det = dot(m0, c0);
+    float det_sign = det < 0.0 ? -1.0 : 1.0;
+
+    float3 nrm = float3(rest_verts[base + 7u], rest_verts[base + 8u], rest_verts[base + 9u]);
+    if (params.has_normals != 0u) {
+        float inv_det = (fabs(det) > 1e-20) ? (1.0 / det) : det_sign;
+        float3 invt = float3(dot(c0, nrm), dot(c1, nrm), dot(c2, nrm)) * inv_det;
+        float nlen = length(invt);
+        nrm = (nlen > 0.0) ? (invt / nlen) : float3(0.0, 1.0, 0.0);
+    }
+    out_verts[base + 7u] = nrm.x;
+    out_verts[base + 8u] = nrm.y;
+    out_verts[base + 9u] = nrm.z;
+    out_verts[base + 10u] = rest_verts[base + 10u];
+    out_verts[base + 11u] = rest_verts[base + 11u];
+
+    if (params.has_tangents != 0u) {
+        float3 tin = float3(rest_verts[base + 12u], rest_verts[base + 13u], rest_verts[base + 14u]);
+        float3 tw = float3(dot(m0, tin), dot(m1, tin), dot(m2, tin));
+        float3 ortho = tw - nrm * dot(tw, nrm);
+        float olen = length(ortho);
+        float3 unit_t = (olen > 0.0) ? (ortho / olen) : float3(1.0, 0.0, 0.0);
+        out_verts[base + 12u] = unit_t.x;
+        out_verts[base + 13u] = unit_t.y;
+        out_verts[base + 14u] = unit_t.z;
+        out_verts[base + 15u] = rest_verts[base + 15u] * det_sign;
+    } else {
+        out_verts[base + 12u] = rest_verts[base + 12u];
+        out_verts[base + 13u] = rest_verts[base + 13u];
+        out_verts[base + 14u] = rest_verts[base + 14u];
+        out_verts[base + 15u] = rest_verts[base + 15u];
+    }
+}

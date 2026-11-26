@@ -57,8 +57,12 @@ fn new_color(device &gpu.Device, width int, height int) gpu.Texture {
         usage: gpu.TEXTURE_COLOR_TARGET | gpu.TEXTURE_SAMPLED}) >>>
 }
 fn new_depth(device &gpu.Device, width int, height int) gpu.Texture {
+    $usage := gpu.TEXTURE_DEPTH_TARGET
+    if device.supports_texture_2d(layout.DEPTH32_FLOAT, gpu.TEXTURE_DEPTH_TARGET | gpu.TEXTURE_SAMPLED) >>> {
+        usage = usage | gpu.TEXTURE_SAMPLED
+    }
     << device.texture_2d(gpu.Texture2DDesc{format: layout.DEPTH32_FLOAT,width: width,height: height,levels: 1,
-        usage: gpu.TEXTURE_DEPTH_TARGET}) >>>
+        usage: usage}) >>>
 }
 fn mesh_pipeline() gpu.PipelineDesc {
     $desc := gpu.pipeline_defaults(layout.RGBA8_UNORM)
@@ -319,6 +323,29 @@ pub fn (device $&Device3D) begin(background int) int {
     device.selected_lights = 0
     << 0
 }
+fn (device $&Device3D) pause_render_pass() int {
+    device.recording() >>>
+    if !device.is_gpu() || device.sealed { << 0 }
+    if device.passes.len > 0 {
+        pass := $&device.passes[0]
+        pass.end() >>> (err){ device.abandon_frame()
+            >>> err }
+        device.passes = []gpu.RenderPass{}
+    }
+    << 0
+}
+fn (device $&Device3D) resume_render_pass() int {
+    device.recording() >>>
+    if !device.is_gpu() || device.sealed { << 0 }
+    if device.passes.len > 0 { << 0 }
+    encoder := $&device.encoders[0]
+    attachment := gpu.ColorAttachment{view: device.targets[0].view(0) >>>,load: gpu.LOAD,store: gpu.STORE,clear: gpu.Color{r: 0.0,g: 0.0,b: 0.0,a: 1.0}}
+    depth := gpu.depth_attachment(&device.targets[1],gpu.LOAD,gpu.STORE,0.0)
+    pass := encoder.begin_render(attachment,depth) >>> (err){ device.abandon_frame()
+        >>> err }
+    device.passes = [pass]
+    << 0
+}
 fn (device $&Device3D) seal() int {
     device.recording() >>>
     if device.sealed { << 0 }
@@ -328,9 +355,7 @@ fn (device $&Device3D) seal() int {
         device.sealed = true
         << 0
     }
-    pass := $&device.passes[0]
-    pass.end() >>> (err){ device.abandon_frame()
-        >>> err }
+    device.pause_render_pass() >>>
     device.resolve_target() >>> (err){ device.abandon_frame()
         >>> err }
     encoder := $&device.encoders[0]

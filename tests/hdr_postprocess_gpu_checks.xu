@@ -1,0 +1,286 @@
+@main
+
+#gpu
+#math
+fm #"github.com/xulang-org/nexus/foundation/math"
+mesh #"github.com/xulang-org/nexus/resources/mesh"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+nexus #"github.com/xulang-org/nexus/scene"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+
+fn quad_xy(w f64, h f64, normal fm.Vec3) mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    for xy in [fm.vec2(-w, -h), fm.vec2(w, -h), fm.vec2(w, h), fm.vec2(-w, h)] {
+        d.vertex_lit(fm.vec3(xy.x, xy.y, 0.0), 4294967295, normal) >>>
+    }
+    d.triangle(0, 1, 2) >>>
+    d.triangle(0, 2, 3) >>>
+    d.validate() >>>
+    << d
+}
+
+fn quad_xz(w f64, d_len f64) mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    n := fm.vec3(0.0, 1.0, 0.0)
+    // CCW when viewed from +Y.
+    d.vertex_lit(fm.vec3(-w, 0.0, d_len), 4294967295, n) >>>
+    d.vertex_lit(fm.vec3(w, 0.0, d_len), 4294967295, n) >>>
+    d.vertex_lit(fm.vec3(w, 0.0, -d_len), 4294967295, n) >>>
+    d.vertex_lit(fm.vec3(-w, 0.0, -d_len), 4294967295, n) >>>
+    d.triangle(0, 1, 2) >>>
+    d.triangle(0, 2, 3) >>>
+    d.validate() >>>
+    << d
+}
+
+fn ch_r(c int) int { << (c >> 24) & 255 }
+fn ch_g(c int) int { << (c >> 16) & 255 }
+fn ch_b(c int) int { << (c >> 8) & 255 }
+
+fn luma(c int) int {
+    << (ch_r(c) * 3 + ch_g(c) * 6 + ch_b(c)) / 10
+}
+
+fn render_post_pass(
+    device $&ren.Device3D,
+    hdr $&ren.HdrTarget3D,
+    hiz $&ren.HizPyramid3D,
+    pp $&ren.PostProcessPipeline3D,
+    clustered &ren.ClusteredRenderer3D,
+    irr &ren.IrradianceGpu3D,
+    floor_mesh &ren.Mesh3D,
+    wall_mesh &ren.Mesh3D,
+    beacon_mesh &ren.Mesh3D,
+    floor_mat &ren.Material3D,
+    wall_mat &ren.Material3D,
+    beacon_mat &ren.Material3D,
+    view fm.Mat4,
+    proj fm.Mat4,
+    vp fm.Mat4,
+    z_near f64,
+    z_far f64,
+    cfg &ren.PostProcessConfig3D,
+    with_wall bool,
+    with_beacon bool
+) int {
+    hdr.begin(device, 255) >>>
+    hdr.draw_clustered_gi(device, clustered, irr, 1.0, floor_mesh.reference(), fm.translation_3d(fm.vec3(0.0, -0.6, 0.0)), view, vp, floor_mat) >>>
+    if with_wall {
+        hdr.draw_clustered_gi(device, clustered, irr, 1.0, wall_mesh.reference(), fm.translation_3d(fm.vec3(0.0, 0.6, -1.6)), view, vp, wall_mat) >>>
+    }
+    if with_beacon {
+        hdr.draw_clustered_gi(device, clustered, irr, 1.0, beacon_mesh.reference(), fm.translation_3d(fm.vec3(0.0, 0.75, -1.0)), view, vp, beacon_mat) >>>
+    }
+    hdr.end() >>>
+
+    device.begin(255) >>>
+    pp.apply(device, hdr, hiz, view, proj, z_near, z_far, cfg) >>>
+    px := device.read_pixel(64, 64) >>>
+    << px
+}
+
+fn run() int {
+    program := shaders.load_mesh("build/mesh-shaders") >>>
+    cprog := shaders.load_clustered_program("build/mesh-shaders") >>>
+    iprog := shaders.load_indirect_program("build/mesh-shaders") >>>
+    pprog := shaders.load_postprocess_program("build/mesh-shaders") >>>
+
+    $device := ren.open_3d("HDR PostProcess checks", 128, 128, gpu.METAL, &program) >>>
+    $clustered := device.clustered_renderer(&cprog) >>>
+    $hiz := device.hiz_pyramid(&iprog) >>>
+    $hdr := device.hdr_target(&pprog) >>>
+    $pp := device.postprocess_pipeline(&pprog) >>>
+
+    // 1. 3D IrradianceGrid3D test: warm-red GI on left (x=-4), cool-blue GI on right (x=+4).
+    $grid := ren.irradiance_grid_3d(fm.vec3(-6.0, -2.0, -4.0), fm.vec3(4.0, 2.0, 4.0), 4, 2, 3) >>>
+    grid.bake_hemisphere(fm.vec3(0.18, 0.18, 0.22), fm.vec3(0.06, 0.06, 0.08), fm.vec3(0.2, 1.0, 0.3), fm.vec3(0.2, 0.2, 0.2)) >>>
+    gi_pt_red := lights.point(fm.vec3(-4.0, 0.0, 1.5), fm.vec3(10.0, 0.6, 0.3), 7.0) >>>
+    gi_pt_blue := lights.point(fm.vec3(4.0, 0.0, 1.5), fm.vec3(0.3, 1.2, 11.0), 7.0) >>>
+    gi_srcs := [gi_pt_red, gi_pt_blue]
+    grid.inject_point_lights(&gi_srcs, 1.0) >>>
+    sh_left := grid.evaluate_sh(fm.vec3(-3.5, 0.0, 0.0), fm.vec3(0.0, 0.0, 1.0)) >>>
+    sh_right := grid.evaluate_sh(fm.vec3(3.5, 0.0, 0.0), fm.vec3(0.0, 0.0, 1.0)) >>>
+    assert(sh_left.x > sh_left.z && sh_right.z > sh_right.x)
+    $irr_gpu := grid.upload(&device) >>>
+
+    eye := fm.vec3(0.0, 0.8, 3.8)
+    view := nexus.look_at_3d(eye, fm.vec3(0.0, 0.0, -0.8), fm.vec3(0.0, 1.0, 0.0)) >>>
+    z_near := 0.25
+    z_far := 40.0
+    proj := nexus.perspective_3d(0.9, 1.0, z_near, z_far) >>>
+    vp := proj.multiply(view)
+
+    // Bin zero direct lights so GI test isolates IrradianceGrid3D!
+    empty_lights := []lights.Light3D{}
+    clustered.bin_lights(&device, fm.vec3(0.0, 0.0, 0.0), eye, 1.0, &empty_lights, view, proj, z_near, z_far, 0) >>>
+
+    $qpanel := quad_xy(0.85, 0.85, fm.vec3(0.0, 0.0, 1.0)) >>>
+    $panel_mesh := device.upload(&qpanel) >>>
+    white_mat := ren.material_3d(fm.vec3(0.85, 0.85, 0.85), 0.0, 0.8, fm.vec3(0.0, 0.0, 0.0)) >>>
+
+    hdr.begin(&device, 255) >>>
+    hdr.draw_clustered_gi(&device, &clustered, &irr_gpu, 1.0, panel_mesh.reference(), fm.translation_3d(fm.vec3(-1.1, 0.0, 0.0)), view, vp, &white_mat) >>>
+    hdr.draw_clustered_gi(&device, &clustered, &irr_gpu, 1.0, panel_mesh.reference(), fm.translation_3d(fm.vec3(1.1, 0.0, 0.0)), view, vp, &white_mat) >>>
+    hdr.end() >>>
+
+    $cfg_plain := ren.post_process_defaults_3d()
+    cfg_plain.ao_enabled = false
+    cfg_plain.ssr_enabled = false
+    cfg_plain.bloom_enabled = false
+    device.begin(255) >>>
+    pp.apply($&device, &hdr, $&hiz, view, proj, z_near, z_far, &cfg_plain) >>>
+    px_gi_l := device.read_pixel(30, 72) >>>
+    px_gi_r := device.read_pixel(98, 72) >>>
+    device.present() >>>
+    assert(ch_r(px_gi_l) > ch_b(px_gi_l) + 15)
+    assert(ch_b(px_gi_r) > ch_r(px_gi_r) + 15)
+
+    // 2. Corner Crevice Scene for GTAO, Glossy Floor for SSR, and Emissive HDR Beacon for Bloom!
+    $floor_m := device.upload(&quad_xz(3.2, 2.2) >>>) >>>
+    $wall_m := device.upload(&quad_xy(3.2, 1.6, fm.vec3(0.0, 0.0, 1.0)) >>>) >>>
+    $beacon_m := device.upload(&quad_xy(0.45, 0.45, fm.vec3(0.0, 0.0, 1.0)) >>>) >>>
+
+    // Glossy low-roughness neutral floor (reflects red-orange emissive wall in SSR!), matte crevice wall, and >1.0 HDR emissive beacon.
+    floor_mat := ren.material_3d(fm.vec3(0.45, 0.45, 0.48), 0.1, 0.08, fm.vec3(0.0, 0.0, 0.0)) >>>
+    wall_mat := ren.material_3d(fm.vec3(0.85, 0.25, 0.15), 0.0, 0.7, fm.vec3(2.6, 0.35, 0.15)) >>>
+    beacon_mat := ren.material_3d(fm.vec3(1.0, 1.0, 1.0), 0.0, 0.5, fm.vec3(10.0, 5.0, 1.2)) >>>
+
+    sun := lights.directional(fm.vec3(0.2, 0.8, 0.6).normalized() >>>, fm.vec3(1.8, 1.8, 1.8)) >>>
+    scene_ls := [sun]
+    clustered.bin_lights(&device, fm.vec3(0.25, 0.25, 0.28), eye, 1.0, &scene_ls, view, proj, z_near, z_far, 0) >>>
+
+    // 2A. Neutral GI for crisp corner GTAO check (white wall meets white floor).
+    matte_white := ren.material_3d(fm.vec3(0.8, 0.8, 0.8), 0.0, 0.85, fm.vec3(0.0, 0.0, 0.0)) >>>
+    $neutral_grid := ren.irradiance_grid_3d(fm.vec3(-4.0, -2.0, -4.0), fm.vec3(4.0, 4.0, 4.0), 3, 2, 3) >>>
+    neutral_grid.bake_hemisphere(fm.vec3(0.3, 0.3, 0.35), fm.vec3(0.25, 0.25, 0.25), fm.vec3(0.0, 1.0, 0.5), fm.vec3(0.4, 0.4, 0.4)) >>>
+    $neutral_irr := neutral_grid.upload(&device) >>>
+
+    // Crevice camera closer and looking slightly down at the floor-wall seam (y=-0.6, z=-1.6).
+    c_eye := fm.vec3(0.0, 0.35, 1.8)
+    c_view := nexus.look_at_3d(c_eye, fm.vec3(0.0, -0.55, -1.6), fm.vec3(0.0, 1.0, 0.0)) >>>
+    c_vp := proj.multiply(c_view)
+    clustered.bin_lights(&device, fm.vec3(0.35, 0.35, 0.38), c_eye, 1.0, &scene_ls, c_view, proj, z_near, z_far, 0) >>>
+
+    // Measure floor/crevice luminance with AO disabled vs AO enabled (SSR/Bloom disabled).
+    $cfg_ao_off := ren.post_process_defaults_3d()
+    cfg_ao_off.ao_enabled = false
+    cfg_ao_off.ssr_enabled = false
+    cfg_ao_off.bloom_enabled = false
+    render_post_pass($&device, $&hdr, $&hiz, $&pp, &clustered, &neutral_irr, &floor_m, &wall_m, &beacon_m,
+        &matte_white, &matte_white, &beacon_mat, c_view, proj, c_vp, z_near, z_far, &cfg_ao_off, true, false) >>>
+    $crevice_off_sum := 0
+    for dx in -4:5 {
+        crevice_off_sum += luma(device.read_pixel(64 + dx * 4, 65) >>>)
+    }
+    device.present() >>>
+
+    $cfg_ao_on := cfg_ao_off
+    cfg_ao_on.ao_enabled = true
+    cfg_ao_on.ao_radius = 1.6
+    cfg_ao_on.ao_strength = 0.95
+    cfg_ao_on.ao_bias = 0.01
+    render_post_pass($&device, $&hdr, $&hiz, $&pp, &clustered, &neutral_irr, &floor_m, &wall_m, &beacon_m,
+        &matte_white, &matte_white, &beacon_mat, c_view, proj, c_vp, z_near, z_far, &cfg_ao_on, true, false) >>>
+    $crevice_on_sum := 0
+    for dx in -4:5 {
+        crevice_on_sum += luma(device.read_pixel(64 + dx * 4, 65) >>>)
+    }
+    device.present() >>>
+    assert(crevice_on_sum < crevice_off_sum - 30)
+
+    // 2B. SSR check: Glossy floor reflects bright emissive red-orange wall!
+    ssr_eye := fm.vec3(0.0, 0.45, 2.2)
+    ssr_view := nexus.look_at_3d(ssr_eye, fm.vec3(0.0, -0.3, -1.2), fm.vec3(0.0, 1.0, 0.0)) >>>
+    ssr_vp := proj.multiply(ssr_view)
+    clustered.bin_lights(&device, fm.vec3(0.06, 0.06, 0.07), ssr_eye, 1.0, &scene_ls, ssr_view, proj, z_near, z_far, 0) >>>
+
+    $cfg_ssr_off := ren.post_process_defaults_3d()
+    cfg_ssr_off.ao_enabled = false
+    cfg_ssr_off.ssr_enabled = false
+    cfg_ssr_off.bloom_enabled = false
+    render_post_pass($&device, $&hdr, $&hiz, $&pp, &clustered, &neutral_irr, &floor_m, &wall_m, &beacon_m,
+        &floor_mat, &wall_mat, &beacon_mat, ssr_view, proj, ssr_vp, z_near, z_far, &cfg_ssr_off, true, false) >>>
+    $ssr_off_red := 0
+    for y in 84:108 {
+        ssr_off_red += ch_r(device.read_pixel(64, y) >>>)
+    }
+    device.present() >>>
+
+    $cfg_ssr_on := cfg_ssr_off
+    cfg_ssr_on.ssr_enabled = true
+    cfg_ssr_on.ssr_strength = 1.8
+    cfg_ssr_on.ssr_max_roughness = 0.65
+    cfg_ssr_on.ssr_max_distance = 10.0
+    cfg_ssr_on.ssr_thickness = 0.65
+    render_post_pass($&device, $&hdr, $&hiz, $&pp, &clustered, &neutral_irr, &floor_m, &wall_m, &beacon_m,
+        &floor_mat, &wall_mat, &beacon_mat, ssr_view, proj, ssr_vp, z_near, z_far, &cfg_ssr_on, true, false) >>>
+    $ssr_on_red := 0
+    for y in 84:108 {
+        ssr_on_red += ch_r(device.read_pixel(64, y) >>>)
+    }
+    device.present() >>>
+    assert(ssr_on_red > ssr_off_red + 180)
+
+    // 2C. HDR Bloom + TAA multi-frame check (with_wall=false isolates beacon bloom halo over sky)!
+    $cfg_bloom_off := ren.post_process_defaults_3d()
+    cfg_bloom_off.ao_enabled = true
+    cfg_bloom_off.ssr_enabled = true
+    cfg_bloom_off.bloom_enabled = false
+    render_post_pass($&device, $&hdr, $&hiz, $&pp, &clustered, &neutral_irr, &floor_m, &wall_m, &beacon_m,
+        &floor_mat, &wall_mat, &beacon_mat, ssr_view, proj, ssr_vp, z_near, z_far, &cfg_bloom_off, false, true) >>>
+    $halo_off := 0
+    for rx in [42, 46, 82, 86] {
+        halo_off += ch_r(device.read_pixel(rx, 28) >>>)
+    }
+    device.present() >>>
+
+    $cfg_full := ren.post_process_defaults_3d()
+    cfg_full.ssr_strength = 1.4
+    cfg_full.bloom_enabled = true
+    cfg_full.bloom_threshold = 1.0
+    cfg_full.bloom_intensity = 0.9
+    cfg_full.taa_enabled = true
+    // Run 3 TAA frames + capture final combined scene frame.
+    $halo_on := 0
+    for f in 0:3 {
+        show_wall := f == 2
+        render_post_pass($&device, $&hdr, $&hiz, $&pp, &clustered, &neutral_irr, &floor_m, &wall_m, &beacon_m,
+            &floor_mat, &wall_mat, &beacon_mat, ssr_view, proj, ssr_vp, z_near, z_far, &cfg_full, show_wall, true) >>>
+        if f == 1 {
+            for rx in [42, 46, 82, 86] {
+                halo_on += ch_r(device.read_pixel(rx, 28) >>>)
+            }
+        }
+        if f == 2 {
+            device.capture("build/postprocess-hdr-gi.png") >>>
+        }
+        device.present() >>>
+    }
+    assert(halo_on > halo_off + 20)
+
+    floor_m.close() >>>
+    wall_m.close() >>>
+    beacon_m.close() >>>
+    panel_mesh.close() >>>
+    irr_gpu.close() >>>
+    neutral_irr.close() >>>
+    pp.close() >>>
+    hdr.close() >>>
+    hiz.close() >>>
+    clustered.close() >>>
+    device.close() >>>
+    println("PASS: HDR + GI + GTAO + Hi-Z SSR + Bloom + ACES/TAA (GI L=(" +
+        str(ch_r(px_gi_l)) + "," + str(ch_b(px_gi_l)) + ") R=(" + str(ch_r(px_gi_r)) + "," + str(ch_b(px_gi_r)) +
+        "), GTAO=" + str(crevice_on_sum) + "<" + str(crevice_off_sum) +
+        ", SSR_red=" + str(ssr_on_red) + ">" + str(ssr_off_red) +
+        ", Bloom_halo=" + str(halo_on) + ">" + str(halo_off) + ")")
+    << 0
+}
+
+fn main() int {
+    << run() >>> (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

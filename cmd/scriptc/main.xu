@@ -1,22 +1,43 @@
 @main
 
 compiler #"github.com/xulang-org/nexus/script/compiler"
+aot #"github.com/xulang-org/nexus/script/aot"
 files #"github.com/xulang-org/nexus/internal/file_snapshot"
 #os
 #errors
 
 fn run() int {
     args := os.args()
-    if args.len < 4 || (args[1] != "check" && args[1] != "build") ||
-        (args[1] == "check" && args.len != 4) || (args[1] == "build" && args.len != 5) {
-        >>> errors.new("usage: xu-nexus-script check source.xus schema.json | build source.xus schema.json output.xubc")
+    if args.len < 4 {
+        >>> errors.new("usage: xu-nexus-script check source.xus schema.json | build source.xus schema.json output.xubc | aot-c source.xus schema.json out_dir prefix")
+    }
+    mode := args[1] + ""
+    if mode != "check" && mode != "build" && mode != "aot-c" {
+        >>> errors.new("usage: xu-nexus-script check source.xus schema.json | build source.xus schema.json output.xubc | aot-c source.xus schema.json out_dir prefix")
+    }
+    if (mode == "check" && args.len != 4) || (mode == "build" && args.len != 5) || (mode == "aot-c" && args.len != 6) {
+        >>> errors.new("usage: xu-nexus-script check source.xus schema.json | build source.xus schema.json output.xubc | aot-c source.xus schema.json out_dir prefix")
     }
     source := files.read(args[2] + "", compiler.MAX_SOURCE_BYTES) >>>
     schema := files.read(args[3] + "", compiler.MAX_SOURCE_BYTES) >>>
     program := compiler.compile(source, schema, args[2] + "") >>>
-    if args[1] == "build" {
+    if mode == "build" {
         raw := program.encode() >>>
         files.write_atomic(args[4] + "", &raw) >>>
+    } else if mode == "aot-c" {
+        out_dir := args[4] + ""
+        prefix := args[5] + ""
+        bundle := aot.compile_aot(&program, "nexus_" + prefix + "_aot", prefix + "_") >>>
+        c_src := bundle.c_source + ""
+        man_json := bundle.manifest_json + ""
+        wrap_xu := bundle.wrapper_xu + ""
+        static_xu := bundle.static_xu + ""
+        xubc := program.encode() >>>
+        files.write_atomic(out_dir + "/" + prefix + ".c", &c_src) >>>
+        files.write_atomic(out_dir + "/native.json", &man_json) >>>
+        files.write_atomic(out_dir + "/" + prefix + "_dual.xu", &wrap_xu) >>>
+        files.write_atomic(out_dir + "/" + prefix + "_static.xu", &static_xu) >>>
+        files.write_atomic(out_dir + "/" + prefix + ".xubc", &xubc) >>>
     }
     println("XuScript scalar-v1: " + str(program.code_count()) + " instructions, " + str(program.field_count()) +
         " fields, " + str(program.signal_count()) + " signals, " + str(program.function_count()) + " callbacks; " + program.fingerprint())

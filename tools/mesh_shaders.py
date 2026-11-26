@@ -39,6 +39,16 @@ def prepare_mesh(backend, out_dir):
                 )
             else:
                 subprocess.run([*vulkan, '-o', str(output), str(source / shader)], check=True)
+    if backend == 'metal':
+        for comp in source.glob('*.msl'):
+            if comp.stem.endswith('.comp') or comp.stem.endswith('.vert') or comp.stem.endswith('.frag'):
+                name_key = comp.stem
+                if name_key in ('mesh.vert', 'mesh.frag', 'shadow.vert', 'shadow.frag'):
+                    continue
+                data = comp.read_bytes()
+                for include in ('lighting.inc', 'shadow.inc'):
+                    data = data.replace(f'#include "{include}"'.encode(), (source / include).read_bytes())
+                (out_dir / f'{name_key}.bin').write_bytes(data)
     print(f'Prepared {backend} mesh shader artifacts in {out_dir}')
 
 

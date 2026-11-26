@@ -1,0 +1,130 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct ParticleVertUniform {
+    float4x4 view_proj;
+    float4x4 view;
+    float4 cam_right_mode; // xyz=cam_right, w=billboard_mode
+    float4 cam_up_atlas;   // xyz=cam_up, w=atlas_cycles
+    float4 color_keys[4];  // 4 RGBA stops at t=0, 1/3, 2/3, 1
+    float4 atlas_info;     // x=cols, y=rows, z=emissive_scale, w=stretch_min_len
+    float4 extra;          // x=size_curve_mode (0=linear, 1=bell), yzw=0
+};
+
+struct ParticleGpu {
+    float4 pos_age;
+    float4 vel_life;
+    float4 size_rot;
+    float4 aux;
+};
+
+struct VertexOut {
+    float4 position [[position]];
+    float4 color;
+    float2 atlas_uv;
+    float2 local_uv;
+    float view_z;
+    float additive;
+};
+
+static inline float4 eval_4stop_color(constant float4* keys, float t) {
+    float s = clamp(t, 0.0, 1.0) * 3.0;
+    int idx = min(int(floor(s)), 2);
+    float f = s - float(idx);
+    return mix(keys[idx], keys[idx + 1], f);
+}
+
+vertex VertexOut main0(
+    constant ParticleVertUniform& u [[buffer(0)]],
+    device const ParticleGpu* particles [[buffer(1)]],
+    device const uint* alive_indices [[buffer(2)]],
+    uint vid [[vertex_id]],
+    uint iid [[instance_id]]
+) {
+    const float2 corners[6] = {
+        float2(-0.5, -0.5),
+        float2( 0.5, -0.5),
+        float2( 0.5,  0.5),
+        float2(-0.5, -0.5),
+        float2( 0.5,  0.5),
+        float2(-0.5,  0.5)
+    };
+    const float2 uvs[6] = {
+        float2(0.0, 1.0),
+        float2(1.0, 1.0),
+        float2(1.0, 0.0),
+        float2(0.0, 1.0),
+        float2(1.0, 0.0),
+        float2(0.0, 0.0)
+    };
+
+    uint ci = vid % 6u;
+    float2 corner = corners[ci];
+    float2 local_uv = uvs[ci];
+
+    uint pid = alive_indices[iid];
+    ParticleGpu p = particles[pid];
+
+    float life = max(p.vel_life.w, 1e-5);
+    float t = clamp(p.pos_age.w / life, 0.0, 1.0);
+
+    float4 col = eval_4stop_color(u.color_keys, t);
+    col.rgb *= u.atlas_info.z;
+
+    float size = mix(p.size_rot.x, p.size_rot.y, t);
+    if (u.extra.x > 0.5) {
+        size *= sin(t * 3.14159265359);
+    }
+
+    int mode = int(u.cam_right_mode.w + 0.5);
+    float3 right_w = float3(0.0);
+    float3 up_w = float3(0.0);
+    float rot = p.size_rot.z;
+    float cr = cos(rot);
+    float sr = sin(rot);
+
+    if (mode == 2) {
+        // Horizontal XZ
+        right_w = float3(cr, 0.0, sr) * size;
+        up_w = float3(-sr, 0.0, cr) * size;
+    } else if (mode == 1) {
+        // Velocity-stretched billboard
+        float3 cam_r = u.cam_right_mode.xyz;
+        float3 cam_u = u.cam_up_atlas.xyz;
+        float3 cam_f = normalize(cross(cam_r, cam_u));
+        float3 vel = p.vel_life.xyz;
+        float3 v_ortho = vel - cam_f * dot(vel, cam_f);
+        float vlen = length(vel);
+        float olen = length(v_ortho);
+        float3 dir = olen > 1e-4 ? (v_ortho / olen) : (cam_r * cr + cam_u * sr);
+        float3 perp = normalize(cross(cam_f, dir));
+        up_w = dir * (size * (1.0 + max(vlen, u.atlas_info.w) * p.aux.y));
+        right_w = perp * (size * 0.35);
+    } else {
+        // Camera-facing billboard
+        float3 cam_r = u.cam_right_mode.xyz;
+        float3 cam_u = u.cam_up_atlas.xyz;
+        right_w = (cam_r * cr + cam_u * sr) * size;
+        up_w = (-cam_r * sr + cam_u * cr) * size;
+    }
+
+    float3 world_pos = p.pos_age.xyz + right_w * corner.x + up_w * corner.y;
+
+    float cols = max(floor(u.atlas_info.x + 0.5), 1.0);
+    float rows = max(floor(u.atlas_info.y + 0.5), 1.0);
+    float total_frames = cols * rows;
+    float frame_f = floor(fract(t * max(u.cam_up_atlas.w, 1.0)) * total_frames);
+    frame_f = clamp(frame_f, 0.0, total_frames - 1.0);
+    float cell_x = fmod(frame_f, cols);
+    float cell_y = floor(frame_f / cols);
+    float2 atlas_uv = (float2(cell_x, cell_y) + local_uv) / float2(cols, rows);
+
+    VertexOut out;
+    out.position = u.view_proj * float4(world_pos, 1.0);
+    out.color = col;
+    out.atlas_uv = atlas_uv;
+    out.local_uv = local_uv;
+    out.view_z = -(u.view * float4(world_pos, 1.0)).z;
+    out.additive = mix(p.aux.z, p.aux.w, t);
+    return out;
+}

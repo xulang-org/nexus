@@ -1,0 +1,451 @@
+@main
+
+#math
+#errors
+fm #"github.com/xulang-org/nexus/foundation/math"
+scene #"github.com/xulang-org/nexus/scene"
+netw #"github.com/xulang-org/nexus/networking"
+netbridge #"github.com/xulang-org/nexus/integration/networking"
+
+fn make_u32_payload(val int) []u8 {
+    $bw := netw.new_bit_writer()
+    bw.write_u32(val) >>>
+    << bw.finish()
+}
+
+fn read_u32_payload(data &[]u8) int {
+    $br := netw.new_bit_reader(data)
+    << br.read_u32() >>>
+}
+
+fn check_bitstream_and_quantization() int {
+    $bw := netw.new_bit_writer()
+    bw.write_bool(true) >>>
+    bw.write_bits(5, 3) >>>
+    bw.write_quantized_f64(123.45, -512.0, 512.0, 18) >>>
+    pos := fm.vec3(42.125, 11.75, -187.375)
+    lo := fm.vec3(-512.0, -128.0, -512.0)
+    hi := fm.vec3(512.0, 384.0, 512.0)
+    bw.write_vec3_quantized(pos, lo, hi, 18) >>>
+    bw.write_angle_rad(2.95, 12) >>>
+    bw.write_angle_rad(-2.95, 12) >>>
+    bytes := bw.finish()
+
+    $br := netw.new_bit_reader(&bytes)
+    rb := br.read_bool() >>>
+    rbits := br.read_bits(3) >>>
+    if !rb || rbits != 5 {
+        >>> errors.new("bitstream bool/bits mismatch")
+    }
+    qf := br.read_quantized_f64(-512.0, 512.0, 18) >>>
+    qp := br.read_vec3_quantized(lo, hi, 18) >>>
+    a1 := br.read_angle_rad(12) >>>
+    a2 := br.read_angle_rad(12) >>>
+    if math.abs(qf - 123.45) > 0.01 || qp.sub(pos).length() > 0.015 ||
+        math.abs(netw.wrap_angle_rad(a1 - 2.95)) > 0.004 ||
+        math.abs(netw.wrap_angle_rad(a2 + 2.95)) > 0.004 {
+        >>> errors.new("quantized vec3/angle round-trip error exceeded threshold")
+    }
+    << 0
+}
+
+fn check_reliable_ordered_lossy_link() int {
+    // Sequence wrap-around verification.
+    if !netw.seq_greater(2, 65534) || netw.seq_greater(65534, 2) || netw.seq_diff(2, 65534) != 4 {
+        >>> errors.new("sequence wrap-around arithmetic failed")
+    }
+
+    $ch_a := netw.new_reliable_channel()
+    $ch_b := netw.new_reliable_channel()
+    $link := netw.new_simulated_link(netw.SimLinkConfig{
+        seed: 777,
+        latency_ms: 40.0,
+        jitter_ms: 8.0,
+        loss_rate: 0.30,
+        duplicate_rate: 0.15,
+        reorder_rate: 0.25
+    }) >>>
+
+    $recv_vals := []int{}
+    $unrel_recv := 0
+    $now := 0.0
+    $sent_idx := 0
+
+    for step in 0:260 {
+        now = f64(step) * 15.0
+        if sent_idx < 40 && step % 2 == 0 {
+            p := make_u32_payload(sent_idx) >>>
+            pkt := ch_a.send(netw.CHANNEL_RELIABLE_ORDERED, netw.PKT_DATA, &p, now) >>>
+            link.send_a_to_b(&pkt, now)
+
+            // Also mix unreliable datagrams to ensure no head-of-line blocking or interference.
+            up := make_u32_payload(1000 + sent_idx) >>>
+            upkt := ch_a.send(netw.CHANNEL_UNRELIABLE, netw.PKT_DATA, &up, now) >>>
+            link.send_a_to_b(&upkt, now)
+            sent_idx += 1
+        }
+
+        // Poll retransmits on sender and heartbeat back from receiver so acks flow both ways.
+        retx := ch_a.poll_retransmits(now) >>>
+        for ri in 0:retx.len {
+            rp := &retx[ri]
+            link.send_a_to_b(&rp.data, now)
+        }
+
+        in_b := link.recv_for_b(now)
+        for bi in 0:in_b.len {
+            bp := &in_b[bi]
+            msgs := ch_b.on_receive(&bp.data, now) >>>
+            for mi in 0:msgs.len {
+                m := &msgs[mi]
+                if m.channel == netw.CHANNEL_RELIABLE_ORDERED {
+                    rv := read_u32_payload(&m.payload) >>>
+                    recv_vals.push(rv)
+                } else if m.channel == netw.CHANNEL_UNRELIABLE {
+                    unrel_recv += 1
+                }
+            }
+        }
+        if in_b.len > 0 || step % 3 == 0 {
+            empty := []u8{}
+            hb := ch_b.send(netw.CHANNEL_UNRELIABLE, netw.PKT_HEARTBEAT, &empty, now) >>>
+            link.send_b_to_a(&hb, now)
+        }
+
+        in_a := link.recv_for_a(now)
+        for ai in 0:in_a.len {
+            ap := &in_a[ai]
+            _ := ch_a.on_receive(&ap.data, now) >>>
+        }
+    }
+
+    if recv_vals.len != 40 {
+        >>> errors.new("reliable ordered delivered " + str(recv_vals.len) + "/40 messages under 30% loss")
+    }
+    for k in 0:40 {
+        if recv_vals[k] != k {
+            >>> errors.new("reliable ordered sequence out of order at index " + str(k))
+        }
+    }
+    st_a := ch_a.stats()
+    st_b := ch_b.stats()
+    if st_a.retransmits == 0 || ch_a.unacked_count() != 0 ||
+        st_b.duplicates_dropped == 0 || st_a.srtt_ms < 50.0 || st_a.srtt_ms > 180.0 ||
+        unrel_recv >= 40 {
+        >>> errors.new("reliable channel RTT/retransmit/dup-drop/unreliable stats check failed")
+    }
+    << st_a.retransmits
+}
+
+fn check_real_os_udp_loopback() int {
+    $srv := netw.bind_udp("127.0.0.1:0") >>>
+    $cli := netw.bind_udp("127.0.0.1:0") >>>
+    srv_addr := srv.local_addr() >>>
+    cli_addr := cli.local_addr() >>>
+    if srv_addr.len == 0 || cli_addr.len == 0 {
+        >>> errors.new("UDP loopback local_addr empty")
+    }
+
+    $ch_cli := netw.new_reliable_channel()
+    $ch_srv := netw.new_reliable_channel()
+
+    req_pay := [u8(0x41), u8(0x42), u8(0x43), u8(0x44)]
+    pkt_c := ch_cli.send(netw.CHANNEL_RELIABLE_ORDERED, netw.PKT_CONNECT, &req_pay, 0.0) >>>
+    _ := cli.send_to(srv_addr, &pkt_c) >>>
+
+    d_srv := srv.recv_from(1500) >>>
+    if !d_srv.received {
+        >>> errors.new("real UDP server failed to receive client packet on loopback")
+    }
+    srv_msgs := ch_srv.on_receive(&d_srv.data, 10.0) >>>
+    if srv_msgs.len != 1 || srv_msgs[0].kind != netw.PKT_CONNECT || srv_msgs[0].payload.len != 4 {
+        >>> errors.new("UDP decoded server payload mismatch")
+    }
+
+    acc_pay := [u8(0x99), u8(0x77)]
+    pkt_s := ch_srv.send(netw.CHANNEL_RELIABLE_ORDERED, netw.PKT_ACCEPT, &acc_pay, 12.0) >>>
+    _ := srv.send_to(d_srv.from, &pkt_s) >>>
+
+    d_cli := cli.recv_from(1500) >>>
+    if !d_cli.received {
+        >>> errors.new("real UDP client failed to receive server ACCEPT on loopback")
+    }
+    cli_msgs := ch_cli.on_receive(&d_cli.data, 20.0) >>>
+    if cli_msgs.len != 1 || cli_msgs[0].kind != netw.PKT_ACCEPT || int(cli_msgs[0].payload[0]) != 0x99 {
+        >>> errors.new("UDP decoded client ACCEPT mismatch")
+    }
+
+    cli.close() >>>
+    srv.close() >>>
+    << 0
+}
+
+fn check_delta_compression_and_aoi() int {
+    bounds := netw.default_snapshot_bounds()
+    $base := netw.new_world_snapshot(1, 0)
+    $curr := netw.new_world_snapshot(2, 4)
+
+    for i in 0:100 {
+        pos := fm.vec3(f64(i % 10) * 4.0, 0.0, f64(i / 10) * 4.0)
+        $e0 := netw.default_entity_state(100 + i, 1, 0, pos)
+        e0.yaw = 0.25
+        base.entities.push(e0)
+
+        // Remove entity 109 in curr; move entities 100, 101, 102 only.
+        if i != 9 {
+            $e1 := e0
+            if i < 3 {
+                e1.position = e0.position.add(fm.vec3(1.5, 0.2, -0.75))
+                e1.yaw = 1.15
+            }
+            curr.entities.push(e1)
+        }
+    }
+
+    empty_snap := netw.new_world_snapshot(0, 0)
+    full_bytes := netw.encode_snapshot_delta(&curr, &empty_snap, false, &bounds) >>>
+    delta_bytes := netw.encode_snapshot_delta(&curr, &base, true, &bounds) >>>
+    if delta_bytes.len * 3 >= full_bytes.len {
+        >>> errors.new("snapshot delta compression savings below 66%")
+    }
+
+    decoded := netw.decode_snapshot_delta(&delta_bytes, &base, &bounds) >>>
+    if decoded.entities.len != 99 || decoded.tick != 2 || decoded.ack_input_seq != 4 {
+        >>> errors.new("decoded delta snapshot entity count or header mismatch")
+    }
+    // Entity 100 updated accurately; entity 150 preserved from baseline.
+    $found_0 := false
+    $found_9 := false
+    for i in 0:decoded.entities.len {
+        e := &decoded.entities[i]
+        if e.net_id == 100 {
+            found_0 = true
+            if e.position.sub(fm.vec3(1.5, 0.2, -0.75)).length() > 0.015 {
+                >>> errors.new("decoded delta entity 100 position error too large")
+            }
+        }
+        if e.net_id == 109 { found_9 = true }
+    }
+    if !found_0 || found_9 {
+        >>> errors.new("decoded delta spawn/removal check failed")
+    }
+
+    // AOI hysteresis check: enter <= 35m, exit > 41m.
+    $im := netw.new_interest_manager(netw.InterestConfig{aoi_radius: 35.0, hysteresis_margin: 6.0, max_entities_per_snapshot: 16}) >>>
+    $ents := []netw.NetEntityState{}
+    ents.push(netw.default_entity_state(1, 1, 1, fm.vec3(0.0, 0.0, 0.0)))   // Owned
+    ents.push(netw.default_entity_state(2, 1, 2, fm.vec3(30.0, 0.0, 0.0)))  // Inside 35m
+    ents.push(netw.default_entity_state(3, 1, 3, fm.vec3(50.0, 0.0, 0.0)))  // Outside 35m
+    s1 := im.filter_snapshot(&ents, 1, fm.vec3(0.0, 0.0, 0.0), 1, 0)
+    if s1.entities.len != 2 { >>> errors.new("AOI initial filter expected 2 entities") }
+
+    // Move entity 2 to 38m (within hysteresis zone 35..41 -> stays visible!).
+    ents[1].position = fm.vec3(38.0, 0.0, 0.0)
+    s2 := im.filter_snapshot(&ents, 1, fm.vec3(0.0, 0.0, 0.0), 2, 0)
+    if s2.entities.len != 2 { >>> errors.new("AOI hysteresis should keep entity 2 at 38m visible") }
+
+    // Move entity 2 to 43m (> 41m -> exits AOI!).
+    ents[1].position = fm.vec3(43.0, 0.0, 0.0)
+    s3 := im.filter_snapshot(&ents, 1, fm.vec3(0.0, 0.0, 0.0), 3, 0)
+    if s3.entities.len != 1 || s3.entities[0].net_id != 1 {
+        >>> errors.new("AOI should cull entity 2 past 41m while keeping owned entity 1")
+    }
+
+    $flen := full_bytes.len
+    if flen < 1 { flen = 1 }
+    << delta_bytes.len * 100 / flen
+}
+
+fn check_prediction_and_interpolation() int {
+    init := netw.initial_body_state(fm.vec3(0.0, 0.0, 0.0), 0.0)
+    $pred := netw.new_client_predictor(init)
+    $auth := init
+
+    // Client runs 6 ticks forward (seq 1..6); server processes 1..4 cleanly.
+    for seq in 1:7 {
+        $cmd := netw.default_player_input(seq, seq, 0.05)
+        cmd.move_z = -1.0
+        _ := pred.record_and_predict(cmd)
+        if seq <= 4 {
+            auth = netw.simulate_player_tick(auth, &cmd)
+        }
+    }
+
+    // Reconcile against matching server state at ack=4 -> zero error!
+    rep_clean := pred.reconcile(auth, 4, 2.0)
+    if rep_clean.error_distance > 1e-6 || rep_clean.replayed_inputs != 2 {
+        >>> errors.new("prediction clean reconcile expected 0 error and 2 replayed inputs")
+    }
+
+    // Simulate server knockback misprediction (+3.5m X impulse at tick 4): reconcile must snap & replay 5..6!
+    $knocked := auth
+    knocked.position = knocked.position.add(fm.vec3(3.5, 0.0, 0.0))
+    rep_err := pred.reconcile(knocked, 4, 2.0)
+    if !rep_err.snapped || math.abs(rep_err.error_distance - 3.5) > 0.01 ||
+        math.abs(pred.state().position.x - 3.5) > 0.01 || rep_err.replayed_inputs != 2 {
+        >>> errors.new("prediction server knockback reconciliation failed")
+    }
+
+    // EntityInterpolator: Hermite spline + shortest-arc +-pi yaw wrap + bounded extrapolation.
+    $interp := netw.new_entity_interpolator(0.10, 0.15) >>>
+    interp.push_sample(netw.InterpSample{tick: 1, time_s: 0.0, position: fm.vec3(0.0, 0.0, 0.0), velocity: fm.vec3(10.0, 0.0, 0.0), yaw: 3.0, pitch: 0.0})
+    interp.push_sample(netw.InterpSample{tick: 2, time_s: 0.1, position: fm.vec3(1.0, 0.0, 0.0), velocity: fm.vec3(10.0, 0.0, 0.0), yaw: -3.0, pitch: 0.0})
+
+    // Query at client_time_s = 0.15 -> render_time = 0.05 (midpoint!).
+    // Shortest arc between +3.0 and -3.0 crosses +-pi (~3.14159), NOT 0.0!
+    r_mid := interp.sample(0.15)
+    if !r_mid.valid || r_mid.extrapolated || math.abs(r_mid.position.x - 0.5) > 0.01 ||
+        math.abs(math.abs(r_mid.yaw) - 3.14159265) > 0.05 {
+        >>> errors.new("EntityInterpolator Hermite / shortest-arc yaw wrap failed")
+    }
+
+    // Starve past max_extrap_s (render_time = 0.45 -> 0.35s past 0.10 -> clamped to +0.15s = 1.0 + 10*0.15 = 2.5m!).
+    r_ext := interp.sample(0.55)
+    if !r_ext.valid || !r_ext.extrapolated || math.abs(r_ext.position.x - 2.5) > 0.01 {
+        >>> errors.new("EntityInterpolator extrapolation clamp failed")
+    }
+    << 0
+}
+
+fn check_end_to_end_session_and_scentree() int {
+    $server := netw.new_server_session()
+    icfg := netw.default_interest_config()
+    server.add_peer(1, icfg) >>>
+    server.add_peer(2, icfg) >>>
+
+    p1_start := fm.vec3(-4.0, 0.0, 0.0)
+    p2_start := fm.vec3(4.0, 0.0, 0.0)
+    server.spawn_entity(netw.default_entity_state(101, 1, 1, p1_start)) >>>
+    server.spawn_entity(netw.default_entity_state(102, 1, 2, p2_start)) >>>
+
+    $c1 := netw.new_client_session(1, 101, netw.initial_body_state(p1_start, 0.0), 0.10, 0.15)
+    $c2 := netw.new_client_session(2, 102, netw.initial_body_state(p2_start, 0.0), 0.10, 0.15)
+
+    $link1 := netw.new_simulated_link(netw.SimLinkConfig{seed: 101, latency_ms: 25.0, jitter_ms: 5.0, loss_rate: 0.15, duplicate_rate: 0.05, reorder_rate: 0.10}) >>>
+    $link2 := netw.new_simulated_link(netw.SimLinkConfig{seed: 202, latency_ms: 25.0, jitter_ms: 5.0, loss_rate: 0.15, duplicate_rate: 0.05, reorder_rate: 0.10}) >>>
+
+    // Client 1 sends a reliable RPC to server ("chat/action") at tick 5.
+    $rpc_recv_srv := 0
+    $rpc_recv_c2 := 0
+
+    for tick in 1:61 {
+        now_ms := f64(tick) * 33.333
+        t_s := now_ms * 0.001
+
+        // Client 1 moves -Z (forward) while ticks <= 40; Client 2 moves +X while ticks <= 40.
+        $cmd1 := netw.default_player_input(tick, tick, 0.03333)
+        $cmd2 := netw.default_player_input(tick, tick, 0.03333)
+        if tick <= 40 {
+            cmd1.move_z = -1.0
+            cmd1.yaw = 0.5
+            cmd2.move_x = 1.0
+            cmd2.yaw = -0.5
+        }
+        u1 := c1.step_local_input(cmd1, now_ms) >>>
+        u2 := c2.step_local_input(cmd2, now_ms) >>>
+        link1.send_a_to_b(&u1, now_ms)
+        link2.send_a_to_b(&u2, now_ms)
+
+        if tick == 5 {
+            rpc_p := make_u32_payload(9001) >>>
+            rp1 := c1.send_rpc(42, &rpc_p, now_ms) >>>
+            link1.send_a_to_b(&rp1, now_ms)
+            rp2 := server.send_rpc_to_peer(2, 77, &rpc_p, now_ms) >>>
+            link2.send_b_to_a(&rp2, now_ms)
+        }
+
+        // Poll client retransmits.
+        rx1 := c1.poll_retransmits(now_ms) >>>
+        for k in 0:rx1.len { link1.send_a_to_b(&rx1[k].data, now_ms) }
+        rx2 := c2.poll_retransmits(now_ms) >>>
+        for k in 0:rx2.len { link2.send_a_to_b(&rx2[k].data, now_ms) }
+
+        // Server receives from clients.
+        in1 := link1.recv_for_b(now_ms)
+        for k in 0:in1.len {
+            rpcs := server.on_packet_from_peer(1, &in1[k].data, now_ms) >>>
+            rpc_recv_srv += rpcs.len
+        }
+        in2 := link2.recv_for_b(now_ms)
+        for k in 0:in2.len {
+            rpcs := server.on_packet_from_peer(2, &in2[k].data, now_ms) >>>
+            rpc_recv_srv += rpcs.len
+        }
+
+        // Server broadcasts AOI delta snapshots to both clients.
+        e1 := server.entity(101) >>>
+        e2 := server.entity(102) >>>
+        out1 := server.build_outbound_for_peer(1, tick, e1.position, now_ms) >>>
+        for k in 0:out1.len { link1.send_b_to_a(&out1[k].data, now_ms) }
+        out2 := server.build_outbound_for_peer(2, tick, e2.position, now_ms) >>>
+        for k in 0:out2.len { link2.send_b_to_a(&out2[k].data, now_ms) }
+
+        // Clients receive snapshots + reliable RPCs.
+        c1_in := link1.recv_for_a(now_ms)
+        for k in 0:c1_in.len {
+            _ := c1.on_packet_from_server(&c1_in[k].data, now_ms, t_s) >>>
+        }
+        c2_in := link2.recv_for_a(now_ms)
+        for k in 0:c2_in.len {
+            _ := c2.on_packet_from_server(&c2_in[k].data, now_ms, t_s) >>>
+        }
+        pop2 := c2.pop_rpcs()
+        rpc_recv_c2 += pop2.len
+    }
+
+    srv_e1 := server.entity(101) >>>
+    srv_e2 := server.entity(102) >>>
+    if rpc_recv_srv != 1 || rpc_recv_c2 != 1 ||
+        srv_e1.position.z > -6.0 || srv_e2.position.x < 10.0 ||
+        c1.local_predicted_state().position.sub(srv_e1.position).length() > 0.25 {
+        >>> errors.new("2-client ServerSession/ClientSession multiplayer converge check failed")
+    }
+
+    // SceneTree integration sync on Client 1: local predicted player 101 + interpolated remote player 102.
+    $tree := scene.new_scene_tree_3d("world", 64)
+    root_id := tree.root()
+    n1 := tree.add_child_3d(root_id, "player_101") >>>
+    n2 := tree.add_child_3d(root_id, "player_102") >>>
+    bindings := [netbridge.NetNodeBinding{net_id: 101, node_id: n1}, netbridge.NetNodeBinding{net_id: 102, node_id: n2}]
+    synced := netbridge.sync_scene_from_client_session($&tree, &c1, &bindings, 60.0 * 0.03333) >>>
+    if synced != 2 {
+        >>> errors.new("SceneTree net bridge did not update both local and remote nodes")
+    }
+    p1_node := tree.node_3d(n1) >>>
+    p2_node := tree.node_3d(n2) >>>
+    if p1_node.transform.c3.z > -6.0 || p2_node.transform.c3.x < 9.0 {
+        >>> errors.new("SceneTree replicated positions mismatch")
+    }
+    << c1.baseline_tick()
+}
+
+fn main() int {
+    check_bitstream_and_quantization() >>> (err) {
+        println("FAIL bitstream: " + err.msg())
+        << 1
+    }
+    retx := check_reliable_ordered_lossy_link() >>> (err) {
+        println("FAIL reliable link: " + err.msg())
+        << 1
+    }
+    check_real_os_udp_loopback() >>> (err) {
+        println("FAIL UDP loopback: " + err.msg())
+        << 1
+    }
+    full_pct := check_delta_compression_and_aoi() >>> (err) {
+        println("FAIL delta/AOI: " + err.msg())
+        << 1
+    }
+    check_prediction_and_interpolation() >>> (err) {
+        println("FAIL prediction/interp: " + err.msg())
+        << 1
+    }
+    last_tick := check_end_to_end_session_and_scentree() >>> (err) {
+        println("FAIL session/sceneree: " + err.msg())
+        << 1
+    }
+
+    println("PASS: Multiplayer Networking (reliable=40/40 under 30% loss, retx=" + str(retx) +
+        ", os_udp=ok, delta_size=" + str(full_pct) + "%_of_full, aoi=ok, pred+hermite=ok, scene_sync_tick=" + str(last_tick) + ")")
+    << 0
+}

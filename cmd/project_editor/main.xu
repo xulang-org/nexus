@@ -6,6 +6,7 @@ files #"github.com/xulang-org/nexus/integration/scene"
 #ui/draw
 #ui/layout
 widgets #ui/widgets
+#encoding/json
 #os
 #os/exec
 #path/filepath
@@ -19,12 +20,15 @@ struct LaunchConfig {
     pub validator_bin string
     pub preview_bin string
     pub viewport_bin string
+    pub tilemap_bin string
     pub verify_headless bool
     pub show_help bool
 }
 
 const WORKER_VIEWPORT = 1
 const WORKER_PREVIEW = 2
+const WORKER_TILEMAP = 3
+const WORKER_EXPORT = 4
 
 struct WorkerDone {
     pub kind int
@@ -32,6 +36,7 @@ struct WorkerDone {
     pub message string
     pub temp_dir string
     pub output_scene string
+    pub meta_path string
     pub revision string
 }
 
@@ -41,6 +46,7 @@ fn print_usage() {
     println("  --validator <bin>   scene/GLB validator binary (default build/nexus-project-validate)")
     println("  --preview <bin>     preview executable (default build/nexus-project-preview)")
     println("  --viewport <bin>    3D viewport executable (default build/nexus-project-viewport)")
+    println("  --tilemap-editor <bin>  2D tilemap editor executable (default build/nexus-tilemap-editor)")
     println("  --headless-check    verify project load, layout, and snapshot cleanly without opening a window")
 }
 
@@ -52,6 +58,7 @@ fn parse_args() LaunchConfig {
         validator_bin: "build/nexus-project-validate",
         preview_bin: "build/nexus-project-preview",
         viewport_bin: "build/nexus-project-viewport",
+        tilemap_bin: "build/nexus-tilemap-editor",
         verify_headless: false,
         show_help: false
     }
@@ -77,6 +84,10 @@ fn parse_args() LaunchConfig {
             i = i + 1
             if i >= args.len { >>> errors.new("missing value for --viewport") }
             cfg.viewport_bin = args[i] + ""
+        } else if a == "--tilemap-editor" {
+            i = i + 1
+            if i >= args.len { >>> errors.new("missing value for --tilemap-editor") }
+            cfg.tilemap_bin = args[i] + ""
         } else if a == "--headless-check" {
             cfg.verify_headless = true
         } else if strings.has_prefix(&a, "-") {
@@ -99,6 +110,8 @@ fn spawn_viewport_worker(
     bin string,
     staged_scene string,
     out_scene string,
+    meta_out string,
+    select_node int,
     tmp_dir string,
     revision string,
     snap SnapSettings
@@ -110,10 +123,14 @@ fn spawn_viewport_worker(
     if scale_pct > 100.0 { scale_pct = 100.0 }
     sc := fmt_coord(scale_pct)
     out_arg := out_scene + ""
+    meta_arg := meta_out + ""
+    sel_arg := str(select_node)
     out := exec.command(
         bin,
         "--scene", staged_scene,
         "--output", out_arg,
+        "--meta-out", meta_arg,
+        "--select-node", sel_arg,
         "--snap-move", mv,
         "--snap-rotate", rt,
         "--snap-scale", sc
@@ -124,6 +141,7 @@ fn spawn_viewport_worker(
             message: err.msg(),
             temp_dir: tmp_dir + "",
             output_scene: out_scene + "",
+            meta_path: meta_out + "",
             revision: revision + ""
         }
         <<
@@ -135,6 +153,7 @@ fn spawn_viewport_worker(
         message: "3D viewport session finished",
         temp_dir: tmp_dir,
         output_scene: out_scene,
+        meta_path: meta_out + "",
         revision: revision
     }
 }
@@ -147,6 +166,7 @@ fn spawn_preview_worker(ch chan WorkerDone, bin string, pub_scene string) {
             message: err.msg(),
             temp_dir: "",
             output_scene: "",
+            meta_path: "",
             revision: ""
         }
         <<
@@ -158,7 +178,80 @@ fn spawn_preview_worker(ch chan WorkerDone, bin string, pub_scene string) {
         message: "Preview closed",
         temp_dir: "",
         output_scene: "",
+        meta_path: "",
         revision: ""
+    }
+}
+
+fn spawn_tilemap_worker(
+    ch chan WorkerDone,
+    bin string,
+    staged_scene string,
+    before_raw string,
+    tmp_dir string,
+    revision string
+) {
+    out := exec.command(bin, staged_scene + "").combined_output() >>> (err) {
+        ch <- WorkerDone{
+            kind: WORKER_TILEMAP,
+            ok: false,
+            message: err.msg(),
+            temp_dir: tmp_dir + "",
+            output_scene: "",
+            meta_path: "",
+            revision: revision + ""
+        }
+        <<
+    }
+    _ := out
+    after_raw := try_read_text(staged_scene + "")
+    $out_scene := ""
+    if after_raw.len > 0 && after_raw != before_raw {
+        out_scene = staged_scene + ""
+    }
+    ch <- WorkerDone{
+        kind: WORKER_TILEMAP,
+        ok: true,
+        message: "TileMap Editor closed",
+        temp_dir: tmp_dir,
+        output_scene: out_scene,
+        meta_path: "",
+        revision: revision
+    }
+}
+
+fn spawn_export_worker(
+    ch chan WorkerDone,
+    proj_path string,
+    out_dir string,
+    val_bin string,
+    scene_key string,
+    draft_doc resource.Document,
+    has_draft bool
+) {
+    res := publish_project_with_draft(&proj_path, &out_dir, &val_bin, &scene_key, &draft_doc, has_draft) >>> (err) {
+        ch <- WorkerDone{
+            kind: WORKER_EXPORT,
+            ok: false,
+            message: err.msg(),
+            temp_dir: "",
+            output_scene: "",
+            meta_path: "",
+            revision: ""
+        }
+        <<
+    }
+    $gshort := res.generation + ""
+    if gshort.len > 8 { gshort = gshort[0:8] + "" }
+    msg := "Exported build " + gshort + " (rebuilt=" + str(res.rebuilt_assets) + ", reused=" + str(res.reused_assets) + ")"
+    ch <- WorkerDone{
+        kind: WORKER_EXPORT,
+        ok: true,
+        message: msg,
+        temp_dir: res.root + "",
+        output_scene: "",
+        meta_path: "",
+        revision: res.generation + ""
     }
 }
 
@@ -169,7 +262,7 @@ struct WaitStep {
 }
 
 fn empty_worker_done() WorkerDone {
-    << WorkerDone{kind: 0, ok: false, message: "", temp_dir: "", output_scene: "", revision: ""}
+    << WorkerDone{kind: 0, ok: false, message: "", temp_dir: "", output_scene: "", meta_path: "", revision: ""}
 }
 
 fn next_event_or_worker(events chan ui.Event, workers chan WorkerDone, deadline time.Instant) WaitStep {
@@ -215,9 +308,9 @@ fn wait_ready(events chan ui.Event) ui.Event {
 
 fn start_import_request(identity &ui.CanvasEvent, ed $&Editor, view $&widgets.View) ui.Request {
     $opts := ui.file_dialog_options()
-    opts.title = "Import GLB 3D Asset"
+    opts.title = "Import Project Asset"
     opts.multiple = false
-    opts.filters = [ui.FileFilter{label: "GLB Models", extensions: ["glb"]}]
+    opts.filters = [ui.FileFilter{label: "Nexus Assets (.glb, .png, .wav, .xubc)", extensions: ["glb", "png", "wav", "xubc"]}]
     req := ui.open_files_async(identity, &opts) >>> (err) {
         ed.set_status(STATUS_ERR, err.msg(), view)
         << ui.Request{id: 0, window_id: 0, canvas_id: 0, generation: 0, kind: 0}
@@ -225,7 +318,41 @@ fn start_import_request(identity &ui.CanvasEvent, ed $&Editor, view $&widgets.Vi
     if req.id > 0 {
         ed.import_active = true
         ed.sync_toolbar_states()
-        ed.set_status(STATUS_INFO, "Choose a .glb file to import...", view)
+        ed.set_status(STATUS_INFO, "Choose a .glb, .png, .wav, or .xubc file to import...", view)
+    }
+    << req
+}
+
+fn start_open_project_request(identity &ui.CanvasEvent, ed $&Editor, view $&widgets.View) ui.Request {
+    $opts := ui.file_dialog_options()
+    opts.title = "Open Nexus Project"
+    opts.multiple = false
+    opts.filters = [ui.FileFilter{label: "Nexus Project (project.json)", extensions: ["json"]}]
+    req := ui.open_files_async(identity, &opts) >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        << ui.Request{id: 0, window_id: 0, canvas_id: 0, generation: 0, kind: 0}
+    }
+    if req.id > 0 {
+        ed.open_proj_active = true
+        ed.sync_toolbar_states()
+        ed.set_status(STATUS_INFO, "Choose a project.json manifest to open...", view)
+    }
+    << req
+}
+
+fn start_relocate_request(identity &ui.CanvasEvent, ed $&Editor, view $&widgets.View) ui.Request {
+    $opts := ui.file_dialog_options()
+    opts.title = "Relocate Selected Asset"
+    opts.multiple = false
+    opts.filters = [ui.FileFilter{label: "Nexus Assets (.glb, .png, .wav, .xubc)", extensions: ["glb", "png", "wav", "xubc"]}]
+    req := ui.open_files_async(identity, &opts) >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        << ui.Request{id: 0, window_id: 0, canvas_id: 0, generation: 0, kind: 0}
+    }
+    if req.id > 0 {
+        ed.relocate_active = true
+        ed.sync_toolbar_states()
+        ed.set_status(STATUS_INFO, "Choose replacement asset file inside project...", view)
     }
     << req
 }
@@ -291,12 +418,14 @@ fn launch_viewport_session(workers chan WorkerDone, ed $&Editor, view $&widgets.
         >>> err
     }
     out_scene := filepath.join([tmp_dir + "", "viewport-output.xuscene"])
+    meta_out := filepath.join([tmp_dir + "", "viewport-meta.json"])
     rev := ed.draft.current + ""
+    sel_node := ed.selected_node
     ed.viewport_active = true
     ed.sync_toolbar_states()
     ed.set_status(STATUS_INFO, "3D View open...", view)
     ed.repaint_all(view)
-    xu spawn_viewport_worker(workers, ed.viewport_bin + "", staged, out_scene, tmp_dir, rev, ed.snap)
+    xu spawn_viewport_worker(workers, ed.viewport_bin + "", staged, out_scene, meta_out, sel_node, tmp_dir, rev, ed.snap)
     << 0
 }
 
@@ -312,26 +441,168 @@ fn launch_preview_session(workers chan WorkerDone, ed $&Editor, view $&widgets.V
     << 0
 }
 
-fn finish_viewport_session(wmsg &WorkerDone, ed $&Editor, view $&widgets.View) int {
-    captured := files.load(wmsg.output_scene + "") >>>
-    d := $&ed.draft
-    d.merge_viewport(&captured, &wmsg.revision) >>>
-    ed.refresh_after_document_change(false, view)
-    ed.set_status(STATUS_OK, "Applied 3D Viewport edits", view)
+fn launch_tilemap_session(workers chan WorkerDone, ed $&Editor, view $&widgets.View) int {
+    tmp_dir := os.mkdir_temp("", "nexus-editor-tm-") >>>
+    doc := ed.draft.document() >>> (err) {
+        try_remove_all(tmp_dir + "")
+        >>> err
+    }
+    staged := stage_scene(&ed.project, &doc, &ed.draft.source, &tmp_dir) >>> (err) {
+        try_remove_all(tmp_dir + "")
+        >>> err
+    }
+    before_raw := try_read_text(staged + "")
+    rev := ed.draft.current + ""
+    ed.tilemap_active = true
+    ed.sync_toolbar_states()
+    ed.set_status(STATUS_INFO, "TileMap Editor open...", view)
+    ed.repaint_all(view)
+    xu spawn_tilemap_worker(workers, ed.tilemap_bin + "", staged, before_raw, tmp_dir, rev)
     << 0
 }
 
-fn finish_glb_import(glb_path &string, ed $&Editor, view $&widgets.View) int {
-    imp := import_external_glb(&ed.project.path, glb_path, &ed.validator_bin) >>>
+fn draft_merge_tilemaps(ed $&Editor, edited &resource.Document, revision &string) int {
+    d := $&ed.draft
+    << d.merge_tilemaps(edited, revision) >>>
+}
+
+fn finish_tilemap_session(wmsg &WorkerDone, ed $&Editor, view $&widgets.View) int {
+    captured := files.load(wmsg.output_scene + "") >>>
+    draft_merge_tilemaps(ed, &captured, &wmsg.revision) >>>
+    ed.refresh_after_document_change(false, view)
+    ed.set_status(STATUS_OK, "Applied TileMap Editor edits", view)
+    << 0
+}
+
+fn draft_merge_viewport(ed $&Editor, captured &resource.Document, revision &string) int {
+    d := $&ed.draft
+    << d.merge_viewport(captured, revision) >>>
+}
+
+fn draft_delete_nodes(ed $&Editor, del_nodes &[]int) int {
+    d := $&ed.draft
+    << d.delete_nodes(del_nodes) >>>
+}
+
+fn try_read_text(path string) string {
+    << os.read(path + "") >>> (err) {
+        _ := err
+        << ""
+    }
+}
+
+fn try_json_int(jdoc &json.Doc, handle int) int {
+    << jdoc.as_int(handle) >>> (err) {
+        _ := err
+        << -1
+    }
+}
+
+fn finish_viewport_session(wmsg &WorkerDone, ed $&Editor, view $&widgets.View) int {
+    captured := files.load(wmsg.output_scene + "") >>>
+    draft_merge_viewport(ed, &captured, &wmsg.revision) >>>
+    $del_count := 0
+    if wmsg.meta_path.len > 0 && path_exists(wmsg.meta_path + "") {
+        raw := try_read_text(wmsg.meta_path + "")
+        if raw.len > 0 {
+            jdoc := json.parse_max(&raw, 1048576)
+            if jdoc.ok() {
+                root := jdoc.root()
+                $del_nodes := []int{}
+                if jdoc.has(root, "deleted_nodes") {
+                    arr := jdoc.get(root, "deleted_nodes")
+                    if arr >= 0 && jdoc.is_list(arr) {
+                        for i in 0:jdoc.count(arr) {
+                            v := try_json_int(&jdoc, jdoc.at(arr, i))
+                            if v > 0 { del_nodes.push(v) }
+                        }
+                    }
+                }
+                if del_nodes.len > 0 {
+                    del_count = del_nodes.len
+                    next_sel := draft_delete_nodes(ed, &del_nodes) >>>
+                    ed.set_single_selection(next_sel)
+                } else if jdoc.has(root, "selected_node") {
+                    sel_idx := try_json_int(&jdoc, jdoc.get(root, "selected_node"))
+                    doc_now := ed.draft.document() >>>
+                    if sel_idx >= 0 && sel_idx < doc_now.node_count() {
+                        ed.set_single_selection(sel_idx)
+                    }
+                }
+            }
+        }
+    }
+    ed.refresh_after_document_change(false, view)
+    if del_count > 0 {
+        ed.set_status(STATUS_OK, "Applied 3D Viewport edits (" + str(del_count) + " deleted)", view)
+    } else {
+        ed.set_status(STATUS_OK, "Applied 3D Viewport edits", view)
+    }
+    << 0
+}
+
+fn launch_export_session(workers chan WorkerDone, ed $&Editor, view $&widgets.View) int {
+    doc := ed.draft.document() >>>
+    $out_dir := ed.export_target_dir + ""
+    if out_dir.len == 0 { out_dir = ed.output_dir + "" }
+    scene_key := ed.project.scenes[ed.scene_index].key + ""
+    proj_path := ed.project.path + ""
+    val_bin := ed.validator_bin + ""
+    ed.export_active = true
+    ed.sync_toolbar_states()
+    ed.set_status(STATUS_INFO, "Exporting project to " + out_dir + "...", view)
+    ed.repaint_all(view)
+    xu spawn_export_worker(workers, proj_path, out_dir, val_bin, scene_key, doc, true)
+    << 0
+}
+
+fn try_launch_export(workers chan WorkerDone, ed $&Editor, view $&widgets.View) {
+    _ := launch_export_session(workers, ed, view) >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        <<
+    }
+}
+
+fn finish_asset_import(asset_path &string, ed $&Editor, view $&widgets.View) int {
+    imp := import_external_asset(&ed.project.path, asset_path, &ed.validator_bin) >>>
     reloaded := load_project(ed.project.path + "") >>>
     ed.project = reloaded
+    ed.panels.glb_prim_cache = map[string]string{}
     ed.refresh_project_selectors()
     for k in 0:ed.project.assets.len {
         if ed.project.assets[k].key == imp.uid {
             set_sel_selected($&ed.asset_select, k)
         }
     }
-    ed.set_status(STATUS_OK, "Imported " + imp.rel_path + " (" + str(imp.primitive_count) + " prims)", view)
+    ed.sync_asset_meta_text()
+    ed.sync_toolbar_states()
+    ed.set_status(STATUS_OK, "Imported " + imp.rel_path, view)
+    repaint(view, ed.id_left_pane)
+    << 0
+}
+
+fn finish_open_project(proj_path &string, ed $&Editor, view $&widgets.View) int {
+    ed.open_project_file(proj_path, view) >>>
+    ed.repaint_all(view)
+    << 0
+}
+
+fn finish_relocate_asset(new_path &string, ed $&Editor, view $&widgets.View) int {
+    uid := ed.relocate_uid + ""
+    if uid.len == 0 { >>> errors.new("no asset selected to relocate") }
+    relocate_asset(&ed.project.path, &uid, new_path) >>>
+    reloaded := load_project(ed.project.path + "") >>>
+    ed.project = reloaded
+    ed.panels.glb_prim_cache = map[string]string{}
+    ed.refresh_project_selectors()
+    for k in 0:ed.project.assets.len {
+        if ed.project.assets[k].key == uid {
+            set_sel_selected($&ed.asset_select, k)
+        }
+    }
+    ed.sync_asset_meta_text()
+    ed.sync_toolbar_states()
+    ed.set_status(STATUS_OK, "Relocated asset " + uid[0:8], view)
     repaint(view, ed.id_left_pane)
     << 0
 }
@@ -350,6 +621,13 @@ fn try_launch_preview(workers chan WorkerDone, ed $&Editor, view $&widgets.View)
     }
 }
 
+fn try_launch_tilemap(workers chan WorkerDone, ed $&Editor, view $&widgets.View) {
+    _ := launch_tilemap_session(workers, ed, view) >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        <<
+    }
+}
+
 fn try_finish_viewport(wmsg &WorkerDone, ed $&Editor, view $&widgets.View) {
     _ := finish_viewport_session(wmsg, ed, view) >>> (err) {
         ed.set_status(STATUS_ERR, err.msg(), view)
@@ -357,11 +635,149 @@ fn try_finish_viewport(wmsg &WorkerDone, ed $&Editor, view $&widgets.View) {
     }
 }
 
-fn try_finish_import(p &string, ed $&Editor, view $&widgets.View) {
-    _ := finish_glb_import(p, ed, view) >>> (err) {
+fn try_finish_tilemap(wmsg &WorkerDone, ed $&Editor, view $&widgets.View) {
+    _ := finish_tilemap_session(wmsg, ed, view) >>> (err) {
         ed.set_status(STATUS_ERR, err.msg(), view)
         <<
     }
+}
+
+fn try_finish_import(p &string, ed $&Editor, view $&widgets.View) {
+    _ := finish_asset_import(p, ed, view) >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        <<
+    }
+}
+
+fn try_finish_open_project(p &string, ed $&Editor, view $&widgets.View) {
+    _ := finish_open_project(p, ed, view) >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        <<
+    }
+}
+
+fn try_finish_relocate(p &string, ed $&Editor, view $&widgets.View) {
+    _ := finish_relocate_asset(p, ed, view) >>> (err) {
+        ed.set_status(STATUS_ERR, err.msg(), view)
+        <<
+    }
+}
+
+fn try_present_frame(view $&widgets.View, ed $&Editor) bool {
+    frame_c := layout.tight(ed.viewport_w, ed.viewport_h) >>> (err) {
+        _ := err
+        << false
+    }
+    _ := widgets.present_styled(view, &frame_c, ed) >>> (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn instant_plus_ms(now time.Instant, ms int) time.Instant {
+    dur := time.milliseconds(ms) >>> (err) {
+        _ := err
+        << time.zero_instant()
+    }
+    << now.add(dur) >>> (err) {
+        _ := err
+        << time.zero_instant()
+    }
+}
+
+fn earlier_deadline(a time.Instant, b time.Instant) time.Instant {
+    if a.is_zero() { << b }
+    if b.is_zero() { << a }
+    if a.before(b) { << a }
+    << b
+}
+
+fn try_file_paths(res &ui.RequestResult) []string {
+    << ui.file_paths(res) >>> (err) {
+        _ := err
+        << []string{}
+    }
+}
+
+fn process_ui_event(
+    event &ui.Event,
+    identity &ui.CanvasEvent,
+    import_req &ui.Request,
+    open_proj_req &ui.Request,
+    relocate_req &ui.Request,
+    ed $&Editor,
+    view $&widgets.View
+) bool {
+    if event.kind == ui.EV_EXIT { << false }
+    if event.kind == ui.EV_NONE { << true }
+    if event.kind == ui.EV_CLOSED || event.kind == ui.EV_CANVAS_CLOSED {
+        if event.window_id == identity.window_id { << false }
+        << true
+    }
+    if event.kind == ui.EV_REQUEST {
+        result := ui.request_of(event) >>> (err) {
+            _ := err
+            << true
+        }
+        if result.matches(import_req) {
+            ed.import_active = false
+            if result.status == ui.REQUEST_COMPLETED {
+                paths := try_file_paths(&result)
+                if paths.len > 0 {
+                    p := paths[0] + ""
+                    try_finish_import(&p, ed, view)
+                }
+            } else if result.status == ui.REQUEST_CANCELLED {
+                ed.set_status(STATUS_INFO, "Import cancelled", view)
+            } else {
+                ed.set_status(STATUS_ERR, "Import failed", view)
+            }
+            ed.sync_toolbar_states()
+            << true
+        }
+        if result.matches(open_proj_req) {
+            ed.open_proj_active = false
+            if result.status == ui.REQUEST_COMPLETED {
+                paths := try_file_paths(&result)
+                if paths.len > 0 {
+                    p := paths[0] + ""
+                    try_finish_open_project(&p, ed, view)
+                }
+            } else if result.status == ui.REQUEST_CANCELLED {
+                ed.set_status(STATUS_INFO, "Open project cancelled", view)
+            } else {
+                ed.set_status(STATUS_ERR, "Open project failed", view)
+            }
+            ed.sync_toolbar_states()
+            << true
+        }
+        if result.matches(relocate_req) {
+            ed.relocate_active = false
+            if result.status == ui.REQUEST_COMPLETED {
+                paths := try_file_paths(&result)
+                if paths.len > 0 {
+                    p := paths[0] + ""
+                    try_finish_relocate(&p, ed, view)
+                }
+            } else if result.status == ui.REQUEST_CANCELLED {
+                ed.set_status(STATUS_INFO, "Relocate asset cancelled", view)
+            } else {
+                ed.set_status(STATUS_ERR, "Relocate asset failed", view)
+            }
+            ed.sync_toolbar_states()
+            << true
+        }
+    }
+    if event.window_id != identity.window_id { << true }
+    try_handle_ui_event(event, ed, view)
+    << true
+}
+
+fn any_async_request_pending(ed &Editor) bool {
+    << ed.req_import_glb || ed.req_open_project || ed.req_relocate_asset ||
+       ed.req_launch_viewport || ed.req_launch_preview || ed.req_launch_tilemap ||
+       ed.req_export_project
 }
 
 fn try_handle_ui_event(event &ui.Event, ed $&Editor, view $&widgets.View) {
@@ -395,12 +811,15 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
         1240.0,
         700.0
     ) >>>
+    ed.tilemap_bin = cfg.tilemap_bin + ""
     ed.sync_layout($&view, 1240.0, 700.0) >>>
-    constraints := layout.tight(ed.viewport_w, ed.viewport_h) >>>
-    _ := widgets.present_styled($&view, &constraints, $&ed) >>>
+    _ := try_present_frame($&view, $&ed)
 
     workers := chan WorkerDone{cap: 8}
     $import_req := ui.Request{id: 0, window_id: 0, canvas_id: 0, generation: 0, kind: 0}
+    $open_proj_req := ui.Request{id: 0, window_id: 0, canvas_id: 0, generation: 0, kind: 0}
+    $relocate_req := ui.Request{id: 0, window_id: 0, canvas_id: 0, generation: 0, kind: 0}
+    $retry_deadline := time.zero_instant()
     $last_dirty := false
 
     while true {
@@ -424,6 +843,20 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
             }
         }
 
+        if ed.req_open_project {
+            ed.req_open_project = false
+            if !ed.open_proj_active {
+                open_proj_req = start_open_project_request(&identity, $&ed, $&view)
+            }
+        }
+
+        if ed.req_relocate_asset {
+            ed.req_relocate_asset = false
+            if !ed.relocate_active {
+                relocate_req = start_relocate_request(&identity, $&ed, $&view)
+            }
+        }
+
         if ed.req_launch_viewport {
             ed.req_launch_viewport = false
             if !ed.viewport_active {
@@ -438,12 +871,29 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
             }
         }
 
+        if ed.req_launch_tilemap {
+            ed.req_launch_tilemap = false
+            if !ed.tilemap_active {
+                try_launch_tilemap(workers, $&ed, $&view)
+            }
+        }
+
+        if ed.req_export_project {
+            ed.req_export_project = false
+            if !ed.export_active {
+                try_launch_export(workers, $&ed, $&view)
+            }
+        }
+
         now := time.instant()
         ed.tick_animations($&view, now)
-        frame_c := layout.tight(ed.viewport_w, ed.viewport_h) >>>
-        _ := widgets.present_styled($&view, &frame_c, $&ed) >>>
+        if try_present_frame($&view, $&ed) {
+            retry_deadline = time.zero_instant()
+        } else {
+            retry_deadline = instant_plus_ms(now, 16)
+        }
 
-        deadline := ed.next_tick_deadline(now)
+        deadline := earlier_deadline(ed.next_tick_deadline(now), retry_deadline)
         step := next_event_or_worker(events, workers, deadline)
         event := &step.event
 
@@ -476,35 +926,53 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
                 ed.repaint_all($&view)
                 ->
             }
-        }
-
-        if event.kind == ui.EV_EXIT { <- }
-        if event.kind == ui.EV_NONE { -> }
-        if event.kind == ui.EV_CLOSED || event.kind == ui.EV_CANVAS_CLOSED {
-            if event.window_id == identity.window_id { <- }
-            ->
-        }
-        if event.kind == ui.EV_REQUEST {
-            result := ui.request_of(event) >>>
-            if result.matches(&import_req) {
-                ed.import_active = false
-                if result.status == ui.REQUEST_COMPLETED {
-                    paths := ui.file_paths(&result) >>>
-                    if paths.len > 0 {
-                        p := paths[0] + ""
-                        try_finish_import(&p, $&ed, $&view)
-                    }
-                } else if result.status == ui.REQUEST_CANCELLED {
-                    ed.set_status(STATUS_INFO, "Import GLB cancelled", $&view)
+            if wmsg.kind == WORKER_TILEMAP {
+                ed.tilemap_active = false
+                if wmsg.ok && wmsg.output_scene.len > 0 && path_exists(wmsg.output_scene + "") {
+                    try_finish_tilemap(wmsg, $&ed, $&view)
                 } else {
-                    ed.set_status(STATUS_ERR, "Import GLB failed", $&view)
+                    if !wmsg.ok {
+                        ed.set_status(STATUS_ERR, "TileMap Editor error: " + wmsg.message, $&view)
+                    } else {
+                        ed.set_status(STATUS_INFO, "TileMap Editor closed without changes", $&view)
+                    }
+                    ed.refresh_after_document_change(false, $&view)
+                }
+                if wmsg.temp_dir.len > 0 {
+                    try_remove_all(wmsg.temp_dir + "")
                 }
                 ed.sync_toolbar_states()
+                ed.repaint_all($&view)
+                ->
+            }
+            if wmsg.kind == WORKER_EXPORT {
+                ed.export_active = false
+                ed.sync_toolbar_states()
+                if wmsg.ok {
+                    ed.set_status(STATUS_OK, wmsg.message, $&view)
+                } else {
+                    ed.set_status(STATUS_ERR, "Export error: " + wmsg.message, $&view)
+                }
+                ed.repaint_all($&view)
                 ->
             }
         }
-        if event.window_id != identity.window_id { -> }
-        try_handle_ui_event(event, $&ed, $&view)
+
+        if !process_ui_event(event, &identity, &import_req, &open_proj_req, &relocate_req, $&ed, $&view) {
+            <-
+        }
+        $burst := 0
+        $closed := false
+        while burst < 64 && !ed.close_pending && !any_async_request_pending(&ed) {
+            pending := ui.poll_chan(events)
+            if pending.kind == ui.EV_NONE { <- }
+            if !process_ui_event(&pending, &identity, &import_req, &open_proj_req, &relocate_req, $&ed, $&view) {
+                closed = true
+                <-
+            }
+            burst = burst + 1
+        }
+        if closed { <- }
     }
     ed.dispose($&view)
     << 0
@@ -546,6 +1014,7 @@ fn run_headless_snapshot_worker(events chan ui.Event, cfg LaunchConfig, project 
         1240.0,
         700.0
     ) >>>
+    ed.tilemap_bin = cfg.tilemap_bin + ""
     run_ui_self_checks($&view, $&ed, &context, &identity, cfg.output_dir + "") >>>
     node_cnt := ed.stage_pts.len
     ed.dispose($&view)

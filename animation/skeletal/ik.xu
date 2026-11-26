@@ -1,0 +1,272 @@
+@"github.com/xulang-org/nexus/animation/skeletal"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+gltf #"github.com/xulang-org/nexus/formats/gltf"
+#errors
+#math
+
+fn world_pos(worlds &[]fm.Mat4, node int) fm.Vec3 {
+    << worlds[node].c3.xyz()
+}
+
+fn safe_dir_or(v fm.Vec3, fallback fm.Vec3) fm.Vec3 {
+    << v.normalized() >>> (err) { << fallback }
+}
+
+fn eval_worlds(asset &gltf.GlbGeometry, pose &[]gltf.NodeTrs) []fm.Mat4 {
+    locals := asset.local_matrices_from_trs(pose) >>>
+    << asset.world_pose(&locals) >>>
+}
+
+fn apply_world_delta_rotation(
+    asset &gltf.GlbGeometry,
+    worlds &[]fm.Mat4,
+    pose $&[]gltf.NodeTrs,
+    node int,
+    dq_world fm.Vec4,
+    weight f64
+) int {
+    parent := asset.node_parent(node) >>>
+    $q_parent := quat_identity()
+    if parent >= 0 {
+        q_parent = mat4_rotation_quat(worlds[parent])
+    }
+    dq_local := quat_mul(quat_mul(quat_conj(q_parent), dq_world), q_parent)
+    $q_target := quat_norm(quat_mul(dq_local, pose[node].rotation)) >>>
+    if weight < 1.0 {
+        q_target = quat_slerp(pose[node].rotation, q_target, weight) >>>
+    }
+    pose[node].rotation = q_target
+    << 0
+}
+
+// Analytic Two-Bone IK with explicit pole vector for hinge direction (e.g. elbow/knee).
+pub fn solve_two_bone_ik(
+    asset &gltf.GlbGeometry,
+    pose $&[]gltf.NodeTrs,
+    root_node int,
+    mid_node int,
+    end_node int,
+    target_world fm.Vec3,
+    pole_world fm.Vec3,
+    weight f64
+) int {
+    n := asset.node_count()
+    if pose.len != n || root_node < 0 || root_node >= n || mid_node < 0 || mid_node >= n ||
+        end_node < 0 || end_node >= n || !target_world.is_finite() || !pole_world.is_finite() ||
+        !fm.finite(weight) || weight < 0.0 || weight > 1.0 {
+        >>> errors.new("nexus ik: invalid two-bone IK parameters")
+    }
+    if (asset.node_parent(mid_node) >>>) != root_node || (asset.node_parent(end_node) >>>) != mid_node {
+        >>> errors.new("nexus ik: two-bone chain must satisfy parent(end)==mid and parent(mid)==root")
+    }
+    if weight <= 0.0 { << 0 }
+
+    orig_root := pose[root_node].rotation
+    orig_mid := pose[mid_node].rotation
+
+    w0 := eval_worlds(asset, pose) >>>
+    p_root := world_pos(&w0, root_node)
+    p_mid := world_pos(&w0, mid_node)
+    p_end := world_pos(&w0, end_node)
+
+    l1 := p_mid.sub(p_root).length()
+    l2 := p_end.sub(p_mid).length()
+    if l1 <= 1e-6 || l2 <= 1e-6 {
+        >>> errors.new("nexus ik: zero-length bone in two-bone chain")
+    }
+
+    to_t := target_world.sub(p_root)
+    raw_dist := to_t.length()
+    if raw_dist <= 1e-6 { << 0 }
+    dir_t := to_t.scaled(1.0 / raw_dist)
+    min_d := math.abs(l1 - l2) + 1e-4
+    max_d := l1 + l2 - 1e-4
+    d_len := clamp_f(raw_dist, min_d, max_d)
+
+    pole_rel := pole_world.sub(p_root)
+    $perp := pole_rel.sub(dir_t.scaled(pole_rel.dot(dir_t)))
+    if perp.dot(perp) <= 1e-10 {
+        bend_rel := p_mid.sub(p_root)
+        perp = bend_rel.sub(dir_t.scaled(bend_rel.dot(dir_t)))
+    }
+    if perp.dot(perp) <= 1e-10 {
+        perp = fm.vec3(1.0, 0.0, 0.0).cross(dir_t)
+        if perp.dot(perp) <= 1e-10 {
+            perp = fm.vec3(0.0, 1.0, 0.0).cross(dir_t)
+        }
+    }
+    u_pole := perp.normalized() >>>
+
+    cos_a := clamp_f((l1 * l1 + d_len * d_len - l2 * l2) / (2.0 * l1 * d_len), -1.0, 1.0)
+    sin_a := math.sqrt(math.max(0.0, 1.0 - cos_a * cos_a))
+    p_mid_goal := p_root.add(dir_t.scaled(l1 * cos_a)).add(u_pole.scaled(l1 * sin_a))
+    p_end_goal := p_root.add(dir_t.scaled(d_len))
+
+    // Step 1: orient root->mid toward p_mid_goal (in current mid bend direction).
+    v_upper_cur := p_mid.sub(p_root).normalized() >>>
+    v_upper_goal := p_mid_goal.sub(p_root).normalized() >>>
+    dq_root := quat_from_to(v_upper_cur, v_upper_goal) >>>
+    apply_world_delta_rotation(asset, &w0, pose, root_node, dq_root, 1.0) >>>
+
+    // Also twist upper arm so current elbow->end plane matches pole plane cleanly if needed:
+    w1 := eval_worlds(asset, pose) >>>
+    p_mid1 := world_pos(&w1, mid_node)
+    p_end1 := world_pos(&w1, end_node)
+
+    // Step 2: orient mid->end toward p_end_goal.
+    v_lower_cur := p_end1.sub(p_mid1).normalized() >>>
+    v_lower_goal := p_end_goal.sub(p_mid1).normalized() >>>
+    dq_mid := quat_from_to(v_lower_cur, v_lower_goal) >>>
+    apply_world_delta_rotation(asset, &w1, pose, mid_node, dq_mid, 1.0) >>>
+
+    if weight < 1.0 {
+        pose[root_node].rotation = quat_slerp(orig_root, pose[root_node].rotation, weight) >>>
+        pose[mid_node].rotation = quat_slerp(orig_mid, pose[mid_node].rotation, weight) >>>
+    }
+    << 0
+}
+
+// Aim / Look-At IK rotating a joint's local_forward axis toward target_world, clamped by max_angle_rad.
+pub fn solve_look_at_ik(
+    asset &gltf.GlbGeometry,
+    pose $&[]gltf.NodeTrs,
+    node int,
+    local_forward fm.Vec3,
+    target_world fm.Vec3,
+    max_angle_rad f64,
+    weight f64
+) int {
+    n := asset.node_count()
+    if pose.len != n || node < 0 || node >= n || !local_forward.is_finite() ||
+        !target_world.is_finite() || !fm.finite(max_angle_rad) || max_angle_rad <= 0.0 ||
+        !fm.finite(weight) || weight < 0.0 || weight > 1.0 {
+        >>> errors.new("nexus ik: invalid look-at IK parameters")
+    }
+    if weight <= 0.0 { << 0 }
+    fwd_local := local_forward.normalized() >>>
+    w0 := eval_worlds(asset, pose) >>>
+    p_node := world_pos(&w0, node)
+    to_t := target_world.sub(p_node)
+    if to_t.dot(to_t) <= 1e-12 { << 0 }
+    dir_t := to_t.normalized() >>>
+    q_world := mat4_rotation_quat(w0[node])
+    fwd_world := quat_rotate_vec3(q_world, fwd_local)
+    dot := clamp_f(fwd_world.dot(dir_t), -1.0, 1.0)
+    ang := math.acos(dot)
+    if ang <= 1e-6 { << 0 }
+    eff_ang := math.min(ang, max_angle_rad)
+    $axis := fwd_world.cross(dir_t)
+    if axis.dot(axis) <= 1e-12 {
+        axis = fm.vec3(0.0, 1.0, 0.0).cross(fwd_world)
+        if axis.dot(axis) <= 1e-12 {
+            axis = fm.vec3(1.0, 0.0, 0.0).cross(fwd_world)
+        }
+    }
+    dq_world := quat_from_axis_angle(axis, eff_ang) >>>
+    << apply_world_delta_rotation(asset, &w0, pose, node, dq_world, weight) >>>
+}
+
+// Iterative FABRIK solver over an arbitrary joint chain [root, ..., end_effector] (>= 3 joints).
+pub fn solve_fabrik_ik(
+    asset &gltf.GlbGeometry,
+    pose $&[]gltf.NodeTrs,
+    chain &[]int,
+    target_world fm.Vec3,
+    max_iterations int,
+    tolerance f64,
+    weight f64
+) int {
+    n := asset.node_count()
+    cn := chain.len
+    if pose.len != n || cn < 3 || cn > 64 || !target_world.is_finite() ||
+        max_iterations < 1 || max_iterations > 64 || !fm.finite(tolerance) || tolerance <= 0.0 ||
+        !fm.finite(weight) || weight < 0.0 || weight > 1.0 {
+        >>> errors.new("nexus ik: invalid FABRIK chain or parameters")
+    }
+    for i in 0:cn {
+        if chain[i] < 0 || chain[i] >= n {
+            >>> errors.new("nexus ik: FABRIK chain node out of range")
+        }
+        if i > 0 {
+            prev_i := i - 1
+            if (asset.node_parent(chain[i]) >>>) != chain[prev_i] {
+                >>> errors.new("nexus ik: FABRIK chain nodes must be consecutive parent->child joints")
+            }
+        }
+    }
+    if weight <= 0.0 { << 0 }
+
+    $orig_rots := []fm.Vec4{}
+    for i in 0:(cn - 1) {
+        idx := chain[i]
+        orig_rots.push(pose[idx].rotation)
+    }
+
+    w0 := eval_worlds(asset, pose) >>>
+    $pts := []fm.Vec3{}
+    $lens := []f64{}
+    $total_len := 0.0
+    for i in 0:cn {
+        pts.push(world_pos(&w0, chain[i]))
+    }
+    for i in 0:(cn - 1) {
+        ni := i + 1
+        d := pts[ni].sub(pts[i]).length()
+        if d <= 1e-6 { >>> errors.new("nexus ik: zero-length FABRIK bone") }
+        lens.push(d)
+        total_len += d
+    }
+
+    root_origin := pts[0]
+    last := cn - 1
+    if target_world.sub(root_origin).length() >= total_len {
+        dir := target_world.sub(root_origin).normalized() >>>
+        for i in 0:(cn - 1) {
+            ni := i + 1
+            pts[ni] = pts[i].add(dir.scaled(lens[i]))
+        }
+    } else {
+        for _ in 0:max_iterations {
+            if pts[last].sub(target_world).length() <= tolerance { <- }
+            // Backward pass: anchor end effector at target.
+            pts[last] = target_world
+            $bi := cn - 2
+            while bi >= 0 {
+                ni := bi + 1
+                dir := safe_dir_or(pts[bi].sub(pts[ni]), fm.vec3(0.0, 1.0, 0.0))
+                pts[bi] = pts[ni].add(dir.scaled(lens[bi]))
+                bi -= 1
+            }
+            // Forward pass: re-anchor root at origin.
+            pts[0] = root_origin
+            for i in 0:(cn - 1) {
+                ni := i + 1
+                dir := safe_dir_or(pts[ni].sub(pts[i]), fm.vec3(0.0, -1.0, 0.0))
+                pts[ni] = pts[i].add(dir.scaled(lens[i]))
+            }
+        }
+    }
+
+    // Commit solved world bone directions down the chain sequentially.
+    for i in 0:(cn - 1) {
+        ni := i + 1
+        node_i := chain[i]
+        node_next := chain[ni]
+        w_cur := eval_worlds(asset, pose) >>>
+        p_cur := world_pos(&w_cur, node_i)
+        p_nxt := world_pos(&w_cur, node_next)
+        d_cur := p_nxt.sub(p_cur).normalized() >>>
+        d_goal := pts[ni].sub(pts[i]).normalized() >>>
+        dq := quat_from_to(d_cur, d_goal) >>>
+        apply_world_delta_rotation(asset, &w_cur, pose, node_i, dq, 1.0) >>>
+    }
+
+    if weight < 1.0 {
+        for i in 0:(cn - 1) {
+            node_i := chain[i]
+            pose[node_i].rotation = quat_slerp(orig_rots[i], pose[node_i].rotation, weight) >>>
+        }
+    }
+    << 0
+}

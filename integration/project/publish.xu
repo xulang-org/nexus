@@ -23,6 +23,7 @@ pub struct PrimitiveInfo {
 
 pub struct ImportRecord {
     pub uid string
+    pub kind string
     pub source_rel string
     pub resolved string
     pub source_hash string
@@ -177,9 +178,65 @@ fn save_receipt(path &string, validator_hash &string, glb_hash &string, prims &[
     << 0
 }
 
-fn import_glb(entry &Entry, validator_bin &string, validator_hash &string, cache_dir &string) ImportRecord {
+fn asset_filename(hash &string, kind &string) string {
+    if *kind == "image_rgba" { << *hash + ".png" }
+    if *kind == "wav_clip" { << *hash + ".wav" }
+    if *kind == "xu_bytecode" { << *hash + ".xubc" }
+    << *hash + ".glb"
+}
+
+fn published_asset_filename(record &ImportRecord) string {
+    if record.kind == "image_rgba" { << record.uid + ".png" }
+    if record.kind == "wav_clip" { << record.uid + ".wav" }
+    if record.kind == "xu_bytecode" { << record.uid + ".xubc" }
+    << asset_filename(&record.source_hash, &record.kind)
+}
+
+fn validate_simple_snapshot(raw &string, validator_bin &string, validator_hash &string,
+    source_hash &string, cache_dir &string, mode string, ext string, label string) bool {
+    receipt := filepath.join([*cache_dir, "imports", *source_hash + ext + ".receipt"])
+    if path_exists(receipt + "") {
+        saved := snapshot.read(receipt + "", 128) >>>
+        if saved == *validator_hash { << true }
+    }
+    candidate := filepath.join([*cache_dir, ".validate-" + str(os.getpid()) + "-" + str(now_ns()) + ext])
+    snapshot.write_atomic(candidate + "", raw) >>>
+    cmd := exec.command(*validator_bin, mode + "", candidate + "")
+    cmd.combined_output() >>> (err) {
+        _ := os.remove(candidate + "")
+        >>> errors.new("nexus project: " + label + " validation failed: " + err.msg())
+    }
+    os.remove(candidate + "") >>>
+    ensure_parent_dir(&receipt) >>>
+    snapshot.write_atomic(receipt, validator_hash) >>>
+    << false
+}
+
+fn import_source(entry &Entry, validator_bin &string, validator_hash &string, cache_dir &string) ImportRecord {
+    suffix := strings.to_lower(&filepath.ext(&entry.path))
+    if suffix != ".glb" && suffix != ".png" && suffix != ".wav" && suffix != ".xubc" {
+        >>> errors.new("nexus project: expected .glb, .png, .wav or .xubc source: " + entry.path)
+    }
     raw := snapshot.read(entry.resolved + "", snapshot.MAX_BYTES) >>>
     source_hash := sha256.sum256(raw + "")
+    if suffix == ".png" {
+        cached := validate_simple_snapshot(&raw, validator_bin, validator_hash, &source_hash, cache_dir, "png", ".png", "PNG") >>>
+        << ImportRecord{uid: entry.key + "", kind: "image_rgba", source_rel: entry.path + "", resolved: entry.resolved + "",
+            source_hash: source_hash, validator_hash: *validator_hash, size_bytes: raw.len,
+            cached: cached, primitives: []PrimitiveInfo{}}
+    }
+    if suffix == ".wav" {
+        cached := validate_simple_snapshot(&raw, validator_bin, validator_hash, &source_hash, cache_dir, "wav", ".wav", "WAV") >>>
+        << ImportRecord{uid: entry.key + "", kind: "wav_clip", source_rel: entry.path + "", resolved: entry.resolved + "",
+            source_hash: source_hash, validator_hash: *validator_hash, size_bytes: raw.len,
+            cached: cached, primitives: []PrimitiveInfo{}}
+    }
+    if suffix == ".xubc" {
+        cached := validate_simple_snapshot(&raw, validator_bin, validator_hash, &source_hash, cache_dir, "script", ".xubc", "Script") >>>
+        << ImportRecord{uid: entry.key + "", kind: "xu_bytecode", source_rel: entry.path + "", resolved: entry.resolved + "",
+            source_hash: source_hash, validator_hash: *validator_hash, size_bytes: raw.len,
+            cached: cached, primitives: []PrimitiveInfo{}}
+    }
     receipt := filepath.join([cache_dir + "", "imports", source_hash + ".json"])
     $prims := load_receipt(&receipt, validator_hash, &source_hash)
     $cached := prims.len > 0
@@ -189,6 +246,7 @@ fn import_glb(entry &Entry, validator_bin &string, validator_hash &string, cache
     }
     << ImportRecord{
         uid: entry.key + "",
+        kind: "glb_model",
         source_rel: entry.path + "",
         resolved: entry.resolved + "",
         source_hash: source_hash,
@@ -258,7 +316,7 @@ fn copy_document_with_resources(document &resource.Document, next_refs []resourc
 struct CookedScene {
     key string
     encoded string
-    hashes []string
+    assets []string
 }
 
 fn cook_scene_raw(scene_key &string, raw &string, records &[]ImportRecord) CookedScene {
@@ -272,12 +330,12 @@ fn cook_scene_raw(scene_key &string, raw &string, records &[]ImportRecord) Cooke
     }
     check_surface_bindings(&document, records) >>>
     $seen_hashes := map[string]int{}
-    $unique_hashes := []string{}
+    $assets := []string{}
     $total_bytes := 0
     $next_refs := []resource.ResourceReference{}
     for i in 0:document.resource_count() {
         ref := document.resource(i) >>>
-        if ref.kind != "glb_model" {
+        if ref.kind != "glb_model" && ref.kind != "image_rgba" && ref.kind != "wav_clip" && ref.kind != "xu_bytecode" {
             >>> errors.new("nexus project: unsupported scene resource type '" + ref.kind + "' in " + scene_key)
         }
         if !by_uid.has(ref.uid + "") {
@@ -285,25 +343,28 @@ fn cook_scene_raw(scene_key &string, raw &string, records &[]ImportRecord) Cooke
         }
         rec_idx := by_uid[ref.uid + ""]
         rec := &records[rec_idx]
-        if !seen_hashes.has(rec.source_hash + "") {
-            seen_hashes[rec.source_hash + ""] = 1
-            unique_hashes.push(rec.source_hash + "")
+        if rec.kind != ref.kind { >>> errors.new("nexus project: scene resource type does not match asset '" + ref.uid + "'") }
+        filename := asset_filename(&rec.source_hash, &rec.kind)
+        published_name := published_asset_filename(rec)
+        assets.push(published_name + "")
+        if !seen_hashes.has(filename + "") {
+            seen_hashes[filename + ""] = 1
             total_bytes = total_bytes + rec.size_bytes
             if total_bytes > snapshot.MAX_BYTES {
-                >>> errors.new("nexus project: scene '" + scene_key + "' GLB source budget exceeds 32 MiB")
+                >>> errors.new("nexus project: scene '" + scene_key + "' asset source budget exceeds 32 MiB")
             }
         }
         next_refs.push(resource.ResourceReference{
             uid: ref.uid + "",
             kind: ref.kind + "",
-            path: "assets/" + rec.source_hash + ".glb",
+            path: "assets/" + published_name,
             content_hash: rec.source_hash + ""
         })
     }
     cooked_doc := copy_document_with_resources(&document, next_refs) >>>
     encoded := scene_fmt.encode(&cooked_doc) >>>
     _ := scene_fmt.decode(&encoded) >>>
-    << CookedScene{key: scene_key + "", encoded: encoded, hashes: unique_hashes}
+    << CookedScene{key: scene_key + "", encoded: encoded, assets: assets}
 }
 
 fn link_or_copy_readonly(src &string, dst &string) int {
@@ -325,7 +386,7 @@ fn link_or_copy_readonly(src &string, dst &string) int {
 }
 
 fn ensure_store_asset(store_dir &string, rec &ImportRecord) string {
-    store_path := filepath.join([store_dir + "", rec.source_hash + ".glb"])
+    store_path := filepath.join([store_dir + "", asset_filename(&rec.source_hash, &rec.kind)])
     if path_exists(store_path + "") {
         existing_hash := sha256_file(store_path + "") >>> (err) { << "" }
         if existing_hash == rec.source_hash {
@@ -372,7 +433,7 @@ fn install_generation(out_dir &string, cooked &[]CookedScene, records &[]ImportR
     os.mkdir_all(store_dir + "") >>>
     $hash_to_store := map[string]string{}
     for i in 0:records.len {
-        h := records[i].source_hash + ""
+        h := asset_filename(&records[i].source_hash, &records[i].kind)
         if !hash_to_store.has(h + "") {
             hash_to_store[h + ""] = ensure_store_asset(&store_dir, &records[i]) >>>
         }
@@ -385,7 +446,7 @@ fn install_generation(out_dir &string, cooked &[]CookedScene, records &[]ImportR
         stage_dir := filepath.join([gens_dir + "", ".staging-" + gen_hash + "-" + str(os.getpid())])
         _ := os.remove_all(stage_dir + "")
         os.mkdir_all(stage_dir + "") >>>
-        $needed_hashes := map[string]int{}
+        $needed_assets := map[string]int{}
         for i in 0:cooked.len {
             cs := &cooked[i]
             scene_dst := filepath.join([stage_dir + "", cs.key + ""])
@@ -395,18 +456,19 @@ fn install_generation(out_dir &string, cooked &[]CookedScene, records &[]ImportR
                 >>> err
             }
             _ := os.chmod(scene_dst + "", MODE_READ_ONLY)
-            for k in 0:cs.hashes.len {
-                h := cs.hashes[k] + ""
-                needed_hashes[h + ""] = 1
+            for k in 0:cs.assets.len {
+                filename := cs.assets[k] + ""
+                needed_assets[filename + ""] = 1
             }
         }
         assets_dir := filepath.join([stage_dir + "", "assets"])
         os.mkdir_all(assets_dir + "") >>>
         for i in 0:records.len {
-            h := records[i].source_hash + ""
-            if needed_hashes.has(h + "") {
-                dst := filepath.join([assets_dir + "", h + ".glb"])
+            published_name := published_asset_filename(&records[i])
+            if needed_assets.has(published_name + "") {
+                dst := filepath.join([assets_dir + "", published_name])
                 if !path_exists(dst + "") {
+                    h := asset_filename(&records[i].source_hash, &records[i].kind)
                     store_src := hash_to_store[h + ""]
                     link_or_copy_readonly(&store_src, &dst) >>> (err) {
                         _ := os.remove_all(stage_dir + "")
@@ -454,11 +516,12 @@ pub fn publish_with_drafts(project_path string, output_dir string, validator_bin
     $reused := 0
     for i in 0:project.assets.len {
         entry := project.assets[i]
-        $rec := import_glb(&entry, &val_bin, &val_hash, &cache_dir) >>>
-        if session_cache.has(rec.source_hash + "") {
+        $rec := import_source(&entry, &val_bin, &val_hash, &cache_dir) >>>
+        filename := asset_filename(&rec.source_hash, &rec.kind)
+        if session_cache.has(filename + "") {
             rec.cached = true
         }
-        session_cache[rec.source_hash + ""] = 1
+        session_cache[filename + ""] = 1
         if rec.cached {
             reused = reused + 1
         } else {
@@ -537,6 +600,20 @@ pub fn published_scene(output_dir string, name string) string {
     << resolved
 }
 
+fn try_asset_source(project &Project, uid &string) string {
+    << project.asset_source(uid) >>> (err) {
+        _ := err
+        << ""
+    }
+}
+
+fn try_resolve_existing(dir &string, rel &string) string {
+    << resolve_project_path(dir, rel, true) >>> (err) {
+        _ := err
+        << ""
+    }
+}
+
 pub fn stage_scene(project &Project, document &resource.Document, scene_path &string, directory &string) string {
     abs_dir := filepath.abs(directory) >>>
     os.mkdir_all(abs_dir + "") >>>
@@ -563,12 +640,18 @@ pub fn stage_scene(project &Project, document &resource.Document, scene_path &st
                 content_hash: hash
             })
         } else {
-            // Preserve non-GLB references if resolvable inside project/scene dir.
-            ref_rel := relative_file(&ref.path) >>>
-            src := resolve_project_path(&scene_dir, &ref_rel, true) >>>
+            // Resolve non-GLB references via project manifest first, then scene/project dir.
+            $src := try_asset_source(project, &ref.uid)
+            if src.len == 0 {
+                ref_rel := relative_file(&ref.path) >>>
+                src = try_resolve_existing(&scene_dir, &ref_rel)
+                if src.len == 0 {
+                    src = resolve_project_path(&project.directory, &ref_rel, true) >>>
+                }
+            }
             raw := snapshot.read(src + "", snapshot.MAX_BYTES) >>>
             hash := sha256.sum256(raw + "")
-            ext := filepath.ext(&ref_rel)
+            ext := filepath.ext(&src)
             rel := "assets/" + hash + ext
             dst := filepath.join([assets_dir + "", hash + ext])
             if !path_exists(dst + "") {
@@ -589,7 +672,7 @@ pub fn stage_scene(project &Project, document &resource.Document, scene_path &st
     << staged_path
 }
 
-fn sanitize_glb_filename(name &string) string {
+fn sanitize_asset_filename(name &string, expected_ext &string) string {
     base := filepath.base(name)
     $out := []int{}
     for i in 0:base.len {
@@ -601,11 +684,13 @@ fn sanitize_glb_filename(name &string) string {
         }
     }
     cleaned := string_from_bytes(out)
+    ext := *expected_ext + ""
     if cleaned.len == 0 || cleaned == "." || cleaned == ".." {
-        << "imported.glb"
+        << "imported" + ext
     }
-    if !strings.ends_with(&strings.to_lower(&cleaned), ".glb") {
-        << cleaned + ".glb"
+    lower := strings.to_lower(&cleaned)
+    if !strings.ends_with(&lower, ext + "") {
+        << cleaned + ext
     }
     << cleaned
 }
@@ -624,24 +709,49 @@ fn try_rel_in_project(dir &string, abs_src &string) string {
     << try_project_rel(dir, &slashed, true)
 }
 
-pub fn import_external_glb(project_path string, external_glb string, validator_bin string) ImportAssetResult {
+pub fn import_external_asset(project_path string, external_path string, validator_bin string) ImportAssetResult {
     project := load_project(project_path + "") >>>
-    abs_src := filepath.abs(&external_glb) >>>
+    abs_src := filepath.abs(&external_path) >>>
     info := os.stat(abs_src + "") >>>
     if info.is_dir {
-        >>> errors.new("nexus project: selected GLB is a directory")
+        >>> errors.new("nexus project: selected asset is a directory")
     }
-    prims := validate_glb_primitives(validator_bin, abs_src + "") >>>
+    suffix := strings.to_lower(&filepath.ext(&abs_src))
+    $prim_count := 0
+    if suffix == ".glb" {
+        prims := validate_glb_primitives(validator_bin, abs_src + "") >>>
+        prim_count = prims.len
+    } else if suffix == ".png" || suffix == ".wav" || suffix == ".xubc" {
+        bin := resolve_validator_path(validator_bin + "") >>>
+        $mode := "png"
+        $label := "PNG"
+        if suffix == ".wav" {
+            mode = "wav"
+            label = "WAV"
+        } else if suffix == ".xubc" {
+            mode = "script"
+            label = "Script"
+        }
+        _ := exec.command(bin + "", mode, abs_src + "").combined_output() >>> (err) {
+            >>> errors.new("nexus project: " + label + " validation failed for " + external_path + ": " + err.msg())
+        }
+    } else {
+        >>> errors.new("nexus project: unsupported asset extension (expected .glb, .png, .wav or .xubc): " + external_path)
+    }
+
     raw := snapshot.read(abs_src + "", snapshot.MAX_BYTES) >>>
     src_hash := sha256.sum256(raw + "")
 
     $rel := try_rel_in_project(&project.directory, &abs_src)
     if rel.len == 0 {
-        fname := sanitize_glb_filename(&abs_src)
-        stem := strings.trim_suffix(&fname, ".glb")
+        fname := sanitize_asset_filename(&abs_src, &suffix)
+        $stem := fname + ""
+        if fname.len > suffix.len {
+            stem = fname[0 : fname.len - suffix.len] + ""
+        }
         $cand_rel := "assets/" + fname
-        $suffix := 2
-        while suffix < 1000 {
+        $suffix_n := 2
+        while suffix_n < 1000 {
             dest := resolve_project_path(&project.directory, &cand_rel, false) >>>
             if !path_exists(dest + "") {
                 ensure_parent_dir(&dest) >>>
@@ -653,8 +763,8 @@ pub fn import_external_glb(project_path string, external_glb string, validator_b
                 rel = cand_rel
                 <-
             }
-            cand_rel = "assets/" + stem + "-" + str(suffix) + ".glb"
-            suffix = suffix + 1
+            cand_rel = "assets/" + stem + "-" + str(suffix_n) + suffix
+            suffix_n = suffix_n + 1
         }
         if rel.len == 0 {
             >>> errors.new("nexus project: unable to allocate unique destination for " + fname)
@@ -669,7 +779,7 @@ pub fn import_external_glb(project_path string, external_glb string, validator_b
             rel_path: rel,
             resolved: resolved_existing,
             reused: true,
-            primitive_count: prims.len
+            primitive_count: prim_count
         }
     }
     new_uid := register_asset(project_path + "", rel + "") >>>
@@ -680,6 +790,14 @@ pub fn import_external_glb(project_path string, external_glb string, validator_b
         rel_path: rel,
         resolved: resolved_new,
         reused: false,
-        primitive_count: prims.len
+        primitive_count: prim_count
     }
+}
+
+pub fn import_external_glb(project_path string, external_glb string, validator_bin string) ImportAssetResult {
+    suffix := strings.to_lower(&filepath.ext(&external_glb))
+    if suffix != ".glb" {
+        >>> errors.new("nexus project: expected .glb asset: " + external_glb)
+    }
+    << import_external_asset(project_path, external_glb, validator_bin) >>>
 }

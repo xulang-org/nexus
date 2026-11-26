@@ -25,6 +25,13 @@ pub struct Material3D {
     flip_u bool
     flip_v bool
     shaded bool
+    alpha f64
+    alpha_blend bool
+    clearcoat f64
+    clearcoat_roughness f64
+    sheen_color fm.Vec3
+    sheen_roughness f64
+    ior f64
 }
 fn color_range(color fm.Vec3, maximum f64) bool {
     << color.is_finite() && color.x >= 0.0 && color.y >= 0.0 && color.z >= 0.0 &&
@@ -34,7 +41,9 @@ pub fn material_3d(base fm.Vec3, metallic f64, roughness f64, emission fm.Vec3) 
     material := Material3D{base: base, metallic: metallic, roughness: roughness, emission: emission, texture: no_texture(),
         orm_texture: no_texture(), emission_texture: no_texture(), occlusion_strength: 1.0, normal_texture: no_texture(),
         normal_scale: 1.0, occlusion_texture: no_texture(), occlusion_texture_strength: 1.0, surface_mode: 0,
-        alpha_cutoff: 0.0, uv_region: fm.rect2(0.0, 0.0, 1.0, 1.0), flip_u: false, flip_v: false, shaded: true}
+        alpha_cutoff: 0.0, uv_region: fm.rect2(0.0, 0.0, 1.0, 1.0), flip_u: false, flip_v: false, shaded: true,
+        alpha: 1.0, alpha_blend: false, clearcoat: 0.0, clearcoat_roughness: 0.08,
+        sheen_color: fm.vec3(0.0, 0.0, 0.0), sheen_roughness: 0.5, ior: 1.5}
     material.check() >>>
     << material
 }
@@ -52,7 +61,13 @@ fn (material &Material3D) check() int {
         !fm.finite(material.occlusion_texture_strength) || material.occlusion_texture_strength < 0.0 || material.occlusion_texture_strength > 1.0 ||
         material.surface_mode < 0 || material.surface_mode > 1 ||
         !fm.finite(material.alpha_cutoff) || material.alpha_cutoff < 0.0 || material.alpha_cutoff > 1.0 ||
-        !valid_uv_region(material.uv_region) {
+        !valid_uv_region(material.uv_region) ||
+        !fm.finite(material.alpha) || material.alpha < 0.0 || material.alpha > 1.0 ||
+        !fm.finite(material.clearcoat) || material.clearcoat < 0.0 || material.clearcoat > 1.0 ||
+        !fm.finite(material.clearcoat_roughness) || material.clearcoat_roughness < 0.045 || material.clearcoat_roughness > 1.0 ||
+        !color_range(material.sheen_color, 1.0) ||
+        !fm.finite(material.sheen_roughness) || material.sheen_roughness < 0.045 || material.sheen_roughness > 1.0 ||
+        !fm.finite(material.ior) || material.ior < 1.0 || material.ior > 2.5 {
         >>> errors.new("nexus GPU: invalid linear material color, metallic, roughness, alpha cutoff or UV region")
     }
     << 0
@@ -60,6 +75,13 @@ fn (material &Material3D) check() int {
 pub fn (material &Material3D) validate() int { << material.check() >>> }
 pub fn (material &Material3D) alpha_cutoff() f64 { << material.alpha_cutoff }
 pub fn (material &Material3D) is_alpha_cutout() bool { << material.alpha_cutoff > 0.0 }
+pub fn (material &Material3D) alpha() f64 { << material.alpha }
+pub fn (material &Material3D) is_alpha_blended() bool { << material.alpha_blend }
+pub fn (material &Material3D) clearcoat() f64 { << material.clearcoat }
+pub fn (material &Material3D) clearcoat_roughness() f64 { << material.clearcoat_roughness }
+pub fn (material &Material3D) sheen_color() fm.Vec3 { << material.sheen_color }
+pub fn (material &Material3D) sheen_roughness() f64 { << material.sheen_roughness }
+pub fn (material &Material3D) ior() f64 { << material.ior }
 pub fn (material &Material3D) uv_region() fm.Rect2 { << material.uv_region }
 pub fn (material &Material3D) is_flip_u() bool { << material.flip_u }
 pub fn (material &Material3D) is_flip_v() bool { << material.flip_v }
@@ -84,7 +106,14 @@ fn (material &Material3D) clone_material() Material3D {
         uv_region: material.uv_region,
         flip_u: material.flip_u,
         flip_v: material.flip_v,
-        shaded: material.shaded
+        shaded: material.shaded,
+        alpha: material.alpha,
+        alpha_blend: material.alpha_blend,
+        clearcoat: material.clearcoat,
+        clearcoat_roughness: material.clearcoat_roughness,
+        sheen_color: material.sheen_color,
+        sheen_roughness: material.sheen_roughness,
+        ior: material.ior
     }
 }
 pub fn (material &Material3D) with_alpha_cutoff(cutoff f64) Material3D {
@@ -116,6 +145,51 @@ pub fn (material &Material3D) with_shaded(shaded bool) Material3D {
     material.check() >>>
     $next := material.clone_material()
     next.shaded = shaded
+    << next
+}
+pub fn (material &Material3D) with_alpha(alpha f64) Material3D {
+    material.check() >>>
+    if !fm.finite(alpha) || alpha < 0.0 || alpha > 1.0 {
+        >>> errors.new("nexus GPU: material alpha must be finite and in 0...1")
+    }
+    $next := material.clone_material()
+    next.alpha = alpha
+    << next
+}
+pub fn (material &Material3D) with_alpha_blend(enabled bool) Material3D {
+    material.check() >>>
+    $next := material.clone_material()
+    next.alpha_blend = enabled
+    << next
+}
+pub fn (material &Material3D) with_clearcoat(strength f64, roughness f64) Material3D {
+    material.check() >>>
+    if !fm.finite(strength) || strength < 0.0 || strength > 1.0 ||
+        !fm.finite(roughness) || roughness < 0.045 || roughness > 1.0 {
+        >>> errors.new("nexus GPU: clearcoat strength must be 0...1 and roughness 0.045...1")
+    }
+    $next := material.clone_material()
+    next.clearcoat = strength
+    next.clearcoat_roughness = roughness
+    << next
+}
+pub fn (material &Material3D) with_sheen(color fm.Vec3, roughness f64) Material3D {
+    material.check() >>>
+    if !color_range(color, 1.0) || !fm.finite(roughness) || roughness < 0.045 || roughness > 1.0 {
+        >>> errors.new("nexus GPU: sheen color must be 0...1 and roughness 0.045...1")
+    }
+    $next := material.clone_material()
+    next.sheen_color = color
+    next.sheen_roughness = roughness
+    << next
+}
+pub fn (material &Material3D) with_ior(ior f64) Material3D {
+    material.check() >>>
+    if !fm.finite(ior) || ior < 1.0 || ior > 2.5 {
+        >>> errors.new("nexus GPU: material IOR must be finite and in 1.0...2.5")
+    }
+    $next := material.clone_material()
+    next.ior = ior
     << next
 }
 pub fn (material &Material3D) uv_transform() fm.Vec4 {
@@ -150,6 +224,14 @@ fn material_words(material &Material3D, orientation f64) []int {
         texture_mode,material.occlusion_strength,material.normal_scale,f64(material.surface_mode),
         orientation,material.occlusion_texture_strength,shading_mode,material.alpha_cutoff,
         uv.x,uv.y,uv.z,uv.w] { words.push(scalar_word(value) >>>) }
+    << words
+}
+fn material_hdr_words(material &Material3D, orientation f64) []int {
+    $words := material_words(material, orientation) >>>
+    for value in [material.alpha, material.clearcoat, material.clearcoat_roughness, material.ior,
+        material.sheen_color.x, material.sheen_color.y, material.sheen_color.z, material.sheen_roughness] {
+        words.push(scalar_word(value) >>>)
+    }
     << words
 }
 fn lit_matrix_words(world fm.Mat4, view_projection fm.Mat4) []int {

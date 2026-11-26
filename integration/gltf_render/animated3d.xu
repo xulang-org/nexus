@@ -11,12 +11,122 @@ nexus #"github.com/xulang-org/nexus/scene"
 
 // One player owns its posed meshes. Material/texture resources are shared
 // within that player, while separate players retain independent poses.
-pub struct GlbAnimated3D { model GlbModel3D
+pub struct GlbAnimated3D {
+    model GlbModel3D
     posed []ren.Mesh3D
-    closed bool }
+    gpu_skins []ren.SkinnedMesh3D
+    gpu_primitive_slot []int
+    gpu_pipelines []ren.SkinPipeline3D
+    gpu_enabled bool
+    closed bool
+}
+fn min_f64(a f64, b f64) f64 {
+    if a < b { << a }
+    << b
+}
+fn max_f64(a f64, b f64) f64 {
+    if a > b { << a }
+    << b
+}
 pub fn upload_animated(device &ren.Device3D,asset &gltf.GlbGeometry) GlbAnimated3D {
     model := upload_material_model(device,asset) >>>
-    << GlbAnimated3D{model: model,posed: []ren.Mesh3D{},closed: false}
+    << GlbAnimated3D{model: model,posed: []ren.Mesh3D{},gpu_skins: []ren.SkinnedMesh3D{},gpu_primitive_slot: []int{},gpu_pipelines: []ren.SkinPipeline3D{},gpu_enabled: false,closed: false}
+}
+fn build_rest_skinned_mesh(device &ren.Device3D, asset &gltf.GlbGeometry, primitive int, bone_count int) ren.SkinnedMesh3D {
+    verts := asset.vertex_count(primitive) >>>
+    inds := asset.index_count(primitive) >>>
+    $data := meshes.new_mesh_data_3d()
+    normals := asset.has_normals(primitive) >>>
+    uvs := asset.has_uvs(primitive) >>>
+    tangents := asset.has_tangents(primitive) >>>
+    $j_indices := []int{}
+    $j_weights := []f64{}
+    $bone_used := []bool{}
+    $bone_mins := []fm.Vec3{}
+    $bone_maxs := []fm.Vec3{}
+    for b in 0:bone_count {
+        bone_used.push(false)
+        bone_mins.push(fm.vec3(0.0, 0.0, 0.0))
+        bone_maxs.push(fm.vec3(0.0, 0.0, 0.0))
+    }
+    for i in 0:verts {
+        p := asset.position(primitive, i) >>>
+        c := asset.color(primitive, i) >>>
+        if tangents {
+            data.vertex_tangent(p, c, asset.normal(primitive, i) >>>, asset.uv(primitive, i) >>>, asset.tangent(primitive, i) >>>) >>>
+        } else if normals && uvs {
+            data.vertex_lit_uv(p, c, asset.normal(primitive, i) >>>, asset.uv(primitive, i) >>>) >>>
+        } else if normals {
+            data.vertex_lit(p, c, asset.normal(primitive, i) >>>) >>>
+        } else if uvs {
+            data.vertex_uv(p, c, asset.uv(primitive, i) >>>) >>>
+        } else {
+            data.vertex(p, c) >>>
+        }
+        js := asset.vertex_skin_joints(primitive, i) >>>
+        ws := asset.vertex_skin_weights(primitive, i) >>>
+        for k in 0:4 {
+            ji := js[k]
+            w := ws[k]
+            j_indices.push(ji)
+            j_weights.push(w)
+            if w > 0.0 {
+                if !bone_used[ji] {
+                    bone_used[ji] = true
+                    bone_mins[ji] = p
+                    bone_maxs[ji] = p
+                } else {
+                    bone_mins[ji] = fm.vec3(min_f64(bone_mins[ji].x, p.x), min_f64(bone_mins[ji].y, p.y), min_f64(bone_mins[ji].z, p.z))
+                    bone_maxs[ji] = fm.vec3(max_f64(bone_maxs[ji].x, p.x), max_f64(bone_maxs[ji].y, p.y), max_f64(bone_maxs[ji].z, p.z))
+                }
+            }
+        }
+    }
+    for i in 0:inds / 3 {
+        data.triangle(asset.index(primitive, i * 3) >>>, asset.index(primitive, i * 3 + 1) >>>, asset.index(primitive, i * 3 + 2) >>>) >>>
+    }
+    data.validate() >>>
+    $bone_boxes := []fm.Aabb3{}
+    for b in 0:bone_count {
+        if bone_used[b] {
+            bone_boxes.push(fm.aabb3(bone_mins[b], bone_maxs[b]) >>>)
+        } else {
+            bone_boxes.push(fm.aabb3(fm.vec3(0.0, 0.0, 0.0), fm.vec3(0.0, 0.0, 0.0)) >>>)
+        }
+    }
+    << device.upload_skinned_mesh(&data, &j_indices, &j_weights, bone_count, &bone_boxes, &bone_used) >>>
+}
+pub fn upload_animated_gpu(device &ren.Device3D, asset &gltf.GlbGeometry, skin_program &ren.SkinProgram3D) GlbAnimated3D {
+    model := upload_material_model(device, asset) >>>
+    if !device.is_gpu() || asset.skin_count() == 0 {
+        << GlbAnimated3D{model: model, posed: []ren.Mesh3D{}, gpu_skins: []ren.SkinnedMesh3D{}, gpu_primitive_slot: []int{}, gpu_pipelines: []ren.SkinPipeline3D{}, gpu_enabled: false, closed: false}
+    }
+    pipeline := device.skin_pipeline(skin_program) >>>
+    $prim_max_bones := []int{}
+    for i in 0:asset.primitive_count() { prim_max_bones.push(0) }
+    for n in 0:asset.node_count() {
+        sk := asset.node_skin(n) >>>
+        if sk < 0 { -> }
+        desc := asset.describe_node(n) >>>
+        if desc.mesh < 0 { -> }
+        first := asset.mesh_first_primitive(desc.mesh) >>>
+        cnt := asset.mesh_primitive_count(desc.mesh) >>>
+        jcnt := asset.skin_joint_count(sk) >>>
+        for p in first:first + cnt {
+            if jcnt > prim_max_bones[p] { prim_max_bones[p] = jcnt }
+        }
+    }
+    $skins := []ren.SkinnedMesh3D{}
+    $slots := []int{}
+    for p in 0:asset.primitive_count() {
+        if prim_max_bones[p] > 0 {
+            slots.push(skins.len)
+            skins.push(build_rest_skinned_mesh(device, asset, p, prim_max_bones[p]) >>>)
+        } else {
+            slots.push(-1)
+        }
+    }
+    << GlbAnimated3D{model: model, posed: []ren.Mesh3D{}, gpu_skins: skins, gpu_primitive_slot: slots, gpu_pipelines: [pipeline], gpu_enabled: true, closed: false}
 }
 pub fn posed_mesh_data(asset &gltf.GlbGeometry,primitive int,node int,worlds &[]fm.Mat4) meshes.MeshData3D {
     palette := asset.skin_palette(node,worlds) >>>
@@ -55,6 +165,62 @@ pub fn (player $&GlbAnimated3D) sample(device &ren.Device3D,scene $&scene_render
     if player.closed || player.model.source_hash!=asset.content_hash() || instance.content_hash()!=asset.content_hash() { >>> errors.new("nexus GLB: closed player or mismatched pose source") }
     locals := asset.sample_pose(clip,time) >>>
     worlds := asset.world_pose(&locals) >>>
+    if player.gpu_enabled && device.is_gpu() {
+        $palettes := [][]fm.Mat4{}
+        $skin_nodes := []int{}
+        for i in 0:instance.primitive_count() {
+            source := instance.primitive_source_node(i) >>>
+            if (asset.node_skin(source) >>>) >= 0 {
+                p := instance.primitive_index(i) >>>
+                slot := player.gpu_primitive_slot[p]
+                palette := asset.skin_palette(source, &worlds) >>>
+                node := instance.primitive_node(i) >>>
+                mi := player.model.primitive_materials[p]
+                // Preflight scene binding capacity with rest ref before GPU dispatch.
+                _ := scene.check_surface_binding_ref(tree, node, player.gpu_skins[slot].reference(), &player.model.materials[mi]) >>>
+                palettes.push(palette)
+                skin_nodes.push(i)
+            } else {
+                node := instance.primitive_node(i) >>>
+                p := instance.primitive_index(i) >>>
+                mi := player.model.primitive_materials[p]
+                _ := scene.check_surface_binding(tree, node, &player.model.meshes[p], &player.model.materials[mi]) >>>
+            }
+        }
+        $added := 0
+        for i in 0:instance.primitive_count() {
+            node := instance.primitive_node(i) >>>
+            p := instance.primitive_index(i) >>>
+            mi := player.model.primitive_materials[p]
+            source := instance.primitive_source_node(i) >>>
+            if (asset.node_skin(source) >>>) >= 0 {
+                slot := player.gpu_primitive_slot[p]
+                added += scene.check_surface_binding_ref(tree, node, player.gpu_skins[slot].reference(), &player.model.materials[mi]) >>>
+            } else {
+                added += scene.check_surface_binding(tree, node, &player.model.meshes[p], &player.model.materials[mi]) >>>
+            }
+        }
+        if added > scene.remaining_bindings() { >>> errors.new("nexus GLB: animated binding budget exceeded") }
+        // All CPU & scene validations passed; preflight apply_pose before dispatching GPU skinning.
+        instance.apply_pose(tree, asset, &locals) >>>
+        $si := 0
+        for i in 0:instance.primitive_count() {
+            node := instance.primitive_node(i) >>>
+            p := instance.primitive_index(i) >>>
+            mi := player.model.primitive_materials[p]
+            source := instance.primitive_source_node(i) >>>
+            if (asset.node_skin(source) >>>) >= 0 {
+                slot := player.gpu_primitive_slot[p]
+                sk := $&player.gpu_skins[slot]
+                ref := sk.pose(device, &player.gpu_pipelines[0], &palettes[si]) >>>
+                scene.attach_surface_ref(tree, node, ref, player.model.materials[mi]) >>>
+                si += 1
+            } else {
+                scene.attach_surface(tree, node, &player.model.meshes[p], player.model.materials[mi]) >>>
+            }
+        }
+        << instance.primitive_count()
+    }
     $next := []ren.Mesh3D{}
     $slots := []int{}
     for i in 0:instance.primitive_count() {
@@ -93,6 +259,10 @@ pub fn (player $&GlbAnimated3D) close() int {
     if player.closed { << 0 }
     for i in 0:player.posed.len { mesh := $&player.posed[i]
         mesh.close() >>> }
+    for i in 0:player.gpu_skins.len { sk := $&player.gpu_skins[i]
+        sk.close() >>> }
+    for i in 0:player.gpu_pipelines.len { sp := $&player.gpu_pipelines[i]
+        sp.close() >>> }
     model := $&player.model
     model.close() >>>
     player.closed=true

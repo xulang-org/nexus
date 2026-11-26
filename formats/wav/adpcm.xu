@@ -1,0 +1,227 @@
+@"github.com/xulang-org/nexus/formats/wav"
+
+pcm #"github.com/xulang-org/nexus/resources/audio"
+#errors
+#math
+
+pub const ADPCM_MONO_BLOCK_ALIGN = 256
+pub const ADPCM_SAMPLES_PER_BLOCK = 505
+
+fn ima_index_delta(nibble int) int {
+    m := nibble & 7
+    if m < 4 { << -1 }
+    if m == 4 { << 2 }
+    if m == 5 { << 4 }
+    if m == 6 { << 6 }
+    << 8
+}
+
+fn new_ima_steps() []int {
+    << [7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767]
+}
+
+fn clamp_i(v int, lo int, hi int) int {
+    if v < lo { << lo }
+    if v > hi { << hi }
+    << v
+}
+
+fn ima_step_decode(nibble int, predictor $&int, index $&int, steps &[]int) int {
+    idx := clamp_i(*index, 0, 88)
+    step := steps[idx]
+    $diff := step >> 3
+    if (nibble & 4) != 0 { diff += step }
+    if (nibble & 2) != 0 { diff += step >> 1 }
+    if (nibble & 1) != 0 { diff += step >> 2 }
+    $pred := *predictor
+    if (nibble & 8) != 0 { pred -= diff } else { pred += diff }
+    *predictor = clamp_i(pred, -32768, 32767)
+    *index = clamp_i(idx + ima_index_delta(nibble), 0, 88)
+    << *predictor
+}
+
+fn ima_step_encode(target int, predictor $&int, index $&int, steps &[]int) int {
+    idx := clamp_i(*index, 0, 88)
+    step := steps[idx]
+    $diff := target - *predictor
+    $nibble := 0
+    if diff < 0 {
+        nibble = 8
+        diff = -diff
+    }
+    if diff >= step {
+        nibble = nibble | 4
+        diff -= step
+    }
+    if diff >= (step >> 1) {
+        nibble = nibble | 2
+        diff -= step >> 1
+    }
+    if diff >= (step >> 2) {
+        nibble = nibble | 1
+    }
+    _ := ima_step_decode(nibble, predictor, index, steps)
+    << nibble
+}
+
+fn push_u16(out $&[]int, v int) {
+    out.push(v & 255)
+    out.push((v >> 8) & 255)
+}
+
+fn push_u32(out $&[]int, v int) {
+    out.push(v & 255)
+    out.push((v >> 8) & 255)
+    out.push((v >> 16) & 255)
+    out.push((v >> 24) & 255)
+}
+
+fn push_tag(out $&[]int, name string) {
+    for i in 0:name.len { out.push(name[i] & 255) }
+}
+
+// Encodes any validated mono/stereo PCM16 clip into Microsoft IMA ADPCM (0x0011, ~4:1).
+pub fn encode_ima_adpcm_wav(clip &pcm.Clip) string {
+    clip.validate() >>>
+    ch := clip.channel_count()
+    rate := clip.sample_rate()
+    frames := clip.frame_count()
+    block_align := ADPCM_MONO_BLOCK_ALIGN * ch
+    spb := ADPCM_SAMPLES_PER_BLOCK
+    if block_align < 1 || spb < 9 { >>> errors.new("nexus WAV: invalid ADPCM block format") }
+    blocks := (frames + spb - 1) / spb
+    data_bytes := blocks * block_align
+    // 12 (RIFF+WAVE) + 28 (fmt 20) + 12 (fact 4) + 8 (data hdr) + data_bytes -> body = 52 + data_bytes
+    total_bytes := 60 + data_bytes
+    if total_bytes > MAX_BYTES || ch < 1 || blocks * spb > pcm.MAX_SAMPLES / ch {
+        >>> errors.new("nexus WAV: IMA ADPCM output exceeds container limits")
+    }
+    avg_bps := int(math.round_to_even(f64(rate) * f64(block_align) / f64(spb)))
+
+    $bytes := []int{}
+    push_tag($&bytes, "RIFF")
+    push_u32($&bytes, total_bytes - 8)
+    push_tag($&bytes, "WAVE")
+    push_tag($&bytes, "fmt ")
+    push_u32($&bytes, 20)
+    push_u16($&bytes, ENCODING_IMA_ADPCM)
+    push_u16($&bytes, ch)
+    push_u32($&bytes, rate)
+    push_u32($&bytes, avg_bps)
+    push_u16($&bytes, block_align)
+    push_u16($&bytes, 4)
+    push_u16($&bytes, 2)
+    push_u16($&bytes, spb)
+    push_tag($&bytes, "fact")
+    push_u32($&bytes, 4)
+    push_u32($&bytes, frames)
+    push_tag($&bytes, "data")
+    push_u32($&bytes, data_bytes)
+
+    steps := new_ima_steps()
+    $preds := [0, 0]
+    $idxs := [0, 0]
+    words_per_channel := (spb - 1) / 8
+
+    for b in 0:blocks {
+        f_base := b * spb
+        for c in 0:ch {
+            $init_s := 0
+            if f_base < frames { init_s = clip.sample(f_base, c) >>> }
+            preds[c] = init_s
+            u16_pred := init_s & 65535
+            push_u16($&bytes, u16_pred)
+            bytes.push(idxs[c])
+            bytes.push(0)
+        }
+        for w in 0:words_per_channel {
+            for c in 0:ch {
+                $p := preds[c]
+                $idx := idxs[c]
+                $s_idx := f_base + 1 + w * 8
+                for _ in 0:4 {
+                    $s0 := 0
+                    $s1 := 0
+                    if s_idx < frames { s0 = clip.sample(s_idx, c) >>> }
+                    if s_idx + 1 < frames { s1 = clip.sample(s_idx + 1, c) >>> }
+                    n0 := ima_step_encode(s0, $&p, $&idx, &steps)
+                    n1 := ima_step_encode(s1, $&p, $&idx, &steps)
+                    bytes.push((n0 & 15) | ((n1 & 15) << 4))
+                    s_idx += 2
+                }
+                preds[c] = p
+                idxs[c] = idx
+            }
+        }
+    }
+    << string_from_bytes(bytes)
+}
+
+// Decodes a complete Microsoft IMA ADPCM (0x0011) data chunk into interleaved PCM16 samples.
+pub fn decode_ima_adpcm(layout &Layout, raw &string) []int {
+    layout.validate() >>>
+    if layout.encoding != ENCODING_IMA_ADPCM {
+        >>> errors.new("nexus WAV: expected IMA ADPCM layout")
+    }
+    block_align := layout.alignment
+    ch := layout.channels
+    spb := layout.samples_per_block
+    if block_align < 1 || ch < 1 || ch > 2 || spb < 9 || (spb - 1) % 8 != 0 ||
+        raw.len < block_align || raw.len > MAX_BYTES || raw.len != layout.bytes || raw.len % block_align != 0 {
+        >>> errors.new("nexus WAV: invalid IMA ADPCM payload size")
+    }
+    blocks := raw.len / block_align
+    words_per_channel := (spb - 1) / 8
+    total_frames := blocks * spb
+    $target_frames := total_frames
+    if layout.fact_frames > 0 && layout.fact_frames < total_frames {
+        target_frames = layout.fact_frames
+    }
+    if target_frames < 1 || target_frames * ch > pcm.MAX_SAMPLES {
+        >>> errors.new("nexus WAV: decoded IMA ADPCM sample count exceeds limit")
+    }
+
+    steps := new_ima_steps()
+    $out := []int{}
+    $preds := [0, 0]
+    $idxs := [0, 0]
+    $block_buf := []int{}
+    for _ in 0:(spb * ch) { block_buf.push(0) }
+
+    for b in 0:blocks {
+        boff := b * block_align
+        for c in 0:ch {
+            $p := read16(raw, boff + c * 4)
+            if p >= 32768 { p -= 65536 }
+            idx := byte_value(raw, boff + c * 4 + 2)
+            if idx > 88 { >>> errors.new("nexus WAV: invalid IMA ADPCM block step index") }
+            preds[c] = p
+            idxs[c] = idx
+            block_buf[c] = p
+        }
+        $pos := boff + 4 * ch
+        for w in 0:words_per_channel {
+            for c in 0:ch {
+                $p := preds[c]
+                $idx := idxs[c]
+                $f := 1 + w * 8
+                for byte_k in 0:4 {
+                    val := byte_value(raw, pos + byte_k)
+                    block_buf[f * ch + c] = ima_step_decode(val & 15, $&p, $&idx, &steps)
+                    block_buf[(f + 1) * ch + c] = ima_step_decode((val >> 4) & 15, $&p, $&idx, &steps)
+                    f += 2
+                }
+                preds[c] = p
+                idxs[c] = idx
+                pos += 4
+            }
+        }
+        f_base := b * spb
+        $take := spb
+        if f_base + take > target_frames { take = target_frames - f_base }
+        if take > 0 {
+            for k in 0:(take * ch) { out.push(block_buf[k]) }
+        }
+    }
+    << out
+}

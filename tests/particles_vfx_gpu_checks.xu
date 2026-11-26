@@ -1,0 +1,456 @@
+@main
+
+#gpu
+#math
+#errors
+fm #"github.com/xulang-org/nexus/foundation/math"
+mesh #"github.com/xulang-org/nexus/resources/mesh"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+nexus #"github.com/xulang-org/nexus/scene"
+ren2d #"github.com/xulang-org/nexus/rendering/two_d"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+shd #"github.com/xulang-org/nexus/assets/shaders/three_d"
+modern #"github.com/xulang-org/nexus/integration/rendering/three_d"
+vfx #"github.com/xulang-org/nexus/vfx"
+
+fn quad_xy(w f64, h f64, normal fm.Vec3) mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    for xy in [fm.vec2(-w, -h), fm.vec2(w, -h), fm.vec2(w, h), fm.vec2(-w, h)] {
+        d.vertex_lit(fm.vec3(xy.x, xy.y, 0.0), 4294967295, normal) >>>
+    }
+    d.triangle(0, 1, 2) >>>
+    d.triangle(0, 2, 3) >>>
+    d.validate() >>>
+    << d
+}
+
+fn ch_r(c int) int { << (c >> 24) & 255 }
+fn ch_g(c int) int { << (c >> 16) & 255 }
+fn ch_b(c int) int { << (c >> 8) & 255 }
+fn abs_i(v int) int { if v < 0 { << -v } << v }
+
+fn test_curves_2d_and_ribbons() int {
+    // 1. Curves, Gradients, and deterministic RNG.
+    $grad := vfx.new_color_gradient()
+    grad.add_stop(0.0, 1.0, 1.0, 1.0, 1.0) >>>
+    grad.add_stop(0.5, 1.0, 0.5, 0.0, 0.8) >>>
+    grad.add_stop(1.0, 0.0, 0.0, 0.0, 0.0) >>>
+    mid := grad.evaluate(0.25) >>>
+    if math.abs(mid[1] - 0.75) > 0.01 || math.abs(mid[3] - 0.9) > 0.01 {
+        >>> errors.new("vfx gradient interpolation mismatch")
+    }
+    baked := grad.bake_4_stops() >>>
+    if baked.len != 16 { >>> errors.new("vfx gradient bake_4_stops expected 16 floats") }
+
+    $curve := vfx.new_float_curve()
+    curve.add_key(0.0, 0.2) >>>
+    curve.add_key(0.5, 1.0) >>>
+    curve.add_key(1.0, 0.0) >>>
+    if math.abs(curve.evaluate(0.25) - 0.6) > 0.01 {
+        >>> errors.new("vfx float curve mismatch")
+    }
+
+    $r1 := vfx.new_vfx_rng(1337)
+    $r2 := vfx.new_vfx_rng(1337)
+    if (r1.next_u32() >>>) != (r2.next_u32() >>>) {
+        >>> errors.new("vfx RNG not deterministic")
+    }
+
+    // 2. 2D Particle System + Floor Bounce + Headless Renderer2D.
+    $e2 := vfx.default_emitter_2d(fm.vec2(64.0, 48.0))
+    e2.direction = fm.vec2(0.0, 1.0)
+    e2.emitting = false
+    e2.life_min = 0.9
+    e2.life_max = 1.1
+    e2.speed_min = 35.0
+    e2.speed_max = 55.0
+    e2.gravity = fm.vec2(0.0, 260.0)
+    e2.floor_enabled = true
+    e2.floor_y = 84.0
+    e2.floor_restitution = 0.75
+    e2.size_start_min = 10.0
+    e2.size_start_max = 12.0
+
+    $ps2 := vfx.new_particle_system_2d(128, 77, e2) >>>
+    ps2.burst(48) >>>
+    $hits_2d := 0
+    for _ in 0:30 {
+        ps2.step(0.016) >>>
+        hits_2d += ps2.collision_count()
+    }
+    if ps2.alive_count() != 48 || hits_2d <= 0 {
+        >>> errors.new("2D particles failed bounce/alive verification")
+    }
+
+    $r2d := ren2d.open_2d_headless(128, 128) >>>
+    r2d.begin(255) >>>
+    $b2 := canvas.new_batch()
+    n2 := ps2.emit_batch($&b2) >>>
+    if n2 != 48 { >>> errors.new("2D emit_batch count mismatch") }
+
+    // 3. Trail2D in same 2D batch.
+    tcfg := vfx.default_trail_config()
+    $t2d := vfx.new_trail_2d(tcfg) >>>
+    for k in 0:8 {
+        t2d.push_point(fm.vec2(16.0 + f64(k) * 12.0, 24.0 + f64(k % 2) * 4.0)) >>>
+    }
+    t2_cfg := vfx.TrailConfig{
+        lifetime: 0.8,
+        min_vertex_distance: 2.0,
+        start_width: 10.0,
+        end_width: 4.0,
+        uv_tile_length: 20.0,
+        max_points: 32
+    }
+    $t2d_w := vfx.new_trail_2d(t2_cfg) >>>
+    for k in 0:8 {
+        t2d_w.push_point(fm.vec2(16.0 + f64(k) * 12.0, 24.0 + f64(k % 2) * 3.0)) >>>
+    }
+    t2_tris := t2d_w.emit_batch($&b2) >>>
+    if t2_tris <= 0 { >>> errors.new("2D trail emitted zero triangles") }
+    r2d.submit(&b2) >>>
+    $lit_2d := 0
+    for py in 16:104 {
+        for px in 16:112 {
+            c := r2d.read_pixel(px, py) >>>
+            if ch_r(c) > 30 || ch_g(c) > 30 || ch_b(c) > 30 {
+                lit_2d += 1
+            }
+        }
+    }
+    r2d.present() >>>
+    r2d.close() >>>
+    if lit_2d < 40 { >>> errors.new("2D particle/trail headless render too sparse") }
+
+    t2d_w.update(1.2) >>>
+    if t2d_w.point_count() != 0 { >>> errors.new("2D trail did not expire points after lifetime") }
+
+    for _ in 0:45 { ps2.step(0.02) >>> }
+    if ps2.alive_count() != 0 { >>> errors.new("2D particles did not expire after lifetime") }
+    << lit_2d
+}
+
+fn render_hdr_particles_frame(
+    device $&ren.Device3D,
+    hdr $&ren.HdrTarget3D,
+    hiz $&ren.HizPyramid3D,
+    pp $&ren.PostProcessPipeline3D,
+    clustered &ren.ClusteredRenderer3D,
+    wall_ref ren.MeshRef3D,
+    wall_world fm.Mat4,
+    wall_mat &ren.Material3D,
+    ps &ren.GpuParticleSystem3D,
+    view fm.Mat4,
+    proj fm.Mat4,
+    vp fm.Mat4,
+    z_near f64,
+    z_far f64,
+    cfg &ren.PostProcessConfig3D
+) int {
+    hdr.begin(device, 255) >>>
+    hdr.draw_clustered(device, clustered, wall_ref, wall_world, view, vp, wall_mat) >>>
+    hdr.end() >>>
+
+    ps.draw_into_hdr(device, hdr, view, proj) >>>
+
+    device.begin(255) >>>
+    pp.apply(device, hdr, hiz, view, proj, z_near, z_far, cfg) >>>
+    << 0
+}
+
+fn run() int {
+    lit_2d := test_curves_2d_and_ribbons() >>>
+
+    program := shd.load_mesh("build/mesh-shaders") >>>
+    cprog := shd.load_clustered_program("build/mesh-shaders") >>>
+    iprog := shd.load_indirect_program("build/mesh-shaders") >>>
+    pprog := shd.load_postprocess_program("build/mesh-shaders") >>>
+    mprog := shd.load_meshlet_program("build/mesh-shaders") >>>
+    vprog := shd.load_particle_program("build/mesh-shaders") >>>
+    sprog := shd.load_shadow("build/mesh-shaders") >>>
+    ibl_prog := shd.load_ibl_program("build/mesh-shaders") >>>
+
+    $device := ren.open_3d("Particles + VFX GPU checks", 128, 128, gpu.METAL, &program) >>>
+
+    // 4. 3D RibbonTrail3D mesh build + Device3D Metal render check.
+    eye := fm.vec3(0.0, 0.0, 2.5)
+    view := nexus.look_at_3d(eye, fm.vec3(0.0, 0.0, 0.0), fm.vec3(0.0, 1.0, 0.0)) >>>
+    z_near := 0.25
+    z_far := 40.0
+    proj := nexus.perspective_3d(0.9, 1.0, z_near, z_far) >>>
+    vp := proj.multiply(view)
+
+    r3_cfg := vfx.TrailConfig{
+        lifetime: 1.0,
+        min_vertex_distance: 0.05,
+        start_width: 0.65,
+        end_width: 0.35,
+        uv_tile_length: 1.0,
+        max_points: 64
+    }
+    $r3 := vfx.new_ribbon_trail_3d(r3_cfg) >>>
+    for k in 0:9 {
+        x := -1.2 + f64(k) * 0.3
+        y := math.sin(f64(k) * 0.4) * 0.15
+        r3.push_point(fm.vec3(x, y, 0.0)) >>>
+    }
+    r3_data := r3.build_mesh(eye) >>>
+    $r3_gpu := device.upload(&r3_data) >>>
+    device.begin(255) >>>
+    device.draw_reference(r3_gpu.reference(), vp) >>>
+    c_rib := device.read_pixel(64, 64) >>>
+    device.present() >>>
+    r3_gpu.close() >>>
+    if ch_r(c_rib) < 120 || ch_b(c_rib) < 120 {
+        >>> errors.new("3D ribbon trail mesh failed to render on Metal GPU")
+    }
+
+    // 5. GPU Compute Particle Simulation (4096 spawn + floor bounce + expiry + 32768 stress).
+    $ps := device.gpu_particle_system(&vprog, 4096, 42) >>>
+    $sim_emit := ren.default_particle_emitter_3d(fm.vec3(0.0, 1.2, 0.0))
+    sim_emit.emitting = false
+    sim_emit.shape = ren.PARTICLE_SHAPE_SPHERE
+    sim_emit.shape_param0 = 0.3
+    sim_emit.shape_param1 = 0.0
+    sim_emit.direction = fm.vec3(0.0, -1.0, 0.0)
+    sim_emit.speed_min = 2.5
+    sim_emit.speed_max = 4.0
+    sim_emit.velocity_spread = 0.4
+    sim_emit.life_min = 0.9
+    sim_emit.life_max = 1.0
+    sim_emit.gravity = fm.vec3(0.0, -9.8, 0.0)
+    sim_emit.plane_enabled = true
+    sim_emit.plane_normal = fm.vec3(0.0, 1.0, 0.0)
+    sim_emit.plane_d = 0.0
+    sim_emit.plane_restitution = 0.75
+    ps.set_emitter(&sim_emit) >>>
+    ps.burst(4096) >>>
+    ps.step(&device, 0.016) >>>
+    st0 := ps.readback_stats(&device) >>>
+    if st0.alive_count != 4096 || st0.spawned_last_step != 4096 {
+        >>> errors.new("GPU particle initial 4096 spawn mismatch")
+    }
+
+    $gpu_cols := 0
+    for _ in 0:50 {
+        ps.step(&device, 0.016) >>>
+        st := ps.readback_stats(&device) >>>
+        gpu_cols += st.collisions_last_step
+    }
+    if gpu_cols <= 100 {
+        >>> errors.new("GPU particle floor collisions unexpectedly low")
+    }
+    samples := ps.readback_sample_positions(&device, 16) >>>
+    for p in samples {
+        if p.y < -0.02 {
+            >>> errors.new("GPU particle clipped below collision plane")
+        }
+    }
+    // Step past max lifetime -> all must expire cleanly.
+    for _ in 0:20 { ps.step(&device, 0.02) >>> }
+    st_end := ps.readback_stats(&device) >>>
+    if st_end.alive_count != 0 {
+        >>> errors.new("GPU particles did not expire to zero")
+    }
+    ps.close() >>>
+
+    // 32,768 particle compute stress + curl turbulence + vortex.
+    $ps_big := device.gpu_particle_system(&vprog, 32768, 999) >>>
+    $big_emit := ren.default_particle_emitter_3d(fm.vec3(0.0, 0.0, 0.0))
+    big_emit.emitting = false
+    big_emit.shape = ren.PARTICLE_SHAPE_RING
+    big_emit.shape_param0 = 0.8
+    big_emit.speed_min = 0.5
+    big_emit.speed_max = 1.0
+    big_emit.life_min = 2.0
+    big_emit.life_max = 2.0
+    big_emit.gravity = fm.vec3(0.0, 0.0, 0.0)
+    big_emit.turbulence_strength = 4.0
+    big_emit.vortex_strength = 3.5
+    ps_big.set_emitter(&big_emit) >>>
+    ps_big.burst(32768) >>>
+    for _ in 0:4 { ps_big.step(&device, 0.016) >>> }
+    st_big := ps_big.readback_stats(&device) >>>
+    if st_big.alive_count != 32768 {
+        >>> errors.new("GPU 32768 stress particle alive count mismatch")
+    }
+    ps_big.close() >>>
+
+    // 6. HDR Pipeline Setup: Additive HDR Fire + Bloom vs Alpha Smoke + Reverse-Z Soft Particles.
+    $clustered := device.clustered_renderer(&cprog) >>>
+    $hiz := device.hiz_pyramid(&iprog) >>>
+    $hdr := device.hdr_target(&pprog) >>>
+    $pp := device.postprocess_pipeline(&pprog) >>>
+
+    $wall_data := quad_xy(5.0, 5.0, fm.vec3(0.0, 0.0, 1.0)) >>>
+    $wall_mesh := device.upload(&wall_data) >>>
+    wall_mat := ren.material_3d(fm.vec3(0.32, 0.32, 0.32), 0.0, 0.9, fm.vec3(0.0, 0.0, 0.0)) >>>
+    wall_back := fm.translation_3d(fm.vec3(0.0, 0.0, -4.0))
+    wall_mid := fm.translation_3d(fm.vec3(0.0, 0.0, 0.0))
+
+    sun := lights.directional(fm.vec3(0.0, 0.1, 0.995).normalized() >>>, fm.vec3(1.8, 1.8, 1.8)) >>>
+    clustered.bin_lights(&device, fm.vec3(0.35, 0.35, 0.35), eye, 1.0, &[sun], view, proj, z_near, z_far, 0) >>>
+
+    $cfg := ren.post_process_defaults_3d()
+    cfg.ao_enabled = false
+    cfg.ssr_enabled = false
+    cfg.taa_enabled = false
+    cfg.taa_blend = 0.0
+    cfg.bloom_enabled = true
+    cfg.bloom_threshold = 1.0
+    cfg.bloom_knee = 0.25
+    cfg.bloom_intensity = 0.75
+
+    // 6a. Additive HDR Fire + Bloom Halo.
+    $ps_vfx := device.gpu_particle_system(&vprog, 64, 12) >>>
+    $fire := ren.default_particle_emitter_3d(fm.vec3(0.0, 0.0, 0.0))
+    fire.emitting = false
+    fire.shape = ren.PARTICLE_SHAPE_POINT
+    fire.speed_min = 0.0
+    fire.speed_max = 0.0
+    fire.velocity_spread = 0.0
+    fire.gravity = fm.vec3(0.0, 0.0, 0.0)
+    fire.drag = 0.0
+    fire.life_min = 4.0
+    fire.life_max = 4.0
+    fire.size_start_min = 0.65
+    fire.size_start_max = 0.65
+    fire.size_end_scale = 1.0
+    fire.start_additive = 1.0
+    fire.end_additive = 1.0
+    fire.emissive_scale = 5.0
+    fire.color_keys = [1.0, 0.55, 0.12, 1.0, 1.0, 0.55, 0.12, 1.0, 1.0, 0.55, 0.12, 1.0, 1.0, 0.55, 0.12, 1.0]
+    fire.soft_distance = 0.0
+    ps_vfx.set_emitter(&fire) >>>
+    ps_vfx.burst(1) >>>
+    ps_vfx.step(&device, 0.016) >>>
+
+    render_hdr_particles_frame($&device, $&hdr, $&hiz, $&pp, &clustered, wall_mesh.reference(), wall_back, &wall_mat, &ps_vfx, view, proj, vp, z_near, z_far, &cfg) >>>
+    fire_core := device.read_pixel(64, 64) >>>
+    fire_halo := device.read_pixel(64, 42) >>>
+    fire_bg := device.read_pixel(8, 8) >>>
+    device.present() >>>
+    if ch_r(fire_core) <= ch_r(fire_halo) + 15 || ch_r(fire_halo) <= ch_r(fire_bg) + 3 {
+        >>> errors.new("HDR additive fire + bloom halo assertion failed")
+    }
+
+    // 6b. Dark Alpha Smoke (same unified pipeline, bloom off).
+    cfg.bloom_enabled = false
+    ps_vfx.reset(&device) >>>
+    fire.size_start_min = 1.6
+    fire.size_start_max = 1.6
+    fire.start_additive = 0.0
+    fire.end_additive = 0.0
+    fire.emissive_scale = 1.0
+    fire.visual_mode = ren.PARTICLE_VISUAL_SOFT_DISC
+    fire.color_keys = [0.04, 0.04, 0.04, 0.92, 0.04, 0.04, 0.04, 0.92, 0.04, 0.04, 0.04, 0.92, 0.04, 0.04, 0.04, 0.92]
+    ps_vfx.set_emitter(&fire) >>>
+    ps_vfx.burst(1) >>>
+    ps_vfx.step(&device, 0.016) >>>
+
+    render_hdr_particles_frame($&device, $&hdr, $&hiz, $&pp, &clustered, wall_mesh.reference(), wall_back, &wall_mat, &ps_vfx, view, proj, vp, z_near, z_far, &cfg) >>>
+    smoke_core := device.read_pixel(64, 64) >>>
+    smoke_bg := device.read_pixel(8, 8) >>>
+    device.present() >>>
+    if ch_r(smoke_core) + 15 >= ch_r(smoke_bg) {
+        >>> errors.new("Alpha smoke failed to darken backdrop")
+    }
+
+    // 6c. Reverse-Z Exact Depth Occlusion (particle at z=-1.0 behind opaque wall at z=0.0).
+    ps_vfx.reset(&device) >>>
+    fire.origin = fm.vec3(0.0, 0.0, -1.0)
+    fire.size_start_min = 2.0
+    fire.size_start_max = 2.0
+    fire.start_additive = 0.0
+    fire.end_additive = 0.0
+    fire.emissive_scale = 2.0
+    fire.color_keys = [1.0, 0.55, 0.12, 1.0, 1.0, 0.55, 0.12, 1.0, 1.0, 0.55, 0.12, 1.0, 1.0, 0.55, 0.12, 1.0]
+    ps_vfx.set_emitter(&fire) >>>
+    ps_vfx.burst(1) >>>
+    ps_vfx.step(&device, 0.016) >>>
+
+    render_hdr_particles_frame($&device, $&hdr, $&hiz, $&pp, &clustered, wall_mesh.reference(), wall_mid, &wall_mat, &ps_vfx, view, proj, vp, z_near, z_far, &cfg) >>>
+    occ_center := device.read_pixel(64, 64) >>>
+    occ_wall := device.read_pixel(8, 8) >>>
+    device.present() >>>
+    if abs_i(ch_r(occ_center) - ch_r(occ_wall)) > 2 || abs_i(ch_b(occ_center) - ch_b(occ_wall)) > 2 {
+        >>> errors.new("Reverse-Z particle depth occlusion failed")
+    }
+
+    // 6d. Soft Particle Depth Feathering (particle at z=+0.12 just in front of z=0.0 wall).
+    ps_vfx.reset(&device) >>>
+    fire.origin = fm.vec3(0.0, 0.0, 0.12)
+    fire.emissive_scale = 1.2
+    fire.soft_distance = 0.0
+    ps_vfx.set_emitter(&fire) >>>
+    ps_vfx.burst(1) >>>
+    ps_vfx.step(&device, 0.016) >>>
+    render_hdr_particles_frame($&device, $&hdr, $&hiz, $&pp, &clustered, wall_mesh.reference(), wall_mid, &wall_mat, &ps_vfx, view, proj, vp, z_near, z_far, &cfg) >>>
+    hard_c := device.read_pixel(64, 64) >>>
+    device.present() >>>
+
+    fire.soft_distance = 0.8
+    ps_vfx.set_emitter(&fire) >>>
+    render_hdr_particles_frame($&device, $&hdr, $&hiz, $&pp, &clustered, wall_mesh.reference(), wall_mid, &wall_mat, &ps_vfx, view, proj, vp, z_near, z_far, &cfg) >>>
+    soft_c := device.read_pixel(64, 64) >>>
+    device.present() >>>
+    if ch_r(soft_c) <= ch_r(occ_wall) + 4 || ch_r(soft_c) + 5 >= ch_r(hard_c) {
+        >>> errors.new("Soft particle depth feathering failed to attenuate near wall")
+    }
+
+    // 7. ModernPipeline3D Unified PBR + VFX Frame integration check.
+    pp.close() >>>
+    hdr.close() >>>
+    hiz.close() >>>
+    clustered.close() >>>
+
+    $mp := modern.new_modern_pipeline_3d(&device, &cprog, &iprog, &pprog) >>>
+    mp.prepare_lights(&device, fm.vec3(0.35, 0.35, 0.35), eye, 1.0, &[sun], view, proj, z_near, z_far) >>>
+
+    $meshlets := device.meshlet_vis_renderer(&mprog) >>>
+    m_wall := meshlets.add_mesh(&wall_data) >>>
+    _ := meshlets.add_instance(m_wall, wall_back, &wall_mat) >>>
+    meshlets.commit(&device) >>>
+
+    grid := ren.irradiance_grid_3d(fm.vec3(-4.0, -4.0, -4.0), fm.vec3(4.0, 4.0, 4.0), 2, 2, 2) >>>
+    $irr_gpu := grid.upload(&device) >>>
+    empty_shadow := ren.no_shadow_binding()
+    empty_ibl := ren.empty_environment_ibl_3d(&device)
+    tq := ren.new_transparent_queue_3d()
+
+    empty_refs := []ren.MeshRef3D{}
+    empty_worlds := []fm.Mat4{}
+    empty_mats := []ren.Material3D{}
+    mp.render_unified_pbr_vfx_frame(
+        $&device, $&meshlets, false, &irr_gpu, 0.0,
+        false, &empty_shadow, false, &empty_ibl,
+        &empty_refs, &empty_worlds, &empty_mats,
+        &tq, &ps_vfx,
+        eye, view, proj, z_near, z_far,
+        fm.vec3(0.02, 0.02, 0.03), 255, false, false, &cfg
+    ) >>>
+    unified_c := device.read_pixel(64, 64) >>>
+    device.present() >>>
+    if ch_r(unified_c) <= ch_r(occ_wall) + 4 {
+        >>> errors.new("ModernPipeline3D VFX integration produced no particle contribution")
+    }
+
+    ps_vfx.close() >>>
+    meshlets.close() >>>
+    irr_gpu.close() >>>
+    mp.close() >>>
+    wall_mesh.close() >>>
+    device.close() >>>
+
+    println("PASS: 2D/3D GPU Compute Particles + Soft/HDR Bloom + Ribbons (2d_px=" + str(lit_2d) + ", rib_r=" + str(ch_r(c_rib)) + ", gpu_cols=" + str(gpu_cols) + ", bloom_halo=" + str(ch_r(fire_bg)) + "->" + str(ch_r(fire_halo)) + "->" + str(ch_r(fire_core)) + ", smoke=" + str(ch_r(smoke_bg)) + "->" + str(ch_r(smoke_core)) + ", soft_z=" + str(ch_r(occ_wall)) + "<" + str(ch_r(soft_c)) + "<" + str(ch_r(hard_c)) + ")")
+    << 0
+}
+
+fn main() int {
+    run() >>> (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

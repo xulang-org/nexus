@@ -1,0 +1,416 @@
+@main
+
+#gpu
+#math
+fm #"github.com/xulang-org/nexus/foundation/math"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+nexus #"github.com/xulang-org/nexus/scene"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+shd #"github.com/xulang-org/nexus/assets/shaders/three_d"
+modern #"github.com/xulang-org/nexus/integration/rendering/three_d"
+shadow_pol #"github.com/xulang-org/nexus/resources/shadow"
+#errors
+
+fn ch_r(c int) int { << (c >> 24) & 255 }
+fn ch_g(c int) int { << (c >> 16) & 255 }
+fn ch_b(c int) int { << (c >> 8) & 255 }
+
+// Builds a geodesic-like UV sphere with many clusters for Normal Cone Backface + Meshlet Culling checks.
+fn build_uv_sphere(stacks int, slices int, radius f64, color int) meshes.MeshData3D {
+    pi := 3.141592653589793
+    $d := meshes.new_mesh_data_3d()
+    for i in 0:(stacks + 1) {
+        phi := pi * f64(i) / f64(stacks)
+        sp := math.sin(phi)
+        cp := math.cos(phi)
+        for j in 0:(slices + 1) {
+            theta := 2.0 * pi * f64(j) / f64(slices)
+            nx := sp * math.cos(theta)
+            ny := cp
+            nz := sp * math.sin(theta)
+            pos := fm.vec3(nx * radius, ny * radius, nz * radius)
+            norm := fm.vec3(nx, ny, nz)
+            uv := fm.vec2(f64(j) / f64(slices), f64(i) / f64(stacks))
+            d.vertex_lit_uv(pos, color, norm, uv) >>>
+        }
+    }
+    cols := slices + 1
+    for i in 0:stacks {
+        for j in 0:slices {
+            a := i * cols + j
+            b := (i + 1) * cols + j
+            c := (i + 1) * cols + (j + 1)
+            e := i * cols + (j + 1)
+            // Outward CCW winding: cross(e - a, b - a) aligns with vertex normal +N.
+            d.triangle(a, e, b) >>>
+            d.triangle(e, c, b) >>>
+        }
+    }
+    d.validate() >>>
+    << d
+}
+
+fn build_quad(hw f64, hh f64, color int) meshes.MeshData3D {
+    $d := meshes.new_mesh_data_3d()
+    n := fm.vec3(0.0, 0.0, 1.0)
+    d.vertex_lit_uv(fm.vec3(-hw, -hh, 0.0), color, n, fm.vec2(0.0, 1.0)) >>>
+    d.vertex_lit_uv(fm.vec3(hw, -hh, 0.0), color, n, fm.vec2(1.0, 1.0)) >>>
+    d.vertex_lit_uv(fm.vec3(hw, hh, 0.0), color, n, fm.vec2(1.0, 0.0)) >>>
+    d.vertex_lit_uv(fm.vec3(-hw, hh, 0.0), color, n, fm.vec2(0.0, 0.0)) >>>
+    d.triangle(0, 1, 2) >>>
+    d.triangle(0, 2, 3) >>>
+    d.validate() >>>
+    << d
+}
+
+fn build_floor_plane(hx f64, hz f64, color int) meshes.MeshData3D {
+    $d := meshes.new_mesh_data_3d()
+    n := fm.vec3(0.0, 1.0, 0.0)
+    d.vertex_lit_uv(fm.vec3(-hx, 0.0, hz), color, n, fm.vec2(0.0, 1.0)) >>>
+    d.vertex_lit_uv(fm.vec3(hx, 0.0, hz), color, n, fm.vec2(1.0, 1.0)) >>>
+    d.vertex_lit_uv(fm.vec3(hx, 0.0, -hz), color, n, fm.vec2(1.0, 0.0)) >>>
+    d.vertex_lit_uv(fm.vec3(-hx, 0.0, -hz), color, n, fm.vec2(0.0, 0.0)) >>>
+    d.triangle(0, 1, 2) >>>
+    d.triangle(0, 2, 3) >>>
+    d.validate() >>>
+    << d
+}
+
+fn run() int {
+    // 1. CPU Meshlet Partitioning & Normal Cone validation.
+    sphere_data := build_uv_sphere(32, 48, 1.35, 4294967295) >>>
+    mb := ren.build_meshlets(&sphere_data, ren.MAX_MESHLET_VERTICES, 64) >>>
+    assert(mb.meshlets.len >= 32)
+    assert(mb.indices.len == sphere_data.indices.len)
+    $valid_cones := 0
+    for i in 0:mb.meshlets.len {
+        m := &mb.meshlets[i]
+        assert(m.vertex_count >= 3 && m.vertex_count <= ren.MAX_MESHLET_VERTICES)
+        assert(m.triangle_count >= 1 && m.triangle_count <= ren.MAX_MESHLET_TRIANGLES)
+        if m.cone_cutoff <= 1.5 { valid_cones += 1 }
+    }
+    assert(valid_cones > 4)
+
+    // 2. Real Metal GPU Device + ModernPipeline3D + MeshletVisRenderer3D + GPU Skinning!
+    program := shd.load_mesh("build/mesh-shaders") >>>
+    cprog := shd.load_clustered_program("build/mesh-shaders") >>>
+    iprog := shd.load_indirect_program("build/mesh-shaders") >>>
+    pprog := shd.load_postprocess_program("build/mesh-shaders") >>>
+    mprog := shd.load_meshlet_program("build/mesh-shaders") >>>
+    sprog := shd.load_skin_program("build/mesh-shaders") >>>
+
+    $device := ren.open_3d("Meshlet + VisBuffer + Unified Modern", 160, 160, gpu.METAL, &program) >>>
+    $pipe := modern.new_modern_pipeline_3d(&device, &cprog, &iprog, &pprog) >>>
+    $mvis := device.meshlet_vis_renderer(&mprog) >>>
+
+    wall_data := build_quad(1.45, 1.45, 4294967295) >>>
+    small_quad := build_quad(0.32, 0.32, 4294967295) >>>
+    floor_data := build_floor_plane(4.5, 4.5, 4294967295) >>>
+
+    id_sphere := mvis.add_mesh(&sphere_data) >>>
+    id_wall := mvis.add_mesh(&wall_data) >>>
+    id_quad := mvis.add_mesh(&small_quad) >>>
+    id_floor := mvis.add_mesh(&floor_data) >>>
+
+    mat_gold := ren.material_3d(fm.vec3(0.95, 0.78, 0.25), 0.75, 0.25, fm.vec3(0.0, 0.0, 0.0)) >>>
+    mat_wall := ren.material_3d(fm.vec3(0.55, 0.56, 0.60), 0.0, 0.85, fm.vec3(0.0, 0.0, 0.0)) >>>
+    mat_blue := ren.material_3d(fm.vec3(0.10, 0.25, 0.95), 0.1, 0.4, fm.vec3(0.0, 0.0, 0.0)) >>>
+    mat_floor := ren.material_3d(fm.vec3(0.42, 0.44, 0.48), 0.25, 0.20, fm.vec3(0.0, 0.0, 0.0)) >>>
+    mat_green_sk := ren.material_3d(fm.vec3(0.15, 0.95, 0.25), 0.0, 0.45, fm.vec3(0.05, 0.15, 0.05)) >>>
+
+    // Scene instances:
+    // inst 0 (frustum-culled off-screen left): sphere clusters ALL frustum-culled!
+    _ := mvis.add_instance(id_sphere, fm.translation_3d(fm.vec3(-80.0, 0.0, 0.0)), &mat_gold) >>>
+    // inst 1 (visible left gold sphere): exercises Normal Cone Backface Culling (~35-50% clusters culled)!
+    _ := mvis.add_instance(id_sphere, fm.translation_3d(fm.vec3(-2.4, 0.3, 0.8)), &mat_gold) >>>
+    // inst 2 (center large occluder wall at z=+1.2): exercises Hi-Z Occlusion in Frame 2!
+    _ := mvis.add_instance(id_wall, fm.translation_3d(fm.vec3(0.0, 0.0, 1.2)), &mat_wall) >>>
+    // inst 3..7 (occluded blue quads directly behind center wall at z=-1.5): visible in Frame 1 w/o Hi-Z, culled in Frame 2 w/ Hi-Z!
+    for k in 0:5 {
+        _ := mvis.add_instance(id_quad, fm.translation_3d(fm.vec3(f64(k - 2) * 0.2, 0.0, -1.5)), &mat_blue) >>>
+    }
+    // inst 8 (floor plane at y=-1.6)
+    _ := mvis.add_instance(id_floor, fm.translation_3d(fm.vec3(0.0, -1.6, 0.0)), &mat_floor) >>>
+    mvis.commit(&device) >>>
+
+    // Upload dynamic GPU SkinnedMesh3D fixture (using Kenney CC0 rig if present, or procedural rigged GLB-less SkinnedMesh)!
+    // Build a procedural 2-bone skinned banner/wing mesh positioned on the right flank (x=+2.2, y=0.3, z=1.0).
+    $sk_data := meshes.new_mesh_data_3d()
+    $j_idx := []int{}
+    $j_wgt := []f64{}
+    sk_n := fm.vec3(0.0, 0.0, 1.0)
+    // Lower half bound to bone 0, upper tip bound to bone 1!
+    pts := [fm.vec3(-0.45, -0.5, 0.0), fm.vec3(0.45, -0.5, 0.0), fm.vec3(0.45, 0.5, 0.0), fm.vec3(-0.45, 0.5, 0.0)]
+    bones := [0, 0, 1, 1]
+    for vi in 0:4 {
+        sk_data.vertex_lit_uv(pts[vi], 4294967295, sk_n, fm.vec2(0.5, 0.5)) >>>
+        b_id := bones[vi]
+        j_idx.push(b_id)
+        j_idx.push(0)
+        j_idx.push(0)
+        j_idx.push(0)
+        j_wgt.push(1.0)
+        j_wgt.push(0.0)
+        j_wgt.push(0.0)
+        j_wgt.push(0.0)
+    }
+    sk_data.triangle(0, 1, 2) >>>
+    sk_data.triangle(0, 2, 3) >>>
+    sk_data.validate() >>>
+    b0_box := fm.aabb3(fm.vec3(-0.5, -0.55, -0.05), fm.vec3(0.5, 0.0, 0.05)) >>>
+    b1_box := fm.aabb3(fm.vec3(-0.5, 0.0, -0.05), fm.vec3(0.5, 0.55, 0.05)) >>>
+    $skinned := device.upload_skinned_mesh(&sk_data, &j_idx, &j_wgt, 2, &[b0_box, b1_box], &[true, true]) >>>
+    $skin_pipe := device.skin_pipeline(&sprog) >>>
+
+    // Camera & Lights (24 dynamic lights + sun)
+    eye := fm.vec3(0.0, 0.4, 6.2)
+    view := nexus.look_at_3d(eye, fm.vec3(0.0, 0.0, 0.0), fm.vec3(0.0, 1.0, 0.0)) >>>
+    z_near := 0.5
+    z_far := 60.0
+    proj := nexus.perspective_3d(0.95, 1.0, z_near, z_far) >>>
+
+    $ls := []lights.Light3D{}
+    ls.push(lights.directional(fm.vec3(0.3, 0.6, 0.8).normalized() >>>, fm.vec3(2.2, 2.1, 1.9)) >>>)
+    for k in 0:24 {
+        px := -3.0 + f64(k % 6) * 1.2
+        py := -1.0 + f64(k / 6) * 0.9
+        ls.push(lights.point(fm.vec3(px, py, 2.5), fm.vec3(0.8, 0.7, 0.9), 5.0) >>>)
+    }
+
+    // Irradiance Probe Grid GI.
+    $irr_grid := ren.irradiance_grid_3d(fm.vec3(-5.0, -3.0, -4.0), fm.vec3(2.5, 2.0, 2.5), 5, 4, 4) >>>
+    _ := irr_grid.bake_hemisphere(fm.vec3(0.18, 0.25, 0.40), fm.vec3(0.10, 0.09, 0.08),
+        fm.vec3(0.3, 0.6, 0.8).normalized() >>>, fm.vec3(0.45, 0.42, 0.38)) >>>
+    _ := irr_grid.inject_point_lights(&ls, 0.35) >>>
+    $irr_gpu := irr_grid.upload(&device) >>>
+
+    pipe.prepare_lights(&device, fm.vec3(0.04, 0.04, 0.05), eye, 1.15, &ls, view, proj, z_near, z_far) >>>
+    pp_cfg := ren.post_process_defaults_3d()
+    sky := fm.vec3(0.08, 0.12, 0.22)
+
+    // Frame 1: GPU Skin pose + Frustum & Normal Cone Meshlet Cull (Hi-Z off -> builds Hi-Z at end of Frame 1).
+    pose1 := [fm.identity_3d(), fm.translation_3d(fm.vec3(0.0, 0.25, 0.0))]
+    sk_ref1 := skinned.pose(&device, &skin_pipe, &pose1) >>>
+    assert(skinned.current_bounds().maximum.y > 0.75)
+
+    // Also include 1 off-screen skinned character to prove conservative bounds culling works!
+    sk_refs := [sk_ref1, sk_ref1]
+    sk_worlds := [fm.translation_3d(fm.vec3(2.2, 0.3, 1.0)), fm.translation_3d(fm.vec3(150.0, 0.0, 0.0))]
+    sk_mats := [mat_green_sk.clone_material(), mat_green_sk.clone_material()]
+
+    drawn_sk1 := pipe.render_unified_frame(
+        $&device, $&mvis, true, &irr_gpu, 1.0,
+        &sk_refs, &sk_worlds, &sk_mats,
+        eye, view, proj, z_near, z_far, sky, 255,
+        false, true, &pp_cfg
+    ) >>>
+    assert(drawn_sk1 == 1) // Right-flank visible, x=150 conservative culled!
+
+    // Verify rendered pixels BEFORE device.present() while frame is still active!
+    // 1) Left sphere gold pixel check (around x=4..44, y=42..102)
+    $gold_hits := 0
+    for y in 42:102 {
+        for x in 4:44 {
+            px := device.read_pixel(x, y) >>>
+            if ch_r(px) > ch_b(px) + 30 && ch_r(px) > 90 { gold_hits += 1 }
+        }
+    }
+    assert(gold_hits > 15)
+
+    // 2) Right skinned green banner check (around x=112..154, y=42..98)
+    $green_hits := 0
+    for y in 42:98 {
+        for x in 112:154 {
+            px := device.read_pixel(x, y) >>>
+            if ch_g(px) > ch_r(px) + 20 && ch_g(px) >= ch_b(px) { green_hits += 1 }
+        }
+    }
+    assert(green_hits > 15)
+
+    // 3) Center occluder wall pixel check (must be gray wall, NOT blue occluded quads!)
+    wall_px := device.read_pixel(80, 80) >>>
+    assert(math.abs(f64(ch_r(wall_px) - ch_b(wall_px))) < 25.0 && ch_r(wall_px) > 60)
+
+    device.capture("build/modern-unified-frame1.png") >>>
+    device.present() >>>
+
+    // Readback GPU cull stats AFTER device.present() (outside active frame).
+    stats1 := mvis.readback_cull_stats(&device) >>>
+    assert(stats1.frustum_culled == mb.meshlets.len) // offscreen sphere completely frustum culled
+    assert(stats1.cone_culled > 0)                   // rear hemisphere meshlets cone backface culled!
+    assert(stats1.visible > 0)
+
+    // Frame 2: Enable Hi-Z occlusion culling using Frame 1's pyramid! Hidden quads behind wall MUST become Hi-Z occluded!
+    drawn_sk2 := pipe.render_unified_frame(
+        $&device, $&mvis, true, &irr_gpu, 1.0,
+        &sk_refs, &sk_worlds, &sk_mats,
+        eye, view, proj, z_near, z_far, sky, 255,
+        true, true, &pp_cfg
+    ) >>>
+    assert(drawn_sk2 == 1)
+    device.present() >>>
+
+    stats2 := mvis.readback_cull_stats(&device) >>>
+    assert(stats2.frustum_culled == mb.meshlets.len)
+    assert(stats2.cone_culled > 0)
+    assert(stats2.hiz_occluded == 5) // All 5 quads behind center wall Hi-Z culled at meshlet granularity!
+    assert(stats2.visible < stats1.visible)
+    total_ml := mvis.meshlet_count()
+    mvis.close() >>>
+    skin_pipe.close() >>>
+    skinned.close() >>>
+
+    // 3. Split-Sum Environment IBL + Textured Analytic-Gradient VisBuffer + Shadow Map check!
+    sprog_sh := shd.load_shadow("build/mesh-shaders") >>>
+    iprog_ibl := shd.load_ibl_program("build/mesh-shaders") >>>
+    $ibl := device.environment_ibl(&iprog_ibl) >>>
+    sun_dir_3 := fm.vec3(0.5, 0.8, 0.35).normalized() >>>
+    ibl.bake(
+        &device,
+        fm.vec3(0.45, 0.72, 1.25),
+        fm.vec3(0.90, 0.95, 1.05),
+        fm.vec3(0.20, 0.18, 0.16),
+        sun_dir_3,
+        fm.vec3(3.0, 2.8, 2.4),
+        1.35
+    ) >>>
+    assert(ibl.is_ready())
+
+    // Build 2x2 textured albedo checkerboard: top-left=RED, top-right=GREEN, bottom-left=BLUE, bottom-right=WHITE.
+    quad_px := [4278190335, 16711935, 65535, 4294967295]
+    $albedo_tex := device.texture_rgba(2, 2, &quad_px, true, false, false) >>>
+    mat_tex := (ren.material_3d(fm.vec3(1.0, 1.0, 1.0), 0.0, 0.8, fm.vec3(0.0, 0.0, 0.0)) >>>).with_base_texture(&albedo_tex) >>>
+    mat_chrome := ren.material_3d(fm.vec3(0.95, 0.95, 0.98), 1.0, 0.12, fm.vec3(0.0, 0.0, 0.0)) >>>
+    mat_matte_floor := ren.material_3d(fm.vec3(0.75, 0.75, 0.75), 0.0, 0.9, fm.vec3(0.0, 0.0, 0.0)) >>>
+
+    // Canopy at (x=+0.9, y=1.2, z=0) casts sun_dir(0.6, 0.8, 0) shadow straight onto center floor (x=0, y=0, z=0)!
+    canopy_data := build_floor_plane(0.9, 1.2, 4294967295) >>>
+    tex_quad_data := build_quad(0.9, 0.7, 4294967295) >>>
+    wide_floor := build_floor_plane(4.0, 4.0, 4294967295) >>>
+    $canopy_mesh_up := device.upload(&canopy_data) >>>
+
+    $mvis2 := device.meshlet_vis_renderer(&mprog) >>>
+    m2_floor := mvis2.add_mesh(&wide_floor) >>>
+    m2_sphere := mvis2.add_mesh(&sphere_data) >>>
+    m2_quad := mvis2.add_mesh(&tex_quad_data) >>>
+    m2_canopy := mvis2.add_mesh(&canopy_data) >>>
+
+    _ := mvis2.add_instance(m2_floor, fm.identity_3d(), &mat_matte_floor) >>>
+    // Left flank chrome sphere tests metallic Split-Sum Specular IBL!
+    _ := mvis2.add_instance(m2_sphere, fm.translation_3d(fm.vec3(-2.3, 1.1, 0.3)), &mat_chrome) >>>
+    // Top-right textured quad tests VisBuffer analytic barycentric UV derivatives!
+    _ := mvis2.add_instance(m2_quad, fm.translation_3d(fm.vec3(2.1, 1.85, 0.0)), &mat_tex) >>>
+    // Floating canopy (above floor center + offset toward sun) blocks sun onto floor center (x=0)!
+    canopy_world := fm.translation_3d(fm.vec3(0.75, 1.2, 0.525))
+    _ := mvis2.add_instance(m2_canopy, canopy_world, &mat_matte_floor) >>>
+    mvis2.commit(&device) >>>
+
+    eye3 := fm.vec3(0.0, 2.2, 5.8)
+    view3 := nexus.look_at_3d(eye3, fm.vec3(0.0, 0.3, 0.0), fm.vec3(0.0, 1.0, 0.0)) >>>
+    proj3 := nexus.perspective_3d(0.95, 1.0, 0.5, 40.0) >>>
+    s_desc := shadow_pol.directional(fm.vec3(0.0, 0.0, 0.0), sun_dir_3, 4.5, 14.0, 256) >>>
+    $smap := device.shadow_map(s_desc, &sprog_sh) >>>
+    casters := [ren.shadow_caster(canopy_mesh_up.reference(), canopy_world)]
+    smap.render(&device, &casters, s_desc) >>>
+
+    sun_l := lights.directional(sun_dir_3, fm.vec3(3.2, 3.0, 2.8)) >>>
+    env3 := lights.environment(fm.vec3(0.04, 0.04, 0.05), eye3, 1.0, [sun_l]) >>>
+    sbind := smap.binding(&env3, 0) >>>
+    pipe.prepare_lights(&device, fm.vec3(0.04, 0.04, 0.05), eye3, 1.1, &[sun_l], view3, proj3, 0.5, 40.0) >>>
+
+    $pp_clean := ren.post_process_defaults_3d()
+    pp_clean.ao_enabled = false
+    pp_clean.ssr_enabled = false
+    pp_clean.bloom_enabled = false
+    pp_clean.taa_enabled = false
+    pp_clean.taa_blend = 0.0
+
+    empty_refs := []ren.MeshRef3D{}
+    empty_mats_4 := []fm.Mat4{}
+    empty_mats_m := []ren.Material3D{}
+
+    // Frame A: IBL OFF (chrome sphere with metallic=1 stays nearly dark!)
+    pipe.render_unified_pbr_frame(
+        $&device, $&mvis2, false, &irr_gpu, 0.0,
+        true, &sbind, false, &ibl,
+        &empty_refs, &empty_mats_4, &empty_mats_m,
+        eye3, view3, proj3, 0.5, 40.0, fm.vec3(0.02, 0.02, 0.04), 255, false, false, &pp_clean
+    ) >>>
+    $chrome_no_ibl := 0
+    for py in 45:90 {
+        for px in 18:55 {
+            p_v := device.read_pixel(px, py) >>>
+            chrome_no_ibl += ch_r(p_v) + ch_g(p_v) + ch_b(p_v)
+        }
+    }
+    device.present() >>>
+
+    // Frame B: IBL ON + Shadow ON + Textured VisBuffer!
+    pipe.render_unified_pbr_frame(
+        $&device, $&mvis2, false, &irr_gpu, 0.0,
+        true, &sbind, true, &ibl,
+        &empty_refs, &empty_mats_4, &empty_mats_m,
+        eye3, view3, proj3, 0.5, 40.0, fm.vec3(0.02, 0.02, 0.04), 255, false, false, &pp_clean
+    ) >>>
+    $chrome_with_ibl := 0
+    for py in 45:90 {
+        for px in 18:55 {
+            p_v := device.read_pixel(px, py) >>>
+            chrome_with_ibl += ch_r(p_v) + ch_g(p_v) + ch_b(p_v)
+        }
+    }
+    // Check shadowed center floor (x=0, y=0 -> ~pixel (80, 92)) vs sunlit right floor (~pixel (130, 92))!
+    $shadow_luma := 0
+    $lit_luma := 0
+    for px in 74:86 {
+        sp := device.read_pixel(px, 92) >>>
+        shadow_luma += ch_r(sp) + ch_g(sp) + ch_b(sp)
+    }
+    for px in 122:134 {
+        lp := device.read_pixel(px, 92) >>>
+        lit_luma += ch_r(lp) + ch_g(lp) + ch_b(lp)
+    }
+    // Check 2x2 textured quad upper-right (sampled UV left side red vs right side green)!
+    $tex_red_hits := 0
+    $tex_green_hits := 0
+    for py in 22:55 {
+        for px in 105:148 {
+            tp := device.read_pixel(px, py) >>>
+            if ch_r(tp) > ch_g(tp) + 25 && ch_r(tp) > ch_b(tp) + 25 { tex_red_hits += 1 }
+            if ch_g(tp) > ch_r(tp) + 20 && ch_g(tp) > ch_b(tp) + 20 { tex_green_hits += 1 }
+        }
+    }
+    device.capture("build/modern-pbr-ibl-shadow.png") >>>
+    device.present() >>>
+
+    assert(chrome_with_ibl > chrome_no_ibl + 4000)
+    assert(lit_luma > shadow_luma + 300)
+    assert(tex_red_hits > 10 && tex_green_hits > 10)
+
+    canopy_mesh_up.close() >>>
+    smap.close() >>>
+    albedo_tex.close() >>>
+    ibl.close() >>>
+    mvis2.close() >>>
+    irr_gpu.close() >>>
+    pipe.close() >>>
+    device.close() >>>
+
+    println("PASS: Meshlet (64v/124t + Normal Cone) + VisBuffer (R32_UINT) + Unified ModernPipeline3D (" +
+        str(total_ml) + " meshlets: visible=" + str(stats2.visible) +
+        ", frustum=" + str(stats2.frustum_culled) +
+        ", cone_backface=" + str(stats2.cone_culled) +
+        ", hiz_occluded=" + str(stats2.hiz_occluded) +
+        ", skinned_overlay=1, ibl=" + str(chrome_no_ibl) + "->" + str(chrome_with_ibl) +
+        ", shadow=" + str(shadow_luma) + "<" + str(lit_luma) +
+        ", tex_hits=" + str(tex_red_hits) + "/" + str(tex_green_hits) + ")")
+    << 0
+}
+
+fn main() int {
+    << run() >>> (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

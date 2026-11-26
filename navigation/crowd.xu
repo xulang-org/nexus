@@ -1,0 +1,303 @@
+@"github.com/xulang-org/nexus/navigation"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const MAX_CROWD_AGENTS = 256
+
+struct CrowdAgent3D {
+    active bool
+    pos fm.Vec3
+    vel fm.Vec3
+    target fm.Vec3
+    has_target bool
+    arrived bool
+    radius f64
+    max_speed f64
+    max_accel f64
+    include_mask int
+    area_costs []f64
+    waypoints []fm.Vec3
+    wp_index int
+}
+
+// Multi-agent NavMesh path-following + predictive Velocity-Obstacle / RVO steering solver.
+pub struct CrowdSolver3D {
+    agents []CrowdAgent3D
+}
+
+pub fn new_crowd_solver_3d() CrowdSolver3D {
+    << CrowdSolver3D{agents: []CrowdAgent3D{}}
+}
+
+pub fn (cs $&CrowdSolver3D) add_agent(
+    nav &NavMesh3D,
+    pos fm.Vec3,
+    radius f64,
+    max_speed f64,
+    max_accel f64,
+    include_mask int,
+    area_costs &[]f64
+) int {
+    if !pos.is_finite() || !fm.finite(radius) || radius <= 0.0 ||
+        !fm.finite(max_speed) || max_speed <= 0.0 || !fm.finite(max_accel) || max_accel <= 0.0 {
+        >>> errors.new("nexus nav crowd: invalid agent parameters")
+    }
+    if cs.agents.len >= MAX_CROWD_AGENTS {
+        >>> errors.new("nexus nav crowd: agent capacity 256 exceeded")
+    }
+    snapped := nav.find_nearest_point(pos, include_mask) >>>
+    $costs := []f64{}
+    for c in area_costs { costs.push(c) }
+    id := cs.agents.len
+    cs.agents.push(CrowdAgent3D{
+        active: true,
+        pos: snapped.point,
+        vel: fm.vec3(0.0, 0.0, 0.0),
+        target: snapped.point,
+        has_target: false,
+        arrived: false,
+        radius: radius,
+        max_speed: max_speed,
+        max_accel: max_accel,
+        include_mask: include_mask,
+        area_costs: costs,
+        waypoints: []fm.Vec3{},
+        wp_index: 0
+    })
+    << id
+}
+
+pub fn (cs $&CrowdSolver3D) set_agent_target(
+    nav &NavMesh3D,
+    agent_id int,
+    target fm.Vec3
+) int {
+    if agent_id < 0 || agent_id >= cs.agents.len || !cs.agents[agent_id].active {
+        >>> errors.new("nexus nav crowd: invalid or inactive agent id")
+    }
+    if !target.is_finite() { >>> errors.new("nexus nav crowd: non-finite target") }
+    ag := $&cs.agents[agent_id]
+    path := nav.find_path(ag.pos, target, ag.include_mask, &ag.area_costs) >>>
+    if path.len == 0 {
+        ag.has_target = false
+        ag.arrived = false
+        ag.waypoints = []fm.Vec3{}
+        ag.wp_index = 0
+        << 0
+    }
+    n_pts := path.len
+    ag.target = path[n_pts - 1]
+    ag.waypoints = path
+    ag.wp_index = 1
+    if ag.wp_index >= n_pts { ag.wp_index = n_pts - 1 }
+    ag.has_target = true
+    ag.arrived = false
+    << n_pts
+}
+
+pub fn (cs $&CrowdSolver3D) remove_agent(agent_id int) int {
+    if agent_id < 0 || agent_id >= cs.agents.len {
+        >>> errors.new("nexus nav crowd: invalid agent id")
+    }
+    cs.agents[agent_id].active = false
+    cs.agents[agent_id].has_target = false
+    << 0
+}
+
+pub fn (cs &CrowdSolver3D) agent_position(agent_id int) fm.Vec3 {
+    if agent_id < 0 || agent_id >= cs.agents.len {
+        >>> errors.new("nexus nav crowd: invalid agent id")
+    }
+    << cs.agents[agent_id].pos
+}
+
+pub fn (cs &CrowdSolver3D) agent_velocity(agent_id int) fm.Vec3 {
+    if agent_id < 0 || agent_id >= cs.agents.len {
+        >>> errors.new("nexus nav crowd: invalid agent id")
+    }
+    << cs.agents[agent_id].vel
+}
+
+pub fn (cs &CrowdSolver3D) agent_arrived(agent_id int) bool {
+    if agent_id < 0 || agent_id >= cs.agents.len {
+        >>> errors.new("nexus nav crowd: invalid agent id")
+    }
+    << cs.agents[agent_id].arrived
+}
+
+pub fn (cs $&CrowdSolver3D) step(dt f64, nav &NavMesh3D) int {
+    if !fm.finite(dt) || dt <= 0.0 || dt > 0.25 {
+        >>> errors.new("nexus nav crowd: invalid dt")
+    }
+    n := cs.agents.len
+    if n == 0 { << 0 }
+
+    // 1. Compute desired preferred velocity along Funnel waypoints.
+    $pref_vels := []fm.Vec3{}
+    for i in 0:n {
+        ag := $&cs.agents[i]
+        $vp := fm.vec3(0.0, 0.0, 0.0)
+        if ag.active && ag.has_target && !ag.arrived && ag.waypoints.len > 0 {
+            while ag.wp_index < ag.waypoints.len - 1 {
+                to_wp := ag.waypoints[ag.wp_index].sub(ag.pos)
+                if math.sqrt(to_wp.x * to_wp.x + to_wp.z * to_wp.z) <= ag.radius * 1.15 {
+                    ag.wp_index += 1
+                } else {
+                    <-
+                }
+            }
+            cur_goal := ag.waypoints[ag.wp_index]
+            delta := cur_goal.sub(ag.pos)
+            d_xz := math.sqrt(delta.x * delta.x + delta.z * delta.z)
+            if ag.wp_index == ag.waypoints.len - 1 && d_xz <= ag.radius * 0.45 {
+                ag.arrived = true
+                ag.has_target = false
+            } else if d_xz > 1e-6 {
+                $spd := ag.max_speed
+                if ag.wp_index == ag.waypoints.len - 1 && d_xz < ag.radius * 2.0 {
+                    spd = spd * math.max(0.2, d_xz / (ag.radius * 2.0))
+                }
+                vp = fm.vec3((delta.x / d_xz) * spd, 0.0, (delta.z / d_xz) * spd)
+            }
+        }
+        pref_vels.push(vp)
+    }
+
+    // 2. Predictive Velocity-Obstacle / RVO steering in XZ plane.
+    $new_vels := []fm.Vec3{}
+    horizon := 1.25
+    for i in 0:n {
+        if !cs.agents[i].active {
+            new_vels.push(fm.vec3(0.0, 0.0, 0.0))
+            ->
+        }
+        pi := cs.agents[i].pos
+        vi_pref := pref_vels[i]
+        ri := cs.agents[i].radius
+        $steer_x := vi_pref.x
+        $steer_z := vi_pref.z
+
+        for j in 0:n {
+            if j == i || !cs.agents[j].active { -> }
+            pj := cs.agents[j].pos
+            if math.abs(pj.y - pi.y) > 2.0 { -> }
+            rj := cs.agents[j].radius
+            combined_r := ri + rj + 0.12
+
+            rel_px := pj.x - pi.x
+            rel_pz := pj.z - pi.z
+            d2 := rel_px * rel_px + rel_pz * rel_pz
+            max_q := combined_r + cs.agents[i].max_speed * horizon + cs.agents[j].max_speed * horizon
+            if d2 > max_q * max_q { -> }
+
+            // Use average velocity (RVO reciprocity) for relative velocity prediction.
+            vj := cs.agents[j].vel
+            rel_vx := steer_x - 0.5 * (vi_pref.x + vj.x)
+            rel_vz := steer_z - 0.5 * (vi_pref.z + vj.z)
+            rv2 := rel_vx * rel_vx + rel_vz * rel_vz
+
+            $t_closest := 0.0
+            if rv2 > 1e-8 {
+                t_closest = clamp_f((rel_px * rel_vx + rel_pz * rel_vz) / rv2, 0.0, horizon)
+            }
+            cx := rel_px - rel_vx * t_closest
+            cz := rel_pz - rel_vz * t_closest
+            c_dist := math.sqrt(cx * cx + cz * cz)
+            if c_dist < combined_r {
+                pen := combined_r - c_dist
+                $nx := 0.0
+                $nz := 0.0
+                if c_dist > 1e-5 {
+                    nx = -cx / c_dist
+                    nz = -cz / c_dist
+                } else {
+                    // Deterministic right-hand lane tie-breaker on head-on alignment.
+                    d := math.sqrt(d2)
+                    if d > 1e-5 {
+                        ux := rel_px / d
+                        uz := rel_pz / d
+                        nx = -uz - ux * 0.35
+                        nz = ux - uz * 0.35
+                        nl := math.sqrt(nx * nx + nz * nz)
+                        nx = nx / nl
+                        nz = nz / nl
+                    } else {
+                        nx = 1.0
+                    }
+                }
+                // Tangential bias for smooth right-side overtaking.
+                tx := -nz
+                tz := nx
+                $side := -1.0
+                if (steer_x * tx + steer_z * tz) >= 0.0 { side = 1.0 }
+                urgency := (pen / combined_r) * (1.0 / math.max(0.18, t_closest + 0.15)) * cs.agents[i].max_speed
+                steer_x += (nx + tx * side * 0.45) * urgency * 0.65
+                steer_z += (nz + tz * side * 0.45) * urgency * 0.65
+            }
+        }
+
+        sp := math.sqrt(steer_x * steer_x + steer_z * steer_z)
+        if sp > cs.agents[i].max_speed {
+            scale := cs.agents[i].max_speed / sp
+            steer_x *= scale
+            steer_z *= scale
+        }
+        // Smooth velocity update bounded by max_accel * dt.
+        cur_vx := cs.agents[i].vel.x
+        cur_vz := cs.agents[i].vel.z
+        $dvx := steer_x - cur_vx
+        $dvz := steer_z - cur_vz
+        dv_len := math.sqrt(dvx * dvx + dvz * dvz)
+        max_dv := cs.agents[i].max_accel * dt
+        if dv_len > max_dv && dv_len > 1e-9 {
+            s := max_dv / dv_len
+            dvx *= s
+            dvz *= s
+        }
+        new_vels.push(fm.vec3(cur_vx + dvx, 0.0, cur_vz + dvz))
+    }
+
+    // 3. Integrate and resolve hard pairwise agent overlap.
+    for i in 0:n {
+        if !cs.agents[i].active { -> }
+        cs.agents[i].vel = new_vels[i]
+        cs.agents[i].pos = cs.agents[i].pos.add(new_vels[i].scaled(dt))
+    }
+    for i in 0:n {
+        if !cs.agents[i].active { -> }
+        for j in (i + 1):n {
+            if !cs.agents[j].active { -> }
+            if math.abs(cs.agents[j].pos.y - cs.agents[i].pos.y) > 2.0 { -> }
+            min_sep := cs.agents[i].radius + cs.agents[j].radius
+            dx := cs.agents[i].pos.x - cs.agents[j].pos.x
+            dz := cs.agents[i].pos.z - cs.agents[j].pos.z
+            d2 := dx * dx + dz * dz
+            if d2 < min_sep * min_sep {
+                $d := math.sqrt(d2)
+                $px := 1.0
+                $pz := 0.0
+                if d > 1e-6 {
+                    px = dx / d
+                    pz = dz / d
+                } else {
+                    d = 0.0
+                }
+                push := (min_sep - d) * 0.5
+                cs.agents[i].pos = fm.vec3(cs.agents[i].pos.x + px * push, cs.agents[i].pos.y, cs.agents[i].pos.z + pz * push)
+                cs.agents[j].pos = fm.vec3(cs.agents[j].pos.x - px * push, cs.agents[j].pos.y, cs.agents[j].pos.z - pz * push)
+            }
+        }
+    }
+
+    // 4. Snap all active agents onto walkable NavMesh surface height & boundaries.
+    $moved := 0
+    for i in 0:n {
+        if !cs.agents[i].active { -> }
+        hit := nav.find_nearest_point(cs.agents[i].pos, cs.agents[i].include_mask) >>>
+        cs.agents[i].pos = hit.point
+        moved += 1
+    }
+    << moved
+}

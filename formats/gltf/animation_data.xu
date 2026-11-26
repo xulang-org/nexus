@@ -89,6 +89,19 @@ fn rotation_unit(v fm.Vec4) fm.Vec4 {
     q := fm.quaternion(v.x,v.y,v.z,v.w).normalized() >>>
     << fm.vec4(q.x,q.y,q.z,q.w)
 }
+fn slerp_rotation(a fm.Vec4, b_in fm.Vec4, t f64) fm.Vec4 {
+    $b := b_in
+    $dot := a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w
+    if dot < 0.0 {
+        b = mix4(b, b, -1.0, 0.0)
+        dot = -dot
+    }
+    dot = math.min(dot, 1.0)
+    if dot > 0.9995 { << rotation_unit(mix4(a, b, 1.0 - t, t)) >>> }
+    angle := math.acos(dot)
+    << rotation_unit(mix4(a, b, math.sin((1.0 - t) * angle) / math.sin(angle), math.sin(t * angle) / math.sin(angle))) >>>
+}
+
 fn sample_track(track &AnimationTrack,time f64) fm.Vec4 {
     $at := 0
     // Binary search supports random access and clips with many keys.
@@ -107,7 +120,7 @@ fn sample_track(track &AnimationTrack,time f64) fm.Vec4 {
     if time<=track.times[0] || at+1>=track.times.len || track.interpolation=="STEP" { << a }
     delta := track.times[at+1]-track.times[at]
     t := (time-track.times[at])/delta
-    $b := track.values[(at+1)*factor+offset]
+    b := track.values[(at+1)*factor+offset]
     if track.interpolation=="CUBICSPLINE" {
         p := mix4(a,b,2.0*t*t*t-3.0*t*t+1.0,-2.0*t*t*t+3.0*t*t)
         tangent := mix4(track.values[at*3+2],track.values[(at+1)*3],(t*t*t-2.0*t*t+t)*delta,(t*t*t-t*t)*delta)
@@ -116,13 +129,7 @@ fn sample_track(track &AnimationTrack,time f64) fm.Vec4 {
         << result
     }
     if track.path!="rotation" { << mix4(a,b,1.0-t,t) }
-    $dot := a.x*b.x+a.y*b.y+a.z*b.z+a.w*b.w
-    if dot<0.0 { b=mix4(b,b,-1.0,0.0)
-        dot = -dot }
-    dot=math.min(dot,1.0)
-    if dot>0.9995 { << rotation_unit(mix4(a,b,1.0-t,t)) >>> }
-    angle := math.acos(dot)
-    << rotation_unit(mix4(a,b,math.sin((1.0-t)*angle)/math.sin(angle),math.sin(t*angle)/math.sin(angle))) >>>
+    << slerp_rotation(a, b, t) >>>
 }
 pub fn (asset &GlbGeometry) animation_count() int { << asset.animations.len }
 pub fn (asset &GlbGeometry) animation_name(index int) string {
@@ -133,32 +140,109 @@ pub fn (asset &GlbGeometry) animation_duration(index int) f64 {
     if index<0 || index>=asset.animations.len { >>> errors.new("nexus GLB: animation index out of range") }
     << asset.animations[index].duration
 }
-// Explicit time, clamped to each track. Looping/blending belongs to a player.
-// -1 returns the authored pose. Each sample starts from authored TRS values.
-pub fn (asset &GlbGeometry) sample_pose(index int,time f64) []fm.Mat4 {
-    if index< -1 || index>=asset.animations.len || !fm.finite(time) { >>> errors.new("nexus GLB: invalid animation sample") }
+struct TrsSampleBuffer {
+    translations []fm.Vec3
+    rotations []fm.Vec4
+    scales []fm.Vec3
+}
+fn (asset &GlbGeometry) sample_trs_channels(index int, time f64) TrsSampleBuffer {
+    if index < -1 || index >= asset.animations.len || !fm.finite(time) { >>> errors.new("nexus GLB: invalid animation sample") }
     $translations := []fm.Vec3{}
     $rotations := []fm.Vec4{}
     $scales := []fm.Vec3{}
-    for node in asset.nodes { translations.push(node.translation)
+    for node in asset.nodes {
+        translations.push(node.translation)
         rotations.push(node.rotation)
-        scales.push(node.scale) }
-    if index>=0 {
+        scales.push(node.scale)
+    }
+    if index >= 0 {
         for j in 0:asset.animations[index].tracks.len {
             track := &asset.animations[index].tracks[j]
-            value := sample_track(track,time) >>>
-            if track.path=="translation" { translations[track.node]=value.xyz()
-            } else if track.path=="rotation" { rotations[track.node]=value
-            } else { scales[track.node]=value.xyz() }
+            value := sample_track(track, time) >>>
+            if track.path == "translation" {
+                translations[track.node] = value.xyz()
+            } else if track.path == "rotation" {
+                rotations[track.node] = value
+            } else {
+                scales[track.node] = value.xyz()
+            }
         }
     }
+    << TrsSampleBuffer{translations: translations, rotations: rotations, scales: scales}
+}
+fn (asset &GlbGeometry) build_local_matrices(trs &TrsSampleBuffer) []fm.Mat4 {
     $result := []fm.Mat4{}
     for i in 0:asset.nodes.len {
         $local := asset.nodes[i].local
         if !asset.nodes[i].matrix {
-            q := rotations[i]
-            rotation := fm.quaternion(q.x,q.y,q.z,q.w).rotation_matrix() >>>
-            local=fm.translation_3d(translations[i]).multiply(rotation).multiply(fm.scale_3d(scales[i]))
+            q := trs.rotations[i]
+            rotation := fm.quaternion(q.x, q.y, q.z, q.w).rotation_matrix() >>>
+            local = fm.translation_3d(trs.translations[i]).multiply(rotation).multiply(fm.scale_3d(trs.scales[i]))
+        }
+        if !local.is_affine() { >>> errors.new("nexus GLB: animated transform overflow") }
+        result.push(local)
+    }
+    << result
+}
+// Explicit time, clamped to each track. Looping/blending belongs to a player.
+// -1 returns the authored pose. Each sample starts from authored TRS values.
+pub fn (asset &GlbGeometry) sample_pose(index int,time f64) []fm.Mat4 {
+    trs := asset.sample_trs_channels(index, time) >>>
+    << asset.build_local_matrices(&trs) >>>
+}
+// Linearly blends translations/scales and shortest-arc SLERP blends rotations between two clips.
+pub fn (asset &GlbGeometry) sample_blended_pose(index_a int, time_a f64, index_b int, time_b f64, blend f64) []fm.Mat4 {
+    if !fm.finite(blend) || blend < 0.0 || blend > 1.0 {
+        >>> errors.new("nexus GLB: pose blend weight must be in [0, 1]")
+    }
+    if blend <= 0.0 { << asset.sample_pose(index_a, time_a) >>> }
+    if blend >= 1.0 { << asset.sample_pose(index_b, time_b) >>> }
+    $a := asset.sample_trs_channels(index_a, time_a) >>>
+    b := asset.sample_trs_channels(index_b, time_b) >>>
+    inv_w := 1.0 - blend
+    for i in 0:asset.nodes.len {
+        ta := a.translations[i]
+        tb := b.translations[i]
+        sa := a.scales[i]
+        sb := b.scales[i]
+        a.translations[i] = fm.vec3(ta.x * inv_w + tb.x * blend, ta.y * inv_w + tb.y * blend, ta.z * inv_w + tb.z * blend)
+        a.scales[i] = fm.vec3(sa.x * inv_w + sb.x * blend, sa.y * inv_w + sb.y * blend, sa.z * inv_w + sb.z * blend)
+        a.rotations[i] = slerp_rotation(a.rotations[i], b.rotations[i], blend) >>>
+    }
+    << asset.build_local_matrices(&a) >>>
+}
+pub struct NodeTrs {
+    pub translation fm.Vec3
+    pub rotation fm.Vec4
+    pub scale fm.Vec3
+    pub is_matrix bool
+}
+pub fn (asset &GlbGeometry) node_parent(index int) int {
+    if index < 0 || index >= asset.nodes.len { >>> errors.new("nexus GLB: node index out of range") }
+    << asset.nodes[index].parent
+}
+pub fn (asset &GlbGeometry) sample_trs_pose(index int, time f64) []NodeTrs {
+    trs := asset.sample_trs_channels(index, time) >>>
+    $out := []NodeTrs{}
+    for i in 0:asset.nodes.len {
+        out.push(NodeTrs{
+            translation: trs.translations[i],
+            rotation: trs.rotations[i],
+            scale: trs.scales[i],
+            is_matrix: asset.nodes[i].matrix
+        })
+    }
+    << out
+}
+pub fn (asset &GlbGeometry) local_matrices_from_trs(trs &[]NodeTrs) []fm.Mat4 {
+    if trs.len != asset.nodes.len { >>> errors.new("nexus GLB: TRS pose node count mismatch") }
+    $result := []fm.Mat4{}
+    for i in 0:asset.nodes.len {
+        $local := asset.nodes[i].local
+        if !asset.nodes[i].matrix && !trs[i].is_matrix {
+            q := trs[i].rotation
+            rotation := fm.quaternion(q.x, q.y, q.z, q.w).rotation_matrix() >>>
+            local = fm.translation_3d(trs[i].translation).multiply(rotation).multiply(fm.scale_3d(trs[i].scale))
         }
         if !local.is_affine() { >>> errors.new("nexus GLB: animated transform overflow") }
         result.push(local)

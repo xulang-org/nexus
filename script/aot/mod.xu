@@ -1,0 +1,506 @@
+@"github.com/xulang-org/nexus/script/aot"
+
+bc #"github.com/xulang-org/nexus/script/bytecode"
+#errors
+#math
+#strings
+
+pub const AOT_OK = 0
+pub const AOT_ERR_INVALID_ARGS = -1
+pub const AOT_ERR_DIVIDE_ZERO = -2
+pub const AOT_ERR_BUDGET = -3
+pub const AOT_ERR_UNINITIALIZED = -4
+pub const AOT_ERR_SCALAR_RANGE = -5
+pub const AOT_ERR_HOST_BOUND = -6
+pub const AOT_ERR_SIGNAL_LIMIT = -7
+pub const AOT_ERR_NO_RETURN = -8
+
+pub struct AotBundle {
+    pub fingerprint string
+    pub native_module string
+    pub fn_prefix string
+    pub c_source string
+    pub manifest_json string
+    pub wrapper_xu string
+    pub static_xu string
+}
+
+fn valid_c_ident(s &string) bool {
+    if s.len < 1 || s.len > 64 { << false }
+    for i in 0:s.len {
+        c := s[i]
+        is_alpha := (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+        is_digit := i > 0 && c >= 48 && c <= 57
+        if !is_alpha && !is_digit { << false }
+    }
+    << true
+}
+
+fn u64_hex(bits int) string {
+    digits := "0123456789abcdef"
+    $out := ""
+    $i := 15
+    while i >= 0 {
+        nibble := (bits >> (i * 4)) & 15
+        out.push_byte(digits[nibble])
+        i -= 1
+    }
+    << out
+}
+
+fn f64_hex_expr(v f64) string {
+    bits := math.float64_bits(v)
+    << "xu_bits_to_f64((xu_uint)0x" + u64_hex(bits) + "ULL)"
+}
+
+fn f64_literal_xu(v f64) string {
+    bits := math.float64_bits(v)
+    if bits < 0 {
+        // Signed 64-bit bit pattern has sign bit set: strip MSB and negate in Xu.
+        pos_bits := math.float64_bits(-v)
+        << "(-math.float64_from_bits(0x" + u64_hex(pos_bits) + "))"
+    }
+    << "math.float64_from_bits(0x" + u64_hex(bits) + ")"
+}
+
+fn emit_c_function(sb $&strings.ByteBuilder, program &bc.Module, fn_idx int, fn_prefix string) int {
+    f := program.function(fn_idx) >>>
+    if f.kind == bc.COROUTINE_FUNCTION {
+        >>> errors.new("XuScript AOT: host calls and coroutines require VM runtime")
+    }
+    reg_n := program.register_count()
+    field_n := program.field_count()
+
+    sb.write_str("static xu_int " + fn_prefix + "fn_" + str(fn_idx) + "(\n")
+    sb.write_str("    double arg_a, double arg_b, xu_int budget, double result_limit, xu_int pending_sigs,\n")
+    sb.write_str("    const xu_int* state_in, xu_int* state_out, xu_int* sig_out) {\n")
+    sb.write_str("    xu_int rem = budget;\n")
+    sb.write_str("    xu_int scount = 0;\n")
+    sb.write_str("    double s[32];\n")
+    if field_n > 0 {
+        sb.write_str("    for (xu_int k = 0; k < " + str(field_n) + "; ++k) { s[k] = xu_bits_to_f64((xu_uint)state_in[k]); }\n")
+    }
+    sb.write_str("    double r[" + str(reg_n) + "];\n")
+    sb.write_str("    uint8_t init[" + str(reg_n) + "];\n")
+    sb.write_str("    memset(init, 0, sizeof(init));\n")
+    sb.write_str("    r[0] = arg_a; init[0] = 1;\n")
+    if f.kind == bc.PHYSICS_FUNCTION {
+        sb.write_str("    r[1] = arg_b; init[1] = 1;\n")
+    }
+
+    for pc in f.entry:f.end {
+        ins := program.instruction(pc) >>>
+        sb.write_str("L_" + str(pc) + ":;\n")
+        sb.write_str("    if (rem <= 0) { return -3; }\n")
+        sb.write_str("    rem--;\n")
+        op := ins.op
+        if op == bc.JUMP {
+            sb.write_str("    goto L_" + str(ins.dst) + ";\n")
+        } else if op == bc.BRANCH_FALSE {
+            sb.write_str("    if (!init[" + str(ins.a) + "]) { return -4; }\n")
+            sb.write_str("    if (r[" + str(ins.a) + "] == 0.0) { goto L_" + str(ins.dst) + "; }\n")
+        } else if op == bc.RETURN {
+            sb.write_str("    if (!init[" + str(ins.a) + "]) { return -4; }\n")
+            sb.write_str("    { double res = r[" + str(ins.a) + "];\n")
+            sb.write_str("      if (!xu_valid_scalar(res) || fabs(res) > result_limit) { return -6; }\n")
+            if field_n > 0 {
+                sb.write_str("      for (xu_int k = 0; k < " + str(field_n) + "; ++k) { state_out[k] = xu_f64_to_bits(s[k]); }\n")
+            }
+            sb.write_str("      sig_out[0] = xu_f64_to_bits(res);\n")
+            sb.write_str("      sig_out[1] = scount;\n")
+            sb.write_str("      return 0; }\n")
+        } else if op == bc.EMIT_SIGNAL {
+            sig := program.signal(ins.dst) >>>
+            sb.write_str("    if (scount >= 32 || pending_sigs + scount >= 128) { return -7; }\n")
+            sb.write_str("    if (!init[" + str(ins.a) + "]) { return -4; }\n")
+            sb.write_str("    sig_out[2 + scount * 2] = (xu_int)" + str(sig.id) + ";\n")
+            sb.write_str("    sig_out[3 + scount * 2] = xu_f64_to_bits(r[" + str(ins.a) + "]);\n")
+            sb.write_str("    scount++;\n")
+        } else if op == bc.STORE_FIELD {
+            sb.write_str("    if (!init[" + str(ins.a) + "]) { return -4; }\n")
+            sb.write_str("    s[" + str(ins.dst) + "] = r[" + str(ins.a) + "];\n")
+        } else if op == bc.CONSTANT {
+            cval := program.constant(ins.a) >>>
+            sb.write_str("    r[" + str(ins.dst) + "] = " + f64_hex_expr(cval) + "; init[" + str(ins.dst) + "] = 1;\n")
+        } else if op == bc.BOOLEAN {
+            $bval := "0.0"
+            if ins.a != 0 { bval = "1.0" }
+            sb.write_str("    r[" + str(ins.dst) + "] = " + bval + "; init[" + str(ins.dst) + "] = 1;\n")
+        } else if op == bc.LOAD_FIELD {
+            sb.write_str("    r[" + str(ins.dst) + "] = s[" + str(ins.a) + "]; init[" + str(ins.dst) + "] = 1;\n")
+        } else if op == bc.MOVE {
+            sb.write_str("    if (!init[" + str(ins.a) + "]) { return -4; }\n")
+            sb.write_str("    r[" + str(ins.dst) + "] = r[" + str(ins.a) + "]; init[" + str(ins.dst) + "] = 1;\n")
+        } else if op == bc.NEGATE {
+            sb.write_str("    if (!init[" + str(ins.a) + "]) { return -4; }\n")
+            sb.write_str("    { double v = -r[" + str(ins.a) + "]; if (!xu_valid_scalar(v)) { return -5; } r[" + str(ins.dst) + "] = v; init[" + str(ins.dst) + "] = 1; }\n")
+        } else if op == bc.NOT {
+            sb.write_str("    if (!init[" + str(ins.a) + "]) { return -4; }\n")
+            sb.write_str("    r[" + str(ins.dst) + "] = (r[" + str(ins.a) + "] == 0.0) ? 1.0 : 0.0; init[" + str(ins.dst) + "] = 1;\n")
+        } else if op == bc.DIVIDE {
+            sb.write_str("    if (!init[" + str(ins.a) + "] || !init[" + str(ins.b) + "]) { return -4; }\n")
+            sb.write_str("    if (r[" + str(ins.b) + "] == 0.0) { return -2; }\n")
+            sb.write_str("    { double v = r[" + str(ins.a) + "] / r[" + str(ins.b) + "]; if (!xu_valid_scalar(v)) { return -5; } r[" + str(ins.dst) + "] = v; init[" + str(ins.dst) + "] = 1; }\n")
+        } else if op == bc.ADD || op == bc.SUBTRACT || op == bc.MULTIPLY {
+            $sym := "+"
+            if op == bc.SUBTRACT { sym = "-" }
+            if op == bc.MULTIPLY { sym = "*" }
+            sb.write_str("    if (!init[" + str(ins.a) + "] || !init[" + str(ins.b) + "]) { return -4; }\n")
+            sb.write_str("    { double v = r[" + str(ins.a) + "] " + sym + " r[" + str(ins.b) + "]; if (!xu_valid_scalar(v)) { return -5; } r[" + str(ins.dst) + "] = v; init[" + str(ins.dst) + "] = 1; }\n")
+        } else if op == bc.MATH_UNARY {
+            sb.write_str("    if (!init[" + str(ins.b) + "]) { return -4; }\n")
+            if ins.a == bc.MATH_ABS {
+                sb.write_str("    { double v = fabs(r[" + str(ins.b) + "]); if (!xu_valid_scalar(v)) { return -5; } r[" + str(ins.dst) + "] = v; init[" + str(ins.dst) + "] = 1; }\n")
+            } else if ins.a == bc.MATH_SQRT {
+                sb.write_str("    if (r[" + str(ins.b) + "] < 0.0) { return -5; }\n")
+                sb.write_str("    { double v = sqrt(r[" + str(ins.b) + "]); if (!xu_valid_scalar(v)) { return -5; } r[" + str(ins.dst) + "] = v; init[" + str(ins.dst) + "] = 1; }\n")
+            } else if ins.a == bc.MATH_SIN || ins.a == bc.MATH_COS || ins.a == bc.MATH_FLOOR || ins.a == bc.MATH_CEIL {
+                $mfn := "sin"
+                if ins.a == bc.MATH_COS { mfn = "cos" }
+                if ins.a == bc.MATH_FLOOR { mfn = "floor" }
+                if ins.a == bc.MATH_CEIL { mfn = "ceil" }
+                sb.write_str("    { double v = " + mfn + "(r[" + str(ins.b) + "]); if (!xu_valid_scalar(v)) { return -5; } r[" + str(ins.dst) + "] = v; init[" + str(ins.dst) + "] = 1; }\n")
+            }
+        } else if op == bc.MIN || op == bc.MAX {
+            $mfn := "fmin"
+            if op == bc.MAX { mfn = "fmax" }
+            sb.write_str("    if (!init[" + str(ins.a) + "] || !init[" + str(ins.b) + "]) { return -4; }\n")
+            sb.write_str("    { double v = " + mfn + "(r[" + str(ins.a) + "], r[" + str(ins.b) + "]); if (!xu_valid_scalar(v)) { return -5; } r[" + str(ins.dst) + "] = v; init[" + str(ins.dst) + "] = 1; }\n")
+        } else if op >= bc.HOST_ARG {
+            >>> errors.new("XuScript AOT: host calls and coroutines require VM runtime")
+        } else if op >= bc.EQUAL && op <= bc.GREATER_EQUAL {
+            $cmp := "=="
+            if op == bc.NOT_EQUAL { cmp = "!=" }
+            if op == bc.LESS { cmp = "<" }
+            if op == bc.LESS_EQUAL { cmp = "<=" }
+            if op == bc.GREATER { cmp = ">" }
+            if op == bc.GREATER_EQUAL { cmp = ">=" }
+            sb.write_str("    if (!init[" + str(ins.a) + "] || !init[" + str(ins.b) + "]) { return -4; }\n")
+            sb.write_str("    r[" + str(ins.dst) + "] = (r[" + str(ins.a) + "] " + cmp + " r[" + str(ins.b) + "]) ? 1.0 : 0.0; init[" + str(ins.dst) + "] = 1;\n")
+        }
+    }
+    sb.write_str("    return -8;\n")
+    sb.write_str("}\n\n")
+    << 0
+}
+
+fn emit_c_source(program &bc.Module, native_module string, fn_prefix string) string {
+    field_n := program.field_count()
+    fn_n := program.function_count()
+    $sb := strings.new_byte_builder(4096)
+    sb.write_str("/* Generated by nexus script/aot; fingerprint=" + program.fingerprint() + " */\n")
+    sb.write_str("#include \"xu_native.h\"\n")
+    sb.write_str("#include <math.h>\n")
+    sb.write_str("#include <stdint.h>\n")
+    sb.write_str("#include <string.h>\n\n")
+    sb.write_str("#define API(name) XU_NATIVE_SYMBOL(xu_" + native_module + "_##name)\n\n")
+    sb.write_str("static inline double xu_bits_to_f64(xu_uint bits) {\n")
+    sb.write_str("    double d = 0.0;\n")
+    sb.write_str("    memcpy(&d, &bits, sizeof(double));\n")
+    sb.write_str("    return d;\n}\n")
+    sb.write_str("static inline xu_int xu_f64_to_bits(double d) {\n")
+    sb.write_str("    xu_int b = 0;\n")
+    sb.write_str("    memcpy(&b, &d, sizeof(double));\n")
+    sb.write_str("    return b;\n}\n")
+    sb.write_str("static inline int xu_valid_scalar(double v) {\n")
+    sb.write_str("    return isfinite(v) && fabs(v) <= 1000000000.0;\n}\n\n")
+
+    for i in 0:fn_n {
+        emit_c_function($&sb, program, i, fn_prefix) >>>
+    }
+
+    sb.write_str("xu_int API(" + fn_prefix + "call)(\n")
+    sb.write_str("    xu_int fn_index, xu_int arg_a_bits, xu_int arg_b_bits,\n")
+    sb.write_str("    xu_int budget, xu_int limit_bits, xu_int pending_sigs,\n")
+    sb.write_str("    const xu_i64_span_mut *state_bits, const xu_i64_span_mut *sig_out) {\n")
+    sb.write_str("    if (!state_bits || !sig_out || state_bits->len < " + str(field_n) + " || sig_out->len < 66) { return -1; }\n")
+    if field_n > 0 {
+        sb.write_str("    if (!state_bits->data) { return -1; }\n")
+    }
+    sb.write_str("    if (!sig_out->data) { return -1; }\n")
+    sb.write_str("    double a = xu_bits_to_f64((xu_uint)arg_a_bits);\n")
+    sb.write_str("    double b = xu_bits_to_f64((xu_uint)arg_b_bits);\n")
+    sb.write_str("    double lim = xu_bits_to_f64((xu_uint)limit_bits);\n")
+    sb.write_str("    if (!xu_valid_scalar(a) || !xu_valid_scalar(b) || budget < 1 || budget > 100000 || !xu_valid_scalar(lim) || lim <= 0.0) { return -1; }\n")
+    sb.write_str("    switch (fn_index) {\n")
+    for i in 0:fn_n {
+        sb.write_str("        case " + str(i) + ": return " + fn_prefix + "fn_" + str(i) + "(a, b, budget, lim, pending_sigs, state_bits->data, state_bits->data, sig_out->data);\n")
+    }
+    sb.write_str("        default: return -1;\n")
+    sb.write_str("    }\n}\n")
+    << sb.to_string()
+}
+
+fn emit_manifest(native_module string, fn_prefix string) string {
+    << "{\n  \"module\": \"" + native_module + "\",\n  \"abi\": \"xu-c-2\",\n  \"exports\": [\n" +
+       "    {\n      \"name\": \"" + fn_prefix + "call\",\n" +
+       "      \"params\": [\"int\", \"int\", \"int\", \"int\", \"int\", \"int\", \"i64_span_mut\", \"i64_span_mut\"],\n" +
+       "      \"ret\": \"int\"\n    }\n  ]\n}\n"
+}
+
+fn emit_wrapper_xu(program &bc.Module, native_module string, fn_prefix string) string {
+    phys_idx := program.physics_index()
+    field_n := program.field_count()
+    fn_n := program.function_count()
+    $sb := strings.new_byte_builder(4096)
+    sb.write_str("// Generated Dual-Track AOT Runner for XuScript module: " + program.name() + "\n")
+    sb.write_str("#" + native_module + "\n")
+    sb.write_str("vm #\"github.com/xulang-org/nexus/script/vm\"\n")
+    sb.write_str("bc #\"github.com/xulang-org/nexus/script/bytecode\"\n")
+    sb.write_str("#errors\n#math\n\n")
+    sb.write_str("pub const AOT_FINGERPRINT = \"" + program.fingerprint() + "\"\n\n")
+    sb.write_str("pub struct DualTrackRunner {\n")
+    sb.write_str("    use_aot bool\n")
+    sb.write_str("    fallback vm.Instance\n")
+    sb.write_str("    state_bits []int\n")
+    sb.write_str("    sig_buf []int\n")
+    sb.write_str("    pending []vm.SignalEvent\n")
+    sb.write_str("    epoch int\n")
+    sb.write_str("    calls int\n")
+    sb.write_str("    module bc.Module\n")
+    sb.write_str("}\n\n")
+    sb.write_str("pub fn new_dual_track(program bc.Module) DualTrackRunner {\n")
+    sb.write_str("    program.check() >>>\n")
+    sb.write_str("    if program.fingerprint() == AOT_FINGERPRINT {\n")
+    sb.write_str("        \$sbits := []int{}\n")
+    for i in 0:field_n {
+        f := program.field(i) >>>
+        sb.write_str("        sbits.push(math.float64_bits(" + f64_literal_xu(f.initial) + "))\n")
+    }
+    sb.write_str("        \$sbuf := []int{}\n")
+    sb.write_str("        for _ in 0:66 { sbuf.push(0) }\n")
+    sb.write_str("        << DualTrackRunner{use_aot: true, fallback: vm.Instance{}, state_bits: sbits, sig_buf: sbuf, pending: []vm.SignalEvent{}, epoch: 1, calls: 0, module: program}\n")
+    sb.write_str("    }\n")
+    sb.write_str("    raw := program.encode() >>>\n")
+    sb.write_str("    program_copy := bc.decode(&raw) >>>\n")
+    sb.write_str("    inst := vm.instantiate(program) >>>\n")
+    sb.write_str("    << DualTrackRunner{use_aot: false, fallback: inst, state_bits: []int{}, sig_buf: []int{}, pending: []vm.SignalEvent{}, epoch: 1, calls: 0, module: program_copy}\n")
+    sb.write_str("}\n\n")
+    sb.write_str("fn fail_aot(code int) int {\n")
+    sb.write_str("    if code == 0 { << 0 }\n")
+    sb.write_str("    if code == -2 { >>> errors.new(\"XuScript AOT: division by zero\") }\n")
+    sb.write_str("    if code == -3 { >>> errors.new(\"XuScript AOT: instruction budget exhausted\") }\n")
+    sb.write_str("    if code == -4 { >>> errors.new(\"XuScript AOT: read of uninitialized register\") }\n")
+    sb.write_str("    if code == -5 { >>> errors.new(\"XuScript AOT: non-finite or out-of-range scalar result\") }\n")
+    sb.write_str("    if code == -6 { >>> errors.new(\"XuScript AOT: callback result outside host bound\") }\n")
+    sb.write_str("    if code == -7 { >>> errors.new(\"XuScript AOT: signal outbox limit exceeded\") }\n")
+    sb.write_str("    >>> errors.new(\"XuScript AOT: execution failed (code=\" + str(code) + \")\")\n")
+    sb.write_str("}\n\n")
+    sb.write_str("pub fn (r \$&DualTrackRunner) execute(delta f64, axis f64, budget int, result_limit f64) f64 {\n")
+    sb.write_str("    if !r.use_aot {\n        fb := \$&r.fallback\n        << fb.execute(delta, axis, budget, result_limit) >>>\n    }\n")
+    if phys_idx >= 0 {
+        sb.write_str("    code := " + native_module + "." + fn_prefix + "call(" + str(phys_idx) + ", math.float64_bits(delta), math.float64_bits(axis), budget, math.float64_bits(result_limit), r.pending.len, \$&r.state_bits, \$&r.sig_buf)\n")
+        sb.write_str("    if code != 0 { fail_aot(code) >>> }\n")
+        sb.write_str("    sc := r.sig_buf[1]\n")
+        sb.write_str("    r.calls += 1\n")
+        sb.write_str("    for i in 0:sc {\n")
+        sb.write_str("        r.pending.push(vm.SignalEvent{id: r.sig_buf[2 + i * 2], value: math.float64_from_bits(r.sig_buf[3 + i * 2]), epoch: r.epoch, call: r.calls})\n")
+        sb.write_str("    }\n")
+        sb.write_str("    << math.float64_from_bits(r.sig_buf[0])\n")
+    } else {
+        sb.write_str("    >>> errors.new(\"XuScript AOT: module has no physics_process callback\")\n")
+    }
+    sb.write_str("}\n\n")
+    sb.write_str("pub fn (r \$&DualTrackRunner) invoke_handler(id int, value f64, budget int, result_limit f64) f64 {\n")
+    sb.write_str("    if !r.use_aot {\n        fb := \$&r.fallback\n        << fb.invoke_handler(id, value, budget, result_limit) >>>\n    }\n")
+    sb.write_str("    \$fn_idx := -1\n")
+    for i in 0:fn_n {
+        f := program.function(i) >>>
+        if f.kind == bc.SIGNAL_FUNCTION {
+            sb.write_str("    if id == " + str(f.id) + " { fn_idx = " + str(i) + " }\n")
+        }
+    }
+    sb.write_str("    if fn_idx < 0 { >>> errors.new(\"XuScript AOT: unknown signal handler ID\") }\n")
+    sb.write_str("    code := " + native_module + "." + fn_prefix + "call(fn_idx, math.float64_bits(value), 0, budget, math.float64_bits(result_limit), r.pending.len, \$&r.state_bits, \$&r.sig_buf)\n")
+    sb.write_str("    if code != 0 { fail_aot(code) >>> }\n")
+    sb.write_str("    sc := r.sig_buf[1]\n")
+    sb.write_str("    r.calls += 1\n")
+    sb.write_str("    for i in 0:sc {\n")
+    sb.write_str("        r.pending.push(vm.SignalEvent{id: r.sig_buf[2 + i * 2], value: math.float64_from_bits(r.sig_buf[3 + i * 2]), epoch: r.epoch, call: r.calls})\n")
+    sb.write_str("    }\n")
+    sb.write_str("    << math.float64_from_bits(r.sig_buf[0])\n")
+    sb.write_str("}\n\n")
+    sb.write_str("pub fn (r \$&DualTrackRunner) state(id int) f64 {\n")
+    sb.write_str("    if !r.use_aot { << r.fallback.state(id) >>> }\n")
+    sb.write_str("    idx := r.module.field_index(id)\n")
+    sb.write_str("    if idx < 0 { >>> errors.new(\"XuScript AOT: unknown field ID\") }\n")
+    sb.write_str("    << math.float64_from_bits(r.state_bits[idx])\n")
+    sb.write_str("}\n\n")
+    sb.write_str("pub fn (r \$&DualTrackRunner) set_state(id int, value f64) int {\n")
+    sb.write_str("    if !r.use_aot {\n        fb := \$&r.fallback\n        << fb.set_state(id, value) >>>\n    }\n")
+    sb.write_str("    idx := r.module.field_index(id)\n")
+    sb.write_str("    if idx < 0 || !bc.valid_scalar(value) { >>> errors.new(\"XuScript AOT: invalid state write\") }\n")
+    sb.write_str("    r.state_bits[idx] = math.float64_bits(value)\n")
+    sb.write_str("    << 0\n")
+    sb.write_str("}\n\n")
+    sb.write_str("pub fn (r \$&DualTrackRunner) drain_signals() []vm.SignalEvent {\n")
+    sb.write_str("    if !r.use_aot {\n        fb := \$&r.fallback\n        << fb.drain_signals() >>>\n    }\n")
+    sb.write_str("    \$out := []vm.SignalEvent{}\n")
+    sb.write_str("    for ev in r.pending { out.push(ev) }\n")
+    sb.write_str("    r.pending = []vm.SignalEvent{}\n")
+    sb.write_str("    << out\n")
+    sb.write_str("}\n\n")
+    sb.write_str("pub fn (r &DualTrackRunner) is_aot() bool { << r.use_aot }\n")
+    sb.write_str("pub fn (r &DualTrackRunner) calls() int { if r.use_aot { << r.calls } << r.fallback.calls() }\n")
+    sb.write_str("pub fn (r &DualTrackRunner) epoch() int { if r.use_aot { << r.epoch } << r.fallback.epoch() }\n\n")
+    sb.write_str("// Seamless hot-reload: preserves live state across AOT -> VM bytecode transition.\n")
+    sb.write_str("pub fn (r \$&DualTrackRunner) reload(candidate bc.Module) int {\n")
+    sb.write_str("    if !r.use_aot {\n        fb := \$&r.fallback\n        << fb.reload(candidate) >>>\n    }\n")
+    sb.write_str("    if candidate.fingerprint() == AOT_FINGERPRINT { << 0 }\n")
+    sb.write_str("    raw := r.module.encode() >>>\n")
+    sb.write_str("    \$inst := vm.instantiate(bc.decode(&raw) >>>) >>>\n")
+    sb.write_str("    for i in 0:r.module.field_count() {\n")
+    sb.write_str("        f := r.module.field(i) >>>\n")
+    sb.write_str("        inst.set_state(f.id, math.float64_from_bits(r.state_bits[i])) >>>\n")
+    sb.write_str("    }\n")
+    sb.write_str("    changed := inst.reload(candidate) >>>\n")
+    sb.write_str("    ep := inst.epoch()\n")
+    sb.write_str("    r.fallback = inst\n")
+    sb.write_str("    r.use_aot = false\n")
+    sb.write_str("    r.epoch = ep\n")
+    sb.write_str("    << changed\n")
+    sb.write_str("}\n")
+    << sb.to_string()
+}
+
+fn emit_static_xu(program &bc.Module, fn_prefix string) string {
+    reg_n := program.register_count()
+    field_n := program.field_count()
+    fn_n := program.function_count()
+    $sb := strings.new_byte_builder(4096)
+    sb.write_str("// Static pure-Xu AOT translation for module: " + program.name() + "\n")
+    sb.write_str("// Fingerprint: " + program.fingerprint() + "\n")
+    sb.write_str("#errors\n#math\n\n")
+    sb.write_str("pub fn " + fn_prefix + "run(fn_index int, arg_a f64, arg_b f64, budget int, result_limit f64, state \$&[]f64) f64 {\n")
+    sb.write_str("    if state.len < " + str(field_n) + " || budget < 1 || result_limit <= 0.0 { >>> errors.new(\"invalid AOT args\") }\n")
+    sb.write_str("    \$s := []f64{}\n")
+    sb.write_str("    for i in 0:" + str(field_n) + " { s.push(state[i]) }\n")
+    sb.write_str("    \$r := []f64{}\n    \$init := []bool{}\n")
+    sb.write_str("    for _ in 0:" + str(reg_n) + " { r.push(0.0)\n        init.push(false) }\n")
+    sb.write_str("    r[0] = arg_a\n    init[0] = true\n")
+    sb.write_str("    \$pc := 0\n    \$end_pc := 0\n")
+    for i in 0:fn_n {
+        f := program.function(i) >>>
+        sb.write_str("    if fn_index == " + str(i) + " {\n")
+        sb.write_str("        pc = " + str(f.entry) + "\n")
+        sb.write_str("        end_pc = " + str(f.end) + "\n")
+        if f.kind == bc.PHYSICS_FUNCTION {
+            sb.write_str("        r[1] = arg_b\n        init[1] = true\n")
+        }
+        sb.write_str("    }\n")
+    }
+    sb.write_str("    \$rem := budget\n")
+    sb.write_str("    while pc < end_pc {\n")
+    sb.write_str("        if rem <= 0 { >>> errors.new(\"budget exhausted\") }\n")
+    sb.write_str("        rem -= 1\n")
+    sb.write_str("        cur := pc\n        pc += 1\n")
+    for pc in 0:program.code_count() {
+        ins := program.instruction(pc) >>>
+        if pc == 0 {
+            sb.write_str("        if cur == 0 {\n")
+        } else {
+            sb.write_str("        } else if cur == " + str(pc) + " {\n")
+        }
+        op := ins.op
+        if op == bc.JUMP {
+            sb.write_str("            pc = " + str(ins.dst) + "\n")
+        } else if op == bc.BRANCH_FALSE {
+            sb.write_str("            if !init[" + str(ins.a) + "] { >>> errors.new(\"uninitialized register\") }\n")
+            sb.write_str("            if r[" + str(ins.a) + "] == 0.0 { pc = " + str(ins.dst) + " }\n")
+        } else if op == bc.RETURN {
+            sb.write_str("            if !init[" + str(ins.a) + "] { >>> errors.new(\"uninitialized register\") }\n")
+            sb.write_str("            res := r[" + str(ins.a) + "]\n")
+            sb.write_str("            if math.is_nan(res) || math.is_inf(res) || math.abs(res) > result_limit { >>> errors.new(\"host bound\") }\n")
+            sb.write_str("            for k in 0:" + str(field_n) + " { state[k] = s[k] }\n")
+            sb.write_str("            << res\n")
+        } else if op == bc.EMIT_SIGNAL {
+            sb.write_str("            if !init[" + str(ins.a) + "] { >>> errors.new(\"uninitialized register\") }\n")
+        } else if op == bc.STORE_FIELD {
+            sb.write_str("            if !init[" + str(ins.a) + "] { >>> errors.new(\"uninitialized register\") }\n")
+            sb.write_str("            s[" + str(ins.dst) + "] = r[" + str(ins.a) + "]\n")
+        } else if op == bc.CONSTANT {
+            cval := program.constant(ins.a) >>>
+            sb.write_str("            r[" + str(ins.dst) + "] = " + f64_literal_xu(cval) + "\n            init[" + str(ins.dst) + "] = true\n")
+        } else if op == bc.BOOLEAN {
+            $bval := "0.0"
+            if ins.a != 0 { bval = "1.0" }
+            sb.write_str("            r[" + str(ins.dst) + "] = " + bval + "\n            init[" + str(ins.dst) + "] = true\n")
+        } else if op == bc.LOAD_FIELD {
+            sb.write_str("            r[" + str(ins.dst) + "] = s[" + str(ins.a) + "]\n            init[" + str(ins.dst) + "] = true\n")
+        } else if op == bc.MOVE {
+            sb.write_str("            if !init[" + str(ins.a) + "] { >>> errors.new(\"uninitialized register\") }\n")
+            sb.write_str("            r[" + str(ins.dst) + "] = r[" + str(ins.a) + "]\n            init[" + str(ins.dst) + "] = true\n")
+        } else if op == bc.NEGATE {
+            sb.write_str("            if !init[" + str(ins.a) + "] { >>> errors.new(\"uninitialized register\") }\n")
+            sb.write_str("            r[" + str(ins.dst) + "] = -r[" + str(ins.a) + "]\n            init[" + str(ins.dst) + "] = true\n")
+        } else if op == bc.NOT {
+            sb.write_str("            if !init[" + str(ins.a) + "] { >>> errors.new(\"uninitialized register\") }\n")
+            sb.write_str("            r[" + str(ins.dst) + "] = 0.0\n            if r[" + str(ins.a) + "] == 0.0 { r[" + str(ins.dst) + "] = 1.0 }\n            init[" + str(ins.dst) + "] = true\n")
+        } else if op == bc.DIVIDE {
+            sb.write_str("            if !init[" + str(ins.a) + "] || !init[" + str(ins.b) + "] { >>> errors.new(\"uninitialized register\") }\n")
+            sb.write_str("            if r[" + str(ins.b) + "] == 0.0 { >>> errors.new(\"division by zero\") }\n")
+            sb.write_str("            r[" + str(ins.dst) + "] = r[" + str(ins.a) + "] / r[" + str(ins.b) + "]\n            init[" + str(ins.dst) + "] = true\n")
+        } else if op == bc.ADD || op == bc.SUBTRACT || op == bc.MULTIPLY {
+            $sym := "+"
+            if op == bc.SUBTRACT { sym = "-" }
+            if op == bc.MULTIPLY { sym = "*" }
+            sb.write_str("            if !init[" + str(ins.a) + "] || !init[" + str(ins.b) + "] { >>> errors.new(\"uninitialized register\") }\n")
+            sb.write_str("            r[" + str(ins.dst) + "] = r[" + str(ins.a) + "] " + sym + " r[" + str(ins.b) + "]\n            init[" + str(ins.dst) + "] = true\n")
+        } else if op == bc.MATH_UNARY {
+            sb.write_str("            if !init[" + str(ins.b) + "] { >>> errors.new(\"uninitialized register\") }\n")
+            if ins.a == bc.MATH_ABS {
+                sb.write_str("            r[" + str(ins.dst) + "] = math.abs(r[" + str(ins.b) + "])\n            init[" + str(ins.dst) + "] = true\n")
+            } else if ins.a == bc.MATH_SQRT {
+                sb.write_str("            if r[" + str(ins.b) + "] < 0.0 { >>> errors.new(\"sqrt of negative scalar\") }\n")
+                sb.write_str("            r[" + str(ins.dst) + "] = math.sqrt(r[" + str(ins.b) + "])\n            init[" + str(ins.dst) + "] = true\n")
+            } else {
+                $mfn := "math.sin"
+                if ins.a == bc.MATH_COS { mfn = "math.cos" }
+                if ins.a == bc.MATH_FLOOR { mfn = "math.floor" }
+                if ins.a == bc.MATH_CEIL { mfn = "math.ceil" }
+                sb.write_str("            r[" + str(ins.dst) + "] = " + mfn + "(r[" + str(ins.b) + "])\n            init[" + str(ins.dst) + "] = true\n")
+            }
+        } else if op == bc.MIN || op == bc.MAX {
+            $mfn := "math.min"
+            if op == bc.MAX { mfn = "math.max" }
+            sb.write_str("            if !init[" + str(ins.a) + "] || !init[" + str(ins.b) + "] { >>> errors.new(\"uninitialized register\") }\n")
+            sb.write_str("            r[" + str(ins.dst) + "] = " + mfn + "(r[" + str(ins.a) + "], r[" + str(ins.b) + "])\n            init[" + str(ins.dst) + "] = true\n")
+        } else if op >= bc.HOST_ARG {
+            >>> errors.new("XuScript AOT: host calls and coroutines require VM runtime")
+        } else if op >= bc.EQUAL && op <= bc.GREATER_EQUAL {
+            $cmp := "=="
+            if op == bc.NOT_EQUAL { cmp = "!=" }
+            if op == bc.LESS { cmp = "<" }
+            if op == bc.LESS_EQUAL { cmp = "<=" }
+            if op == bc.GREATER { cmp = ">" }
+            if op == bc.GREATER_EQUAL { cmp = ">=" }
+            sb.write_str("            if !init[" + str(ins.a) + "] || !init[" + str(ins.b) + "] { >>> errors.new(\"uninitialized register\") }\n")
+            sb.write_str("            r[" + str(ins.dst) + "] = 0.0\n            if r[" + str(ins.a) + "] " + cmp + " r[" + str(ins.b) + "] { r[" + str(ins.dst) + "] = 1.0 }\n            init[" + str(ins.dst) + "] = true\n")
+        }
+    }
+    if program.code_count() > 0 {
+        sb.write_str("        }\n")
+    }
+    sb.write_str("    }\n    >>> errors.new(\"callback did not return\")\n}\n")
+    << sb.to_string()
+}
+
+pub fn compile_aot(program &bc.Module, native_module string, fn_prefix string) AotBundle {
+    program.check() >>>
+    if !valid_c_ident(&native_module) || !valid_c_ident(&fn_prefix) {
+        >>> errors.new("XuScript AOT: native_module and fn_prefix must be valid C identifiers")
+    }
+    c_src := emit_c_source(program, native_module + "", fn_prefix + "") >>>
+    man := emit_manifest(native_module + "", fn_prefix + "")
+    wrap := emit_wrapper_xu(program, native_module + "", fn_prefix + "") >>>
+    sxu := emit_static_xu(program, fn_prefix + "") >>>
+    << AotBundle{
+        fingerprint: program.fingerprint(),
+        native_module: native_module,
+        fn_prefix: fn_prefix,
+        c_source: c_src,
+        manifest_json: man,
+        wrapper_xu: wrap,
+        static_xu: sxu
+    }
+}

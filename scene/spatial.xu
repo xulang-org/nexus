@@ -35,9 +35,13 @@ fn (tree $&SceneTree) allocate_spatial(index int, kind int) {
         if component < 0 {
             component = tree.spatial_2d.len
             tree.spatial_2d.push(empty)
+            tree.world_2d.push(fm.identity())
+            tree.dirty_2d.push(true)
         } else {
             tree.free_2d = tree.spatial_2d[component].free_next
             tree.spatial_2d[component] = empty
+            tree.world_2d[component] = fm.identity()
+            tree.dirty_2d[component] = true
         }
         tree.slots[index].spatial = component
     }
@@ -48,9 +52,13 @@ fn (tree $&SceneTree) allocate_spatial(index int, kind int) {
         if component < 0 {
             component = tree.spatial_3d.len
             tree.spatial_3d.push(empty)
+            tree.world_3d.push(fm.identity_3d())
+            tree.dirty_3d.push(true)
         } else {
             tree.free_3d = tree.spatial_3d[component].free_next
             tree.spatial_3d[component] = empty
+            tree.world_3d[component] = fm.identity_3d()
+            tree.dirty_3d[component] = true
         }
         tree.slots[index].spatial = component
     }
@@ -60,10 +68,12 @@ fn (tree $&SceneTree) release_spatial(index int) {
     component := tree.slots[index].spatial
     if kind == NODE_2D {
         tree.spatial_2d[component].free_next = tree.free_2d
+        tree.dirty_2d[component] = true
         tree.free_2d = component
     }
     if kind == NODE_3D {
         tree.spatial_3d[component].free_next = tree.free_3d
+        tree.dirty_3d[component] = true
         tree.free_3d = component
     }
     tree.slots[index].spatial = -1
@@ -72,26 +82,140 @@ fn (tree &SceneTree) require_spatial(index int, kind int) int {
     if tree.slots[index].kind != kind { >>> errors.new("nexus: node has the wrong spatial dimension") }
     << tree.slots[index].spatial
 }
+fn (tree $&SceneTree) mark_dirty_subtree_kind(start int, target_kind int, stop_kind int) {
+    $queue := [start]
+    $head := 0
+    while head < queue.len {
+        node := queue[head]
+        head += 1
+        kind := tree.slots[node].kind
+        if kind == stop_kind { -> }
+        if kind == target_kind {
+            comp := tree.slots[node].spatial
+            $already := false
+            if target_kind == NODE_2D {
+                already = tree.dirty_2d[comp]
+                tree.dirty_2d[comp] = true
+            } else {
+                already = tree.dirty_3d[comp]
+                tree.dirty_3d[comp] = true
+            }
+            tree.transforms_dirty = true
+            if already && node != start { -> }
+        }
+        $child := tree.slots[node].first_child
+        while child >= 0 {
+            queue.push(child)
+            child = tree.slots[child].next
+        }
+    }
+}
+fn (tree $&SceneTree) mark_dirty_subtree_2d(start int) { tree.mark_dirty_subtree_kind(start, NODE_2D, NODE_3D) }
+fn (tree $&SceneTree) mark_dirty_subtree_3d(start int) { tree.mark_dirty_subtree_kind(start, NODE_3D, NODE_2D) }
+fn (tree &SceneTree) parent_cached_2d(start int) fm.Transform2D {
+    $p := tree.slots[start].parent
+    while p >= 0 {
+        kind := tree.slots[p].kind
+        if kind == NODE_3D { << fm.identity() }
+        if kind == NODE_2D { << tree.world_2d[tree.slots[p].spatial] }
+        p = tree.slots[p].parent
+    }
+    << fm.identity()
+}
+fn (tree &SceneTree) parent_cached_3d(start int) fm.Mat4 {
+    $p := tree.slots[start].parent
+    while p >= 0 {
+        kind := tree.slots[p].kind
+        if kind == NODE_2D { << fm.identity_3d() }
+        if kind == NODE_3D { << tree.world_3d[tree.slots[p].spatial] }
+        p = tree.slots[p].parent
+    }
+    << fm.identity_3d()
+}
+// Topological pre-order SoA transform update over only dirty spatial components.
+pub fn (tree $&SceneTree) flush_transforms() int {
+    if !tree.transforms_dirty { << 0 }
+    $updated := 0
+    $index := 0
+    while true {
+        kind := tree.slots[index].kind
+        if kind == NODE_2D {
+            comp := tree.slots[index].spatial
+            if tree.dirty_2d[comp] {
+                world := tree.parent_cached_2d(index).multiply(tree.spatial_2d[comp].local)
+                if !world.is_finite() { >>> errors.new("nexus: global 2D transform overflow") }
+                tree.world_2d[comp] = world
+                tree.dirty_2d[comp] = false
+                updated += 1
+            }
+        } else if kind == NODE_3D {
+            comp := tree.slots[index].spatial
+            if tree.dirty_3d[comp] {
+                world := tree.parent_cached_3d(index).multiply(tree.spatial_3d[comp].local)
+                if !world.is_affine() { >>> errors.new("nexus: global 3D transform overflow") }
+                tree.world_3d[comp] = world
+                tree.dirty_3d[comp] = false
+                updated += 1
+            }
+        }
+        if tree.slots[index].first_child >= 0 {
+            index = tree.slots[index].first_child
+            ->
+        }
+        while index != 0 && tree.slots[index].next < 0 { index = tree.slots[index].parent }
+        if index == 0 { <- }
+        index = tree.slots[index].next
+    }
+    tree.transforms_dirty = false
+    << updated
+}
+pub fn (tree &SceneTree) is_transform_dirty_3d(id int) bool {
+    index := tree.index(id) >>>
+    comp := tree.require_spatial(index, NODE_3D) >>>
+    << tree.dirty_3d[comp]
+}
 // Groups are transparent; crossing the other spatial dimension starts a new space.
 fn (tree &SceneTree) inherited_2d(start int) fm.Transform2D {
+    if tree.slots[start].kind == NODE_2D {
+        c0 := tree.slots[start].spatial
+        if !tree.dirty_2d[c0] { << tree.world_2d[c0] }
+    }
     $index := start
     $result := fm.identity()
     while index >= 0 {
         kind := tree.slots[index].kind
         if kind == NODE_3D { <- }
-        if kind == NODE_2D { result = tree.spatial_2d[tree.slots[index].spatial].local.multiply(result) }
+        if kind == NODE_2D {
+            comp := tree.slots[index].spatial
+            if !tree.dirty_2d[comp] {
+                result = tree.world_2d[comp].multiply(result)
+                <-
+            }
+            result = tree.spatial_2d[comp].local.multiply(result)
+        }
         index = tree.slots[index].parent
     }
     if !result.is_finite() { >>> errors.new("nexus: global 2D transform overflow") }
     << result
 }
 fn (tree &SceneTree) inherited_3d(start int) fm.Mat4 {
+    if tree.slots[start].kind == NODE_3D {
+        c0 := tree.slots[start].spatial
+        if !tree.dirty_3d[c0] { << tree.world_3d[c0] }
+    }
     $index := start
     $result := fm.identity_3d()
     while index >= 0 {
         kind := tree.slots[index].kind
         if kind == NODE_2D { <- }
-        if kind == NODE_3D { result = tree.spatial_3d[tree.slots[index].spatial].local.multiply(result) }
+        if kind == NODE_3D {
+            comp := tree.slots[index].spatial
+            if !tree.dirty_3d[comp] {
+                result = tree.world_3d[comp].multiply(result)
+                <-
+            }
+            result = tree.spatial_3d[comp].local.multiply(result)
+        }
         index = tree.slots[index].parent
     }
     if !result.is_affine() { >>> errors.new("nexus: global 3D transform overflow") }
@@ -115,6 +239,7 @@ pub fn (tree $&SceneTree) set_transform_3d(id int, value fm.Mat4) int {
     component := tree.require_spatial(index, NODE_3D) >>>
     if !value.is_affine() { >>> errors.new("nexus: 3D node transform must be a finite affine matrix") }
     tree.spatial_3d[component].local = value
+    tree.mark_dirty_subtree_3d(index)
     << 0
 }
 pub fn (tree $&SceneTree) set_position_3d(id int, position fm.Vec3) int {
@@ -122,5 +247,6 @@ pub fn (tree $&SceneTree) set_position_3d(id int, position fm.Vec3) int {
     component := tree.require_spatial(index, NODE_3D) >>>
     if !position.is_finite() { >>> errors.new("nexus: 3D position must be finite") }
     tree.spatial_3d[component].local.c3 = fm.vec4(position.x, position.y, position.z, 1.0)
+    tree.mark_dirty_subtree_3d(index)
     << 0
 }

@@ -1,0 +1,46 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct CompositeParams {
+    float4 gains; // x=ao_strength, y=ssr_strength, z=bloom_intensity, w=exposure
+    float4 mode;  // x=aces_enabled, y=width, z=height, w=0
+};
+
+struct FragIn {
+    float4 position [[position]];
+    float2 uv;
+};
+
+static inline float srgb_channel(float value) {
+    return value <= 0.0031308 ? 12.92 * value : 1.055 * pow(value, 1.0 / 2.4) - 0.055;
+}
+
+static inline float3 aces_filmic(float3 x) {
+    float3 a = x * (2.51 * x + 0.03);
+    float3 b = x * (2.43 * x + 0.59) + 0.14;
+    return clamp(a / max(b, float3(1e-6)), float3(0.0), float3(1.0));
+}
+
+fragment float4 main0(
+    FragIn in [[stage_in]],
+    texture2d<float> hdr_tex [[texture(0)]],
+    texture2d<float> ao_tex [[texture(1)]],
+    texture2d<float> ssr_tex [[texture(2)]],
+    texture2d<float> bloom_tex [[texture(3)]],
+    sampler hdr_sampler [[sampler(0)]],
+    sampler ao_sampler [[sampler(1)]],
+    sampler ssr_sampler [[sampler(2)]],
+    sampler bloom_sampler [[sampler(3)]],
+    constant CompositeParams& params [[buffer(0)]]
+) {
+    float3 hdr = hdr_tex.sample(hdr_sampler, in.uv, level(0.0)).rgb;
+    float ao = ao_tex.sample(ao_sampler, in.uv, level(0.0)).r;
+    float4 ssr = ssr_tex.sample(ssr_sampler, in.uv, level(0.0));
+    float3 bloom = bloom_tex.sample(bloom_sampler, in.uv, level(0.0)).rgb;
+
+    float ao_factor = mix(1.0, ao, clamp(params.gains.x, 0.0, 1.0));
+    float3 combined = hdr * ao_factor + ssr.rgb * (ssr.a * params.gains.y) + bloom * params.gains.z;
+    float3 exposed = max(combined * params.gains.w, float3(0.0));
+    float3 mapped = params.mode.x > 0.5 ? aces_filmic(exposed) : (exposed / (1.0 + exposed));
+    return float4(srgb_channel(mapped.x), srgb_channel(mapped.y), srgb_channel(mapped.z), 1.0);
+}

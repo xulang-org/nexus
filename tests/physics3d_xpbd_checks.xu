@@ -1,0 +1,97 @@
+@main
+
+#math
+#time
+fm #"github.com/xulang-org/nexus/foundation/math"
+phys #"github.com/xulang-org/nexus/physics3d"
+
+fn run() int {
+    // 1. Stiff 16-link XPBD pendulum chain: zero visible stretch & energy stability over 120 frames.
+    floor_box := fm.aabb3(fm.vec3(-20.0, -2.0, -20.0), fm.vec3(20.0, 0.0, 20.0)) >>>
+    $chain_world := phys.new_xpbd_world_3d(fm.vec3(0.0, -9.81, 0.0), 0.02, &[floor_box], &[1], &[]phys.StaticTriangle3D{}) >>>
+    $chain_ids := []int{}
+    $cids := []int{}
+    link_len := 0.25
+    for i in 0:17 {
+        $m := 1.0
+        if i == 0 { m = 0.0 }
+        id := chain_world.add_particle(fm.vec3(f64(i) * link_len, 6.0, 0.0), 0.05, m, 0.0, 0.2, 1, 1) >>>
+        chain_ids.push(id)
+        if i > 0 {
+            cid := chain_world.add_distance_constraint(chain_ids[i - 1], id, link_len, 0.0) >>>
+            cids.push(cid)
+        }
+    }
+    for _ in 0:120 {
+        chain_world.step(1.0 / 60.0, 8, 4) >>>
+    }
+    $max_stretch := 0.0
+    for cid in cids {
+        e := chain_world.constraint_error(cid)
+        if e > max_stretch { max_stretch = e }
+    }
+    tip_pos := chain_world.position(chain_ids[16]) >>>
+    // Tip stays bounded within chain length below anchor (6.0 - 16*0.25 = 2.0 min Y) and zero stretch!
+    assert(max_stretch < 0.005)
+    assert(tip_pos.y > 1.8 && tip_pos.y < 6.0 && tip_pos.x < 3.5)
+
+    // 2. 8x8 Cloth grid draping onto sloped static triangle BVH mesh without tunneling!
+    tri0 := phys.static_triangle_3d(fm.vec3(-4.0, 0.0, -4.0), fm.vec3(4.0, 0.0, 4.0), fm.vec3(4.0, 1.2, -4.0), 1) >>>
+    tri1 := phys.static_triangle_3d(fm.vec3(-4.0, 0.0, -4.0), fm.vec3(-4.0, 1.2, 4.0), fm.vec3(4.0, 0.0, 4.0), 1) >>>
+    tris := [tri0, tri1]
+    $cloth_world := phys.new_xpbd_world_3d(fm.vec3(0.0, -9.81, 0.0), 0.08, &[floor_box], &[1], &tris) >>>
+    cloth_ids := cloth_world.add_cloth_grid(
+        fm.vec3(-1.4, 3.0, -1.4),
+        fm.vec3(0.4, 0.0, 0.0),
+        fm.vec3(0.0, 0.0, 0.4),
+        8, 8, 0.06, 0.25, 0.0001, 0.002, true, 1, 1
+    ) >>>
+    assert(cloth_ids.len == 64 && cloth_world.constraint_count() > 200)
+    t0 := time.now()
+    for _ in 0:90 {
+        cloth_world.step(1.0 / 60.0, 6, 3) >>>
+    }
+    cloth_us := (time.now() - t0) / 1000
+    // Pinned corners stay at y=3.0; center cloth drapes downward onto floor/triangles above y >= 0.0!
+    assert(math.abs((cloth_world.position(cloth_ids[0]) >>>).y - 3.0) < 1e-6)
+    center_p := cloth_world.position(cloth_ids[3 * 8 + 3]) >>>
+    bottom_p := cloth_world.position(cloth_ids[7 * 8 + 4]) >>>
+    assert(center_p.y < 2.6 && center_p.y >= 0.0)
+    assert(bottom_p.y >= 0.0)
+
+    // 3. 8-tall XPBD Rigid Box Stack stability test (180 frames at 60Hz, zero interpenetration collapse).
+    $stack_world := phys.new_xpbd_world_3d(fm.vec3(0.0, -9.81, 0.0), 0.15, &[floor_box], &[1], &[]phys.StaticTriangle3D{}) >>>
+    $boxes := []int{}
+    for k in 0:8 {
+        bid := stack_world.add_box(fm.vec3(0.0, 0.5 + f64(k) * 1.0, 0.0), fm.vec3(0.5, 0.5, 0.5), 1.0, 0.0, 0.8, 1, 1) >>>
+        boxes.push(bid)
+    }
+    for _ in 0:180 {
+        stack_world.step(1.0 / 60.0, 8, 4) >>>
+    }
+    for k in 0:8 {
+        expected_y := 0.5 + f64(k) * 1.0
+        actual_y := (stack_world.position(boxes[k]) >>>).y
+        assert(math.abs(actual_y - expected_y) < 0.02)
+    }
+
+    // 4. Ball/Tether ragdoll reach constraint check.
+    $rag := phys.new_xpbd_world_3d(fm.vec3(0.0, -9.81, 0.0), 0.05, &[floor_box], &[1], &[]phys.StaticTriangle3D{}) >>>
+    pelvis := rag.add_particle(fm.vec3(0.0, 5.0, 0.0), 0.1, 0.0, 0.0, 0.2, 1, 1) >>>
+    limb := rag.add_particle(fm.vec3(0.0, 4.2, 0.0), 0.1, 1.0, 0.0, 0.2, 1, 1) >>>
+    tc := rag.add_tether_constraint(pelvis, limb, 1.2, 0.0) >>>
+    for _ in 0:60 { rag.step(1.0 / 60.0, 6, 3) >>> }
+    assert(rag.constraint_error(tc) < 0.002)
+    assert((rag.position(limb) >>>).y >= 3.79)
+
+    println("PASS: XPBD physics (16-link stretch=" + str(int(max_stretch * 1000000.0)) +
+        "nm, 64-node cloth x90 frames=" + str(cloth_us) + "us, 8-box stack error < 0.02, tether verified)")
+    << 0
+}
+
+fn main() int {
+    << run() >>> (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

@@ -62,6 +62,9 @@ pub struct RigidWorld3D {
     box_bounds []fm.Aabb3
     ramp_bounds []fm.Aabb3
     triangle_bounds []fm.Aabb3
+    box_bvh StaticBvh3D
+    ramp_bvh StaticBvh3D
+    triangle_bvh StaticBvh3D
 }
 
 struct NarrowContact {
@@ -232,9 +235,12 @@ pub fn new_rigid_world(gravity fm.Vec3, boxes []StaticBox3D, ramps []StaticRamp3
         check_triangle(tri) >>>
         triangle_bounds.push(triangle_bounds_unchecked(tri))
     }
+    box_bvh := build_static_bvh(&box_bounds)
+    ramp_bvh := build_static_bvh(&ramp_bounds)
+    triangle_bvh := build_static_bvh(&triangle_bounds)
     << RigidWorld3D{gravity: gravity, boxes: boxes, ramps: ramps, triangles: triangles,
         bodies: []RigidBody3D{}, box_bounds: box_bounds, ramp_bounds: ramp_bounds,
-        triangle_bounds: triangle_bounds}
+        triangle_bounds: triangle_bounds, box_bvh: box_bvh, ramp_bvh: ramp_bvh, triangle_bvh: triangle_bvh}
 }
 
 fn (world &RigidWorld3D) check_body_index(index int) int {
@@ -612,48 +618,51 @@ fn sweep_box_ramp_ccd(pos fm.Vec3, half fm.Vec3, motion fm.Vec3, ramp StaticRamp
 
 fn ccd_sweep_static(world &RigidWorld3D, body RigidBody3D, motion fm.Vec3) SweepHit3D {
     swept := swept_aabb(body_bounds_unchecked(body), motion)
+    box_cands := world.box_bvh.query_aabb(swept, &world.box_bounds)
+    ramp_cands := world.ramp_bvh.query_aabb(swept, &world.ramp_bounds)
+    tri_cands := world.triangle_bvh.query_aabb(swept, &world.triangle_bounds)
     $best := capsule_miss()
     if body.kind == SHAPE_SPHERE {
         sphere := Capsule3D{center: body.position, radius: body.radius, half_segment: 0.0}
-        for i in 0:world.boxes.len {
+        for i in box_cands {
             box := world.boxes[i]
-            if box.trigger || (box.layer & body.mask) == 0 || !aabb_overlap(swept, world.box_bounds[i]) { -> }
+            if box.trigger || (box.layer & body.mask) == 0 { -> }
             hit := sweep_hull(sphere, motion, capsule_hull(box.bounds, 0, 0.0)) >>> (err) { -> }
             if hit.hit && !hit.started_overlapping && (!best.hit || hit.time < best.time) { best = hit }
         }
-        for i in 0:world.ramps.len {
+        for i in ramp_cands {
             ramp := world.ramps[i]
-            if (ramp.layer & body.mask) == 0 || !aabb_overlap(swept, world.ramp_bounds[i]) { -> }
+            if (ramp.layer & body.mask) == 0 { -> }
             hit := sweep_hull(sphere, motion, capsule_hull(ramp.bounds, ramp.direction, 0.0)) >>> (err) { -> }
             if hit.hit && !hit.started_overlapping && (!best.hit || hit.time < best.time) { best = hit }
         }
-        for i in 0:world.triangles.len {
+        for i in tri_cands {
             tri := world.triangles[i]
-            if (tri.layer & body.mask) == 0 || !aabb_overlap(swept, world.triangle_bounds[i]) { -> }
+            if (tri.layer & body.mask) == 0 { -> }
             hit := sweep_capsule_triangle_unchecked(sphere, motion, tri) >>> (err) { -> }
             if hit.hit && !hit.started_overlapping && (!best.hit || hit.time < best.time) { best = hit }
         }
         << best
     }
     box_aabb := body_bounds_unchecked(body)
-    for i in 0:world.boxes.len {
+    for i in box_cands {
         box := world.boxes[i]
-        if box.trigger || (box.layer & body.mask) == 0 || !aabb_overlap(swept, world.box_bounds[i]) { -> }
+        if box.trigger || (box.layer & body.mask) == 0 { -> }
         if intersects_open(box_aabb, box.bounds) { -> }
         cast := cast_box(box_aabb, motion, box.bounds, false)
         if cast.hit && (!best.hit || cast.time < best.time) {
             best = SweepHit3D{hit: true, time: cast.time, normal: cast.normal, started_overlapping: false}
         }
     }
-    for i in 0:world.ramps.len {
+    for i in ramp_cands {
         ramp := world.ramps[i]
-        if (ramp.layer & body.mask) == 0 || !aabb_overlap(swept, world.ramp_bounds[i]) { -> }
+        if (ramp.layer & body.mask) == 0 { -> }
         hit := sweep_box_ramp_ccd(body.position, body.half_extents, motion, ramp)
         if hit.hit && !hit.started_overlapping && (!best.hit || hit.time < best.time) { best = hit }
     }
-    for i in 0:world.triangles.len {
+    for i in tri_cands {
         tri := world.triangles[i]
-        if (tri.layer & body.mask) == 0 || !aabb_overlap(swept, world.triangle_bounds[i]) { -> }
+        if (tri.layer & body.mask) == 0 { -> }
         hit := sweep_box_triangle_ccd(body.position, body.half_extents, motion, tri, world.triangle_bounds[i])
         if hit.hit && !hit.started_overlapping && (!best.hit || hit.time < best.time) { best = hit }
     }
@@ -751,40 +760,39 @@ pub fn (world $&RigidWorld3D) step(dt f64, substeps int, iterations int) RigidSt
             world.bodies[i] = body
         }
 
-        // 2. Broadphase AABB culling, pre-contact island waking, and narrowphase contact generation.
+        // 2. SAP & BVH Broadphase culling, pre-contact island waking, and narrowphase contact generation.
         $body_aabbs := []fm.Aabb3{}
         for i in 0:world.bodies.len {
             body_aabbs.push(body_bounds_unchecked(world.bodies[i]))
         }
-        // Wake sleeping islands before static contact gathering when hit by an awake moving body
-        // or a moving kinematic body. Bodies that remain asleep are treated as immovable (inv_mass=0)
-        // for this substep so they never drift without static support contacts.
-        for i in 0:world.bodies.len {
-            for j in i + 1:world.bodies.len {
-                a := world.bodies[i]
-                b := world.bodies[j]
-                if a.sleeping == b.sleeping { -> }
-                if !a.is_dynamic() && !b.is_dynamic() { -> }
-                if (a.layer & b.mask) == 0 || (b.layer & a.mask) == 0 { -> }
-                if !aabb_overlap(body_aabbs[i], body_aabbs[j]) { -> }
-                kinematic_push := (!a.is_dynamic() && a.velocity.dot(a.velocity) > 0.0) ||
-                    (!b.is_dynamic() && b.velocity.dot(b.velocity) > 0.0)
-                if (kinematic_push || a.velocity.sub(b.velocity).length() > wake_speed()) && body_vs_body(a, b).hit {
-                    if a.sleeping { world.wake_island(i) }
-                    if b.sleeping { world.wake_island(j) }
-                }
+        sap_pairs := sap_broadphase_pairs(&body_aabbs)
+        $pidx := 0
+        while pidx < sap_pairs.len {
+            i := sap_pairs[pidx]
+            j := sap_pairs[pidx + 1]
+            pidx += 2
+            a := world.bodies[i]
+            b := world.bodies[j]
+            if a.sleeping == b.sleeping { -> }
+            if !a.is_dynamic() && !b.is_dynamic() { -> }
+            if (a.layer & b.mask) == 0 || (b.layer & a.mask) == 0 { -> }
+            kinematic_push := (!a.is_dynamic() && a.velocity.dot(a.velocity) > 0.0) ||
+                (!b.is_dynamic() && b.velocity.dot(b.velocity) > 0.0)
+            if (kinematic_push || a.velocity.sub(b.velocity).length() > wake_speed()) && body_vs_body(a, b).hit {
+                if a.sleeping { world.wake_island(i) }
+                if b.sleeping { world.wake_island(j) }
             }
         }
         $contacts := []SolverContact{}
 
-        // 2a. Body vs static colliders.
+        // 2a. Body vs static colliders via BVH broadphase.
         for i in 0:world.bodies.len {
             body := world.bodies[i]
             if !body.is_dynamic() || body.sleeping { -> }
             bb := body_aabbs[i]
-            for j in 0:world.boxes.len {
+            for j in world.box_bvh.query_aabb(bb, &world.box_bounds) {
                 box := world.boxes[j]
-                if box.trigger || (box.layer & body.mask) == 0 || !aabb_overlap(bb, world.box_bounds[j]) { -> }
+                if box.trigger || (box.layer & body.mask) == 0 { -> }
                 total_pairs += 1
                 $hit := no_narrow()
                 if body.kind == SHAPE_SPHERE {
@@ -798,9 +806,9 @@ pub fn (world $&RigidWorld3D) step(dt f64, substeps int, iterations int) RigidSt
                     contacts.push(make_solver_contact(i, -1, hit, body, body.restitution, body.friction, zero()))
                 }
             }
-            for j in 0:world.ramps.len {
+            for j in world.ramp_bvh.query_aabb(bb, &world.ramp_bounds) {
                 ramp := world.ramps[j]
-                if (ramp.layer & body.mask) == 0 || !aabb_overlap(bb, world.ramp_bounds[j]) { -> }
+                if (ramp.layer & body.mask) == 0 { -> }
                 total_pairs += 1
                 $hit := no_narrow()
                 if body.kind == SHAPE_SPHERE {
@@ -812,9 +820,9 @@ pub fn (world $&RigidWorld3D) step(dt f64, substeps int, iterations int) RigidSt
                     contacts.push(make_solver_contact(i, -1, hit, body, body.restitution, body.friction, zero()))
                 }
             }
-            for j in 0:world.triangles.len {
+            for j in world.triangle_bvh.query_aabb(bb, &world.triangle_bounds) {
                 tri := world.triangles[j]
-                if (tri.layer & body.mask) == 0 || !aabb_overlap(bb, world.triangle_bounds[j]) { -> }
+                if (tri.layer & body.mask) == 0 { -> }
                 total_pairs += 1
                 $hit := no_narrow()
                 if body.kind == SHAPE_SPHERE {
@@ -828,20 +836,21 @@ pub fn (world $&RigidWorld3D) step(dt f64, substeps int, iterations int) RigidSt
             }
         }
 
-        // 2b. Body vs Body pairs.
-        for i in 0:world.bodies.len {
-            for j in i + 1:world.bodies.len {
-                a := world.bodies[i]
-                b := world.bodies[j]
-                if !a.is_dynamic() && !b.is_dynamic() { -> }
-                if a.sleeping && b.sleeping { -> }
-                if (a.layer & b.mask) == 0 || (b.layer & a.mask) == 0 { -> }
-                if !aabb_overlap(body_aabbs[i], body_aabbs[j]) { -> }
-                total_pairs += 1
-                hit := body_vs_body(a, b)
-                if !hit.hit { -> }
-                contacts.push(make_solver_contact(i, j, hit, world.bodies[i], b.restitution, b.friction, b.velocity))
-            }
+        // 2b. Body vs Body pairs via SAP broadphase.
+        pidx = 0
+        while pidx < sap_pairs.len {
+            i := sap_pairs[pidx]
+            j := sap_pairs[pidx + 1]
+            pidx += 2
+            a := world.bodies[i]
+            b := world.bodies[j]
+            if !a.is_dynamic() && !b.is_dynamic() { -> }
+            if a.sleeping && b.sleeping { -> }
+            if (a.layer & b.mask) == 0 || (b.layer & a.mask) == 0 { -> }
+            total_pairs += 1
+            hit := body_vs_body(a, b)
+            if !hit.hit { -> }
+            contacts.push(make_solver_contact(i, j, hit, world.bodies[i], b.restitution, b.friction, b.velocity))
         }
 
         total_contacts += contacts.len
@@ -969,9 +978,9 @@ pub fn (world &RigidWorld3D) body_triggers(index int) []int {
     body := world.bodies[index]
     bb := body_bounds_unchecked(body)
     $hits := []int{}
-    for i in 0:world.boxes.len {
+    for i in world.box_bvh.query_aabb(bb, &world.box_bounds) {
         box := world.boxes[i]
-        if !box.trigger || (box.layer & body.mask) == 0 || !aabb_overlap(bb, box.bounds) { -> }
+        if !box.trigger || (box.layer & body.mask) == 0 { -> }
         if body.kind == SHAPE_SPHERE {
             if sphere_vs_aabb(body.position, body.radius, box.bounds).hit { hits.push(i) }
         } else {
@@ -1015,7 +1024,7 @@ pub fn (world &RigidWorld3D) raycast_all(origin fm.Vec3, direction fm.Vec3, dist
     $best_time := 1.0
     $best_normal := zero()
 
-    for i in 0:world.boxes.len {
+    for i in world.box_bvh.query_ray(origin, motion) {
         box := world.boxes[i]
         if box.trigger || (box.layer & mask) == 0 { -> }
         if box.bounds.contains(origin) >>> {
@@ -1030,7 +1039,7 @@ pub fn (world &RigidWorld3D) raycast_all(origin fm.Vec3, direction fm.Vec3, dist
             best_normal = cand.normal
         }
     }
-    for i in 0:world.ramps.len {
+    for i in world.ramp_bvh.query_ray(origin, motion) {
         ramp := world.ramps[i]
         if (ramp.layer & mask) == 0 { -> }
         cand := ray_ramp_cast(origin, unit, distance, ramp)
@@ -1045,7 +1054,7 @@ pub fn (world &RigidWorld3D) raycast_all(origin fm.Vec3, direction fm.Vec3, dist
             best_normal = cand.normal
         }
     }
-    for i in 0:world.triangles.len {
+    for i in world.triangle_bvh.query_ray(origin, motion) {
         tri := world.triangles[i]
         if (tri.layer & mask) == 0 { -> }
         cand := ray_triangle_cast(origin, unit, distance, tri, world.triangle_bounds[i])

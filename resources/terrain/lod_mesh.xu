@@ -1,0 +1,266 @@
+@"github.com/xulang-org/nexus/resources/terrain"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+#errors
+#math
+
+pub struct TerrainChunkSpec {
+    pub chunk_x int
+    pub chunk_z int
+    pub start_x int
+    pub start_z int
+    pub cells_x int
+    pub cells_z int
+    pub lod int
+    pub skirt_depth f64
+    pub bake_splat_tint bool
+}
+
+fn perp_unit_tangent(normal fm.Vec3) fm.Vec4 {
+    $ref_t := fm.vec3(1.0, 0.0, 0.0)
+    if math.abs(normal.x) > 0.92 {
+        ref_t = fm.vec3(0.0, 0.0, 1.0)
+    }
+    proj := ref_t.sub(normal.scaled(ref_t.dot(normal)))
+    unit := proj.normalized() >>> (err) { << fm.vec4(0.0, 0.0, 1.0, 1.0) }
+    << fm.vec4(unit.x, unit.y, unit.z, 1.0)
+}
+
+fn splat_preview_color(w fm.Vec4) int {
+    // Grass=green, Dirt=brown, Rock=slate gray, Snow=white. Always opaque (alpha=255).
+    r_f := w.x * 0.28 + w.y * 0.56 + w.z * 0.45 + w.w * 0.95
+    g_f := w.x * 0.62 + w.y * 0.39 + w.z * 0.46 + w.w * 0.96
+    b_f := w.x * 0.22 + w.y * 0.23 + w.z * 0.50 + w.w * 0.98
+    ri := clamp_i(int(math.round(r_f * 255.0)), 0, 255)
+    gi := clamp_i(int(math.round(g_f * 255.0)), 0, 255)
+    bi := clamp_i(int(math.round(b_f * 255.0)), 0, 255)
+    << (ri << 24) | (gi << 16) | (bi << 8) | 255
+}
+
+fn build_lod_samples(start int, count int, step int) []int {
+    end_idx := start + count
+    $out := []int{}
+    $cur := start
+    while cur < end_idx {
+        out.push(cur)
+        cur += step
+    }
+    out.push(end_idx)
+    << out
+}
+
+pub fn (t &HeightmapTerrain) chunk_grid_dims(chunk_cells int) []int {
+    if chunk_cells < 2 || chunk_cells > 512 {
+        >>> errors.new("nexus terrain: chunk_cells must be in 2..512")
+    }
+    $cc := chunk_cells
+    if cc < 2 { cc = 2 }
+    cx := (t.width - 1 + cc - 1) / cc
+    cz := (t.depth - 1 + cc - 1) / cc
+    << [cx, cz]
+}
+
+pub fn (t &HeightmapTerrain) chunk_bounds(cx int, cz int, chunk_cells int) fm.Aabb3 {
+    dims := t.chunk_grid_dims(chunk_cells) >>>
+    if cx < 0 || cx >= dims[0] || cz < 0 || cz >= dims[1] {
+        >>> errors.new("nexus terrain: chunk index out of range")
+    }
+    sx := cx * chunk_cells
+    sz := cz * chunk_cells
+    ex := clamp_i(sx + chunk_cells, sx + 1, t.width - 1)
+    ez := clamp_i(sz + chunk_cells, sz + 1, t.depth - 1)
+    $min_y := t.vertex_height(sx, sz)
+    $max_y := min_y
+    for gz in sz:(ez + 1) {
+        for gx in sx:(ex + 1) {
+            wy := t.vertex_height(gx, gz)
+            if wy < min_y { min_y = wy }
+            if wy > max_y { max_y = wy }
+        }
+    }
+    min_pt := fm.vec3(t.origin.x + f64(sx) * t.cell_size, min_y, t.origin.z + f64(sz) * t.cell_size)
+    max_pt := fm.vec3(t.origin.x + f64(ex) * t.cell_size, max_y, t.origin.z + f64(ez) * t.cell_size)
+    << fm.Aabb3{minimum: min_pt, maximum: max_pt}
+}
+
+pub fn (t &HeightmapTerrain) build_chunk_mesh(spec TerrainChunkSpec) meshes.MeshData3D {
+    if spec.lod < 0 || spec.lod > MAX_TERRAIN_LOD {
+        >>> errors.new("nexus terrain: LOD must be in 0..4")
+    }
+    if spec.cells_x < 1 || spec.cells_z < 1 ||
+        spec.start_x < 0 || spec.start_z < 0 ||
+        spec.start_x + spec.cells_x >= t.width || spec.start_z + spec.cells_z >= t.depth {
+        >>> errors.new("nexus terrain: chunk cell region out of terrain bounds")
+    }
+    if !fm.finite(spec.skirt_depth) || spec.skirt_depth < 0.0 || spec.skirt_depth > 1000.0 {
+        >>> errors.new("nexus terrain: skirt_depth must be in 0..1000")
+    }
+
+    $step := 1
+    for _ in 0:spec.lod { step *= 2 }
+
+    xs := build_lod_samples(spec.start_x, spec.cells_x, step)
+    zs := build_lod_samples(spec.start_z, spec.cells_z, step)
+    nx := xs.len
+    nz := zs.len
+
+    $mesh := meshes.new_mesh_data_3d()
+    inv_w := 1.0 / f64(t.width - 1)
+    inv_d := 1.0 / f64(t.depth - 1)
+
+    for iz in 0:nz {
+        gz := zs[iz]
+        v_uv := f64(gz) * inv_d
+        for ix in 0:nx {
+            gx := xs[ix]
+            u_uv := f64(gx) * inv_w
+            pos := t.vertex_position(gx, gz)
+            n := t.vertex_normal(gx, gz)
+            tang := perp_unit_tangent(n)
+            $col := -1
+            col = (255 << 24) | (255 << 16) | (255 << 8) | 255
+            if spec.bake_splat_tint {
+                base := (gz * t.width + gx) * 4
+                w := fm.vec4(t.splat[base], t.splat[base + 1], t.splat[base + 2], t.splat[base + 3])
+                col = splat_preview_color(w)
+            }
+            mesh.vertices.push(meshes.Vertex3D{
+                position: pos,
+                color: col,
+                normal: n,
+                uv: fm.vec2(u_uv, v_uv),
+                tangent: tang,
+                has_uv: true,
+                has_tangent: true
+            })
+        }
+    }
+
+    // Top surface triangles (CCW +Y outward).
+    for iz in 0:(nz - 1) {
+        row0 := iz * nx
+        row1 := (iz + 1) * nx
+        for ix in 0:(nx - 1) {
+            i00 := row0 + ix
+            i10 := row0 + ix + 1
+            i01 := row1 + ix
+            i11 := row1 + ix + 1
+            mesh.triangle(i00, i01, i11) >>>
+            mesh.triangle(i00, i11, i10) >>>
+        }
+    }
+
+    // Crack-preventing perimeter skirts extending downward along all 4 chunk borders.
+    if spec.skirt_depth > 0.0 {
+        west_base := mesh.vertices.len
+        for iz in 0:nz {
+            widx := iz * nx
+            top_v := &mesh.vertices[widx]
+            mesh.vertices.push(meshes.Vertex3D{
+                position: fm.vec3(top_v.position.x, top_v.position.y - spec.skirt_depth, top_v.position.z),
+                color: top_v.color,
+                normal: top_v.normal,
+                uv: top_v.uv,
+                tangent: top_v.tangent,
+                has_uv: true,
+                has_tangent: true
+            })
+        }
+        for iz in 0:(nz - 1) {
+            t0 := iz * nx
+            t1 := (iz + 1) * nx
+            b0 := west_base + iz
+            b1 := west_base + iz + 1
+            mesh.triangle(t0, b0, b1) >>>
+            mesh.triangle(t0, b1, t1) >>>
+        }
+
+        east_base := mesh.vertices.len
+        for iz in 0:nz {
+            eidx := iz * nx + (nx - 1)
+            top_v := &mesh.vertices[eidx]
+            mesh.vertices.push(meshes.Vertex3D{
+                position: fm.vec3(top_v.position.x, top_v.position.y - spec.skirt_depth, top_v.position.z),
+                color: top_v.color,
+                normal: top_v.normal,
+                uv: top_v.uv,
+                tangent: top_v.tangent,
+                has_uv: true,
+                has_tangent: true
+            })
+        }
+        for iz in 0:(nz - 1) {
+            t0 := iz * nx + (nx - 1)
+            t1 := (iz + 1) * nx + (nx - 1)
+            b0 := east_base + iz
+            b1 := east_base + iz + 1
+            mesh.triangle(t0, t1, b1) >>>
+            mesh.triangle(t0, b1, b0) >>>
+        }
+
+        north_base := mesh.vertices.len
+        for ix in 0:nx {
+            top_v := &mesh.vertices[ix]
+            mesh.vertices.push(meshes.Vertex3D{
+                position: fm.vec3(top_v.position.x, top_v.position.y - spec.skirt_depth, top_v.position.z),
+                color: top_v.color,
+                normal: top_v.normal,
+                uv: top_v.uv,
+                tangent: top_v.tangent,
+                has_uv: true,
+                has_tangent: true
+            })
+        }
+        for ix in 0:(nx - 1) {
+            t0 := ix
+            t1 := ix + 1
+            b0 := north_base + ix
+            b1 := north_base + ix + 1
+            mesh.triangle(t0, t1, b1) >>>
+            mesh.triangle(t0, b1, b0) >>>
+        }
+
+        south_base := mesh.vertices.len
+        last_row := (nz - 1) * nx
+        for ix in 0:nx {
+            sidx := last_row + ix
+            top_v := &mesh.vertices[sidx]
+            mesh.vertices.push(meshes.Vertex3D{
+                position: fm.vec3(top_v.position.x, top_v.position.y - spec.skirt_depth, top_v.position.z),
+                color: top_v.color,
+                normal: top_v.normal,
+                uv: top_v.uv,
+                tangent: top_v.tangent,
+                has_uv: true,
+                has_tangent: true
+            })
+        }
+        for ix in 0:(nx - 1) {
+            t0 := last_row + ix
+            t1 := last_row + ix + 1
+            b0 := south_base + ix
+            b1 := south_base + ix + 1
+            mesh.triangle(t0, b0, b1) >>>
+            mesh.triangle(t0, b1, t1) >>>
+        }
+    }
+
+    mesh.validate() >>>
+    << mesh
+}
+
+pub fn select_chunk_lod(bounds fm.Aabb3, camera_pos fm.Vec3, lod_distances &[]f64) int {
+    qx := clamp_f(camera_pos.x, bounds.minimum.x, bounds.maximum.x)
+    qy := clamp_f(camera_pos.y, bounds.minimum.y, bounds.maximum.y)
+    qz := clamp_f(camera_pos.z, bounds.minimum.z, bounds.maximum.z)
+    dist := camera_pos.sub(fm.vec3(qx, qy, qz)).length()
+    $lod := 0
+    for i in 0:lod_distances.len {
+        if dist >= lod_distances[i] {
+            lod += 1
+        }
+    }
+    if lod > MAX_TERRAIN_LOD { lod = MAX_TERRAIN_LOD }
+    << lod
+}

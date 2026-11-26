@@ -21,6 +21,14 @@ pub struct Trs3D {
     pub scale fm.Vec3
 }
 
+pub struct Trs2D {
+    pub x f64
+    pub y f64
+    pub rot_deg f64
+    pub sx f64
+    pub sy f64
+}
+
 pub struct Draft {
     pub source string
     pub opened string
@@ -213,6 +221,28 @@ pub fn compose_trs(trs &Trs3D) fm.Mat4 {
     << m
 }
 
+pub fn decompose_2d(t &fm.Transform2D) Trs2D {
+    sx := math.sqrt(t.a * t.a + t.b * t.b)
+    $rot_deg := 0.0
+    $sy := math.sqrt(t.c * t.c + t.d * t.d)
+    if sx > 1e-12 {
+        rot_deg = clean_zero(math.atan2(t.b, t.a) * 180.0 / pi_val())
+        sy = clean_zero((t.a * t.d - t.b * t.c) / sx)
+    }
+    << Trs2D{
+        x: clean_zero(t.tx),
+        y: clean_zero(t.ty),
+        rot_deg: rot_deg,
+        sx: clean_zero(sx),
+        sy: sy
+    }
+}
+
+pub fn compose_2d(trs &Trs2D) fm.Transform2D {
+    rad := trs.rot_deg * pi_val() / 180.0
+    << fm.transform_2d(fm.vec2(trs.x, trs.y), rad, fm.vec2(trs.sx, trs.sy))
+}
+
 fn clone_node(src &resource.NodeData, new_parent int, new_name string) resource.NodeData {
     $out := resource.node(new_parent, new_name, src.kind)
     out.visible = src.visible
@@ -266,6 +296,23 @@ fn clone_light(lt &resource.LightAttachment, node int) resource.LightAttachment 
     << resource.LightAttachment{node: node, source: lt.source, cascades: lt.cascades, punctual: lt.punctual}
 }
 
+fn clone_sprite_3d(sp &resource.Sprite3DAttachment, node int) resource.Sprite3DAttachment {
+    << resource.Sprite3DAttachment{node: node, resource_uid: sp.resource_uid + "", sprite: sp.sprite}
+}
+
+fn clone_tilemap_2d(tm &resource.TileMap2DAttachment, node int) resource.TileMap2DAttachment {
+    grid := tm.grid.clone() >>>
+    << resource.TileMap2DAttachment{
+        node: node,
+        resource_uid: tm.resource_uid + "",
+        z_index: tm.z_index,
+        y_sort_cells: tm.y_sort_cells,
+        y_offset: tm.y_offset,
+        pixel_art: tm.pixel_art,
+        grid: grid
+    }
+}
+
 fn dfs_flatten_subtree(
     cur int,
     new_parent int,
@@ -293,7 +340,9 @@ fn collect_refs_and_build(
     emitters []resource.AudioEmitter,
     scripts []resource.ScriptAttachment,
     conns []resource.ScriptConnection,
-    lights []resource.LightAttachment
+    lights []resource.LightAttachment,
+    sprites []resource.Sprite3DAttachment,
+    tilemaps []resource.TileMap2DAttachment
 ) resource.Document {
     $used := map[string]int{}
     for i in 0:surfaces.len {
@@ -309,6 +358,12 @@ fn collect_refs_and_build(
     for i in 0:scripts.len {
         used[scripts[i].resource_uid + ""] = 1
     }
+    for i in 0:sprites.len {
+        used[sprites[i].resource_uid + ""] = 1
+    }
+    for i in 0:tilemaps.len {
+        used[tilemaps[i].resource_uid + ""] = 1
+    }
     $kept_refs := []resource.ResourceReference{}
     for i in 0:all_refs.len {
         r := &all_refs[i]
@@ -322,7 +377,7 @@ fn collect_refs_and_build(
         }
     }
     base := resource.make_document(nodes) >>>
-    << resource.with_attachments(&base, kept_refs, surfaces, buses, emitters, scripts, conns, lights) >>>
+    << resource.with_all_attachments(&base, kept_refs, surfaces, buses, emitters, scripts, conns, lights, sprites, tilemaps) >>>
 }
 
 fn document_nodes_and_refs(doc &resource.Document) []resource.NodeData {
@@ -358,6 +413,8 @@ fn rebuild_from_children(
     extra_scripts []resource.ScriptAttachment,
     extra_conns []resource.ScriptConnection,
     extra_lights []resource.LightAttachment,
+    extra_sprites []resource.Sprite3DAttachment,
+    extra_tilemaps []resource.TileMap2DAttachment,
     remap $&[]int
 ) resource.Document {
     $flat := []resource.NodeData{}
@@ -488,7 +545,39 @@ fn rebuild_from_children(
         }
     }
 
-    << collect_refs_and_build(flat, &all_refs, surfaces, buses, emitters, scripts, conns, lights) >>>
+    $sprites := []resource.Sprite3DAttachment{}
+    for i in 0:doc.sprite_3d_count() {
+        sp := doc.sprite_3d(i) >>>
+        mapped := remap[sp.node]
+        if mapped >= 0 {
+            sprites.push(clone_sprite_3d(&sp, mapped))
+        }
+    }
+    for i in 0:extra_sprites.len {
+        sp := &extra_sprites[i]
+        mapped := remap[sp.node]
+        if mapped >= 0 {
+            sprites.push(clone_sprite_3d(sp, mapped))
+        }
+    }
+
+    $tilemaps := []resource.TileMap2DAttachment{}
+    for i in 0:doc.tilemap_2d_count() {
+        tm := doc.tilemap_2d(i) >>>
+        mapped := remap[tm.node]
+        if mapped >= 0 {
+            tilemaps.push(clone_tilemap_2d(&tm, mapped))
+        }
+    }
+    for i in 0:extra_tilemaps.len {
+        tm := &extra_tilemaps[i]
+        mapped := remap[tm.node]
+        if mapped >= 0 {
+            tilemaps.push(clone_tilemap_2d(tm, mapped))
+        }
+    }
+
+    << collect_refs_and_build(flat, &all_refs, surfaces, buses, emitters, scripts, conns, lights, sprites, tilemaps) >>>
 }
 
 fn children_table(nodes &[]resource.NodeData) [][]int {
@@ -556,9 +645,30 @@ pub fn (draft $&Draft) set_node_properties(
     rot_deg fm.Vec3,
     scale fm.Vec3
 ) int {
+    doc := draft.document() >>>
+    if index < 0 || index >= doc.node_count() {
+        >>> errors.new("nexus editor: node index out of range")
+    }
+    cur := doc.describe_node(index) >>>
+    << draft.set_node_full_properties(index, raw_name, visible, cur.process_mode, position, update_rs, rot_deg, scale) >>>
+}
+
+pub fn (draft $&Draft) set_node_full_properties(
+    index int,
+    raw_name string,
+    visible bool,
+    process_mode int,
+    position fm.Vec3,
+    update_rs bool,
+    rot_deg fm.Vec3,
+    scale fm.Vec3
+) int {
     name := strings.trim_space(&raw_name)
     if !valid_node_name(&name) {
         >>> errors.new("nexus editor: node name must be 1..255 UTF-8 bytes without /, ., .. or control characters")
+    }
+    if process_mode < resource.PROCESS_INHERIT || process_mode > resource.PROCESS_DISABLED {
+        >>> errors.new("nexus editor: invalid process mode")
     }
     doc := draft.document() >>>
     if index < 0 || index >= doc.node_count() {
@@ -575,6 +685,7 @@ pub fn (draft $&Draft) set_node_properties(
     target := $&nodes[index]
     target.name = name
     target.visible = visible
+    target.process_mode = process_mode
     if target.kind == resource.NODE_3D {
         if !position.is_finite() {
             >>> errors.new("nexus editor: position must be finite")
@@ -594,8 +705,18 @@ pub fn (draft $&Draft) set_node_properties(
         if !fm.finite(position.x) || !fm.finite(position.y) {
             >>> errors.new("nexus editor: 2D position must be finite")
         }
-        target.local.tx = position.x
-        target.local.ty = position.y
+        if update_rs {
+            if !fm.finite(rot_deg.z) || !fm.finite(scale.x) || !fm.finite(scale.y) {
+                >>> errors.new("nexus editor: 2D rotation and scale must be finite")
+            }
+            if math.abs(scale.x) < 1e-6 || math.abs(scale.y) < 1e-6 {
+                >>> errors.new("nexus editor: 2D scale components must be non-zero")
+            }
+            target.local = compose_2d(&Trs2D{x: position.x, y: position.y, rot_deg: rot_deg.z, sx: scale.x, sy: scale.y})
+        } else {
+            target.local.tx = position.x
+            target.local.ty = position.y
+        }
     }
 
     children := children_table(&nodes)
@@ -610,6 +731,8 @@ pub fn (draft $&Draft) set_node_properties(
         []resource.ScriptAttachment{},
         []resource.ScriptConnection{},
         []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
         $&remap
     ) >>>
     draft.replace(&next) >>>
@@ -648,7 +771,160 @@ pub fn (draft $&Draft) set_surface_primitive(node_index int, primitive int) int 
     for i in 0:doc.script_connection_count() { conns.push(doc.script_connection(i) >>>) }
     $lights := []resource.LightAttachment{}
     for i in 0:doc.light_count() { lights.push(doc.light(i) >>>) }
-    next := resource.with_attachments(&doc, refs, surfaces, buses, emitters, scripts, conns, lights) >>>
+    $sprites := []resource.Sprite3DAttachment{}
+    for i in 0:doc.sprite_3d_count() { sprites.push(doc.sprite_3d(i) >>>) }
+    $tilemaps := []resource.TileMap2DAttachment{}
+    for i in 0:doc.tilemap_2d_count() { tilemaps.push(doc.tilemap_2d(i) >>>) }
+    next := resource.with_all_attachments(&doc, refs, surfaces, buses, emitters, scripts, conns, lights, sprites, tilemaps) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+fn glb_ref_for_uid(project &Project, scene_path &string, uid &string) resource.ResourceReference {
+    resolved := project.asset_source(uid) >>>
+    raw := snapshot.read(resolved + "", snapshot.MAX_BYTES) >>>
+    hash := sha256.sum256(raw + "")
+    scene_dir := filepath.dir(scene_path)
+    $rel := try_rel_path(&scene_dir, &resolved)
+    if rel.len == 0 || rel == "." || rel == ".." || strings.has_prefix(&rel, "../") {
+        proj_rel := try_rel_path(&project.directory, &resolved)
+        if proj_rel.len == 0 || proj_rel == "." || proj_rel == ".." || strings.has_prefix(&proj_rel, "../") {
+            >>> errors.new("nexus editor: asset '" + resolved + "' must reside inside project directory '" + project.directory + "'")
+        }
+        rel = proj_rel
+    }
+    << resource.ResourceReference{
+        uid: *uid + "",
+        kind: "glb_model",
+        path: rel,
+        content_hash: hash
+    }
+}
+
+pub fn (draft $&Draft) set_node_surface(
+    project &Project,
+    node_index int,
+    uid string,
+    primitive int,
+    levels []resource.SurfaceLevel,
+    hysteresis f64
+) int {
+    if primitive < 0 {
+        >>> errors.new("nexus editor: primitive index must be non-negative")
+    }
+    doc := draft.document() >>>
+    if node_index < 0 || node_index >= doc.node_count() {
+        >>> errors.new("nexus editor: node index out of range")
+    }
+    nd := doc.describe_node(node_index) >>>
+    if nd.kind != resource.NODE_3D {
+        >>> errors.new("nexus editor: GLB surface requires a Node3D")
+    }
+    $extra_refs := [glb_ref_for_uid(project, &draft.source, &uid) >>>]
+    $seen_uids := map[string]bool{}
+    seen_uids[uid + ""] = true
+    $clean_lvls := []resource.SurfaceLevel{}
+    for i in 0:levels.len {
+        lv := &levels[i]
+        luid := lv.resource_uid + ""
+        if !seen_uids.has(luid + "") {
+            seen_uids[luid + ""] = true
+            extra_refs.push(glb_ref_for_uid(project, &draft.source, &luid) >>>)
+        }
+        clean_lvls.push(resource.SurfaceLevel{
+            distance: lv.distance,
+            resource_uid: luid,
+            primitive: lv.primitive
+        })
+    }
+    $new_surf := resource.surface(node_index, uid + "", primitive)
+    new_surf.levels = clean_lvls
+    new_surf.hysteresis = hysteresis
+
+    $all_refs := document_refs(&doc) >>>
+    $ref_seen := map[string]bool{}
+    for i in 0:all_refs.len { ref_seen[all_refs[i].uid + ""] = true }
+    for i in 0:extra_refs.len {
+        er := &extra_refs[i]
+        if !ref_seen.has(er.uid + "") {
+            ref_seen[er.uid + ""] = true
+            all_refs.push(resource.ResourceReference{
+                uid: er.uid + "",
+                kind: er.kind + "",
+                path: er.path + "",
+                content_hash: er.content_hash + ""
+            })
+        }
+    }
+    $surfaces := []resource.Surface{}
+    $replaced := false
+    for i in 0:doc.surface_count() {
+        s := doc.surface(i) >>>
+        if s.node == node_index {
+            surfaces.push(clone_surface(&new_surf, node_index))
+            replaced = true
+        } else {
+            surfaces.push(clone_surface(&s, s.node))
+        }
+    }
+    if !replaced {
+        surfaces.push(clone_surface(&new_surf, node_index))
+    }
+    nodes := document_nodes_and_refs(&doc) >>>
+    $buses := []resource.AudioBus{}
+    for i in 0:doc.audio_bus_count() { buses.push(doc.audio_bus(i) >>>) }
+    $emitters := []resource.AudioEmitter{}
+    for i in 0:doc.audio_count() { emitters.push(doc.audio_emitter(i) >>>) }
+    $scripts := []resource.ScriptAttachment{}
+    for i in 0:doc.script_count() { scripts.push(doc.script(i) >>>) }
+    $conns := []resource.ScriptConnection{}
+    for i in 0:doc.script_connection_count() { conns.push(doc.script_connection(i) >>>) }
+    $lights := []resource.LightAttachment{}
+    for i in 0:doc.light_count() { lights.push(doc.light(i) >>>) }
+    $sprites := []resource.Sprite3DAttachment{}
+    for i in 0:doc.sprite_3d_count() { sprites.push(doc.sprite_3d(i) >>>) }
+    $tilemaps := []resource.TileMap2DAttachment{}
+    for i in 0:doc.tilemap_2d_count() { tilemaps.push(doc.tilemap_2d(i) >>>) }
+    next := collect_refs_and_build(nodes, &all_refs, surfaces, buses, emitters, scripts, conns, lights, sprites, tilemaps) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) clear_node_surface(node_index int) int {
+    doc := draft.document() >>>
+    if node_index < 0 || node_index >= doc.node_count() {
+        >>> errors.new("nexus editor: node index out of range")
+    }
+    $surfaces := []resource.Surface{}
+    $removed := false
+    for i in 0:doc.surface_count() {
+        s := doc.surface(i) >>>
+        if s.node == node_index {
+            removed = true
+        } else {
+            surfaces.push(clone_surface(&s, s.node))
+        }
+    }
+    if !removed {
+        << 0
+    }
+    nodes := document_nodes_and_refs(&doc) >>>
+    all_refs := document_refs(&doc) >>>
+    $buses := []resource.AudioBus{}
+    for i in 0:doc.audio_bus_count() { buses.push(doc.audio_bus(i) >>>) }
+    $emitters := []resource.AudioEmitter{}
+    for i in 0:doc.audio_count() { emitters.push(doc.audio_emitter(i) >>>) }
+    $scripts := []resource.ScriptAttachment{}
+    for i in 0:doc.script_count() { scripts.push(doc.script(i) >>>) }
+    $conns := []resource.ScriptConnection{}
+    for i in 0:doc.script_connection_count() { conns.push(doc.script_connection(i) >>>) }
+    $lights := []resource.LightAttachment{}
+    for i in 0:doc.light_count() { lights.push(doc.light(i) >>>) }
+    $sprites := []resource.Sprite3DAttachment{}
+    for i in 0:doc.sprite_3d_count() { sprites.push(doc.sprite_3d(i) >>>) }
+    $tilemaps := []resource.TileMap2DAttachment{}
+    for i in 0:doc.tilemap_2d_count() { tilemaps.push(doc.tilemap_2d(i) >>>) }
+    next := collect_refs_and_build(nodes, &all_refs, surfaces, buses, emitters, scripts, conns, lights, sprites, tilemaps) >>>
     draft.replace(&next) >>>
     << 0
 }
@@ -681,6 +957,8 @@ pub fn (draft $&Draft) add_node_under(parent_idx int, kind int, base_name string
         []resource.ScriptAttachment{},
         []resource.ScriptConnection{},
         []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
         $&remap
     ) >>>
     draft.replace(&next) >>>
@@ -777,6 +1055,20 @@ pub fn (draft $&Draft) duplicate_node(idx int) int {
             extra_lights.push(clone_light(&lt, copy_of[lt.node]))
         }
     }
+    $extra_sprites := []resource.Sprite3DAttachment{}
+    for i in 0:doc.sprite_3d_count() {
+        sp := doc.sprite_3d(i) >>>
+        if copy_of.has(sp.node) {
+            extra_sprites.push(clone_sprite_3d(&sp, copy_of[sp.node]))
+        }
+    }
+    $extra_tilemaps := []resource.TileMap2DAttachment{}
+    for i in 0:doc.tilemap_2d_count() {
+        tm := doc.tilemap_2d(i) >>>
+        if copy_of.has(tm.node) {
+            extra_tilemaps.push(clone_tilemap_2d(&tm, copy_of[tm.node]))
+        }
+    }
 
     new_raw_root := copy_of[idx]
     $remap := []int{}
@@ -790,6 +1082,8 @@ pub fn (draft $&Draft) duplicate_node(idx int) int {
         extra_scripts,
         extra_conns,
         extra_lights,
+        extra_sprites,
+        extra_tilemaps,
         $&remap
     ) >>>
     draft.replace(&next) >>>
@@ -824,10 +1118,62 @@ pub fn (draft $&Draft) delete_node(idx int) int {
         []resource.ScriptAttachment{},
         []resource.ScriptConnection{},
         []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
         $&remap
     ) >>>
     draft.replace(&next) >>>
     << remap[parent_idx]
+}
+
+pub fn (draft $&Draft) delete_nodes(indices &[]int) int {
+    doc := draft.document() >>>
+    $drop := map[int]bool{}
+    $fallback_parent := 0
+    for i in 0:indices.len {
+        idx := indices[i]
+        if idx > 0 && idx < doc.node_count() {
+            drop[idx] = true
+            if fallback_parent == 0 {
+                fallback_parent = (doc.describe_node(idx) >>>).parent
+            }
+        }
+    }
+    if drop.len() == 0 {
+        << 0
+    }
+    nodes := document_nodes_and_refs(&doc) >>>
+    $children := children_table(&nodes)
+    for p in 0:children.len {
+        $kept := []int{}
+        ch := &children[p]
+        for k in 0:ch.len {
+            if !drop.has(ch[k]) {
+                kept.push(ch[k])
+            }
+        }
+        children[p] = kept
+    }
+    $remap := []int{}
+    next := rebuild_from_children(
+        &doc,
+        nodes,
+        children,
+        []resource.ResourceReference{},
+        []resource.Surface{},
+        []resource.AudioEmitter{},
+        []resource.ScriptAttachment{},
+        []resource.ScriptConnection{},
+        []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
+        $&remap
+    ) >>>
+    draft.replace(&next) >>>
+    if fallback_parent >= 0 && fallback_parent < remap.len && remap[fallback_parent] >= 0 {
+        << remap[fallback_parent]
+    }
+    << 0
 }
 
 fn is_ancestor_of(nodes &[]resource.NodeData, candidate_ancestor int, node int) bool {
@@ -922,10 +1268,154 @@ pub fn (draft $&Draft) reparent_node(idx int, new_parent int, preserve_world boo
         []resource.ScriptAttachment{},
         []resource.ScriptConnection{},
         []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
         $&remap
     ) >>>
     draft.replace(&next) >>>
     << remap[idx]
+}
+
+pub fn (draft $&Draft) move_node_sibling(idx int, delta int) int {
+    doc := draft.document() >>>
+    if idx <= 0 || idx >= doc.node_count() {
+        >>> errors.new("nexus editor: cannot reorder root or invalid node")
+    }
+    if delta == 0 { << idx }
+    nodes := document_nodes_and_refs(&doc) >>>
+    parent := nodes[idx].parent
+    $children := children_table(&nodes)
+    $ch := []int{}
+    src_ch := &children[parent]
+    for i in 0:src_ch.len {
+        ch.push(src_ch[i])
+    }
+    $pos := -1
+    for i in 0:ch.len {
+        if ch[i] == idx {
+            pos = i
+            <-
+        }
+    }
+    if pos < 0 { << idx }
+    next_pos := pos + delta
+    if next_pos < 0 || next_pos >= ch.len {
+        << idx
+    }
+    tmp := ch[pos]
+    ch[pos] = ch[next_pos]
+    ch[next_pos] = tmp
+    children[parent] = ch
+    $remap := []int{}
+    next := rebuild_from_children(
+        &doc,
+        nodes,
+        children,
+        []resource.ResourceReference{},
+        []resource.Surface{},
+        []resource.AudioEmitter{},
+        []resource.ScriptAttachment{},
+        []resource.ScriptConnection{},
+        []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
+        $&remap
+    ) >>>
+    draft.replace(&next) >>>
+    << remap[idx]
+}
+
+pub fn (draft $&Draft) move_nodes_delta(indices &[]int, dx f64, dy f64, dz f64) int {
+    if !fm.finite(dx) || !fm.finite(dy) || !fm.finite(dz) {
+        >>> errors.new("nexus editor: move delta must be finite")
+    }
+    if dx == 0.0 && dy == 0.0 && dz == 0.0 { << 0 }
+    doc := draft.document() >>>
+    $chosen := map[int]bool{}
+    for i in 0:indices.len {
+        id := indices[i]
+        if id > 0 && id < doc.node_count() {
+            chosen[id] = true
+        }
+    }
+    if chosen.len() == 0 { << 0 }
+    $nodes := document_nodes_and_refs(&doc) >>>
+    $roots := []int{}
+    for i in 1:nodes.len {
+        if !chosen.has(i) { -> }
+        $has_anc := false
+        $p := nodes[i].parent
+        while p > 0 {
+            if chosen.has(p) {
+                has_anc = true
+                <-
+            }
+            p = nodes[p].parent
+        }
+        if !has_anc { roots.push(i) }
+    }
+    for k in 0:roots.len {
+        idx := roots[k]
+        if nodes[idx].kind == resource.NODE_3D {
+            pw := world_matrix_3d(&nodes, nodes[idx].parent)
+            inv_pw := safe_affine_inverse(&pw)
+            w := pw.multiply(nodes[idx].local_3d).c3.xyz()
+            w2 := fm.vec3(w.x + dx, w.y + dy, w.z + dz)
+            l2 := inv_pw.transform(fm.vec4(w2.x, w2.y, w2.z, 1.0)).xyz()
+            nodes[idx].local_3d.c3 = fm.vec4(l2.x, l2.y, l2.z, 1.0)
+        } else if nodes[idx].kind == resource.NODE_2D {
+            $move_y := dy
+            if move_y == 0.0 && dz != 0.0 { move_y = dz }
+            nodes[idx].local.tx = nodes[idx].local.tx + dx
+            nodes[idx].local.ty = nodes[idx].local.ty + move_y
+        }
+    }
+    children := children_table(&nodes)
+    $remap := []int{}
+    next := rebuild_from_children(
+        &doc,
+        nodes,
+        children,
+        []resource.ResourceReference{},
+        []resource.Surface{},
+        []resource.AudioEmitter{},
+        []resource.ScriptAttachment{},
+        []resource.ScriptConnection{},
+        []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
+        $&remap
+    ) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) set_node_visible_only(idx int, visible bool) int {
+    doc := draft.document() >>>
+    if idx < 0 || idx >= doc.node_count() {
+        >>> errors.new("nexus editor: node index out of range")
+    }
+    $nodes := document_nodes_and_refs(&doc) >>>
+    if nodes[idx].visible == visible { << 0 }
+    nodes[idx].visible = visible
+    children := children_table(&nodes)
+    $remap := []int{}
+    next := rebuild_from_children(
+        &doc,
+        nodes,
+        children,
+        []resource.ResourceReference{},
+        []resource.Surface{},
+        []resource.AudioEmitter{},
+        []resource.ScriptAttachment{},
+        []resource.ScriptConnection{},
+        []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
+        $&remap
+    ) >>>
+    draft.replace(&next) >>>
+    << 0
 }
 
 fn stem_for_glb(glb_path &string) string {
@@ -952,7 +1442,11 @@ pub fn (draft $&Draft) place_asset(project &Project, uid string, primitive int, 
     scene_dir := filepath.dir(&draft.source)
     $rel := try_rel_path(&scene_dir, &resolved)
     if rel.len == 0 || rel == "." || rel == ".." || strings.has_prefix(&rel, "../") {
-        >>> errors.new("nexus editor: asset '" + resolved + "' must reside inside scene directory '" + scene_dir + "'")
+        proj_rel := try_rel_path(&project.directory, &resolved)
+        if proj_rel.len == 0 || proj_rel == "." || proj_rel == ".." || strings.has_prefix(&proj_rel, "../") {
+            >>> errors.new("nexus editor: asset '" + resolved + "' must reside inside project directory '" + project.directory + "'")
+        }
+        rel = proj_rel
     }
 
     doc := draft.document() >>>
@@ -988,6 +1482,8 @@ pub fn (draft $&Draft) place_asset(project &Project, uid string, primitive int, 
         []resource.ScriptAttachment{},
         []resource.ScriptConnection{},
         []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
         $&remap
     ) >>>
     draft.replace(&next) >>>
@@ -1031,8 +1527,12 @@ pub fn (draft $&Draft) merge_viewport(captured &resource.Document, revision &str
     for i in 0:cur_doc.script_connection_count() { conns.push(cur_doc.script_connection(i) >>>) }
     $lights := []resource.LightAttachment{}
     for i in 0:cur_doc.light_count() { lights.push(cur_doc.light(i) >>>) }
+    $sprites := []resource.Sprite3DAttachment{}
+    for i in 0:cur_doc.sprite_3d_count() { sprites.push(cur_doc.sprite_3d(i) >>>) }
+    $tilemaps := []resource.TileMap2DAttachment{}
+    for i in 0:cur_doc.tilemap_2d_count() { tilemaps.push(cur_doc.tilemap_2d(i) >>>) }
     base := resource.make_document(merged_nodes) >>>
-    next := resource.with_attachments(&base, refs, surfaces, buses, emitters, scripts, conns, lights) >>>
+    next := resource.with_all_attachments(&base, refs, surfaces, buses, emitters, scripts, conns, lights, sprites, tilemaps) >>>
     draft.replace(&next) >>>
     << 0
 }

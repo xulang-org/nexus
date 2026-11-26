@@ -1,0 +1,246 @@
+@"github.com/xulang-org/nexus/rendering/three_d"
+
+#gpu
+#encoding/binary
+#errors
+#math
+layout #gpu/layout
+fm #"github.com/xulang-org/nexus/foundation/math"
+
+pub struct IblProgram3D {
+    pub format int
+    pub entrypoint string
+    pub brdf_lut []u8
+    pub prefilter_env []u8
+}
+
+pub fn empty_ibl_program_3d() IblProgram3D {
+    << IblProgram3D{format: 0, entrypoint: "", brdf_lut: []u8{}, prefilter_env: []u8{}}
+}
+
+pub fn empty_environment_ibl_3d(device &Device3D) EnvironmentIbl3D {
+    << EnvironmentIbl3D{
+        owner: device.reference(),
+        textures: []gpu.Texture{},
+        samplers: []gpu.Sampler{},
+        compute: []gpu.ComputePipeline{},
+        sky_top: fm.vec3(0.0, 0.0, 0.0),
+        sky_horizon: fm.vec3(0.0, 0.0, 0.0),
+        ground_color: fm.vec3(0.0, 0.0, 0.0),
+        sun_dir: fm.vec3(0.0, 1.0, 0.0),
+        sun_radiance: fm.vec3(0.0, 0.0, 0.0),
+        intensity: 0.0,
+        brdf_ready: false,
+        ready: false,
+        closed: true
+    }
+}
+
+// GPU-precomputed PBR Split-Sum Environment IBL:
+// - textures[0]: 64x64 RGBA16_FLOAT GGX DFG BRDF integration LUT (NdotV, roughness)
+// - textures[1]: 256x128x5-mip RGBA16_FLOAT roughness-prefiltered equirectangular environment radiance map
+pub struct EnvironmentIbl3D {
+    owner DeviceRef3D
+    textures []gpu.Texture
+    samplers []gpu.Sampler
+    compute []gpu.ComputePipeline // [0]=brdf_lut, [1]=prefilter_env
+    pub sky_top fm.Vec3
+    pub sky_horizon fm.Vec3
+    pub ground_color fm.Vec3
+    pub sun_dir fm.Vec3
+    pub sun_radiance fm.Vec3
+    pub intensity f64
+    brdf_ready bool
+    ready bool
+    closed bool
+}
+
+fn ibl_bytes(vals &[]f64) []u8 {
+    order := binary.little_endian()
+    $out := []u8{}
+    for _ in 0:(vals.len * 4) { out.push(u8(0)) }
+    for i in 0:vals.len {
+        w := scalar_word(vals[i]) >>>
+        order.put_u32_bytes($&out, i * 4, w) >>>
+    }
+    << out
+}
+
+pub fn (device &Device3D) environment_ibl(program &IblProgram3D) EnvironmentIbl3D {
+    device.alive() >>>
+    if device.active { >>> errors.new("nexus IBL: create EnvironmentIbl3D outside an active frame") }
+    if !device.is_gpu() { >>> errors.new("nexus IBL: EnvironmentIbl3D requires GPU backend") }
+    dev := device.gpu_device() >>>
+    if (dev.shader_formats() & program.format) == 0 || program.entrypoint.len == 0 ||
+        program.brdf_lut.len == 0 || program.prefilter_env.len == 0 {
+        >>> errors.new("nexus IBL: invalid or unsupported IBL compute shaders")
+    }
+    if !(dev.supports_texture_2d(layout.RGBA16_FLOAT, gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COMPUTE_STORAGE_WRITE) >>>) {
+        >>> errors.new("nexus IBL: GPU does not support RGBA16_FLOAT compute storage write")
+    }
+
+    bdesc := gpu.ComputeResourcesDesc{
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 0,
+        read_textures: 0,
+        read_buffers: 0,
+        write_textures: 1,
+        write_buffers: 0,
+        uniform_sizes: [16],
+        threads_x: 8,
+        threads_y: 8,
+        threads_z: 1
+    }
+    $lut_pipe := dev.compute_pipeline_with_resources(&bdesc, &program.brdf_lut) >>>
+
+    pdesc := gpu.ComputeResourcesDesc{
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 0,
+        read_textures: 0,
+        read_buffers: 0,
+        write_textures: 1,
+        write_buffers: 0,
+        uniform_sizes: [96],
+        threads_x: 8,
+        threads_y: 8,
+        threads_z: 1
+    }
+    $env_pipe := dev.compute_pipeline_with_resources(&pdesc, &program.prefilter_env) >>>
+
+    $lut_tex := dev.texture_2d(gpu.Texture2DDesc{
+        format: layout.RGBA16_FLOAT,
+        width: 64, height: 64, levels: 1,
+        usage: gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COMPUTE_STORAGE_WRITE
+    }) >>>
+    $env_tex := dev.texture_2d(gpu.Texture2DDesc{
+        format: layout.RGBA16_FLOAT,
+        width: 256, height: 128, levels: 5,
+        usage: gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COMPUTE_STORAGE_WRITE
+    }) >>>
+
+    $lut_sdesc := gpu.sampler_defaults()
+    lut_sdesc.min_filter = gpu.LINEAR
+    lut_sdesc.mag_filter = gpu.LINEAR
+    lut_sdesc.mip_filter = gpu.NEAREST
+    lut_sdesc.address_u = gpu.CLAMP_TO_EDGE
+    lut_sdesc.address_v = gpu.CLAMP_TO_EDGE
+    $lut_samp := dev.sampler(lut_sdesc) >>>
+
+    $env_sdesc := gpu.sampler_defaults()
+    env_sdesc.min_filter = gpu.LINEAR
+    env_sdesc.mag_filter = gpu.LINEAR
+    env_sdesc.mip_filter = gpu.LINEAR
+    env_sdesc.address_u = gpu.REPEAT
+    env_sdesc.address_v = gpu.CLAMP_TO_EDGE
+    env_sdesc.max_lod = 4.0
+    $env_samp := dev.sampler(env_sdesc) >>>
+
+    << EnvironmentIbl3D{
+        owner: device.reference(),
+        textures: [lut_tex, env_tex],
+        samplers: [lut_samp, env_samp],
+        compute: [lut_pipe, env_pipe],
+        sky_top: fm.vec3(0.25, 0.55, 1.0),
+        sky_horizon: fm.vec3(0.75, 0.85, 0.98),
+        ground_color: fm.vec3(0.14, 0.12, 0.10),
+        sun_dir: fm.vec3(0.4, 0.8, 0.45),
+        sun_radiance: fm.vec3(2.0, 1.9, 1.7),
+        intensity: 1.0,
+        brdf_ready: false,
+        ready: false,
+        closed: false
+    }
+}
+
+pub fn (ibl $&EnvironmentIbl3D) bake(
+    device &Device3D,
+    sky_top fm.Vec3,
+    sky_horizon fm.Vec3,
+    ground_color fm.Vec3,
+    sun_dir fm.Vec3,
+    sun_radiance fm.Vec3,
+    intensity f64
+) int {
+    device.alive() >>>
+    if device.active { >>> errors.new("nexus IBL: bake outside an active Device3D frame") }
+    if ibl.closed || !ibl.owner.matches(device) { >>> errors.new("nexus IBL: closed or foreign EnvironmentIbl3D") }
+    if !sky_top.is_finite() || !sky_horizon.is_finite() || !ground_color.is_finite() ||
+        !sun_dir.is_finite() || !sun_radiance.is_finite() || !fm.finite(intensity) || intensity < 0.0 || intensity > 8.0 {
+        >>> errors.new("nexus IBL: invalid environment radiance parameters")
+    }
+    nsun := sun_dir.normalized() >>>
+
+    dev := device.gpu_device() >>>
+    $enc := dev.command_encoder() >>>
+    bw_empty := []gpu.StorageBufferWrite{}
+
+    if !ibl.brdf_ready {
+        lut_bytes := ibl_bytes(&[64.0, 64.0, 32.0, 0.0]) >>>
+        tw := [gpu.write_texture(&ibl.textures[0], 0, 0, true)]
+        $cpass := enc.begin_compute_with_resources(&tw, &bw_empty) >>>
+        cpass.pipeline(&ibl.compute[0]) >>>
+        cpass.uniform(0, &lut_bytes) >>>
+        cpass.dispatch(8, 8, 1) >>>
+        cpass.end() >>>
+        ibl.brdf_ready = true
+    }
+
+    $w := 256
+    $h := 128
+    for mip in 0:5 {
+        rough := f64(mip) / 4.0
+        uvals := [f64(w), f64(h), rough, 32.0, sky_top.x, sky_top.y, sky_top.z, 0.0, sky_horizon.x, sky_horizon.y, sky_horizon.z, 0.0, ground_color.x, ground_color.y, ground_color.z, 0.0, nsun.x, nsun.y, nsun.z, 0.0, sun_radiance.x, sun_radiance.y, sun_radiance.z, 0.0]
+        ubytes := ibl_bytes(&uvals) >>>
+        tw := [gpu.write_texture(&ibl.textures[1], mip, 0, mip == 0)]
+        $epass := enc.begin_compute_with_resources(&tw, &bw_empty) >>>
+        epass.pipeline(&ibl.compute[1]) >>>
+        epass.uniform(0, &ubytes) >>>
+        epass.dispatch((w + 7) / 8, (h + 7) / 8, 1) >>>
+        epass.end() >>>
+        w = w / 2
+        h = h / 2
+    }
+
+    $fence := enc.submit() >>>
+    fence.wait() >>>
+    fence.close() >>>
+
+    ibl.sky_top = sky_top
+    ibl.sky_horizon = sky_horizon
+    ibl.ground_color = ground_color
+    ibl.sun_dir = nsun
+    ibl.sun_radiance = sun_radiance
+    ibl.intensity = intensity
+    ibl.ready = true
+    << 0
+}
+
+pub fn (ibl &EnvironmentIbl3D) is_ready() bool { << !ibl.closed && ibl.ready }
+
+pub fn (ibl $&EnvironmentIbl3D) close() int {
+    if ibl.closed { << 0 }
+    for i in 0:ibl.textures.len {
+        t := $&ibl.textures[i]
+        t.close() >>>
+    }
+    for i in 0:ibl.samplers.len {
+        s := $&ibl.samplers[i]
+        s.close() >>>
+    }
+    for i in 0:ibl.compute.len {
+        c := $&ibl.compute[i]
+        c.close() >>>
+    }
+    ibl.textures = []gpu.Texture{}
+    ibl.samplers = []gpu.Sampler{}
+    ibl.compute = []gpu.ComputePipeline{}
+    ibl.ready = false
+    ibl.closed = true
+    << 0
+}
+
+fn (ibl $&EnvironmentIbl3D) drop() {
+    ibl.close() >>> (err) { << }
+}

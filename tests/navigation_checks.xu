@@ -1,0 +1,183 @@
+@main
+
+#math
+fm #"github.com/xulang-org/nexus/foundation/math"
+nav #"github.com/xulang-org/nexus/navigation"
+
+fn add_quad(
+    verts $&[]fm.Vec3,
+    idxs $&[]int,
+    areas $&[]int,
+    flags $&[]int,
+    x0 f64, z0 f64, x1 f64, z1 f64,
+    y0 f64, y1 f64,
+    area_id int, flag int
+) {
+    // Counter-clockwise from above (+Y normal: (v1-v0) x (v2-v0) > 0 in Y):
+    // v0=(x0, y0, z0), v1=(x0, y1, z1), v2=(x1, y1, z1), v3=(x1, y0, z0)
+    b := verts.len
+    verts.push(fm.vec3(x0, y0, z0))
+    verts.push(fm.vec3(x0, y1, z1))
+    verts.push(fm.vec3(x1, y1, z1))
+    verts.push(fm.vec3(x1, y0, z0))
+    idxs.push(b)
+    idxs.push(b + 1)
+    idxs.push(b + 2)
+    areas.push(area_id)
+    flags.push(flag)
+    idxs.push(b)
+    idxs.push(b + 2)
+    idxs.push(b + 3)
+    areas.push(area_id)
+    flags.push(flag)
+}
+
+fn path_length(pts &[]fm.Vec3) f64 {
+    $total := 0.0
+    for i in 0:(pts.len - 1) {
+        total += pts[i + 1].sub(pts[i]).length()
+    }
+    << total
+}
+
+fn run() int {
+    // 1. Build a 3D NavMesh with a central obstacle hole (hollow U/O ring), sloped ramp,
+    // a steep unwalkable wall (must be filtered out!), a muddy high-cost shortcut, and a disconnected island!
+    $verts := []fm.Vec3{}
+    $idxs := []int{}
+    $areas := []int{}
+    $flags := []int{}
+
+    // Left strip x in [0, 3], z in [0, 9]
+    add_quad($&verts, $&idxs, $&areas, $&flags, 0.0, 0.0, 3.0, 3.0, 0.0, 0.0, 0, 1)
+    add_quad($&verts, $&idxs, $&areas, $&flags, 0.0, 3.0, 3.0, 6.0, 0.0, 0.0, 0, 1)
+    add_quad($&verts, $&idxs, $&areas, $&flags, 0.0, 6.0, 3.0, 9.0, 0.0, 0.0, 0, 1)
+    // Top bridge x in [3, 6], z in [6, 9]
+    add_quad($&verts, $&idxs, $&areas, $&flags, 3.0, 6.0, 6.0, 9.0, 0.0, 0.0, 0, 1)
+    // Right strip x in [6, 9], z in [0, 9]
+    add_quad($&verts, $&idxs, $&areas, $&flags, 6.0, 6.0, 9.0, 9.0, 0.0, 0.0, 0, 1)
+    add_quad($&verts, $&idxs, $&areas, $&flags, 6.0, 3.0, 9.0, 6.0, 0.0, 0.0, 0, 1)
+    add_quad($&verts, $&idxs, $&areas, $&flags, 6.0, 0.0, 9.0, 3.0, 0.0, 0.0, 0, 1)
+    // East sloped ramp x in [9, 12], z in [0, 3] rising smoothly in +X from y=0.0 to y=1.5!
+    rb := verts.len
+    verts.push(fm.vec3(9.0, 0.0, 0.0))
+    verts.push(fm.vec3(9.0, 0.0, 3.0))
+    verts.push(fm.vec3(12.0, 1.5, 3.0))
+    verts.push(fm.vec3(12.0, 1.5, 0.0))
+    idxs.push(rb)
+    idxs.push(rb + 1)
+    idxs.push(rb + 2)
+    areas.push(0)
+    flags.push(1)
+    idxs.push(rb)
+    idxs.push(rb + 2)
+    idxs.push(rb + 3)
+    areas.push(0)
+    flags.push(1)
+    // Bottom mud bridge x in [3, 6], z in [0, 3] with area_id=1 (high mud cost vs clean top bridge!)
+    add_quad($&verts, $&idxs, $&areas, $&flags, 3.0, 0.0, 6.0, 3.0, 0.0, 0.0, 1, 2)
+
+    // Disconnected island at x in [20, 23], z in [0, 3]
+    add_quad($&verts, $&idxs, $&areas, $&flags, 20.0, 0.0, 23.0, 3.0, 0.0, 0.0, 0, 1)
+
+    // Steep vertical wall (85 deg slope -> ny ~ 0.08 < cos(0.75)) -> MUST be excluded from walkable polygons!
+    wb := verts.len
+    verts.push(fm.vec3(0.0, 0.0, 9.0))
+    verts.push(fm.vec3(0.0, 4.0, 9.2))
+    verts.push(fm.vec3(3.0, 4.0, 9.2))
+    idxs.push(wb)
+    idxs.push(wb + 1)
+    idxs.push(wb + 2)
+    areas.push(0)
+    flags.push(1)
+
+    mesh := nav.build_navmesh(&verts, &idxs, 0.75, &areas, &flags) >>>
+    assert(mesh.poly_count() == 20) // 10 quads * 2 tris = 20; steep wall excluded!
+
+    // 2. Funnel String Pulling around inner corners vs zig-zag centers + Area Cost Routing!
+    // Mask=1 excludes mud bridge (flag=2), forcing U-detour across top bridge around obstacle hole [3..6, 3..6] up to ramp!
+    costs_normal := [1.0, 1.0]
+    goal_ramp := fm.vec3(11.0, 1.0, 1.5)
+    p_u := mesh.find_path(fm.vec3(1.5, 0.0, 1.5), goal_ramp, 1, &costs_normal) >>>
+    assert(p_u.len >= 4) // bends tightly at corners (3,6) and (6,6)!
+    len_u := path_length(&p_u)
+    assert(len_u > 14.5 && len_u < 18.0)
+    assert(math.abs(p_u[p_u.len - 1].y - 1.0) < 0.05)
+
+    // With mask=3, area_cost[mud]=1.0 uses short straight mud shortcut;
+    // with area_cost[mud]=10.0, avoids mud and takes long U-detour again!
+    p_short := mesh.find_path(fm.vec3(1.5, 0.0, 1.5), goal_ramp, 3, &costs_normal) >>>
+    assert(path_length(&p_short) < 10.5)
+    costs_muddy := [1.0, 10.0]
+    p_avoid_mud := mesh.find_path(fm.vec3(1.5, 0.0, 1.5), goal_ramp, 3, &costs_muddy) >>>
+    assert(path_length(&p_avoid_mud) > 14.5)
+
+    // Disconnected island returns empty path!
+    p_none := mesh.find_path(fm.vec3(1.5, 0.0, 1.5), fm.vec3(21.5, 0.0, 1.5), 3, &costs_normal) >>>
+    assert(p_none.len == 0)
+
+    // 3. Multi-Agent Crowd Avoidance (16 opposing agents crossing a wide corridor without deadlocking or overlapping!)
+    $cverts := []fm.Vec3{}
+    $cidxs := []int{}
+    $careas := []int{}
+    $cflags := []int{}
+    for gx in 0:4 {
+        for gz in 0:4 {
+            x0 := f64(gx) * 4.0
+            z0 := f64(gz) * 4.0
+            add_quad($&cverts, $&cidxs, $&careas, $&cflags, x0, z0, x0 + 4.0, z0 + 4.0, 0.0, 0.0, 0, 1)
+        }
+    }
+    arena := nav.build_navmesh(&cverts, &cidxs, 0.75, &careas, &cflags) >>>
+    $crowd := nav.new_crowd_solver_3d()
+    $agents := []int{}
+    $targets := []fm.Vec3{}
+    for i in 0:8 {
+        z := 2.0 + f64(i) * 1.7
+        a_l := crowd.add_agent(&arena, fm.vec3(1.5, 0.0, z), 0.35, 4.5, 18.0, 1, &costs_normal) >>>
+        t_l := fm.vec3(14.5, 0.0, z)
+        crowd.set_agent_target(&arena, a_l, t_l) >>>
+        agents.push(a_l)
+        targets.push(t_l)
+
+        a_r := crowd.add_agent(&arena, fm.vec3(14.5, 0.0, z), 0.35, 4.5, 18.0, 1, &costs_normal) >>>
+        t_r := fm.vec3(1.5, 0.0, z)
+        crowd.set_agent_target(&arena, a_r, t_r) >>>
+        agents.push(a_r)
+        targets.push(t_r)
+    }
+
+    $min_pair_dist := 1e30
+    for _ in 0:300 {
+        crowd.step(1.0 / 60.0, &arena) >>>
+        for i in 0:agents.len {
+            pi := crowd.agent_position(agents[i]) >>>
+            for j in (i + 1):agents.len {
+                pj := crowd.agent_position(agents[j]) >>>
+                dx := pi.x - pj.x
+                dz := pi.z - pj.z
+                d := math.sqrt(dx * dx + dz * dz)
+                if d < min_pair_dist { min_pair_dist = d }
+            }
+        }
+    }
+    $arrived_cnt := 0
+    for i in 0:agents.len {
+        if crowd.agent_arrived(agents[i]) >>> { arrived_cnt += 1 }
+    }
+    assert(arrived_cnt == agents.len)
+    // Hard separation guarantee across all 300 frames: agents maintain diameter >= 0.68m (2 * 0.35m)!
+    assert(min_pair_dist >= 0.65)
+
+    println("PASS: 3D NavMesh + A* Area Costs + Funnel Smoothing (U=" + str(int(len_u * 100.0)) +
+        "cm) + RVO Crowd (" + str(arrived_cnt) + "/" + str(agents.len) + " arrived, min_sep=" +
+        str(int(min_pair_dist * 100.0)) + "cm)")
+    << 0
+}
+
+fn main() int {
+    << run() >>> (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

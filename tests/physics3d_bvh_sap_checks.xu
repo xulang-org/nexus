@@ -1,0 +1,80 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+p #"github.com/xulang-org/nexus/physics3d"
+#math
+#time
+
+fn run() int {
+    // 1. Build a 16x32 heightfield grid = 1024 static triangles.
+    $tris := []p.StaticTriangle3D{}
+    for gx in 0:16 {
+        for gz in 0:32 {
+            x0 := f64(gx * 2) - 16.0
+            x1 := x0 + 2.0
+            z0 := f64(gz * 2) - 32.0
+            z1 := z0 + 2.0
+            y := math.sin(x0 * 0.25) * 0.5
+            t0 := p.static_triangle_3d(fm.vec3(x0, y, z0), fm.vec3(x0, y, z1), fm.vec3(x1, y, z0), 1) >>>
+            t1 := p.static_triangle_3d(fm.vec3(x1, y, z0), fm.vec3(x0, y, z1), fm.vec3(x1, y, z1), 1) >>>
+            tris.push(t0)
+            tris.push(t1)
+        }
+    }
+    assert(tris.len == 1024)
+
+    $world := p.new_rigid_world(fm.vec3(0.0, -9.8, 0.0), []p.StaticBox3D{}, []p.StaticRamp3D{}, tris) >>>
+
+    // 2. Spawn 128 separated bodies along X + 8 colliding stacked pairs.
+    for k in 0:128 {
+        x := -15.0 + f64(k) * 0.23
+        z := -28.0 + f64(k % 16) * 3.5
+        body := p.dynamic_sphere_3d(fm.vec3(x, 3.0 + f64(k % 4) * 0.5, z), 0.35, 1.0, 0.2, 0.6) >>>
+        world.add_body(body) >>>
+    }
+    // Colliding stack pair at origin.
+    b_bot := p.dynamic_box_3d(fm.vec3(0.0, 1.0, 0.0), fm.vec3(0.4, 0.4, 0.4), 2.0, 0.1, 0.8) >>>
+    b_top := p.dynamic_box_3d(fm.vec3(0.0, 1.75, 0.0), fm.vec3(0.4, 0.4, 0.4), 1.0, 0.1, 0.8) >>>
+    bot_id := world.add_body(b_bot) >>>
+    top_id := world.add_body(b_top) >>>
+
+    t0 := time.now()
+    $total_pairs := 0
+    $total_contacts := 0
+    for step_i in 0:20 {
+        rep := world.step(1.0 / 60.0, 2, 4) >>>
+        total_pairs += rep.broadphase_pairs
+        total_contacts += rep.contacts
+    }
+    step_ms := (time.now() - t0) / 1000000
+    assert(total_contacts > 0)
+    // Top box stays above bottom box (never tunnels through floor or bottom box).
+    assert((world.body(top_id) >>>).position.y > (world.body(bot_id) >>>).position.y)
+
+    // 3. 500 downward raycasts across the 1024-triangle terrain BVH (y=10 checks bodies+terrain, y=0.75 misses falling spheres and hits terrain).
+    t1 := time.now()
+    $tri_hits := 0
+    $any_hits := 0
+    for i in 0:500 {
+        rx := -15.0 + f64(i % 15) * 2.0 + 0.5
+        rz := -30.0 + f64((i / 15) % 30) * 2.0 + 0.5
+        sky_hit := world.raycast_all(fm.vec3(rx, 10.0, rz), fm.vec3(0.0, -1.0, 0.0), 20.0, 1) >>>
+        if sky_hit.kind != p.HIT_NONE { any_hits += 1 }
+        low_hit := world.raycast_all(fm.vec3(rx, 0.75, rz), fm.vec3(0.0, -1.0, 0.0), 3.0, 1) >>>
+        if low_hit.kind == p.HIT_STATIC_TRIANGLE {
+            assert(low_hit.normal.y > 0.99 && low_hit.point.y >= -0.55 && low_hit.point.y <= 0.55)
+            tri_hits += 1
+        }
+    }
+    ray_ms := (time.now() - t1) / 1000000
+    assert(any_hits == 500 && tri_hits >= 490)
+    println("PASS: physics3d BVH+SAP gate (1024 triangles x 130 bodies x 20 sub-stepped frames in " + str(step_ms) + "ms, 1000 BVH rays in " + str(ray_ms) + "ms, pairs=" + str(total_pairs) + ")")
+    << 0
+}
+
+fn main() int {
+    << run() >>> (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

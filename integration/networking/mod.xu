@@ -1,0 +1,55 @@
+@"github.com/xulang-org/nexus/integration/networking"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+netw #"github.com/xulang-org/nexus/networking"
+scene #"github.com/xulang-org/nexus/scene"
+#errors
+
+pub struct NetNodeBinding {
+    pub net_id int
+    pub node_id int
+}
+
+pub fn sync_scene_from_client_session(
+    tree $&scene.SceneTree,
+    client &netw.ClientSession,
+    bindings &[]NetNodeBinding,
+    client_time_s f64
+) int {
+    $updated := 0
+    for i in 0:bindings.len {
+        b := &bindings[i]
+        if b.net_id == client.local_net_id {
+            st := client.local_predicted_state()
+            xf := fm.translation_3d(st.position).multiply(fm.rotation_y(st.yaw))
+            tree.set_transform_3d(b.node_id, xf) >>>
+            updated += 1
+        } else {
+            res := client.sample_remote_entity(b.net_id, client_time_s)
+            if res.valid {
+                xf := fm.translation_3d(res.position).multiply(fm.rotation_y(res.yaw))
+                tree.set_transform_3d(b.node_id, xf) >>>
+                updated += 1
+            }
+        }
+    }
+    << updated
+}
+
+pub fn capture_server_entities_from_scene(
+    tree &scene.SceneTree,
+    bindings &[]NetNodeBinding,
+    server $&netw.ServerSession
+) int {
+    $captured := 0
+    for i in 0:bindings.len {
+        b := &bindings[i]
+        node := tree.node_3d(b.node_id) >>>
+        pos := node.transform.c3.xyz()
+        $ent := server.entity(b.net_id) >>>
+        ent.position = pos
+        server.update_entity(ent) >>>
+        captured += 1
+    }
+    << captured
+}
