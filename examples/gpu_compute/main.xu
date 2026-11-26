@@ -6,25 +6,25 @@
 #errors
 
 fn shader_bytes(path string) []u8 {
-    $file := os.open(path) or >>
+    $file := os.open(path) >>>
     $output := []u8{}
     while output.len <= 1048576 {
-        chunk := file.read(65536) or >>
+        chunk := file.read(65536) >>>
         if chunk.len == 0 { <- }
-        if chunk.len > 1048576 - output.len { >> errors.new("shader exceeds example's 1 MiB budget") }
+        if chunk.len > 1048576 - output.len { >>> errors.new("shader exceeds example's 1 MiB budget") }
         for i in 0:chunk.len { output.push(u8(chunk[i])) }
     }
-    file.close() or >>
-    if output.len == 0 { >> errors.new("empty shader") }
+    file.close() >>>
+    if output.len == 0 { >>> errors.new("empty shader") }
     << output
 }
 fn parameters(multiplier int, bias int, count int) []u8 {
     $bytes := []u8{}
     for i in 0:16 { bytes.push(u8(0)) }
     order := binary.little_endian()
-    order.put_u32_bytes($&bytes, 0, multiplier) or >>
-    order.put_u32_bytes($&bytes, 4, bias) or >>
-    order.put_u32_bytes($&bytes, 8, count) or >>
+    order.put_u32_bytes($&bytes, 0, multiplier) >>>
+    order.put_u32_bytes($&bytes, 4, bias) >>>
+    order.put_u32_bytes($&bytes, 8, count) >>>
     << bytes
 }
 fn run() int {
@@ -33,18 +33,18 @@ fn run() int {
     $directory := "build/gpu-compute-shaders"
     $i := 1
     while i < args.len {
-        if i+1 >= args.len { >> errors.new("missing option value") }
+        if i+1 >= args.len { >>> errors.new("missing option value") }
         if args[i] == "--shaders" { directory = args[i+1] + ""
         } else if args[i] == "--backend" {
             if args[i+1] == "metal" { backend = gpu.METAL
             } else if args[i+1] == "vulkan" { backend = gpu.VULKAN
             } else if args[i+1] == "d3d12" { backend = gpu.D3D12
-            } else if args[i+1] != "auto" { >> errors.new("unknown GPU backend") }
-        } else { >> errors.new("unknown option: " + args[i]) }
+            } else if args[i+1] != "auto" { >>> errors.new("unknown GPU backend") }
+        } else { >>> errors.new("unknown option: " + args[i]) }
         i += 2
     }
-    $device := gpu.open(gpu.DeviceOptions{backend: backend, debug: true, shader_formats: 0}) or >>
-    selected := device.backend() or >>
+    $device := gpu.open(gpu.DeviceOptions{backend: backend, debug: true, shader_formats: 0}) >>>
+    selected := device.backend() >>>
     $format := gpu.SHADER_MSL
     $entrypoint := "main0"
     $name := "Metal"
@@ -54,60 +54,60 @@ fn run() int {
     } else if selected == gpu.D3D12 { format = gpu.SHADER_DXIL
         entrypoint = "main"
         name = "D3D12" }
-    code := shader_bytes(directory + "/transform.comp.bin") or >>
+    code := shader_bytes(directory + "/transform.comp.bin") >>>
     desc := gpu.ComputePipelineDesc{format: format, entrypoint: entrypoint, read_buffers: 1,
         write_buffers: 1, uniform_sizes: [16], threads_x: 64, threads_y: 1, threads_z: 1}
-    $pipeline := device.compute_pipeline(&desc, &code) or >>
+    $pipeline := device.compute_pipeline(&desc, &code) >>>
     count := 1027
     order := binary.little_endian()
     $bytes := []u8{}
     for n in 0:count*4 { bytes.push(u8(0)) }
-    for n in 0:count { order.put_u32_bytes($&bytes, n*4, (n*1234567) & 4294967295) or >> }
-    $input := device.buffer(count*4, gpu.BUFFER_COMPUTE_STORAGE_READ) or >>
-    $middle := device.buffer(count*4, gpu.BUFFER_COMPUTE_STORAGE_READ | gpu.BUFFER_COMPUTE_STORAGE_WRITE) or >>
-    $output := device.buffer(count*4, gpu.BUFFER_COMPUTE_STORAGE_WRITE) or >>
-    $uploaded := device.upload(&input, 0, &bytes) or >>
-    uploaded.close() or >>
-    $encoder := device.command_encoder() or >>
+    for n in 0:count { order.put_u32_bytes($&bytes, n*4, (n*1234567) & 4294967295) >>> }
+    $input := device.buffer(count*4, gpu.BUFFER_COMPUTE_STORAGE_READ) >>>
+    $middle := device.buffer(count*4, gpu.BUFFER_COMPUTE_STORAGE_READ | gpu.BUFFER_COMPUTE_STORAGE_WRITE) >>>
+    $output := device.buffer(count*4, gpu.BUFFER_COMPUTE_STORAGE_WRITE) >>>
+    $uploaded := device.upload(&input, 0, &bytes) >>>
+    uploaded.close() >>>
+    $encoder := device.command_encoder() >>>
     first_writes := [gpu.write_buffer(&middle, false)]
-    $first := encoder.begin_compute(&first_writes) or >>
-    first.pipeline(&pipeline) or >>
-    first.read_buffer(0, &input) or >>
-    u1 := parameters(3, 7, count) or >>
-    first.uniform(0, &u1) or >>
-    input.close() or >>
-    first.dispatch((count+63)/64, 1, 1) or >>
-    first.end() or >>
+    $first := encoder.begin_compute(&first_writes) >>>
+    first.pipeline(&pipeline) >>>
+    first.read_buffer(0, &input) >>>
+    u1 := parameters(3, 7, count) >>>
+    first.uniform(0, &u1) >>>
+    input.close() >>>
+    first.dispatch((count+63)/64, 1, 1) >>>
+    first.end() >>>
     // A separate pass supplies the dependency barrier before reading middle.
     second_writes := [gpu.write_buffer(&output, false)]
-    $second := encoder.begin_compute(&second_writes) or >>
-    second.pipeline(&pipeline) or >>
-    second.read_buffer(0, &middle) or >>
-    u2 := parameters(5, 11, count) or >>
-    second.uniform(0, &u2) or >>
-    middle.close() or >>
-    pipeline.close() or >>
-    second.dispatch((count+63)/64, 1, 1) or >>
-    second.end() or >>
-    $fence := encoder.submit() or >>
-    $readback := device.download(&output, 0, count*4) or >>
-    output.close() or >>
-    readback.wait() or >>
-    readback.read($&bytes) or >>
+    $second := encoder.begin_compute(&second_writes) >>>
+    second.pipeline(&pipeline) >>>
+    second.read_buffer(0, &middle) >>>
+    u2 := parameters(5, 11, count) >>>
+    second.uniform(0, &u2) >>>
+    middle.close() >>>
+    pipeline.close() >>>
+    second.dispatch((count+63)/64, 1, 1) >>>
+    second.end() >>>
+    $fence := encoder.submit() >>>
+    $readback := device.download(&output, 0, count*4) >>>
+    output.close() >>>
+    readback.wait() >>>
+    readback.read($&bytes) >>>
     for n in 0:count {
-        actual := order.get_u32_bytes(&bytes, n*4) or >>
+        actual := order.get_u32_bytes(&bytes, n*4) >>>
         assert(actual == ((n*1234567*15+46) & 4294967295))
     }
-    fence.wait() or >>
-    fence.close() or >>
-    readback.close() or >>
-    stats := device.stats() or >>
+    fence.wait() >>>
+    fence.close() >>>
+    readback.close() >>>
+    stats := device.stats() >>>
     assert(stats.buffer_count == 0 && stats.buffer_bytes == 0 && stats.submission_count == 0 && stats.staging_bytes == 0)
     assert(stats.compute_pipeline_count == 0 && stats.compute_pass_count == 0 && stats.encoder_count == 0)
-    device.close() or >>
+    device.close() >>>
     println("Standard GPU compute backend: " + name)
     println("Verified 1027 exact GPU values through two dependent compute passes and zero live resources")
     << 0
 }
-fn main() int { << run() or (err) { eprintln(err.msg())
+fn main() int { << run() >>> (err) { eprintln(err.msg())
     << 1 } }
