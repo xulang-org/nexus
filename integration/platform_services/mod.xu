@@ -1,0 +1,800 @@
+@"github.com/xulang-org/nexus/integration/platform_services"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+inp #"github.com/xulang-org/nexus/input"
+vp #"github.com/xulang-org/nexus/integration/viewport"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+rs #"github.com/xulang-org/nexus/resources/steam"
+rc #"github.com/xulang-org/nexus/resources/console"
+rt #"github.com/xulang-org/nexus/resources/taptap"
+st #"github.com/xulang-org/nexus/steam"
+cs #"github.com/xulang-org/nexus/console"
+tt #"github.com/xulang-org/nexus/taptap"
+timing #"github.com/xulang-org/nexus/timing"
+#crypto/sha256
+#errors
+#os
+#path/filepath
+#strings
+
+pub struct PlatformServices {
+    kind int
+    steam_client st.SteamClient
+    console_svc cs.ConsoleService
+    taptap_client tt.TapTapClient
+    mapping rc.MultiPlatformMapping
+}
+
+fn clone_mapping(m &rc.MultiPlatformMapping) rc.MultiPlatformMapping {
+    $am := []rc.LogicalAchievementMap{}
+    for i in 0:m.achievements.len {
+        a := &m.achievements[i]
+        am.push(rc.LogicalAchievementMap{
+            logical_id: a.logical_id + "",
+            steam_id: a.steam_id + "",
+            xbox_id: a.xbox_id + "",
+            ps_trophy_id: a.ps_trophy_id,
+            taptap_id: a.taptap_id + ""
+        })
+    }
+    $dm := []rc.LogicalDlcMap{}
+    for i in 0:m.dlcs.len {
+        d := &m.dlcs[i]
+        dm.push(rc.LogicalDlcMap{
+            logical_id: d.logical_id + "",
+            steam_app_id: d.steam_app_id,
+            xbox_store_id: d.xbox_store_id + "",
+            ps_entitlement: d.ps_entitlement + "",
+            switch_aoc_index: d.switch_aoc_index,
+            taptap_dlc_id: d.taptap_dlc_id + ""
+        })
+    }
+    << rc.MultiPlatformMapping{achievements: am, dlcs: dm}
+}
+
+pub fn open_steam(cfg rs.SteamAppConfig, save_dir string, mapping rc.MultiPlatformMapping) PlatformServices {
+    client := st.init_auto(cfg, save_dir + "") or >>
+    << PlatformServices{
+        kind: rc.PLATFORM_PC_STEAM,
+        steam_client: client,
+        console_svc: cs.empty_service(),
+        taptap_client: tt.empty_client(),
+        mapping: mapping
+    }
+}
+
+pub fn open_xbox(cfg rc.XboxAppConfig, platform int, save_dir string, mapping rc.MultiPlatformMapping) PlatformServices {
+    svc := cs.init_xbox_auto(cfg, platform, save_dir + "") or >>
+    << PlatformServices{
+        kind: platform,
+        steam_client: st.empty_client(),
+        console_svc: svc,
+        taptap_client: tt.empty_client(),
+        mapping: mapping
+    }
+}
+
+pub fn open_playstation(cfg rc.PlayStationAppConfig, platform int, save_dir string, mapping rc.MultiPlatformMapping) PlatformServices {
+    svc := cs.init_ps_auto(cfg, platform, save_dir + "") or >>
+    << PlatformServices{
+        kind: platform,
+        steam_client: st.empty_client(),
+        console_svc: svc,
+        taptap_client: tt.empty_client(),
+        mapping: mapping
+    }
+}
+
+pub fn open_switch(cfg rc.SwitchAppConfig, platform int, save_dir string, mapping rc.MultiPlatformMapping) PlatformServices {
+    svc := cs.init_switch_auto(cfg, platform, save_dir + "") or >>
+    << PlatformServices{
+        kind: platform,
+        steam_client: st.empty_client(),
+        console_svc: svc,
+        taptap_client: tt.empty_client(),
+        mapping: mapping
+    }
+}
+
+pub fn open_taptap(cfg rt.TapTapAppConfig, save_dir string, mapping rc.MultiPlatformMapping) PlatformServices {
+    $plat := rc.PLATFORM_TAPTAP_ANDROID
+    if cfg.target_platform == rt.TARGET_IOS { plat = rc.PLATFORM_TAPTAP_IOS }
+    else if cfg.target_platform == rt.TARGET_PC { plat = rc.PLATFORM_TAPTAP_PC }
+    tc := tt.init_auto(cfg, save_dir + "") or >>
+    << PlatformServices{
+        kind: plat,
+        steam_client: st.empty_client(),
+        console_svc: cs.empty_service(),
+        taptap_client: tc,
+        mapping: mapping
+    }
+}
+
+pub fn (p &PlatformServices) platform() int { << p.kind }
+pub fn (p &PlatformServices) is_steam() bool { << p.kind == rc.PLATFORM_PC_STEAM }
+pub fn (p &PlatformServices) is_xbox() bool { << rc.is_xbox_platform(p.kind) }
+pub fn (p &PlatformServices) is_playstation() bool { << rc.is_playstation_platform(p.kind) }
+pub fn (p &PlatformServices) is_switch() bool { << rc.is_switch_platform(p.kind) }
+pub fn (p &PlatformServices) is_taptap() bool { << rc.is_taptap_platform(p.kind) }
+
+pub fn (p &PlatformServices) platform_name() string {
+    if p.kind == rc.PLATFORM_PC_STEAM { << "PC Steam" }
+    if p.is_taptap() {
+        hw := rc.hardware_profile(p.kind) or (err) {
+            _ := err.msg()
+            << "TapTap"
+        }
+        << hw.name + ""
+    }
+    hw := p.console_svc.hardware()
+    << hw.name + ""
+}
+
+pub fn (p &PlatformServices) glyph_family() int {
+    if p.is_xbox() { << rc.GLYPH_XBOX }
+    if p.is_playstation() { << rc.GLYPH_PLAYSTATION }
+    if p.is_switch() { << rc.GLYPH_SWITCH }
+    if p.is_taptap() {
+        if p.kind == rc.PLATFORM_TAPTAP_PC { << rc.GLYPH_KEYBOARD_MOUSE }
+        << rc.GLYPH_TOUCH
+    }
+    prof := p.steam_client.profile()
+    if prof.on_steam_deck { << rc.GLYPH_STEAM_DECK }
+    << rc.GLYPH_KEYBOARD_MOUSE
+}
+
+pub fn (p &PlatformServices) confirm_label() string {
+    if p.is_xbox() { << "A" }
+    if p.is_switch() { << "A" }
+    if p.is_playstation() {
+        if p.console_svc.confirm_button_layout() == rc.CONFIRM_CIRCLE_B { << "Circle" }
+        << "Cross"
+    }
+    if p.is_taptap() {
+        if p.kind == rc.PLATFORM_TAPTAP_PC { << "Enter" }
+        << "Tap"
+    }
+    if p.steam_client.profile().on_steam_deck { << "A" }
+    << "Enter"
+}
+
+pub fn (p &PlatformServices) cancel_label() string {
+    if p.is_xbox() { << "B" }
+    if p.is_switch() { << "B" }
+    if p.is_playstation() {
+        if p.console_svc.confirm_button_layout() == rc.CONFIRM_CIRCLE_B { << "Cross" }
+        << "Circle"
+    }
+    if p.is_taptap() {
+        if p.kind == rc.PLATFORM_TAPTAP_PC { << "Esc" }
+        << "Back"
+    }
+    if p.steam_client.profile().on_steam_deck { << "B" }
+    << "Esc"
+}
+
+fn find_ach_idx_opt(mapping &rc.MultiPlatformMapping, logical_id &string) int {
+    for i in 0:mapping.achievements.len {
+        if mapping.achievements[i].logical_id == *logical_id { << i }
+    }
+    << -1
+}
+
+fn find_dlc_idx_opt(mapping &rc.MultiPlatformMapping, logical_id &string) int {
+    for i in 0:mapping.dlcs.len {
+        if mapping.dlcs[i].logical_id == *logical_id { << i }
+    }
+    << -1
+}
+
+fn find_ach_idx(mapping &rc.MultiPlatformMapping, logical_id &string) int {
+    idx := find_ach_idx_opt(mapping, logical_id)
+    if idx < 0 { >> errors.new("nexus platform_services: unknown logical achievement: " + logical_id) }
+    << idx
+}
+
+fn find_dlc_idx(mapping &rc.MultiPlatformMapping, logical_id &string) int {
+    idx := find_dlc_idx_opt(mapping, logical_id)
+    if idx < 0 { >> errors.new("nexus platform_services: unknown logical dlc: " + logical_id) }
+    << idx
+}
+
+pub fn (p $&PlatformServices) unlock_logical_achievement(logical_id string) int {
+    idx := find_ach_idx(&p.mapping, &logical_id) or >>
+    entry := &p.mapping.achievements[idx]
+    if p.is_steam() {
+        sid := entry.steam_id + ""
+        sc := $&p.steam_client
+        sc.unlock_achievement(sid + "") or >>
+        << 0
+    }
+    if p.is_taptap() {
+        $tid := entry.taptap_id + ""
+        if tid.len == 0 { tid = entry.logical_id + "" }
+        tc := $&p.taptap_client
+        << tc.unlock_achievement(tid + "") or >>
+    }
+    $aid := ""
+    $pid := entry.ps_trophy_id
+    if p.is_xbox() {
+        aid = entry.xbox_id + ""
+        pid = 0
+    } else if p.is_switch() {
+        aid = entry.logical_id + ""
+        pid = 0
+    }
+    cv := $&p.console_svc
+    << cv.unlock_achievement(aid, pid) or >>
+}
+
+pub fn (p &PlatformServices) has_logical_achievement(logical_id string) bool {
+    idx := find_ach_idx_opt(&p.mapping, &logical_id)
+    if idx < 0 { << false }
+    entry := &p.mapping.achievements[idx]
+    if p.is_steam() {
+        << p.steam_client.has_achievement(entry.steam_id + "")
+    }
+    if p.is_taptap() {
+        $tid := entry.taptap_id + ""
+        if tid.len == 0 { tid = entry.logical_id + "" }
+        << p.taptap_client.has_achievement(tid + "")
+    }
+    if p.is_xbox() {
+        << p.console_svc.has_achievement(entry.xbox_id + "", 0)
+    }
+    if p.is_switch() {
+        << p.console_svc.has_achievement(entry.logical_id + "", 0)
+    }
+    << p.console_svc.has_achievement("", entry.ps_trophy_id)
+}
+
+pub fn (p &PlatformServices) has_logical_dlc(logical_id string) bool {
+    idx := find_dlc_idx_opt(&p.mapping, &logical_id)
+    if idx < 0 { << false }
+    entry := &p.mapping.dlcs[idx]
+    if p.is_steam() {
+        << p.steam_client.is_dlc_installed(entry.steam_app_id)
+    }
+    if p.is_taptap() {
+        $did := entry.taptap_dlc_id + ""
+        if did.len == 0 { did = entry.logical_id + "" }
+        << p.taptap_client.has_dlc(did + "")
+    }
+    if p.is_xbox() {
+        << p.console_svc.has_entitlement(entry.xbox_store_id + "")
+    }
+    if p.is_switch() {
+        << p.console_svc.has_aoc(entry.switch_aoc_index)
+    }
+    << p.console_svc.has_entitlement(entry.ps_entitlement + "")
+}
+
+pub fn (p $&PlatformServices) grant_mock_logical_dlc(logical_id string) int {
+    idx := find_dlc_idx(&p.mapping, &logical_id) or >>
+    entry := &p.mapping.dlcs[idx]
+    if p.is_steam() {
+        sc := $&p.steam_client
+        << sc.register_mock_dlc(rs.SteamDlcInfo{app_id: entry.steam_app_id, installed: true, name: entry.logical_id + ""}) or >>
+    }
+    if p.is_taptap() {
+        $did := entry.taptap_dlc_id + ""
+        if did.len == 0 { did = entry.logical_id + "" }
+        tc := $&p.taptap_client
+        << tc.grant_mock_dlc(did + "") or >>
+    }
+    cv := $&p.console_svc
+    if p.is_xbox() {
+        << cv.grant_mock_entitlement(entry.xbox_store_id + "") or >>
+    }
+    if p.is_switch() {
+        << cv.grant_mock_aoc(entry.switch_aoc_index) or >>
+    }
+    << cv.grant_mock_entitlement(entry.ps_entitlement + "") or >>
+}
+
+pub fn (p $&PlatformServices) set_rich_activity(status string, activity_id string) int {
+    if p.is_steam() {
+        sc := $&p.steam_client
+        << sc.set_rich_presence("status", status + "") or >>
+    }
+    if p.is_taptap() { << 0 }
+    cv := $&p.console_svc
+    << cv.set_presence(status + "", activity_id + "") or >>
+}
+
+pub fn (p $&PlatformServices) apply_haptics(pad_idx int, cmd rc.GamepadHapticCommand) int {
+    rc.validate_haptic_command(&cmd) or >>
+    if p.is_steam() || p.is_taptap() { << 0 }
+    cv := $&p.console_svc
+    << cv.apply_haptics(pad_idx, cmd) or >>
+}
+
+pub fn (p &PlatformServices) can_use_multiplayer(require_crossplay bool) bool {
+    if p.is_steam() {
+        << p.steam_client.profile().logged_on
+    }
+    if p.is_taptap() {
+        << p.taptap_client.is_logged_in() && !p.taptap_client.compliance_state().restricted
+    }
+    u := p.console_svc.primary_user()
+    if !u.signed_in || !u.has_multiplayer_privilege { << false }
+    if require_crossplay && !u.crossplay_allowed { << false }
+    << true
+}
+
+pub fn (p $&PlatformServices) shutdown() int {
+    if p.is_steam() {
+        sc := $&p.steam_client
+        << sc.shutdown() or >>
+    }
+    if p.is_taptap() {
+        tc := $&p.taptap_client
+        << tc.shutdown() or >>
+    }
+    cv := $&p.console_svc
+    << cv.shutdown() or >>
+}
+
+pub fn (p &PlatformServices) current_confirm_layout() int {
+    if p.is_steam() || p.is_taptap() { << rc.CONFIRM_CROSS_A }
+    << p.console_svc.confirm_button_layout()
+}
+
+pub fn (p &PlatformServices) current_presence() string {
+    if p.is_steam() { << p.steam_client.get_rich_presence("status") }
+    if p.is_taptap() { << "" }
+    << p.console_svc.current_presence()
+}
+
+pub fn (p &PlatformServices) last_haptics(pad_idx int) rc.GamepadHapticCommand {
+    if p.is_steam() || p.is_taptap() { << rc.default_haptic_command() }
+    << p.console_svc.last_haptics(pad_idx)
+}
+
+pub fn (p &PlatformServices) platinum_unlocked() bool {
+    if !p.is_playstation() { << false }
+    << p.console_svc.platinum_unlocked()
+}
+
+pub fn (p $&PlatformServices) create_session(max_players int, crossplay bool) int {
+    if p.is_steam() {
+        sc := $&p.steam_client
+        << sc.create_lobby(rs.LOBBY_PUBLIC, max_players) or >>
+    }
+    if p.is_taptap() { << 1 }
+    cv := $&p.console_svc
+    << cv.create_session(max_players, crossplay) or >>
+}
+
+pub fn (p $&PlatformServices) start_activity(activity_id string) int {
+    if p.is_steam() || p.is_taptap() { << 0 }
+    cv := $&p.console_svc
+    << cv.start_activity(activity_id + "") or >>
+}
+
+pub fn (p $&PlatformServices) end_activity(activity_id string, outcome int) int {
+    if p.is_steam() || p.is_taptap() { << 0 }
+    cv := $&p.console_svc
+    << cv.end_activity(activity_id + "", outcome) or >>
+}
+
+pub fn (p $&PlatformServices) set_mock_overlay_or_constrained(active bool) {
+    if p.is_steam() {
+        sc := $&p.steam_client
+        sc.set_mock_overlay_active(active)
+        <<
+    }
+    if p.is_taptap() {
+        tc := $&p.taptap_client
+        if active {
+            tc.open_moment("forum") or (err) {
+                _ := err.msg()
+                <<
+            }
+        } else {
+            tc.close_mock_moment()
+        }
+        <<
+    }
+    cv := $&p.console_svc
+    cv.simulate_constrained(active)
+}
+
+pub fn (p $&PlatformServices) set_mock_confirm_button(layout int) int {
+    if p.is_steam() || p.is_taptap() { << 0 }
+    cv := $&p.console_svc
+    << cv.set_mock_confirm_button(layout) or >>
+}
+
+pub fn (p $&PlatformServices) simulate_suspend() {
+    if !p.is_steam() && !p.is_taptap() {
+        cv := $&p.console_svc
+        cv.simulate_suspend()
+    }
+}
+
+pub fn (p $&PlatformServices) simulate_resume() {
+    if !p.is_steam() && !p.is_taptap() {
+        cv := $&p.console_svc
+        cv.simulate_resume()
+    }
+}
+
+pub fn (p $&PlatformServices) simulate_user_sign_out() {
+    if p.is_taptap() {
+        tc := $&p.taptap_client
+        tc.simulate_switch_account() or (err) {
+            _ := err.msg()
+            <<
+        }
+        <<
+    }
+    if !p.is_steam() {
+        cv := $&p.console_svc
+        cv.simulate_user_sign_out()
+    }
+}
+
+pub fn (p $&PlatformServices) simulate_controller_disconnect(disconnected bool) {
+    if !p.is_steam() && !p.is_taptap() {
+        cv := $&p.console_svc
+        cv.simulate_controller_disconnect(disconnected)
+    }
+}
+
+pub fn (p &PlatformServices) taptap_compliance_restricted() bool {
+    if !p.is_taptap() { << false }
+    << p.taptap_client.compliance_state().restricted
+}
+
+pub fn (p &PlatformServices) taptap_check_payment(amount_cents int) int {
+    if !p.is_taptap() { << 0 }
+    << p.taptap_client.check_payment(amount_cents) or >>
+}
+
+pub fn (p $&PlatformServices) taptap_submit_payment(amount_cents int) int {
+    if !p.is_taptap() { << 0 }
+    tc := $&p.taptap_client
+    << tc.submit_payment(amount_cents) or >>
+}
+
+pub fn (p $&PlatformServices) taptap_open_moment(page string) int {
+    if !p.is_taptap() { << 0 }
+    tc := $&p.taptap_client
+    << tc.open_moment(page + "") or >>
+}
+
+pub fn (p $&PlatformServices) taptap_close_mock_moment() {
+    if p.is_taptap() {
+        tc := $&p.taptap_client
+        tc.close_mock_moment()
+    }
+}
+
+pub fn (p $&PlatformServices) taptap_simulate_minor(age_range int, remaining_sec int, restricted bool, reason int) int {
+    if !p.is_taptap() { << 0 }
+    tc := $&p.taptap_client
+    << tc.simulate_minor_profile(age_range, remaining_sec, restricted, reason) or >>
+}
+
+pub fn (p &PlatformServices) operation_mode() int {
+    if !p.is_switch() { << rc.OPERATION_MODE_DOCKED }
+    << p.console_svc.operation_mode()
+}
+
+pub fn (p &PlatformServices) npad_style() int {
+    if !p.is_switch() { << 0 }
+    << p.console_svc.npad_style()
+}
+
+pub fn (p &PlatformServices) touch_screen_active() bool {
+    if !p.is_switch() { << false }
+    << p.console_svc.touch_screen_active()
+}
+
+pub fn (p $&PlatformServices) simulate_operation_mode(mode int) int {
+    if !p.is_switch() { << 0 }
+    cv := $&p.console_svc
+    << cv.simulate_operation_mode(mode) or >>
+}
+
+pub fn (p $&PlatformServices) simulate_npad_style(style int) int {
+    if !p.is_switch() { << 0 }
+    cv := $&p.console_svc
+    << cv.simulate_npad_style(style) or >>
+}
+
+pub struct UnifiedStepStatus {
+    pub platform int
+    pub should_pause bool
+    pub must_flush_saves bool
+    pub must_reverify_user bool
+    pub return_to_title_required bool
+    pub controller_disconnected bool
+    pub safe_area_percent int
+    pub safe_ui_rect fm.Rect2
+    pub ui_scale f64
+    pub glyph_family int
+    pub confirm_label string
+    pub operation_mode int
+    pub npad_style int
+    pub touch_enabled bool
+    pub render_width int
+    pub render_height int
+    pub compliance_restricted bool
+    pub compliance_remaining_seconds int
+}
+
+// Unified per-frame coordinator automating Steam Overlay / Xbox Constrained /
+// PlayStation Rest-Mode / Switch Home-Sleep / TapTap Moment & Compliance pausing,
+// input release, user sign-out, Handheld-Docked transitions, and TV safe-area margins.
+pub struct UnifiedRuntimeBridge {
+    paused_by_platform bool
+    clock_was_paused bool
+    controller_disconnected bool
+    auto_pause bool
+}
+
+pub fn new_unified_bridge(auto_pause bool) UnifiedRuntimeBridge {
+    << UnifiedRuntimeBridge{
+        paused_by_platform: false,
+        clock_was_paused: false,
+        controller_disconnected: false,
+        auto_pause: auto_pause
+    }
+}
+
+fn resolve_taptap_hw(platform int) rc.ConsoleHardwareProfile {
+    hw := rc.hardware_profile(platform) or (err) {
+        _ := err.msg()
+        << rc.ConsoleHardwareProfile{
+            platform: platform, name: "TapTap", gfx_api: rc.GFX_VULKAN,
+            target_width: 1920, target_height: 1080, max_refresh_hz: 60,
+            memory_budget_mb: 4096, tv_safe_area_pct: 100,
+            supports_hdr: false, supports_vrr: false, supports_spatial_audio: false
+        }
+    }
+    << hw
+}
+
+pub fn (b $&UnifiedRuntimeBridge) step(svc $&PlatformServices, clock $&timing.ScaledClock,
+        input_map $&inp.InputMap, viewport &vp.Viewport) UnifiedStepStatus {
+    $should_pause := false
+    $must_flush := false
+    $must_reverify := false
+    $return_title := false
+    $safe_pct := 100
+    $ui_scale := 1.0
+    $op_mode := rc.OPERATION_MODE_DOCKED
+    $npad := 0
+    $touch_on := false
+    $ren_w := int(viewport.safe_rect.size.x)
+    $ren_h := int(viewport.safe_rect.size.y)
+    $comp_restricted := false
+    $comp_rem := -1
+
+    if svc.is_steam() {
+        sc := $&svc.steam_client
+        sc.tick() or >>
+        _ := sc.drain_events()
+        if sc.overlay_active() { should_pause = true }
+        prof := sc.profile()
+        if prof.on_steam_deck { ui_scale = 1.25 }
+    } else if svc.is_taptap() {
+        tc := $&svc.taptap_client
+        tc.poll() or >>
+        tevs := tc.drain_events()
+        for i in 0:tevs.len {
+            ek := tevs[i].kind
+            if ek == rt.EVENT_COMPLIANCE_PERIOD_RESTRICT ||
+                ek == rt.EVENT_COMPLIANCE_DURATION_LIMIT ||
+                ek == rt.EVENT_COMPLIANCE_AGE_LIMIT {
+                must_flush = true
+                should_pause = true
+                comp_restricted = true
+            }
+            if ek == rt.EVENT_COMPLIANCE_EXITED || ek == rt.EVENT_COMPLIANCE_SWITCH_ACCOUNT {
+                return_title = true
+            }
+        }
+        cs_t := tc.compliance_state()
+        comp_rem = cs_t.remaining_seconds
+        if cs_t.restricted {
+            comp_restricted = true
+            should_pause = true
+            must_flush = true
+        }
+        if tc.is_moment_open() { should_pause = true }
+        if !tc.is_logged_in() { return_title = true }
+        if svc.platform() == rc.PLATFORM_TAPTAP_ANDROID || svc.platform() == rc.PLATFORM_TAPTAP_IOS {
+            touch_on = true
+        }
+        hw := resolve_taptap_hw(svc.platform())
+        ren_w = hw.target_width
+        ren_h = hw.target_height
+    } else {
+        cv := $&svc.console_svc
+        cv.poll() or >>
+        evs := cv.drain_events()
+        for i in 0:evs.len {
+            ek := evs[i].kind
+            if ek == rc.EVENT_SUSPENDED { must_flush = true }
+            if ek == rc.EVENT_RESUMED { must_reverify = true }
+            if ek == rc.EVENT_USER_SIGNED_OUT { return_title = true }
+            if ek == rc.EVENT_CONTROLLER_DISCONNECTED { b.controller_disconnected = true }
+            if ek == rc.EVENT_CONTROLLER_RECONNECTED { b.controller_disconnected = false }
+        }
+        lc := cv.lifecycle_state()
+        if lc == rc.LIFECYCLE_CONSTRAINED || lc == rc.LIFECYCLE_SUSPENDED || b.controller_disconnected {
+            should_pause = true
+        }
+        if !cv.primary_user().signed_in { return_title = true }
+        safe_pct = cv.safe_area_percent()
+        hw := cv.hardware()
+        if cv.is_switch() {
+            op_mode = cv.operation_mode()
+            npad = cv.npad_style()
+            touch_on = cv.touch_screen_active()
+            res := rc.switch_resolution(svc.platform(), op_mode)
+            ren_w = res[0]
+            ren_h = res[1]
+            if op_mode == rc.OPERATION_MODE_HANDHELD || ren_w >= 3840 {
+                ui_scale = 1.25
+            }
+        } else {
+            ren_w = hw.target_width
+            ren_h = hw.target_height
+            if hw.target_width >= 3840 { ui_scale = 1.25 }
+        }
+    }
+
+    if b.auto_pause {
+        if should_pause && !b.paused_by_platform {
+            input_map.release_all()
+            b.clock_was_paused = clock.is_paused()
+            clock.set_paused(true)
+            b.paused_by_platform = true
+        } else if !should_pause && b.paused_by_platform {
+            clock.set_paused(b.clock_was_paused)
+            b.paused_by_platform = false
+        }
+    }
+
+    $margin_frac := f64(100 - safe_pct) * 0.005
+    if margin_frac < 0.0 { margin_frac = 0.0 }
+    pad_x := viewport.safe_rect.size.x * margin_frac
+    pad_y := viewport.safe_rect.size.y * margin_frac
+    safe_rect := viewport.safe_inset_rect(pad_x, pad_y, pad_x, pad_y) or >>
+
+    << UnifiedStepStatus{
+        platform: svc.platform(),
+        should_pause: should_pause,
+        must_flush_saves: must_flush,
+        must_reverify_user: must_reverify,
+        return_to_title_required: return_title,
+        controller_disconnected: b.controller_disconnected,
+        safe_area_percent: safe_pct,
+        safe_ui_rect: safe_rect,
+        ui_scale: ui_scale,
+        glyph_family: svc.glyph_family(),
+        confirm_label: svc.confirm_label(),
+        operation_mode: op_mode,
+        npad_style: npad,
+        touch_enabled: touch_on,
+        render_width: ren_w,
+        render_height: ren_h,
+        compliance_restricted: comp_restricted,
+        compliance_remaining_seconds: comp_rem
+    }
+}
+
+const SAVE_ENVELOPE_PREFIX = "NXSV1|"
+
+// Integrity-verified save slot store backed transparently by Steam Cloud,
+// Xbox Connected Storage, PlayStation sceSaveData, Nintendo Switch save:/, or TapTap CloudSave.
+pub struct UnifiedSaveStore {
+    pub local_dir string
+}
+
+pub fn new_unified_save_store(local_dir string) UnifiedSaveStore {
+    << UnifiedSaveStore{local_dir: local_dir + ""}
+}
+
+fn slice_to_string(data &[]u8, start int, stop int) string {
+    $b := strings.new_byte_builder(stop - start + 1)
+    for i in start:stop { b.write_byte(int(data[i])) }
+    << b.to_string()
+}
+
+fn encode_save_envelope(data &[]u8) []u8 {
+    body := slice_to_string(data, 0, data.len)
+    digest := sha256.sum256(body)
+    hdr := SAVE_ENVELOPE_PREFIX + digest + "|"
+    $out := []u8{}
+    for i in 0:hdr.len { out.push(u8(hdr[i] & 255)) }
+    for i in 0:data.len { out.push(data[i]) }
+    << out
+}
+
+fn decode_save_envelope(raw &[]u8) []u8 {
+    if raw.len < 71 { >> errors.new("nexus platform save: envelope truncated") }
+    if slice_to_string(raw, 0, 6) != SAVE_ENVELOPE_PREFIX || (raw[70] & 255) != 124 {
+        >> errors.new("nexus platform save: invalid envelope header")
+    }
+    expected := slice_to_string(raw, 6, 70)
+    body := slice_to_string(raw, 71, raw.len)
+    if sha256.sum256(body) != expected {
+        >> errors.new("nexus platform save: SHA-256 verification failed")
+    }
+    $out := []u8{}
+    for i in 71:raw.len { out.push(raw[i]) }
+    << out
+}
+
+fn console_container_name(p &PlatformServices) string {
+    if p.is_xbox() { << "saves" }
+    if p.is_switch() { << "save" }
+    << "SAVEDATA"
+}
+
+fn console_blob_name(clean &string) string {
+    << strings.replace_all(clean, "/", "_")
+}
+
+pub fn (s &UnifiedSaveStore) write_slot(svc $&PlatformServices, slot string, data &[]u8) int {
+    clean := rs.validate_cloud_filename(&slot) or >>
+    env := encode_save_envelope(data)
+    if svc.is_steam() {
+        sc := $&svc.steam_client
+        if sc.is_initialized() && sc.cloud_enabled() {
+            sc.cloud_write(clean + "", &env) or >>
+        }
+    } else if svc.is_taptap() {
+        tc := $&svc.taptap_client
+        if tc.is_initialized() {
+            tc.cloud_write(clean + "", "Nexus Save", &env) or >>
+        }
+    } else {
+        cont := console_container_name(svc)
+        blob := console_blob_name(&clean)
+        cv := $&svc.console_svc
+        cv.save_write(cont, blob, &env) or >>
+    }
+    if s.local_dir.len > 0 {
+        dest := filepath.join([s.local_dir + "", clean + ""])
+        os.mkdir_all(filepath.dir(dest)) or >>
+        raw := slice_to_string(&env, 0, env.len)
+        snapshot.write_atomic(dest + "", &raw) or >>
+    }
+    << 0
+}
+
+pub fn (s &UnifiedSaveStore) read_slot(svc &PlatformServices, slot string) []u8 {
+    clean := rs.validate_cloud_filename(&slot) or >>
+    if svc.is_steam() {
+        if svc.steam_client.is_initialized() && svc.steam_client.cloud_enabled() && svc.steam_client.cloud_exists(clean + "") {
+            env := svc.steam_client.cloud_read(clean + "") or >>
+            << decode_save_envelope(&env) or >>
+        }
+    } else if svc.is_taptap() {
+        if svc.taptap_client.is_initialized() && svc.taptap_client.cloud_exists(clean + "") {
+            env := svc.taptap_client.cloud_read(clean + "") or >>
+            << decode_save_envelope(&env) or >>
+        }
+    } else {
+        cont := console_container_name(svc)
+        blob := console_blob_name(&clean)
+        if svc.console_svc.is_initialized() && svc.console_svc.save_exists(cont + "", blob + "") {
+            env := svc.console_svc.save_read(cont + "", blob + "") or >>
+            << decode_save_envelope(&env) or >>
+        }
+    }
+    if s.local_dir.len > 0 {
+        src := filepath.join([s.local_dir + "", clean + ""])
+        raw := snapshot.read(src, rs.MAX_CLOUD_FILE_BYTES) or >>
+        $env := []u8{}
+        for i in 0:raw.len { env.push(u8(raw[i] & 255)) }
+        << decode_save_envelope(&env) or >>
+    }
+    >> errors.new("nexus platform save: save slot missing: " + clean)
+}

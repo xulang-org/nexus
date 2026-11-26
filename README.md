@@ -2390,3 +2390,44 @@ make scene-lod-gpu-test
 ```
 
 Metal 回归验证近景与远景各自保存后由新进程重开，整张画面逐像素一致，实际提交从两个三角形降到一个。屏幕误差 LOD、自动简化、级间渐变和 GLB 自带 LOD 声明的导入仍待实现。
+
+## Steamworks 与 SteamPipe 集成
+
+Nexus 按四层边界接入 Steam 生态，保持引擎核心仓库**零专有 SDK 头文件或二进制**：
+
+- **数据层 (`resources/steam`)**：`SteamAppConfig`（AppID、DepotID、分支、Cloud 配额、DLC、成就、统计、排行榜）JSON 编解码、严格云存档路径校验，以及 SteamPipe `steam_appid.txt`、`depot_build_<id>.vdf` 与 `app_build_<id>.vdf` 生成器。
+- **平台层 (`native/steam.c` + `platform/steam`)**：`nexus_steam.xulib` 通过 `dlopen`/`LoadLibraryA` 在运行时按需查找 `XU_NEXUS_STEAM_LIBRARY` 或标准 `libsteam_api.dylib` / `libsteam_api.so` / `steam_api64.dll` 符号并绑定 Valve Flat C API。
+- **服务层 (`steam`)**：提供统一 `SteamClient`（`init_native` / `init_mock` / `init_auto` 无库自动回退），覆盖成就与进度、Int/Float 统计、Cloud 读写删与配额校验、排行榜排序、DLC 检测、Workshop UGC 列表、大厅元数据与 `SteamMockBus` P2P 路由。
+- **集成层 (`integration/steam`)**：`SteamRuntimeBridge`（Overlay 激活自动暂停 `ScaledClock`、清零 `InputMap` 与 Steam Deck 1.25× HUD 缩放）、`SteamSaveStore`（`NXSV1|<sha256>|` 完整性存档信封）、`SteamNetBridge`（封装 `networking` 二进制包走 Steam P2P）与 `mount_workshop_bundle`（HMAC-SHA256 校验订阅模组）。
+- **工具链 (`cmd/project`)**：新增 `nexus-project steam-validate <steam.json>` 与 `nexus-project steam-stage <project.json> --steam <steam.json> --output <dir>`。
+
+```sh
+make native-steam steam-data-test steam-test steam-native-test
+```
+
+## 主机平台（Xbox GDK、PlayStation 5/4、Nintendo Switch）与统一平台层
+
+Nexus 为 **Steam PC、Xbox（Series X|S / Xbox PC GDK）、PlayStation（PS5 / PS5 Pro / PS4）与 Nintendo Switch（Switch / Switch 2）**提供统一四层接口，同样坚持**仓库零专有主机 SDK**：
+
+- **主机数据与认证规则 (`resources/console`)**：12 档硬件渲染/显存/安全区预算（Series X/S、Xbox PC、PS5/5 Pro、PS4、Switch、Switch 2、PC Steam、TapTap Android/iOS/PC），`XboxAppConfig`（`MicrosoftGame.config`、`layout.xml`）、`PlayStationAppConfig`（`sce_sys/param.json`、`package.gp5`、UDS 奖杯/活动 JSON）、`SwitchAppConfig`（`.nmeta` XML 声明、掌机/底座动态分辨率表 `switch_resolution`）、HD Rumble（40–1280 Hz）/脉冲扳机/自适应扳机校验，以及 XR/TRC/Lotcheck 自动合规检查。
+- **动态原生桥 (`native/console.c` + `platform/console`)**：按平台族分别动态加载 `XU_NEXUS_XBOX_DRIVER`（Xbox GDK）、`XU_NEXUS_PS_DRIVER`（PlayStation SDK）或 `XU_NEXUS_SWITCH_DRIVER`（Nintendo SDK）导出的 `nexus_console_v1_*` C 符号（含 Switch `operation_mode` 与 `npad_style` 查询），未提供驱动时无缝切换至离线模拟器。
+- **主机运行时 (`console`)**：Xbox 成就/脉冲扳机/Connected Storage/Quick Resume/MPSD 会话；PlayStation 奖杯（全解锁自动颁发白金奖杯）/PS5 Activities/DualSense 自适应扳机与灯条/亚区 `Circle`/`Cross` 确认键切换/`sceSaveData` 配额管理；Nintendo Switch 掌机（100% 安全区 + 触屏 + `A` 东侧确认键）与底座（90% 电视安全区 + Pro 手柄）动态切换、HD Rumble 频率控制、AOC（追加内容索引）与 `save:/` 挂载配额。
+- **跨平台统一门面 (`integration/platform_services`)**：`PlatformServices`、`UnifiedRuntimeBridge`（Overlay/Constrained/Rest Mode/Home-Sleep/TapTap Moment & 防沉迷自动暂停并清零按键、挂起冲刷存档、断连暂停、主账号登出或切换账号回标题、`90%` 电视安全边距、Switch 掌机/底座实时分辨率与触屏状态切换）与 `UnifiedSaveStore`（跨五端 **Steam / Xbox / PlayStation / Switch / TapTap** SHA-256 `NXSV1` 防篡改存档）。
+- **主机打包 CLI (`cmd/project`)**：新增 `xbox-validate`、`xbox-stage`、`ps-validate`、`ps-stage`、`switch-validate`、`switch-stage`、`taptap-validate`、`taptap-stage`。
+
+```sh
+make native-console console-data-test console-test console-native-test
+```
+
+## TapTap（TapSDK v4：Android / iOS / PC）集成
+
+Nexus 为 **TapTap 中国区（CN）与国际区（Global）**的 **Android / iOS / PC** 发行提供完整四层接入，同样坚持**仓库零专有 TapSDK 头文件或二进制**：
+
+- **配置、防沉迷法规与审核 (`resources/taptap`)**：`TapTapAppConfig` JSON 编解码与校验、CN 国家新闻出版署未成年人充值单笔与月累计限额检查（8 岁以下禁止、8–15 岁单笔 ¥50/月 ¥200、16–17 岁单笔 ¥100/月 ¥400）、CN 实名防沉迷/CADPA 适龄提示与版号上线审计，以及 `taptap_sdk_config.json` / `TapTapAndroidManifest.xml` / `TapTapInfo.plist` / `taptap_client_id.txt` 生成器。
+- **动态原生桥 (`native/taptap.c` + `platform/taptap`)**：`nexus_taptap.xulib` 通过 `dlopen`/`LoadLibraryA` 运行时按需加载 `XU_NEXUS_TAPTAP_LIBRARY` 或 `libnexus_taptap_sdk.*` 导出的 `nexus_taptap_v1_*` C 符号（34 个导出函数），未加载外部库时无缝回退本地确定性模拟器。
+- **TapTap 运行时 (`taptap`)**：`TapTapClient` 统一提供 TapTap 登录/登出/切换账号、实名防沉迷与消费限额、正版校验（TapLicense）与 DLC 检查、普通与增量成就、CloudSave 存档与配额校验、排行榜降序排名、TapTap Moments 动态社区与更新检查，并支持本地 JSON/Cloud 状态持久化。
+- **分发 CLI (`cmd/project`)**：新增 `nexus-project taptap-validate <taptap.json>` 与 `nexus-project taptap-stage <project.json> --taptap <taptap.json> --output <dir>`。
+
+```sh
+make native-taptap taptap-data-test taptap-test taptap-native-test
+```

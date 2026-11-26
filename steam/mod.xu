@@ -1,0 +1,1235 @@
+@"github.com/xulang-org/nexus/steam"
+
+plat #"github.com/xulang-org/nexus/platform/steam"
+rs #"github.com/xulang-org/nexus/resources/steam"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#encoding/json
+#errors
+#math
+#os
+#path/filepath
+#strconv
+#strings
+
+pub const BACKEND_NONE = 0
+pub const BACKEND_NATIVE = 1
+pub const BACKEND_LOCAL_MOCK = 2
+
+const MAX_P2P_CHANNEL = 32
+const MAX_OUTBOX = 256
+const MAX_EVENTS = 256
+
+struct MockBusPacket {
+    to_id int
+    msg rs.SteamP2PMessage
+}
+
+// Deterministic in-memory router linking mock SteamClient peers for lobby and P2P tests.
+pub struct SteamMockBus {
+    next_lobby_id int
+    lobbies map[int]rs.SteamLobbyInfo
+    packets []MockBusPacket
+}
+
+pub fn new_mock_bus() SteamMockBus {
+    << SteamMockBus{
+        next_lobby_id: 10001,
+        lobbies: map[int]rs.SteamLobbyInfo{},
+        packets: []MockBusPacket{}
+    }
+}
+
+pub struct SteamClient {
+    cfg rs.SteamAppConfig
+    backend int
+    initialized bool
+    restart_req bool
+    save_dir string
+    profile_state rs.SteamUserProfile
+    mock_overlay_active bool
+    mock_friends int
+    mock_rich_presence map[string]string
+    achievements map[string]rs.SteamAchievement
+    ach_keys []string
+    int_stats map[string]int
+    int_stat_keys []string
+    float_stats map[string]f64
+    float_stat_keys []string
+    leaderboards map[string][]rs.SteamLeaderboardEntry
+    board_keys []string
+    cloud_index []string
+    cloud_mem map[string][]u8
+    mock_dlcs map[int]rs.SteamDlcInfo
+    mock_ugc map[int]rs.SteamWorkshopItem
+    ugc_keys []int
+    in_lobby bool
+    lobby rs.SteamLobbyInfo
+    next_mock_lobby_id int
+    p2p_outbox []MockBusPacket
+    p2p_inbox []rs.SteamP2PMessage
+    events []rs.SteamEvent
+}
+
+fn empty_lobby() rs.SteamLobbyInfo {
+    << rs.SteamLobbyInfo{
+        lobby_id: 0,
+        owner_id: 0,
+        visibility: rs.LOBBY_PRIVATE,
+        max_members: 0,
+        member_ids: []int{},
+        metadata: map[string]string{}
+    }
+}
+
+fn push_unique_str(list $&[]string, key string) {
+    for i in 0:list.len {
+        if list[i] == key { << }
+    }
+    list.push(key)
+}
+
+fn push_unique_int(list $&[]int, key int) {
+    for i in 0:list.len {
+        if list[i] == key { << }
+    }
+    list.push(key)
+}
+
+fn init_defaults_for_cfg(client $&SteamClient, cfg &rs.SteamAppConfig) {
+    for i in 0:cfg.achievement_ids.len {
+        aid := cfg.achievement_ids[i] + ""
+        client.achievements[aid + ""] = rs.SteamAchievement{
+            id: aid + "",
+            unlocked: false,
+            progress: 0,
+            max_progress: 0
+        }
+        push_unique_str($&client.ach_keys, aid + "")
+    }
+    for i in 0:cfg.stat_defs.len {
+        sd := &cfg.stat_defs[i]
+        sid := sd.id + ""
+        if sd.is_float {
+            client.float_stats[sid + ""] = sd.default_float
+            push_unique_str($&client.float_stat_keys, sid + "")
+        } else {
+            client.int_stats[sid + ""] = sd.default_int
+            push_unique_str($&client.int_stat_keys, sid + "")
+        }
+    }
+    for i in 0:cfg.dlc_ids.len {
+        did := cfg.dlc_ids[i]
+        client.mock_dlcs[did] = rs.SteamDlcInfo{
+            app_id: did,
+            installed: false,
+            name: "DLC-" + str(did)
+        }
+    }
+}
+
+fn new_client_shell(cfg rs.SteamAppConfig, backend int) SteamClient {
+    $c := SteamClient{
+        cfg: cfg,
+        backend: backend,
+        initialized: true,
+        restart_req: false,
+        save_dir: "",
+        profile_state: rs.SteamUserProfile{
+            steam_id: 0,
+            persona_name: "",
+            language: "english",
+            logged_on: false,
+            on_steam_deck: false,
+            in_big_picture: false,
+            overlay_enabled: false
+        },
+        mock_overlay_active: false,
+        mock_friends: 0,
+        mock_rich_presence: map[string]string{},
+        achievements: map[string]rs.SteamAchievement{},
+        ach_keys: []string{},
+        int_stats: map[string]int{},
+        int_stat_keys: []string{},
+        float_stats: map[string]f64{},
+        float_stat_keys: []string{},
+        leaderboards: map[string][]rs.SteamLeaderboardEntry{},
+        board_keys: []string{},
+        cloud_index: []string{},
+        cloud_mem: map[string][]u8{},
+        mock_dlcs: map[int]rs.SteamDlcInfo{},
+        mock_ugc: map[int]rs.SteamWorkshopItem{},
+        ugc_keys: []int{},
+        in_lobby: false,
+        lobby: empty_lobby(),
+        next_mock_lobby_id: 20001,
+        p2p_outbox: []MockBusPacket{},
+        p2p_inbox: []rs.SteamP2PMessage{},
+        events: []rs.SteamEvent{}
+    }
+    init_defaults_for_cfg($&c, &c.cfg)
+    << c
+}
+
+fn push_event(c $&SteamClient, ev rs.SteamEvent) {
+    if c.events.len >= MAX_EVENTS { << }
+    c.events.push(ev)
+}
+
+fn path_exists(p &string) bool {
+    _ := os.stat(p + "") or (err) { << false }
+    << true
+}
+
+fn load_mock_state(c $&SteamClient) int {
+    if c.save_dir.len == 0 { << 0 }
+    state_path := filepath.join([c.save_dir + "", "steam_state.json"])
+    if !path_exists(&state_path) { << 0 }
+    raw := snapshot.read(state_path + "", 4194304) or >>
+    doc := json.parse_max(&raw, 4194304)
+    if !doc.ok() { >> errors.new("nexus steam state JSON: " + doc.error()) }
+    root := doc.root()
+    if !doc.is_dict(root) { >> errors.new("nexus steam: corrupted mock state") }
+    if doc.has(root, "achievements") {
+        al := doc.get(root, "achievements")
+        if doc.is_dict(al) {
+            keys := doc.dict_keys(al)
+            for k in keys {
+                aid := k + ""
+                node := doc.get(al, aid + "")
+                $un := false
+                $pr := 0
+                $mp := 0
+                if doc.has(node, "unlocked") { un = doc.as_bool(doc.get(node, "unlocked")) or >> }
+                if doc.has(node, "progress") { pr = doc.as_int(doc.get(node, "progress")) or >> }
+                if doc.has(node, "max_progress") { mp = doc.as_int(doc.get(node, "max_progress")) or >> }
+                c.achievements[aid + ""] = rs.SteamAchievement{id: aid + "", unlocked: un, progress: pr, max_progress: mp}
+                push_unique_str($&c.ach_keys, aid + "")
+            }
+        }
+    }
+    if doc.has(root, "int_stats") {
+        isl := doc.get(root, "int_stats")
+        if doc.is_dict(isl) {
+            keys := doc.dict_keys(isl)
+            for k in keys {
+                sid := k + ""
+                c.int_stats[sid + ""] = doc.as_int(doc.get(isl, sid + "")) or >>
+                push_unique_str($&c.int_stat_keys, sid + "")
+            }
+        }
+    }
+    if doc.has(root, "float_stats") {
+        fsl := doc.get(root, "float_stats")
+        if doc.is_dict(fsl) {
+            keys := doc.dict_keys(fsl)
+            for k in keys {
+                sid := k + ""
+                c.float_stats[sid + ""] = doc.as_f64(doc.get(fsl, sid + "")) or >>
+                push_unique_str($&c.float_stat_keys, sid + "")
+            }
+        }
+    }
+    if doc.has(root, "cloud_files") {
+        cf := doc.get(root, "cloud_files")
+        if doc.is_list(cf) {
+            c.cloud_index = []string{}
+            for i in 0:doc.count(cf) {
+                fname := doc.as_string(doc.at(cf, i)) or >>
+                c.cloud_index.push(fname)
+            }
+        }
+    }
+    if doc.has(root, "leaderboards") {
+        lbs := doc.get(root, "leaderboards")
+        if doc.is_dict(lbs) {
+            bnames := doc.dict_keys(lbs)
+            for bn in bnames {
+                board := bn + ""
+                arr := doc.get(lbs, board + "")
+                $entries := []rs.SteamLeaderboardEntry{}
+                if doc.is_list(arr) {
+                    for i in 0:doc.count(arr) {
+                        en := doc.at(arr, i)
+                        entries.push(rs.SteamLeaderboardEntry{
+                            steam_id: doc.as_int(doc.get(en, "steam_id")) or >>,
+                            persona_name: doc.as_string(doc.get(en, "persona_name")) or >>,
+                            rank: doc.as_int(doc.get(en, "rank")) or >>,
+                            score: doc.as_int(doc.get(en, "score")) or >>
+                        })
+                    }
+                }
+                c.leaderboards[board + ""] = entries
+                push_unique_str($&c.board_keys, board + "")
+            }
+        }
+    }
+    << 0
+}
+
+fn save_mock_state(c &SteamClient) int {
+    if c.save_dir.len == 0 { << 0 }
+    os.mkdir_all(c.save_dir + "") or >>
+    $b := strings.new_byte_builder(1024)
+    b.write_str("{\n  \"achievements\": {")
+    for i in 0:c.ach_keys.len {
+        if i > 0 { b.write_str(", ") }
+        aid := c.ach_keys[i] + ""
+        akey := c.ach_keys[i] + ""
+        ach := &c.achievements[akey]
+        $un := "false"
+        if ach.unlocked { un = "true" }
+        b.write_str(json.quote(&aid) + ": {\"unlocked\": " + un +
+            ", \"progress\": " + str(ach.progress) +
+            ", \"max_progress\": " + str(ach.max_progress) + "}")
+    }
+    b.write_str("},\n  \"int_stats\": {")
+    for i in 0:c.int_stat_keys.len {
+        if i > 0 { b.write_str(", ") }
+        sid := c.int_stat_keys[i] + ""
+        b.write_str(json.quote(&sid) + ": " + str(c.int_stats[sid + ""]))
+    }
+    b.write_str("},\n  \"float_stats\": {")
+    for i in 0:c.float_stat_keys.len {
+        if i > 0 { b.write_str(", ") }
+        sid := c.float_stat_keys[i] + ""
+        fv := strconv.format_float(c.float_stats[sid + ""], 103, -1) or >>
+        b.write_str(json.quote(&sid) + ": " + fv)
+    }
+    b.write_str("},\n  \"cloud_files\": [")
+    for i in 0:c.cloud_index.len {
+        if i > 0 { b.write_str(", ") }
+        cf := c.cloud_index[i] + ""
+        b.write_str(json.quote(&cf))
+    }
+    b.write_str("],\n  \"leaderboards\": {")
+    for bi in 0:c.board_keys.len {
+        if bi > 0 { b.write_str(", ") }
+        bn := c.board_keys[bi] + ""
+        bkey := c.board_keys[bi] + ""
+        entries := &c.leaderboards[bkey]
+        b.write_str(json.quote(&bn) + ": [")
+        for ei in 0:entries.len {
+            if ei > 0 { b.write_str(", ") }
+            e := &entries[ei]
+            pn := e.persona_name + ""
+            b.write_str("{\"steam_id\": " + str(e.steam_id) +
+                ", \"persona_name\": " + json.quote(&pn) +
+                ", \"rank\": " + str(e.rank) +
+                ", \"score\": " + str(e.score) + "}")
+        }
+        b.write_str("]")
+    }
+    b.write_str("}\n}\n")
+    raw := b.to_string()
+    snapshot.write_atomic(filepath.join([c.save_dir + "", "steam_state.json"]), &raw) or >>
+    << 0
+}
+
+pub fn empty_client() SteamClient {
+    $c := new_client_shell(rs.default_config(1, 1), BACKEND_NONE)
+    c.initialized = false
+    << c
+}
+
+pub fn init_native(cfg rs.SteamAppConfig) SteamClient {
+    rs.validate_config(&cfg) or >>
+    if cfg.require_steam_restart {
+        need := plat.raw_restart_if_necessary(cfg.app_id)
+        if need < 0 {
+            plat.checked(need) or >>
+        }
+        if need > 0 {
+            $c := new_client_shell(cfg, BACKEND_NONE)
+            c.initialized = false
+            c.restart_req = true
+            << c
+        }
+    }
+    plat.checked(plat.raw_init(cfg.app_id)) or >>
+    plat.checked(plat.raw_request_stats()) or >>
+    $pbuf := plat.alloc_u8(256)
+    plen := plat.raw_persona_name($&pbuf)
+    persona := plat.u8_to_str(&pbuf, plen)
+    $lbuf := plat.alloc_u8(64)
+    llen := plat.raw_game_language($&lbuf)
+    lang := plat.u8_to_str(&lbuf, llen)
+    $prof_lang := "english"
+    if lang.len > 0 { prof_lang = lang + "" }
+    $c := new_client_shell(cfg, BACKEND_NATIVE)
+    c.profile_state = rs.SteamUserProfile{
+        steam_id: plat.raw_steam_id(),
+        persona_name: persona,
+        language: prof_lang,
+        logged_on: plat.raw_logged_on() == 1,
+        on_steam_deck: plat.raw_is_steam_deck() == 1,
+        in_big_picture: plat.raw_is_big_picture() == 1,
+        overlay_enabled: plat.raw_is_overlay_enabled() == 1
+    }
+    push_event($&c, rs.SteamEvent{kind: rs.EVENT_STATS_RECEIVED, active: true, code: 0, id: c.cfg.app_id, text: ""})
+    << c
+}
+
+pub fn init_mock(cfg rs.SteamAppConfig, save_dir string, steam_id int, persona string) SteamClient {
+    rs.validate_config(&cfg) or >>
+    if steam_id <= 0 || persona.len == 0 {
+        >> errors.new("nexus steam mock: steam_id must be positive and persona non-empty")
+    }
+    $c := new_client_shell(cfg, BACKEND_LOCAL_MOCK)
+    c.save_dir = save_dir + ""
+    c.mock_friends = 3
+    c.profile_state = rs.SteamUserProfile{
+        steam_id: steam_id,
+        persona_name: persona + "",
+        language: "english",
+        logged_on: true,
+        on_steam_deck: false,
+        in_big_picture: false,
+        overlay_enabled: true
+    }
+    load_mock_state($&c) or >>
+    push_event($&c, rs.SteamEvent{kind: rs.EVENT_STATS_RECEIVED, active: true, code: 0, id: c.cfg.app_id, text: persona + ""})
+    << c
+}
+
+pub fn init_auto(cfg rs.SteamAppConfig, fallback_save_dir string) SteamClient {
+    rs.validate_config(&cfg) or >>
+    if plat.raw_is_available() == 1 {
+        native_cfg := cfg.clone()
+        native_res := init_native(native_cfg) or (err) {
+            _ := err.msg()
+            << init_mock(cfg.clone(), fallback_save_dir + "", 76561198000000001, "NexusPlayer") or >>
+        }
+        << native_res
+    }
+    << init_mock(cfg, fallback_save_dir + "", 76561198000000001, "NexusPlayer") or >>
+}
+
+pub fn (c &SteamClient) is_initialized() bool { << c.initialized }
+pub fn (c &SteamClient) is_native() bool { << c.backend == BACKEND_NATIVE }
+pub fn (c &SteamClient) restart_required() bool { << c.restart_req }
+pub fn (c &SteamClient) backend_name() string {
+    if c.backend == BACKEND_NATIVE { << "steam_native" }
+    if c.backend == BACKEND_LOCAL_MOCK { << "steam_mock" }
+    << "none"
+}
+
+pub fn (c &SteamClient) profile() rs.SteamUserProfile {
+    << rs.SteamUserProfile{
+        steam_id: c.profile_state.steam_id,
+        persona_name: c.profile_state.persona_name + "",
+        language: c.profile_state.language + "",
+        logged_on: c.profile_state.logged_on,
+        on_steam_deck: c.profile_state.on_steam_deck,
+        in_big_picture: c.profile_state.in_big_picture,
+        overlay_enabled: c.profile_state.overlay_enabled
+    }
+}
+pub fn (c &SteamClient) overlay_active() bool { << c.mock_overlay_active }
+
+pub fn (c $&SteamClient) set_mock_overlay_active(active bool) int {
+    if c.backend != BACKEND_LOCAL_MOCK { << 0 }
+    if c.mock_overlay_active != active {
+        c.mock_overlay_active = active
+        push_event(c, rs.SteamEvent{kind: rs.EVENT_OVERLAY_ACTIVATED, active: active, code: 0, id: 0, text: ""})
+    }
+    << 0
+}
+
+pub fn (c $&SteamClient) set_mock_steam_deck(on_deck bool, big_picture bool) int {
+    if c.backend != BACKEND_LOCAL_MOCK { << 0 }
+    c.profile_state = rs.SteamUserProfile{
+        steam_id: c.profile_state.steam_id,
+        persona_name: c.profile_state.persona_name + "",
+        language: c.profile_state.language + "",
+        logged_on: c.profile_state.logged_on,
+        on_steam_deck: on_deck,
+        in_big_picture: big_picture,
+        overlay_enabled: c.profile_state.overlay_enabled
+    }
+    << 0
+}
+
+pub fn (c $&SteamClient) tick() int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    if c.backend == BACKEND_NATIVE {
+        plat.checked(plat.raw_run_callbacks()) or >>
+    }
+    << 0
+}
+
+pub fn (c $&SteamClient) shutdown() int {
+    if !c.initialized { << 0 }
+    if c.backend == BACKEND_NATIVE {
+        plat.raw_shutdown()
+    } else if c.backend == BACKEND_LOCAL_MOCK {
+        save_mock_state(c) or >>
+    }
+    c.initialized = false
+    << 0
+}
+
+pub fn (c $&SteamClient) drain_events() []rs.SteamEvent {
+    $out := []rs.SteamEvent{}
+    for i in 0:c.events.len { out.push(c.events[i]) }
+    c.events = []rs.SteamEvent{}
+    << out
+}
+
+pub fn (c &SteamClient) friend_count() int {
+    if !c.initialized { << 0 }
+    if c.backend == BACKEND_NATIVE { << plat.raw_friend_count() }
+    << c.mock_friends
+}
+
+pub fn (c $&SteamClient) open_overlay(dialog string) int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    if dialog.len == 0 || dialog.len > 64 { >> errors.new("nexus steam: invalid overlay dialog") }
+    if c.backend == BACKEND_NATIVE {
+        d := plat.str_to_u8(&dialog)
+        plat.checked(plat.raw_activate_overlay(&d)) or >>
+        << 0
+    }
+    c.mock_overlay_active = true
+    push_event(c, rs.SteamEvent{kind: rs.EVENT_OVERLAY_ACTIVATED, active: true, code: 0, id: 0, text: dialog + ""})
+    << 0
+}
+
+pub fn (c $&SteamClient) set_rich_presence(key string, val string) int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    if key.len == 0 || key.len > 128 || val.len > 256 {
+        >> errors.new("nexus steam: invalid rich presence key/value")
+    }
+    if c.backend == BACKEND_NATIVE {
+        kb := plat.str_to_u8(&key)
+        vb := plat.str_to_u8(&val)
+        plat.checked(plat.raw_set_rich_presence(&kb, &vb)) or >>
+    }
+    c.mock_rich_presence[key + ""] = val + ""
+    << 0
+}
+
+pub fn (c &SteamClient) get_rich_presence(key string) string {
+    if c.mock_rich_presence.has(key) { << c.mock_rich_presence[key] + "" }
+    << ""
+}
+
+pub fn (c $&SteamClient) clear_rich_presence() int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    if c.backend == BACKEND_NATIVE {
+        plat.checked(plat.raw_clear_rich_presence()) or >>
+    }
+    c.mock_rich_presence = map[string]string{}
+    << 0
+}
+
+pub fn (c $&SteamClient) unlock_achievement(id string) int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    if id.len == 0 || id.len > 128 { >> errors.new("nexus steam: invalid achievement id") }
+    if c.backend == BACKEND_NATIVE {
+        ib := plat.str_to_u8(&id)
+        plat.checked(plat.raw_set_achievement(&ib)) or >>
+        << 0
+    }
+    c.achievements[id + ""] = rs.SteamAchievement{id: id + "", unlocked: true, progress: 1, max_progress: 1}
+    push_unique_str($&c.ach_keys, id + "")
+    << 0
+}
+
+pub fn (c $&SteamClient) clear_achievement(id string) int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    if id.len == 0 || id.len > 128 { >> errors.new("nexus steam: invalid achievement id") }
+    if c.backend == BACKEND_NATIVE {
+        ib := plat.str_to_u8(&id)
+        plat.checked(plat.raw_clear_achievement(&ib)) or >>
+        << 0
+    }
+    c.achievements[id + ""] = rs.SteamAchievement{id: id + "", unlocked: false, progress: 0, max_progress: 0}
+    push_unique_str($&c.ach_keys, id + "")
+    << 0
+}
+
+pub fn (c &SteamClient) has_achievement(id string) bool {
+    if !c.initialized || id.len == 0 { << false }
+    if c.backend == BACKEND_NATIVE {
+        ib := plat.str_to_u8(&id)
+        << plat.raw_get_achievement(&ib) == 1
+    }
+    if c.achievements.has(id) {
+        a := &c.achievements[id]
+        << a.unlocked
+    }
+    << false
+}
+
+pub fn (c $&SteamClient) indicate_achievement_progress(id string, current int, max_val int) int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    if id.len == 0 || current < 0 || max_val <= 0 {
+        >> errors.new("nexus steam: invalid achievement progress")
+    }
+    if c.backend == BACKEND_NATIVE {
+        ib := plat.str_to_u8(&id)
+        plat.checked(plat.raw_indicate_achievement_progress(&ib, current, max_val)) or >>
+        << 0
+    }
+    unlocked := current >= max_val
+    c.achievements[id + ""] = rs.SteamAchievement{
+        id: id + "",
+        unlocked: unlocked,
+        progress: current,
+        max_progress: max_val
+    }
+    push_unique_str($&c.ach_keys, id + "")
+    << 0
+}
+
+pub fn (c $&SteamClient) set_stat_int(id string, value int) int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    if id.len == 0 { >> errors.new("nexus steam: empty stat id") }
+    if c.backend == BACKEND_NATIVE {
+        ib := plat.str_to_u8(&id)
+        plat.checked(plat.raw_set_stat_int(&ib, value)) or >>
+        << 0
+    }
+    c.int_stats[id + ""] = value
+    push_unique_str($&c.int_stat_keys, id + "")
+    << 0
+}
+
+pub fn (c &SteamClient) get_stat_int(id string) int {
+    if !c.initialized || id.len == 0 { >> errors.new("nexus steam: stat query requires initialized client") }
+    if c.backend == BACKEND_NATIVE {
+        ib := plat.str_to_u8(&id)
+        $out := [0]
+        plat.checked(plat.raw_get_stat_int(&ib, $&out)) or >>
+        << out[0]
+    }
+    if c.int_stats.has(id) { << c.int_stats[id] }
+    << 0
+}
+
+pub fn (c $&SteamClient) set_stat_float(id string, value f64) int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    if id.len == 0 || math.is_nan(value) || math.is_inf(value) {
+        >> errors.new("nexus steam: invalid float stat")
+    }
+    if c.backend == BACKEND_NATIVE {
+        ib := plat.str_to_u8(&id)
+        plat.checked(plat.raw_set_stat_float(&ib, value)) or >>
+        << 0
+    }
+    c.float_stats[id + ""] = value
+    push_unique_str($&c.float_stat_keys, id + "")
+    << 0
+}
+
+pub fn (c &SteamClient) get_stat_float(id string) f64 {
+    if !c.initialized || id.len == 0 { >> errors.new("nexus steam: stat query requires initialized client") }
+    if c.backend == BACKEND_NATIVE {
+        ib := plat.str_to_u8(&id)
+        v := plat.raw_get_stat_float(&ib)
+        if math.is_nan(v) {
+            >> errors.new("nexus steam: " + plat.last_error())
+        }
+        << v
+    }
+    if c.float_stats.has(id) { << c.float_stats[id] }
+    << 0.0
+}
+
+pub fn (c $&SteamClient) store_stats() int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    if c.backend == BACKEND_NATIVE {
+        plat.checked(plat.raw_store_stats()) or >>
+    } else if c.backend == BACKEND_LOCAL_MOCK {
+        save_mock_state(c) or >>
+    }
+    push_event(c, rs.SteamEvent{kind: rs.EVENT_ACHIEVEMENT_STORED, active: true, code: 0, id: c.cfg.app_id, text: ""})
+    << 0
+}
+
+pub fn (c &SteamClient) cloud_enabled() bool {
+    if !c.initialized { << false }
+    if c.backend == BACKEND_NATIVE { << plat.raw_cloud_enabled() == 1 }
+    << true
+}
+
+fn read_file_len_safe(path string) int {
+    raw := snapshot.read(path, rs.MAX_CLOUD_FILE_BYTES) or (err) { << 0 }
+    << raw.len
+}
+
+fn mock_cloud_used_bytes(c &SteamClient) int {
+    $used := 0
+    for i in 0:c.cloud_index.len {
+        fname := c.cloud_index[i] + ""
+        if c.cloud_mem.has(fname) {
+            cm := &c.cloud_mem[fname]
+            used += cm.len
+        } else if c.save_dir.len > 0 {
+            p := filepath.join([c.save_dir + "", "cloud", fname + ""])
+            if path_exists(&p) {
+                used += read_file_len_safe(p + "")
+            }
+        }
+    }
+    << used
+}
+
+fn cloud_existing_len(c &SteamClient, clean string) int {
+    prev := c.cloud_read(clean) or (err) {
+        _ := err.msg()
+        << 0
+    }
+    << prev.len
+}
+
+fn cloud_index_add(c $&SteamClient, clean &string) {
+    for i in 0:c.cloud_index.len {
+        if c.cloud_index[i] == *clean { << }
+    }
+    c.cloud_index.push(clean + "")
+}
+
+fn cloud_index_remove(c $&SteamClient, clean &string) {
+    $next := []string{}
+    for i in 0:c.cloud_index.len {
+        if c.cloud_index[i] != *clean { next.push(c.cloud_index[i] + "") }
+    }
+    c.cloud_index = next
+}
+
+fn bytes_to_str_raw(src &[]u8) string {
+    $b := strings.new_byte_builder(src.len + 1)
+    for i in 0:src.len {
+        b.write_byte(int(src[i]))
+    }
+    << b.to_string()
+}
+
+pub fn (c $&SteamClient) cloud_write(filename string, data &[]u8) int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    clean := rs.validate_cloud_filename(&filename) or >>
+    if data.len > rs.MAX_CLOUD_FILE_BYTES {
+        >> errors.new("nexus steam: cloud file exceeds MAX_CLOUD_FILE_BYTES")
+    }
+    if c.backend == BACKEND_NATIVE {
+        fb := plat.str_to_u8(&clean)
+        plat.checked(plat.raw_cloud_write(&fb, data)) or >>
+        push_event(c, rs.SteamEvent{kind: rs.EVENT_CLOUD_SYNCED, active: true, code: data.len, id: 0, text: clean + ""})
+        << 0
+    }
+    $prev_len := 0
+    if c.cloud_exists(clean + "") {
+        prev_len = cloud_existing_len(c, clean + "")
+    }
+    used := mock_cloud_used_bytes(c) - prev_len
+    if used + data.len > c.cfg.cloud_quota_bytes {
+        >> errors.new("nexus steam: cloud storage quota exceeded")
+    }
+    $copy := []u8{}
+    for i in 0:data.len { copy.push(data[i]) }
+    raw := bytes_to_str_raw(&copy)
+    c.cloud_mem[clean + ""] = copy
+    cloud_index_add(c, &clean)
+    if c.save_dir.len > 0 {
+        dest := filepath.join([c.save_dir + "", "cloud", clean + ""])
+        os.mkdir_all(filepath.dir(dest)) or >>
+        snapshot.write_atomic(dest + "", &raw) or >>
+        save_mock_state(c) or >>
+    }
+    push_event(c, rs.SteamEvent{kind: rs.EVENT_CLOUD_SYNCED, active: true, code: data.len, id: 0, text: clean + ""})
+    << 0
+}
+
+pub fn (c &SteamClient) cloud_read(filename string) []u8 {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    clean := rs.validate_cloud_filename(&filename) or >>
+    if c.backend == BACKEND_NATIVE {
+        fb := plat.str_to_u8(&clean)
+        if plat.raw_cloud_exists(&fb) != 1 {
+            >> errors.new("nexus steam: cloud file missing: " + clean + "")
+        }
+        $buf := plat.alloc_u8(rs.MAX_CLOUD_FILE_BYTES)
+        n := plat.checked(plat.raw_cloud_read(&fb, $&buf)) or >>
+        << buf[0:n]
+    }
+    if c.cloud_mem.has(clean + "") {
+        mkey := clean + ""
+        src := &c.cloud_mem[mkey]
+        $out := []u8{}
+        for i in 0:src.len { out.push(src[i]) }
+        << out
+    }
+    if c.save_dir.len > 0 {
+        p := filepath.join([c.save_dir + "", "cloud", clean + ""])
+        if path_exists(&p) {
+            raw := snapshot.read(p + "", rs.MAX_CLOUD_FILE_BYTES) or >>
+            $out := []u8{}
+            for i in 0:raw.len { out.push(u8(raw[i] & 255)) }
+            << out
+        }
+    }
+    >> errors.new("nexus steam: cloud file missing: " + clean + "")
+}
+
+pub fn (c &SteamClient) cloud_exists(filename string) bool {
+    if !c.initialized { << false }
+    clean := rs.validate_cloud_filename(&filename) or (err) { << false }
+    if c.backend == BACKEND_NATIVE {
+        fb := plat.str_to_u8(&clean)
+        << plat.raw_cloud_exists(&fb) == 1
+    }
+    if c.cloud_mem.has(clean + "") { << true }
+    if c.save_dir.len > 0 {
+        p := filepath.join([c.save_dir + "", "cloud", clean + ""])
+        << path_exists(&p)
+    }
+    << false
+}
+
+pub fn (c $&SteamClient) cloud_delete(filename string) int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    clean := rs.validate_cloud_filename(&filename) or >>
+    if c.backend == BACKEND_NATIVE {
+        fb := plat.str_to_u8(&clean)
+        plat.checked(plat.raw_cloud_delete(&fb)) or >>
+        << 0
+    }
+    if c.cloud_mem.has(clean + "") {
+        cm := $&c.cloud_mem
+        cm.delete(clean + "")
+    }
+    cloud_index_remove(c, &clean)
+    if c.save_dir.len > 0 {
+        p := filepath.join([c.save_dir + "", "cloud", clean + ""])
+        if path_exists(&p) { os.remove(p + "") or >> }
+        save_mock_state(c) or >>
+    }
+    << 0
+}
+
+pub fn (c &SteamClient) cloud_list() []string {
+    $out := []string{}
+    for i in 0:c.cloud_index.len { out.push(c.cloud_index[i] + "") }
+    << out
+}
+
+pub fn (c &SteamClient) cloud_quota_total() int {
+    if !c.initialized { << 0 }
+    if c.backend == BACKEND_NATIVE {
+        $q := [0, 0]
+        if plat.raw_cloud_quota($&q) == 0 { << q[0] }
+        << 0
+    }
+    << c.cfg.cloud_quota_bytes
+}
+
+pub fn (c &SteamClient) cloud_quota_used() int {
+    if !c.initialized { << 0 }
+    if c.backend == BACKEND_NATIVE {
+        $q := [0, 0]
+        if plat.raw_cloud_quota($&q) == 0 { << q[0] - q[1] }
+        << 0
+    }
+    << mock_cloud_used_bytes(c)
+}
+
+pub fn (c $&SteamClient) submit_score(board string, score int, keep_best bool) int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    if board.len == 0 || board.len > 128 { >> errors.new("nexus steam: invalid leaderboard name") }
+    $entries := []rs.SteamLeaderboardEntry{}
+    if c.leaderboards.has(board) {
+        old := &c.leaderboards[board]
+        for i in 0:old.len {
+            oe := &old[i]
+            entries.push(rs.SteamLeaderboardEntry{
+                steam_id: oe.steam_id,
+                persona_name: oe.persona_name + "",
+                rank: oe.rank,
+                score: oe.score
+            })
+        }
+    }
+    sid := c.profile_state.steam_id
+    $found := false
+    for i in 0:entries.len {
+        if entries[i].steam_id == sid {
+            found = true
+            if !keep_best || score > entries[i].score {
+                entries[i] = rs.SteamLeaderboardEntry{
+                    steam_id: sid,
+                    persona_name: c.profile_state.persona_name + "",
+                    rank: 0,
+                    score: score
+                }
+            }
+        }
+    }
+    if !found {
+        entries.push(rs.SteamLeaderboardEntry{
+            steam_id: sid,
+            persona_name: c.profile_state.persona_name + "",
+            rank: 0,
+            score: score
+        })
+    }
+    for i in 0:entries.len {
+        for j in (i + 1):entries.len {
+            swap := entries[j].score > entries[i].score ||
+                (entries[j].score == entries[i].score && entries[j].steam_id < entries[i].steam_id)
+            if swap {
+                tmp := entries[i]
+                entries[i] = entries[j]
+                entries[j] = tmp
+            }
+        }
+    }
+    for i in 0:entries.len {
+        entries[i] = rs.SteamLeaderboardEntry{
+            steam_id: entries[i].steam_id,
+            persona_name: entries[i].persona_name + "",
+            rank: i + 1,
+            score: entries[i].score
+        }
+    }
+    c.leaderboards[board + ""] = entries
+    push_unique_str($&c.board_keys, board + "")
+    if c.backend == BACKEND_LOCAL_MOCK {
+        save_mock_state(c) or >>
+    }
+    << 0
+}
+
+pub fn (c &SteamClient) query_leaderboard(board string, top_n int) []rs.SteamLeaderboardEntry {
+    if !c.initialized || top_n <= 0 { << []rs.SteamLeaderboardEntry{} }
+    if !c.leaderboards.has(board) { << []rs.SteamLeaderboardEntry{} }
+    all := &c.leaderboards[board]
+    $n := top_n
+    if n > all.len { n = all.len }
+    $out := []rs.SteamLeaderboardEntry{}
+    for i in 0:n {
+        e := &all[i]
+        out.push(rs.SteamLeaderboardEntry{
+            steam_id: e.steam_id,
+            persona_name: e.persona_name + "",
+            rank: e.rank,
+            score: e.score
+        })
+    }
+    << out
+}
+
+pub fn (c $&SteamClient) register_mock_dlc(dlc rs.SteamDlcInfo) int {
+    if dlc.app_id <= 0 { >> errors.new("nexus steam: invalid dlc app_id") }
+    c.mock_dlcs[dlc.app_id] = dlc
+    << 0
+}
+
+pub fn (c &SteamClient) is_dlc_installed(dlc_app_id int) bool {
+    if !c.initialized || dlc_app_id <= 0 { << false }
+    if c.backend == BACKEND_NATIVE {
+        << plat.raw_is_dlc_installed(dlc_app_id) == 1
+    }
+    if c.mock_dlcs.has(dlc_app_id) {
+        d := &c.mock_dlcs[dlc_app_id]
+        << d.installed
+    }
+    << false
+}
+
+pub fn (c $&SteamClient) register_mock_workshop_item(item rs.SteamWorkshopItem) int {
+    if item.published_file_id <= 0 { >> errors.new("nexus steam: invalid workshop published_file_id") }
+    fid := item.published_file_id
+    installed := item.installed
+    ipath := item.install_path + ""
+    c.mock_ugc[fid] = item
+    push_unique_int($&c.ugc_keys, fid)
+    if installed {
+        push_event(c, rs.SteamEvent{
+            kind: rs.EVENT_WORKSHOP_INSTALLED,
+            active: true,
+            code: 0,
+            id: fid,
+            text: ipath
+        })
+    }
+    << 0
+}
+
+pub fn (c &SteamClient) installed_workshop_items() []rs.SteamWorkshopItem {
+    $out := []rs.SteamWorkshopItem{}
+    if !c.initialized { << out }
+    if c.backend == BACKEND_NATIVE {
+        cnt := plat.raw_subscribed_ugc_count()
+        if cnt <= 0 { << out }
+        $limit := cnt
+        if limit > 256 { limit = 256 }
+        $ids := []int{}
+        for _ in 0:limit { ids.push(0) }
+        got := plat.raw_subscribed_ugc_ids($&ids)
+        for i in 0:got {
+            fid := ids[i]
+            $fbuf := plat.alloc_u8(512)
+            $mbuf := [0, 0]
+            flen := plat.raw_ugc_install_info(fid, $&fbuf, $&mbuf)
+            if flen > 0 {
+                out.push(rs.SteamWorkshopItem{
+                    published_file_id: fid,
+                    title: "UGC-" + str(fid),
+                    install_path: plat.u8_to_str(&fbuf, flen),
+                    size_bytes: mbuf[0],
+                    subscribed: true,
+                    installed: true
+                })
+            }
+        }
+        << out
+    }
+    for i in 0:c.ugc_keys.len {
+        uid := c.ugc_keys[i]
+        it := &c.mock_ugc[uid]
+        if it.subscribed && it.installed {
+            out.push(rs.SteamWorkshopItem{
+                published_file_id: it.published_file_id,
+                title: it.title + "",
+                install_path: it.install_path + "",
+                size_bytes: it.size_bytes,
+                subscribed: it.subscribed,
+                installed: it.installed
+            })
+        }
+    }
+    << out
+}
+
+pub fn (c $&SteamClient) create_lobby(visibility int, max_members int) int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    if max_members < 1 || max_members > 64 { >> errors.new("nexus steam: lobby max_members must be 1..64") }
+    if c.backend == BACKEND_NATIVE {
+        lid := plat.checked(plat.raw_lobby_create(visibility, max_members)) or >>
+        c.in_lobby = true
+        c.lobby = rs.SteamLobbyInfo{
+            lobby_id: lid,
+            owner_id: c.profile_state.steam_id,
+            visibility: visibility,
+            max_members: max_members,
+            member_ids: [c.profile_state.steam_id],
+            metadata: map[string]string{}
+        }
+        push_event(c, rs.SteamEvent{kind: rs.EVENT_LOBBY_CREATED, active: true, code: 0, id: lid, text: ""})
+        << lid
+    }
+    lid := c.next_mock_lobby_id
+    c.next_mock_lobby_id += 1
+    c.in_lobby = true
+    c.lobby = rs.SteamLobbyInfo{
+        lobby_id: lid,
+        owner_id: c.profile_state.steam_id,
+        visibility: visibility,
+        max_members: max_members,
+        member_ids: [c.profile_state.steam_id],
+        metadata: map[string]string{}
+    }
+    push_event(c, rs.SteamEvent{kind: rs.EVENT_LOBBY_CREATED, active: true, code: 0, id: lid, text: ""})
+    << lid
+}
+
+pub fn (c $&SteamClient) join_lobby(lobby_id int) int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    if lobby_id <= 0 { >> errors.new("nexus steam: invalid lobby_id") }
+    if c.backend == BACKEND_NATIVE {
+        plat.checked(plat.raw_lobby_join(lobby_id)) or >>
+    }
+    c.in_lobby = true
+    c.lobby = rs.SteamLobbyInfo{
+        lobby_id: lobby_id,
+        owner_id: c.profile_state.steam_id,
+        visibility: rs.LOBBY_PUBLIC,
+        max_members: 8,
+        member_ids: [c.profile_state.steam_id],
+        metadata: map[string]string{}
+    }
+    push_event(c, rs.SteamEvent{kind: rs.EVENT_LOBBY_ENTERED, active: true, code: 0, id: lobby_id, text: ""})
+    << 0
+}
+
+pub fn (c $&SteamClient) leave_lobby() int {
+    if !c.initialized || !c.in_lobby { << 0 }
+    lid := c.lobby.lobby_id
+    if c.backend == BACKEND_NATIVE {
+        plat.raw_lobby_leave(lid)
+    }
+    c.in_lobby = false
+    c.lobby = empty_lobby()
+    push_event(c, rs.SteamEvent{kind: rs.EVENT_LOBBY_LEFT, active: false, code: 0, id: lid, text: ""})
+    << 0
+}
+
+pub fn (c &SteamClient) has_lobby() bool { << c.in_lobby }
+pub fn (c &SteamClient) current_lobby() rs.SteamLobbyInfo { << clone_lobby_info(&c.lobby, 0) }
+
+fn clone_p2p_msg(m &rs.SteamP2PMessage) rs.SteamP2PMessage {
+    $p := []u8{}
+    for i in 0:m.payload.len { p.push(m.payload[i]) }
+    << rs.SteamP2PMessage{
+        sender_id: m.sender_id,
+        channel: m.channel,
+        reliable: m.reliable,
+        payload: p
+    }
+}
+
+fn clone_lobby_info(src &rs.SteamLobbyInfo, extra_member int) rs.SteamLobbyInfo {
+    $mids := []int{}
+    $seen := false
+    for i in 0:src.member_ids.len {
+        id := src.member_ids[i]
+        mids.push(id)
+        if id == extra_member { seen = true }
+    }
+    if extra_member > 0 && !seen { mids.push(extra_member) }
+    << rs.SteamLobbyInfo{
+        lobby_id: src.lobby_id,
+        owner_id: src.owner_id,
+        visibility: src.visibility,
+        max_members: src.max_members,
+        member_ids: mids,
+        metadata: map[string]string{}
+    }
+}
+
+pub fn (c $&SteamClient) set_lobby_data(key string, val string) int {
+    if !c.initialized || !c.in_lobby { >> errors.new("nexus steam: not in a lobby") }
+    if key.len == 0 || key.len > 128 || val.len > 512 {
+        >> errors.new("nexus steam: invalid lobby metadata key/value")
+    }
+    if c.backend == BACKEND_NATIVE {
+        kb := plat.str_to_u8(&key)
+        vb := plat.str_to_u8(&val)
+        plat.checked(plat.raw_lobby_set_data(c.lobby.lobby_id, &kb, &vb)) or >>
+    }
+    c.lobby.metadata[key + ""] = val + ""
+    push_event(c, rs.SteamEvent{kind: rs.EVENT_LOBBY_DATA_UPDATED, active: true, code: 0, id: c.lobby.lobby_id, text: key + ""})
+    << 0
+}
+
+pub fn (c &SteamClient) get_lobby_data(key string) string {
+    if !c.initialized || !c.in_lobby { << "" }
+    if c.backend == BACKEND_NATIVE {
+        kb := plat.str_to_u8(&key)
+        $out := plat.alloc_u8(512)
+        n := plat.raw_lobby_get_data(c.lobby.lobby_id, &kb, $&out)
+        << plat.u8_to_str(&out, n)
+    }
+    if c.lobby.metadata.has(key) { << c.lobby.metadata[key] + "" }
+    << ""
+}
+
+pub fn (c $&SteamClient) send_p2p(peer_id int, channel int, reliable bool, payload &[]u8) int {
+    if !c.initialized { >> errors.new("nexus steam: client not initialized") }
+    if peer_id <= 0 || channel < 0 || channel >= MAX_P2P_CHANNEL || payload.len > 65536 {
+        >> errors.new("nexus steam: invalid P2P send arguments")
+    }
+    if c.p2p_outbox.len >= MAX_OUTBOX {
+        >> errors.new("nexus steam: P2P outbox full")
+    }
+    $copy := []u8{}
+    for i in 0:payload.len { copy.push(payload[i]) }
+    c.p2p_outbox.push(MockBusPacket{
+        to_id: peer_id,
+        msg: rs.SteamP2PMessage{
+            sender_id: c.profile_state.steam_id,
+            channel: channel,
+            reliable: reliable,
+            payload: copy
+        }
+    })
+    << 0
+}
+
+pub fn (c $&SteamClient) recv_p2p(channel int) []rs.SteamP2PMessage {
+    $out := []rs.SteamP2PMessage{}
+    $keep := []rs.SteamP2PMessage{}
+    for i in 0:c.p2p_inbox.len {
+        m := &c.p2p_inbox[i]
+        if m.channel == channel {
+            out.push(clone_p2p_msg(m))
+        } else {
+            keep.push(clone_p2p_msg(m))
+        }
+    }
+    c.p2p_inbox = keep
+    << out
+}
+
+pub fn (b $&SteamMockBus) create_lobby(owner $&SteamClient, visibility int, max_members int) int {
+    if !owner.is_initialized() || max_members < 1 || max_members > 64 {
+        >> errors.new("nexus steam mock bus: invalid owner or max_members")
+    }
+    lid := b.next_lobby_id
+    b.next_lobby_id += 1
+    info := rs.SteamLobbyInfo{
+        lobby_id: lid,
+        owner_id: owner.profile_state.steam_id,
+        visibility: visibility,
+        max_members: max_members,
+        member_ids: [owner.profile_state.steam_id],
+        metadata: map[string]string{}
+    }
+    owner_copy := clone_lobby_info(&info, 0)
+    b.lobbies[lid] = info
+    owner.in_lobby = true
+    owner.lobby = owner_copy
+    push_event(owner, rs.SteamEvent{kind: rs.EVENT_LOBBY_CREATED, active: true, code: 0, id: lid, text: ""})
+    << lid
+}
+
+pub fn (b $&SteamMockBus) join_lobby(client $&SteamClient, lobby_id int) int {
+    if !client.is_initialized() || !b.lobbies.has(lobby_id) {
+        >> errors.new("nexus steam mock bus: unknown lobby_id")
+    }
+    cur := &b.lobbies[lobby_id]
+    if cur.member_ids.len >= cur.max_members {
+        >> errors.new("nexus steam mock bus: lobby is full")
+    }
+    updated := clone_lobby_info(cur, client.profile_state.steam_id)
+    client_copy := clone_lobby_info(&updated, 0)
+    b.lobbies[lobby_id] = updated
+    client.in_lobby = true
+    client.lobby = client_copy
+    push_event(client, rs.SteamEvent{kind: rs.EVENT_LOBBY_ENTERED, active: true, code: 0, id: lobby_id, text: ""})
+    << 0
+}
+
+pub fn (b $&SteamMockBus) route(peer_a $&SteamClient, peer_b $&SteamClient) int {
+    $delivered := 0
+    for i in 0:peer_a.p2p_outbox.len {
+        pkt := &peer_a.p2p_outbox[i]
+        b.packets.push(MockBusPacket{to_id: pkt.to_id, msg: clone_p2p_msg(&pkt.msg)})
+    }
+    peer_a.p2p_outbox = []MockBusPacket{}
+    for i in 0:peer_b.p2p_outbox.len {
+        pkt := &peer_b.p2p_outbox[i]
+        b.packets.push(MockBusPacket{to_id: pkt.to_id, msg: clone_p2p_msg(&pkt.msg)})
+    }
+    peer_b.p2p_outbox = []MockBusPacket{}
+    $remaining := []MockBusPacket{}
+    aid := peer_a.profile_state.steam_id
+    bid := peer_b.profile_state.steam_id
+    for i in 0:b.packets.len {
+        pkt := &b.packets[i]
+        if pkt.to_id == aid {
+            peer_a.p2p_inbox.push(clone_p2p_msg(&pkt.msg))
+            push_event(peer_a, rs.SteamEvent{kind: rs.EVENT_P2P_MESSAGE, active: true, code: pkt.msg.channel, id: pkt.msg.sender_id, text: ""})
+            delivered += 1
+        } else if pkt.to_id == bid {
+            peer_b.p2p_inbox.push(clone_p2p_msg(&pkt.msg))
+            push_event(peer_b, rs.SteamEvent{kind: rs.EVENT_P2P_MESSAGE, active: true, code: pkt.msg.channel, id: pkt.msg.sender_id, text: ""})
+            delivered += 1
+        } else {
+            remaining.push(MockBusPacket{to_id: pkt.to_id, msg: clone_p2p_msg(&pkt.msg)})
+        }
+    }
+    b.packets = remaining
+    << delivered
+}

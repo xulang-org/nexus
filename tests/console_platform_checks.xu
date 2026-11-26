@@ -1,0 +1,258 @@
+@main
+
+rc #"github.com/xulang-org/nexus/resources/console"
+rs #"github.com/xulang-org/nexus/resources/steam"
+ps #"github.com/xulang-org/nexus/integration/platform_services"
+vp #"github.com/xulang-org/nexus/integration/viewport"
+inp #"github.com/xulang-org/nexus/input"
+timing #"github.com/xulang-org/nexus/timing"
+#os
+#path/filepath
+
+fn to_bytes(s string) []u8 {
+    $out := []u8{}
+    for i in 0:s.len { out.push(u8(s[i] & 255)) }
+    << out
+}
+
+fn from_bytes(buf &[]u8) string {
+    $s := ""
+    for i in 0:buf.len { s = s + string_from_byte(int(buf[i])) }
+    << s
+}
+
+fn clean_dir(path string) int {
+    os.remove_all(path) or (err) {
+        _ := err.msg()
+        << 0
+    }
+    << 0
+}
+
+fn read_slot_fails(store &ps.UnifiedSaveStore, svc &ps.PlatformServices, slot string) bool {
+    _ := store.read_slot(svc, slot) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn build_mapping() rc.MultiPlatformMapping {
+    << rc.MultiPlatformMapping{
+        achievements: [
+            rc.LogicalAchievementMap{logical_id: "FIRST_BLOOD", steam_id: "ACH_FIRST_BLOOD", xbox_id: "XB_FIRST_BLOOD", ps_trophy_id: 1, taptap_id: "TAP_FIRST_BLOOD"},
+            rc.LogicalAchievementMap{logical_id: "CAMPAIGN_DONE", steam_id: "ACH_CAMPAIGN", xbox_id: "XB_CAMPAIGN", ps_trophy_id: 2, taptap_id: "TAP_CAMPAIGN"}
+        ],
+        dlcs: [
+            rc.LogicalDlcMap{logical_id: "EXPANSION_1", steam_app_id: 482, xbox_store_id: "9NX0DLC00001", ps_entitlement: "SEASONPASS000001", switch_aoc_index: 1, taptap_dlc_id: "tap_dlc_exp1"}
+        ]
+    }
+}
+
+fn verify_common_flow(svc $&ps.PlatformServices, store &ps.UnifiedSaveStore, tmp_label string,
+        expect_safe_pct int, expect_confirm string) int {
+    svc.unlock_logical_achievement("FIRST_BLOOD") or >>
+    assert(svc.has_logical_achievement("FIRST_BLOOD"))
+    svc.grant_mock_logical_dlc("EXPANSION_1") or >>
+    assert(svc.has_logical_dlc("EXPANSION_1"))
+    assert(svc.confirm_label() == expect_confirm)
+    assert(svc.can_use_multiplayer(true))
+
+    payload := to_bytes("progress-" + tmp_label)
+    store.write_slot(svc, "campaign/slot0.sav", &payload) or >>
+    loaded := store.read_slot(svc, "campaign/slot0.sav") or >>
+    assert(from_bytes(&loaded) == "progress-" + tmp_label)
+
+    $clock := timing.new_scaled_clock(60, 4) or >>
+    $imap := inp.new_input_map()
+    imap.bind("fire", 32) or >>
+    imap.begin_frame()
+    imap.feed_key(32, true) or >>
+    assert(imap.pressed("fire"))
+
+    view := vp.from_metrics(1920, 1080, 1920, 1080, 0, 0, 1920, 1080) or >>
+    $bridge := ps.new_unified_bridge(true)
+
+    st_active := bridge.step(svc, $&clock, $&imap, &view) or >>
+    assert(!st_active.should_pause && st_active.safe_area_percent == expect_safe_pct)
+    if expect_safe_pct == 90 {
+        assert(st_active.safe_ui_rect.position.x > 90.0 && st_active.safe_ui_rect.size.x < 1740.0)
+    }
+
+    // Trigger Steam Overlay / Xbox Constrained / PS Quick Menu -> auto pause & release keys
+    svc.set_mock_overlay_or_constrained(true)
+    st_paused := bridge.step(svc, $&clock, $&imap, &view) or >>
+    assert(st_paused.should_pause && clock.is_paused() && !imap.pressed("fire"))
+
+    svc.set_mock_overlay_or_constrained(false)
+    st_resumed := bridge.step(svc, $&clock, $&imap, &view) or >>
+    assert(!st_resumed.should_pause && !clock.is_paused())
+    << 0
+}
+
+fn run() int {
+    tmp := filepath.join(["build", "console-platform-tmp"])
+    clean_dir(tmp + "")
+    os.mkdir_all(tmp + "") or >>
+
+    // 1. Steam PC
+    $scfg := rs.default_config(480, 481)
+    scfg.dlc_ids = [482]
+    scfg.achievement_ids = ["ACH_FIRST_BLOOD", "ACH_CAMPAIGN"]
+    $steam_svc := ps.open_steam(scfg, filepath.join([tmp + "", "steam"]), build_mapping()) or >>
+    steam_store := ps.new_unified_save_store("")
+    verify_common_flow($&steam_svc, &steam_store, "steam", 100, "Enter") or >>
+    steam_svc.shutdown() or >>
+
+    // 2. Xbox Series X
+    $xcfg := rc.default_xbox_config()
+    xcfg.achievement_ids = ["XB_FIRST_BLOOD", "XB_CAMPAIGN"]
+    xcfg.dlc_store_ids = ["9NX0DLC00001"]
+    xb_dir := filepath.join([tmp + "", "xbox"])
+    $xb_svc := ps.open_xbox(xcfg.clone(), rc.PLATFORM_XBOX_SERIES_X, xb_dir + "", build_mapping()) or >>
+    xb_store := ps.new_unified_save_store("")
+    verify_common_flow($&xb_svc, &xb_store, "xbox", 90, "A") or >>
+
+    // Xbox Impulse Triggers + Quick Resume suspend/resume + Session + SignOut
+    $xb_h := rc.default_haptic_command()
+    xb_h.left_trigger_rumble = 0.75
+    xb_h.right_trigger_rumble = 0.5
+    xb_svc.apply_haptics(0, xb_h) or >>
+    assert(xb_svc.last_haptics(0).left_trigger_rumble == 0.75)
+    assert(xb_svc.create_session(4, true) > 0)
+
+    $clock := timing.new_scaled_clock(60, 4) or >>
+    $imap := inp.new_input_map()
+    view := vp.from_metrics(3840, 2160, 3840, 2160, 0, 0, 3840, 2160) or >>
+    $ub := ps.new_unified_bridge(true)
+    xb_svc.simulate_suspend()
+    s_susp := ub.step($&xb_svc, $&clock, $&imap, &view) or >>
+    assert(s_susp.must_flush_saves && s_susp.should_pause)
+    xb_svc.simulate_resume()
+    s_res := ub.step($&xb_svc, $&clock, $&imap, &view) or >>
+    assert(s_res.must_reverify_user)
+    xb_svc.simulate_controller_disconnect(true)
+    s_disc := ub.step($&xb_svc, $&clock, $&imap, &view) or >>
+    assert(s_disc.controller_disconnected && s_disc.should_pause)
+    xb_svc.simulate_controller_disconnect(false)
+    xb_svc.simulate_user_sign_out()
+    s_out := ub.step($&xb_svc, $&clock, $&imap, &view) or >>
+    assert(s_out.return_to_title_required)
+    xb_svc.shutdown() or >>
+
+    // Reopen Xbox from disk -> achievement & save persisted
+    $xb_reloaded := ps.open_xbox(xcfg, rc.PLATFORM_XBOX_SERIES_X, xb_dir + "", build_mapping()) or >>
+    assert(xb_reloaded.has_logical_achievement("FIRST_BLOOD"))
+    xb_load := xb_store.read_slot(&xb_reloaded, "campaign/slot0.sav") or >>
+    assert(from_bytes(&xb_load) == "progress-xbox")
+    xb_reloaded.shutdown() or >>
+
+    // 3. PlayStation 5 (Trophies + Auto Platinum + DualSense + Activities + Circle Confirm + Tamper)
+    $pcfg := rc.default_ps_config()
+    pcfg.trophies = [
+        rc.PsTrophyDef{trophy_id: 0, grade: rc.TROPHY_PLATINUM, name: "Platinum", is_progress: false, target_value: 0, hidden: false},
+        rc.PsTrophyDef{trophy_id: 1, grade: rc.TROPHY_SILVER, name: "First Blood", is_progress: false, target_value: 0, hidden: false},
+        rc.PsTrophyDef{trophy_id: 2, grade: rc.TROPHY_GOLD, name: "Campaign", is_progress: false, target_value: 0, hidden: false}
+    ]
+    pcfg.activities = [rc.PsActivityDef{activity_id: "arena_1", name: "Arena 1", category: "competitive"}]
+    pcfg.entitlement_labels = ["SEASONPASS000001"]
+    ps_dir := filepath.join([tmp + "", "ps5"])
+    $ps_svc := ps.open_playstation(pcfg.clone(), rc.PLATFORM_PS5, ps_dir + "", build_mapping()) or >>
+    ps_store := ps.new_unified_save_store("")
+    verify_common_flow($&ps_svc, &ps_store, "ps5", 90, "Cross") or >>
+
+    assert(!ps_svc.platinum_unlocked())
+    ps_svc.unlock_logical_achievement("CAMPAIGN_DONE") or >>
+    assert(ps_svc.platinum_unlocked())
+
+    ps_svc.set_mock_confirm_button(rc.CONFIRM_CIRCLE_B) or >>
+    assert(ps_svc.confirm_label() == "Circle" && ps_svc.cancel_label() == "Cross")
+
+    ps_svc.start_activity("arena_1") or >>
+    $ps_h := rc.default_haptic_command()
+    ps_h.right_adaptive = rc.AdaptiveTriggerEffect{mode: rc.TRIGGER_WEAPON, start_position: 2, end_position: 6, strength: 8, frequency: 0}
+    ps_h.lightbar_r = 255
+    ps_h.lightbar_g = 40
+    ps_h.lightbar_b = 10
+    ps_svc.apply_haptics(0, ps_h) or >>
+    assert(ps_svc.last_haptics(0).lightbar_r == 255 && ps_svc.last_haptics(0).right_adaptive.mode == rc.TRIGGER_WEAPON)
+    ps_svc.end_activity("arena_1", rc.ACTIVITY_COMPLETED) or >>
+
+    ps_svc.shutdown() or >>
+
+    // Tampered save envelope on disk must be rejected by SHA-256 check upon reload
+    bad_str := "NXSV1|0000000000000000000000000000000000000000000000000000000000000000|hack"
+    $f := os.create(filepath.join([ps_dir + "", "saves", "SAVEDATA", "campaign_slot0.sav"])) or >>
+    _ := f.write(bad_str + "") or >>
+    f.close() or >>
+    $ps_reloaded := ps.open_playstation(pcfg, rc.PLATFORM_PS5, ps_dir + "", build_mapping()) or >>
+    assert(read_slot_fails(&ps_store, &ps_reloaded, "campaign/slot0.sav"))
+    ps_reloaded.shutdown() or >>
+
+    // 4. Nintendo Switch (Handheld 100% safe area + touch -> Docked 90% safe area + Pro Controller, HD Rumble, AOC, save:/ tamper check)
+    $sw_cfg := rc.default_switch_config()
+    sw_cfg.aoc_indices = [1, 2]
+    sw_dir := filepath.join([tmp + "", "switch"])
+    $sw_svc := ps.open_switch(sw_cfg.clone(), rc.PLATFORM_SWITCH, sw_dir + "", build_mapping()) or >>
+    sw_store := ps.new_unified_save_store("")
+    assert(sw_svc.glyph_family() == rc.GLYPH_SWITCH)
+    assert(sw_svc.confirm_label() == "A" && sw_svc.cancel_label() == "B")
+    assert(sw_svc.operation_mode() == rc.OPERATION_MODE_HANDHELD)
+    assert(sw_svc.touch_screen_active())
+
+    verify_common_flow($&sw_svc, &sw_store, "switch", 100, "A") or >>
+
+    $sw_bridge := ps.new_unified_bridge(true)
+    $sw_clock := timing.new_scaled_clock(60, 4) or >>
+    $sw_imap := inp.new_input_map()
+    sw_vp := vp.from_metrics(1920, 1080, 1920, 1080, 0, 0, 1920, 1080) or >>
+    st_handheld := sw_bridge.step($&sw_svc, $&sw_clock, $&sw_imap, &sw_vp)
+    assert(st_handheld.operation_mode == rc.OPERATION_MODE_HANDHELD)
+    assert(st_handheld.render_width == 1280 && st_handheld.render_height == 720)
+    assert(st_handheld.touch_enabled && st_handheld.safe_area_percent == 100)
+    assert(st_handheld.ui_scale == 1.25)
+
+    sw_svc.simulate_operation_mode(rc.OPERATION_MODE_DOCKED) or >>
+    st_docked := sw_bridge.step($&sw_svc, $&sw_clock, $&sw_imap, &sw_vp)
+    assert(st_docked.operation_mode == rc.OPERATION_MODE_DOCKED)
+    assert(st_docked.npad_style == rc.NPAD_PRO_CONTROLLER)
+    assert(st_docked.render_width == 1920 && st_docked.render_height == 1080)
+    assert(!st_docked.touch_enabled && st_docked.safe_area_percent == 90)
+    assert(st_docked.ui_scale == 1.0)
+
+    $sw_h := rc.default_haptic_command()
+    sw_h.low_freq_motor = 0.65
+    sw_h.high_freq_motor = 0.45
+    sw_h.hd_rumble_freq_low = 180.0
+    sw_h.hd_rumble_freq_high = 360.0
+    sw_svc.apply_haptics(0, sw_h) or >>
+    assert(sw_svc.last_haptics(0).hd_rumble_freq_low == 180.0 && sw_svc.last_haptics(0).hd_rumble_freq_high == 360.0)
+    sw_svc.shutdown() or >>
+
+    $sw_reloaded := ps.open_switch(sw_cfg.clone(), rc.PLATFORM_SWITCH, sw_dir + "", build_mapping()) or >>
+    assert(sw_reloaded.has_logical_achievement("FIRST_BLOOD"))
+    sw_reloaded.grant_mock_logical_dlc("EXPANSION_1") or >>
+    assert(sw_reloaded.has_logical_dlc("EXPANSION_1"))
+    loaded_sw := sw_store.read_slot(&sw_reloaded, "campaign/slot0.sav") or >>
+    assert(from_bytes(&loaded_sw) == "progress-switch")
+    sw_reloaded.shutdown() or >>
+
+    $sf := os.create(filepath.join([sw_dir + "", "saves", "save", "campaign_slot0.sav"])) or >>
+    _ := sf.write(bad_str + "") or >>
+    sf.close() or >>
+    $sw_tampered := ps.open_switch(sw_cfg, rc.PLATFORM_SWITCH, sw_dir + "", build_mapping()) or >>
+    assert(read_slot_fails(&sw_store, &sw_tampered, "campaign/slot0.sav"))
+    sw_tampered.shutdown() or >>
+
+    clean_dir(tmp + "")
+    println("PASS: console_platform_checks")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

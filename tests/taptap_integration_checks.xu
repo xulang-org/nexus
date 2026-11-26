@@ -1,0 +1,209 @@
+@main
+
+inp #"github.com/xulang-org/nexus/input"
+ps #"github.com/xulang-org/nexus/integration/platform_services"
+vp #"github.com/xulang-org/nexus/integration/viewport"
+rc #"github.com/xulang-org/nexus/resources/console"
+rt #"github.com/xulang-org/nexus/resources/taptap"
+tt #"github.com/xulang-org/nexus/taptap"
+timing #"github.com/xulang-org/nexus/timing"
+#os
+#path/filepath
+#strings
+
+fn clean_dir(path string) {
+    os.remove_all(path) or (err) {
+        _ := err.msg()
+        <<
+    }
+}
+
+fn to_bytes(s string) []u8 {
+    $out := []u8{}
+    for i in 0:s.len { out.push(u8(s[i] & 255)) }
+    << out
+}
+
+fn from_bytes(b &[]u8) string {
+    $sb := strings.new_byte_builder(b.len + 1)
+    for i in 0:b.len { sb.write_byte(int(b[i])) }
+    << sb.to_string()
+}
+
+fn check_pay_fails(client &tt.TapTapClient, cents int) bool {
+    _ := client.check_payment(cents) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn cloud_write_fails(client $&tt.TapTapClient, name string, data &[]u8) bool {
+    _ := client.cloud_write(name, "test", data) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn read_slot_fails(store &ps.UnifiedSaveStore, svc &ps.PlatformServices, slot string) bool {
+    _ := store.read_slot(svc, slot) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn build_mapping() rc.MultiPlatformMapping {
+    << rc.MultiPlatformMapping{
+        achievements: [
+            rc.LogicalAchievementMap{logical_id: "FIRST_BLOOD", steam_id: "ACH_FIRST_BLOOD", xbox_id: "XB_FIRST_BLOOD", ps_trophy_id: 1, taptap_id: "TAP_FIRST_BLOOD"},
+            rc.LogicalAchievementMap{logical_id: "CAMPAIGN_DONE", steam_id: "ACH_CAMPAIGN", xbox_id: "XB_CAMPAIGN", ps_trophy_id: 2, taptap_id: "TAP_CAMPAIGN"}
+        ],
+        dlcs: [
+            rc.LogicalDlcMap{logical_id: "EXPANSION_1", steam_app_id: 482, xbox_store_id: "9NX0DLC00001", ps_entitlement: "SEASONPASS000001", switch_aoc_index: 1, taptap_dlc_id: "tap_dlc_exp1"}
+        ]
+    }
+}
+
+fn run() int {
+    tmp := filepath.join(["build", "taptap-integ-tmp"])
+    clean_dir(tmp + "")
+    os.mkdir_all(tmp + "") or >>
+
+    // 1. Direct TapTapClient lifecycle, achievements, CloudSave quota, leaderboards, DLC, Moment & CN payment limit
+    direct_dir := filepath.join([tmp + "", "direct"])
+    $cfg := rt.default_config("tap_game_888", "tap_tok_888", rt.REGION_CN)
+    cfg.cloud_quota_bytes = 32
+    cfg.achievement_ids = ["TAP_WIN", "TAP_STEP"]
+    cfg.dlc_ids = ["dlc_skin_1"]
+    cfg.leaderboard_ids = ["lb_score"]
+    $client := tt.init_auto(cfg.clone(), direct_dir + "") or >>
+    assert(client.backend_kind() == tt.BACKEND_LOCAL_MOCK)
+    assert(client.is_logged_in() && client.verify_license())
+
+    client.unlock_achievement("TAP_WIN") or >>
+    assert(client.has_achievement("TAP_WIN"))
+    client.increment_achievement("TAP_STEP", 2, 5) or >>
+    assert(!client.has_achievement("TAP_STEP"))
+    client.increment_achievement("TAP_STEP", 3, 5) or >>
+    assert(client.has_achievement("TAP_STEP"))
+
+    client.grant_mock_dlc("dlc_skin_1") or >>
+    assert(client.has_dlc("dlc_skin_1"))
+
+    client.submit_leaderboard_score("lb_score", 2400) or >>
+    lb := client.leaderboard_entries("lb_score")
+    assert(lb.len == 1 && lb[0].rank == 1 && lb[0].score == 2400)
+
+    small_save := to_bytes("hello-tap-cloud")
+    client.cloud_write("slot1.dat", "Stage 1", &small_save) or >>
+    assert(client.cloud_exists("slot1.dat"))
+    rb_slot := client.cloud_read("slot1.dat") or >>
+    assert(from_bytes(&rb_slot) == "hello-tap-cloud")
+    too_big := to_bytes("this-payload-definitely-exceeds-32-bytes")
+    assert(cloud_write_fails($&client, "slot2.dat", &too_big))
+
+    client.simulate_minor_profile(rt.AGE_8_TO_15, 3600, false, rt.RESTRICT_NONE) or >>
+    client.submit_payment(3000) or >>
+    client.submit_payment(2000) or >>
+    assert(check_pay_fails(&client, 5001))
+    assert(client.compliance_state().monthly_spent_cents == 5000)
+    client.shutdown() or >>
+
+    // Reload persistence check
+    $reloaded := tt.init_auto(cfg.clone(), direct_dir + "") or >>
+    assert(reloaded.has_achievement("TAP_WIN") && reloaded.has_achievement("TAP_STEP"))
+    assert(reloaded.has_dlc("dlc_skin_1"))
+    assert(reloaded.cloud_exists("slot1.dat"))
+    assert(reloaded.leaderboard_entries("lb_score")[0].score == 2400)
+    assert(reloaded.compliance_state().monthly_spent_cents == 5000)
+    reloaded.shutdown() or >>
+
+    // 2. Unified PlatformServices on TapTap Android (touch + Moment pause + CN compliance pause + tamper-proof save)
+    and_dir := filepath.join([tmp + "", "unified_android"])
+    $and_cfg := rt.default_config("tap_uni_01", "tap_uni_tok", rt.REGION_CN)
+    and_cfg.target_platform = rt.TARGET_ANDROID
+    and_cfg.achievement_ids = ["TAP_FIRST_BLOOD", "TAP_CAMPAIGN"]
+    and_cfg.dlc_ids = ["tap_dlc_exp1"]
+    $svc := ps.open_taptap(and_cfg.clone(), and_dir + "", build_mapping()) or >>
+    assert(svc.is_taptap() && svc.glyph_family() == rc.GLYPH_TOUCH)
+    assert(svc.confirm_label() == "Tap" && svc.cancel_label() == "Back")
+    assert(svc.can_use_multiplayer(true))
+
+    svc.unlock_logical_achievement("FIRST_BLOOD") or >>
+    assert(svc.has_logical_achievement("FIRST_BLOOD"))
+    svc.grant_mock_logical_dlc("EXPANSION_1") or >>
+    assert(svc.has_logical_dlc("EXPANSION_1"))
+
+    store := ps.new_unified_save_store("")
+    payload := to_bytes("progress-taptap-android")
+    store.write_slot($&svc, "campaign/slot0.sav", &payload) or >>
+    rb_uni := store.read_slot(&svc, "campaign/slot0.sav") or >>
+    assert(from_bytes(&rb_uni) == "progress-taptap-android")
+
+    $clock := timing.new_scaled_clock(60, 4) or >>
+    $imap := inp.new_input_map()
+    imap.bind("fire", 32) or >>
+    imap.begin_frame()
+    imap.feed_key(32, true) or >>
+    view := vp.from_metrics(1920, 1080, 1920, 1080, 0, 0, 1920, 1080) or >>
+    $bridge := ps.new_unified_bridge(true)
+
+    st_ok := bridge.step($&svc, $&clock, $&imap, &view)
+    assert(!st_ok.should_pause && st_ok.touch_enabled && st_ok.render_width == 2400 && st_ok.render_height == 1080)
+
+    // Opening TapTap Moment pauses gameplay clock & clears held inputs
+    svc.set_mock_overlay_or_constrained(true)
+    st_moment := bridge.step($&svc, $&clock, $&imap, &view)
+    assert(st_moment.should_pause && clock.is_paused() && !imap.pressed("fire"))
+    svc.set_mock_overlay_or_constrained(false)
+    st_resume := bridge.step($&svc, $&clock, $&imap, &view)
+    assert(!st_resume.should_pause && !clock.is_paused())
+
+    // CN curfew / duration compliance restriction triggers pause + save flush + multiplayer disable
+    svc.taptap_simulate_minor(rt.AGE_8_TO_15, 0, true, rt.RESTRICT_PERIOD) or >>
+    st_curfew := bridge.step($&svc, $&clock, $&imap, &view)
+    assert(st_curfew.should_pause && st_curfew.must_flush_saves && st_curfew.compliance_restricted)
+    assert(st_curfew.compliance_remaining_seconds == 0)
+    assert(!svc.can_use_multiplayer(true))
+
+    // Account switch requests returning to title screen
+    svc.simulate_user_sign_out()
+    st_logout := bridge.step($&svc, $&clock, $&imap, &view)
+    assert(st_logout.return_to_title_required)
+    svc.shutdown() or >>
+
+    // Disk tamper rejection on NXSV1 TapTap CloudSave envelope
+    save_file := filepath.join([and_dir + "", "cloud", "campaign", "slot0.sav"])
+    $f := os.create(save_file + "") or >>
+    _ := f.write("NXSV1|0000000000000000000000000000000000000000000000000000000000000000|bad") or >>
+    f.close() or >>
+    $reopened := ps.open_taptap(and_cfg, and_dir + "", build_mapping()) or >>
+    assert(read_slot_fails(&store, &reopened, "campaign/slot0.sav"))
+    reopened.shutdown() or >>
+
+    // 3. TapTap PC platform check
+    $pc_cfg := rt.default_config("tap_pc_01", "tap_pc_tok", rt.REGION_GLOBAL)
+    pc_cfg.target_platform = rt.TARGET_PC
+    $pc_svc := ps.open_taptap(pc_cfg, filepath.join([tmp + "", "pc"]), build_mapping()) or >>
+    assert(pc_svc.glyph_family() == rc.GLYPH_KEYBOARD_MOUSE && pc_svc.confirm_label() == "Enter")
+    $pc_bridge := ps.new_unified_bridge(true)
+    $pc_clk := timing.new_scaled_clock(60, 4) or >>
+    $pc_im := inp.new_input_map()
+    st_pc := pc_bridge.step($&pc_svc, $&pc_clk, $&pc_im, &view)
+    assert(!st_pc.touch_enabled && st_pc.render_width == 1920 && st_pc.render_height == 1080)
+    pc_svc.shutdown() or >>
+
+    clean_dir(tmp + "")
+    println("PASS: taptap_integration_checks")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

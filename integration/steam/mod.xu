@@ -1,0 +1,214 @@
+@"github.com/xulang-org/nexus/integration/steam"
+
+rs #"github.com/xulang-org/nexus/resources/steam"
+st #"github.com/xulang-org/nexus/steam"
+bm #"github.com/xulang-org/nexus/integration/bundle"
+inp #"github.com/xulang-org/nexus/input"
+timing #"github.com/xulang-org/nexus/timing"
+netw #"github.com/xulang-org/nexus/networking"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#crypto/sha256
+#errors
+#os
+#path/filepath
+#strings
+
+pub struct SteamStepStatus {
+    pub overlay_active bool
+    pub overlay_changed bool
+    pub paused_by_overlay bool
+    pub on_steam_deck bool
+    pub prefer_gamepad_glyphs bool
+    pub ui_scale f64
+    pub events_drained int
+}
+
+// Bridges Steam overlay lifecycle, Steam Deck layout scaling, InputMap reset,
+// and ScaledClock pausing per engine tick.
+pub struct SteamRuntimeBridge {
+    pub overlay_was_active bool
+    pub paused_by_overlay bool
+    pub clock_was_paused bool
+    pub auto_pause_on_overlay bool
+}
+
+pub fn new_runtime_bridge(auto_pause_on_overlay bool) SteamRuntimeBridge {
+    << SteamRuntimeBridge{
+        overlay_was_active: false,
+        paused_by_overlay: false,
+        clock_was_paused: false,
+        auto_pause_on_overlay: auto_pause_on_overlay
+    }
+}
+
+pub fn (b $&SteamRuntimeBridge) step(client $&st.SteamClient, clock $&timing.ScaledClock,
+        input_map $&inp.InputMap) SteamStepStatus {
+    client.tick() or >>
+    evs := client.drain_events()
+    now_active := client.overlay_active()
+    changed := now_active != b.overlay_was_active
+    if changed {
+        if now_active {
+            input_map.release_all()
+            if b.auto_pause_on_overlay {
+                b.clock_was_paused = clock.is_paused()
+                clock.set_paused(true)
+                b.paused_by_overlay = true
+            }
+        } else if b.paused_by_overlay {
+            clock.set_paused(b.clock_was_paused)
+            b.paused_by_overlay = false
+        }
+        b.overlay_was_active = now_active
+    }
+    prof := client.profile()
+    deck := prof.on_steam_deck
+    glyphs := deck || prof.in_big_picture
+    $scale := 1.0
+    if deck { scale = 1.25 }
+    << SteamStepStatus{
+        overlay_active: now_active,
+        overlay_changed: changed,
+        paused_by_overlay: b.paused_by_overlay,
+        on_steam_deck: deck,
+        prefer_gamepad_glyphs: glyphs,
+        ui_scale: scale,
+        events_drained: evs.len
+    }
+}
+
+const SAVE_ENVELOPE_PREFIX = "NXSV1|"
+
+// Integrity-verified save slot store syncing Steam Cloud with an optional local mirror.
+pub struct SteamSaveStore {
+    pub local_dir string
+}
+
+pub fn new_save_store(local_dir string) SteamSaveStore {
+    << SteamSaveStore{local_dir: local_dir + ""}
+}
+
+fn slice_to_string(data &[]u8, start int, stop int) string {
+    $b := strings.new_byte_builder(stop - start + 1)
+    for i in start:stop {
+        b.write_byte(int(data[i]))
+    }
+    << b.to_string()
+}
+
+fn encode_save_envelope(data &[]u8) []u8 {
+    body := slice_to_string(data, 0, data.len)
+    digest := sha256.sum256(body)
+    hdr := SAVE_ENVELOPE_PREFIX + digest + "|"
+    $out := []u8{}
+    for i in 0:hdr.len { out.push(u8(hdr[i] & 255)) }
+    for i in 0:data.len { out.push(data[i]) }
+    << out
+}
+
+fn decode_save_envelope(raw &[]u8) []u8 {
+    if raw.len < 71 {
+        >> errors.new("nexus steam save: envelope truncated")
+    }
+    hdr_str := slice_to_string(raw, 0, 6)
+    if hdr_str != SAVE_ENVELOPE_PREFIX || (raw[70] & 255) != 124 {
+        >> errors.new("nexus steam save: invalid envelope header")
+    }
+    expected := slice_to_string(raw, 6, 70)
+    body := slice_to_string(raw, 71, raw.len)
+    actual := sha256.sum256(body)
+    if actual != expected {
+        >> errors.new("nexus steam save: SHA-256 integrity check failed")
+    }
+    $out := []u8{}
+    for i in 71:raw.len { out.push(raw[i]) }
+    << out
+}
+
+pub fn (s &SteamSaveStore) write_slot(client $&st.SteamClient, slot string, data &[]u8) int {
+    clean := rs.validate_cloud_filename(&slot) or >>
+    env := encode_save_envelope(data)
+    if client.is_initialized() && client.cloud_enabled() {
+        client.cloud_write(clean + "", &env) or >>
+    }
+    if s.local_dir.len > 0 {
+        dest := filepath.join([s.local_dir + "", clean + ""])
+        os.mkdir_all(filepath.dir(dest)) or >>
+        raw := slice_to_string(&env, 0, env.len)
+        snapshot.write_atomic(dest + "", &raw) or >>
+    }
+    << 0
+}
+
+pub fn (s &SteamSaveStore) read_slot(client &st.SteamClient, slot string) []u8 {
+    clean := rs.validate_cloud_filename(&slot) or >>
+    if client.is_initialized() && client.cloud_enabled() && client.cloud_exists(clean + "") {
+        env := client.cloud_read(clean + "") or >>
+        << decode_save_envelope(&env) or >>
+    }
+    if s.local_dir.len > 0 {
+        src := filepath.join([s.local_dir + "", clean + ""])
+        raw := snapshot.read(src, rs.MAX_CLOUD_FILE_BYTES) or >>
+        $env := []u8{}
+        for i in 0:raw.len { env.push(u8(raw[i] & 255)) }
+        << decode_save_envelope(&env) or >>
+    }
+    >> errors.new("nexus steam save: save slot not found: " + clean)
+}
+
+pub struct SteamNetPacket {
+    pub sender_steam_id int
+    pub decoded netw.DecodedPacket
+}
+
+// Bridges Nexus networking binary packets onto Steam P2P transport channels.
+pub fn send_net_packet(client $&st.SteamClient, peer_id int, channel int,
+        hdr netw.PacketHeader, payload &[]u8) int {
+    raw := netw.encode_packet(hdr, payload) or >>
+    reliable := hdr.channel != netw.CHANNEL_UNRELIABLE
+    client.send_p2p(peer_id, channel, reliable, &raw) or >>
+    << 0
+}
+
+pub fn poll_net_packets(client $&st.SteamClient, channel int) []SteamNetPacket {
+    msgs := client.recv_p2p(channel)
+    $out := []SteamNetPacket{}
+    for i in 0:msgs.len {
+        dec := netw.decode_packet(&msgs[i].payload) or >>
+        out.push(SteamNetPacket{
+            sender_steam_id: msgs[i].sender_id,
+            decoded: dec
+        })
+    }
+    << out
+}
+
+// Verifies HMAC-SHA256 signature and per-asset hashes on a subscribed Steam Workshop bundle.
+pub fn mount_workshop_bundle(item &rs.SteamWorkshopItem, signing_key &string) bm.BundleMount {
+    if !item.subscribed || !item.installed || item.install_path.len == 0 {
+        >> errors.new("nexus steam workshop: item is not subscribed and installed")
+    }
+    if strings.contains(&item.install_path, "..") {
+        >> errors.new("nexus steam workshop: invalid install_path traversal")
+    }
+    $mount := bm.new_mount()
+    mount.verify_and_stage(item.install_path + "", signing_key) or >>
+    << mount
+}
+
+// Safe bounded helper for gameplay scripts triggering indexed achievements or stats.
+pub fn script_unlock_achievement(client $&st.SteamClient, cfg &rs.SteamAppConfig, index int) int {
+    if index < 0 || index >= cfg.achievement_ids.len {
+        >> errors.new("nexus steam script: achievement index out of bounds")
+    }
+    << client.unlock_achievement(cfg.achievement_ids[index] + "") or >>
+}
+
+pub fn script_add_stat_int(client $&st.SteamClient, cfg &rs.SteamAppConfig, index int, delta int) int {
+    if index < 0 || index >= cfg.stat_defs.len || cfg.stat_defs[index].is_float {
+        >> errors.new("nexus steam script: integer stat index out of bounds")
+    }
+    sid := cfg.stat_defs[index].id + ""
+    cur := client.get_stat_int(sid + "") or >>
+    << client.set_stat_int(sid + "", cur + delta) or >>
+}

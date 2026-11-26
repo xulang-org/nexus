@@ -2,16 +2,25 @@ XU ?= xu
 PYTHON ?= python3
 export XU
 
-.PHONY: prefab-runtime-test ai-bt-nav-test input-replay-timing-test timeline-test project-bundle-cli-test ui-tree-test profiler-test bundle-test shader-cross-backend-test scene-v9-test scene-soa-test ecs-parallel-test navigation-test networking-test audio-dsp-test script-aot-test script-host-coroutines-test physics3d-joints-ragdoll-test physics3d-advanced-test gpu-skinning-test skeletal-animation-test particles-vfx-gpu-test terrain-foliage-gpu-test decals-atmosphere-gpu-test ddgi-gi-gpu-test engine-integration-gpu-test all-modern-tests clustered-lighting-gpu-test indirect-cull-hiz-gpu-test hdr-postprocess-gpu-test meshlet-visbuffer-gpu-test transparent-pbr-gpu-test streaming-lru-gpu-test xacp-test lighting-demo-test demo-lighting lighting-core-test lighting-gpu-test gpu-failure-test present-fallback-test text-2d-test ui-hud-test demo-ui-hud mesh-shaders canvas-shaders native-image window-input-smoke gpu-surface-smoke sdk gpu-compute-smoke native-probe gpu-offscreen-smoke gpu-transfer-smoke check-core test-core mesh-core-test audio-core-test audio-device-test native native-audio audio-fixtures audio-test audio-smoke demo-audio demo-audio-stream demo-audio-seek check layers test demo demo2d demo3d demo-glb demo-script demo-materials demo-textures3d demo-mipmaps3d demo-material-maps demo-normal-maps demo-generated-tangents demo-glb-materials smoke gpu-smoke gpu3d-smoke image-fixtures glb-fixtures script-tool script-fixtures script-live-smoke glb-material-fixtures scene-fixtures demo-scene-file scene-asset-fixtures demo-scene-assets scene-audio-fixtures demo-scene-audio demo-scene-av scene-script-assets scene-script-fixtures demo-scene-scripts
+.PHONY: taptap-data-test taptap-test taptap-native-test native-taptap console-data-test console-test console-native-test native-console steam-data-test steam-test steam-native-test native-steam prefab-runtime-test ai-bt-nav-test input-replay-timing-test timeline-test project-bundle-cli-test ui-tree-test profiler-test bundle-test shader-cross-backend-test scene-v9-test scene-soa-test ecs-parallel-test navigation-test networking-test audio-dsp-test script-aot-test script-host-coroutines-test physics3d-joints-ragdoll-test physics3d-advanced-test gpu-skinning-test skeletal-animation-test particles-vfx-gpu-test terrain-foliage-gpu-test decals-atmosphere-gpu-test ddgi-gi-gpu-test engine-integration-gpu-test all-modern-tests clustered-lighting-gpu-test indirect-cull-hiz-gpu-test hdr-postprocess-gpu-test meshlet-visbuffer-gpu-test transparent-pbr-gpu-test streaming-lru-gpu-test xacp-test lighting-demo-test demo-lighting lighting-core-test lighting-gpu-test gpu-failure-test present-fallback-test text-2d-test ui-hud-test demo-ui-hud mesh-shaders canvas-shaders native-image window-input-smoke gpu-surface-smoke sdk gpu-compute-smoke native-probe gpu-offscreen-smoke gpu-transfer-smoke check-core test-core mesh-core-test audio-core-test audio-device-test native native-audio audio-fixtures audio-test audio-smoke demo-audio demo-audio-stream demo-audio-seek check layers test demo demo2d demo3d demo-glb demo-script demo-materials demo-textures3d demo-mipmaps3d demo-material-maps demo-normal_maps demo-generated-tangents demo-glb-materials smoke gpu-smoke gpu3d-smoke image-fixtures glb-fixtures script-tool script-fixtures script-live-smoke glb-material-fixtures scene-fixtures demo-scene-file scene-asset-fixtures demo-scene-assets scene-audio-fixtures demo-scene-audio demo-scene-av scene-script-assets scene-script-fixtures demo-scene-scripts
 xacp-test: sdk
 	mkdir -p build
 	$(XU) build tests/xacp_checks.xu -o build/xacp-tests
 	./build/xacp-tests
 
-native: native-audio native-image
+native: native-audio native-image native-steam native-console native-taptap
 
 native-image: sdk
 	$(PYTHON) native/build.py --xu "$(XU)" --only-image
+
+native-steam: sdk
+	$(PYTHON) native/build.py --xu "$(XU)" --only-steam
+
+native-console: sdk
+	$(PYTHON) native/build.py --xu "$(XU)" --only-console
+
+native-taptap: sdk
+	$(PYTHON) native/build.py --xu "$(XU)" --only-taptap
 
 mesh-shaders: sdk
 	$(PYTHON) tools/mesh_shaders.py
@@ -207,7 +216,7 @@ check-core: layers sdk
 
 # Pure Xu validation stays usable while a compiler/platform backend is incomplete.
 # The aggregate check/test/gpu targets still fail on real device build failures.
-test-core: prefab-runtime-test ai-bt-nav-test input-replay-timing-test timeline-test project-bundle-cli-test ui-tree-test profiler-test bundle-test shader-cross-backend-test scene-v9-test scene-soa-test ecs-parallel-test navigation-test audio-dsp-test script-aot-test 25d-core-test shadow-core-test gltf-animation-test mesh-format-core-test lod-core-test frustum-core-test physics3d-test scene-lighting-test lighting-core-test check-core mesh-core-test glb-fixtures glb-material-fixtures script-fixtures audio-core-test scene-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
+test-core: taptap-data-test console-data-test steam-data-test prefab-runtime-test ai-bt-nav-test input-replay-timing-test timeline-test project-bundle-cli-test ui-tree-test profiler-test bundle-test shader-cross-backend-test scene-v9-test scene-soa-test ecs-parallel-test navigation-test audio-dsp-test script-aot-test 25d-core-test shadow-core-test gltf-animation-test mesh-format-core-test lod-core-test frustum-core-test physics3d-test scene-lighting-test lighting-core-test check-core mesh-core-test glb-fixtures glb-material-fixtures script-fixtures audio-core-test scene-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
 	mkdir -p build
 	$(PYTHON) tests/layer_rules_checks.py
 	$(PYTHON) tests/layer_headless_checks.py
@@ -968,8 +977,56 @@ engine-integration-gpu-test: layers mesh-shaders
 	$(XU) build tests/engine_full_integration_gpu_checks.xu -o build/engine-integration-gpu-checks
 	./build/engine-integration-gpu-checks
 
-all-modern-tests: modern-sandbox-test engine-integration-gpu-test ddgi-gi-gpu-test physics3d-advanced-test networking-test decals-atmosphere-gpu-test terrain-foliage-gpu-test script-host-coroutines-test particles-vfx-gpu-test skeletal-animation-test transparent-pbr-gpu-test
+all-modern-tests: modern-sandbox-test steam-test steam-native-test console-test console-native-test taptap-test taptap-native-test engine-integration-gpu-test ddgi-gi-gpu-test physics3d-advanced-test networking-test decals-atmosphere-gpu-test terrain-foliage-gpu-test script-host-coroutines-test particles-vfx-gpu-test skeletal-animation-test transparent-pbr-gpu-test
 	@echo "ALL MODERN ENGINE TESTS PASSED"
+
+console-data-test: sdk
+	mkdir -p build
+	$(XU) build tests/console_data_checks.xu -o build/console-data-checks
+	./build/console-data-checks
+
+console-test: native-steam native-console native-taptap project-cli
+	mkdir -p build
+	$(XU) build tests/console_platform_checks.xu -o build/console-platform-checks
+	XU_NEXUS_STEAM_LIBRARY=/nonexistent/no-steam XU_NEXUS_XBOX_DRIVER=/nonexistent/no-xbox XU_NEXUS_PS_DRIVER=/nonexistent/no-ps XU_NEXUS_SWITCH_DRIVER=/nonexistent/no-switch XU_NEXUS_TAPTAP_LIBRARY=/nonexistent/no-taptap ./build/console-platform-checks
+	$(XU) build tests/console_cli_checks.xu -o build/console-cli-checks
+	./build/console-cli-checks --project-cli build/nexus-project
+
+console-native-test: native-console
+	mkdir -p build
+	$(PYTHON) tests/console_native_bridge_checks.py --xu "$(XU)"
+
+taptap-data-test: sdk
+	mkdir -p build
+	$(XU) build tests/taptap_data_checks.xu -o build/taptap-data-checks
+	./build/taptap-data-checks
+
+taptap-test: native-taptap native-steam native-console project-cli
+	mkdir -p build
+	$(XU) build tests/taptap_integration_checks.xu -o build/taptap-integration-checks
+	XU_NEXUS_TAPTAP_LIBRARY=/nonexistent/no-taptap ./build/taptap-integration-checks
+	$(XU) build tests/taptap_cli_checks.xu -o build/taptap-cli-checks
+	./build/taptap-cli-checks --project-cli build/nexus-project
+
+taptap-native-test: native-taptap
+	mkdir -p build
+	$(PYTHON) tests/taptap_native_bridge_checks.py --xu "$(XU)"
+
+steam-data-test: sdk
+	mkdir -p build
+	$(XU) build tests/steam_data_checks.xu -o build/steam-data-checks
+	./build/steam-data-checks
+
+steam-test: native-steam project-cli
+	mkdir -p build
+	$(XU) build tests/steam_integration_checks.xu -o build/steam-integration-checks
+	XU_NEXUS_STEAM_LIBRARY=/nonexistent/no-steam ./build/steam-integration-checks
+	$(XU) build tests/steam_cli_checks.xu -o build/steam-cli-checks
+	./build/steam-cli-checks --project-cli build/nexus-project
+
+steam-native-test: native-steam
+	mkdir -p build
+	$(PYTHON) tests/steam_native_bridge_checks.py --xu "$(XU)"
 
 .PHONY: modern-sandbox demo-modern-sandbox modern-sandbox-test
 modern-sandbox: mesh-shaders canvas-shaders native-image script-tool

@@ -1,0 +1,87 @@
+@main
+
+plat #"github.com/xulang-org/nexus/platform/taptap"
+rt #"github.com/xulang-org/nexus/resources/taptap"
+tt #"github.com/xulang-org/nexus/taptap"
+#os
+#strings
+
+fn from_u8(buf &[]u8) string {
+    << plat.u8_to_str(buf, buf.len)
+}
+
+fn pay_rejected(client &tt.TapTapClient, cents int) bool {
+    _ := client.check_payment(cents) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn run() int {
+    expect_native := os.getenv("NEXUS_EXPECT_NATIVE_TAPTAP") == "1"
+    avail := plat.raw_is_available()
+    $cfg := rt.default_config("tap_nat_01", "tap_nat_tok", rt.REGION_CN)
+    cfg.achievement_ids = ["ACH_TAP_1", "ACH_TAP_STEPS"]
+    cfg.dlc_ids = ["tap_dlc_1"]
+    cfg.leaderboard_ids = ["lb_main"]
+
+    if !expect_native {
+        assert(avail == 0)
+        $client := tt.init_auto(cfg, "") or >>
+        assert(client.backend_kind() == tt.BACKEND_LOCAL_MOCK)
+        client.shutdown() or >>
+        println("PASS: taptap_native_checks missing-lib fallback")
+        << 0
+    }
+
+    assert(avail == 1)
+    $client := tt.init_native(cfg, "") or >>
+    assert(client.backend_kind() == tt.BACKEND_NATIVE && client.is_initialized())
+    assert(!client.restart_if_necessary())
+
+    u := client.user()
+    assert(u.logged_in && u.open_id == "tap_open_777" && u.union_id == "tap_union_999" && u.name == "TapNativeUser")
+
+    comp := client.compliance_state()
+    assert(comp.age_range == 16 && comp.remaining_seconds == 3600 && !comp.restricted)
+    client.check_payment(5000) or >>
+    client.submit_payment(5000) or >>
+    assert(pay_rejected(&client, 15000))
+
+    assert(client.verify_license())
+    assert(client.has_dlc("tap_dlc_1") && !client.has_dlc("tap_dlc_other"))
+
+    client.unlock_achievement("ACH_TAP_1") or >>
+    assert(client.has_achievement("ACH_TAP_1"))
+    client.increment_achievement("ACH_TAP_STEPS", 5, 10) or >>
+
+    payload := plat.str_to_u8(&"taptap-native-cloud-data")
+    client.cloud_write("slot0.sav", "Level 1", &payload) or >>
+    assert(client.cloud_exists("slot0.sav"))
+    rb := client.cloud_read("slot0.sav") or >>
+    assert(from_u8(&rb) == "taptap-native-cloud-data")
+    client.cloud_delete("slot0.sav") or >>
+    assert(!client.cloud_exists("slot0.sav"))
+
+    client.submit_leaderboard_score("lb_main", 9950) or >>
+    client.open_moment("forum") or >>
+    assert(client.is_moment_open())
+    assert(client.check_update() == 0)
+
+    client.poll() or >>
+    evs := client.drain_events()
+    assert(evs.len >= 1)
+
+    client.shutdown() or >>
+    println("PASS: taptap_native_checks dlopen ABI live")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

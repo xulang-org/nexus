@@ -1,0 +1,603 @@
+@"github.com/xulang-org/nexus/resources/taptap"
+
+#encoding/json
+#errors
+#strconv
+#strings
+
+pub const TAPTAP_CONFIG_FORMAT = "nexus.taptap"
+pub const TAPTAP_CONFIG_VERSION = 1
+
+pub const REGION_CN = 0
+pub const REGION_GLOBAL = 1
+
+pub const TARGET_ANDROID = 0
+pub const TARGET_IOS = 1
+pub const TARGET_PC = 2
+
+pub const AGE_UNKNOWN = -1
+pub const AGE_UNDER_8 = 0
+pub const AGE_8_TO_15 = 8
+pub const AGE_16_TO_17 = 16
+pub const AGE_ADULT = 18
+
+pub const RESTRICT_NONE = 0
+pub const RESTRICT_PERIOD = 1
+pub const RESTRICT_DURATION = 2
+pub const RESTRICT_AGE = 3
+pub const RESTRICT_UNVERIFIED = 4
+
+pub const DEFAULT_CLOUDSAVE_QUOTA_BYTES = 104857600
+pub const MAX_CLOUDSAVE_FILE_BYTES = 10485760
+pub const MAX_CLOUDSAVE_ARCHIVES = 64
+pub const MAX_ACHIEVEMENTS = 256
+pub const MAX_DLCS = 64
+pub const MAX_LEADERBOARDS = 64
+
+pub const EVENT_LOGIN_SUCCEEDED = 1
+pub const EVENT_LOGIN_CANCELLED = 2
+pub const EVENT_COMPLIANCE_LOGIN_SUCCESS = 3
+pub const EVENT_COMPLIANCE_EXITED = 4
+pub const EVENT_COMPLIANCE_SWITCH_ACCOUNT = 5
+pub const EVENT_COMPLIANCE_PERIOD_RESTRICT = 6
+pub const EVENT_COMPLIANCE_DURATION_LIMIT = 7
+pub const EVENT_COMPLIANCE_AGE_LIMIT = 8
+pub const EVENT_MOMENT_OPENED = 9
+pub const EVENT_MOMENT_CLOSED = 10
+pub const EVENT_ACHIEVEMENT_UNLOCKED = 11
+pub const EVENT_CLOUDSAVE_SYNCED = 12
+pub const EVENT_LICENSE_VERIFIED = 13
+
+pub struct TapTapAppConfig {
+    pub client_id string
+    pub client_token string
+    pub server_url string
+    pub region int
+    pub target_platform int
+    pub package_name string
+    pub app_name string
+    pub app_version string
+    pub isbn_code string
+    pub age_rating int
+    pub enable_compliance bool
+    pub enable_payment_check bool
+    pub enable_license_check bool
+    pub enable_cloudsave bool
+    pub enable_moment bool
+    pub enable_leaderboard bool
+    pub enable_pc_launch_check bool
+    pub cloud_quota_bytes int
+    pub achievement_ids []string
+    pub dlc_ids []string
+    pub leaderboard_ids []string
+}
+
+pub struct TapTapUser {
+    pub open_id string
+    pub union_id string
+    pub name string
+    pub avatar_url string
+    pub logged_in bool
+    pub access_token string
+}
+
+pub struct TapTapComplianceState {
+    pub verified bool
+    pub age_range int
+    pub remaining_seconds int
+    pub restricted bool
+    pub restriction_reason int
+    pub monthly_spent_cents int
+}
+
+pub struct TapTapAchievement {
+    pub display_id string
+    pub unlocked bool
+    pub steps int
+    pub max_steps int
+}
+
+pub struct TapTapCloudArchive {
+    pub uuid string
+    pub name string
+    pub summary string
+    pub extra string
+    pub playtime_sec int
+    pub size_bytes int
+    pub modified_epoch int
+}
+
+pub struct TapTapLeaderboardEntry {
+    pub open_id string
+    pub name string
+    pub rank int
+    pub score int
+}
+
+pub struct TapTapEvent {
+    pub kind int
+    pub code int
+    pub text string
+}
+
+pub struct TapTapAuditIssue {
+    pub code string
+    pub severity string
+    pub message string
+}
+
+pub struct TapTapAuditReport {
+    pub passed bool
+    pub issues []TapTapAuditIssue
+}
+
+pub fn default_config(client_id string, client_token string, region int) TapTapAppConfig {
+    comp := region == REGION_CN
+    << TapTapAppConfig{
+        client_id: client_id + "",
+        client_token: client_token + "",
+        server_url: "",
+        region: region,
+        target_platform: TARGET_ANDROID,
+        package_name: "com.nexus.demo",
+        app_name: "NexusGame",
+        app_version: "1.0.0",
+        isbn_code: "",
+        age_rating: 12,
+        enable_compliance: comp,
+        enable_payment_check: comp,
+        enable_license_check: false,
+        enable_cloudsave: true,
+        enable_moment: true,
+        enable_leaderboard: true,
+        enable_pc_launch_check: false,
+        cloud_quota_bytes: DEFAULT_CLOUDSAVE_QUOTA_BYTES,
+        achievement_ids: []string{},
+        dlc_ids: []string{},
+        leaderboard_ids: []string{}
+    }
+}
+
+pub fn (cfg &TapTapAppConfig) clone() TapTapAppConfig {
+    $aids := []string{}
+    for i in 0:cfg.achievement_ids.len { aids.push(cfg.achievement_ids[i] + "") }
+    $dids := []string{}
+    for i in 0:cfg.dlc_ids.len { dids.push(cfg.dlc_ids[i] + "") }
+    $lids := []string{}
+    for i in 0:cfg.leaderboard_ids.len { lids.push(cfg.leaderboard_ids[i] + "") }
+    << TapTapAppConfig{
+        client_id: cfg.client_id + "",
+        client_token: cfg.client_token + "",
+        server_url: cfg.server_url + "",
+        region: cfg.region,
+        target_platform: cfg.target_platform,
+        package_name: cfg.package_name + "",
+        app_name: cfg.app_name + "",
+        app_version: cfg.app_version + "",
+        isbn_code: cfg.isbn_code + "",
+        age_rating: cfg.age_rating,
+        enable_compliance: cfg.enable_compliance,
+        enable_payment_check: cfg.enable_payment_check,
+        enable_license_check: cfg.enable_license_check,
+        enable_cloudsave: cfg.enable_cloudsave,
+        enable_moment: cfg.enable_moment,
+        enable_leaderboard: cfg.enable_leaderboard,
+        enable_pc_launch_check: cfg.enable_pc_launch_check,
+        cloud_quota_bytes: cfg.cloud_quota_bytes,
+        achievement_ids: aids,
+        dlc_ids: dids,
+        leaderboard_ids: lids
+    }
+}
+
+fn validate_ascii_id(raw &string, label string, max_len int) int {
+    if raw.len < 1 || raw.len > max_len {
+        >> errors.new("nexus taptap: invalid " + label + " length")
+    }
+    for i in 0:raw.len {
+        b := raw[i] & 255
+        ok := (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
+            (b >= 48 && b <= 57) || b == 95 || b == 45
+        if !ok {
+            >> errors.new("nexus taptap: illegal character in " + label + ": " + raw)
+        }
+    }
+    << 0
+}
+
+fn validate_printable_ascii(raw &string, label string, min_len int, max_len int) int {
+    if raw.len < min_len || raw.len > max_len {
+        >> errors.new("nexus taptap: invalid " + label + " length")
+    }
+    for i in 0:raw.len {
+        b := raw[i] & 255
+        if b < 33 || b > 126 {
+            >> errors.new("nexus taptap: invalid character in " + label)
+        }
+    }
+    << 0
+}
+
+fn is_valid_package_name(pkg &string) bool {
+    if pkg.len < 3 || pkg.len > 128 { << false }
+    $has_dot := false
+    for i in 0:pkg.len {
+        b := pkg[i] & 255
+        if b == 46 {
+            has_dot = true
+            if i == 0 || i == pkg.len - 1 || (pkg[i - 1] & 255) == 46 { << false }
+        } else {
+            ok := (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
+                (b >= 48 && b <= 57) || b == 95
+            if !ok { << false }
+        }
+    }
+    << has_dot
+}
+
+fn is_valid_age_rating(age int) bool {
+    << age == 0 || age == 8 || age == 12 || age == 16 || age == 18
+}
+
+pub fn validate_archive_name(raw &string) string {
+    trimmed := strings.trim_space(raw)
+    if trimmed.len < 1 || trimmed.len > 128 {
+        >> errors.new("nexus taptap: cloudsave archive name must be 1..128 bytes")
+    }
+    if (trimmed[0] & 255) == 47 || (trimmed[0] & 255) == 92 {
+        >> errors.new("nexus taptap: cloudsave archive name must be relative")
+    }
+    if strings.contains(&trimmed, "..") || strings.contains(&trimmed, "\\") {
+        >> errors.new("nexus taptap: cloudsave archive name contains forbidden traversal")
+    }
+    for i in 0:trimmed.len {
+        b := trimmed[i] & 255
+        ok := (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
+            (b >= 48 && b <= 57) || b == 95 || b == 45 || b == 46 || b == 47
+        if !ok {
+            >> errors.new("nexus taptap: illegal character in archive name: " + trimmed)
+        }
+    }
+    parts := strings.split(&trimmed, "/")
+    for i in 0:parts.len {
+        seg := parts[i] + ""
+        if seg.len == 0 || seg == "." || seg == ".." {
+            >> errors.new("nexus taptap: invalid archive path segment: " + trimmed)
+        }
+    }
+    << trimmed
+}
+
+fn validate_unique_ids(ids &[]string, label string, max_count int) int {
+    if ids.len > max_count {
+        >> errors.new("nexus taptap: " + label + " exceeds limit of " + str(max_count))
+    }
+    for i in 0:ids.len {
+        tok := ids[i] + ""
+        validate_ascii_id(&tok, label, 128) or >>
+        for j in 0:i {
+            if ids[j] == tok {
+                >> errors.new("nexus taptap: duplicate " + label + ": " + tok)
+            }
+        }
+    }
+    << 0
+}
+
+pub fn validate_config(cfg &TapTapAppConfig) int {
+    validate_ascii_id(&cfg.client_id, "client_id", 64) or >>
+    validate_printable_ascii(&cfg.client_token, "client_token", 1, 128) or >>
+    if cfg.region != REGION_CN && cfg.region != REGION_GLOBAL {
+        >> errors.new("nexus taptap: region must be REGION_CN (0) or REGION_GLOBAL (1)")
+    }
+    if cfg.target_platform < TARGET_ANDROID || cfg.target_platform > TARGET_PC {
+        >> errors.new("nexus taptap: invalid target_platform")
+    }
+    if !is_valid_package_name(&cfg.package_name) {
+        >> errors.new("nexus taptap: invalid reverse-DNS package_name: " + cfg.package_name)
+    }
+    if cfg.app_name.len < 1 || cfg.app_name.len > 128 {
+        >> errors.new("nexus taptap: app_name must be 1..128 bytes")
+    }
+    if cfg.app_version.len < 1 || cfg.app_version.len > 64 {
+        >> errors.new("nexus taptap: app_version must be 1..64 bytes")
+    }
+    if !is_valid_age_rating(cfg.age_rating) {
+        >> errors.new("nexus taptap: age_rating must be one of 0, 8, 12, 16, 18")
+    }
+    if cfg.cloud_quota_bytes < 1 || cfg.cloud_quota_bytes > 1073741824 {
+        >> errors.new("nexus taptap: cloud_quota_bytes out of valid range")
+    }
+    validate_unique_ids(&cfg.achievement_ids, "achievement_ids", MAX_ACHIEVEMENTS) or >>
+    validate_unique_ids(&cfg.dlc_ids, "dlc_ids", MAX_DLCS) or >>
+    validate_unique_ids(&cfg.leaderboard_ids, "leaderboard_ids", MAX_LEADERBOARDS) or >>
+    << 0
+}
+
+pub fn check_minor_payment_limit(age_range int, amount_cents int, monthly_spent_cents int) int {
+    if amount_cents <= 0 {
+        >> errors.new("nexus taptap: payment amount must be positive")
+    }
+    if monthly_spent_cents < 0 {
+        >> errors.new("nexus taptap: monthly_spent_cents cannot be negative")
+    }
+    if age_range == AGE_ADULT { << 0 }
+    if age_range == AGE_UNKNOWN {
+        >> errors.new("nexus taptap: unverified real-name identity cannot make payments")
+    }
+    if age_range == AGE_UNDER_8 {
+        >> errors.new("nexus taptap: minors under 8 are prohibited from in-app purchases")
+    }
+    if age_range == AGE_8_TO_15 {
+        if amount_cents > 5000 {
+            >> errors.new("nexus taptap: ages 8-15 single purchase limit is 5000 cents (50 CNY)")
+        }
+        if monthly_spent_cents + amount_cents > 20000 {
+            >> errors.new("nexus taptap: ages 8-15 monthly purchase limit is 20000 cents (200 CNY)")
+        }
+        << 0
+    }
+    if age_range == AGE_16_TO_17 {
+        if amount_cents > 10000 {
+            >> errors.new("nexus taptap: ages 16-17 single purchase limit is 10000 cents (100 CNY)")
+        }
+        if monthly_spent_cents + amount_cents > 40000 {
+            >> errors.new("nexus taptap: ages 16-17 monthly purchase limit is 40000 cents (400 CNY)")
+        }
+        << 0
+    }
+    >> errors.new("nexus taptap: unknown compliance age_range: " + str(age_range))
+}
+
+fn json_bool(v bool) string {
+    if v { << "true" }
+    << "false"
+}
+
+fn write_str_array(b $&strings.ByteBuilder, arr &[]string) {
+    b.write_str("[")
+    for i in 0:arr.len {
+        if i > 0 { b.write_str(", ") }
+        s := arr[i] + ""
+        b.write_str(json.quote(&s))
+    }
+    b.write_str("]")
+}
+
+pub fn encode_config_json(cfg &TapTapAppConfig) string {
+    validate_config(cfg) or >>
+    $b := strings.new_byte_builder(1024)
+    fmt_s := TAPTAP_CONFIG_FORMAT + ""
+    cid := cfg.client_id + ""
+    ctok := cfg.client_token + ""
+    surl := cfg.server_url + ""
+    pkg := cfg.package_name + ""
+    aname := cfg.app_name + ""
+    aver := cfg.app_version + ""
+    isbn := cfg.isbn_code + ""
+    b.write_str("{\n")
+    b.write_str("  \"format\": " + json.quote(&fmt_s) + ",\n")
+    b.write_str("  \"version\": " + str(TAPTAP_CONFIG_VERSION) + ",\n")
+    b.write_str("  \"client_id\": " + json.quote(&cid) + ",\n")
+    b.write_str("  \"client_token\": " + json.quote(&ctok) + ",\n")
+    b.write_str("  \"server_url\": " + json.quote(&surl) + ",\n")
+    b.write_str("  \"region\": " + str(cfg.region) + ",\n")
+    b.write_str("  \"target_platform\": " + str(cfg.target_platform) + ",\n")
+    b.write_str("  \"package_name\": " + json.quote(&pkg) + ",\n")
+    b.write_str("  \"app_name\": " + json.quote(&aname) + ",\n")
+    b.write_str("  \"app_version\": " + json.quote(&aver) + ",\n")
+    b.write_str("  \"isbn_code\": " + json.quote(&isbn) + ",\n")
+    b.write_str("  \"age_rating\": " + str(cfg.age_rating) + ",\n")
+    b.write_str("  \"enable_compliance\": " + json_bool(cfg.enable_compliance) + ",\n")
+    b.write_str("  \"enable_payment_check\": " + json_bool(cfg.enable_payment_check) + ",\n")
+    b.write_str("  \"enable_license_check\": " + json_bool(cfg.enable_license_check) + ",\n")
+    b.write_str("  \"enable_cloudsave\": " + json_bool(cfg.enable_cloudsave) + ",\n")
+    b.write_str("  \"enable_moment\": " + json_bool(cfg.enable_moment) + ",\n")
+    b.write_str("  \"enable_leaderboard\": " + json_bool(cfg.enable_leaderboard) + ",\n")
+    b.write_str("  \"enable_pc_launch_check\": " + json_bool(cfg.enable_pc_launch_check) + ",\n")
+    b.write_str("  \"cloud_quota_bytes\": " + str(cfg.cloud_quota_bytes) + ",\n")
+    b.write_str("  \"achievement_ids\": ")
+    write_str_array($&b, &cfg.achievement_ids)
+    b.write_str(",\n  \"dlc_ids\": ")
+    write_str_array($&b, &cfg.dlc_ids)
+    b.write_str(",\n  \"leaderboard_ids\": ")
+    write_str_array($&b, &cfg.leaderboard_ids)
+    b.write_str("\n}\n")
+    << b.to_string()
+}
+
+fn read_str_list(doc &json.Doc, root int, key string, out $&[]string) int {
+    if !doc.has(root, key + "") { << 0 }
+    lst := doc.get(root, key + "")
+    if !doc.is_list(lst) { >> errors.new("nexus taptap: " + key + " must be list") }
+    for i in 0:doc.count(lst) {
+        out.push(doc.as_string(doc.at(lst, i)) or >>)
+    }
+    << 0
+}
+
+pub fn decode_config_json(raw &string) TapTapAppConfig {
+    if raw.len < 2 || raw.len > 1048576 {
+        >> errors.new("nexus taptap: config JSON size out of bounds")
+    }
+    doc := json.parse_max(raw, 1048576)
+    if !doc.ok() { >> errors.new("nexus taptap JSON: " + doc.error()) }
+    root := doc.root()
+    if !doc.is_dict(root) { >> errors.new("nexus taptap: root must be JSON object") }
+    if !doc.has(root, "format") || !doc.has(root, "version") ||
+        !doc.has(root, "client_id") || !doc.has(root, "client_token") {
+        >> errors.new("nexus taptap: missing required field (format/version/client_id/client_token)")
+    }
+    fmt_s := doc.as_string(doc.get(root, "format")) or >>
+    ver := doc.as_int(doc.get(root, "version")) or >>
+    if fmt_s != TAPTAP_CONFIG_FORMAT || ver != TAPTAP_CONFIG_VERSION {
+        >> errors.new("nexus taptap: unsupported config format or version")
+    }
+    cid := doc.as_string(doc.get(root, "client_id")) or >>
+    ctok := doc.as_string(doc.get(root, "client_token")) or >>
+    $region := REGION_CN
+    if doc.has(root, "region") { region = doc.as_int(doc.get(root, "region")) or >> }
+    $cfg := default_config(cid, ctok, region)
+    if doc.has(root, "server_url") { cfg.server_url = doc.as_string(doc.get(root, "server_url")) or >> }
+    if doc.has(root, "target_platform") { cfg.target_platform = doc.as_int(doc.get(root, "target_platform")) or >> }
+    if doc.has(root, "package_name") { cfg.package_name = doc.as_string(doc.get(root, "package_name")) or >> }
+    if doc.has(root, "app_name") { cfg.app_name = doc.as_string(doc.get(root, "app_name")) or >> }
+    if doc.has(root, "app_version") { cfg.app_version = doc.as_string(doc.get(root, "app_version")) or >> }
+    if doc.has(root, "isbn_code") { cfg.isbn_code = doc.as_string(doc.get(root, "isbn_code")) or >> }
+    if doc.has(root, "age_rating") { cfg.age_rating = doc.as_int(doc.get(root, "age_rating")) or >> }
+    if doc.has(root, "enable_compliance") { cfg.enable_compliance = doc.as_bool(doc.get(root, "enable_compliance")) or >> }
+    if doc.has(root, "enable_payment_check") { cfg.enable_payment_check = doc.as_bool(doc.get(root, "enable_payment_check")) or >> }
+    if doc.has(root, "enable_license_check") { cfg.enable_license_check = doc.as_bool(doc.get(root, "enable_license_check")) or >> }
+    if doc.has(root, "enable_cloudsave") { cfg.enable_cloudsave = doc.as_bool(doc.get(root, "enable_cloudsave")) or >> }
+    if doc.has(root, "enable_moment") { cfg.enable_moment = doc.as_bool(doc.get(root, "enable_moment")) or >> }
+    if doc.has(root, "enable_leaderboard") { cfg.enable_leaderboard = doc.as_bool(doc.get(root, "enable_leaderboard")) or >> }
+    if doc.has(root, "enable_pc_launch_check") { cfg.enable_pc_launch_check = doc.as_bool(doc.get(root, "enable_pc_launch_check")) or >> }
+    if doc.has(root, "cloud_quota_bytes") { cfg.cloud_quota_bytes = doc.as_int(doc.get(root, "cloud_quota_bytes")) or >> }
+    read_str_list(&doc, root, "achievement_ids", $&cfg.achievement_ids) or >>
+    read_str_list(&doc, root, "dlc_ids", $&cfg.dlc_ids) or >>
+    read_str_list(&doc, root, "leaderboard_ids", $&cfg.leaderboard_ids) or >>
+    validate_config(&cfg) or >>
+    << cfg
+}
+
+fn check_cfg_ok(cfg &TapTapAppConfig) string {
+    validate_config(cfg) or (err) { << err.msg() }
+    << ""
+}
+
+pub fn audit_taptap_submission(cfg &TapTapAppConfig) TapTapAuditReport {
+    $issues := []TapTapAuditIssue{}
+    $has_err := false
+    err_msg := check_cfg_ok(cfg)
+    if err_msg.len > 0 {
+        has_err = true
+        issues.push(TapTapAuditIssue{code: "TAP-001", severity: "error", message: err_msg})
+    }
+    if !is_valid_package_name(&cfg.package_name) {
+        has_err = true
+        issues.push(TapTapAuditIssue{
+            code: "TAP-002",
+            severity: "error",
+            message: "package_name must be a valid reverse-DNS identifier"
+        })
+    }
+    if cfg.region == REGION_CN && !cfg.enable_compliance {
+        has_err = true
+        issues.push(TapTapAuditIssue{
+            code: "TAP-003",
+            severity: "error",
+            message: "CN TapTap distribution requires real-name anti-addiction compliance enabled"
+        })
+    }
+    if cfg.region == REGION_CN && cfg.age_rating == 0 {
+        has_err = true
+        issues.push(TapTapAuditIssue{
+            code: "TAP-004",
+            severity: "error",
+            message: "CN TapTap distribution requires CADPA age_rating of 8, 12, 16, or 18"
+        })
+    }
+    if cfg.region == REGION_CN && cfg.isbn_code.len == 0 {
+        issues.push(TapTapAuditIssue{
+            code: "TAP-005",
+            severity: "warning",
+            message: "isbn_code is empty; commercial release in Mainland China requires approved ISBN"
+        })
+    }
+    if cfg.target_platform == TARGET_PC && cfg.enable_license_check && !cfg.enable_pc_launch_check {
+        issues.push(TapTapAuditIssue{
+            code: "TAP-006",
+            severity: "warning",
+            message: "TapTap PC with license check enabled recommends enable_pc_launch_check=true"
+        })
+    }
+    << TapTapAuditReport{passed: !has_err, issues: issues}
+}
+
+fn xml_escape(raw &string) string {
+    $b := strings.new_byte_builder(raw.len + 16)
+    for i in 0:raw.len {
+        c := raw[i] & 255
+        if c == 38 { b.write_str("&amp;") }
+        else if c == 60 { b.write_str("&lt;") }
+        else if c == 62 { b.write_str("&gt;") }
+        else if c == 34 { b.write_str("&quot;") }
+        else { b.write_byte(int(c)) }
+    }
+    << b.to_string()
+}
+
+pub fn generate_taptap_sdk_config_json(cfg &TapTapAppConfig) string {
+    validate_config(cfg) or >>
+    $region_name := "CN"
+    if cfg.region == REGION_GLOBAL { region_name = "Global" }
+    $plat_name := "Android"
+    if cfg.target_platform == TARGET_IOS { plat_name = "iOS" }
+    else if cfg.target_platform == TARGET_PC { plat_name = "PC" }
+    cid := cfg.client_id + ""
+    surl := cfg.server_url + ""
+    pkg := cfg.package_name + ""
+    aname := cfg.app_name + ""
+    aver := cfg.app_version + ""
+    $b := strings.new_byte_builder(512)
+    b.write_str("{\n")
+    b.write_str("  \"clientId\": " + json.quote(&cid) + ",\n")
+    b.write_str("  \"region\": " + json.quote(&region_name) + ",\n")
+    b.write_str("  \"platform\": " + json.quote(&plat_name) + ",\n")
+    b.write_str("  \"serverUrl\": " + json.quote(&surl) + ",\n")
+    b.write_str("  \"packageName\": " + json.quote(&pkg) + ",\n")
+    b.write_str("  \"appName\": " + json.quote(&aname) + ",\n")
+    b.write_str("  \"appVersion\": " + json.quote(&aver) + ",\n")
+    b.write_str("  \"ageRating\": " + str(cfg.age_rating) + ",\n")
+    b.write_str("  \"complianceEnabled\": " + json_bool(cfg.enable_compliance) + ",\n")
+    b.write_str("  \"cloudSaveEnabled\": " + json_bool(cfg.enable_cloudsave) + ",\n")
+    b.write_str("  \"momentEnabled\": " + json_bool(cfg.enable_moment) + "\n")
+    b.write_str("}\n")
+    << b.to_string()
+}
+
+pub fn generate_android_manifest_snippet(cfg &TapTapAppConfig) string {
+    validate_config(cfg) or >>
+    $pkg_ref := "com.taptap"
+    if cfg.region == REGION_GLOBAL { pkg_ref = "com.taptap.global" }
+    $b := strings.new_byte_builder(768)
+    b.write_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n")
+    b.write_str("<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n")
+    b.write_str("          package=\"" + xml_escape(&cfg.package_name) + "\">\n")
+    b.write_str("  <queries>\n")
+    b.write_str("    <package android:name=\"" + pkg_ref + "\" />\n")
+    b.write_str("  </queries>\n")
+    b.write_str("  <application>\n")
+    b.write_str("    <meta-data android:name=\"com.taptap.sdk.client_id\" android:value=\"" + xml_escape(&cfg.client_id) + "\" />\n")
+    b.write_str("    <meta-data android:name=\"com.taptap.sdk.region\" android:value=\"" + str(cfg.region) + "\" />\n")
+    b.write_str("    <intent-filter>\n")
+    b.write_str("      <data android:scheme=\"tt" + xml_escape(&cfg.client_id) + "\" />\n")
+    b.write_str("    </intent-filter>\n")
+    b.write_str("  </application>\n")
+    b.write_str("</manifest>\n")
+    << b.to_string()
+}
+
+pub fn generate_ios_info_plist_snippet(cfg &TapTapAppConfig) string {
+    validate_config(cfg) or >>
+    $b := strings.new_byte_builder(768)
+    b.write_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+    b.write_str("<plist version=\"1.0\">\n<dict>\n")
+    b.write_str("  <key>CFBundleIdentifier</key>\n")
+    b.write_str("  <string>" + xml_escape(&cfg.package_name) + "</string>\n")
+    b.write_str("  <key>CFBundleURLTypes</key>\n  <array>\n    <dict>\n")
+    b.write_str("      <key>CFBundleURLName</key>\n      <string>taptap</string>\n")
+    b.write_str("      <key>CFBundleURLSchemes</key>\n      <array>\n")
+    b.write_str("        <string>tt" + xml_escape(&cfg.client_id) + "</string>\n")
+    b.write_str("      </array>\n    </dict>\n  </array>\n")
+    b.write_str("  <key>LSApplicationQueriesSchemes</key>\n  <array>\n")
+    b.write_str("    <string>tapiosdk</string>\n    <string>tapsdk</string>\n    <string>taptap</string>\n")
+    b.write_str("  </array>\n")
+    b.write_str("</dict>\n</plist>\n")
+    << b.to_string()
+}
+
+pub fn generate_pc_appid_txt(cfg &TapTapAppConfig) string {
+    validate_config(cfg) or >>
+    << cfg.client_id + "\n"
+}
