@@ -172,14 +172,20 @@ def verify_sha256sums(root: Path, expected_assets: list[str]) -> dict[str, dict[
         recorded[name.lstrip("*").strip()] = digest.lower()
     assert set(recorded) == set(expected_assets), f"SHA256SUMS set mismatch: {set(recorded)} != {set(expected_assets)}"
 
+    allowed_meta = {"SHA256SUMS", "RELEASE_MANIFEST.md", "RELEASE_NOTES.md"}
     receipt_assets: dict[str, dict[str, object]] = {}
     for path in sorted(root.iterdir()):
         assert path.is_file() and not path.is_symlink(), f"Unexpected entry in release dir: {path}"
         assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", path.name), f"Unsafe asset name: {path.name}"
         digest = sha256_file(path)
-        if path.name != "SHA256SUMS":
+        if path.name in recorded:
             assert recorded[path.name] == digest, f"SHA256SUMS mismatch for {path.name}"
+        else:
+            assert path.name in allowed_meta, f"Unlisted file in release dir: {path.name}"
         receipt_assets[path.name] = {"sha256": digest, "size": path.stat().st_size}
+    assert set(receipt_assets) == set(expected_assets) | allowed_meta, (
+        f"Release asset set mismatch: {set(receipt_assets)} != {set(expected_assets) | allowed_meta}"
+    )
     return receipt_assets
 
 
