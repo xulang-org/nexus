@@ -81,8 +81,14 @@ vec3 material_direct(vec3 base, float metallic, float roughness,
     vec3 f0 = mix(vec3(0.04), base, metallic);
     float factor = pow(1.0 - vh, 5.0);
     vec3 fresnel = f0 + (vec3(1.0) - f0) * factor;
+    // Fdez-Aguera analytical GGX multi-scattering energy compensation.
+    vec4 r_ms = roughness * vec4(-1.0, -0.0275, -0.572, 0.022) + vec4(1.0, 0.0425, 1.04, -0.04);
+    float a004 = min(r_ms.x * r_ms.x, exp2(-9.28 * nv)) * r_ms.x + r_ms.y;
+    vec2 ab_ms = vec2(-1.04, 1.04) * a004 + r_ms.zw;
+    float ess = clamp(ab_ms.x + ab_ms.y, 0.05, 1.0);
+    vec3 ms_comp = vec3(1.0) + f0 * (1.0 / ess - 1.0);
     vec3 diffuse = (vec3(1.0) - fresnel) * (1.0 - metallic) * base / 3.14159265359;
-    return (diffuse + distribution * visibility * fresnel) * radiance * nl;
+    return (diffuse + distribution * visibility * fresnel * ms_comp) * radiance * nl;
 }
 
 vec3 source_direct(vec3 base, float metallic, float roughness,
@@ -199,10 +205,50 @@ vec2 cascade_gradient(vec3 pt) {
     return vec2(-2.0 * n.x, 2.0 * n.y) / n.z;
 }
 
-float cascade_sample(vec3 pt, vec2 gradient, int layer, float bias, float texel, vec2 atlas_size, float raster_bias) {
+float pcss_fract(float x) { return x - floor(x); }
+float pcss_contact_hardened(vec2 uv, float receiver_z, vec2 gradient, float bias,
+    float texel, vec2 atlas_offset, vec2 atlas_size, float pcss_radius) {
+    vec2 cell = floor(uv / texel);
+    float ign = pcss_fract(52.9829189 * pcss_fract(dot(cell, vec2(0.06711056, 0.00583715))));
+    float ang = 6.2831853 * ign;
+    float search_r = pcss_radius * texel;
+    float blocker_sum = 0.0;
+    float blocker_count = 0.0;
+    for (int k = 0; k < 16; ++k) {
+        float r = sqrt((float(k) + 0.5) / 16.0);
+        float theta = float(k) * 2.39996323 + ang;
+        vec2 at = clamp(uv + vec2(cos(theta), sin(theta)) * (r * search_r), vec2(0.5 * texel), vec2(1.0 - 0.5 * texel));
+        vec2 atlas = (at + atlas_offset) / atlas_size;
+        float sample_d = textureLod(shadow_texture, atlas, 0.0).r;
+        if (sample_d > receiver_z + dot(gradient, at - uv) + bias) {
+            blocker_sum += sample_d;
+            blocker_count += 1.0;
+        }
+    }
+    if (blocker_count < 0.5) return 1.0;
+    float avg_blocker = blocker_sum / blocker_count;
+    float blocker_gap = max(0.0, avg_blocker - receiver_z);
+    float penumbra_texels = clamp(0.75 + blocker_gap * pcss_radius * 18.0, 0.75, pcss_radius * 2.5);
+    float filter_r = penumbra_texels * texel;
+    float vis = 0.0;
+    for (int k = 0; k < 16; ++k) {
+        float r = sqrt((float(k) + 0.5) / 16.0);
+        float theta = float(k) * 2.39996323 + ang;
+        vec2 at = uv + vec2(cos(theta), sin(theta)) * (r * filter_r);
+        if (at.x < 0.0 || at.x > 1.0 || at.y < 0.0 || at.y > 1.0) { vis += 1.0; continue; }
+        vec2 atlas = (at + atlas_offset) / atlas_size;
+        vis += (receiver_z + dot(gradient, at - uv) + bias >= textureLod(shadow_texture, atlas, 0.0).r) ? 1.0 : 0.0;
+    }
+    return vis / 16.0;
+}
+
+float cascade_sample(vec3 pt, vec2 gradient, int layer, float bias, float texel, vec2 atlas_size, float raster_bias, float pcss_radius) {
     if (pt.x < -1.0 || pt.x > 1.0 || pt.y < -1.0 || pt.y > 1.0 || pt.z < 0.0 || pt.z > 1.0) return 1.0;
     bias += max(abs(gradient.x), abs(gradient.y)) * texel * raster_bias;
     vec2 uv = vec2(pt.x * 0.5 + 0.5, 0.5 - pt.y * 0.5);
+    if (pcss_radius > 0.0001) {
+        return pcss_contact_hardened(uv, pt.z, gradient, bias, texel, vec2(float(layer % 2), float(layer / 2)), atlas_size, pcss_radius);
+    }
     float visible = 0.0, total = 0.0;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
@@ -237,11 +283,12 @@ float cascade_shadow_visibility(vec3 wpos, vec3 nrm) {
     if (layer == 1) { pt = p1; g = g1; range = s.ranges[1]; next_p = p2; next_g = g2; next_range = s.ranges[2]; }
     if (layer == 2) { pt = p2; g = g2; range = s.ranges[2]; next_p = p3; next_g = g3; next_range = s.ranges[3]; }
     if (layer == 3) { pt = p3; g = g3; range = s.ranges[3]; }
+    float pcss_radius = max(0.0, -s.gradient_scales.x);
     float bias = s.direction_bias.w + s.shadow_filter.y * (1.0 - max(0.0, dot(unit_safe(nrm), s.direction_bias.xyz)));
-    float current = cascade_sample(pt, g, layer, bias * range.w, s.shadow_filter.x, s.depth.zw, s.limits.w);
+    float current = cascade_sample(pt, g, layer, bias * range.w, s.shadow_filter.x, s.depth.zw, s.limits.w, pcss_radius);
     if (range.y > range.z && dist > range.z) {
         float next = 1.0;
-        if (float(layer + 1) < s.limits.z) next = cascade_sample(next_p, next_g, layer + 1, bias * next_range.w, s.shadow_filter.x, s.depth.zw, s.limits.w);
+        if (float(layer + 1) < s.limits.z) next = cascade_sample(next_p, next_g, layer + 1, bias * next_range.w, s.shadow_filter.x, s.depth.zw, s.limits.w, pcss_radius);
         float alpha = clamp((dist - range.z) / (range.y - range.z), 0.0, 1.0);
         alpha = alpha * alpha * (3.0 - 2.0 * alpha);
         current = mix(current, next, alpha);
@@ -261,6 +308,10 @@ float shadow_visibility(vec3 wpos, vec3 nrm) {
     vec3 toward_light = s.direction_bias.xyz;
     if (s.shadow_filter.w > 1.5) toward_light = unit_safe(s.direction_bias.xyz - wpos);
     float bias = s.direction_bias.w + s.shadow_filter.y * (1.0 - max(0.0, dot(unit_safe(nrm), toward_light)));
+    float pcss_radius = max(0.0, -s.gradient_scales.x);
+    if (pcss_radius > 0.0001) {
+        return pcss_contact_hardened(uv, pt.z, gradient, bias, s.shadow_filter.x, vec2(0.0), vec2(1.0), pcss_radius);
+    }
     float visibility = 0.0;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {

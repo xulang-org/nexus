@@ -67,6 +67,9 @@ make sdk
 - `make mikktspace-gpu-test`：验证 `resources/mesh/mikktspace.xu` 与 `integration/gltf_render`（镜像 UV 接缝拆分、对抗法线/共线退化兜底、`upload_model_with_mikktspace` 对无切线法线贴图 GLB 在 Metal GPU 上的正常着色）。
 - `make audio-async-music-test`：验证 `integration/audio_stream/async_pool.xu`（多协程后台解码池、乱序分块重排、`seek_frames` 代际屏障、48MB 大 WAV 寻址与无缝循环）及 `audio/mixer/music_director.xu`（拍/小节量化多轨 `MusicDirector` 与空间 `AmbientZoneMixer` 优先级闪避）。
 - `make physics2d-platformer-test`：验证 `physics2d/world2d.xu`（层级过滤射线检测、单向穿透平台、`Enter`/`Stay`/`Exit` 触发器生命周期，及包含土狼时间、跳跃缓存、松键变速跳与蹬墙滑/蹬墙跳的 `PlatformerController2D`）。
+- `make detail-optimizations-test`：验证五项底层质感深度优化（3D TAA Karis 亮度加权 YCoCg 方差裁剪 + Reverse-Z 深度膨胀 + IGN 蓝噪抖动去色带、2D 9-Tap 高斯半影 + Reinhard 压缩与 2D Blinn-Phong 高光 Metal/软件像素一致性、音频总线 Soft-Knee 限幅器/去非正规数/平滑斜坡、2D 移动平台同步与起跳动量继承/MTV/顶角挤压/微台阶抬升、MikkTSpace 散片顶点重合角自动焊接）。
+- `make detail-optimizations-r2-test`：验证第二轮细节增强（13-Tap Jimenez Karis Bloom 下采样、Reverse-Z 线性深度缩放 GTAO 双边滤波、IGN 抖动 SSR + 距离/迎角平滑淡出、Soft Two-Bone IK 渐近缓冲伸展与上肢扭转对齐、以及无序依赖 Crowd RVO 右行规避与卡死自动重寻路）。
+- `make detail-optimizations-r3-test`：验证第三轮引擎深水区能力（3D PBR 多重散射能量补偿、可选 PCSS 接触硬化软阴影、GPU/软件像素一致 2D 屏幕空间泛光与纯 CPU `Skeleton2D`/`SkinnedMesh2D` 2D 骨骼蒙皮变形、状态机惯性平滑过渡与步态相位同步组、`RigidBody3D` 6-DOF 四元数旋转/滚动摩擦扭矩与休眠唤醒、`WorldPartitionGrid` 滞回流式卸载与持久化迁移，以及弱网输入冗余窗口恢复与自适应 RTT/Jitter 缓冲）。
 
 ## Phone 原生 2D / 3D 示例
 

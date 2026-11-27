@@ -259,6 +259,7 @@ struct AnimState {
     param_y string
     looping bool
     speed f64
+    sync_group int
 }
 
 struct AnimTransition {
@@ -312,6 +313,16 @@ pub struct AnimationStateMachine {
     rm_root_node int
     rm_lock_xz bool
     rm_lock_y bool
+    inertial_enabled bool
+    inertial_half_life f64
+    inertial_active bool
+    inertial_elapsed f64
+    inertial_duration f64
+    has_last_pose bool
+    last_pose []gltf.NodeTrs
+    offset_pos []fm.Vec3
+    offset_rot []fm.Vec4
+    offset_scale []fm.Vec3
 }
 
 pub fn new_state_machine() AnimationStateMachine {
@@ -347,7 +358,17 @@ pub fn new_state_machine() AnimationStateMachine {
         rm_enabled: false,
         rm_root_node: 0,
         rm_lock_xz: true,
-        rm_lock_y: false
+        rm_lock_y: false,
+        inertial_enabled: false,
+        inertial_half_life: 0.12,
+        inertial_active: false,
+        inertial_elapsed: 0.0,
+        inertial_duration: 0.0,
+        has_last_pose: false,
+        last_pose: []gltf.NodeTrs{},
+        offset_pos: []fm.Vec3{},
+        offset_rot: []fm.Vec4{},
+        offset_scale: []fm.Vec3{}
     }
 }
 
@@ -364,7 +385,8 @@ pub fn (sm $&AnimationStateMachine) add_clip_state(name string, clip int, loopin
         param_x: "",
         param_y: "",
         looping: looping,
-        speed: speed
+        speed: speed,
+        sync_group: -1
     })
     id := sm.states.len - 1
     if sm.current_state < 0 { sm.current_state = id }
@@ -390,7 +412,8 @@ pub fn (sm $&AnimationStateMachine) add_blend_1d_state(
         param_x: param_name + "",
         param_y: "",
         looping: looping,
-        speed: speed
+        speed: speed,
+        sync_group: -1
     })
     id := sm.states.len - 1
     if sm.current_state < 0 { sm.current_state = id }
@@ -417,7 +440,8 @@ pub fn (sm $&AnimationStateMachine) add_blend_2d_state(
         param_x: param_x + "",
         param_y: param_y + "",
         looping: looping,
-        speed: speed
+        speed: speed,
+        sync_group: -1
     })
     id := sm.states.len - 1
     if sm.current_state < 0 { sm.current_state = id }
@@ -565,7 +589,45 @@ pub fn (sm &AnimationStateMachine) active_state() int {
 }
 
 pub fn (sm &AnimationStateMachine) is_blending() bool {
-    << sm.blending
+    << sm.blending || sm.inertial_active
+}
+
+pub fn (sm $&AnimationStateMachine) set_state_sync_group(state_id int, group_id int) int {
+    if state_id < 0 || state_id >= sm.states.len || group_id < -1 {
+        >> errors.new("nexus anim: invalid state_id or sync_group")
+    }
+    st := $&sm.states[state_id]
+    st.sync_group = group_id
+    << 0
+}
+
+pub fn (sm &AnimationStateMachine) state_sync_group(state_id int) int {
+    if state_id < 0 || state_id >= sm.states.len {
+        >> errors.new("nexus anim: state_id out of range")
+    }
+    << sm.states[state_id].sync_group
+}
+
+pub fn (sm &AnimationStateMachine) current_phase() f64 {
+    << sm.current_phase
+}
+
+pub fn (sm $&AnimationStateMachine) enable_inertialization(half_life f64) int {
+    if !fm.finite(half_life) || half_life < 0.005 || half_life > 2.0 {
+        >> errors.new("nexus anim: inertialization half_life must be in [0.005, 2.0]")
+    }
+    sm.inertial_enabled = true
+    sm.inertial_half_life = half_life
+    << 0
+}
+
+pub fn (sm $&AnimationStateMachine) disable_inertialization() {
+    sm.inertial_enabled = false
+    sm.inertial_active = false
+}
+
+pub fn (sm &AnimationStateMachine) is_inertializing() bool {
+    << sm.inertial_active
 }
 
 fn (sm &AnimationStateMachine) condition_met(c &TransitionCondition) bool {
@@ -651,8 +713,8 @@ pub fn (sm $&AnimationStateMachine) advance(asset &gltf.GlbGeometry, dt f64) Ani
         >> errors.new("nexus anim: invalid state machine advance")
     }
 
-    // 1. Evaluate transitions when not already mid-fade.
-    if !sm.blending {
+    // 1. Evaluate transitions (inertialization supports immediate interruption mid-transition).
+    if !sm.blending || sm.inertial_enabled {
         for ti in 0:sm.transitions.len {
             tr := &sm.transitions[ti]
             if tr.to_state == sm.current_state { -> }
@@ -671,19 +733,63 @@ pub fn (sm $&AnimationStateMachine) advance(asset &gltf.GlbGeometry, dt f64) Ani
                     sm.triggers[tr.conditions[ci].param + ""] = false
                 }
             }
-            if tr.fade_duration > 0.0 {
-                sm.prev_state = sm.current_state
+            old_sid := sm.current_state
+            new_sid := tr.to_state
+            old_sg := sm.states[old_sid].sync_group
+            new_sg := sm.states[new_sid].sync_group
+            $next_phase := 0.0
+            if old_sg >= 0 && old_sg == new_sg {
+                next_phase = sm.current_phase
+            }
+            if sm.inertial_enabled && tr.fade_duration > 0.0 && sm.has_last_pose {
+                sm.current_state = new_sid
+                sm.prev_state = -1
+                sm.current_phase = next_phase
+                sm.fade_elapsed = 0.0
+                sm.fade_duration = tr.fade_duration
+                sm.blending = false
+                target0 := sm.sample_state(asset, new_sid, next_phase) or >>
+                $op := []fm.Vec3{}
+                $or_q := []fm.Vec4{}
+                $os := []fm.Vec3{}
+                for j in 0:target0.len {
+                    if j < sm.last_pose.len {
+                        lp := &sm.last_pose[j]
+                        tp := &target0[j]
+                        op.push(lp.translation.sub(tp.translation))
+                        $dq := quat_norm(quat_mul(quat_conj(tp.rotation), lp.rotation)) or >>
+                        if dq.w < 0.0 {
+                            dq = fm.vec4(-dq.x, -dq.y, -dq.z, -dq.w)
+                        }
+                        or_q.push(dq)
+                        os.push(lp.scale.sub(tp.scale))
+                    } else {
+                        op.push(fm.vec3(0.0, 0.0, 0.0))
+                        or_q.push(quat_identity())
+                        os.push(fm.vec3(0.0, 0.0, 0.0))
+                    }
+                }
+                sm.offset_pos = op
+                sm.offset_rot = or_q
+                sm.offset_scale = os
+                sm.inertial_active = true
+                sm.inertial_elapsed = 0.0
+                sm.inertial_duration = math.max(tr.fade_duration, sm.inertial_half_life * 6.0)
+            } else if tr.fade_duration > 0.0 {
+                sm.prev_state = old_sid
                 sm.prev_phase = sm.current_phase
-                sm.current_state = tr.to_state
-                sm.current_phase = 0.0
+                sm.current_state = new_sid
+                sm.current_phase = next_phase
                 sm.fade_elapsed = 0.0
                 sm.fade_duration = tr.fade_duration
                 sm.blending = true
+                sm.inertial_active = false
             } else {
-                sm.current_state = tr.to_state
+                sm.current_state = new_sid
                 sm.prev_state = -1
-                sm.current_phase = 0.0
+                sm.current_phase = next_phase
                 sm.blending = false
+                sm.inertial_active = false
             }
             <-
         }
@@ -719,7 +825,7 @@ pub fn (sm $&AnimationStateMachine) advance(asset &gltf.GlbGeometry, dt f64) Ani
         }
     }
 
-    // 3. Evaluate pose & cross-fade.
+    // 3. Evaluate pose & cross-fade / inertialization.
     curr_pose := sm.sample_state(asset, curr_sid, new_phase) or >>
     $out_pose := []gltf.NodeTrs{}
     if sm.blending && sm.prev_state >= 0 {
@@ -728,6 +834,30 @@ pub fn (sm $&AnimationStateMachine) advance(asset &gltf.GlbGeometry, dt f64) Ani
     } else {
         for i in 0:curr_pose.len { out_pose.push(curr_pose[i]) }
     }
+    if sm.inertial_active {
+        sm.inertial_elapsed += dt
+        omega := 1.67834699 / math.max(0.005, sm.inertial_half_life)
+        x := omega * sm.inertial_elapsed
+        k := (1.0 + x) * math.exp(-x)
+        if sm.inertial_elapsed >= sm.inertial_duration || k <= 0.0005 {
+            sm.inertial_active = false
+            alpha = 1.0
+        } else {
+            alpha = clamp_f(1.0 - k, 0.0, 1.0)
+            for ji in 0:out_pose.len {
+                if ji >= sm.offset_pos.len { <- }
+                jnode := $&out_pose[ji]
+                jnode.translation = jnode.translation.add(sm.offset_pos[ji].scaled(k))
+                dq_k := quat_slerp(quat_identity(), sm.offset_rot[ji], k) or >>
+                jnode.rotation = quat_norm(quat_mul(jnode.rotation, dq_k)) or >>
+                jnode.scale = jnode.scale.add(sm.offset_scale[ji].scaled(k))
+            }
+        }
+    }
+    $saved_last := []gltf.NodeTrs{}
+    for i in 0:out_pose.len { saved_last.push(out_pose[i]) }
+    sm.last_pose = saved_last
+    sm.has_last_pose = out_pose.len > 0
 
     // 4. Optional root motion extraction (on active clip state).
     $rm := zero_root_motion()
@@ -774,7 +904,7 @@ pub fn (sm $&AnimationStateMachine) advance(asset &gltf.GlbGeometry, dt f64) Ani
         events: fired,
         root_motion: rm,
         active_state: sm.current_state,
-        blending: sm.blending,
+        blending: sm.blending || sm.inertial_active,
         blend_alpha: alpha
     }
 }

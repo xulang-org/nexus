@@ -11,6 +11,7 @@ struct Lighting2DUniform {
     float4 view_rect;        // xy=origin, zw=size
     float4 ambient_exposure; // xyz=ambient, w=exposure
     float4 counts_bias;      // x=light_count, y=occluder_count, z=shadow_bias, w=use_normal_map
+    float4 tuning;           // x=soft_tonemap, y=specular_strength
     float4 lights[128];      // 32 lights * 4 float4
     float4 occluders[128];   // 128 segments (ax, ay, bx, by)
 };
@@ -47,12 +48,13 @@ static inline float shadow_factor_2d(float2 light_pos, float2 world_pos, float s
     }
     float2 perp = float2(-delta.y / dist, delta.x / dist);
     float vis = 0.0;
-    const float offsets[5] = { -1.0, -0.5, 0.0, 0.5, 1.0 };
-    for (int k = 0; k < 5; ++k) {
+    const float offsets[9] = { -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0 };
+    const float weights[9] = { 0.0190, 0.0558, 0.1209, 0.1922, 0.2242, 0.1922, 0.1209, 0.0558, 0.0190 };
+    for (int k = 0; k < 9; ++k) {
         float2 tap = light_pos + perp * (offsets[k] * softness);
-        if (!seg_occluded_2d(tap, world_pos, u, occ_count, bias)) vis += 1.0;
+        if (!seg_occluded_2d(tap, world_pos, u, occ_count, bias)) vis += weights[k];
     }
-    return vis * 0.2;
+    return vis;
 }
 
 fragment float4 main0(
@@ -76,6 +78,8 @@ fragment float4 main0(
     float bias = u.counts_bias.z;
 
     float3 lit = u.ambient_exposure.xyz;
+    float spec_strength = u.tuning.y;
+    float3 view_dir = float3(0.0, 0.0, 1.0);
     for (int i = 0; i < 32 && i < lcount; ++i) {
         int b = i * 4;
         float4 d0 = u.lights[b + 0]; // px, py, height, kind
@@ -88,7 +92,12 @@ fragment float4 main0(
         if (kind == 2) {
             float3 l3 = normalize(float3(-d1.x, -d1.y, max(d0.z, 1.0) / 32.0));
             float ndotl = max(0.0, dot(normal, l3));
-            lit += d2.xyz * ndotl;
+            float term = ndotl;
+            if (spec_strength > 0.0 && ndotl > 0.0) {
+                float3 h = normalize(l3 + view_dir);
+                term += pow(max(dot(normal, h), 0.0), 24.0) * spec_strength;
+            }
+            lit += d2.xyz * term;
             continue;
         }
 
@@ -114,8 +123,17 @@ fragment float4 main0(
         if (d3.y > 0.5) {
             vis = shadow_factor_2d(d0.xy, world_pos, d3.z, u, ocount, bias);
         }
-        lit += d2.xyz * (atten * ndotl * vis);
+        float term = ndotl;
+        if (spec_strength > 0.0) {
+            float3 h = normalize(l3 + view_dir);
+            term += pow(max(dot(normal, h), 0.0), 24.0) * spec_strength;
+        }
+        lit += d2.xyz * (atten * term * vis);
     }
-    float3 final_rgb = clamp(albedo.rgb * lit * u.ambient_exposure.w, float3(0.0), float3(1.0));
+    float3 exposed = lit * u.ambient_exposure.w;
+    if (u.tuning.x > 0.5) {
+        exposed = exposed / (1.0 + max(exposed, float3(0.0)));
+    }
+    float3 final_rgb = clamp(albedo.rgb * exposed, float3(0.0), float3(1.0));
     return float4(final_rgb * input.color.rgb, albedo.a * input.color.a);
 }

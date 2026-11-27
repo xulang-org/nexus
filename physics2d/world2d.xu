@@ -16,6 +16,9 @@ pub const TRIGGER_EXIT = 3
 pub struct Collider2D {
     pub id int
     pub bounds fm.Rect2
+    pub prev_bounds fm.Rect2
+    pub frame_delta fm.Vec2
+    pub velocity fm.Vec2
     pub kind int
     pub layer int
     pub mask int
@@ -85,6 +88,9 @@ pub fn (w $&PhysicsWorld2D) add_collider(bounds fm.Rect2, kind int, layer int, m
     w.colliders.push(Collider2D{
         id: id,
         bounds: bounds,
+        prev_bounds: bounds,
+        frame_delta: fm.vec2(0.0, 0.0),
+        velocity: fm.vec2(0.0, 0.0),
         kind: kind,
         layer: layer,
         mask: mask,
@@ -108,8 +114,34 @@ pub fn (w $&PhysicsWorld2D) add_trigger(bounds fm.Rect2, layer int, mask int) in
 pub fn (w $&PhysicsWorld2D) set_collider_bounds(id int, bounds fm.Rect2) int {
     check_rect(bounds) or >>
     if id < 0 || id >= w.colliders.len { >> errors.new("nexus physics2d: invalid collider id") }
+    w.colliders[id].prev_bounds = bounds
     w.colliders[id].bounds = bounds
+    w.colliders[id].frame_delta = fm.vec2(0.0, 0.0)
+    w.colliders[id].velocity = fm.vec2(0.0, 0.0)
     << 0
+}
+
+pub fn (w $&PhysicsWorld2D) move_collider(id int, next_bounds fm.Rect2, dt f64) fm.Vec2 {
+    check_rect(next_bounds) or >>
+    if !fm.finite(dt) || dt <= 0.0 || dt > 1.0 {
+        >> errors.new("nexus physics2d: invalid dt for move_collider")
+    }
+    if id < 0 || id >= w.colliders.len { >> errors.new("nexus physics2d: invalid collider id") }
+    c := $&w.colliders[id]
+    delta := fm.vec2(next_bounds.position.x - c.bounds.position.x, next_bounds.position.y - c.bounds.position.y)
+    c.prev_bounds = c.bounds
+    c.bounds = next_bounds
+    c.frame_delta = delta
+    c.velocity = delta.scaled(1.0 / dt)
+    << delta
+}
+
+pub fn (w $&PhysicsWorld2D) clear_frame_deltas() {
+    for i in 0:w.colliders.len {
+        w.colliders[i].prev_bounds = w.colliders[i].bounds
+        w.colliders[i].frame_delta = fm.vec2(0.0, 0.0)
+        w.colliders[i].velocity = fm.vec2(0.0, 0.0)
+    }
 }
 
 pub fn (w $&PhysicsWorld2D) set_collider_enabled(id int, enabled bool) int {
@@ -121,7 +153,17 @@ pub fn (w $&PhysicsWorld2D) set_collider_enabled(id int, enabled bool) int {
 pub fn (w &PhysicsWorld2D) collider(id int) Collider2D {
     if id < 0 || id >= w.colliders.len { >> errors.new("nexus physics2d: invalid collider id") }
     c := &w.colliders[id]
-    << Collider2D{id: c.id, bounds: c.bounds, kind: c.kind, layer: c.layer, mask: c.mask, enabled: c.enabled}
+    << Collider2D{
+        id: c.id,
+        bounds: c.bounds,
+        prev_bounds: c.prev_bounds,
+        frame_delta: c.frame_delta,
+        velocity: c.velocity,
+        kind: c.kind,
+        layer: c.layer,
+        mask: c.mask,
+        enabled: c.enabled
+    }
 }
 
 fn rects_overlap_strict(a fm.Rect2, b fm.Rect2) bool {
@@ -369,6 +411,62 @@ pub fn (w $&PhysicsWorld2D) step_triggers(actor_id int, body fm.Rect2, mask int)
     << events
 }
 
+pub struct OverlapResolution2D {
+    pub bounds fm.Rect2
+    pub push fm.Vec2
+    pub resolved bool
+    pub iterations int
+}
+
+fn (w &PhysicsWorld2D) has_solid_overlap(query fm.Rect2, mask int) bool {
+    for c in w.colliders {
+        if !c.enabled || c.kind != COLLIDER_SOLID || !layer_matches(&c, mask) { -> }
+        if query.overlaps(c.bounds) { << true }
+    }
+    << false
+}
+
+pub fn (w &PhysicsWorld2D) resolve_overlaps(body fm.Rect2, mask int) OverlapResolution2D {
+    check_rect(body) or >>
+    $cur := body
+    $total_push := fm.vec2(0.0, 0.0)
+    $iters := 0
+    for _it in 0:4 {
+        $moved := false
+        for c in w.colliders {
+            if !c.enabled || c.kind != COLLIDER_SOLID || !layer_matches(&c, mask) { -> }
+            if !cur.overlaps(c.bounds) { -> }
+            b := c.bounds
+            ov_x := math.min(cur.position.x + cur.size.x, b.position.x + b.size.x) - math.max(cur.position.x, b.position.x)
+            ov_y := math.min(cur.position.y + cur.size.y, b.position.y + b.size.y) - math.max(cur.position.y, b.position.y)
+            if ov_x <= 0.0 || ov_y <= 0.0 { -> }
+            $dx := 0.0
+            $dy := 0.0
+            if ov_x <= ov_y {
+                cx := cur.position.x + cur.size.x * 0.5
+                bcx := b.position.x + b.size.x * 0.5
+                if cx < bcx { dx = -ov_x } else { dx = ov_x }
+            } else {
+                cy := cur.position.y + cur.size.y * 0.5
+                bcy := b.position.y + b.size.y * 0.5
+                if cy < bcy { dy = -ov_y } else { dy = ov_y }
+            }
+            cur = fm.rect2(cur.position.x + dx, cur.position.y + dy, cur.size.x, cur.size.y)
+            total_push = fm.vec2(total_push.x + dx, total_push.y + dy)
+            moved = true
+            iters += 1
+        }
+        if !moved { <- }
+    }
+    resolved := !w.has_solid_overlap(cur, mask)
+    << OverlapResolution2D{
+        bounds: cur,
+        push: total_push,
+        resolved: resolved,
+        iterations: iters
+    }
+}
+
 pub struct PlatformerConfig2D {
     pub move_speed f64
     pub ground_accel f64
@@ -384,6 +482,9 @@ pub struct PlatformerConfig2D {
     pub wall_jump_vy f64
     pub wall_jump_lock_time f64
     pub one_way_drop_time f64
+    pub corner_correction_px f64
+    pub step_up_px f64
+    pub platform_momentum_factor f64
 }
 
 pub fn default_platformer_config_2d() PlatformerConfig2D {
@@ -401,7 +502,10 @@ pub fn default_platformer_config_2d() PlatformerConfig2D {
         wall_jump_vx: 240.0,
         wall_jump_vy: 400.0,
         wall_jump_lock_time: 0.14,
-        one_way_drop_time: 0.16
+        one_way_drop_time: 0.16,
+        corner_correction_px: 5.0,
+        step_up_px: 4.0,
+        platform_momentum_factor: 0.5
     }
 }
 
@@ -427,6 +531,9 @@ pub struct PlatformerController2D {
     pub jump_cut_done bool
     pub jumped_from_coyote bool
     pub wall_jumps int
+    pub floor_collider_id int
+    pub corner_corrections int
+    pub step_ups int
 }
 
 pub fn new_platformer_controller_2d(bounds fm.Rect2, cfg PlatformerConfig2D) PlatformerController2D {
@@ -445,7 +552,10 @@ pub fn new_platformer_controller_2d(bounds fm.Rect2, cfg PlatformerConfig2D) Pla
         drop_timer: 0.0,
         jump_cut_done: false,
         jumped_from_coyote: false,
-        wall_jumps: 0
+        wall_jumps: 0,
+        floor_collider_id: -1,
+        corner_corrections: 0,
+        step_ups: 0
     }
 }
 
@@ -467,6 +577,27 @@ pub fn (ctrl $&PlatformerController2D) step(world &PhysicsWorld2D, mask int, inp
     $move_x := input.move_x
     if move_x < -1.0 { move_x = -1.0 }
     if move_x > 1.0 { move_x = 1.0 }
+
+    was_on_floor := ctrl.on_floor
+    $floor_vel := fm.vec2(0.0, 0.0)
+    if was_on_floor && ctrl.floor_collider_id >= 0 && ctrl.floor_collider_id < world.colliders.len {
+        fc := world.collider(ctrl.floor_collider_id) or >>
+        floor_vel = fc.velocity
+        if fc.enabled && (math.abs(fc.frame_delta.x) > 0.0 || math.abs(fc.frame_delta.y) > 0.0) {
+            // If vertical platform rises into the rider, depenetrate vertically first, then carry horizontally.
+            if world.has_solid_overlap(ctrl.bounds, mask) {
+                mtv := world.resolve_overlaps(ctrl.bounds, mask) or >>
+                ctrl.bounds = mtv.bounds
+                if math.abs(fc.frame_delta.x) > 0.0 {
+                    carry_x := world.move_and_slide_world_opts(ctrl.bounds, fm.vec2(fc.frame_delta.x, 0.0), mask, false) or >>
+                    ctrl.bounds = carry_x.bounds
+                }
+            } else {
+                carry := world.move_and_slide_world_opts(ctrl.bounds, fc.frame_delta, mask, false) or >>
+                ctrl.bounds = carry.bounds
+            }
+        }
+    }
 
     if ctrl.on_floor {
         ctrl.coyote_timer = ctrl.config.coyote_time
@@ -509,7 +640,8 @@ pub fn (ctrl $&PlatformerController2D) step(world &PhysicsWorld2D, mask int, inp
     if ctrl.jump_buffer_timer > 0.0 {
         if ctrl.on_floor || ctrl.coyote_timer > 0.0 {
             if !ctrl.on_floor && ctrl.coyote_timer > 0.0 { ctrl.jumped_from_coyote = true }
-            ctrl.velocity.y = -ctrl.config.jump_velocity
+            ctrl.velocity.y = -ctrl.config.jump_velocity + math.min(0.0, floor_vel.y * ctrl.config.platform_momentum_factor)
+            ctrl.velocity.x += floor_vel.x * ctrl.config.platform_momentum_factor
             ctrl.on_floor = false
             ctrl.coyote_timer = 0.0
             ctrl.jump_buffer_timer = 0.0
@@ -538,11 +670,65 @@ pub fn (ctrl $&PlatformerController2D) step(world &PhysicsWorld2D, mask int, inp
         ctrl.velocity.y = ctrl.config.max_fall_speed
     }
 
-    res := world.move_and_slide_world_opts(ctrl.bounds, ctrl.velocity.scaled(dt), mask, ctrl.drop_timer > 0.0) or >>
+    pre_step_bounds := ctrl.bounds
+    pre_move_vx := ctrl.velocity.x
+    pre_move_vy := ctrl.velocity.y
+    intended_motion := ctrl.velocity.scaled(dt)
+    $res := world.move_and_slide_world_opts(ctrl.bounds, intended_motion, mask, ctrl.drop_timer > 0.0) or >>
+
+    // Ascending corner squeeze: nudge past small ceiling overlaps and preserve upward velocity.
+    if !was_on_floor && res.ceiling && pre_move_vy < 0.0 && ctrl.config.corner_correction_px >= 1.0 {
+        max_nudge := int(math.floor(ctrl.config.corner_correction_px))
+        $corrected := false
+        $step := 1
+        while step <= max_nudge && !corrected {
+            for sign_dir in [-1.0, 1.0] {
+                dx := f64(step) * sign_dir
+                shifted := fm.rect2(pre_step_bounds.position.x + dx, pre_step_bounds.position.y, pre_step_bounds.size.x, pre_step_bounds.size.y)
+                if !world.has_solid_overlap(shifted, mask) {
+                    cand := world.move_and_slide_world_opts(shifted, fm.vec2(0.0, intended_motion.y), mask, ctrl.drop_timer > 0.0) or >>
+                    if !cand.ceiling {
+                        res = cand
+                        corrected = true
+                        ctrl.corner_corrections += 1
+                        <-
+                    }
+                }
+            }
+            step += 1
+        }
+        if corrected {
+            ctrl.velocity.y = pre_move_vy
+        }
+    }
+
+    // Grounded micro step-up over small curbs/stairs when walking into a low wall.
+    if was_on_floor && (res.wall_left || res.wall_right) && math.abs(move_x) > 0.1 && ctrl.config.step_up_px >= 1.0 {
+        max_step := int(math.floor(ctrl.config.step_up_px))
+        $step := 1
+        while step <= max_step {
+            lifted := fm.rect2(pre_step_bounds.position.x, pre_step_bounds.position.y - f64(step), pre_step_bounds.size.x, pre_step_bounds.size.y)
+            if !world.has_solid_overlap(lifted, mask) {
+                fwd := world.move_and_slide_world_opts(lifted, fm.vec2(intended_motion.x, 0.0), mask, false) or >>
+                if !fwd.wall_left && !fwd.wall_right {
+                    down := world.move_and_slide_world_opts(fwd.bounds, fm.vec2(0.0, f64(step) + 0.5), mask, false) or >>
+                    if down.floor {
+                        res = down
+                        ctrl.velocity.x = pre_move_vx
+                        ctrl.step_ups += 1
+                        <-
+                    }
+                }
+            }
+            step += 1
+        }
+    }
+
     ctrl.bounds = res.bounds
     ctrl.on_floor = res.floor
     ctrl.on_wall_left = res.wall_left
     ctrl.on_wall_right = res.wall_right
+    ctrl.floor_collider_id = res.floor_collider_id
 
     if res.floor && ctrl.velocity.y > 0.0 { ctrl.velocity.y = 0.0 }
     if res.ceiling && ctrl.velocity.y < 0.0 { ctrl.velocity.y = 0.0 }

@@ -20,6 +20,10 @@ pub struct RigidBody3D {
     pub kind int
     pub position fm.Vec3
     pub velocity fm.Vec3
+    pub orientation fm.Vec4
+    pub angular_velocity fm.Vec3
+    pub inverse_inertia fm.Vec3
+    pub angular_damping f64
     pub radius f64
     pub half_extents fm.Vec3
     pub inverse_mass f64
@@ -123,11 +127,77 @@ fn body_min_extent(body RigidBody3D) f64 {
     << math.min(body.half_extents.x, math.min(body.half_extents.y, body.half_extents.z))
 }
 
+fn quat_identity_3d() fm.Vec4 { << fm.vec4(0.0, 0.0, 0.0, 1.0) }
+
+fn quat_normalize_3d(q fm.Vec4) fm.Vec4 {
+    len2 := q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w
+    if !fm.finite(len2) || len2 <= 1e-12 { << quat_identity_3d() }
+    inv := 1.0 / math.sqrt(len2)
+    << fm.vec4(q.x * inv, q.y * inv, q.z * inv, q.w * inv)
+}
+
+fn quat_mul_3d(a fm.Vec4, b fm.Vec4) fm.Vec4 {
+    << fm.vec4(
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+    )
+}
+
+fn quat_rotate_3d(q fm.Vec4, v fm.Vec3) fm.Vec3 {
+    qv := fm.vec3(q.x, q.y, q.z)
+    t := qv.cross(v).scaled(2.0)
+    << v.add(t.scaled(q.w)).add(qv.cross(t))
+}
+
+fn quat_inv_rotate_3d(q fm.Vec4, v fm.Vec3) fm.Vec3 {
+    << quat_rotate_3d(fm.vec4(-q.x, -q.y, -q.z, q.w), v)
+}
+
+fn quat_integrate_3d(q fm.Vec4, omega fm.Vec3, dt f64) fm.Vec4 {
+    w_len := omega.length()
+    angle := w_len * dt
+    if !fm.finite(angle) || angle <= 1e-12 { << q }
+    axis := omega.scaled(1.0 / w_len)
+    half := angle * 0.5
+    s := math.sin(half)
+    dq := fm.vec4(axis.x * s, axis.y * s, axis.z * s, math.cos(half))
+    << quat_normalize_3d(quat_mul_3d(dq, q))
+}
+
+fn world_inv_inertia_mul(body RigidBody3D, v fm.Vec3) fm.Vec3 {
+    local := quat_inv_rotate_3d(body.orientation, v)
+    scaled := fm.vec3(
+        local.x * body.inverse_inertia.x,
+        local.y * body.inverse_inertia.y,
+        local.z * body.inverse_inertia.z
+    )
+    << quat_rotate_3d(body.orientation, scaled)
+}
+
+pub fn (body RigidBody3D) transform_matrix() fm.Mat4 {
+    c0 := quat_rotate_3d(body.orientation, fm.vec3(1.0, 0.0, 0.0))
+    c1 := quat_rotate_3d(body.orientation, fm.vec3(0.0, 1.0, 0.0))
+    c2 := quat_rotate_3d(body.orientation, fm.vec3(0.0, 0.0, 1.0))
+    << fm.Mat4{
+        c0: fm.vec4(c0.x, c0.y, c0.z, 0.0),
+        c1: fm.vec4(c1.x, c1.y, c1.z, 0.0),
+        c2: fm.vec4(c2.x, c2.y, c2.z, 0.0),
+        c3: fm.vec4(body.position.x, body.position.y, body.position.z, 1.0)
+    }
+}
+
 pub fn (body RigidBody3D) is_dynamic() bool { << body.inverse_mass > 0.0 }
 
 pub fn (body RigidBody3D) kinetic_energy() f64 {
     if body.inverse_mass <= 0.0 { << 0.0 }
-    << 0.5 * (1.0 / body.inverse_mass) * body.velocity.dot(body.velocity)
+    $ke := 0.5 * (1.0 / body.inverse_mass) * body.velocity.dot(body.velocity)
+    wl := quat_inv_rotate_3d(body.orientation, body.angular_velocity)
+    if body.inverse_inertia.x > 0.0 { ke += 0.5 * (1.0 / body.inverse_inertia.x) * wl.x * wl.x }
+    if body.inverse_inertia.y > 0.0 { ke += 0.5 * (1.0 / body.inverse_inertia.y) * wl.y * wl.y }
+    if body.inverse_inertia.z > 0.0 { ke += 0.5 * (1.0 / body.inverse_inertia.z) * wl.z * wl.z }
+    << ke
 }
 
 pub fn (body RigidBody3D) validate() int {
@@ -136,6 +206,21 @@ pub fn (body RigidBody3D) validate() int {
     }
     if !valid_point(body.position) || !valid_point(body.velocity) {
         >> errors.new("nexus physics3d: rigid body position or velocity out of bounds")
+    }
+    if !fm.finite(body.orientation.x) || !fm.finite(body.orientation.y) ||
+        !fm.finite(body.orientation.z) || !fm.finite(body.orientation.w) {
+        >> errors.new("nexus physics3d: non-finite rigid body orientation quaternion")
+    }
+    qlen2 := body.orientation.x * body.orientation.x + body.orientation.y * body.orientation.y +
+        body.orientation.z * body.orientation.z + body.orientation.w * body.orientation.w
+    if qlen2 < 0.81 || qlen2 > 1.21 {
+        >> errors.new("nexus physics3d: rigid body orientation quaternion must be near unit length")
+    }
+    if !body.angular_velocity.is_finite() || body.angular_velocity.length() > 1000.0 ||
+        !body.inverse_inertia.is_finite() || body.inverse_inertia.x < 0.0 ||
+        body.inverse_inertia.y < 0.0 || body.inverse_inertia.z < 0.0 ||
+        !fm.finite(body.angular_damping) || body.angular_damping < 0.0 || body.angular_damping > 10.0 {
+        >> errors.new("nexus physics3d: invalid rigid body angular dynamics parameters")
     }
     if body.kind == SHAPE_SPHERE {
         if !fm.finite(body.radius) || body.radius < 0.0001 {
@@ -170,8 +255,11 @@ pub fn dynamic_sphere_3d(position fm.Vec3, radius f64, mass f64, restitution f64
     if !fm.finite(mass) || mass < 0.0001 || mass > 1000000.0 {
         >> errors.new("nexus physics3d: dynamic rigid body requires mass in [0.0001, 1000000]")
     }
-    body := RigidBody3D{kind: SHAPE_SPHERE, position: position, velocity: zero(), radius: radius,
-        half_extents: fm.vec3(radius, radius, radius), inverse_mass: 1.0 / mass,
+    inv_i := 2.5 / math.max(mass * radius * radius, 1e-12)
+    body := RigidBody3D{kind: SHAPE_SPHERE, position: position, velocity: zero(),
+        orientation: quat_identity_3d(), angular_velocity: zero(),
+        inverse_inertia: fm.vec3(inv_i, inv_i, inv_i), angular_damping: 0.04,
+        radius: radius, half_extents: fm.vec3(radius, radius, radius), inverse_mass: 1.0 / mass,
         restitution: restitution, friction: friction, linear_damping: 0.02,
         layer: 1, mask: 0x7fffffff, sleeping: false, sleep_timer: 0.0,
         grounded: false, contacts: 0, last_normal: zero()}
@@ -183,8 +271,17 @@ pub fn dynamic_box_3d(position fm.Vec3, half_extents fm.Vec3, mass f64, restitut
     if !fm.finite(mass) || mass < 0.0001 || mass > 1000000.0 {
         >> errors.new("nexus physics3d: dynamic rigid body requires mass in [0.0001, 1000000]")
     }
-    body := RigidBody3D{kind: SHAPE_BOX, position: position, velocity: zero(), radius: half_extents.length(),
-        half_extents: half_extents, inverse_mass: 1.0 / mass,
+    hx := half_extents.x
+    hy := half_extents.y
+    hz := half_extents.z
+    ix := (1.0 / 3.0) * mass * (hy * hy + hz * hz)
+    iy := (1.0 / 3.0) * mass * (hx * hx + hz * hz)
+    iz := (1.0 / 3.0) * mass * (hx * hx + hy * hy)
+    inv_inertia := fm.vec3(1.0 / math.max(ix, 1e-12), 1.0 / math.max(iy, 1e-12), 1.0 / math.max(iz, 1e-12))
+    body := RigidBody3D{kind: SHAPE_BOX, position: position, velocity: zero(),
+        orientation: quat_identity_3d(), angular_velocity: zero(),
+        inverse_inertia: inv_inertia, angular_damping: 0.04,
+        radius: half_extents.length(), half_extents: half_extents, inverse_mass: 1.0 / mass,
         restitution: restitution, friction: friction, linear_damping: 0.02,
         layer: 1, mask: 0x7fffffff, sleeping: false, sleep_timer: 0.0,
         grounded: false, contacts: 0, last_normal: zero()}
@@ -193,8 +290,10 @@ pub fn dynamic_box_3d(position fm.Vec3, half_extents fm.Vec3, mass f64, restitut
 }
 
 pub fn kinematic_sphere_3d(position fm.Vec3, radius f64, layer int) RigidBody3D {
-    body := RigidBody3D{kind: SHAPE_SPHERE, position: position, velocity: zero(), radius: radius,
-        half_extents: fm.vec3(radius, radius, radius), inverse_mass: 0.0,
+    body := RigidBody3D{kind: SHAPE_SPHERE, position: position, velocity: zero(),
+        orientation: quat_identity_3d(), angular_velocity: zero(),
+        inverse_inertia: zero(), angular_damping: 0.0,
+        radius: radius, half_extents: fm.vec3(radius, radius, radius), inverse_mass: 0.0,
         restitution: 0.0, friction: 0.5, linear_damping: 0.0,
         layer: layer, mask: 0x7fffffff, sleeping: false, sleep_timer: 0.0,
         grounded: false, contacts: 0, last_normal: zero()}
@@ -203,8 +302,10 @@ pub fn kinematic_sphere_3d(position fm.Vec3, radius f64, layer int) RigidBody3D 
 }
 
 pub fn kinematic_box_3d(position fm.Vec3, half_extents fm.Vec3, layer int) RigidBody3D {
-    body := RigidBody3D{kind: SHAPE_BOX, position: position, velocity: zero(), radius: half_extents.length(),
-        half_extents: half_extents, inverse_mass: 0.0,
+    body := RigidBody3D{kind: SHAPE_BOX, position: position, velocity: zero(),
+        orientation: quat_identity_3d(), angular_velocity: zero(),
+        inverse_inertia: zero(), angular_damping: 0.0,
+        radius: half_extents.length(), half_extents: half_extents, inverse_mass: 0.0,
         restitution: 0.0, friction: 0.5, linear_damping: 0.0,
         layer: layer, mask: 0x7fffffff, sleeping: false, sleep_timer: 0.0,
         grounded: false, contacts: 0, last_normal: zero()}
@@ -321,6 +422,50 @@ pub fn (world $&RigidWorld3D) apply_impulse(index int, impulse fm.Vec3) int {
     next_v := world.bodies[index].velocity.add(impulse.scaled(world.bodies[index].inverse_mass))
     if !valid_point(next_v) { >> errors.new("nexus physics3d: impulse exceeded world velocity bounds") }
     world.bodies[index].velocity = next_v
+    if impulse.dot(impulse) > 0.0 { world.wake_island(index) }
+    << 0
+}
+
+pub fn (world $&RigidWorld3D) set_angular_velocity(index int, omega fm.Vec3) int {
+    world.check_body_index(index) or >>
+    if !omega.is_finite() || omega.length() > 1000.0 {
+        >> errors.new("nexus physics3d: invalid angular velocity")
+    }
+    world.bodies[index].angular_velocity = omega
+    if omega.dot(omega) > 0.0 { world.wake_island(index) }
+    << 0
+}
+
+pub fn (world $&RigidWorld3D) apply_torque_impulse(index int, torque_impulse fm.Vec3) int {
+    world.check_body_index(index) or >>
+    if !valid_point(torque_impulse) { >> errors.new("nexus physics3d: invalid torque impulse vector") }
+    if world.bodies[index].inverse_mass <= 0.0 { << 0 }
+    delta_w := world_inv_inertia_mul(world.bodies[index], torque_impulse)
+    next_w := world.bodies[index].angular_velocity.add(delta_w)
+    if !next_w.is_finite() || next_w.length() > 1000.0 {
+        >> errors.new("nexus physics3d: torque impulse exceeded angular velocity bounds")
+    }
+    world.bodies[index].angular_velocity = next_w
+    if torque_impulse.dot(torque_impulse) > 0.0 { world.wake_island(index) }
+    << 0
+}
+
+pub fn (world $&RigidWorld3D) apply_impulse_at_point(index int, impulse fm.Vec3, world_point fm.Vec3) int {
+    world.check_body_index(index) or >>
+    if !valid_point(impulse) || !valid_point(world_point) {
+        >> errors.new("nexus physics3d: invalid off-center impulse or world point")
+    }
+    if world.bodies[index].inverse_mass <= 0.0 { << 0 }
+    next_v := world.bodies[index].velocity.add(impulse.scaled(world.bodies[index].inverse_mass))
+    if !valid_point(next_v) { >> errors.new("nexus physics3d: impulse exceeded world velocity bounds") }
+    r := world_point.sub(world.bodies[index].position)
+    delta_w := world_inv_inertia_mul(world.bodies[index], r.cross(impulse))
+    next_w := world.bodies[index].angular_velocity.add(delta_w)
+    if !next_w.is_finite() || next_w.length() > 1000.0 {
+        >> errors.new("nexus physics3d: off-center impulse exceeded angular velocity bounds")
+    }
+    world.bodies[index].velocity = next_v
+    world.bodies[index].angular_velocity = next_w
     if impulse.dot(impulse) > 0.0 { world.wake_island(index) }
     << 0
 }
@@ -715,6 +860,9 @@ pub fn (world $&RigidWorld3D) step(dt f64, substeps int, iterations int) RigidSt
             body.velocity = body.velocity.add(world.gravity.scaled(sub_dt))
             damp := math.max(0.0, 1.0 - body.linear_damping * sub_dt)
             body.velocity = body.velocity.scaled(damp)
+            adamp := math.max(0.0, 1.0 - body.angular_damping * sub_dt)
+            body.angular_velocity = body.angular_velocity.scaled(adamp)
+            body.orientation = quat_integrate_3d(body.orientation, body.angular_velocity, sub_dt)
             min_ext := body_min_extent(body)
             $rem_dt := sub_dt
             for ccd_pass in 0:2 {
@@ -778,7 +926,9 @@ pub fn (world $&RigidWorld3D) step(dt f64, substeps int, iterations int) RigidSt
             if (a.layer & b.mask) == 0 || (b.layer & a.mask) == 0 { -> }
             kinematic_push := (!a.is_dynamic() && a.velocity.dot(a.velocity) > 0.0) ||
                 (!b.is_dynamic() && b.velocity.dot(b.velocity) > 0.0)
-            if (kinematic_push || a.velocity.sub(b.velocity).length() > wake_speed()) && body_vs_body(a, b).hit {
+            rel_wake := a.velocity.sub(b.velocity).length() > wake_speed() ||
+                a.angular_velocity.length() > wake_speed() || b.angular_velocity.length() > wake_speed()
+            if (kinematic_push || rel_wake) && body_vs_body(a, b).hit {
                 if a.sleeping { world.wake_island(i) }
                 if b.sleeping { world.wake_island(j) }
             }
@@ -898,13 +1048,29 @@ pub fn (world $&RigidWorld3D) step(dt f64, substeps int, iterations int) RigidSt
                     vel_b = world.bodies[ib].velocity
                 }
 
-                // Isotropic 3D Coulomb friction cone impulse.
-                rv2 := world.bodies[ia].velocity.sub(vel_b)
+                // Isotropic 3D Coulomb friction cone impulse with sphere rolling torque coupling.
+                has_rot_a := world.bodies[ia].kind == SHAPE_SPHERE && inv_a > 0.0
+                has_rot_b := ib >= 0 && world.bodies[ib].kind == SHAPE_SPHERE && inv_b > 0.0
+                ra := c.normal.scaled(-world.bodies[ia].radius)
+                $rb := zero()
+                if ib >= 0 { rb = c.normal.scaled(world.bodies[ib].radius) }
+                $va_c := world.bodies[ia].velocity
+                if has_rot_a { va_c = va_c.add(world.bodies[ia].angular_velocity.cross(ra)) }
+                $vb_c := vel_b
+                if has_rot_b { vb_c = vb_c.add(world.bodies[ib].angular_velocity.cross(rb)) }
+                rv2 := va_c.sub(vb_c)
                 vt := rv2.sub(c.normal.scaled(rv2.dot(c.normal)))
                 vt_len := vt.length()
                 if vt_len > 0.0000001 && c.friction > 0.0 {
                     t_dir := vt.scaled(1.0 / vt_len)
-                    djt := -vt_len / inv_sum
+                    $k_t := inv_a + inv_b
+                    if has_rot_a {
+                        k_t += world_inv_inertia_mul(world.bodies[ia], ra.cross(t_dir)).cross(ra).dot(t_dir)
+                    }
+                    if has_rot_b {
+                        k_t += world_inv_inertia_mul(world.bodies[ib], rb.cross(t_dir)).cross(rb).dot(t_dir)
+                    }
+                    djt := -vt_len / math.max(k_t, 1e-12)
                     $new_ti := c.tangent_impulse.add(t_dir.scaled(djt))
                     max_f := c.friction * c.normal_impulse
                     ti_len := new_ti.length()
@@ -914,8 +1080,16 @@ pub fn (world $&RigidWorld3D) step(dt f64, substeps int, iterations int) RigidSt
                     delta_ti := new_ti.sub(c.tangent_impulse)
                     c.tangent_impulse = new_ti
                     world.bodies[ia].velocity = world.bodies[ia].velocity.add(delta_ti.scaled(inv_a))
+                    if has_rot_a {
+                        world.bodies[ia].angular_velocity = world.bodies[ia].angular_velocity.add(
+                            world_inv_inertia_mul(world.bodies[ia], ra.cross(delta_ti)))
+                    }
                     if ib >= 0 {
                         world.bodies[ib].velocity = world.bodies[ib].velocity.sub(delta_ti.scaled(inv_b))
+                        if has_rot_b {
+                            world.bodies[ib].angular_velocity = world.bodies[ib].angular_velocity.sub(
+                                world_inv_inertia_mul(world.bodies[ib], rb.cross(delta_ti)))
+                        }
                     }
                 }
                 contacts[ci] = c
@@ -947,11 +1121,13 @@ pub fn (world $&RigidWorld3D) step(dt f64, substeps int, iterations int) RigidSt
             if !body.is_dynamic() { -> }
             if !body.sleeping {
                 speed2 := body.velocity.dot(body.velocity)
-                if body.contacts > 0 && speed2 < sleep_speed_sq() {
+                ang2 := body.angular_velocity.dot(body.angular_velocity)
+                if body.contacts > 0 && speed2 < sleep_speed_sq() && ang2 < 0.0064 {
                     body.sleep_timer += sub_dt
                     if body.sleep_timer >= sleep_time_limit() {
                         body.sleeping = true
                         body.velocity = zero()
+                        body.angular_velocity = zero()
                     }
                 } else {
                     body.sleep_timer = 0.0

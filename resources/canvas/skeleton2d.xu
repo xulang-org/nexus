@@ -1,0 +1,224 @@
+@"github.com/xulang-org/nexus/resources/canvas"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+
+pub struct Bone2D {
+    pub name string
+    pub parent int
+    pub rest_position fm.Vec2
+    pub rest_rotation f64
+    pub rest_scale fm.Vec2
+    pub length f64
+}
+
+pub struct BonePose2D {
+    pub position fm.Vec2
+    pub rotation f64
+    pub scale fm.Vec2
+}
+
+pub struct Skeleton2D {
+    bones []Bone2D
+    inv_bind []fm.Transform2D
+}
+
+pub fn new_skeleton_2d() Skeleton2D {
+    << Skeleton2D{bones: []Bone2D{}, inv_bind: []fm.Transform2D{}}
+}
+
+pub fn (sk $&Skeleton2D) add_bone(name string, parent int, rest_pos fm.Vec2, rest_rot f64, length f64) int {
+    if name.len == 0 || name.len > 64 || parent < -1 || parent >= sk.bones.len {
+        >> errors.new("nexus canvas: invalid 2D bone name or parent index")
+    }
+    if !fm.finite(rest_pos.x) || !fm.finite(rest_pos.y) || !fm.finite(rest_rot) ||
+        !fm.finite(length) || length < 0.0 {
+        >> errors.new("nexus canvas: non-finite 2D bone rest transform or length")
+    }
+    local_xf := fm.transform_2d(rest_pos, rest_rot, fm.vec2(1.0, 1.0))
+    $world_xf := local_xf
+    if parent >= 0 {
+        parent_inv := sk.inv_bind[parent]
+        parent_world := parent_inv.inverse() or >>
+        world_xf = parent_world.multiply(local_xf)
+    }
+    inv := world_xf.inverse() or >>
+    sk.bones.push(Bone2D{
+        name: name + "",
+        parent: parent,
+        rest_position: rest_pos,
+        rest_rotation: rest_rot,
+        rest_scale: fm.vec2(1.0, 1.0),
+        length: length
+    })
+    sk.inv_bind.push(inv)
+    << sk.bones.len - 1
+}
+
+pub fn (sk &Skeleton2D) bone_count() int {
+    << sk.bones.len
+}
+
+pub fn (sk &Skeleton2D) default_pose() []BonePose2D {
+    $pose := []BonePose2D{}
+    for i in 0:sk.bones.len {
+        b := &sk.bones[i]
+        pose.push(BonePose2D{
+            position: b.rest_position,
+            rotation: b.rest_rotation,
+            scale: b.rest_scale
+        })
+    }
+    << pose
+}
+
+pub fn (sk &Skeleton2D) bone_world_transforms(pose &[]BonePose2D, root_transform fm.Transform2D) []fm.Transform2D {
+    if sk.bones.len == 0 || pose.len != sk.bones.len {
+        >> errors.new("nexus canvas: 2D skeleton pose length mismatch")
+    }
+    if !root_transform.is_finite() {
+        >> errors.new("nexus canvas: non-finite 2D skeleton root transform")
+    }
+    $worlds := []fm.Transform2D{}
+    for i in 0:sk.bones.len {
+        p := &pose[i]
+        if !fm.finite(p.position.x) || !fm.finite(p.position.y) || !fm.finite(p.rotation) ||
+            !fm.finite(p.scale.x) || !fm.finite(p.scale.y) {
+            >> errors.new("nexus canvas: non-finite 2D bone pose")
+        }
+        local_xf := fm.transform_2d(p.position, p.rotation, p.scale)
+        parent := sk.bones[i].parent
+        if parent < 0 {
+            worlds.push(root_transform.multiply(local_xf))
+        } else {
+            worlds.push(worlds[parent].multiply(local_xf))
+        }
+    }
+    << worlds
+}
+
+pub fn (sk &Skeleton2D) compute_skin_matrices(pose &[]BonePose2D, root_transform fm.Transform2D) []fm.Transform2D {
+    worlds := sk.bone_world_transforms(pose, root_transform) or >>
+    $mats := []fm.Transform2D{}
+    for i in 0:worlds.len {
+        mats.push(worlds[i].multiply(sk.inv_bind[i]))
+    }
+    << mats
+}
+
+pub struct SkinVertex2D {
+    pub position fm.Vec2
+    pub uv fm.Vec2
+    pub color int
+    pub bone0 int
+    pub bone1 int
+    pub weight0 f64
+    pub weight1 f64
+}
+
+pub struct SkinnedMesh2D {
+    vertices []SkinVertex2D
+    indices []int
+}
+
+pub fn new_skinned_mesh_2d() SkinnedMesh2D {
+    << SkinnedMesh2D{vertices: []SkinVertex2D{}, indices: []int{}}
+}
+
+pub fn (m $&SkinnedMesh2D) add_vertex(
+    pos fm.Vec2,
+    uv fm.Vec2,
+    color int,
+    bone0 int,
+    bone1 int,
+    weight0 f64,
+    weight1 f64
+) int {
+    if !valid_point(pos) || !fm.finite(uv.x) || !fm.finite(uv.y) || color < 0 || color > 4294967295 {
+        >> errors.new("nexus canvas: invalid 2D skinned vertex attributes")
+    }
+    if bone0 < 0 || bone1 < 0 || !fm.finite(weight0) || !fm.finite(weight1) || weight0 < 0.0 || weight1 < 0.0 {
+        >> errors.new("nexus canvas: invalid 2D skinning bone index or negative weight")
+    }
+    wsum := weight0 + weight1
+    if wsum <= 0.000001 {
+        >> errors.new("nexus canvas: 2D skinning vertex weights must sum > 0")
+    }
+    m.vertices.push(SkinVertex2D{
+        position: pos,
+        uv: uv,
+        color: color,
+        bone0: bone0,
+        bone1: bone1,
+        weight0: weight0 / wsum,
+        weight1: weight1 / wsum
+    })
+    << m.vertices.len - 1
+}
+
+pub fn (m $&SkinnedMesh2D) add_triangle(a int, b int, c int) int {
+    n := m.vertices.len
+    if a < 0 || a >= n || b < 0 || b >= n || c < 0 || c >= n || a == b || b == c || a == c {
+        >> errors.new("nexus canvas: invalid 2D skinned mesh triangle indices")
+    }
+    m.indices.push(a)
+    m.indices.push(b)
+    m.indices.push(c)
+    << m.indices.len / 3 - 1
+}
+
+pub fn (m &SkinnedMesh2D) vertex_count() int { << m.vertices.len }
+pub fn (m &SkinnedMesh2D) triangle_count() int { << m.indices.len / 3 }
+
+pub fn (m &SkinnedMesh2D) deform_positions(skin_mats &[]fm.Transform2D) []fm.Vec2 {
+    if skin_mats.len == 0 {
+        >> errors.new("nexus canvas: empty 2D skin matrix slice")
+    }
+    $out := []fm.Vec2{}
+    for i in 0:m.vertices.len {
+        v := &m.vertices[i]
+        if v.bone0 >= skin_mats.len || v.bone1 >= skin_mats.len {
+            >> errors.new("nexus canvas: 2D skinned vertex bone index out of range")
+        }
+        p0 := skin_mats[v.bone0].point(v.position)
+        if v.weight1 <= 0.0000001 {
+            out.push(p0)
+        } else {
+            p1 := skin_mats[v.bone1].point(v.position)
+            out.push(fm.vec2(
+                p0.x * v.weight0 + p1.x * v.weight1,
+                p0.y * v.weight0 + p1.y * v.weight1
+            ))
+        }
+    }
+    << out
+}
+
+pub fn (m &SkinnedMesh2D) emit_to_batch(
+    batch $&Batch2D,
+    sk &Skeleton2D,
+    pose &[]BonePose2D,
+    root_transform fm.Transform2D
+) int {
+    if m.indices.len % 3 != 0 {
+        >> errors.new("nexus canvas: corrupted 2D skinned mesh index buffer")
+    }
+    skin_mats := sk.compute_skin_matrices(pose, root_transform) or >>
+    pts := m.deform_positions(&skin_mats) or >>
+    tris := m.indices.len / 3
+    for ti in 0:tris {
+        base := ti * 3
+        ia := m.indices[base]
+        ib := m.indices[base + 1]
+        ic := m.indices[base + 2]
+        va := &m.vertices[ia]
+        vb := &m.vertices[ib]
+        vc := &m.vertices[ic]
+        batch.triangle_uv(
+            pts[ia], pts[ib], pts[ic],
+            va.color, vb.color, vc.color,
+            va.uv, vb.uv, vc.uv
+        ) or >>
+    }
+    << tris
+}

@@ -1,0 +1,265 @@
+@"github.com/xulang-org/nexus/integration/scene"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+persist #"github.com/xulang-org/nexus/resources/persistence"
+nexus #"github.com/xulang-org/nexus/scene"
+#errors
+#strings
+
+pub struct PartitionCellCoord {
+    pub cx int
+    pub cz int
+}
+
+pub struct PartitionUpdateReport {
+    pub cells_to_load []PartitionCellCoord
+    pub cells_to_unload []PartitionCellCoord
+    pub loaded_count int
+}
+
+pub struct WorldPartitionGrid {
+    cell_size f64
+    load_radius int
+    unload_radius int
+    loaded map[string]bool
+    loaded_coords []PartitionCellCoord
+}
+
+pub fn cell_world_id(cx int, cz int) string {
+    << "cell:" + str(cx) + "," + str(cz)
+}
+
+fn floor_div_coord(val f64, cell_size f64) int {
+    $q := int(val / cell_size)
+    if f64(q) * cell_size > val { q -= 1 }
+    << q
+}
+
+pub fn new_world_partition(cell_size f64, load_radius int, unload_radius int) WorldPartitionGrid {
+    if !fm.finite(cell_size) || cell_size < 1.0 || cell_size > 100000.0 {
+        >> errors.new("nexus partition: cell_size must be in [1.0, 100000.0]")
+    }
+    if load_radius < 0 || unload_radius <= load_radius || unload_radius > 16 {
+        >> errors.new("nexus partition: requires 0 <= load_radius < unload_radius <= 16")
+    }
+    << WorldPartitionGrid{
+        cell_size: cell_size,
+        load_radius: load_radius,
+        unload_radius: unload_radius,
+        loaded: map[string]bool{},
+        loaded_coords: []PartitionCellCoord{}
+    }
+}
+
+pub fn (wp &WorldPartitionGrid) cell_size() f64 { << wp.cell_size }
+pub fn (wp &WorldPartitionGrid) load_radius() int { << wp.load_radius }
+pub fn (wp &WorldPartitionGrid) unload_radius() int { << wp.unload_radius }
+
+pub fn (wp &WorldPartitionGrid) world_to_cell(pos fm.Vec3) PartitionCellCoord {
+    if !pos.is_finite() {
+        >> errors.new("nexus partition: non-finite world position")
+    }
+    << PartitionCellCoord{
+        cx: floor_div_coord(pos.x, wp.cell_size),
+        cz: floor_div_coord(pos.z, wp.cell_size)
+    }
+}
+
+pub fn (wp &WorldPartitionGrid) cell_center(cx int, cz int) fm.Vec3 {
+    << fm.vec3((f64(cx) + 0.5) * wp.cell_size, 0.0, (f64(cz) + 0.5) * wp.cell_size)
+}
+
+pub fn (wp &WorldPartitionGrid) is_cell_loaded(cx int, cz int) bool {
+    k := cell_world_id(cx, cz)
+    << wp.loaded.has(k + "")
+}
+
+pub fn (wp &WorldPartitionGrid) loaded_cell_count() int {
+    << wp.loaded_coords.len
+}
+
+pub fn (wp &WorldPartitionGrid) loaded_cells() []PartitionCellCoord {
+    $out := []PartitionCellCoord{}
+    for i in 0:wp.loaded_coords.len {
+        out.push(wp.loaded_coords[i])
+    }
+    << out
+}
+
+fn (wp $&WorldPartitionGrid) mark_cell_loaded(cx int, cz int) {
+    key := cell_world_id(cx, cz)
+    if !wp.loaded.has(key + "") {
+        wp.loaded[key + ""] = true
+        wp.loaded_coords.push(PartitionCellCoord{cx: cx, cz: cz})
+    }
+}
+
+fn (wp $&WorldPartitionGrid) mark_cell_unloaded(cx int, cz int) {
+    key := cell_world_id(cx, cz)
+    lm := $&wp.loaded
+    if lm.has(key + "") {
+        lm.delete(key + "")
+    }
+    $kept := []PartitionCellCoord{}
+    for i in 0:wp.loaded_coords.len {
+        c := wp.loaded_coords[i]
+        if c.cx != cx || c.cz != cz {
+            kept.push(c)
+        }
+    }
+    wp.loaded_coords = kept
+}
+
+pub fn (wp $&WorldPartitionGrid) update_focus(focus_pos fm.Vec3) PartitionUpdateReport {
+    anchors := [focus_pos]
+    << wp.update_focus_multi(&anchors) or >>
+}
+
+pub fn (wp $&WorldPartitionGrid) update_focus_multi(anchors &[]fm.Vec3) PartitionUpdateReport {
+    if anchors.len == 0 || anchors.len > 64 {
+        >> errors.new("nexus partition: anchors count must be in 1..64")
+    }
+    $anchor_cells := []PartitionCellCoord{}
+    for i in 0:anchors.len {
+        anchor_cells.push(wp.world_to_cell(anchors[i]) or >>)
+    }
+
+    lr2 := wp.load_radius * wp.load_radius
+    ur2 := wp.unload_radius * wp.unload_radius
+
+    // 1. Unload existing cells strictly outside unload_radius from every anchor.
+    $to_unload := []PartitionCellCoord{}
+    $kept := []PartitionCellCoord{}
+    lm := $&wp.loaded
+    for i in 0:wp.loaded_coords.len {
+        coord := wp.loaded_coords[i]
+        $min_d2 := 1000000000
+        for ai in 0:anchor_cells.len {
+            dx := coord.cx - anchor_cells[ai].cx
+            dz := coord.cz - anchor_cells[ai].cz
+            d2 := dx * dx + dz * dz
+            if d2 < min_d2 { min_d2 = d2 }
+        }
+        if min_d2 > ur2 {
+            to_unload.push(coord)
+            uk := cell_world_id(coord.cx, coord.cz)
+            if lm.has(uk + "") { lm.delete(uk + "") }
+        } else {
+            kept.push(coord)
+        }
+    }
+    wp.loaded_coords = kept
+
+    // 2. Load missing cells within load_radius of any anchor, sorted nearest-first.
+    $to_load := []PartitionCellCoord{}
+    $to_load_d2 := []int{}
+    for ai in 0:anchor_cells.len {
+        ac := anchor_cells[ai]
+        $dz := -wp.load_radius
+        while dz <= wp.load_radius {
+            $dx := -wp.load_radius
+            while dx <= wp.load_radius {
+                d2 := dx * dx + dz * dz
+                if d2 <= lr2 {
+                    cx := ac.cx + dx
+                    cz := ac.cz + dz
+                    key := cell_world_id(cx, cz)
+                    if !wp.loaded.has(key + "") {
+                        coord := PartitionCellCoord{cx: cx, cz: cz}
+                        wp.loaded[key + ""] = true
+                        wp.loaded_coords.push(coord)
+                        $best_d2 := d2
+                        for aj in 0:anchor_cells.len {
+                            ax := cx - anchor_cells[aj].cx
+                            az := cz - anchor_cells[aj].cz
+                            ad2 := ax * ax + az * az
+                            if ad2 < best_d2 { best_d2 = ad2 }
+                        }
+                        to_load.push(coord)
+                        to_load_d2.push(best_d2)
+                    }
+                }
+                dx += 1
+            }
+            dz += 1
+        }
+    }
+    // Insertion sort to_load ascending by min distance squared.
+    for i in 1:to_load.len {
+        c_val := to_load[i]
+        d_val := to_load_d2[i]
+        $j := i - 1
+        while j >= 0 && to_load_d2[j] > d_val {
+            to_load[j + 1] = to_load[j]
+            to_load_d2[j + 1] = to_load_d2[j]
+            j -= 1
+        }
+        to_load[j + 1] = c_val
+        to_load_d2[j + 1] = d_val
+    }
+
+    << PartitionUpdateReport{
+        cells_to_load: to_load,
+        cells_to_unload: to_unload,
+        loaded_count: wp.loaded_coords.len
+    }
+}
+
+pub fn (wp $&WorldPartitionGrid) register_cell_entity(
+    registry $&PersistentEntityRegistry,
+    cx int,
+    cz int,
+    tree &nexus.SceneTree,
+    node_id int,
+    tag string,
+    persistent_across_cells bool
+) persist.PersistentEntityRef {
+    wid := cell_world_id(cx, cz)
+    wp.mark_cell_loaded(cx, cz)
+    << registry.assign_new_guid(wid + "", tree, node_id, tag, persistent_across_cells) or >>
+}
+
+pub fn (wp $&WorldPartitionGrid) unload_cell_tree(
+    registry $&PersistentEntityRegistry,
+    cx int,
+    cz int,
+    cell_tree $&nexus.SceneTree,
+    persistent_host_world string,
+    persistent_host_tree $&nexus.SceneTree,
+    host_parent int
+) int {
+    wid := cell_world_id(cx, cz)
+    $transfer_guids := []persist.EntityGuid{}
+    for idx in 0:registry.records.len {
+        rec := &registry.records[idx]
+        if rec.world_id == wid && rec.persistent_across_worlds && !rec.retired && rec.node_id > 0 {
+            transfer_guids.push(persist.EntityGuid{value: rec.guid.value + ""})
+        }
+    }
+    $transferred := 0
+    for gi in 0:transfer_guids.len {
+        g := transfer_guids[gi]
+        if !registry.has_guid(&g) { -> }
+        rref := registry.ref_for_guid(&g) or >>
+        if rref.world_id != wid { -> }
+        registry.transfer_entity_world(
+            &g, wid + "", cell_tree, persistent_host_world + "", persistent_host_tree, host_parent
+        ) or >>
+        transferred += 1
+    }
+    _ := registry.sync_world(wid + "", cell_tree) or >>
+    wp.mark_cell_unloaded(cx, cz)
+    << transferred
+}
+
+pub fn (wp $&WorldPartitionGrid) reload_cell_tree(
+    registry $&PersistentEntityRegistry,
+    cx int,
+    cz int,
+    cell_tree $&nexus.SceneTree,
+    prune_retired bool
+) RebindReport {
+    wid := cell_world_id(cx, cz)
+    wp.mark_cell_loaded(cx, cz)
+    << registry.rebind_world(wid + "", cell_tree, prune_retired) or >>
+}

@@ -10,6 +10,10 @@ layout(set = 2, binding = 0, std140) uniform BlurParams {
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
+float linearize_reverse_z(float d, float z_near, float z_far) {
+    return (z_near * z_far) / max(z_near + d * (z_far - z_near), 1e-5);
+}
+
 void main() {
     uvec2 gid = gl_GlobalInvocationID.xy;
     uint w = uint(params.info.x), h = uint(params.info.y);
@@ -24,13 +28,20 @@ void main() {
         return;
     }
 
+    float z_near = max(params.info.z, 1e-4);
+    float z_far = max(params.info.w, z_near + 0.1);
+    float center_lin = linearize_reverse_z(center_d, z_near, z_far);
+    float norm_scale = 1.0 / max(center_lin * 0.05, 0.04);
+
     float sum_ao = 0.0, sum_w = 0.0;
     for (int dy = -2; dy <= 2; ++dy) {
         for (int dx = -2; dx <= 2; ++dx) {
             vec2 suv = clamp(uv + vec2(float(dx), float(dy)) * inv_res, vec2(0.0001), vec2(0.9999));
             float sd = textureLod(src_depth, suv, 0.0).r;
+            if (sd <= 1e-6) continue;
             float sao = textureLod(src_ao, suv, 0.0).r;
-            float depth_diff = abs(sd - center_d) * 180.0;
+            float lin_sd = linearize_reverse_z(sd, z_near, z_far);
+            float depth_diff = abs(lin_sd - center_lin) * norm_scale;
             float spatial = exp(-float(dx * dx + dy * dy) * 0.2);
             float weight = spatial * exp(-depth_diff * depth_diff);
             sum_ao += sao * weight;

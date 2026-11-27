@@ -7,6 +7,7 @@ layout(set=3,binding=0,std140) uniform Lighting2DUniform {
     vec4 view_rect;
     vec4 ambient_exposure;
     vec4 counts_bias;
+    vec4 tuning;
     vec4 lights[128];
     vec4 occluders[128];
 } u;
@@ -44,12 +45,13 @@ float shadow_factor_2d(vec2 light_pos, vec2 world_pos, float softness, int occ_c
     }
     vec2 perp = vec2(-delta.y / dist, delta.x / dist);
     float vis = 0.0;
-    float offsets[5] = float[5](-1.0, -0.5, 0.0, 0.5, 1.0);
-    for (int k = 0; k < 5; ++k) {
+    float offsets[9] = float[9](-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0);
+    float weights[9] = float[9](0.0190, 0.0558, 0.1209, 0.1922, 0.2242, 0.1922, 0.1209, 0.0558, 0.0190);
+    for (int k = 0; k < 9; ++k) {
         vec2 tap = light_pos + perp * (offsets[k] * softness);
-        if (!seg_occluded_2d(tap, world_pos, occ_count, bias)) vis += 1.0;
+        if (!seg_occluded_2d(tap, world_pos, occ_count, bias)) vis += weights[k];
     }
-    return vis * 0.2;
+    return vis;
 }
 
 void main() {
@@ -66,6 +68,8 @@ void main() {
     float bias = u.counts_bias.z;
 
     vec3 lit = u.ambient_exposure.xyz;
+    float spec_strength = u.tuning.y;
+    vec3 view_dir = vec3(0.0, 0.0, 1.0);
     for (int i = 0; i < 32 && i < lcount; ++i) {
         int b = i * 4;
         vec4 d0 = u.lights[b + 0];
@@ -78,7 +82,12 @@ void main() {
         if (kind == 2) {
             vec3 l3 = normalize(vec3(-d1.x, -d1.y, max(d0.z, 1.0) / 32.0));
             float ndotl = max(0.0, dot(normal, l3));
-            lit += d2.xyz * ndotl;
+            float term = ndotl;
+            if (spec_strength > 0.0 && ndotl > 0.0) {
+                vec3 h = normalize(l3 + view_dir);
+                term += pow(max(dot(normal, h), 0.0), 24.0) * spec_strength;
+            }
+            lit += d2.xyz * term;
             continue;
         }
 
@@ -104,8 +113,17 @@ void main() {
         if (d3.y > 0.5) {
             vis = shadow_factor_2d(d0.xy, world_pos, d3.z, ocount, bias);
         }
-        lit += d2.xyz * (atten * ndotl * vis);
+        float term = ndotl;
+        if (spec_strength > 0.0) {
+            vec3 h = normalize(l3 + view_dir);
+            term += pow(max(dot(normal, h), 0.0), 24.0) * spec_strength;
+        }
+        lit += d2.xyz * (atten * term * vis);
     }
-    vec3 final_rgb = clamp(albedo.rgb * lit * u.ambient_exposure.w, vec3(0.0), vec3(1.0));
+    vec3 exposed = lit * u.ambient_exposure.w;
+    if (u.tuning.x > 0.5) {
+        exposed = exposed / (1.0 + max(exposed, vec3(0.0)));
+    }
+    vec3 final_rgb = clamp(albedo.rgb * exposed, vec3(0.0), vec3(1.0));
     color = vec4(final_rgb * tint.rgb, albedo.a * tint.a);
 }

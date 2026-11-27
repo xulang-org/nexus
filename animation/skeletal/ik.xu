@@ -51,10 +51,26 @@ pub fn solve_two_bone_ik(
     pole_world fm.Vec3,
     weight f64
 ) int {
+    << solve_two_bone_ik_soft(asset, pose, root_node, mid_node, end_node, target_world, pole_world, weight, 0.0) or >>
+}
+
+// Soft Two-Bone IK with smooth reach easing near max extension (soft_ratio in 0.0..0.995) and upper-limb twist alignment.
+pub fn solve_two_bone_ik_soft(
+    asset &gltf.GlbGeometry,
+    pose $&[]gltf.NodeTrs,
+    root_node int,
+    mid_node int,
+    end_node int,
+    target_world fm.Vec3,
+    pole_world fm.Vec3,
+    weight f64,
+    soft_ratio f64
+) int {
     n := asset.node_count()
     if pose.len != n || root_node < 0 || root_node >= n || mid_node < 0 || mid_node >= n ||
         end_node < 0 || end_node >= n || !target_world.is_finite() || !pole_world.is_finite() ||
-        !fm.finite(weight) || weight < 0.0 || weight > 1.0 {
+        !fm.finite(weight) || weight < 0.0 || weight > 1.0 ||
+        !fm.finite(soft_ratio) || soft_ratio < 0.0 || soft_ratio >= 0.995 {
         >> errors.new("nexus ik: invalid two-bone IK parameters")
     }
     if (asset.node_parent(mid_node) or >>) != root_node || (asset.node_parent(end_node) or >>) != mid_node {
@@ -82,7 +98,14 @@ pub fn solve_two_bone_ik(
     dir_t := to_t.scaled(1.0 / raw_dist)
     min_d := math.abs(l1 - l2) + 1e-4
     max_d := l1 + l2 - 1e-4
-    d_len := clamp_f(raw_dist, min_d, max_d)
+    $d_len := clamp_f(raw_dist, min_d, max_d)
+    if soft_ratio > 0.0 {
+        soft_d := math.max(min_d, (l1 + l2) * soft_ratio)
+        if raw_dist > soft_d && max_d > soft_d + 1e-6 {
+            span := max_d - soft_d
+            d_len = clamp_f(soft_d + span * (1.0 - math.exp(-(raw_dist - soft_d) / span)), min_d, max_d)
+        }
+    }
 
     pole_rel := pole_world.sub(p_root)
     $perp := pole_rel.sub(dir_t.scaled(pole_rel.dot(dir_t)))
@@ -103,13 +126,24 @@ pub fn solve_two_bone_ik(
     p_mid_goal := p_root.add(dir_t.scaled(l1 * cos_a)).add(u_pole.scaled(l1 * sin_a))
     p_end_goal := p_root.add(dir_t.scaled(d_len))
 
-    // Step 1: orient root->mid toward p_mid_goal (in current mid bend direction).
+    // Step 1: orient root->mid toward p_mid_goal, then twist around upper limb into pole plane.
     v_upper_cur := p_mid.sub(p_root).normalized() or >>
     v_upper_goal := p_mid_goal.sub(p_root).normalized() or >>
     dq_root := quat_from_to(v_upper_cur, v_upper_goal) or >>
     apply_world_delta_rotation(asset, &w0, pose, root_node, dq_root, 1.0) or >>
 
-    // Also twist upper arm so current elbow->end plane matches pole plane cleanly if needed:
+    w_rot := eval_worlds(asset, pose) or >>
+    p_root_r := world_pos(&w_rot, root_node)
+    p_mid_r := world_pos(&w_rot, mid_node)
+    p_end_r := world_pos(&w_rot, end_node)
+    axis_u := p_mid_r.sub(p_root_r).normalized() or >>
+    cur_bend := p_end_r.sub(p_mid_r).sub(axis_u.scaled(p_end_r.sub(p_mid_r).dot(axis_u)))
+    goal_bend := p_end_goal.sub(p_mid_goal).sub(axis_u.scaled(p_end_goal.sub(p_mid_goal).dot(axis_u)))
+    if cur_bend.dot(cur_bend) > 1e-10 && goal_bend.dot(goal_bend) > 1e-10 {
+        dq_twist := quat_from_to(cur_bend.normalized() or >>, goal_bend.normalized() or >>) or >>
+        apply_world_delta_rotation(asset, &w_rot, pose, root_node, dq_twist, 1.0) or >>
+    }
+
     w1 := eval_worlds(asset, pose) or >>
     p_mid1 := world_pos(&w1, mid_node)
     p_end1 := world_pos(&w1, end_node)

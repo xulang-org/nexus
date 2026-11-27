@@ -39,6 +39,7 @@ pub struct MusicDirector {
     pending_fade_sec f64
     pending_trigger_beat f64
     transitions_triggered int
+    smooth_ramp_ms f64
 }
 
 pub fn new_music_director(bpm f64, beats_per_bar int) MusicDirector {
@@ -64,7 +65,8 @@ pub fn new_music_director(bpm f64, beats_per_bar int) MusicDirector {
         pending_quantize: QUANTIZE_IMMEDIATE,
         pending_fade_sec: 0.0,
         pending_trigger_beat: 0.0,
-        transitions_triggered: 0
+        transitions_triggered: 0,
+        smooth_ramp_ms: 0.0
     }
 }
 
@@ -73,6 +75,14 @@ pub fn (dir $&MusicDirector) set_bpm(bpm f64) int {
         >> errors.new("nexus audio: invalid BPM")
     }
     dir.bpm = bpm
+    << 0
+}
+
+pub fn (dir $&MusicDirector) set_smooth_ramp_ms(ms f64) int {
+    if !fm.finite(ms) || ms < 0.0 || ms > 5000.0 {
+        >> errors.new("nexus audio: smooth ramp_ms outside 0..5000")
+    }
+    dir.smooth_ramp_ms = ms
     << 0
 }
 
@@ -135,7 +145,11 @@ pub fn (dir &MusicDirector) stem_volume(name string) f64 {
 fn (dir $&MusicDirector) apply_mixer_volumes(mixer $&Mixer) int {
     for i in 0:dir.stems.len {
         vol := clamp_mix(dir.current_weights[i] * dir.stems[i].base_volume, 0.0, 4.0)
-        mixer.set_volume(dir.stems[i].voice_id, vol) or >>
+        if dir.smooth_ramp_ms > 0.000001 {
+            mixer.set_volume_smooth(dir.stems[i].voice_id, vol, dir.smooth_ramp_ms) or >>
+        } else {
+            mixer.set_volume(dir.stems[i].voice_id, vol) or >>
+        }
     }
     << 0
 }
@@ -250,14 +264,24 @@ pub struct AmbientZoneMixer {
     zones []AmbientZone
     zone_index map[string]int
     dominant string
+    smooth_ramp_ms f64
 }
 
 pub fn new_ambient_zone_mixer() AmbientZoneMixer {
     << AmbientZoneMixer{
         zones: []AmbientZone{},
         zone_index: map[string]int{},
-        dominant: ""
+        dominant: "",
+        smooth_ramp_ms: 0.0
     }
+}
+
+pub fn (amb $&AmbientZoneMixer) set_smooth_ramp_ms(ms f64) int {
+    if !fm.finite(ms) || ms < 0.0 || ms > 5000.0 {
+        >> errors.new("nexus audio: smooth ramp_ms outside 0..5000")
+    }
+    amb.smooth_ramp_ms = ms
+    << 0
 }
 
 pub fn (amb $&AmbientZoneMixer) add_zone(
@@ -359,7 +383,11 @@ pub fn (amb $&AmbientZoneMixer) update(mixer $&Mixer, listener fm.Vec2) int {
         }
         vol := clamp_mix(amb.zones[i].base_volume * raw_weights[i] * duck, 0.0, 4.0)
         amb.zones[i].current_volume = vol
-        mixer.set_volume(amb.zones[i].voice_id, vol) or >>
+        if amb.smooth_ramp_ms > 0.000001 {
+            mixer.set_volume_smooth(amb.zones[i].voice_id, vol, amb.smooth_ramp_ms) or >>
+        } else {
+            mixer.set_volume(amb.zones[i].voice_id, vol) or >>
+        }
     }
     << 0
 }

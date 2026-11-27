@@ -1,0 +1,328 @@
+@main
+
+#gpu
+#math
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+colors #"github.com/xulang-org/nexus/foundation/color"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+l2d #"github.com/xulang-org/nexus/resources/lighting2d"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+ren2 #"github.com/xulang-org/nexus/rendering/two_d"
+ren3 #"github.com/xulang-org/nexus/rendering/three_d"
+shd2 #"github.com/xulang-org/nexus/assets/shaders/two_d"
+shd3 #"github.com/xulang-org/nexus/assets/shaders/three_d"
+nexus #"github.com/xulang-org/nexus/scene"
+pcm #"github.com/xulang-org/nexus/resources/audio"
+mix #"github.com/xulang-org/nexus/audio/mixer"
+p2 #"github.com/xulang-org/nexus/physics2d"
+
+fn px_r(c int) int { << (c >> 24) & 255 }
+fn px_g(c int) int { << (c >> 16) & 255 }
+fn px_b(c int) int { << (c >> 8) & 255 }
+fn abs_i(v int) int { if v < 0 { << -v } << v }
+
+fn quad_xy(w f64, h f64, normal fm.Vec3) meshes.MeshData3D {
+    $d := meshes.new_mesh_data_3d()
+    for xy in [fm.vec2(-w, -h), fm.vec2(w, -h), fm.vec2(w, h), fm.vec2(-w, h)] {
+        d.vertex_lit(fm.vec3(xy.x, xy.y, 0.0), 4294967295, normal) or >>
+    }
+    d.triangle(0, 1, 2) or >>
+    d.triangle(0, 2, 3) or >>
+    d.validate() or >>
+    << d
+}
+
+fn check_3d_taa_and_dither_metal() int {
+    program := shd3.load_mesh("build/mesh-shaders") or >>
+    cprog := shd3.load_clustered_program("build/mesh-shaders") or >>
+    iprog := shd3.load_indirect_program("build/mesh-shaders") or >>
+    pprog := shd3.load_postprocess_program("build/mesh-shaders") or >>
+
+    $device := ren3.open_3d("Detail TAA+Dither GPU", 64, 64, gpu.METAL, &program) or >>
+    $clustered := device.clustered_renderer(&cprog) or >>
+    $hiz := device.hiz_pyramid(&iprog) or >>
+    $hdr := device.hdr_target(&pprog) or >>
+    $pp := device.postprocess_pipeline(&pprog) or >>
+
+    $grid := ren3.irradiance_grid_3d(fm.vec3(-4.0, -4.0, -4.0), fm.vec3(4.0, 4.0, 4.0), 2, 2, 2) or >>
+    grid.bake_hemisphere(fm.vec3(0.08, 0.08, 0.10), fm.vec3(0.05, 0.05, 0.06), fm.vec3(0.0, 1.0, 0.0), fm.vec3(0.0, 0.0, 0.0)) or >>
+    $irr_gpu := grid.upload(&device) or >>
+
+    eye := fm.vec3(0.0, 0.0, 3.5)
+    view := nexus.look_at_3d(eye, fm.vec3(0.0, 0.0, 0.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+    z_near := 0.25
+    z_far := 30.0
+    proj := nexus.perspective_3d(0.9, 1.0, z_near, z_far) or >>
+    vp := proj.multiply(view)
+
+    empty_lights := []lights.Light3D{}
+    clustered.bin_lights(&device, fm.vec3(0.0, 0.0, 0.0), eye, 1.0, &empty_lights, view, proj, z_near, z_far, 0) or >>
+
+    $q := quad_xy(1.2, 1.2, fm.vec3(0.0, 0.0, 1.0)) or >>
+    $mesh := device.upload(&q) or >>
+    bright_mat := ren3.material_3d(fm.vec3(0.1, 0.1, 0.1), 0.0, 0.9, fm.vec3(12.0, 12.0, 12.0)) or >>
+    dim_mat := ren3.material_3d(fm.vec3(0.45, 0.45, 0.50), 0.0, 0.9, fm.vec3(0.0, 0.0, 0.0)) or >>
+
+    $cfg := ren3.post_process_defaults_3d()
+    cfg.ao_enabled = false
+    cfg.ssr_enabled = false
+    cfg.bloom_enabled = false
+    cfg.taa_enabled = true
+    cfg.taa_blend = 0.85
+    cfg.dither_strength = 1.0
+    cfg.validate() or >>
+
+    // Frame 0: intense HDR bright surface primes TAA history.
+    hdr.begin(&device, 255) or >>
+    hdr.draw_clustered_gi(&device, &clustered, &irr_gpu, 1.0, mesh.reference(), fm.identity_3d(), view, vp, &bright_mat) or >>
+    hdr.end() or >>
+    device.begin(255) or >>
+    pp.apply($&device, &hdr, $&hiz, view, proj, z_near, z_far, &cfg) or >>
+    px_bright := device.read_pixel(32, 32) or >>
+    device.present() or >>
+
+    // Frame 1: surface suddenly switches dark — Karis YCoCg variance clip prevents bright ghosting!
+    hdr.begin(&device, 255) or >>
+    hdr.draw_clustered_gi(&device, &clustered, &irr_gpu, 1.0, mesh.reference(), fm.identity_3d(), view, vp, &dim_mat) or >>
+    hdr.end() or >>
+    device.begin(255) or >>
+    pp.apply($&device, &hdr, $&hiz, view, proj, z_near, z_far, &cfg) or >>
+    px_clamped := device.read_pixel(32, 32) or >>
+    px_sky := device.read_pixel(2, 2) or >>
+    device.present() or >>
+
+    assert(px_r(px_bright) > 220)
+    assert(px_r(px_clamped) < 100)
+    // Pure black background stays strictly 0 (dither skips pure black pixels).
+    assert(px_r(px_sky) == 0 && px_g(px_sky) == 0 && px_b(px_sky) == 0)
+
+    mesh.close() or >>
+    irr_gpu.close() or >>
+    pp.close() or >>
+    hdr.close() or >>
+    hiz.close() or >>
+    clustered.close() or >>
+    device.close() or >>
+    << 0
+}
+
+fn check_2d_lighting_gaussian_tonemap_specular() int {
+    // 1. 9-tap Gaussian penumbra monotonicity across shadow edge.
+    $env_shadow := l2d.new_environment_2d(fm.vec3(0.0, 0.0, 0.0)) or >>
+    pt := (l2d.point_light_2d(fm.vec2(40.0, 100.0), fm.vec3(1.0, 1.0, 1.0), 1.0, 200.0) or >>).with_shadows(true, 18.0) or >>
+    env_shadow.add_light(pt) or >>
+    env_shadow.add_occluder(l2d.occluder_segment_2d(fm.vec2(80.0, 70.0), fm.vec2(80.0, 130.0)) or >>) or >>
+    f_in := l2d.point_shadow_factor(&pt, fm.vec2(120.0, 62.0), &env_shadow.occluders, 0.5)
+    f_mid := l2d.point_shadow_factor(&pt, fm.vec2(120.0, 46.0), &env_shadow.occluders, 0.5)
+    f_out := l2d.point_shadow_factor(&pt, fm.vec2(120.0, 30.0), &env_shadow.occluders, 0.5)
+    assert(f_in < f_mid && f_mid < f_out && f_in >= 0.0 && f_out <= 1.0)
+
+    // 2. Soft tonemap preserves hue ratio under high exposure, vs flat 255 clamp without it.
+    w := 128
+    h := 96
+    $env := l2d.new_environment_2d(fm.vec3(0.02, 0.02, 0.03)) or >>
+    hot_pt := (l2d.point_light_2d(fm.vec2(64.0, 48.0), fm.vec3(1.0, 0.4, 0.1), 4.0, 90.0) or >>).with_height(16.0) or >>
+    env.add_light(hot_pt) or >>
+    env.set_soft_tonemap(true)
+    env.set_specular_strength(1.2) or >>
+
+    $env_nospec := l2d.new_environment_2d(fm.vec3(0.02, 0.02, 0.03)) or >>
+    env_nospec.add_light(hot_pt) or >>
+    env_nospec.set_soft_tonemap(true)
+    env_nospec.set_specular_strength(0.0) or >>
+
+    cprog := shd2.load_canvas("build/canvas-shaders") or >>
+    lprog := shd2.load_lighting_2d("build/canvas-shaders") or >>
+
+    albedo := colors.rgba8(220, 220, 220, 255) or >>
+    $batch := canvas.new_batch()
+    batch.quad(fm.rect2(0.0, 0.0, f64(w), f64(h)), fm.identity(), albedo) or >>
+
+    $r_gpu := ren2.open_2d("Detail 2D Lighting GPU", w, h, gpu.METAL, &cprog) or >>
+    r_gpu.enable_lighting_2d(&lprog) or >>
+    r_gpu.begin(255) or >>
+    r_gpu.submit(&batch) or >>
+    r_gpu.apply_lighting_2d(&env, fm.vec2(0.0, 0.0), fm.vec2(f64(w), f64(h)), 1) or >>
+    px_gpu_spec := r_gpu.read_pixel(64, 48) or >>
+    r_gpu.present() or >>
+
+    r_gpu.begin(255) or >>
+    r_gpu.submit(&batch) or >>
+    r_gpu.apply_lighting_2d(&env_nospec, fm.vec2(0.0, 0.0), fm.vec2(f64(w), f64(h)), 1) or >>
+    px_gpu_nospec := r_gpu.read_pixel(64, 48) or >>
+    r_gpu.present() or >>
+    r_gpu.close() or >>
+
+    // Specular adds highlight while soft Reinhard preserves orange/red > green > blue channel ordering.
+    assert(px_r(px_gpu_spec) > px_g(px_gpu_spec) && px_g(px_gpu_spec) > px_b(px_gpu_spec))
+    assert(px_g(px_gpu_spec) > px_g(px_gpu_nospec) && px_b(px_gpu_spec) >= px_b(px_gpu_nospec))
+
+    // Software vs Metal GPU parity check on both tonemap and specular.
+    $r_soft := ren2.open_2d_headless(w, h) or >>
+    el := ren2.empty_lighting_program_2d()
+    r_soft.enable_lighting_2d(&el) or >>
+    r_soft.begin(255) or >>
+    r_soft.submit(&batch) or >>
+    r_soft.apply_lighting_2d(&env, fm.vec2(0.0, 0.0), fm.vec2(f64(w), f64(h)), 1) or >>
+    px_soft_spec := r_soft.read_pixel(64, 48) or >>
+    r_soft.present() or >>
+    r_soft.close() or >>
+
+    assert(abs_i(px_r(px_gpu_spec) - px_r(px_soft_spec)) <= 2)
+    assert(abs_i(px_g(px_gpu_spec) - px_g(px_soft_spec)) <= 2)
+    assert(abs_i(px_b(px_gpu_spec) - px_b(px_soft_spec)) <= 2)
+    << 0
+}
+
+fn check_audio_limiter_denormals_and_smooth_ramp() int {
+    $mixer := mix.new_mixer(48000, 8) or >>
+    clip_data := pcm.pcm16(48000, 1, [26000]) or >>
+    clip := mixer.add_clip(clip_data) or >>
+
+    // Two summing +26000 streams -> +52000 (> +4dB over 32767 full scale).
+    v1 := mixer.play(clip, 0, 1.0, 0.0, true) or >>
+    v2 := mixer.play(clip, 0, 1.0, 0.0, true) or >>
+
+    mixer.enable_bus_limiter(0, -6.0, -0.5, 40.0) or >>
+    ceil_approx := int(math.round_to_even(32767.0 * math.pow_f64(10.0, -0.5 / 20.0)))
+    block := mixer.render(256) or >>
+    for i in 0:256 {
+        s := abs_i(block[i * 2])
+        assert(s <= ceil_approx + 2 && s < 32767)
+    }
+    gr_db := mixer.bus_limiter_gain_reduction_db(0) or >>
+    assert(gr_db > 4.0)
+    mixer.stop(v1) or >>
+    mixer.stop(v2) or >>
+
+    // Denormal tail + click-free set_volume_smooth ramp over 10ms (480 frames).
+    mixer.enable_bus_lowpass(0, 1200.0, 0.707) or >>
+    mixer.enable_bus_reverb(0, 0.6, 0.4, 0.25) or >>
+    v3 := mixer.play(clip, 0, 1.0, 0.0, true) or >>
+    mixer.render(128) or >>
+    mixer.set_volume_smooth(v3, 0.1, 10.0) or >>
+    ramp_block := mixer.render(480) or >>
+    $max_delta := 0
+    for i in 1:480 {
+        d := abs_i(ramp_block[i * 2] - ramp_block[(i - 1) * 2])
+        if d > max_delta { max_delta = d }
+    }
+    // Without smooth ramp an instant drop from ~26000 to ~2600 jumps >20000 in 1 sample.
+    assert(max_delta < 4000)
+    assert(math.abs((mixer.volume(v3) or >>) - 0.1) < 0.01)
+
+    // MusicDirector & AmbientZoneMixer smooth ramp API check.
+    $dir := mix.new_music_director(120.0, 4) or >>
+    dir.set_smooth_ramp_ms(12.0) or >>
+    dir.add_stem("lead", v3, 1.0) or >>
+    dir.define_state("quiet", &[0.2]) or >>
+    dir.set_state_immediate($&mixer, "quiet") or >>
+    assert(math.abs((dir.stem_volume("lead") or >>) - 0.2) < 0.001)
+
+    // Silence after stop flushes cleanly with zero NaN/runaway reverb tails.
+    mixer.stop(v3) or >>
+    for _ in 0:16 {
+        tail := mixer.render(256) or >>
+        assert(abs_i(tail[0]) <= ceil_approx)
+    }
+    << 0
+}
+
+fn check_physics2d_advanced_game_feel() int {
+    $world := p2.new_physics_world_2d()
+    world.add_solid(fm.rect2(0.0, 200.0, 400.0, 40.0), 1, 1) or >>
+    // Platform (1) that will move horizontally & vertically.
+    plat := world.add_solid(fm.rect2(100.0, 150.0, 60.0, 12.0), 1, 1) or >>
+    // Ceiling overhang whose left edge is at x=120, y=60..80 (for corner squeeze!).
+    world.add_solid(fm.rect2(120.0, 60.0, 60.0, 20.0), 1, 1) or >>
+    // Small 3px curb step at x=260, y=197..200 (for grounded micro step-up!).
+    world.add_solid(fm.rect2(260.0, 197.0, 40.0, 3.0), 1, 1) or >>
+
+    // 1. MTV resolve_overlaps pushes body out cleanly by shortest penetration axis (3px).
+    mtv := world.resolve_overlaps(fm.rect2(25.0, 183.0, 16.0, 20.0), 1) or >>
+    assert(mtv.resolved && math.abs(mtv.push.y + 3.0) < 0.001)
+
+    // 2. Moving platform carry + jump momentum inheritance.
+    dt := 1.0 / 60.0
+    cfg := p2.default_platformer_config_2d()
+    $rider := p2.new_platformer_controller_2d(fm.rect2(110.0, 130.0, 16.0, 20.0), cfg) or >>
+    rider.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: false, drop_down: false}, dt) or >>
+    assert(rider.on_floor && rider.floor_collider_id == plat)
+
+    world.move_collider(plat, fm.rect2(104.0, 148.0, 60.0, 12.0), dt) or >>
+    rider.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: false, drop_down: false}, dt) or >>
+    assert(math.abs(rider.bounds.position.x - 114.0) < 0.05 && math.abs(rider.bounds.position.y - 128.0) < 0.05)
+
+    // Jump off moving platform inherits horizontal + upward momentum!
+    rider.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: true, jump_held: true, drop_down: false}, dt) or >>
+    assert(rider.velocity.x > 80.0 && rider.velocity.y < -400.0)
+    world.clear_frame_deltas()
+
+    // 3. Ceiling corner squeeze: head overlaps ceiling [120..180, 60..80] by 2px at [106..122, 81..101].
+    $sq := p2.new_platformer_controller_2d(fm.rect2(106.0, 81.0, 16.0, 20.0), cfg) or >>
+    sq.velocity = fm.vec2(0.0, -320.0)
+    sq.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: true, drop_down: false}, dt) or >>
+    assert(sq.corner_corrections == 1 && sq.velocity.y < -250.0 && sq.bounds.position.x <= 104.1)
+
+    // 4. Grounded micro step-up over 3px curb at x=260 while walking right.
+    $walker := p2.new_platformer_controller_2d(fm.rect2(243.0, 180.0, 16.0, 20.0), cfg) or >>
+    walker.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: false, drop_down: false}, dt) or >>
+    assert(walker.on_floor)
+    walker.velocity.x = 180.0
+    walker.step(&world, 1, &p2.PlatformerInput2D{move_x: 1.0, jump_pressed: false, jump_held: false, drop_down: false}, dt) or >>
+    assert(walker.step_ups >= 1 && walker.bounds.position.y + walker.bounds.size.y < 197.5 && walker.on_floor)
+    << 0
+}
+
+fn build_curved_soup() meshes.MeshData3D {
+    white := 4294967295
+    n_mid := fm.vec3(0.0, 0.25, 0.9682458365518543).normalized() or >>
+    $m := meshes.new_mesh_data_3d()
+    m.vertex_lit_uv(fm.vec3(-1.0, 0.0, -0.3), white, fm.vec3(0.0, 0.0, 1.0), fm.vec2(0.0, 0.0)) or >>
+    m.vertex_lit_uv(fm.vec3(0.0, 0.0, 0.0), white, n_mid, fm.vec2(1.0, 0.0)) or >>
+    m.vertex_lit_uv(fm.vec3(0.0, 1.0, 0.1), white, n_mid, fm.vec2(1.0, 1.0)) or >>
+    m.vertex_lit_uv(fm.vec3(0.0, 0.0, 0.0), white, n_mid, fm.vec2(1.0, 0.0)) or >>
+    m.vertex_lit_uv(fm.vec3(0.0, 1.0, 0.1), white, n_mid, fm.vec2(1.0, 1.0)) or >>
+    m.vertex_lit_uv(fm.vec3(1.0, 0.0, -0.3), white, fm.vec3(0.0, 0.0, 1.0), fm.vec2(2.0, 0.0)) or >>
+    m.triangle(0, 1, 2) or >>
+    m.triangle(3, 5, 4) or >>
+    << m
+}
+
+fn check_mikktspace_coincident_welding() int {
+    // Unwelded 6-vertex curved two-triangle strip sharing geometric edge (p1==p3, p2==p4).
+    $no_weld := build_curved_soup() or >>
+    opts_off := meshes.MikkTSpaceOptions{weld_angle_deg: 60.0, weld_coincident_corners: false, position_epsilon: 0.00001}
+    no_weld.generate_mikktspace_tangents_with(&opts_off) or >>
+    t1_off := no_weld.vertices[1].tangent.xyz()
+    t3_off := no_weld.vertices[3].tangent.xyz()
+    assert(t1_off.dot(t3_off) < 0.999)
+
+    $welded := build_curved_soup() or >>
+    stats := welded.generate_mikktspace_tangents() or >>
+    welded.validate() or >>
+    assert(stats.final_vertices == 6)
+    t1_on := welded.vertices[1].tangent.xyz()
+    t3_on := welded.vertices[3].tangent.xyz()
+    assert(t1_on.dot(t3_on) > 0.999999 && welded.vertices[1].tangent.w == welded.vertices[3].tangent.w)
+    << 0
+}
+
+fn run() int {
+    check_3d_taa_and_dither_metal() or >>
+    check_2d_lighting_gaussian_tonemap_specular() or >>
+    check_audio_limiter_denormals_and_smooth_ramp() or >>
+    check_physics2d_advanced_game_feel() or >>
+    check_mikktspace_coincident_welding() or >>
+    println("PASS: detail_optimizations_checks (TAA Karis+Reverse-Z+IGN + 2D 9-Tap Gaussian/Reinhard/Spec + Audio SoftLimiter/Ramp + Physics2D Carry/Squeeze/StepUp + MikkTSpace Coincident Weld)")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

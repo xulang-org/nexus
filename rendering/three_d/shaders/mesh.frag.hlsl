@@ -75,7 +75,7 @@ float4 main(float4 color : TEXCOORD0,float3 world : TEXCOORD1,float3 normal : TE
         float visibility = 1.0;
         if (s.shadow_filter.w > 0.5 && i == int(s.shadow_filter.z)) {
             if (s.shadow_filter.w > 3.5) visibility = cascade_shadow_visibility(world,normal,XU_MUL(s.mvp[0],XU_VEC4(world,1.0)),XU_MUL(s.mvp[1],XU_VEC4(world,1.0)),XU_MUL(s.mvp[2],XU_VEC4(world,1.0)),XU_MUL(s.mvp[3],XU_VEC4(world,1.0)),s.camera_depth,s.ranges[0],s.ranges[1],s.ranges[2],s.ranges[3],s.limits,s.direction_bias,s.shadow_filter,s.depth,s.gradient_scales,shadow_texture,shadow_sampler);
-            else visibility = shadow_visibility(world,normal,s.mvp[0],s.direction_bias,s.shadow_filter,s.depth,shadow_texture,shadow_sampler);
+            else visibility = shadow_visibility(world,normal,s.mvp[0],s.direction_bias,s.shadow_filter,s.depth,s.gradient_scales.x,shadow_texture,shadow_sampler);
         }
         linear_color += source_direct(base, metallic, roughness, shading_normal, world, l.eye_exposure.xyz,
             l.sources[offset], l.sources[offset+1], l.sources[offset+2], l.sources[offset+3]) * visibility;

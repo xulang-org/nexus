@@ -33,5 +33,11 @@ void main() {
     vec3 combined = hdr * ao_factor + ssr.rgb * (ssr.a * params.gains.y) + bloom * params.gains.z;
     vec3 exposed = max(combined * params.gains.w, vec3(0.0));
     vec3 mapped = params.mode.x > 0.5 ? aces_filmic(exposed) : (exposed / (1.0 + exposed));
-    output_color = vec4(srgb_channel(mapped.x), srgb_channel(mapped.y), srgb_channel(mapped.z), 1.0);
+    vec3 srgb = vec3(srgb_channel(mapped.x), srgb_channel(mapped.y), srgb_channel(mapped.z));
+    if (params.mode.w > 0.001 && max(srgb.x, max(srgb.y, srgb.z)) > 0.0005) {
+        float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+        float dither = (ign - 0.5) * (1.0 / 255.0) * clamp(params.mode.w, 0.0, 1.0);
+        srgb = clamp(srgb + vec3(dither), vec3(0.0), vec3(1.0));
+    }
+    output_color = vec4(srgb, 1.0);
 }

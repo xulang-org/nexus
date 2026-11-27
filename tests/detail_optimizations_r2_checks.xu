@@ -1,0 +1,304 @@
+@main
+
+#gpu
+#math
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+gltf #"github.com/xulang-org/nexus/formats/gltf"
+mesh #"github.com/xulang-org/nexus/resources/mesh"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+nexus #"github.com/xulang-org/nexus/scene"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+shd #"github.com/xulang-org/nexus/assets/shaders/three_d"
+anim #"github.com/xulang-org/nexus/animation/skeletal"
+nav #"github.com/xulang-org/nexus/navigation"
+
+fn ch_r(c int) int { << (c >> 24) & 255 }
+fn ch_g(c int) int { << (c >> 16) & 255 }
+fn ch_b(c int) int { << (c >> 8) & 255 }
+
+fn push_u16_b(buf $&[]int, v int) {
+    buf.push(v & 255)
+    buf.push((v >> 8) & 255)
+}
+
+fn push_u32_b(buf $&[]int, v int) {
+    buf.push(v & 255)
+    buf.push((v >> 8) & 255)
+    buf.push((v >> 16) & 255)
+    buf.push((v >> 24) & 255)
+}
+
+fn push_f32_b(buf $&[]int, v f64) {
+    push_u32_b(buf, math.float32_bits(v))
+}
+
+fn push_ascii_b(buf $&[]int, s string) {
+    for i in 0:s.len { buf.push(s[i] & 255) }
+}
+
+fn pad4_zeros(buf $&[]int) {
+    while buf.len % 4 != 0 { buf.push(0) }
+}
+
+fn build_arm_glb() string {
+    $bin := []int{}
+    for idx in [0, 1, 2] { push_u16_b($&bin, idx) }
+    pad4_zeros($&bin)
+    for v in [0.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0, 0.0] { push_f32_b($&bin, v) }
+    pad4_zeros($&bin)
+    js := "{\"asset\":{\"version\":\"2.0\"}," +
+        "\"buffers\":[{\"byteLength\":" + str(bin.len) + "}]," +
+        "\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":6,\"target\":34963},{\"buffer\":0,\"byteOffset\":8,\"byteLength\":36,\"target\":34962}]," +
+        "\"accessors\":[{\"bufferView\":0,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"},{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\",\"min\":[0,0,0],\"max\":[1,1,0]}]," +
+        "\"meshes\":[{\"primitives\":[{\"indices\":0,\"attributes\":{\"POSITION\":1}}]}]," +
+        "\"nodes\":[" +
+        "{\"name\":\"Root\",\"children\":[1]}," +
+        "{\"name\":\"UpperArm\",\"translation\":[0,0,0],\"children\":[2]}," +
+        "{\"name\":\"Forearm\",\"translation\":[1,0,0],\"children\":[3]}," +
+        "{\"name\":\"Hand\",\"translation\":[1,0,0]}]," +
+        "\"scenes\":[{\"nodes\":[0]}],\"scene\":0}"
+    $js_bytes := []int{}
+    push_ascii_b($&js_bytes, js)
+    while js_bytes.len % 4 != 0 { js_bytes.push(32) }
+    total := 12 + 8 + js_bytes.len + 8 + bin.len
+    $glb := []int{}
+    push_u32_b($&glb, 1179937895)
+    push_u32_b($&glb, 2)
+    push_u32_b($&glb, total)
+    push_u32_b($&glb, js_bytes.len)
+    push_u32_b($&glb, 1313821514)
+    for b in js_bytes { glb.push(b) }
+    push_u32_b($&glb, bin.len)
+    push_u32_b($&glb, 5130562)
+    for b in bin { glb.push(b) }
+    << string_from_bytes(glb)
+}
+
+fn world_pos_of(asset &gltf.GlbGeometry, pose &[]gltf.NodeTrs, node int) fm.Vec3 {
+    locals := asset.local_matrices_from_trs(pose) or >>
+    worlds := asset.world_pose(&locals) or >>
+    << worlds[node].c3.xyz()
+}
+
+fn check_soft_two_bone_ik() int {
+    glb_raw := build_arm_glb()
+    asset := gltf.decode_glb_geometry(&glb_raw) or >>
+
+    // Arm joints: UpperArm(1) at (0,0,0), Forearm(2) at (1,0,0), Hand(3) at (2,0,0), total len = 2.0.
+    // Soft ratio 0.85 begins easing reach above 1.70 smoothly toward 2.0 without snap popping.
+    $p_near := asset.sample_trs_pose(-1, 0.0) or >>
+    anim.solve_two_bone_ik_soft(&asset, $&p_near, 1, 2, 3, fm.vec3(1.80, 0.0, 0.0), fm.vec3(1.0, 0.0, 2.0), 1.0, 0.85) or >>
+    d_near := world_pos_of(&asset, &p_near, 3).length()
+
+    $p_ext := asset.sample_trs_pose(-1, 0.0) or >>
+    anim.solve_two_bone_ik_soft(&asset, $&p_ext, 1, 2, 3, fm.vec3(2.20, 0.0, 0.0), fm.vec3(1.0, 0.0, 2.0), 1.0, 0.85) or >>
+    d_ext := world_pos_of(&asset, &p_ext, 3).length()
+
+    $p_hard := asset.sample_trs_pose(-1, 0.0) or >>
+    anim.solve_two_bone_ik(&asset, $&p_hard, 1, 2, 3, fm.vec3(1.80, 0.0, 0.0), fm.vec3(1.0, 0.0, 2.0), 1.0) or >>
+    d_hard := world_pos_of(&asset, &p_hard, 3).length()
+
+    // Soft IK stays shorter than hard-clamped 1.80, stretches smoothly when target pulls to 2.20, and bends along +Z pole.
+    assert(math.abs(d_hard - 1.80) < 0.002)
+    assert(d_near > 1.70 && d_near < 1.80 && d_ext > d_near && d_ext < 2.0)
+    elbow_ext := world_pos_of(&asset, &p_ext, 2)
+    assert(elbow_ext.z > 0.1)
+
+    // Pre-bent arm rotated out of target pole plane twists cleanly onto +Y pole plane!
+    $p_twist := asset.sample_trs_pose(-1, 0.0) or >>
+    p_twist[1].rotation = fm.vec4(0.3826834, 0.0, 0.0, 0.9238795) // 45 deg X twist
+    anim.solve_two_bone_ik_soft(&asset, $&p_twist, 1, 2, 3, fm.vec3(1.4, 0.0, 0.0), fm.vec3(0.7, 2.0, 0.0), 1.0, 0.0) or >>
+    e_twist := world_pos_of(&asset, &p_twist, 2)
+    h_twist := world_pos_of(&asset, &p_twist, 3)
+    assert(h_twist.sub(fm.vec3(1.4, 0.0, 0.0)).length() < 0.003 && e_twist.y > 0.5 && math.abs(e_twist.z) < 0.01)
+    << 0
+}
+
+fn add_quad(
+    verts $&[]fm.Vec3, idxs $&[]int, areas $&[]int, flags $&[]int,
+    x0 f64, z0 f64, x1 f64, z1 f64
+) {
+    b := verts.len
+    verts.push(fm.vec3(x0, 0.0, z0))
+    verts.push(fm.vec3(x0, 0.0, z1))
+    verts.push(fm.vec3(x1, 0.0, z1))
+    verts.push(fm.vec3(x1, 0.0, z0))
+    idxs.push(b)
+    idxs.push(b + 1)
+    idxs.push(b + 2)
+    areas.push(0)
+    flags.push(1)
+    idxs.push(b)
+    idxs.push(b + 2)
+    idxs.push(b + 3)
+    areas.push(0)
+    flags.push(1)
+}
+
+fn check_crowd_crossroad_and_stuck_repath() int {
+    $verts := []fm.Vec3{}
+    $idxs := []int{}
+    $areas := []int{}
+    $flags := []int{}
+    for gx in 0:4 {
+        for gz in 0:4 {
+            x0 := f64(gx) * 4.0
+            z0 := f64(gz) * 4.0
+            add_quad($&verts, $&idxs, $&areas, $&flags, x0, z0, x0 + 4.0, z0 + 4.0)
+        }
+    }
+    arena := nav.build_navmesh(&verts, &idxs, 0.75, &areas, &flags) or >>
+
+    // 1. 4-way symmetric crossroad (W->E, E->W, S->N, N->S): right-hand bias prevents head-on deadlock.
+    $crowd := nav.new_crowd_solver_3d()
+    costs := [1.0]
+    a0 := crowd.add_agent(&arena, fm.vec3(2.0, 0.0, 8.0), 0.5, 4.0, 12.0, 1, &costs) or >>
+    a1 := crowd.add_agent(&arena, fm.vec3(14.0, 0.0, 8.0), 0.5, 4.0, 12.0, 1, &costs) or >>
+    a2 := crowd.add_agent(&arena, fm.vec3(8.0, 0.0, 2.0), 0.5, 4.0, 12.0, 1, &costs) or >>
+    a3 := crowd.add_agent(&arena, fm.vec3(8.0, 0.0, 14.0), 0.5, 4.0, 12.0, 1, &costs) or >>
+    crowd.set_agent_target(&arena, a0, fm.vec3(14.0, 0.0, 8.0)) or >>
+    crowd.set_agent_target(&arena, a1, fm.vec3(2.0, 0.0, 8.0)) or >>
+    crowd.set_agent_target(&arena, a2, fm.vec3(8.0, 0.0, 14.0)) or >>
+    crowd.set_agent_target(&arena, a3, fm.vec3(8.0, 0.0, 2.0)) or >>
+
+    for _step in 0:180 {
+        crowd.step(0.05, &arena) or >>
+        for i in 0:4 {
+            for j in (i + 1):4 {
+                pi := crowd.agent_position(i) or >>
+                pj := crowd.agent_position(j) or >>
+                assert(pi.sub(pj).length() >= 0.85)
+            }
+        }
+    }
+    for i in 0:4 { assert(crowd.agent_arrived(i) or >>) }
+
+    // 2. Wedged agent against dead-end blockers automatically triggers stuck recovery & repath_count!
+    $cv := []fm.Vec3{}
+    $ci := []int{}
+    $ca := []int{}
+    $cf := []int{}
+    add_quad($&cv, $&ci, $&ca, $&cf, 0.0, 0.0, 1.5, 8.0)
+    corridor := nav.build_navmesh(&cv, &ci, 0.75, &ca, &cf) or >>
+    $stuck_cs := nav.new_crowd_solver_3d()
+    walker := stuck_cs.add_agent(&corridor, fm.vec3(0.75, 0.0, 5.5), 0.65, 3.0, 12.0, 1, &costs) or >>
+    _b1 := stuck_cs.add_agent(&corridor, fm.vec3(0.35, 0.0, 7.35), 0.65, 0.01, 0.01, 1, &costs) or >>
+    _b2 := stuck_cs.add_agent(&corridor, fm.vec3(1.15, 0.0, 7.35), 0.65, 0.01, 0.01, 1, &costs) or >>
+    stuck_cs.set_agent_target(&corridor, walker, fm.vec3(0.75, 0.0, 7.85)) or >>
+    for _step in 0:35 {
+        stuck_cs.step(0.05, &corridor) or >>
+    }
+    assert((stuck_cs.agent_repath_count(walker) or >>) >= 1)
+    << 0
+}
+
+fn quad_xy(w f64, h f64, normal fm.Vec3) mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    for xy in [fm.vec2(-w, -h), fm.vec2(w, -h), fm.vec2(w, h), fm.vec2(-w, h)] {
+        d.vertex_lit(fm.vec3(xy.x, xy.y, 0.0), 4294967295, normal) or >>
+    }
+    d.triangle(0, 1, 2) or >>
+    d.triangle(0, 2, 3) or >>
+    d.validate() or >>
+    << d
+}
+
+fn quad_xz(w f64, d_len f64) mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    n := fm.vec3(0.0, 1.0, 0.0)
+    d.vertex_lit(fm.vec3(-w, 0.0, d_len), 4294967295, n) or >>
+    d.vertex_lit(fm.vec3(w, 0.0, d_len), 4294967295, n) or >>
+    d.vertex_lit(fm.vec3(w, 0.0, -d_len), 4294967295, n) or >>
+    d.vertex_lit(fm.vec3(-w, 0.0, -d_len), 4294967295, n) or >>
+    d.triangle(0, 1, 2) or >>
+    d.triangle(0, 2, 3) or >>
+    d.validate() or >>
+    << d
+}
+
+fn check_r2_post_shaders_metal() int {
+    program := shd.load_mesh("build/mesh-shaders") or >>
+    cprog := shd.load_clustered_program("build/mesh-shaders") or >>
+    iprog := shd.load_indirect_program("build/mesh-shaders") or >>
+    pprog := shd.load_postprocess_program("build/mesh-shaders") or >>
+
+    $device := ren.open_3d("Detail R2 Post Shaders Metal", 128, 128, gpu.METAL, &program) or >>
+    $clustered := device.clustered_renderer(&cprog) or >>
+    $hiz := device.hiz_pyramid(&iprog) or >>
+    $hdr := device.hdr_target(&pprog) or >>
+    $pp := device.postprocess_pipeline(&pprog) or >>
+
+    $grid := ren.irradiance_grid_3d(fm.vec3(-4.0, -2.0, -4.0), fm.vec3(4.0, 2.0, 4.0), 2, 2, 2) or >>
+    grid.bake_hemisphere(fm.vec3(0.22, 0.22, 0.24), fm.vec3(0.10, 0.10, 0.12), fm.vec3(0.0, 1.0, 0.0), fm.vec3(0.0, 0.0, 0.0)) or >>
+    $irr := grid.upload(&device) or >>
+
+    eye := fm.vec3(0.0, 0.65, 3.0)
+    view := nexus.look_at_3d(eye, fm.vec3(0.0, 0.1, -0.8), fm.vec3(0.0, 1.0, 0.0)) or >>
+    z_near := 0.25
+    z_far := 30.0
+    proj := nexus.perspective_3d(0.9, 1.0, z_near, z_far) or >>
+    vp := proj.multiply(view)
+
+    empty_lights := []lights.Light3D{}
+    clustered.bin_lights(&device, fm.vec3(0.0, 0.0, 0.0), eye, 1.0, &empty_lights, view, proj, z_near, z_far, 0) or >>
+
+    $floor_d := quad_xz(2.5, 2.5) or >>
+    $wall_d := quad_xy(1.1, 1.1, fm.vec3(0.0, 0.0, 1.0)) or >>
+    $floor_m := device.upload(&floor_d) or >>
+    $wall_m := device.upload(&wall_d) or >>
+    floor_mat := ren.material_3d(fm.vec3(0.25, 0.25, 0.28), 0.15, 0.15, fm.vec3(0.0, 0.0, 0.0)) or >>
+    wall_mat := ren.material_3d(fm.vec3(0.2, 0.2, 0.2), 0.0, 0.7, fm.vec3(7.0, 0.8, 0.3)) or >>
+
+    $cfg := ren.post_process_defaults_3d()
+    cfg.ao_enabled = true
+    cfg.ao_radius = 1.4
+    cfg.ao_strength = 0.9
+    cfg.ssr_enabled = true
+    cfg.ssr_strength = 1.5
+    cfg.ssr_max_roughness = 0.6
+    cfg.bloom_enabled = true
+    cfg.bloom_threshold = 1.0
+    cfg.bloom_intensity = 0.85
+
+    hdr.begin(&device, 255) or >>
+    hdr.draw_clustered_gi(&device, &clustered, &irr, 1.0, floor_m.reference(), fm.translation_3d(fm.vec3(0.0, -0.5, 0.0)), view, vp, &floor_mat) or >>
+    hdr.draw_clustered_gi(&device, &clustered, &irr, 1.0, wall_m.reference(), fm.translation_3d(fm.vec3(0.0, 0.6, -1.5)), view, vp, &wall_mat) or >>
+    hdr.end() or >>
+
+    device.begin(255) or >>
+    pp.apply($&device, &hdr, $&hiz, view, proj, z_near, z_far, &cfg) or >>
+    $refl_red := 0
+    for y in 86:106 { refl_red += ch_r(device.read_pixel(64, y) or >>) }
+    sky_px := device.read_pixel(20, 12) or >>
+    device.present() or >>
+
+    // Strong glowing red reflection on glossy floor + smooth bloom halo near bright edge above sky!
+    assert(refl_red > 1500)
+    assert(ch_r(sky_px) > 10 && ch_g(sky_px) < ch_r(sky_px))
+
+    floor_m.close() or >>
+    wall_m.close() or >>
+    irr.close() or >>
+    pp.close() or >>
+    hdr.close() or >>
+    hiz.close() or >>
+    clustered.close() or >>
+    device.close() or >>
+    << 0
+}
+
+fn run() int {
+    check_soft_two_bone_ik() or >>
+    check_crowd_crossroad_and_stuck_repath() or >>
+    check_r2_post_shaders_metal() or >>
+    println("PASS: detail_optimizations_r2_checks (13-Tap Karis Bloom + Linear GTAO Blur + Jittered SSR + Soft Two-Bone IK Twist + Order-Independent Crowd RVO Repath)")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

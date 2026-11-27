@@ -38,5 +38,11 @@ float4 main(Input input) : SV_Target0 {
     float3 combined = hdr * ao_factor + ssr.rgb * (ssr.a * gains.y) + bloom * gains.z;
     float3 exposed = max(combined * gains.w, float3(0.0, 0.0, 0.0));
     float3 mapped = mode.x > 0.5 ? aces_filmic(exposed) : (exposed / (1.0 + exposed));
-    return float4(srgb_channel(mapped.x), srgb_channel(mapped.y), srgb_channel(mapped.z), 1.0);
+    float3 srgb = float3(srgb_channel(mapped.x), srgb_channel(mapped.y), srgb_channel(mapped.z));
+    if (mode.w > 0.001 && max(srgb.x, max(srgb.y, srgb.z)) > 0.0005) {
+        float ign = frac(52.9829189 * frac(dot(input.position.xy, float2(0.06711056, 0.00583715))));
+        float dither = (ign - 0.5) * (1.0 / 255.0) * clamp(mode.w, 0.0, 1.0);
+        srgb = clamp(srgb + float3(dither, dither, dither), float3(0.0, 0.0, 0.0), float3(1.0, 1.0, 1.0));
+    }
+    return float4(srgb, 1.0);
 }

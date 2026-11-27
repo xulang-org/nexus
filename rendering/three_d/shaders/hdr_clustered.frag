@@ -98,8 +98,14 @@ vec3 material_direct(vec3 base, float metallic, float roughness,
     vec3 f0 = mix(vec3(f0_dielectric), base, metallic);
     float factor = pow(1.0 - vh, 5.0);
     vec3 fresnel = f0 + (vec3(1.0) - f0) * factor;
+    // Fdez-Aguera analytical GGX multi-scattering energy compensation.
+    vec4 r_ms = roughness * vec4(-1.0, -0.0275, -0.572, 0.022) + vec4(1.0, 0.0425, 1.04, -0.04);
+    float a004 = min(r_ms.x * r_ms.x, exp2(-9.28 * nv)) * r_ms.x + r_ms.y;
+    vec2 ab_ms = vec2(-1.04, 1.04) * a004 + r_ms.zw;
+    float ess = clamp(ab_ms.x + ab_ms.y, 0.05, 1.0);
+    vec3 ms_comp = vec3(1.0) + f0 * (1.0 / ess - 1.0);
     vec3 diffuse = (vec3(1.0) - fresnel) * (1.0 - metallic) * base / 3.14159265359;
-    vec3 brdf = diffuse + distribution * visibility * fresnel;
+    vec3 brdf = diffuse + distribution * visibility * fresnel * ms_comp;
 
     float max_sheen = max(sheen_color.x, max(sheen_color.y, sheen_color.z));
     if (max_sheen > 0.0) {

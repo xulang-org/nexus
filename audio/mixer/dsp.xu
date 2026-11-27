@@ -51,10 +51,20 @@ struct ReverbState {
     ap_r CombBank
 }
 
+struct LimiterState {
+    enabled bool
+    threshold f64
+    ceiling f64
+    release_coeff f64
+    envelope f64
+    gain_reduction_min f64
+}
+
 struct BusDsp {
     filter BiquadState
     delay DelayState
     reverb ReverbState
+    limiter LimiterState
     epoch int
 }
 
@@ -97,6 +107,22 @@ fn new_comb_bank(base_sizes &[]int, rate int, spread int) CombBank {
     << CombBank{sizes: sizes, cursors: cursors, lp: lp, buf: buf, offsets: offsets}
 }
 
+fn flush_denormal(x f64) f64 {
+    if math.abs(x) < 1e-18 { << 0.0 }
+    << x
+}
+
+fn default_limiter_state() LimiterState {
+    << LimiterState{
+        enabled: false,
+        threshold: 32767.0,
+        ceiling: 32767.0,
+        release_coeff: 0.999,
+        envelope: 0.0,
+        gain_reduction_min: 1.0
+    }
+}
+
 fn default_bus_dsp() BusDsp {
     << BusDsp{
         filter: BiquadState{mode: DSP_FILTER_NONE, b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0, z1_l: 0.0, z2_l: 0.0, z1_r: 0.0, z2_r: 0.0},
@@ -104,6 +130,7 @@ fn default_bus_dsp() BusDsp {
         reverb: ReverbState{enabled: false, feedback: 0.84, damp: 0.35, wet: 0.0,
             comb_l: empty_comb_bank(), comb_r: empty_comb_bank(),
             ap_l: empty_comb_bank(), ap_r: empty_comb_bank()},
+        limiter: default_limiter_state(),
         epoch: 0
     }
 }
@@ -121,16 +148,17 @@ fn clone_bus_dsp(src &BusDsp) BusDsp {
             comb_l: clone_comb_bank(&src.reverb.comb_l), comb_r: clone_comb_bank(&src.reverb.comb_r),
             ap_l: clone_comb_bank(&src.reverb.ap_l), ap_r: clone_comb_bank(&src.reverb.ap_r)
         },
+        limiter: src.limiter,
         epoch: src.epoch
     }
 }
 
 fn (d &BusDsp) active() bool {
-    << d.filter.mode != DSP_FILTER_NONE || d.delay.enabled || d.reverb.enabled
+    << d.filter.mode != DSP_FILTER_NONE || d.delay.enabled || d.reverb.enabled || d.limiter.enabled
 }
 
 fn (d &BusDsp) stamp() string {
-    << str(d.epoch) + ":" + str(d.filter.mode) + "," + str(flag(d.delay.enabled)) + "," + str(d.delay.cursor) + "," + str(flag(d.reverb.enabled))
+    << str(d.epoch) + ":" + str(d.filter.mode) + "," + str(flag(d.delay.enabled)) + "," + str(d.delay.cursor) + "," + str(flag(d.reverb.enabled)) + "," + str(flag(d.limiter.enabled))
 }
 
 fn make_biquad(mode int, rate int, cutoff_hz f64, q f64) BiquadState {
@@ -170,9 +198,9 @@ fn comb_bank_tick(bank $&CombBank, input f64, fb f64, damp f64) f64 {
     for i in 0:bank.sizes.len {
         idx := bank.offsets[i] + bank.cursors[i]
         out := bank.buf[idx]
-        filt := out * (1.0 - damp) + bank.lp[i] * damp
+        filt := flush_denormal(out * (1.0 - damp) + bank.lp[i] * damp)
         bank.lp[i] = filt
-        bank.buf[idx] = input + filt * fb
+        bank.buf[idx] = flush_denormal(input + filt * fb)
         $next_c := bank.cursors[i] + 1
         if next_c >= bank.sizes[i] { next_c = 0 }
         bank.cursors[i] = next_c
@@ -187,7 +215,7 @@ fn allpass_bank_tick(bank $&CombBank, input f64) f64 {
         idx := bank.offsets[i] + bank.cursors[i]
         bufout := bank.buf[idx]
         out := -cur + bufout
-        bank.buf[idx] = cur + bufout * 0.5
+        bank.buf[idx] = flush_denormal(cur + bufout * 0.5)
         $next_c := bank.cursors[i] + 1
         if next_c >= bank.sizes[i] { next_c = 0 }
         bank.cursors[i] = next_c
@@ -196,20 +224,35 @@ fn allpass_bank_tick(bank $&CombBank, input f64) f64 {
     << cur
 }
 
+fn soft_ceiling_sample(x f64, ceil_amp f64) f64 {
+    ax := math.abs(x)
+    knee := ceil_amp * 0.85
+    if ax <= knee { << x }
+    span := ceil_amp - knee
+    if span <= 1e-9 {
+        if x < 0.0 { << -ceil_amp }
+        << ceil_amp
+    }
+    excess := (ax - knee) / span
+    limited := knee + span * (excess / (1.0 + excess))
+    if x < 0.0 { << -limited }
+    << limited
+}
+
 fn process_bus_dsp(dsp $&BusDsp, left $&[]f64, right $&[]f64, frames int) {
     if dsp.filter.mode != DSP_FILTER_NONE {
         f := $&dsp.filter
         for i in 0:frames {
             xl := left[i]
             yl := f.b0 * xl + f.z1_l
-            f.z1_l = f.b1 * xl - f.a1 * yl + f.z2_l
-            f.z2_l = f.b2 * xl - f.a2 * yl
+            f.z1_l = flush_denormal(f.b1 * xl - f.a1 * yl + f.z2_l)
+            f.z2_l = flush_denormal(f.b2 * xl - f.a2 * yl)
             left[i] = yl
 
             xr := right[i]
             yr := f.b0 * xr + f.z1_r
-            f.z1_r = f.b1 * xr - f.a1 * yr + f.z2_r
-            f.z2_r = f.b2 * xr - f.a2 * yr
+            f.z1_r = flush_denormal(f.b1 * xr - f.a1 * yr + f.z2_r)
+            f.z2_r = flush_denormal(f.b2 * xr - f.a2 * yr)
             right[i] = yr
         }
     }
@@ -225,8 +268,8 @@ fn process_bus_dsp(dsp $&BusDsp, left $&[]f64, right $&[]f64, frames int) {
             dr := d.buf_r[cur]
             xl := left[i]
             xr := right[i]
-            d.buf_l[cur] = xl + dl * fb
-            d.buf_r[cur] = xr + dr * fb
+            d.buf_l[cur] = flush_denormal(xl + dl * fb)
+            d.buf_r[cur] = flush_denormal(xr + dr * fb)
             $next_c := cur + 1
             if next_c >= n { next_c = 0 }
             d.cursor = next_c
@@ -250,6 +293,41 @@ fn process_bus_dsp(dsp $&BusDsp, left $&[]f64, right $&[]f64, frames int) {
             left[i] = xl * dry_mix + al * wet
             right[i] = xr * dry_mix + ar * wet
         }
+    }
+    if dsp.limiter.enabled {
+        lim := $&dsp.limiter
+        thresh := lim.threshold
+        ceil_amp := lim.ceiling
+        rel := lim.release_coeff
+        knee_lo := thresh * 0.75
+        $min_gain := 1.0
+        for i in 0:frames {
+            pk := math.max(math.abs(left[i]), math.abs(right[i]))
+            if pk > lim.envelope {
+                lim.envelope = pk
+            } else {
+                lim.envelope = flush_denormal(lim.envelope * rel + pk * (1.0 - rel))
+            }
+            $gain := 1.0
+            if lim.envelope > knee_lo && lim.envelope > 1e-9 {
+                $target_lvl := lim.envelope
+                if lim.envelope < thresh * 1.25 {
+                    span := thresh * 0.5
+                    u := (lim.envelope - knee_lo) / span
+                    // Smooth quadratic soft-knee interpolation approaching threshold.
+                    target_lvl = knee_lo + span * (u - 0.5 * u * u) * 0.8 + thresh * 0.1
+                    if target_lvl > lim.envelope { target_lvl = lim.envelope }
+                    if target_lvl > thresh { target_lvl = thresh }
+                } else {
+                    target_lvl = thresh
+                }
+                gain = math.min(1.0, target_lvl / lim.envelope)
+            }
+            if gain < min_gain { min_gain = gain }
+            left[i] = soft_ceiling_sample(left[i] * gain, ceil_amp)
+            right[i] = soft_ceiling_sample(right[i] * gain, ceil_amp)
+        }
+        lim.gain_reduction_min = min_gain
     }
 }
 
@@ -357,4 +435,44 @@ pub fn (mixer $&Mixer) clear_bus_dsp(bus int) int {
     mixer.buses[bus].dsp = default_bus_dsp()
     mixer.revision += 1
     << 0
+}
+
+pub fn (mixer $&Mixer) enable_bus_limiter(bus int, threshold_db f64, ceiling_db f64, release_ms f64) int {
+    mixer.bus_index(bus) or >>
+    if math.is_nan(threshold_db) || math.is_inf(threshold_db) || math.is_nan(ceiling_db) || math.is_inf(ceiling_db) ||
+        math.is_nan(release_ms) || math.is_inf(release_ms) ||
+        threshold_db < -36.0 || threshold_db > -0.1 || ceiling_db < threshold_db || ceiling_db > 0.0 ||
+        release_ms < 5.0 || release_ms > 1000.0 {
+        >> errors.new("nexus mixer: invalid bus limiter threshold, ceiling or release_ms")
+    }
+    thresh_amp := 32767.0 * math.pow_f64(10.0, threshold_db / 20.0)
+    ceil_amp := 32767.0 * math.pow_f64(10.0, ceiling_db / 20.0)
+    rel_coeff := math.exp(-1.0 / (release_ms * 0.001 * f64(mixer.rate)))
+    mixer.buses[bus].dsp.limiter = LimiterState{
+        enabled: true,
+        threshold: thresh_amp,
+        ceiling: ceil_amp,
+        release_coeff: rel_coeff,
+        envelope: 0.0,
+        gain_reduction_min: 1.0
+    }
+    mixer.buses[bus].dsp.epoch += 1
+    mixer.revision += 1
+    << 0
+}
+
+pub fn (mixer $&Mixer) disable_bus_limiter(bus int) int {
+    mixer.bus_index(bus) or >>
+    mixer.buses[bus].dsp.limiter = default_limiter_state()
+    mixer.buses[bus].dsp.epoch += 1
+    mixer.revision += 1
+    << 0
+}
+
+pub fn (mixer &Mixer) bus_limiter_gain_reduction_db(bus int) f64 {
+    mixer.bus_index(bus) or >>
+    lim := &mixer.buses[bus].dsp.limiter
+    if !lim.enabled || lim.gain_reduction_min >= 1.0 { << 0.0 }
+    g := math.max(lim.gain_reduction_min, 1e-6)
+    << -20.0 * (math.log(g) / 2.302585092994046)
 }

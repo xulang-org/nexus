@@ -12,6 +12,36 @@ layout(set = 2, binding = 0, std140) uniform TaaParams {
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
+float karis_luma(vec3 c) {
+    return max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+}
+
+vec3 karis_tone(vec3 c) {
+    vec3 sc = max(c, vec3(0.0));
+    return sc / (1.0 + karis_luma(sc));
+}
+
+vec3 karis_inv(vec3 c) {
+    vec3 sc = max(c, vec3(0.0));
+    return sc / max(1.0 - karis_luma(sc), 1e-4);
+}
+
+vec3 rgb_to_ycocg(vec3 c) {
+    return vec3(
+        dot(c, vec3(0.25, 0.50, 0.25)),
+        dot(c, vec3(0.50, 0.00, -0.50)),
+        dot(c, vec3(-0.25, 0.50, -0.25))
+    );
+}
+
+vec3 ycocg_to_rgb(vec3 ycc) {
+    return vec3(
+        ycc.x + ycc.y - ycc.z,
+        ycc.x + ycc.z,
+        ycc.x - ycc.y - ycc.z
+    );
+}
+
 void main() {
     uvec2 gid = gl_GlobalInvocationID.xy;
     uint w = uint(params.info.x), h = uint(params.info.y);
@@ -26,8 +56,24 @@ void main() {
         return;
     }
 
-    float d = textureLod(src_depth, uv, 0.0).r;
-    vec4 clip_curr = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
+    float best_d = textureLod(src_depth, uv, 0.0).r;
+    vec3 m1 = vec3(0.0), m2 = vec3(0.0);
+    vec3 min_c = rgb_to_ycocg(karis_tone(curr));
+    vec3 max_c = min_c;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            vec2 suv = clamp(uv + vec2(float(dx), float(dy)) * inv_res, vec2(0.0001), vec2(0.9999));
+            float sd = textureLod(src_depth, suv, 0.0).r;
+            best_d = max(best_d, sd);
+            vec3 ycc = rgb_to_ycocg(karis_tone(textureLod(curr_hdr, suv, 0.0).rgb));
+            m1 += ycc;
+            m2 += ycc * ycc;
+            min_c = min(min_c, ycc);
+            max_c = max(max_c, ycc);
+        }
+    }
+
+    vec4 clip_curr = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, best_d, 1.0);
     vec4 clip_prev = params.reproj * clip_curr;
     if (clip_prev.w <= 1e-5) {
         imageStore(dst_history, ivec2(gid), vec4(curr, 1.0));
@@ -40,17 +86,17 @@ void main() {
         return;
     }
 
-    vec3 box_min = curr, box_max = curr;
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            vec2 suv = clamp(uv + vec2(float(dx), float(dy)) * inv_res, vec2(0.0001), vec2(0.9999));
-            vec3 n = textureLod(curr_hdr, suv, 0.0).rgb;
-            box_min = min(box_min, n);
-            box_max = max(box_max, n);
-        }
-    }
+    vec3 mean = m1 / 9.0;
+    vec3 sigma = sqrt(max(m2 / 9.0 - mean * mean, vec3(0.0)));
+    vec3 aabb_min = max(min_c, mean - 1.25 * sigma);
+    vec3 aabb_max = min(max_c, mean + 1.25 * sigma);
 
-    vec3 hist = clamp(textureLod(prev_history, prev_uv, 0.0).rgb, box_min, box_max);
-    vec3 resolved = mix(curr, hist, clamp(params.info.z, 0.0, 0.95));
-    imageStore(dst_history, ivec2(gid), vec4(resolved, 1.0));
+    vec3 curr_ycc = rgb_to_ycocg(karis_tone(curr));
+    vec3 hist_ycc = clamp(rgb_to_ycocg(karis_tone(textureLod(prev_history, prev_uv, 0.0).rgb)), aabb_min, aabb_max);
+
+    float motion_px = length((prev_uv - uv) * params.info.xy);
+    float vel_scale = 1.0 / (1.0 + motion_px * 0.15);
+    float alpha = clamp(params.info.z * vel_scale, 0.0, 0.95);
+    vec3 resolved = karis_inv(ycocg_to_rgb(mix(curr_ycc, hist_ycc, alpha)));
+    imageStore(dst_history, ivec2(gid), vec4(max(resolved, vec3(0.0)), 1.0));
 }

@@ -1,6 +1,7 @@
 @"github.com/xulang-org/nexus/networking"
 
 fm #"github.com/xulang-org/nexus/foundation/math"
+#encoding/binary
 #errors
 #math
 
@@ -290,6 +291,16 @@ pub fn (ei $&EntityInterpolator) push_sample(sample InterpSample) {
 
 pub fn (ei &EntityInterpolator) sample_count() int { << ei.samples.len }
 
+pub fn (ei &EntityInterpolator) interp_delay() f64 { << ei.interp_delay_s }
+
+pub fn (ei $&EntityInterpolator) set_interp_delay(delay_s f64) int {
+    if !fm.finite(delay_s) || delay_s < 0.0 || delay_s > 2.0 {
+        >> errors.new("nexus net: invalid EntityInterpolator interp_delay_s")
+    }
+    ei.interp_delay_s = delay_s
+    << 0
+}
+
 pub fn (ei &EntityInterpolator) sample(client_time_s f64) InterpResult {
     n := ei.samples.len
     if n == 0 {
@@ -371,4 +382,209 @@ pub fn (ei &EntityInterpolator) sample(client_time_s f64) InterpResult {
         yaw: yaw,
         pitch: pitch
     }
+}
+
+pub const MAX_REDUNDANT_INPUTS = 8
+pub const INPUT_BUNDLE_MAGIC = 0x4E58
+
+pub struct InputRedundancyWindow {
+    max_window int
+    history []PlayerInputCmd
+}
+
+pub fn new_input_redundancy_window(window_size int) InputRedundancyWindow {
+    if window_size < 1 || window_size > MAX_REDUNDANT_INPUTS {
+        >> errors.new("nexus net: redundant input window size must be in 1...8")
+    }
+    << InputRedundancyWindow{max_window: window_size, history: []PlayerInputCmd{}}
+}
+
+pub fn (w &InputRedundancyWindow) len() int { << w.history.len }
+
+pub fn (w $&InputRedundancyWindow) push(cmd PlayerInputCmd) int {
+    if !fm.finite(cmd.move_x) || !fm.finite(cmd.move_z) || !fm.finite(cmd.yaw) ||
+        !fm.finite(cmd.dt) || cmd.dt <= 0.0 || cmd.seq < 0 || cmd.tick < 0 {
+        >> errors.new("nexus net: invalid PlayerInputCmd for redundant window")
+    }
+    if w.history.len > 0 {
+        li := w.history.len - 1
+        if cmd.seq <= w.history[li].seq {
+            >> errors.new("nexus net: input redundancy window requires strictly increasing seq")
+        }
+    }
+    w.history.push(cmd)
+    while w.history.len > w.max_window {
+        $trimmed := []PlayerInputCmd{}
+        for i in 1:w.history.len { trimmed.push(w.history[i]) }
+        w.history = trimmed
+    }
+    << w.history.len
+}
+
+pub fn (w &InputRedundancyWindow) encode_bundle() []u8 {
+    n := w.history.len
+    if n == 0 || n > MAX_REDUNDANT_INPUTS {
+        >> errors.new("nexus net: cannot encode empty input redundancy window")
+    }
+    total := 4 + n * 28
+    $out := []u8{}
+    for _ in 0:total { out.push(u8(0)) }
+    order := binary.little_endian()
+    order.put_u16_bytes($&out, 0, INPUT_BUNDLE_MAGIC) or >>
+    out[2] = u8(1)
+    out[3] = u8(n)
+    for i in 0:n {
+        cmd := &w.history[i]
+        off := 4 + i * 28
+        order.put_u32_bytes($&out, off + 0, cmd.seq) or >>
+        order.put_u32_bytes($&out, off + 4, cmd.tick) or >>
+        order.put_f32($&out, off + 8, cmd.move_x) or >>
+        order.put_f32($&out, off + 12, cmd.move_z) or >>
+        order.put_f32($&out, off + 16, cmd.yaw) or >>
+        $flags := 0
+        if cmd.jump { flags = flags | 1 }
+        if cmd.sprint { flags = flags | 2 }
+        order.put_u32_bytes($&out, off + 20, flags) or >>
+        order.put_f32($&out, off + 24, cmd.dt) or >>
+    }
+    << out
+}
+
+pub fn decode_input_bundle(data &[]u8) []PlayerInputCmd {
+    if data.len < 4 {
+        >> errors.new("nexus net: input bundle header truncated")
+    }
+    order := binary.little_endian()
+    magic := order.get_u16_bytes(data, 0) or >>
+    if magic != INPUT_BUNDLE_MAGIC || int(data[2]) != 1 {
+        >> errors.new("nexus net: invalid input bundle magic or version")
+    }
+    count := int(data[3])
+    if count < 1 || count > MAX_REDUNDANT_INPUTS || data.len != 4 + count * 28 {
+        >> errors.new("nexus net: input bundle length mismatch")
+    }
+    $cmds := []PlayerInputCmd{}
+    for i in 0:count {
+        off := 4 + i * 28
+        seq := order.get_u32_bytes(data, off + 0) or >>
+        tick := order.get_u32_bytes(data, off + 4) or >>
+        mx := math.float32_from_bits(order.get_u32_bytes(data, off + 8) or >>)
+        mz := math.float32_from_bits(order.get_u32_bytes(data, off + 12) or >>)
+        yaw := math.float32_from_bits(order.get_u32_bytes(data, off + 16) or >>)
+        flags := order.get_u32_bytes(data, off + 20) or >>
+        dt := math.float32_from_bits(order.get_u32_bytes(data, off + 24) or >>)
+        if !fm.finite(mx) || !fm.finite(mz) || !fm.finite(yaw) || !fm.finite(dt) || dt <= 0.0 {
+            >> errors.new("nexus net: corrupted float in input bundle")
+        }
+        cmds.push(PlayerInputCmd{
+            seq: seq,
+            tick: tick,
+            move_x: mx,
+            move_z: mz,
+            yaw: yaw,
+            jump: (flags & 1) != 0,
+            sprint: (flags & 2) != 0,
+            dt: dt
+        })
+    }
+    << cmds
+}
+
+pub struct ServerInputReceiver {
+    last_applied_seq int
+    recovered_count int
+    duplicate_count int
+}
+
+pub fn new_server_input_receiver() ServerInputReceiver {
+    << ServerInputReceiver{last_applied_seq: -1, recovered_count: 0, duplicate_count: 0}
+}
+
+pub fn (r &ServerInputReceiver) last_seq() int { << r.last_applied_seq }
+pub fn (r &ServerInputReceiver) recovered() int { << r.recovered_count }
+pub fn (r &ServerInputReceiver) duplicates() int { << r.duplicate_count }
+
+pub fn (r $&ServerInputReceiver) ingest_bundle(data &[]u8) []PlayerInputCmd {
+    cmds := decode_input_bundle(data) or >>
+    $unseen := []PlayerInputCmd{}
+    for i in 0:cmds.len {
+        c := cmds[i]
+        if c.seq <= r.last_applied_seq {
+            r.duplicate_count += 1
+        } else {
+            unseen.push(c)
+        }
+    }
+    if unseen.len > 1 {
+        r.recovered_count += unseen.len - 1
+    }
+    if unseen.len > 0 {
+        li := unseen.len - 1
+        r.last_applied_seq = unseen[li].seq
+    }
+    << unseen
+}
+
+pub struct AdaptiveJitterBuffer {
+    send_interval_s f64
+    min_delay_s f64
+    max_delay_s f64
+    srtt_s f64
+    jitter_s f64
+    current_delay_s f64
+    last_arrival_s f64
+    last_server_s f64
+    has_sample bool
+    attack_rate f64
+    release_rate f64
+}
+
+pub fn new_adaptive_jitter_buffer(send_interval_s f64, min_delay_s f64, max_delay_s f64) AdaptiveJitterBuffer {
+    if !fm.finite(send_interval_s) || send_interval_s <= 0.0 ||
+        !fm.finite(min_delay_s) || !fm.finite(max_delay_s) ||
+        min_delay_s < 0.0 || max_delay_s < min_delay_s || max_delay_s > 2.0 {
+        >> errors.new("nexus net: invalid AdaptiveJitterBuffer configuration")
+    }
+    init_d := clamp_f_net(send_interval_s * 1.5, min_delay_s, max_delay_s)
+    << AdaptiveJitterBuffer{
+        send_interval_s: send_interval_s,
+        min_delay_s: min_delay_s,
+        max_delay_s: max_delay_s,
+        srtt_s: 0.0,
+        jitter_s: 0.0,
+        current_delay_s: init_d,
+        last_arrival_s: 0.0,
+        last_server_s: 0.0,
+        has_sample: false,
+        attack_rate: 0.35,
+        release_rate: 0.06
+    }
+}
+
+pub fn (jb &AdaptiveJitterBuffer) recommended_delay_s() f64 { << jb.current_delay_s }
+pub fn (jb &AdaptiveJitterBuffer) jitter_estimate_s() f64 { << jb.jitter_s }
+pub fn (jb &AdaptiveJitterBuffer) srtt_estimate_s() f64 { << jb.srtt_s }
+
+pub fn (jb $&AdaptiveJitterBuffer) observe_packet(arrival_time_s f64, server_time_s f64, rtt_s f64) f64 {
+    if !fm.finite(arrival_time_s) || !fm.finite(server_time_s) || !fm.finite(rtt_s) || rtt_s < 0.0 {
+        >> errors.new("nexus net: invalid jitter buffer packet sample")
+    }
+    if !jb.has_sample {
+        jb.srtt_s = rtt_s
+        jb.last_arrival_s = arrival_time_s
+        jb.last_server_s = server_time_s
+        jb.has_sample = true
+        << jb.current_delay_s
+    }
+    jb.srtt_s = jb.srtt_s * 0.875 + rtt_s * 0.125
+    transit_delta := math.abs((arrival_time_s - jb.last_arrival_s) - (server_time_s - jb.last_server_s))
+    jb.jitter_s = jb.jitter_s + (transit_delta - jb.jitter_s) / 16.0
+    jb.last_arrival_s = arrival_time_s
+    jb.last_server_s = server_time_s
+
+    target := clamp_f_net(jb.send_interval_s + jb.jitter_s * 3.0 + jb.srtt_s * 0.05, jb.min_delay_s, jb.max_delay_s)
+    $rate := jb.release_rate
+    if target > jb.current_delay_s { rate = jb.attack_rate }
+    jb.current_delay_s = clamp_f_net(jb.current_delay_s + (target - jb.current_delay_s) * rate, jb.min_delay_s, jb.max_delay_s)
+    << jb.current_delay_s
 }

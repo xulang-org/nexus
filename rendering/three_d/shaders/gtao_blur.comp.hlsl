@@ -8,6 +8,10 @@ SamplerState ao_sampler : register(s0, space0);
 SamplerState depth_sampler : register(s1, space0);
 RWTexture2D<float4> dst_ao : register(u0, space1);
 
+float linearize_reverse_z(float d, float z_near, float z_far) {
+    return (z_near * z_far) / max(z_near + d * (z_far - z_near), 1e-5);
+}
+
 [numthreads(8, 8, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID) {
     uint2 gid = dispatch_id.xy;
@@ -23,13 +27,20 @@ void main(uint3 dispatch_id : SV_DispatchThreadID) {
         return;
     }
 
+    float z_near = max(info.z, 1e-4);
+    float z_far = max(info.w, z_near + 0.1);
+    float center_lin = linearize_reverse_z(center_d, z_near, z_far);
+    float norm_scale = 1.0 / max(center_lin * 0.05, 0.04);
+
     float sum_ao = 0.0, sum_w = 0.0;
     for (int dy = -2; dy <= 2; ++dy) {
         for (int dx = -2; dx <= 2; ++dx) {
             float2 suv = clamp(uv + float2(float(dx), float(dy)) * inv_res, float2(0.0001, 0.0001), float2(0.9999, 0.9999));
             float sd = src_depth.SampleLevel(depth_sampler, suv, 0.0).r;
+            if (sd <= 1e-6) continue;
             float sao = src_ao.SampleLevel(ao_sampler, suv, 0.0).r;
-            float depth_diff = abs(sd - center_d) * 180.0;
+            float lin_sd = linearize_reverse_z(sd, z_near, z_far);
+            float depth_diff = abs(lin_sd - center_lin) * norm_scale;
             float spatial = exp(-float(dx * dx + dy * dy) * 0.2);
             float weight = spatial * exp(-depth_diff * depth_diff);
             sum_ao += sao * weight;

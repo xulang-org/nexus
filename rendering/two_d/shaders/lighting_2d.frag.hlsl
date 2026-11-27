@@ -7,6 +7,7 @@ cbuffer Lighting2DUniform : register(b0,space3) {
     float4 view_rect;
     float4 ambient_exposure;
     float4 counts_bias;
+    float4 tuning;
     float4 lights[128];
     float4 occluders[128];
 };
@@ -49,12 +50,13 @@ float shadow_factor_2d(float2 light_pos, float2 world_pos, float softness, int o
     }
     float2 perp = float2(-delta.y / dist, delta.x / dist);
     float vis = 0.0;
-    static const float offsets[5] = { -1.0, -0.5, 0.0, 0.5, 1.0 };
-    for (int k = 0; k < 5; ++k) {
+    static const float offsets[9] = { -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0 };
+    static const float weights[9] = { 0.0190, 0.0558, 0.1209, 0.1922, 0.2242, 0.1922, 0.1209, 0.0558, 0.0190 };
+    for (int k = 0; k < 9; ++k) {
         float2 tap = light_pos + perp * (offsets[k] * softness);
-        if (!seg_occluded_2d(tap, world_pos, occ_count, bias)) vis += 1.0;
+        if (!seg_occluded_2d(tap, world_pos, occ_count, bias)) vis += weights[k];
     }
-    return vis * 0.2;
+    return vis;
 }
 
 float4 main(Input input) : SV_Target0 {
@@ -71,6 +73,8 @@ float4 main(Input input) : SV_Target0 {
     float bias = counts_bias.z;
 
     float3 lit = ambient_exposure.xyz;
+    float spec_strength = tuning.y;
+    float3 view_dir = float3(0.0, 0.0, 1.0);
     for (int i = 0; i < 32 && i < lcount; ++i) {
         int b = i * 4;
         float4 d0 = lights[b + 0];
@@ -83,7 +87,12 @@ float4 main(Input input) : SV_Target0 {
         if (kind == 2) {
             float3 l3 = normalize(float3(-d1.x, -d1.y, max(d0.z, 1.0) / 32.0));
             float ndotl = max(0.0, dot(normal, l3));
-            lit += d2.xyz * ndotl;
+            float term = ndotl;
+            if (spec_strength > 0.0 && ndotl > 0.0) {
+                float3 h = normalize(l3 + view_dir);
+                term += pow(max(dot(normal, h), 0.0), 24.0) * spec_strength;
+            }
+            lit += d2.xyz * term;
             continue;
         }
 
@@ -109,8 +118,17 @@ float4 main(Input input) : SV_Target0 {
         if (d3.y > 0.5) {
             vis = shadow_factor_2d(d0.xy, world_pos, d3.z, ocount, bias);
         }
-        lit += d2.xyz * (atten * ndotl * vis);
+        float term = ndotl;
+        if (spec_strength > 0.0) {
+            float3 h = normalize(l3 + view_dir);
+            term += pow(max(dot(normal, h), 0.0), 24.0) * spec_strength;
+        }
+        lit += d2.xyz * (atten * term * vis);
     }
-    float3 final_rgb = clamp(albedo.rgb * lit * ambient_exposure.w, float3(0.0), float3(1.0));
+    float3 exposed = lit * ambient_exposure.w;
+    if (tuning.x > 0.5) {
+        exposed = exposed / (1.0 + max(exposed, float3(0.0, 0.0, 0.0)));
+    }
+    float3 final_rgb = clamp(albedo.rgb * exposed, float3(0.0, 0.0, 0.0), float3(1.0, 1.0, 1.0));
     return float4(final_rgb * input.color.rgb, albedo.a * input.color.a);
 }

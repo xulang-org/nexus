@@ -977,7 +977,7 @@ engine-integration-gpu-test: layers mesh-shaders
 	$(XU) build tests/engine_full_integration_gpu_checks.xu -o build/engine-integration-gpu-checks
 	./build/engine-integration-gpu-checks
 
-all-modern-tests: modern-sandbox-test mikktspace-gpu-test lighting-2d-gpu-test audio-async-music-test physics2d-platformer-test persistent-entities-test gameplay-test effects-detail-test project-scaffold-test steam-test steam-native-test console-test console-native-test taptap-test taptap-native-test engine-integration-gpu-test ddgi-gi-gpu-test physics3d-advanced-test networking-test decals-atmosphere-gpu-test terrain-foliage-gpu-test script-host-coroutines-test particles-vfx-gpu-test skeletal-animation-test transparent-pbr-gpu-test
+all-modern-tests: modern-sandbox-test detail-optimizations-r3-test detail-optimizations-r2-test detail-optimizations-test mikktspace-gpu-test lighting-2d-gpu-test audio-async-music-test physics2d-platformer-test persistent-entities-test gameplay-test effects-detail-test project-scaffold-test steam-test steam-native-test console-test console-native-test taptap-test taptap-native-test engine-integration-gpu-test ddgi-gi-gpu-test physics3d-advanced-test networking-test decals-atmosphere-gpu-test terrain-foliage-gpu-test script-host-coroutines-test particles-vfx-gpu-test skeletal-animation-test transparent-pbr-gpu-test
 	@echo "ALL MODERN ENGINE TESTS PASSED"
 
 console-data-test: sdk
@@ -1129,3 +1129,18 @@ physics2d-platformer-test: layers sdk
 	mkdir -p build
 	$(XU) build tests/physics2d_platformer_checks.xu -o build/physics2d-platformer-checks
 	./build/physics2d-platformer-checks
+
+detail-optimizations-test: layers sdk canvas-shaders mesh-shaders
+	mkdir -p build
+	$(XU) build tests/detail_optimizations_checks.xu -o build/detail-optimizations-checks
+	./build/detail-optimizations-checks
+
+detail-optimizations-r2-test: layers sdk mesh-shaders
+	mkdir -p build
+	$(XU) build tests/detail_optimizations_r2_checks.xu -o build/detail-optimizations-r2-checks
+	./build/detail-optimizations-r2-checks
+
+detail-optimizations-r3-test: layers sdk canvas-shaders mesh-shaders
+	mkdir -p build
+	$(XU) build tests/detail_optimizations_r3_checks.xu -o build/detail-optimizations-r3-checks
+	./build/detail-optimizations-r3-checks

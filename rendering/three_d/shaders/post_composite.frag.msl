@@ -3,7 +3,7 @@ using namespace metal;
 
 struct CompositeParams {
     float4 gains; // x=ao_strength, y=ssr_strength, z=bloom_intensity, w=exposure
-    float4 mode;  // x=aces_enabled, y=width, z=height, w=0
+    float4 mode;  // x=aces_enabled, y=width, z=height, w=dither_strength
 };
 
 struct FragIn {
@@ -42,5 +42,11 @@ fragment float4 main0(
     float3 combined = hdr * ao_factor + ssr.rgb * (ssr.a * params.gains.y) + bloom * params.gains.z;
     float3 exposed = max(combined * params.gains.w, float3(0.0));
     float3 mapped = params.mode.x > 0.5 ? aces_filmic(exposed) : (exposed / (1.0 + exposed));
-    return float4(srgb_channel(mapped.x), srgb_channel(mapped.y), srgb_channel(mapped.z), 1.0);
+    float3 srgb = float3(srgb_channel(mapped.x), srgb_channel(mapped.y), srgb_channel(mapped.z));
+    if (params.mode.w > 0.001 && max(srgb.x, max(srgb.y, srgb.z)) > 0.0005) {
+        float ign = fract(52.9829189 * fract(dot(in.position.xy, float2(0.06711056, 0.00583715))));
+        float dither = (ign - 0.5) * (1.0 / 255.0) * clamp(params.mode.w, 0.0, 1.0);
+        srgb = clamp(srgb + float3(dither), float3(0.0), float3(1.0));
+    }
+    return float4(srgb, 1.0);
 }

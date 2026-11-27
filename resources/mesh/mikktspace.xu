@@ -6,10 +6,16 @@ fm #"github.com/xulang-org/nexus/foundation/math"
 
 pub struct MikkTSpaceOptions {
     pub weld_angle_deg f64
+    pub weld_coincident_corners bool
+    pub position_epsilon f64
 }
 
 pub fn default_mikktspace_options() MikkTSpaceOptions {
-    << MikkTSpaceOptions{weld_angle_deg: 60.0}
+    << MikkTSpaceOptions{
+        weld_angle_deg: 60.0,
+        weld_coincident_corners: true,
+        position_epsilon: 0.00001
+    }
 }
 
 pub struct MikkTSpaceStats {
@@ -64,8 +70,9 @@ pub fn (mesh $&MeshData3D) generate_mikktspace_tangents() MikkTSpaceStats {
 // Generates corner-angle-weighted MikkTSpace-style tangents, automatically
 // splitting vertices across mirrored UV handedness or sharp tangent seams.
 pub fn (mesh $&MeshData3D) generate_mikktspace_tangents_with(opts &MikkTSpaceOptions) MikkTSpaceStats {
-    if !fm.finite(opts.weld_angle_deg) || opts.weld_angle_deg < 0.0 || opts.weld_angle_deg > 180.0 {
-        >> errors.new("nexus mesh: MikkTSpace weld_angle_deg must be in 0..180")
+    if !fm.finite(opts.weld_angle_deg) || opts.weld_angle_deg < 0.0 || opts.weld_angle_deg > 180.0 ||
+        !fm.finite(opts.position_epsilon) || opts.position_epsilon <= 0.0 || opts.position_epsilon > 0.1 {
+        >> errors.new("nexus mesh: MikkTSpace weld_angle_deg must be in 0..180 and position_epsilon in (0, 0.1]")
     }
     mesh.validate() or >>
     for vertex in mesh.vertices {
@@ -171,14 +178,46 @@ pub fn (mesh $&MeshData3D) generate_mikktspace_tangents_with(opts &MikkTSpaceOpt
         }
     }
 
-    // Group corners per original vertex using linked chains by (handedness side, weld angle).
-    $vert_head := []int{}
+    // Build topological smoothing buckets (optional coincident-corner welding across triangle soups).
+    $vert_bucket := []int{}
+    $bucket_count := 0
+    if !opts.weld_coincident_corners {
+        for i in 0:orig_count { vert_bucket.push(i) }
+        bucket_count = orig_count
+    } else {
+        inv_p := 1.0 / opts.position_epsilon
+        $bucket_map := map[string]int{}
+        for i in 0:orig_count {
+            v := &mesh.vertices[i]
+            key := str(int(math.round_to_even(v.position.x * inv_p))) + "," +
+                str(int(math.round_to_even(v.position.y * inv_p))) + "," +
+                str(int(math.round_to_even(v.position.z * inv_p))) + "|" +
+                str(int(math.round_to_even(v.normal.x * 10000.0))) + "," +
+                str(int(math.round_to_even(v.normal.y * 10000.0))) + "," +
+                str(int(math.round_to_even(v.normal.z * 10000.0))) + "|" +
+                str(int(math.round_to_even(v.uv.x * 10000.0))) + "," +
+                str(int(math.round_to_even(v.uv.y * 10000.0)))
+            if bucket_map.has(key + "") {
+                vert_bucket.push(bucket_map[key + ""])
+            } else {
+                bid := bucket_count
+                bucket_map[key + ""] = bid
+                vert_bucket.push(bid)
+                bucket_count += 1
+            }
+        }
+    }
+
+    // Group corners per smoothing bucket using linked chains by (handedness side, weld angle).
+    $bucket_head := []int{}
+    for _b in 0:bucket_count { bucket_head.push(-1) }
     $vert_has_pos := []bool{}
     $vert_has_neg := []bool{}
+    $vert_referenced := []bool{}
     for _i in 0:orig_count {
-        vert_head.push(-1)
         vert_has_pos.push(false)
         vert_has_neg.push(false)
+        vert_referenced.push(false)
     }
 
     $group_orig := []int{}
@@ -190,13 +229,15 @@ pub fn (mesh $&MeshData3D) generate_mikktspace_tangents_with(opts &MikkTSpaceOpt
 
     for c in 0:corner_vertex.len {
         ov := corner_vertex[c]
+        bk := vert_bucket[ov]
         side := corner_side[c]
         tan := corner_t[c]
         ang := corner_angle[c]
+        vert_referenced[ov] = true
         if side == 0 { vert_has_pos[ov] = true } else { vert_has_neg[ov] = true }
 
         $matched := -1
-        $g := vert_head[ov]
+        $g := bucket_head[bk]
         while g >= 0 {
             if group_side[g] == side && group_seed[g].dot(tan) >= cos_threshold {
                 candidate_sum := group_sum[g].add(tan.scaled(ang))
@@ -215,8 +256,8 @@ pub fn (mesh $&MeshData3D) generate_mikktspace_tangents_with(opts &MikkTSpaceOpt
             group_side.push(side)
             group_seed.push(tan)
             group_sum.push(tan.scaled(ang))
-            group_next.push(vert_head[ov])
-            vert_head[ov] = matched
+            group_next.push(bucket_head[bk])
+            bucket_head[bk] = matched
         }
         corner_group.push(matched)
     }
@@ -224,36 +265,38 @@ pub fn (mesh $&MeshData3D) generate_mikktspace_tangents_with(opts &MikkTSpaceOpt
     $mirrored_seams := 0
     for ov in 0:orig_count {
         if vert_has_pos[ov] && vert_has_neg[ov] { mirrored_seams += 1 }
-        if vert_head[ov] < 0 {
-            fb := fallback_tangent_for_normal(mesh.vertices[ov].normal)
-            ng := group_orig.len
-            group_orig.push(ov)
-            group_side.push(0)
-            group_seed.push(fb)
-            group_sum.push(fb)
-            group_next.push(-1)
-            vert_head[ov] = ng
-        }
     }
 
-    // Place the first group of each original vertex at index 0..orig_count-1,
-    // and append extra seam-split groups afterwards so unsplit meshes keep IDs.
-    $group_to_out := []int{}
-    for _g in 0:group_orig.len { group_to_out.push(-1) }
+    // Materialize output vertices per (original_vertex, smoothing_group) pair so welded
+    // coincident corners share exact averaged tangents while keeping topology valid.
     $out_vertices := []Vertex3D{}
-    for _i in 0:orig_count {
+    for i in 0:orig_count {
+        src := &mesh.vertices[i]
+        fb := fallback_tangent_for_normal(src.normal)
         out_vertices.push(Vertex3D{
-            position: fm.vec3(0.0, 0.0, 0.0), color: 0, normal: fm.vec3(0.0, 0.0, 0.0),
-            uv: fm.vec2(0.0, 0.0), tangent: fm.vec4(0.0, 0.0, 0.0, 0.0),
-            has_uv: false, has_tangent: false
+            position: src.position,
+            color: src.color,
+            normal: src.normal,
+            uv: src.uv,
+            tangent: fm.vec4(fb.x, fb.y, fb.z, 1.0),
+            has_uv: true,
+            has_tangent: true
         })
     }
 
     $primary_assigned := []bool{}
     for _i in 0:orig_count { primary_assigned.push(false) }
+    $pair_map := map[string]int{}
+    $out_indices := []int{}
 
-    for g in 0:group_orig.len {
-        ov := group_orig[g]
+    for c in 0:corner_group.len {
+        ov := corner_vertex[c]
+        g := corner_group[c]
+        pk := str(ov) + ":" + str(g)
+        if pair_map.has(pk + "") {
+            out_indices.push(pair_map[pk + ""])
+            ->
+        }
         src := &mesh.vertices[ov]
         $raw_avg := group_sum[g]
         if raw_avg.length() <= 0.000000001 { raw_avg = group_seed[g] }
@@ -269,22 +312,19 @@ pub fn (mesh $&MeshData3D) generate_mikktspace_tangents_with(opts &MikkTSpaceOpt
             has_uv: true,
             has_tangent: true
         }
+        $out_idx := ov
         if !primary_assigned[ov] {
             primary_assigned[ov] = true
             out_vertices[ov] = new_v
-            group_to_out[g] = ov
         } else {
             if out_vertices.len >= MAX_VERTICES {
                 >> errors.new("nexus mesh: MikkTSpace seam split exceeds vertex limit")
             }
-            group_to_out[g] = out_vertices.len
+            out_idx = out_vertices.len
             out_vertices.push(new_v)
         }
-    }
-
-    $out_indices := []int{}
-    for c in 0:corner_group.len {
-        out_indices.push(group_to_out[corner_group[c]])
+        pair_map[pk + ""] = out_idx
+        out_indices.push(out_idx)
     }
 
     $candidate := MeshData3D{vertices: out_vertices, indices: out_indices}

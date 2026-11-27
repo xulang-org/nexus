@@ -71,15 +71,16 @@ pub fn point_shadow_factor(
         << 1.0
     }
     perp := fm.vec2(-delta.y / dist, delta.x / dist)
-    offsets := [-1.0, -0.5, 0.0, 0.5, 1.0]
+    offsets := [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0]
+    weights := [0.0190, 0.0558, 0.1209, 0.1922, 0.2242, 0.1922, 0.1209, 0.0558, 0.0190]
     $visible := 0.0
-    for i in 0:5 {
+    for i in 0:9 {
         tap_pos := light.position.add(perp.scaled(offsets[i] * light.shadow_softness))
         if !segment_occluded(tap_pos, target, occluders, light.layer_mask, bias) {
-            visible = visible + 1.0
+            visible = visible + weights[i]
         }
     }
-    << visible / 5.0
+    << visible
 }
 
 fn sort_f64(values $&[]f64) {
@@ -211,13 +212,19 @@ pub fn evaluate_point_2d(
         n = normal.normalized() or >>
     }
     $acc := env.ambient
+    view_dir := fm.vec3(0.0, 0.0, 1.0)
     for i in 0:env.lights.len {
         l := &env.lights[i]
         if !l.enabled || (l.layer_mask & layer_mask) == 0 { -> }
         if l.kind == LIGHT_2D_DIRECTIONAL {
             l3 := fm.vec3(-l.direction.x, -l.direction.y, math.max(l.height, 1.0) / 32.0).normalized() or >>
             ndotl := math.max(0.0, n.dot(l3))
-            acc = acc.add(l.color.scaled(l.intensity * ndotl))
+            $term := ndotl
+            if env.specular_strength > 0.0 && ndotl > 0.0 {
+                h := l3.add(view_dir).normalized() or >>
+                term += math.pow_f64(math.max(0.0, n.dot(h)), 24.0) * env.specular_strength
+            }
+            acc = acc.add(l.color.scaled(l.intensity * term))
             ->
         }
         to_light := l.position.sub(pos)
@@ -238,7 +245,20 @@ pub fn evaluate_point_2d(
         ndotl := math.max(0.0, n.dot(l3))
         if ndotl <= 0.0 { -> }
         vis := point_shadow_factor(l, pos, &env.occluders, env.shadow_bias)
-        acc = acc.add(l.color.scaled(l.intensity * atten * ndotl * vis))
+        $term := ndotl
+        if env.specular_strength > 0.0 {
+            h := l3.add(view_dir).normalized() or >>
+            term += math.pow_f64(math.max(0.0, n.dot(h)), 24.0) * env.specular_strength
+        }
+        acc = acc.add(l.color.scaled(l.intensity * atten * term * vis))
     }
-    << acc.scaled(env.exposure)
+    exposed := acc.scaled(env.exposure)
+    if env.soft_tonemap {
+        << fm.vec3(
+            exposed.x / (1.0 + math.max(exposed.x, 0.0)),
+            exposed.y / (1.0 + math.max(exposed.y, 0.0)),
+            exposed.z / (1.0 + math.max(exposed.z, 0.0))
+        )
+    }
+    << exposed
 }
