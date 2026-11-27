@@ -130,12 +130,29 @@ def setup_env(xu_path: str | None, sdl_runtime: str | None) -> tuple[str, dict[s
         env["XU_NEXUS_SDL_LIBRARY"] = rt
         env["XU_NEXUS_SDL_AUDIO_LIBRARY"] = rt
 
-    if platform.system() == "Windows" and not shutil.which("dxc", path=env.get("PATH")):
-        kits = Path("C:/Program Files (x86)/Windows Kits/10/bin")
-        if kits.is_dir():
-            dxc_hits = sorted(kits.glob("*/x64/dxc.exe"), reverse=True)
-            if dxc_hits:
-                env["PATH"] = str(dxc_hits[0].parent) + os.pathsep + env.get("PATH", "")
+    if platform.system() == "Windows":
+        if not shutil.which("dxc", path=env.get("PATH")):
+            kits = Path("C:/Program Files (x86)/Windows Kits/10/bin")
+            if kits.is_dir():
+                dxc_hits = sorted(kits.glob("*/x64/dxc.exe"), reverse=True)
+                if dxc_hits:
+                    env["PATH"] = str(dxc_hits[0].parent) + os.pathsep + env.get("PATH", "")
+
+        # MinGW-w64 distributions like MSYS2/mingw64 sometimes ship ar.exe/windres.exe without the triple prefix.
+        shim_dir = ROOT / "build/win-mingw-shims"
+        need_shim = False
+        for base in ("ar", "windres", "ranlib"):
+            prefixed = f"x86_64-w64-mingw32-{base}"
+            if not shutil.which(prefixed, path=env.get("PATH")):
+                plain = shutil.which(base, path=env.get("PATH"))
+                if plain:
+                    shim_dir.mkdir(parents=True, exist_ok=True)
+                    dst = shim_dir / f"{prefixed}.exe"
+                    if not dst.exists():
+                        shutil.copy2(plain, dst)
+                    need_shim = True
+        if need_shim or shim_dir.is_dir():
+            env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
     return xu_bin, env
 
 
