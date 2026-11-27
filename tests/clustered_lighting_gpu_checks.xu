@@ -1,0 +1,183 @@
+@main
+
+#gpu
+#math
+#os
+fm #"github.com/xulang-org/nexus/foundation/math"
+mesh #"github.com/xulang-org/nexus/resources/mesh"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+nexus #"github.com/xulang-org/nexus/scene"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+bridge #"github.com/xulang-org/nexus/integration/rendering/three_d"
+shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+
+fn quad_data(half_size f64) mesh.MeshData3D {
+    $data := mesh.new_mesh_data_3d()
+    normal := fm.vec3(0.0, 0.0, 1.0)
+    for xy in [fm.vec2(-half_size, -half_size), fm.vec2(half_size, -half_size),
+               fm.vec2(half_size, half_size), fm.vec2(-half_size, half_size)] {
+        data.vertex_lit(fm.vec3(xy.x, xy.y, 0.0), 4294967295, normal) or >>
+    }
+    data.triangle(0, 1, 2) or >>
+    data.triangle(0, 2, 3) or >>
+    data.validate() or >>
+    << data
+}
+
+fn rgba_close(a int, b int, tol int) bool {
+    r0 := (a >> 24) & 255
+    g0 := (a >> 16) & 255
+    b0 := (a >> 8) & 255
+    a0 := a & 255
+    r1 := (b >> 24) & 255
+    g1 := (b >> 16) & 255
+    b1 := (b >> 8) & 255
+    a1 := b & 255
+    << math.abs(f64(r0 - r1)) <= f64(tol) &&
+        math.abs(f64(g0 - g1)) <= f64(tol) &&
+        math.abs(f64(b0 - b1)) <= f64(tol) &&
+        math.abs(f64(a0 - a1)) <= f64(tol)
+}
+
+fn red_channel(rgba int) int {
+    << (rgba >> 24) & 255
+}
+
+fn green_channel(rgba int) int {
+    << (rgba >> 16) & 255
+}
+
+fn blue_channel(rgba int) int {
+    << (rgba >> 8) & 255
+}
+
+fn run() int {
+    program := shaders.load_mesh("build/mesh-shaders") or >>
+    cprog := shaders.load_clustered_program("build/mesh-shaders") or >>
+    $device := ren.open_3d("Clustered checks", 128, 128, gpu.METAL, &program) or >>
+    $clustered := device.clustered_renderer(&cprog) or >>
+
+    qdata := quad_data(12.0) or >>
+    $quad_mesh := device.upload(&qdata) or >>
+    mat := ren.material_3d(fm.vec3(0.8, 0.8, 0.8), 0.0, 0.85, fm.vec3(0.0, 0.0, 0.0)) or >>
+
+    eye := fm.vec3(0.0, 0.0, 16.0)
+    view := nexus.look_at_3d(eye, fm.vec3(0.0, 0.0, 0.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+    z_near := 0.5
+    z_far := 100.0
+    proj := nexus.perspective_3d(0.9, 1.0, z_near, z_far) or >>
+    vp := proj.multiply(view)
+
+    // 1. Parity check: Legacy forward vs Clustered forward with directional + point + spot lights.
+    dir_l := lights.directional(fm.vec3(0.2, 0.3, 1.0).normalized() or >>, fm.vec3(1.2, 1.0, 0.8)) or >>
+    pt_l := lights.point(fm.vec3(-2.5, 1.5, 2.0), fm.vec3(12.0, 2.0, 1.0), 8.0) or >>
+    sp_l := lights.spot(fm.vec3(2.5, -1.0, 3.0), fm.vec3(0.0, 0.0, -1.0), fm.vec3(2.0, 14.0, 4.0), 10.0, 0.25, 0.55) or >>
+    env3 := lights.environment(fm.vec3(0.04, 0.04, 0.05), eye, 1.0, [dir_l, pt_l, sp_l]) or >>
+
+    $tree := nexus.new_scene_tree_3d("ClusterWorld", 32) or >>
+    n_quad := tree.add_child_3d(tree.root(), "Floor") or >>
+    $scene := bridge.new_scene_3d(&device) or >>
+    scene.attach_surface(&tree, n_quad, &quad_mesh, mat) or >>
+
+    device.begin(255) or >>
+    scene.draw_lit($&device, &tree, vp, &env3) or >>
+    $legacy_px := []int{}
+    for y in 0:16 {
+        for x in 0:16 {
+            legacy_px.push(device.read_pixel(x * 8 + 4, y * 8 + 4) or >>)
+        }
+    }
+    device.present() or >>
+
+    clustered.bin_environment(&device, &env3, view, proj, z_near, z_far, 0) or >>
+    device.begin(255) or >>
+    draw_rep := scene.draw_clustered($&device, &clustered, &tree, view, vp) or >>
+    assert(draw_rep.instances == 1 && draw_rep.triangles == 2)
+    $clust_px := []int{}
+    for y in 0:16 {
+        for x in 0:16 {
+            clust_px.push(device.read_pixel(x * 8 + 4, y * 8 + 4) or >>)
+        }
+    }
+    device.present() or >>
+    for i in 0:legacy_px.len {
+        assert(rgba_close(legacy_px[i], clust_px[i], 2))
+    }
+
+    // 2. Break BOTH the 16-light-per-mesh cap AND the 256-light-scene cap:
+    //    512 lights on ONE single mesh (16x32 grid across world space) + 1 directional light = 513 lights!
+    $many := []lights.Light3D{}
+    many.push(lights.directional(fm.vec3(0.0, 0.0, 1.0), fm.vec3(0.1, 0.1, 0.1)) or >>)
+    for row in 0:16 {
+        for col in 0:32 {
+            lx := -7.5 + f64(col) * (15.0 / 31.0)
+            ly := -7.5 + f64(row) * (15.0 / 15.0)
+            if col < 16 {
+                // Left side warm orange/red lights
+                many.push(lights.point(fm.vec3(lx, ly, 1.2), fm.vec3(3.2, 0.8, 0.2), 2.5) or >>)
+            } else {
+                // Right side cool cyan/blue lights
+                many.push(lights.point(fm.vec3(lx, ly, 1.2), fm.vec3(0.2, 1.2, 3.4), 2.5) or >>)
+            }
+        }
+    }
+    assert(many.len == 513)
+    clustered.bin_lights(&device, fm.vec3(0.01, 0.01, 0.01), eye, 1.0, &many, view, proj, z_near, z_far, 0) or >>
+    counts := clustered.readback_cluster_counts(&device) or >>
+    assert(counts.len == ren.CLUSTER_TOTAL + 1)
+    assert(counts[ren.CLUSTER_TOTAL] == 1) // 1 directional light
+    $nonzero_clusters := 0
+    $max_cluster_load := 0
+    for c in 0:ren.CLUSTER_TOTAL {
+        if counts[c] > 0 { nonzero_clusters += 1 }
+        if counts[c] > max_cluster_load { max_cluster_load = counts[c] }
+    }
+    // Spatial binning: only clusters near z=1.2 get local lights, each << 512!
+    assert(nonzero_clusters > 32 && max_cluster_load > 0 && max_cluster_load < 128)
+
+    device.begin(255) or >>
+    scene.draw_clustered($&device, &clustered, &tree, view, vp) or >>
+    left_px := device.read_pixel(24, 64) or >>
+    right_px := device.read_pixel(104, 64) or >>
+    device.capture("build/clustered-513-lights.png") or >>
+    device.present() or >>
+    // Left half must be warm-red dominant; right half must be cool-blue dominant!
+    assert(red_channel(left_px) > blue_channel(left_px) + 30)
+    assert(blue_channel(right_px) > red_channel(right_px) + 30)
+
+    // 3. Prove > 16 lights contribute to the SAME pixel on the SAME mesh (16 vs 36 coincident lights)!
+    $sixteen := []lights.Light3D{}
+    $thirtysix := []lights.Light3D{}
+    for k in 0:36 {
+        lp := lights.point(fm.vec3(0.0, 0.0, 2.0), fm.vec3(0.25, 0.25, 0.25), 8.0) or >>
+        if k < 16 { sixteen.push(lp) }
+        thirtysix.push(lp)
+    }
+    clustered.bin_lights(&device, fm.vec3(0.0, 0.0, 0.0), eye, 1.0, &sixteen, view, proj, z_near, z_far, 0) or >>
+    device.begin(255) or >>
+    scene.draw_clustered($&device, &clustered, &tree, view, vp) or >>
+    px16 := device.read_pixel(64, 64) or >>
+    device.present() or >>
+
+    clustered.bin_lights(&device, fm.vec3(0.0, 0.0, 0.0), eye, 1.0, &thirtysix, view, proj, z_near, z_far, 0) or >>
+    device.begin(255) or >>
+    scene.draw_clustered($&device, &clustered, &tree, view, vp) or >>
+    px36 := device.read_pixel(64, 64) or >>
+    device.present() or >>
+    assert(green_channel(px36) > green_channel(px16) + 15)
+
+    quad_mesh.close() or >>
+    clustered.close() or >>
+    device.close() or >>
+    println("PASS: Clustered Forward (16x16x24): parity verified, 513 lights on 1 mesh (" +
+        str(nonzero_clusters) + " active clusters, peak=" + str(max_cluster_load) +
+        "/cluster), 36 overlapping lights g=" + str(green_channel(px36)) + " > 16-light g=" + str(green_channel(px16)))
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

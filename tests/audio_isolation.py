@@ -19,10 +19,11 @@ with tempfile.TemporaryDirectory(prefix='xu-nexus-audio-isolation-') as temporar
     shutil.copytree(ROOT / 'build/audio-fixtures', target / 'build/audio-fixtures')
     shutil.copytree(ROOT / 'integration/audio_stream', target / 'integration/audio_stream')
     tool = os.environ.get('XU', 'xu')
+    sdk = next(line for line in (ROOT / 'xu.xun').read_text().splitlines() if line.startswith('xu:'))
     def check(name, source, environment=None, arguments=()):
         main = target / 'checks' / name / 'main.xu'
         main.parent.mkdir(parents=True)
-        (main.parent / 'xu.xun').write_text(f'module: example/audio_{name}\nversion: !ver 0.1.0\nxu: !ver 0.12.3\nrequire:\n  "github.com/xulang-org/nexus": file:../..\n')
+        (main.parent / 'xu.xun').write_text(f'module: example/audio_{name}\nversion: !ver 0.1.0\n{sdk}\nrequire:\n  "github.com/xulang-org/nexus": file:../..\n')
         shutil.copyfile(ROOT / 'tests' / source, main)
         binary = target / name
         subprocess.run([tool, 'build', str(main), '-o', str(binary)], cwd=target, check=True, timeout=60)

@@ -1,8 +1,9 @@
 @"github.com/xulang-org/nexus/scene"
 
 fm #"github.com/xulang-org/nexus/foundation/math"
-#math
+camera_data #"github.com/xulang-org/nexus/resources/camera"
 #errors
+#math
 
 // Engine camera conventions stay separate from reusable vector/matrix algebra.
 // Right-handed, +Y up, metres, camera forward -Z.
@@ -18,20 +19,7 @@ pub fn look_at_3d(eye fm.Vec3, target fm.Vec3, up fm.Vec3) fm.Mat4 {
 }
 // Finite reverse-Z perspective: NDC depth near=1, far=0, clear=0, compare GREATER.
 pub fn perspective_3d(vertical_fov f64, aspect f64, near f64, far f64) fm.Mat4 {
-    if !fm.finite(vertical_fov) || !fm.finite(aspect) || !fm.finite(near) || !fm.finite(far) ||
-        vertical_fov < 0.01 || vertical_fov > 3.13 || aspect <= 0.0 || near <= 0.0 || far <= near {
-        >> errors.new("nexus: invalid perspective frustum")
-    }
-    half := vertical_fov * 0.5
-    sine := math.sin(half)
-    if sine <= 0.0 { >> errors.new("nexus: invalid perspective angle") }
-    focal := math.cos(half) / sine
-    range := far - near
-    if range <= 0.0 { >> errors.new("nexus: empty perspective depth range") }
-    result := fm.Mat4{c0: fm.vec4(focal / aspect, 0.0, 0.0, 0.0), c1: fm.vec4(0.0, focal, 0.0, 0.0),
-        c2: fm.vec4(0.0, 0.0, near / range, -1.0), c3: fm.vec4(0.0, 0.0, near * (far / range), 0.0)}
-    if !result.is_finite() { >> errors.new("nexus: perspective matrix overflow") }
-    << result
+    << camera_data.projection(vertical_fov, aspect, near, far) or >>
 }
 
 pub struct Camera3D {
@@ -62,8 +50,45 @@ pub struct CameraNode3D {
 }
 pub fn new_camera_node_3d(tree &SceneTree, node int) CameraNode3D {
     index := tree.editable(node) or >>
-    tree.require_spatial(index, NODE_3D) or >>
+    component := tree.require_spatial(index, NODE_3D) or >>
+    if tree.spatial_3d[component].orthographic.is_set() {
+        >> errors.new("nexus: orthographic camera requires camera_view_projection_3d")
+    }
+    lens := tree.spatial_3d[component].camera
+    if lens.is_set() {
+        << CameraNode3D{node: node, vertical_fov: lens.vertical_fov(), near: lens.near(), far: lens.far()}
+    }
     << CameraNode3D{node: node, vertical_fov: 1.0471975511965976, near: 0.1, far: 1000.0}
+}
+
+pub fn (tree $&SceneTree) set_camera_3d(node int, lens camera_data.Perspective) int {
+    index := tree.editable(node) or >>
+    component := tree.require_spatial(index, NODE_3D) or >>
+    tree.spatial_3d[component].camera = lens
+    tree.spatial_3d[component].orthographic = camera_data.Orthographic{}
+    << 0
+}
+pub fn (tree $&SceneTree) set_orthographic_camera_3d(node int, lens camera_data.Orthographic) int {
+    index := tree.editable(node) or >>
+    component := tree.require_spatial(index, NODE_3D) or >>
+    tree.spatial_3d[component].orthographic = lens
+    tree.spatial_3d[component].camera = camera_data.Perspective{}
+    << 0
+}
+pub fn (tree &SceneTree) camera_projection_3d(node int, aspect f64) fm.Mat4 {
+    index := tree.editable(node) or >>
+    component := tree.require_spatial(index, NODE_3D) or >>
+    ortho := tree.spatial_3d[component].orthographic
+    if ortho.is_set() { << ortho.projection(aspect) or >> }
+    camera := new_camera_node_3d(tree, node) or >>
+    << perspective_3d(camera.vertical_fov, aspect, camera.near, camera.far) or >>
+}
+pub fn (tree &SceneTree) camera_view_projection_3d(node int, aspect f64) fm.Mat4 {
+    projection := tree.camera_projection_3d(node, aspect) or >>
+    view := (tree.global_transform_3d(node) or >>).affine_inverse() or >>
+    result := projection.multiply(view)
+    if !result.is_finite() { >> errors.new("nexus: camera view-projection overflow") }
+    << result
 }
 pub fn (camera CameraNode3D) view_projection(tree &SceneTree, aspect f64) fm.Mat4 {
     tree.editable(camera.node) or >>
@@ -71,4 +96,94 @@ pub fn (camera CameraNode3D) view_projection(tree &SceneTree, aspect f64) fm.Mat
     view := world.affine_inverse() or >>
     projection := perspective_3d(camera.vertical_fov, aspect, camera.near, camera.far) or >>
     << projection.multiply(view)
+}
+
+pub struct ScreenPoint3D {
+    pub x f64
+    pub y f64
+    pub depth f64
+    pub in_front bool
+    pub visible bool
+}
+
+fn unproject_vp_ray(vp fm.Mat4, screen_xy fm.Vec2, viewport_size fm.Vec2) fm.Ray3D {
+    if !screen_xy.is_finite() || !viewport_size.is_finite() ||
+        viewport_size.x <= 0.0 || viewport_size.y <= 0.0 {
+        >> errors.new("nexus scene: invalid viewport size or screen coordinates")
+    }
+    inv_vp := vp.inverse() or >>
+    ndc_x := (screen_xy.x / viewport_size.x) * 2.0 - 1.0
+    ndc_y := 1.0 - (screen_xy.y / viewport_size.y) * 2.0
+    // Finite reverse-Z: near plane is z = 1, far plane is z = 0.
+    near_clip := inv_vp.transform(fm.vec4(ndc_x, ndc_y, 1.0, 1.0))
+    far_clip := inv_vp.transform(fm.vec4(ndc_x, ndc_y, 0.0, 1.0))
+    if math.abs(near_clip.w) <= 1e-12 || math.abs(far_clip.w) <= 1e-12 {
+        >> errors.new("nexus scene: degenerate clip unprojection")
+    }
+    near_world := near_clip.xyz().scaled(1.0 / near_clip.w)
+    far_world := far_clip.xyz().scaled(1.0 / far_clip.w)
+    << fm.ray3d(near_world, far_world.sub(near_world)) or >>
+}
+
+fn project_vp_point(vp fm.Mat4, world_pos fm.Vec3, viewport_size fm.Vec2) ScreenPoint3D {
+    if !world_pos.is_finite() || !viewport_size.is_finite() ||
+        viewport_size.x <= 0.0 || viewport_size.y <= 0.0 {
+        >> errors.new("nexus scene: invalid point or viewport size")
+    }
+    clip := vp.transform(fm.vec4(world_pos.x, world_pos.y, world_pos.z, 1.0))
+    in_front := clip.w > 1e-9
+    if math.abs(clip.w) <= 1e-12 {
+        << ScreenPoint3D{x: 0.0, y: 0.0, depth: 0.0, in_front: false, visible: false}
+    }
+    inv_w := 1.0 / clip.w
+    ndc_x := clip.x * inv_w
+    ndc_y := clip.y * inv_w
+    ndc_z := clip.z * inv_w
+    sx := (ndc_x * 0.5 + 0.5) * viewport_size.x
+    sy := (0.5 - ndc_y * 0.5) * viewport_size.y
+    visible := in_front && ndc_x >= -1.0 && ndc_x <= 1.0 && ndc_y >= -1.0 && ndc_y <= 1.0 &&
+        ndc_z >= 0.0 && ndc_z <= 1.0
+    << ScreenPoint3D{x: sx, y: sy, depth: ndc_z, in_front: in_front, visible: visible}
+}
+
+pub fn (camera Camera3D) screen_to_world_ray(screen_xy fm.Vec2, viewport_size fm.Vec2) fm.Ray3D {
+    if !viewport_size.is_finite() || viewport_size.x <= 0.0 || viewport_size.y <= 0.0 {
+        >> errors.new("nexus scene: invalid viewport size")
+    }
+    vp := camera.view_projection(viewport_size.x / viewport_size.y) or >>
+    << unproject_vp_ray(vp, screen_xy, viewport_size) or >>
+}
+
+pub fn (camera Camera3D) world_to_screen(world_pos fm.Vec3, viewport_size fm.Vec2) ScreenPoint3D {
+    if !viewport_size.is_finite() || viewport_size.x <= 0.0 || viewport_size.y <= 0.0 {
+        >> errors.new("nexus scene: invalid viewport size")
+    }
+    vp := camera.view_projection(viewport_size.x / viewport_size.y) or >>
+    << project_vp_point(vp, world_pos, viewport_size) or >>
+}
+
+pub fn (camera Camera3D) frustum(aspect f64) fm.Frustum3D {
+    vp := camera.view_projection(aspect) or >>
+    << fm.extract_frustum_from_vp(vp) or >>
+}
+
+pub fn (tree &SceneTree) camera_screen_to_world_ray_3d(node int, screen_xy fm.Vec2, viewport_size fm.Vec2) fm.Ray3D {
+    if !viewport_size.is_finite() || viewport_size.x <= 0.0 || viewport_size.y <= 0.0 {
+        >> errors.new("nexus scene: invalid viewport size")
+    }
+    vp := tree.camera_view_projection_3d(node, viewport_size.x / viewport_size.y) or >>
+    << unproject_vp_ray(vp, screen_xy, viewport_size) or >>
+}
+
+pub fn (tree &SceneTree) camera_world_to_screen_3d(node int, world_pos fm.Vec3, viewport_size fm.Vec2) ScreenPoint3D {
+    if !viewport_size.is_finite() || viewport_size.x <= 0.0 || viewport_size.y <= 0.0 {
+        >> errors.new("nexus scene: invalid viewport size")
+    }
+    vp := tree.camera_view_projection_3d(node, viewport_size.x / viewport_size.y) or >>
+    << project_vp_point(vp, world_pos, viewport_size) or >>
+}
+
+pub fn (tree &SceneTree) camera_frustum_3d(node int, aspect f64) fm.Frustum3D {
+    vp := tree.camera_view_projection_3d(node, aspect) or >>
+    << fm.extract_frustum_from_vp(vp) or >>
 }

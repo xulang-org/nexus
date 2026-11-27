@@ -416,11 +416,27 @@ fn soft_source_contribution(base fm.Vec3, metallic f64, roughness f64, normal fm
 }
 
 fn soft_shade_lit(material &Material3D, lighting &light_data.Environment3D, orientation f64, is_ccw_ndc bool,
-    vcolor fm.Vec4, wpos fm.Vec3, wnorm fm.Vec3, uv fm.Vec2, wtangent fm.Vec3, wbitan fm.Vec3) fm.Vec4 {
+    vcolor fm.Vec4, wpos fm.Vec3, wnorm fm.Vec3, raw_uv fm.Vec2, wtangent fm.Vec3, wbitan fm.Vec3) fm.Vec4 {
+    uv_xform := material.uv_transform()
+    uv := fm.vec2(uv_xform.x + raw_uv.x * uv_xform.z, uv_xform.y + raw_uv.y * uv_xform.w)
     $base := fm.vec3(material.base.x * vcolor.x, material.base.y * vcolor.y, material.base.z * vcolor.z)
+    $alpha := vcolor.w
     if material.has_base_texture() {
         tex := soft_sample_texture(&material.texture, uv.x, uv.y) or >>
         base = fm.vec3(base.x * tex.x, base.y * tex.y, base.z * tex.z)
+        alpha = alpha * tex.w
+    }
+    if material.alpha_cutoff > 0.0 && alpha < material.alpha_cutoff {
+        << fm.vec4(0.0, 0.0, 0.0, -1.0)
+    }
+    $out_alpha := 1.0
+    if material.alpha_blend {
+        out_alpha = soft_clamp01(alpha * material.alpha)
+    }
+    if !material.shaded {
+        << fm.vec4(soft_linear_to_srgb(soft_clamp01(base.x)),
+            soft_linear_to_srgb(soft_clamp01(base.y)),
+            soft_linear_to_srgb(soft_clamp01(base.z)), out_alpha)
     }
     $orm := fm.vec3(1.0, 1.0, 1.0)
     if material.has_orm_texture() {
@@ -441,7 +457,11 @@ fn soft_shade_lit(material &Material3D, lighting &light_data.Environment3D, orie
     $shading_normal := wnorm
     if material.has_normal_texture() {
         tnorm := soft_sample_texture(&material.normal_texture, uv.x, uv.y) or >>
-        shading_normal = soft_normal_map_dir(wnorm, wtangent, wbitan, fm.vec3(tnorm.x, tnorm.y, tnorm.z), material.normal_scale)
+        $adj_tan := wtangent
+        $adj_bit := wbitan
+        if uv_xform.z < 0.0 { adj_tan = adj_tan.scaled(-1.0) }
+        if uv_xform.w < 0.0 { adj_bit = adj_bit.scaled(-1.0) }
+        shading_normal = soft_normal_map_dir(wnorm, adj_tan, adj_bit, fm.vec3(tnorm.x, tnorm.y, tnorm.z), material.normal_scale)
     }
     $surface_front := is_ccw_ndc
     if orientation < 0.0 { surface_front = !surface_front }
@@ -470,7 +490,7 @@ fn soft_shade_lit(material &Material3D, lighting &light_data.Environment3D, orie
     mx := ex / (1.0 + ex)
     my := ey / (1.0 + ey)
     mz := ez / (1.0 + ez)
-    << fm.vec4(soft_linear_to_srgb(mx), soft_linear_to_srgb(my), soft_linear_to_srgb(mz), 1.0)
+    << fm.vec4(soft_linear_to_srgb(mx), soft_linear_to_srgb(my), soft_linear_to_srgb(mz), out_alpha)
 }
 
 fn soft_edge_top_left(ax f64, ay f64, bx f64, by f64) bool {
@@ -597,14 +617,28 @@ fn soft_rasterize_triangle(device $&Device3D, width int, height int,
                     v0.by * k0 + v1.by * k1 + v2.by * k2,
                     v0.bz * k0 + v1.bz * k1 + v2.bz * k2)
                 shaded := soft_shade_lit(material, lighting, orientation, is_ccw_ndc, vcolor, wpos, wnorm, uv, wtan, wbit) or >>
+                if shaded.w < 0.0 { -> }
                 out = shaded
             }
-            device.soft_depth[didx] = z
             pidx := didx * 4
-            device.soft_pixels[pidx] = soft_to_u8(out.x)
-            device.soft_pixels[pidx + 1] = soft_to_u8(out.y)
-            device.soft_pixels[pidx + 2] = soft_to_u8(out.z)
-            device.soft_pixels[pidx + 3] = soft_to_u8(out.w)
+            if lit && material.alpha_blend {
+                sa := soft_clamp01(out.w)
+                inv_sa := 1.0 - sa
+                dr := f64(int(device.soft_pixels[pidx])) / 255.0
+                dg := f64(int(device.soft_pixels[pidx + 1])) / 255.0
+                db := f64(int(device.soft_pixels[pidx + 2])) / 255.0
+                da := f64(int(device.soft_pixels[pidx + 3])) / 255.0
+                device.soft_pixels[pidx] = soft_to_u8(out.x * sa + dr * inv_sa)
+                device.soft_pixels[pidx + 1] = soft_to_u8(out.y * sa + dg * inv_sa)
+                device.soft_pixels[pidx + 2] = soft_to_u8(out.z * sa + db * inv_sa)
+                device.soft_pixels[pidx + 3] = soft_to_u8(sa + da * inv_sa)
+            } else {
+                device.soft_depth[didx] = z
+                device.soft_pixels[pidx] = soft_to_u8(out.x)
+                device.soft_pixels[pidx + 1] = soft_to_u8(out.y)
+                device.soft_pixels[pidx + 2] = soft_to_u8(out.z)
+                device.soft_pixels[pidx + 3] = soft_to_u8(out.w)
+            }
         }
     }
     << 0

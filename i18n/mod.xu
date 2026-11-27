@@ -1,0 +1,98 @@
+@"github.com/xulang-org/nexus/i18n"
+
+ri #"github.com/xulang-org/nexus/resources/i18n"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#errors
+
+const MAX_CATALOG_BYTES = 4194304
+
+pub struct Localizer {
+    catalog ri.StringCatalog
+    current_locale string
+    rev int
+    missing_count int
+    missing_keys []string
+}
+
+pub fn new_localizer(catalog ri.StringCatalog, locale string) Localizer {
+    norm := ri.normalize_locale(&locale) or >>
+    << Localizer{
+        catalog: catalog,
+        current_locale: norm + "",
+        rev: 1,
+        missing_count: 0,
+        missing_keys: []string{}
+    }
+}
+
+pub fn load_json_file(path string, locale string) Localizer {
+    raw := snapshot.read(path + "", MAX_CATALOG_BYTES) or >>
+    cat := ri.decode_catalog_json(&raw) or >>
+    << new_localizer(cat, locale) or >>
+}
+
+pub fn load_csv_file(path string, default_locale string, locale string) Localizer {
+    raw := snapshot.read(path + "", MAX_CATALOG_BYTES) or >>
+    cat := ri.decode_catalog_csv(&raw, default_locale) or >>
+    << new_localizer(cat, locale) or >>
+}
+
+pub fn (l $&Localizer) set_locale(locale string) int {
+    norm := ri.normalize_locale(&locale) or >>
+    if norm != l.current_locale {
+        l.current_locale = norm + ""
+        l.rev += 1
+    }
+    << 0
+}
+
+pub fn (l &Localizer) locale() string { << l.current_locale + "" }
+pub fn (l &Localizer) is_rtl() bool { << ri.is_rtl_locale(&l.current_locale) }
+pub fn (l &Localizer) revision() int { << l.rev }
+pub fn (l &Localizer) missing_key_count() int { << l.missing_count }
+
+pub fn (l &Localizer) missing_keys_snapshot() []string {
+    $out := []string{}
+    for i in 0:l.missing_keys.len { out.push(l.missing_keys[i] + "") }
+    << out
+}
+
+fn (l $&Localizer) record_missing(key &string) {
+    l.missing_count += 1
+    for i in 0:l.missing_keys.len {
+        if l.missing_keys[i] == *key { << }
+    }
+    l.missing_keys.push(key + "")
+}
+
+pub fn (l $&Localizer) tr(key string) string {
+    res := l.catalog.resolve(l.current_locale + "", key + "")
+    if res.len == 0 && !l.catalog.has_entry(l.catalog.default_loc(), key + "") {
+        l.record_missing(&key)
+        << key + ""
+    }
+    << res
+}
+
+pub fn (l $&Localizer) tr_fmt(key string, params &map[string]string) string {
+    tmpl := l.catalog.resolve(l.current_locale + "", key + "")
+    if tmpl.len == 0 && !l.catalog.has_entry(l.catalog.default_loc(), key + "") {
+        l.record_missing(&key)
+        << key + ""
+    }
+    << ri.format_template(&tmpl, params) or >>
+}
+
+pub fn (l $&Localizer) tr_plural(key string, count int, params &map[string]string) string {
+    tmpl := l.catalog.resolve_plural(l.current_locale + "", key + "", count)
+    if tmpl.len == 0 {
+        l.record_missing(&key)
+        << key + ""
+    }
+    $merged := map[string]string{}
+    merged["count"] = str(count)
+    for k, v in params {
+        merged[k + ""] = v + ""
+    }
+    << ri.format_template(&tmpl, &merged) or >>
+}

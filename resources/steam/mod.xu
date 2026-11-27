@@ -1,0 +1,522 @@
+@"github.com/xulang-org/nexus/resources/steam"
+
+#encoding/json
+#errors
+#math
+#strconv
+#strings
+
+pub const STEAM_CONFIG_FORMAT = "nexus.steam"
+pub const STEAM_CONFIG_VERSION = 1
+pub const DEFAULT_CLOUD_QUOTA_BYTES = 104857600
+pub const MAX_CLOUD_FILE_BYTES = 16777216
+pub const MAX_ACHIEVEMENTS = 256
+pub const MAX_STATS = 256
+pub const MAX_LEADERBOARDS = 64
+pub const MAX_DLCS = 64
+
+pub const LOBBY_PRIVATE = 0
+pub const LOBBY_FRIENDS_ONLY = 1
+pub const LOBBY_PUBLIC = 2
+pub const LOBBY_INVISIBLE = 3
+
+pub const EVENT_OVERLAY_ACTIVATED = 1
+pub const EVENT_ACHIEVEMENT_STORED = 2
+pub const EVENT_STATS_RECEIVED = 3
+pub const EVENT_LOBBY_CREATED = 4
+pub const EVENT_LOBBY_ENTERED = 5
+pub const EVENT_LOBBY_LEFT = 6
+pub const EVENT_LOBBY_DATA_UPDATED = 7
+pub const EVENT_P2P_MESSAGE = 8
+pub const EVENT_CLOUD_SYNCED = 9
+pub const EVENT_WORKSHOP_INSTALLED = 10
+
+pub const GLYPH_UNKNOWN = 0
+pub const GLYPH_KEYBOARD_MOUSE = 1
+pub const GLYPH_XBOX = 2
+pub const GLYPH_PLAYSTATION = 3
+pub const GLYPH_STEAM_DECK = 4
+pub const GLYPH_SWITCH = 5
+
+pub struct SteamStatDef {
+    pub id string
+    pub is_float bool
+    pub default_int int
+    pub default_float f64
+}
+
+pub struct SteamAppConfig {
+    pub app_id int
+    pub depot_id int
+    pub branch string
+    pub content_root string
+    pub build_output string
+    pub cloud_quota_bytes int
+    pub require_steam_restart bool
+    pub enable_overlay_pause bool
+    pub enable_steam_input bool
+    pub enable_rich_presence bool
+    pub dlc_ids []int
+    pub achievement_ids []string
+    pub stat_defs []SteamStatDef
+    pub leaderboard_names []string
+}
+
+pub struct SteamUserProfile {
+    pub steam_id int
+    pub persona_name string
+    pub language string
+    pub logged_on bool
+    pub on_steam_deck bool
+    pub in_big_picture bool
+    pub overlay_enabled bool
+}
+
+pub struct SteamAchievement {
+    pub id string
+    pub unlocked bool
+    pub progress int
+    pub max_progress int
+}
+
+pub struct SteamStat {
+    pub id string
+    pub is_float bool
+    pub int_value int
+    pub float_value f64
+}
+
+pub struct SteamLeaderboardEntry {
+    pub steam_id int
+    pub persona_name string
+    pub rank int
+    pub score int
+}
+
+pub struct SteamLobbyInfo {
+    pub lobby_id int
+    pub owner_id int
+    pub visibility int
+    pub max_members int
+    pub member_ids []int
+    pub metadata map[string]string
+}
+
+pub struct SteamDlcInfo {
+    pub app_id int
+    pub installed bool
+    pub name string
+}
+
+pub struct SteamWorkshopItem {
+    pub published_file_id int
+    pub title string
+    pub install_path string
+    pub size_bytes int
+    pub subscribed bool
+    pub installed bool
+}
+
+pub struct SteamEvent {
+    pub kind int
+    pub active bool
+    pub code int
+    pub id int
+    pub text string
+}
+
+pub struct SteamP2PMessage {
+    pub sender_id int
+    pub channel int
+    pub reliable bool
+    pub payload []u8
+}
+
+pub fn (cfg &SteamAppConfig) clone() SteamAppConfig {
+    $dlcs := []int{}
+    for i in 0:cfg.dlc_ids.len { dlcs.push(cfg.dlc_ids[i]) }
+    $achs := []string{}
+    for i in 0:cfg.achievement_ids.len { achs.push(cfg.achievement_ids[i] + "") }
+    $stats := []SteamStatDef{}
+    for i in 0:cfg.stat_defs.len {
+        sd := &cfg.stat_defs[i]
+        stats.push(SteamStatDef{
+            id: sd.id + "",
+            is_float: sd.is_float,
+            default_int: sd.default_int,
+            default_float: sd.default_float
+        })
+    }
+    $lbs := []string{}
+    for i in 0:cfg.leaderboard_names.len { lbs.push(cfg.leaderboard_names[i] + "") }
+    << SteamAppConfig{
+        app_id: cfg.app_id,
+        depot_id: cfg.depot_id,
+        branch: cfg.branch + "",
+        content_root: cfg.content_root + "",
+        build_output: cfg.build_output + "",
+        cloud_quota_bytes: cfg.cloud_quota_bytes,
+        require_steam_restart: cfg.require_steam_restart,
+        enable_overlay_pause: cfg.enable_overlay_pause,
+        enable_steam_input: cfg.enable_steam_input,
+        enable_rich_presence: cfg.enable_rich_presence,
+        dlc_ids: dlcs,
+        achievement_ids: achs,
+        stat_defs: stats,
+        leaderboard_names: lbs
+    }
+}
+
+pub fn default_config(app_id int, depot_id int) SteamAppConfig {
+    << SteamAppConfig{
+        app_id: app_id,
+        depot_id: depot_id,
+        branch: "default",
+        content_root: "../content",
+        build_output: "../output",
+        cloud_quota_bytes: DEFAULT_CLOUD_QUOTA_BYTES,
+        require_steam_restart: false,
+        enable_overlay_pause: true,
+        enable_steam_input: true,
+        enable_rich_presence: true,
+        dlc_ids: []int{},
+        achievement_ids: []string{},
+        stat_defs: []SteamStatDef{},
+        leaderboard_names: []string{}
+    }
+}
+
+fn validate_ascii_token(raw &string, label string) int {
+    lbl := label + ""
+    if raw.len < 1 || raw.len > 128 {
+        >> errors.new("nexus steam: invalid " + lbl + " length")
+    }
+    for i in 0:raw.len {
+        b := raw[i] & 255
+        ok := (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
+            (b >= 48 && b <= 57) || b == 95 || b == 45 || b == 46
+        if !ok {
+            >> errors.new("nexus steam: illegal character in " + lbl + ": " + raw)
+        }
+    }
+    << 0
+}
+
+fn validate_safe_text(raw &string, label string) int {
+    lbl := label + ""
+    if raw.len > 512 {
+        >> errors.new("nexus steam: " + lbl + " exceeds 512 bytes")
+    }
+    for i in 0:raw.len {
+        b := raw[i] & 255
+        if b < 32 || b == 127 {
+            >> errors.new("nexus steam: control character forbidden in " + lbl)
+        }
+    }
+    << 0
+}
+
+pub fn validate_vdf_path(raw &string, label string) int {
+    lbl := label + ""
+    if raw.len < 1 || raw.len > 512 {
+        >> errors.new("nexus steam: empty or overlong " + lbl)
+    }
+    validate_safe_text(raw, lbl + "") or >>
+    if (raw[0] & 255) == 47 || (raw[0] & 255) == 92 {
+        >> errors.new("nexus steam: " + lbl + " must be relative")
+    }
+    if raw.len >= 2 && (raw[1] & 255) == 58 {
+        >> errors.new("nexus steam: drive-qualified path forbidden in " + lbl)
+    }
+    << 0
+}
+
+pub fn validate_cloud_filename(name &string) string {
+    trimmed := strings.trim_space(name)
+    if trimmed.len < 1 || trimmed.len > 240 {
+        >> errors.new("nexus steam: invalid cloud filename length")
+    }
+    validate_safe_text(&trimmed, "cloud filename") or >>
+    if (trimmed[0] & 255) == 47 || (trimmed[0] & 255) == 92 {
+        >> errors.new("nexus steam: cloud filename must be relative: " + trimmed)
+    }
+    if trimmed.len >= 2 && (trimmed[1] & 255) == 58 {
+        >> errors.new("nexus steam: drive-qualified cloud filename forbidden")
+    }
+    slashed := strings.replace_all(&trimmed, "\\", "/")
+    parts := strings.split(&slashed, "/")
+    $clean := []string{}
+    for part in parts {
+        seg := part + ""
+        if seg.len == 0 || seg == "." || seg == ".." {
+            >> errors.new("nexus steam: invalid cloud path segment: " + trimmed)
+        }
+        for i in 0:seg.len {
+            b := seg[i] & 255
+            ok := (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
+                (b >= 48 && b <= 57) || b == 95 || b == 45 || b == 46
+            if !ok {
+                >> errors.new("nexus steam: unsupported character in cloud filename: " + trimmed)
+            }
+        }
+        clean.push(seg)
+    }
+    << strings.join(clean, "/")
+}
+
+pub fn validate_config(cfg &SteamAppConfig) int {
+    if cfg.app_id <= 0 || cfg.depot_id <= 0 {
+        >> errors.new("nexus steam: app_id and depot_id must be positive")
+    }
+    if cfg.cloud_quota_bytes < 4096 || cfg.cloud_quota_bytes > 1073741824 {
+        >> errors.new("nexus steam: cloud_quota_bytes out of valid range")
+    }
+    validate_ascii_token(&cfg.branch, "branch") or >>
+    validate_vdf_path(&cfg.content_root, "content_root") or >>
+    validate_vdf_path(&cfg.build_output, "build_output") or >>
+    if cfg.dlc_ids.len > MAX_DLCS {
+        >> errors.new("nexus steam: dlc_ids exceeds limit")
+    }
+    for i in 0:cfg.dlc_ids.len {
+        if cfg.dlc_ids[i] <= 0 {
+            >> errors.new("nexus steam: dlc app_id must be positive")
+        }
+        for j in 0:i {
+            if cfg.dlc_ids[j] == cfg.dlc_ids[i] {
+                >> errors.new("nexus steam: duplicate dlc app_id")
+            }
+        }
+    }
+    if cfg.achievement_ids.len > MAX_ACHIEVEMENTS {
+        >> errors.new("nexus steam: achievement_ids exceeds limit")
+    }
+    for i in 0:cfg.achievement_ids.len {
+        aid := cfg.achievement_ids[i] + ""
+        validate_ascii_token(&aid, "achievement_id") or >>
+        for j in 0:i {
+            if cfg.achievement_ids[j] == aid {
+                >> errors.new("nexus steam: duplicate achievement_id: " + aid)
+            }
+        }
+    }
+    if cfg.stat_defs.len > MAX_STATS {
+        >> errors.new("nexus steam: stat_defs exceeds limit")
+    }
+    for i in 0:cfg.stat_defs.len {
+        sd := &cfg.stat_defs[i]
+        sid := sd.id + ""
+        validate_ascii_token(&sid, "stat_id") or >>
+        if math.is_nan(sd.default_float) || math.is_inf(sd.default_float) {
+            >> errors.new("nexus steam: stat default_float must be finite")
+        }
+        for j in 0:i {
+            if cfg.stat_defs[j].id == sid {
+                >> errors.new("nexus steam: duplicate stat_id: " + sid)
+            }
+        }
+    }
+    if cfg.leaderboard_names.len > MAX_LEADERBOARDS {
+        >> errors.new("nexus steam: leaderboard_names exceeds limit")
+    }
+    for i in 0:cfg.leaderboard_names.len {
+        lb := cfg.leaderboard_names[i] + ""
+        validate_ascii_token(&lb, "leaderboard_name") or >>
+        for j in 0:i {
+            if cfg.leaderboard_names[j] == lb {
+                >> errors.new("nexus steam: duplicate leaderboard_name: " + lb)
+            }
+        }
+    }
+    << 0
+}
+
+fn escape_vdf(raw &string) string {
+    $b := strings.new_byte_builder(raw.len + 16)
+    for i in 0:raw.len {
+        c := raw[i] & 255
+        if c == 34 {
+            b.write_str("\\\"")
+        } else if c == 92 {
+            b.write_str("\\\\")
+        } else {
+            b.write_byte(int(c))
+        }
+    }
+    << b.to_string()
+}
+
+pub fn generate_steam_appid_txt(app_id int) string {
+    if app_id <= 0 {
+        >> errors.new("nexus steam: steam_appid requires positive app_id")
+    }
+    << str(app_id) + "\n"
+}
+
+pub fn generate_depot_build_vdf(cfg &SteamAppConfig) string {
+    validate_config(cfg) or >>
+    $b := strings.new_byte_builder(512)
+    b.write_str("\"DepotBuild\"\n{\n")
+    b.write_str("\t\"DepotID\"\t\t\"" + str(cfg.depot_id) + "\"\n")
+    b.write_str("\t\"ContentRoot\"\t\"" + escape_vdf(&cfg.content_root) + "\"\n")
+    b.write_str("\t\"FileMapping\"\n\t{\n")
+    b.write_str("\t\t\"LocalPath\"\t\t\"*\"\n")
+    b.write_str("\t\t\"DepotPath\"\t\t\".\"\n")
+    b.write_str("\t\t\"recursive\"\t\t\"1\"\n")
+    b.write_str("\t}\n")
+    b.write_str("\t\"FileExclusion\"\t\"*.pdb\"\n")
+    b.write_str("}\n")
+    << b.to_string()
+}
+
+pub fn generate_app_build_vdf(cfg &SteamAppConfig, description string, preview bool) string {
+    validate_config(cfg) or >>
+    validate_safe_text(&description, "VDF description") or >>
+    $desc_text := "Nexus SteamPipe build"
+    if description.len > 0 { desc_text = description + "" }
+    $prev_flag := "0"
+    if preview { prev_flag = "1" }
+    $b := strings.new_byte_builder(512)
+    b.write_str("\"AppBuild\"\n{\n")
+    b.write_str("\t\"AppID\"\t\t\t\"" + str(cfg.app_id) + "\"\n")
+    b.write_str("\t\"Desc\"\t\t\t\"" + escape_vdf(&desc_text) + "\"\n")
+    b.write_str("\t\"SetLive\"\t\t\"" + escape_vdf(&cfg.branch) + "\"\n")
+    b.write_str("\t\"Preview\"\t\t\"" + prev_flag + "\"\n")
+    b.write_str("\t\"ContentRoot\"\t\"" + escape_vdf(&cfg.content_root) + "\"\n")
+    b.write_str("\t\"BuildOutput\"\t\"" + escape_vdf(&cfg.build_output) + "\"\n")
+    b.write_str("\t\"Depots\"\n\t{\n")
+    b.write_str("\t\t\"" + str(cfg.depot_id) + "\"\t\"depot_build_" + str(cfg.depot_id) + ".vdf\"\n")
+    b.write_str("\t}\n")
+    b.write_str("}\n")
+    << b.to_string()
+}
+
+fn json_bool(v bool) string {
+    if v { << "true" }
+    << "false"
+}
+
+pub fn encode_config_json(cfg &SteamAppConfig) string {
+    validate_config(cfg) or >>
+    $b := strings.new_byte_builder(1024)
+    fmt_s := STEAM_CONFIG_FORMAT + ""
+    br_s := cfg.branch + ""
+    cr_s := cfg.content_root + ""
+    bo_s := cfg.build_output + ""
+    b.write_str("{\n")
+    b.write_str("  \"format\": " + json.quote(&fmt_s) + ",\n")
+    b.write_str("  \"version\": " + str(STEAM_CONFIG_VERSION) + ",\n")
+    b.write_str("  \"app_id\": " + str(cfg.app_id) + ",\n")
+    b.write_str("  \"depot_id\": " + str(cfg.depot_id) + ",\n")
+    b.write_str("  \"branch\": " + json.quote(&br_s) + ",\n")
+    b.write_str("  \"content_root\": " + json.quote(&cr_s) + ",\n")
+    b.write_str("  \"build_output\": " + json.quote(&bo_s) + ",\n")
+    b.write_str("  \"cloud_quota_bytes\": " + str(cfg.cloud_quota_bytes) + ",\n")
+    b.write_str("  \"require_steam_restart\": " + json_bool(cfg.require_steam_restart) + ",\n")
+    b.write_str("  \"enable_overlay_pause\": " + json_bool(cfg.enable_overlay_pause) + ",\n")
+    b.write_str("  \"enable_steam_input\": " + json_bool(cfg.enable_steam_input) + ",\n")
+    b.write_str("  \"enable_rich_presence\": " + json_bool(cfg.enable_rich_presence) + ",\n")
+    b.write_str("  \"dlc_ids\": [")
+    for i in 0:cfg.dlc_ids.len {
+        if i > 0 { b.write_str(", ") }
+        b.write_str(str(cfg.dlc_ids[i]))
+    }
+    b.write_str("],\n  \"achievement_ids\": [")
+    for i in 0:cfg.achievement_ids.len {
+        if i > 0 { b.write_str(", ") }
+        aid := cfg.achievement_ids[i] + ""
+        b.write_str(json.quote(&aid))
+    }
+    b.write_str("],\n  \"stat_defs\": [")
+    for i in 0:cfg.stat_defs.len {
+        if i > 0 { b.write_str(", ") }
+        sd := &cfg.stat_defs[i]
+        sid := sd.id + ""
+        df_s := strconv.format_float(sd.default_float, 103, -1) or >>
+        b.write_str("{\"id\": " + json.quote(&sid) +
+            ", \"is_float\": " + json_bool(sd.is_float) +
+            ", \"default_int\": " + str(sd.default_int) +
+            ", \"default_float\": " + df_s + "}")
+    }
+    b.write_str("],\n  \"leaderboard_names\": [")
+    for i in 0:cfg.leaderboard_names.len {
+        if i > 0 { b.write_str(", ") }
+        lb := cfg.leaderboard_names[i] + ""
+        b.write_str(json.quote(&lb))
+    }
+    b.write_str("]\n}\n")
+    << b.to_string()
+}
+
+pub fn decode_config_json(raw &string) SteamAppConfig {
+    if raw.len < 2 || raw.len > 1048576 {
+        >> errors.new("nexus steam: config JSON size out of bounds")
+    }
+    doc := json.parse_max(raw, 1048576)
+    if !doc.ok() { >> errors.new("nexus steam JSON: " + doc.error()) }
+    root := doc.root()
+    if !doc.is_dict(root) { >> errors.new("nexus steam: root must be object") }
+    if !doc.has(root, "format") || !doc.has(root, "version") || !doc.has(root, "app_id") || !doc.has(root, "depot_id") {
+        >> errors.new("nexus steam: missing required config field (format/version/app_id/depot_id)")
+    }
+    fmt_s := doc.as_string(doc.get(root, "format")) or >>
+    ver := doc.as_int(doc.get(root, "version")) or >>
+    if fmt_s != STEAM_CONFIG_FORMAT || ver != STEAM_CONFIG_VERSION {
+        >> errors.new("nexus steam: unsupported config format or version")
+    }
+    app_id := doc.as_int(doc.get(root, "app_id")) or >>
+    depot_id := doc.as_int(doc.get(root, "depot_id")) or >>
+    $cfg := default_config(app_id, depot_id)
+    if doc.has(root, "branch") { cfg.branch = doc.as_string(doc.get(root, "branch")) or >> }
+    if doc.has(root, "content_root") { cfg.content_root = doc.as_string(doc.get(root, "content_root")) or >> }
+    if doc.has(root, "build_output") { cfg.build_output = doc.as_string(doc.get(root, "build_output")) or >> }
+    if doc.has(root, "cloud_quota_bytes") { cfg.cloud_quota_bytes = doc.as_int(doc.get(root, "cloud_quota_bytes")) or >> }
+    if doc.has(root, "require_steam_restart") { cfg.require_steam_restart = doc.as_bool(doc.get(root, "require_steam_restart")) or >> }
+    if doc.has(root, "enable_overlay_pause") { cfg.enable_overlay_pause = doc.as_bool(doc.get(root, "enable_overlay_pause")) or >> }
+    if doc.has(root, "enable_steam_input") { cfg.enable_steam_input = doc.as_bool(doc.get(root, "enable_steam_input")) or >> }
+    if doc.has(root, "enable_rich_presence") { cfg.enable_rich_presence = doc.as_bool(doc.get(root, "enable_rich_presence")) or >> }
+    if doc.has(root, "dlc_ids") {
+        dlcs := doc.get(root, "dlc_ids")
+        if !doc.is_list(dlcs) { >> errors.new("nexus steam: dlc_ids must be list") }
+        for i in 0:doc.count(dlcs) {
+            cfg.dlc_ids.push(doc.as_int(doc.at(dlcs, i)) or >>)
+        }
+    }
+    if doc.has(root, "achievement_ids") {
+        aids := doc.get(root, "achievement_ids")
+        if !doc.is_list(aids) { >> errors.new("nexus steam: achievement_ids must be list") }
+        for i in 0:doc.count(aids) {
+            cfg.achievement_ids.push(doc.as_string(doc.at(aids, i)) or >>)
+        }
+    }
+    if doc.has(root, "stat_defs") {
+        slist := doc.get(root, "stat_defs")
+        if !doc.is_list(slist) { >> errors.new("nexus steam: stat_defs must be list") }
+        for i in 0:doc.count(slist) {
+            node := doc.at(slist, i)
+            if !doc.is_dict(node) || !doc.has(node, "id") {
+                >> errors.new("nexus steam: stat_defs element must be object with id")
+            }
+            $is_f := false
+            if doc.has(node, "is_float") { is_f = doc.as_bool(doc.get(node, "is_float")) or >> }
+            $dint := 0
+            if doc.has(node, "default_int") { dint = doc.as_int(doc.get(node, "default_int")) or >> }
+            $dflt := 0.0
+            if doc.has(node, "default_float") { dflt = doc.as_f64(doc.get(node, "default_float")) or >> }
+            cfg.stat_defs.push(SteamStatDef{
+                id: doc.as_string(doc.get(node, "id")) or >>,
+                is_float: is_f,
+                default_int: dint,
+                default_float: dflt
+            })
+        }
+    }
+    if doc.has(root, "leaderboard_names") {
+        lbn := doc.get(root, "leaderboard_names")
+        if !doc.is_list(lbn) { >> errors.new("nexus steam: leaderboard_names must be list") }
+        for i in 0:doc.count(lbn) {
+            cfg.leaderboard_names.push(doc.as_string(doc.at(lbn, i)) or >>)
+        }
+    }
+    validate_config(&cfg) or >>
+    << cfg
+}

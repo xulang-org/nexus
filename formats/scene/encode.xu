@@ -30,7 +30,8 @@ fn transform(node &resource.NodeData) []f64 {
 pub fn encode(document &resource.Document) string {
     if document.node_count() < 1 { >> errors.new("nexus scene: cannot encode an empty document") }
     $out := strings.new_byte_builder(4096)
-    out.write_str("{\"format\":\"" + FORMAT + "\",\"version\":" + str(VERSION) + ",\"nodes\":[\n")
+    $version := LEGACY_VERSION
+    out.write_str(",\"nodes\":[\n")
     for i in 0:document.node_count() {
         if i > 0 { out.write_str(",\n") }
         node := document.describe_node(i) or >>
@@ -48,6 +49,12 @@ pub fn encode(document &resource.Document) string {
             }
             out.write_str("]")
         }
+        if node.camera_2d.is_set() || node.orthographic.is_set() {
+            version = CAMERA_VERSION
+        } else if node.camera.is_set() && version == LEGACY_VERSION {
+            version = PERSPECTIVE_VERSION
+        }
+        out.write_str(encode_camera(&node) or >>)
         out.write_str("}")
     }
     out.write_str("\n]")
@@ -55,8 +62,40 @@ pub fn encode(document &resource.Document) string {
     out.write_str(encode_audio(document) or >>)
     out.write_str(encode_scripts(document) or >>)
     out.write_str(encode_lights(document) or >>)
+    for i in 0:document.light_count() {
+        light := document.light(i) or >>
+        if light.punctual.enabled() {
+            if version < PUNCTUAL_SHADOW_VERSION { version = PUNCTUAL_SHADOW_VERSION }
+        } else if light.cascades.enabled() {
+            if version < CASCADE_VERSION { version = CASCADE_VERSION }
+        }
+    }
+    for i in 0:document.surface_count() {
+        if (document.surface(i) or >>).levels.len > 0 {
+            if version < LOD_VERSION { version = LOD_VERSION }
+            <-
+        }
+    }
+    has_v10 := document.has_modeling_attachments()
+    if document.sprite_3d_count() > 0 || document.tilemap_2d_count() > 0 || document.has_modern_attachments() || has_v10 {
+        version = SPRITE_TILEMAP_VERSION
+        if document.has_solid_tiles_2d() { version = TILE_COLLISION_VERSION }
+        if document.has_modern_attachments() { version = MODERN_COMPONENTS_VERSION }
+        if has_v10 { version = MODELING_VERSION }
+        out.write_str(encode_sprites_3d(document) or >>)
+        out.write_str(encode_tilemaps_2d(document, version) or >>)
+    }
+    if document.has_modern_attachments() || has_v10 {
+        out.write_str(encode_modern(document) or >>)
+    }
+    if has_v10 {
+        out.write_str(encode_modeling_v10(document) or >>)
+    }
     out.write_str("}\n")
-    raw := out.to_string()
+    raw := "{\"format\":\"" + FORMAT + "\",\"version\":" + str(version) + out.to_string()
     if raw.len > MAX_BYTES { >> errors.new("nexus scene: encoded file exceeds byte limit") }
+    // A JSON node occupies at least one byte. Larger documents must also fit
+    // the exact reader budget before the file can be published.
+    if raw.len > MAX_JSON_NODES { parse_scene_json(&raw) or >> }
     << raw
 }

@@ -1,0 +1,286 @@
+@"github.com/xulang-org/nexus/timing"
+
+#errors
+#strings
+
+pub const JOB_PENDING = 0
+pub const JOB_RUNNING = 1
+pub const JOB_DONE = 2
+pub const JOB_FAILED = 3
+pub const JOB_CANCELLED = 4
+
+pub struct JobQueueStats {
+    pub pending int
+    pub ready int
+    pub running int
+    pub done int
+    pub failed int
+    pub cancelled int
+    pub total_dispatched_units int
+}
+
+struct JobEntry {
+    id int
+    tag string
+    priority int
+    cost_units int
+    depends_on []int
+    max_retries int
+    retries int
+    status int
+}
+
+pub struct BudgetedJobQueue {
+    unit_budget_per_tick int
+    max_in_flight int
+    next_id int
+    total_dispatched_units int
+    jobs []JobEntry
+    id_to_index map[int]int
+}
+
+pub fn new_job_queue(unit_budget_per_tick int, max_in_flight int) BudgetedJobQueue {
+    if unit_budget_per_tick < 1 || max_in_flight < 1 {
+        >> errors.new("nexus timing: job queue unit_budget_per_tick and max_in_flight must be >= 1")
+    }
+    << BudgetedJobQueue{
+        unit_budget_per_tick: unit_budget_per_tick,
+        max_in_flight: max_in_flight,
+        next_id: 1,
+        total_dispatched_units: 0,
+        jobs: []JobEntry{},
+        id_to_index: map[int]int{}
+    }
+}
+
+pub fn (q $&BudgetedJobQueue) enqueue(
+    tag string,
+    priority int,
+    cost_units int,
+    depends_on []int,
+    max_retries int
+) int {
+    if cost_units < 1 {
+        >> errors.new("nexus timing: job cost_units must be >= 1")
+    }
+    if max_retries < 0 || max_retries > 64 {
+        >> errors.new("nexus timing: job max_retries must be in [0, 64]")
+    }
+    $clean_deps := []int{}
+    for d in depends_on {
+        if !q.id_to_index.has(d) {
+            >> errors.new("nexus timing: unknown dependency job id " + str(d))
+        }
+        $dup := false
+        for ex in clean_deps {
+            if ex == d {
+                dup = true
+                <-
+            }
+        }
+        if !dup { clean_deps.push(d) }
+    }
+    id := q.next_id
+    q.next_id += 1
+    idx := q.jobs.len
+    q.jobs.push(JobEntry{
+        id: id,
+        tag: tag + "",
+        priority: priority,
+        cost_units: cost_units,
+        depends_on: clean_deps,
+        max_retries: max_retries,
+        retries: 0,
+        status: JOB_PENDING
+    })
+    q.id_to_index[id] = idx
+    << id
+}
+
+pub fn (q &BudgetedJobQueue) status(job_id int) int {
+    if !q.id_to_index.has(job_id) {
+        >> errors.new("nexus timing: unknown job id " + str(job_id))
+    }
+    << q.jobs[q.id_to_index[job_id]].status
+}
+
+pub fn (q &BudgetedJobQueue) retry_count(job_id int) int {
+    if !q.id_to_index.has(job_id) {
+        >> errors.new("nexus timing: unknown job id " + str(job_id))
+    }
+    << q.jobs[q.id_to_index[job_id]].retries
+}
+
+pub fn (q $&BudgetedJobQueue) reprioritize(job_id int, priority int) bool {
+    if !q.id_to_index.has(job_id) { << false }
+    idx := q.id_to_index[job_id]
+    if q.jobs[idx].status != JOB_PENDING { << false }
+    q.jobs[idx].priority = priority
+    << true
+}
+
+fn (q $&BudgetedJobQueue) cascade_blocked_dependents() {
+    $changed := true
+    while changed {
+        changed = false
+        for i in 0:q.jobs.len {
+            if q.jobs[i].status != JOB_PENDING { -> }
+            $blocked := false
+            for d in q.jobs[i].depends_on {
+                ds := q.jobs[q.id_to_index[d]].status
+                if ds == JOB_FAILED || ds == JOB_CANCELLED {
+                    blocked = true
+                    <-
+                }
+            }
+            if blocked {
+                q.jobs[i].status = JOB_CANCELLED
+                changed = true
+            }
+        }
+    }
+}
+
+pub fn (q $&BudgetedJobQueue) cancel(job_id int) bool {
+    if !q.id_to_index.has(job_id) { << false }
+    idx := q.id_to_index[job_id]
+    st := q.jobs[idx].status
+    if st != JOB_PENDING && st != JOB_RUNNING { << false }
+    q.jobs[idx].status = JOB_CANCELLED
+    q.cascade_blocked_dependents()
+    << true
+}
+
+pub fn (q $&BudgetedJobQueue) cancel_by_tag(tag string) int {
+    $count := 0
+    for i in 0:q.jobs.len {
+        st := q.jobs[i].status
+        if q.jobs[i].tag == tag && (st == JOB_PENDING || st == JOB_RUNNING) {
+            q.jobs[i].status = JOB_CANCELLED
+            count += 1
+        }
+    }
+    if count > 0 {
+        q.cascade_blocked_dependents()
+    }
+    << count
+}
+
+fn (q &BudgetedJobQueue) is_job_ready(idx int) bool {
+    if q.jobs[idx].status != JOB_PENDING { << false }
+    for d in q.jobs[idx].depends_on {
+        if q.jobs[q.id_to_index[d]].status != JOB_DONE { << false }
+    }
+    << true
+}
+
+pub fn (q $&BudgetedJobQueue) dispatch_tick() []int {
+    q.cascade_blocked_dependents()
+    $running := 0
+    $ready_idxs := []int{}
+    for i in 0:q.jobs.len {
+        if q.jobs[i].status == JOB_RUNNING {
+            running += 1
+        } else if q.is_job_ready(i) {
+            ready_idxs.push(i)
+        }
+    }
+    if running >= q.max_in_flight || ready_idxs.len == 0 {
+        << []int{}
+    }
+    // Sort ready jobs by priority descending, then job id ascending.
+    for i in 1:ready_idxs.len {
+        cur := ready_idxs[i]
+        cur_p := q.jobs[cur].priority
+        cur_id := q.jobs[cur].id
+        $j := i - 1
+        while j >= 0 {
+            prev := ready_idxs[j]
+            pp := q.jobs[prev].priority
+            pid := q.jobs[prev].id
+            if pp < cur_p || (pp == cur_p && pid > cur_id) {
+                ready_idxs[j + 1] = prev
+                j -= 1
+            } else {
+                <-
+            }
+        }
+        ready_idxs[j + 1] = cur
+    }
+
+    $dispatched := []int{}
+    $used_units := 0
+    for idx in ready_idxs {
+        if running >= q.max_in_flight { <- }
+        cost := q.jobs[idx].cost_units
+        fits := used_units + cost <= q.unit_budget_per_tick
+        oversized_first := dispatched.len == 0 && running == 0
+        if !fits && !oversized_first { -> }
+        q.jobs[idx].status = JOB_RUNNING
+        dispatched.push(q.jobs[idx].id)
+        used_units += cost
+        q.total_dispatched_units += cost
+        running += 1
+    }
+    << dispatched
+}
+
+pub fn (q $&BudgetedJobQueue) complete(job_id int) int {
+    if !q.id_to_index.has(job_id) {
+        >> errors.new("nexus timing: unknown job id " + str(job_id))
+    }
+    idx := q.id_to_index[job_id]
+    if q.jobs[idx].status == JOB_CANCELLED { << 0 }
+    if q.jobs[idx].status != JOB_RUNNING {
+        >> errors.new("nexus timing: cannot complete non-running job " + str(job_id))
+    }
+    q.jobs[idx].status = JOB_DONE
+    << 0
+}
+
+pub fn (q $&BudgetedJobQueue) fail(job_id int) int {
+    if !q.id_to_index.has(job_id) {
+        >> errors.new("nexus timing: unknown job id " + str(job_id))
+    }
+    idx := q.id_to_index[job_id]
+    if q.jobs[idx].status == JOB_CANCELLED { << JOB_CANCELLED }
+    if q.jobs[idx].status != JOB_RUNNING {
+        >> errors.new("nexus timing: cannot fail non-running job " + str(job_id))
+    }
+    if q.jobs[idx].retries < q.jobs[idx].max_retries {
+        q.jobs[idx].retries += 1
+        q.jobs[idx].status = JOB_PENDING
+        << JOB_PENDING
+    }
+    q.jobs[idx].status = JOB_FAILED
+    q.cascade_blocked_dependents()
+    << JOB_FAILED
+}
+
+pub fn (q &BudgetedJobQueue) stats() JobQueueStats {
+    $pending := 0
+    $ready := 0
+    $running := 0
+    $done := 0
+    $failed := 0
+    $cancelled := 0
+    for i in 0:q.jobs.len {
+        st := q.jobs[i].status
+        if st == JOB_PENDING {
+            pending += 1
+            if q.is_job_ready(i) { ready += 1 }
+        } else if st == JOB_RUNNING { running += 1 }
+        else if st == JOB_DONE { done += 1 }
+        else if st == JOB_FAILED { failed += 1 }
+        else if st == JOB_CANCELLED { cancelled += 1 }
+    }
+    << JobQueueStats{
+        pending: pending,
+        ready: ready,
+        running: running,
+        done: done,
+        failed: failed,
+        cancelled: cancelled,
+        total_dispatched_units: q.total_dispatched_units
+    }
+}

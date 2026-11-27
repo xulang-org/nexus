@@ -24,10 +24,14 @@ def build(project_path, output, tool):
     template_path = project_path.parent / portable(project['template'])
     scene = json.loads(template_path.read_text())
     arrays = {'nodes', 'resources', 'surfaces', 'audio_buses', 'audio_emitters', 'scripts', 'script_connections', 'lights'}
-    if not isinstance(scene, dict) or set(scene) != arrays | {'format', 'version'}:
+    if not isinstance(scene, dict) or scene.get('format') != 'xu.scene' or type(scene.get('version')) is not int or not 1 <= scene['version'] <= 8:
+        raise ValueError('script scene template must use xu.scene version 1 through 8')
+    resource_types = {'glb_model', 'wav_clip', 'xu_bytecode'}
+    if scene['version'] >= 7:
+        arrays.update({'sprites_3d', 'tilemaps_2d'})
+        resource_types.add('image_rgba')
+    if set(scene) != arrays | {'format', 'version'}:
         raise ValueError('scene template must provide the complete current schema')
-    if scene['format'] != 'xu.scene' or type(scene['version']) is not int or scene['version'] != 1:
-        raise ValueError('script scene template must use xu.scene version 1')
     if any(not isinstance(scene[name], list) for name in arrays):
         raise ValueError('scene template collections must be arrays')
     scripts = {item['uid']: item for item in project['scripts']}
@@ -44,7 +48,7 @@ def build(project_path, output, tool):
     temporary_scene = None
     try:
         for reference in references:
-            if reference['type'] not in {'glb_model', 'wav_clip', 'xu_bytecode'}:
+            if reference['type'] not in resource_types:
                 raise ValueError('unsupported source resource type')
             target = stage / portable(reference['path'])
             target.parent.mkdir(parents=True, exist_ok=True)

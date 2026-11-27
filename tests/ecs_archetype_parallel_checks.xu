@@ -1,0 +1,145 @@
+@main
+
+#math
+#time
+fm #"github.com/xulang-org/nexus/foundation/math"
+ecs #"github.com/xulang-org/nexus/ecs"
+
+fn vec_close(a fm.Vec3, b fm.Vec3) bool {
+    << math.abs(a.x - b.x) < 1e-9 && math.abs(a.y - b.y) < 1e-9 && math.abs(a.z - b.z) < 1e-9
+}
+
+fn run() int {
+    // 1. Conflict graph & parallel stage scheduler test.
+    systems := [ecs.sys_integrate_velocity(),
+                ecs.sys_update_bounds(),
+                ecs.sys_audio_attenuation(),
+                ecs.sys_step_particles(),
+                ecs.sys_health_regen()]
+    sched := ecs.compile_schedule(&systems) or >>
+    // Stage 0: IntegrateVelocity (W:TRANSFORM) + StepParticles (W:PARTICLE) + HealthRegen (W:HEALTH) -> 3 parallel!
+    // Stage 1: UpdateBounds (R:TRANSFORM, W:BOUNDS) + AudioAttenuation (R:TRANSFORM, W:AUDIO) -> 2 parallel!
+    assert(sched.stages.len == 2)
+    assert(sched.stages[0].system_indices.len == 3)
+    assert(sched.stages[1].system_indices.len == 2)
+    assert((sched.stages[1].shared_read_mask & ecs.COMP_TRANSFORM) != 0)
+
+    // 2. Equivalence check between execute_sequential, execute_parallel, and persistent EcsWorkerPool across multiple archetypes & swap-remove despawn!
+    $w_seq := ecs.new_ecs_world()
+    $w_par := ecs.new_ecs_world()
+    $w_pool := ecs.new_ecs_world()
+
+    full_mask := ecs.COMP_TRANSFORM | ecs.COMP_VELOCITY | ecs.COMP_BOUNDS | ecs.COMP_HEALTH | ecs.COMP_PARTICLE | ecs.COMP_AUDIO
+    fast_mask := ecs.COMP_TRANSFORM | ecs.COMP_VELOCITY | ecs.COMP_BOUNDS
+
+    $h_seq := w_seq.spawn_batch(full_mask, 320) or >>
+    $h_par := w_par.spawn_batch(full_mask, 320) or >>
+    $h_pool := w_pool.spawn_batch(full_mask, 320) or >>
+    $f_seq := w_seq.spawn_batch(fast_mask, 300) or >>
+    $f_par := w_par.spawn_batch(fast_mask, 300) or >>
+    $f_pool := w_pool.spawn_batch(fast_mask, 300) or >>
+
+    assert(w_seq.archetype_count() == 2 && w_seq.entity_count() == 620)
+    assert(w_seq.chunk_count() == 4) // 256+64 in arch0, 256+44 in arch1
+
+    for i in 0:320 {
+        p := fm.vec3(f64(i % 16) * 0.5, f64(i / 16) * 0.5, 0.0)
+        sc := fm.vec3(1.5, 2.0, 1.0)
+        vel := fm.vec3(2.0, -0.5, 1.0)
+        w_seq.set_transform(h_seq[i], p, sc) or >>
+        w_par.set_transform(h_par[i], p, sc) or >>
+        w_pool.set_transform(h_pool[i], p, sc) or >>
+        w_seq.set_velocity(h_seq[i], vel) or >>
+        w_par.set_velocity(h_par[i], vel) or >>
+        w_pool.set_velocity(h_pool[i], vel) or >>
+        w_seq.set_bounds(h_seq[i], fm.aabb3(fm.vec3(-1.0, -1.0, -1.0), fm.vec3(1.0, 1.0, 1.0)) or >>) or >>
+        w_par.set_bounds(h_par[i], fm.aabb3(fm.vec3(-1.0, -1.0, -1.0), fm.vec3(1.0, 1.0, 1.0)) or >>) or >>
+        w_pool.set_bounds(h_pool[i], fm.aabb3(fm.vec3(-1.0, -1.0, -1.0), fm.vec3(1.0, 1.0, 1.0)) or >>) or >>
+        w_seq.set_health(h_seq[i], 50.0, 100.0, 10.0) or >>
+        w_par.set_health(h_par[i], 50.0, 100.0, 10.0) or >>
+        w_pool.set_health(h_pool[i], 50.0, 100.0, 10.0) or >>
+        w_seq.set_particle(h_seq[i], 0.1, 2.0, 0.0) or >>
+        w_par.set_particle(h_par[i], 0.1, 2.0, 0.0) or >>
+        w_pool.set_particle(h_pool[i], 0.1, 2.0, 0.0) or >>
+        w_seq.set_audio(h_seq[i], 20.0, 1.0) or >>
+        w_par.set_audio(h_par[i], 20.0, 1.0) or >>
+        w_pool.set_audio(h_pool[i], 20.0, 1.0) or >>
+    }
+    for i in 0:300 {
+        p := fm.vec3(f64(i), 1.0, -2.0)
+        v := fm.vec3(-1.0, 0.5, 0.0)
+        w_seq.set_transform(f_seq[i], p, fm.vec3(1.0, 1.0, 1.0)) or >>
+        w_par.set_transform(f_par[i], p, fm.vec3(1.0, 1.0, 1.0)) or >>
+        w_pool.set_transform(f_pool[i], p, fm.vec3(1.0, 1.0, 1.0)) or >>
+        w_seq.set_velocity(f_seq[i], v) or >>
+        w_par.set_velocity(f_par[i], v) or >>
+        w_pool.set_velocity(f_pool[i], v) or >>
+    }
+
+    // Despawn some entities and check O(1) swap-remove + stale generation safety!
+    w_seq.despawn(h_seq[10]) or >>
+    w_par.despawn(h_par[10]) or >>
+    w_pool.despawn(h_pool[10]) or >>
+    w_seq.despawn(h_seq[256]) or >>
+    w_par.despawn(h_par[256]) or >>
+    w_pool.despawn(h_pool[256]) or >>
+    assert(!w_seq.is_alive(h_seq[10]) && !w_par.is_alive(h_par[256]) && !w_pool.is_alive(h_pool[256]))
+    assert(w_seq.entity_count() == 618 && w_par.entity_count() == 618 && w_pool.entity_count() == 618)
+
+    ctx_seq := ecs.FrameContext{dt: 0.1, listener: fm.vec3(0.0, 0.0, 0.0), workers: 1}
+    ctx_par := ecs.FrameContext{dt: 0.1, listener: fm.vec3(0.0, 0.0, 0.0), workers: 4}
+    $pool4 := ecs.new_worker_pool(4) or >>
+    for _ in 0:10 {
+        ecs.execute_sequential(&w_seq, &sched, ctx_seq) or >>
+        ecs.execute_parallel(&w_par, &sched, ctx_par) or >>
+        ecs.execute_with_pool(&pool4, &w_pool, &sched, ctx_par) or >>
+    }
+
+    for i in 0:320 {
+        if i == 10 || i == 256 { -> }
+        assert(vec_close(w_seq.get_position(h_seq[i]) or >>, w_par.get_position(h_par[i]) or >>))
+        assert(vec_close(w_seq.get_position(h_seq[i]) or >>, w_pool.get_position(h_pool[i]) or >>))
+        b_s := w_seq.get_world_bounds(h_seq[i]) or >>
+        b_p := w_par.get_world_bounds(h_par[i]) or >>
+        b_o := w_pool.get_world_bounds(h_pool[i]) or >>
+        assert(vec_close(b_s.minimum, b_p.minimum) && vec_close(b_s.maximum, b_p.maximum))
+        assert(vec_close(b_s.minimum, b_o.minimum) && vec_close(b_s.maximum, b_o.maximum))
+        assert(math.abs((w_seq.get_health(h_seq[i]) or >>) - (w_par.get_health(h_par[i]) or >>)) < 1e-9)
+        assert(math.abs((w_seq.get_health(h_seq[i]) or >>) - (w_pool.get_health(h_pool[i]) or >>)) < 1e-9)
+        assert(math.abs((w_seq.get_particle_age(h_seq[i]) or >>) - (w_par.get_particle_age(h_par[i]) or >>)) < 1e-9)
+        assert(math.abs((w_seq.get_particle_age(h_seq[i]) or >>) - (w_pool.get_particle_age(h_pool[i]) or >>)) < 1e-9)
+        assert(math.abs((w_seq.get_audio_attenuated(h_seq[i]) or >>) - (w_par.get_audio_attenuated(h_par[i]) or >>)) < 1e-9)
+        assert(math.abs((w_seq.get_audio_attenuated(h_seq[i]) or >>) - (w_pool.get_audio_attenuated(h_pool[i]) or >>)) < 1e-9)
+    }
+
+    // 3. Throughput Benchmark: 20,480 entities (80 contiguous 256-entity chunks) across 20 steps!
+    $bench := ecs.new_ecs_world()
+    _ := bench.spawn_batch(full_mask, 20480) or >>
+    assert(bench.chunk_count() == 80)
+
+    t0 := time.now()
+    for _ in 0:20 {
+        ecs.execute_sequential(&bench, &sched, ctx_seq) or >>
+    }
+    seq_us := (time.now() - t0) / 1000
+
+    t1 := time.now()
+    for _ in 0:20 {
+        ecs.execute_with_pool(&pool4, &bench, &sched, ctx_par) or >>
+    }
+    pool_us := (time.now() - t1) / 1000
+    pool4.close() or >>
+
+    assert(pool_us <= seq_us * 2 + 500)
+    println("PASS: Archetype Chunk ECS + Disjoint Xu Coroutine Persistent Pool (stages=" +
+        str(sched.stages.len) + ", 618 live verified, 20480x20 bench: seq=" +
+        str(seq_us) + "us, pool4=" + str(pool_us) + "us)")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

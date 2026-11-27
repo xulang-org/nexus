@@ -1,0 +1,350 @@
+@"github.com/xulang-org/nexus/formats/scene"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+resource #"github.com/xulang-org/nexus/resources/scene"
+#encoding/json
+#strconv
+#strings
+#errors
+
+fn sky_mode_name(mode int) string {
+    if mode == resource.SKY_SOLID { << "solid" }
+    << "atmosphere"
+}
+
+fn sky_mode_value(name string) int {
+    if name == "solid" { << resource.SKY_SOLID }
+    if name == "atmosphere" { << resource.SKY_ATMOSPHERE }
+    >> errors.new("nexus scene: unsupported environment sky_mode")
+}
+
+fn body_type_name(t int) string {
+    if t == resource.BODY_STATIC { << "static" }
+    if t == resource.BODY_KINEMATIC { << "kinematic" }
+    << "dynamic"
+}
+
+fn body_type_value(name string) int {
+    if name == "static" { << resource.BODY_STATIC }
+    if name == "kinematic" { << resource.BODY_KINEMATIC }
+    if name == "dynamic" { << resource.BODY_DYNAMIC }
+    >> errors.new("nexus scene: unsupported RigidBody3D body_type")
+}
+
+fn shape_kind_name(k int) string {
+    if k == resource.SHAPE_BOX { << "box" }
+    if k == resource.SHAPE_SPHERE { << "sphere" }
+    if k == resource.SHAPE_CAPSULE { << "capsule" }
+    << "mesh"
+}
+
+fn shape_kind_value(name string) int {
+    if name == "box" { << resource.SHAPE_BOX }
+    if name == "sphere" { << resource.SHAPE_SPHERE }
+    if name == "capsule" { << resource.SHAPE_CAPSULE }
+    if name == "mesh" { << resource.SHAPE_MESH }
+    >> errors.new("nexus scene: unsupported RigidBody3D shape_kind")
+}
+
+fn joint_kind_name(k int) string {
+    if k == resource.JOINT_BALL { << "ball" }
+    if k == resource.JOINT_HINGE { << "hinge" }
+    << "distance"
+}
+
+fn joint_kind_value(name string) int {
+    if name == "ball" { << resource.JOINT_BALL }
+    if name == "hinge" { << resource.JOINT_HINGE }
+    if name == "distance" { << resource.JOINT_DISTANCE }
+    >> errors.new("nexus scene: unsupported Joint3D kind")
+}
+
+fn decode_vec3(doc &json.Doc, at int, field string) fm.Vec3 {
+    v := vector(doc, doc.get(at, field), 3) or >>
+    << fm.vec3(v[0], v[1], v[2])
+}
+
+fn fmt_vec3(v fm.Vec3) string {
+    << fmt_f64_list(&[v.x, v.y, v.z]) or >>
+}
+
+fn fmt_dec(v f64) string {
+    << strconv.format_float(v, 103, -1) or >>
+}
+
+fn decode_environments(doc &json.Doc, root int, version int) []resource.EnvironmentAttachment {
+    if version < MODERN_COMPONENTS_VERSION { << []resource.EnvironmentAttachment{} }
+    rows := rows_min(doc, doc.get(root, "environments"), 0, resource.MAX_SCENE_ENVIRONMENTS) or >>
+    expected := ["node", "sky_mode", "sun_dir", "sun_intensity", "turbidity", "ambient",
+        "exposure", "fog_density", "fog_scattering", "bloom_enabled", "bloom_threshold",
+        "bloom_intensity", "gtao_enabled", "ssr_enabled", "taa_enabled", "ibl_strength",
+        "ddgi_enabled", "ddgi_origin", "ddgi_spacing"]
+    $out := []resource.EnvironmentAttachment{}
+    for at in rows {
+        fields(doc, at, &expected) or >>
+        env := resource.EnvironmentAttachment{
+            node: doc.as_int(doc.get(at, "node")) or >>,
+            sky_mode: sky_mode_value(doc.as_string(doc.get(at, "sky_mode")) or >>) or >>,
+            sun_dir: decode_vec3(doc, at, "sun_dir") or >>,
+            sun_intensity: doc.as_f64(doc.get(at, "sun_intensity")) or >>,
+            turbidity: doc.as_f64(doc.get(at, "turbidity")) or >>,
+            ambient: decode_vec3(doc, at, "ambient") or >>,
+            exposure: doc.as_f64(doc.get(at, "exposure")) or >>,
+            fog_density: doc.as_f64(doc.get(at, "fog_density")) or >>,
+            fog_scattering: doc.as_f64(doc.get(at, "fog_scattering")) or >>,
+            bloom_enabled: doc.as_bool(doc.get(at, "bloom_enabled")) or >>,
+            bloom_threshold: doc.as_f64(doc.get(at, "bloom_threshold")) or >>,
+            bloom_intensity: doc.as_f64(doc.get(at, "bloom_intensity")) or >>,
+            gtao_enabled: doc.as_bool(doc.get(at, "gtao_enabled")) or >>,
+            ssr_enabled: doc.as_bool(doc.get(at, "ssr_enabled")) or >>,
+            taa_enabled: doc.as_bool(doc.get(at, "taa_enabled")) or >>,
+            ibl_strength: doc.as_f64(doc.get(at, "ibl_strength")) or >>,
+            ddgi_enabled: doc.as_bool(doc.get(at, "ddgi_enabled")) or >>,
+            ddgi_origin: decode_vec3(doc, at, "ddgi_origin") or >>,
+            ddgi_spacing: doc.as_f64(doc.get(at, "ddgi_spacing")) or >>
+        }
+        env.validate() or >>
+        out.push(env)
+    }
+    << out
+}
+
+fn decode_rigid_bodies_3d(doc &json.Doc, root int, version int) []resource.RigidBody3DAttachment {
+    if version < MODERN_COMPONENTS_VERSION { << []resource.RigidBody3DAttachment{} }
+    rows := rows_min(doc, doc.get(root, "rigid_bodies_3d"), 0, resource.MAX_SCENE_RIGID_BODIES_3D) or >>
+    expected := ["node", "body_type", "shape_kind", "half_extents", "radius", "height",
+        "mass", "restitution", "friction", "layer", "mask", "is_trigger"]
+    $out := []resource.RigidBody3DAttachment{}
+    for at in rows {
+        fields(doc, at, &expected) or >>
+        b := resource.RigidBody3DAttachment{
+            node: doc.as_int(doc.get(at, "node")) or >>,
+            body_type: body_type_value(doc.as_string(doc.get(at, "body_type")) or >>) or >>,
+            shape_kind: shape_kind_value(doc.as_string(doc.get(at, "shape_kind")) or >>) or >>,
+            half_extents: decode_vec3(doc, at, "half_extents") or >>,
+            radius: doc.as_f64(doc.get(at, "radius")) or >>,
+            height: doc.as_f64(doc.get(at, "height")) or >>,
+            mass: doc.as_f64(doc.get(at, "mass")) or >>,
+            restitution: doc.as_f64(doc.get(at, "restitution")) or >>,
+            friction: doc.as_f64(doc.get(at, "friction")) or >>,
+            layer: doc.as_int(doc.get(at, "layer")) or >>,
+            mask: doc.as_int(doc.get(at, "mask")) or >>,
+            is_trigger: doc.as_bool(doc.get(at, "is_trigger")) or >>
+        }
+        b.validate() or >>
+        out.push(b)
+    }
+    << out
+}
+
+fn decode_joints_3d(doc &json.Doc, root int, version int) []resource.Joint3DAttachment {
+    if version < MODERN_COMPONENTS_VERSION { << []resource.Joint3DAttachment{} }
+    rows := rows_min(doc, doc.get(root, "joints_3d"), 0, resource.MAX_SCENE_JOINTS_3D) or >>
+    expected := ["node_a", "node_b", "kind", "anchor_a", "anchor_b", "axis",
+        "limit_min", "limit_max", "motor_speed", "motor_torque"]
+    $out := []resource.Joint3DAttachment{}
+    for at in rows {
+        fields(doc, at, &expected) or >>
+        j := resource.Joint3DAttachment{
+            node_a: doc.as_int(doc.get(at, "node_a")) or >>,
+            node_b: doc.as_int(doc.get(at, "node_b")) or >>,
+            kind: joint_kind_value(doc.as_string(doc.get(at, "kind")) or >>) or >>,
+            anchor_a: decode_vec3(doc, at, "anchor_a") or >>,
+            anchor_b: decode_vec3(doc, at, "anchor_b") or >>,
+            axis: decode_vec3(doc, at, "axis") or >>,
+            limit_min: doc.as_f64(doc.get(at, "limit_min")) or >>,
+            limit_max: doc.as_f64(doc.get(at, "limit_max")) or >>,
+            motor_speed: doc.as_f64(doc.get(at, "motor_speed")) or >>,
+            motor_torque: doc.as_f64(doc.get(at, "motor_torque")) or >>
+        }
+        j.validate() or >>
+        out.push(j)
+    }
+    << out
+}
+
+fn decode_terrains(doc &json.Doc, root int, version int) []resource.TerrainAttachment {
+    if version < MODERN_COMPONENTS_VERSION { << []resource.TerrainAttachment{} }
+    rows := rows_min(doc, doc.get(root, "terrains"), 0, resource.MAX_SCENE_TERRAINS) or >>
+    expected := ["node", "grid_x", "grid_z", "cell_size", "height_scale", "seed", "foliage_density", "wind_strength"]
+    $out := []resource.TerrainAttachment{}
+    for at in rows {
+        fields(doc, at, &expected) or >>
+        t := resource.TerrainAttachment{
+            node: doc.as_int(doc.get(at, "node")) or >>,
+            grid_x: doc.as_int(doc.get(at, "grid_x")) or >>,
+            grid_z: doc.as_int(doc.get(at, "grid_z")) or >>,
+            cell_size: doc.as_f64(doc.get(at, "cell_size")) or >>,
+            height_scale: doc.as_f64(doc.get(at, "height_scale")) or >>,
+            seed: doc.as_int(doc.get(at, "seed")) or >>,
+            foliage_density: doc.as_f64(doc.get(at, "foliage_density")) or >>,
+            wind_strength: doc.as_f64(doc.get(at, "wind_strength")) or >>
+        }
+        t.validate() or >>
+        out.push(t)
+    }
+    << out
+}
+
+fn decode_particles_3d(doc &json.Doc, root int, version int) []resource.ParticleEmitter3DAttachment {
+    if version < MODERN_COMPONENTS_VERSION { << []resource.ParticleEmitter3DAttachment{} }
+    rows := rows_min(doc, doc.get(root, "particles_3d"), 0, resource.MAX_SCENE_PARTICLES_3D) or >>
+    expected := ["node", "max_particles", "spawn_rate", "lifetime", "speed", "gravity", "start_color", "end_color", "size", "additive"]
+    $out := []resource.ParticleEmitter3DAttachment{}
+    for at in rows {
+        fields(doc, at, &expected) or >>
+        p := resource.ParticleEmitter3DAttachment{
+            node: doc.as_int(doc.get(at, "node")) or >>,
+            max_particles: doc.as_int(doc.get(at, "max_particles")) or >>,
+            spawn_rate: doc.as_f64(doc.get(at, "spawn_rate")) or >>,
+            lifetime: doc.as_f64(doc.get(at, "lifetime")) or >>,
+            speed: doc.as_f64(doc.get(at, "speed")) or >>,
+            gravity: doc.as_f64(doc.get(at, "gravity")) or >>,
+            start_color: doc.as_int(doc.get(at, "start_color")) or >>,
+            end_color: doc.as_int(doc.get(at, "end_color")) or >>,
+            size: doc.as_f64(doc.get(at, "size")) or >>,
+            additive: doc.as_bool(doc.get(at, "additive")) or >>
+        }
+        p.validate() or >>
+        out.push(p)
+    }
+    << out
+}
+
+fn decode_prefab_instances(doc &json.Doc, root int, version int) []resource.PrefabInstanceAttachment {
+    if version < MODERN_COMPONENTS_VERSION { << []resource.PrefabInstanceAttachment{} }
+    rows := rows_min(doc, doc.get(root, "prefab_instances"), 0, resource.MAX_SCENE_PREFAB_INSTANCES) or >>
+    expected := ["node", "resource", "overrides"]
+    ov_fields := ["target_path", "visible_set", "visible", "position_set", "position"]
+    $out := []resource.PrefabInstanceAttachment{}
+    for at in rows {
+        fields(doc, at, &expected) or >>
+        node := doc.as_int(doc.get(at, "node")) or >>
+        uid := doc.as_string(doc.get(at, "resource")) or >>
+        ov_rows := rows_min(doc, doc.get(at, "overrides"), 0, resource.MAX_PREFAB_OVERRIDES) or >>
+        $ovs := []resource.PrefabOverride{}
+        for item in ov_rows {
+            fields(doc, item, &ov_fields) or >>
+            ovs.push(resource.PrefabOverride{
+                target_path: doc.as_string(doc.get(item, "target_path")) or >>,
+                visible_set: doc.as_bool(doc.get(item, "visible_set")) or >>,
+                visible: doc.as_bool(doc.get(item, "visible")) or >>,
+                position_set: doc.as_bool(doc.get(item, "position_set")) or >>,
+                position: decode_vec3(doc, item, "position") or >>
+            })
+        }
+        prefab := resource.prefab_instance_attachment(node, uid, ovs)
+        prefab.validate() or >>
+        out.push(prefab)
+    }
+    << out
+}
+
+fn encode_modern(document &resource.Document) string {
+    $out := strings.new_byte_builder(2048)
+
+    out.write_str(",\"environments\":[\n")
+    for i in 0:document.environment_count() {
+        if i > 0 { out.write_str(",\n") }
+        e := document.environment(i) or >>
+        out.write_str("{\"node\":" + str(e.node) +
+            ",\"sky_mode\":\"" + sky_mode_name(e.sky_mode) +
+            "\",\"sun_dir\":" + (fmt_vec3(e.sun_dir) or >>) +
+            ",\"sun_intensity\":" + (fmt_dec(e.sun_intensity) or >>) +
+            ",\"turbidity\":" + (fmt_dec(e.turbidity) or >>) +
+            ",\"ambient\":" + (fmt_vec3(e.ambient) or >>) +
+            ",\"exposure\":" + (fmt_dec(e.exposure) or >>) +
+            ",\"fog_density\":" + (fmt_dec(e.fog_density) or >>) +
+            ",\"fog_scattering\":" + (fmt_dec(e.fog_scattering) or >>) +
+            ",\"bloom_enabled\":" + str(e.bloom_enabled) +
+            ",\"bloom_threshold\":" + (fmt_dec(e.bloom_threshold) or >>) +
+            ",\"bloom_intensity\":" + (fmt_dec(e.bloom_intensity) or >>) +
+            ",\"gtao_enabled\":" + str(e.gtao_enabled) +
+            ",\"ssr_enabled\":" + str(e.ssr_enabled) +
+            ",\"taa_enabled\":" + str(e.taa_enabled) +
+            ",\"ibl_strength\":" + (fmt_dec(e.ibl_strength) or >>) +
+            ",\"ddgi_enabled\":" + str(e.ddgi_enabled) +
+            ",\"ddgi_origin\":" + (fmt_vec3(e.ddgi_origin) or >>) +
+            ",\"ddgi_spacing\":" + (fmt_dec(e.ddgi_spacing) or >>) + "}")
+    }
+    out.write_str("\n],\"rigid_bodies_3d\":[\n")
+    for i in 0:document.rigid_body_3d_count() {
+        if i > 0 { out.write_str(",\n") }
+        b := document.rigid_body_3d(i) or >>
+        out.write_str("{\"node\":" + str(b.node) +
+            ",\"body_type\":\"" + body_type_name(b.body_type) +
+            "\",\"shape_kind\":\"" + shape_kind_name(b.shape_kind) +
+            "\",\"half_extents\":" + (fmt_vec3(b.half_extents) or >>) +
+            ",\"radius\":" + (fmt_dec(b.radius) or >>) +
+            ",\"height\":" + (fmt_dec(b.height) or >>) +
+            ",\"mass\":" + (fmt_dec(b.mass) or >>) +
+            ",\"restitution\":" + (fmt_dec(b.restitution) or >>) +
+            ",\"friction\":" + (fmt_dec(b.friction) or >>) +
+            ",\"layer\":" + str(b.layer) +
+            ",\"mask\":" + str(b.mask) +
+            ",\"is_trigger\":" + str(b.is_trigger) + "}")
+    }
+    out.write_str("\n],\"joints_3d\":[\n")
+    for i in 0:document.joint_3d_count() {
+        if i > 0 { out.write_str(",\n") }
+        j := document.joint_3d(i) or >>
+        out.write_str("{\"node_a\":" + str(j.node_a) +
+            ",\"node_b\":" + str(j.node_b) +
+            ",\"kind\":\"" + joint_kind_name(j.kind) +
+            "\",\"anchor_a\":" + (fmt_vec3(j.anchor_a) or >>) +
+            ",\"anchor_b\":" + (fmt_vec3(j.anchor_b) or >>) +
+            ",\"axis\":" + (fmt_vec3(j.axis) or >>) +
+            ",\"limit_min\":" + (fmt_dec(j.limit_min) or >>) +
+            ",\"limit_max\":" + (fmt_dec(j.limit_max) or >>) +
+            ",\"motor_speed\":" + (fmt_dec(j.motor_speed) or >>) +
+            ",\"motor_torque\":" + (fmt_dec(j.motor_torque) or >>) + "}")
+    }
+    out.write_str("\n],\"terrains\":[\n")
+    for i in 0:document.terrain_count() {
+        if i > 0 { out.write_str(",\n") }
+        t := document.terrain(i) or >>
+        out.write_str("{\"node\":" + str(t.node) +
+            ",\"grid_x\":" + str(t.grid_x) +
+            ",\"grid_z\":" + str(t.grid_z) +
+            ",\"cell_size\":" + (fmt_dec(t.cell_size) or >>) +
+            ",\"height_scale\":" + (fmt_dec(t.height_scale) or >>) +
+            ",\"seed\":" + str(t.seed) +
+            ",\"foliage_density\":" + (fmt_dec(t.foliage_density) or >>) +
+            ",\"wind_strength\":" + (fmt_dec(t.wind_strength) or >>) + "}")
+    }
+    out.write_str("\n],\"particles_3d\":[\n")
+    for i in 0:document.particle_emitter_3d_count() {
+        if i > 0 { out.write_str(",\n") }
+        p := document.particle_emitter_3d(i) or >>
+        out.write_str("{\"node\":" + str(p.node) +
+            ",\"max_particles\":" + str(p.max_particles) +
+            ",\"spawn_rate\":" + (fmt_dec(p.spawn_rate) or >>) +
+            ",\"lifetime\":" + (fmt_dec(p.lifetime) or >>) +
+            ",\"speed\":" + (fmt_dec(p.speed) or >>) +
+            ",\"gravity\":" + (fmt_dec(p.gravity) or >>) +
+            ",\"start_color\":" + str(p.start_color) +
+            ",\"end_color\":" + str(p.end_color) +
+            ",\"size\":" + (fmt_dec(p.size) or >>) +
+            ",\"additive\":" + str(p.additive) + "}")
+    }
+    out.write_str("\n],\"prefab_instances\":[\n")
+    for i in 0:document.prefab_instance_count() {
+        if i > 0 { out.write_str(",\n") }
+        pf := document.prefab_instance(i) or >>
+        uid := pf.scene_uid + ""
+        out.write_str("{\"node\":" + str(pf.node) + ",\"resource\":" + json.quote(&uid) + ",\"overrides\":[")
+        for j in 0:pf.overrides.len {
+            if j > 0 { out.write_str(",") }
+            ov := &pf.overrides[j]
+            tp := ov.target_path + ""
+            out.write_str("{\"target_path\":" + json.quote(&tp) +
+                ",\"visible_set\":" + str(ov.visible_set) +
+                ",\"visible\":" + str(ov.visible) +
+                ",\"position_set\":" + str(ov.position_set) +
+                ",\"position\":" + (fmt_vec3(ov.position) or >>) + "}")
+        }
+        out.write_str("]}")
+    }
+    out.write_str("\n]")
+    << out.to_string()
+}

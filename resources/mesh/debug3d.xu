@@ -1,0 +1,312 @@
+@"github.com/xulang-org/nexus/resources/mesh"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+struct DebugSegment3D {
+    a fm.Vec3
+    b fm.Vec3
+    color int
+    ttl f64
+}
+
+pub struct DebugDraw3D {
+    line_radius f64
+    segments []DebugSegment3D
+}
+
+pub fn new_debug_draw_3d(line_radius f64) DebugDraw3D {
+    if !fm.finite(line_radius) || line_radius <= 0.0 || line_radius > 10.0 {
+        >> errors.new("nexus mesh: DebugDraw3D line_radius must be in (0, 10]")
+    }
+    << DebugDraw3D{line_radius: line_radius, segments: []DebugSegment3D{}}
+}
+
+pub fn (d $&DebugDraw3D) clear() {
+    d.segments = []DebugSegment3D{}
+}
+
+pub fn (d &DebugDraw3D) segment_count() int { << d.segments.len }
+pub fn (d &DebugDraw3D) has_segments() bool { << d.segments.len > 0 }
+pub fn (d &DebugDraw3D) segment_a(index int) fm.Vec3 { << d.segments[index].a }
+pub fn (d &DebugDraw3D) segment_b(index int) fm.Vec3 { << d.segments[index].b }
+pub fn (d &DebugDraw3D) segment_color(index int) int { << d.segments[index].color }
+
+pub fn (d $&DebugDraw3D) step(dt f64) {
+    if !fm.finite(dt) || dt < 0.0 { << }
+    $kept := []DebugSegment3D{}
+    for seg in d.segments {
+        rem := seg.ttl - dt
+        if rem > 0.0 {
+            kept.push(DebugSegment3D{a: seg.a, b: seg.b, color: seg.color, ttl: rem})
+        }
+    }
+    d.segments = kept
+}
+
+pub fn (d $&DebugDraw3D) line(a fm.Vec3, b fm.Vec3, color int, duration f64) int {
+    if !a.is_finite() || !b.is_finite() || !fm.finite(duration) || color < 0 || color > 4294967295 {
+        >> errors.new("nexus mesh: invalid DebugDraw3D line segment")
+    }
+    if a.distance_sq(b) <= 1e-12 { << 0 }
+    d.segments.push(DebugSegment3D{a: a, b: b, color: color, ttl: math.max(0.0, duration)})
+    << 0
+}
+
+pub fn (d $&DebugDraw3D) ray(origin fm.Vec3, direction fm.Vec3, length f64, color int, duration f64) int {
+    if !fm.finite(length) || length <= 0.0 { >> errors.new("nexus mesh: invalid ray length") }
+    unit := direction.normalized() or >>
+    << d.line(origin, origin.add(unit.scaled(length)), color, duration) or >>
+}
+
+pub fn (d $&DebugDraw3D) arrow(from fm.Vec3, to fm.Vec3, color int, duration f64) int {
+    d.line(from, to, color, duration) or >>
+    diff := to.sub(from)
+    len := diff.length()
+    if len <= 1e-6 { << 0 }
+    dir := diff.scaled(1.0 / len)
+    head_len := math.min(len * 0.25, math.max(d.line_radius * 6.0, 0.15))
+    head_w := head_len * 0.55
+    $up := fm.vec3(0.0, 1.0, 0.0)
+    if math.abs(dir.y) > 0.9 { up = fm.vec3(1.0, 0.0, 0.0) }
+    side := dir.cross(up).normalized() or >>
+    ortho := side.cross(dir)
+    base := to.sub(dir.scaled(head_len))
+    d.line(to, base.add(side.scaled(head_w)), color, duration) or >>
+    d.line(to, base.sub(side.scaled(head_w)), color, duration) or >>
+    d.line(to, base.add(ortho.scaled(head_w)), color, duration) or >>
+    d.line(to, base.sub(ortho.scaled(head_w)), color, duration) or >>
+    << 0
+}
+
+pub fn (d $&DebugDraw3D) aabb(box fm.Aabb3, color int, duration f64) int {
+    box.validate() or >>
+    x0 := box.minimum.x
+    y0 := box.minimum.y
+    z0 := box.minimum.z
+    x1 := box.maximum.x
+    y1 := box.maximum.y
+    z1 := box.maximum.z
+    p000 := fm.vec3(x0, y0, z0)
+    p100 := fm.vec3(x1, y0, z0)
+    p110 := fm.vec3(x1, y1, z0)
+    p010 := fm.vec3(x0, y1, z0)
+    p001 := fm.vec3(x0, y0, z1)
+    p101 := fm.vec3(x1, y0, z1)
+    p111 := fm.vec3(x1, y1, z1)
+    p011 := fm.vec3(x0, y1, z1)
+    d.line(p000, p100, color, duration) or >>
+    d.line(p100, p110, color, duration) or >>
+    d.line(p110, p010, color, duration) or >>
+    d.line(p010, p000, color, duration) or >>
+    d.line(p001, p101, color, duration) or >>
+    d.line(p101, p111, color, duration) or >>
+    d.line(p111, p011, color, duration) or >>
+    d.line(p011, p001, color, duration) or >>
+    d.line(p000, p001, color, duration) or >>
+    d.line(p100, p101, color, duration) or >>
+    d.line(p110, p111, color, duration) or >>
+    d.line(p010, p011, color, duration) or >>
+    << 0
+}
+
+pub fn (d $&DebugDraw3D) obb(transform fm.Mat4, half_extents fm.Vec3, color int, duration f64) int {
+    if !transform.is_finite() || !half_extents.is_finite() {
+        >> errors.new("nexus mesh: invalid OBB transform or extents")
+    }
+    hx := half_extents.x
+    hy := half_extents.y
+    hz := half_extents.z
+    c000 := transform.transform_point(fm.vec3(-hx, -hy, -hz))
+    c100 := transform.transform_point(fm.vec3(hx, -hy, -hz))
+    c110 := transform.transform_point(fm.vec3(hx, hy, -hz))
+    c010 := transform.transform_point(fm.vec3(-hx, hy, -hz))
+    c001 := transform.transform_point(fm.vec3(-hx, -hy, hz))
+    c101 := transform.transform_point(fm.vec3(hx, -hy, hz))
+    c111 := transform.transform_point(fm.vec3(hx, hy, hz))
+    c011 := transform.transform_point(fm.vec3(-hx, hy, hz))
+    d.line(c000, c100, color, duration) or >>
+    d.line(c100, c110, color, duration) or >>
+    d.line(c110, c010, color, duration) or >>
+    d.line(c010, c000, color, duration) or >>
+    d.line(c001, c101, color, duration) or >>
+    d.line(c101, c111, color, duration) or >>
+    d.line(c111, c011, color, duration) or >>
+    d.line(c011, c001, color, duration) or >>
+    d.line(c000, c001, color, duration) or >>
+    d.line(c100, c101, color, duration) or >>
+    d.line(c110, c111, color, duration) or >>
+    d.line(c010, c011, color, duration) or >>
+    << 0
+}
+
+pub fn (d $&DebugDraw3D) sphere(center fm.Vec3, radius f64, segments int, color int, duration f64) int {
+    if !center.is_finite() || !fm.finite(radius) || radius <= 0.0 || segments < 4 || segments > 64 {
+        >> errors.new("nexus mesh: invalid DebugDraw3D sphere parameters")
+    }
+    step := (math.pi() * 2.0) / f64(segments)
+    for i in 0:segments {
+        a0 := f64(i) * step
+        a1 := f64(i + 1) * step
+        c0 := math.cos(a0) * radius
+        s0 := math.sin(a0) * radius
+        c1 := math.cos(a1) * radius
+        s1 := math.sin(a1) * radius
+        d.line(center.add(fm.vec3(c0, s0, 0.0)), center.add(fm.vec3(c1, s1, 0.0)), color, duration) or >>
+        d.line(center.add(fm.vec3(c0, 0.0, s0)), center.add(fm.vec3(c1, 0.0, s1)), color, duration) or >>
+        d.line(center.add(fm.vec3(0.0, c0, s0)), center.add(fm.vec3(0.0, c1, s1)), color, duration) or >>
+    }
+    << 0
+}
+
+pub fn (d $&DebugDraw3D) capsule(p0 fm.Vec3, p1 fm.Vec3, radius f64, segments int, color int, duration f64) int {
+    if !p0.is_finite() || !p1.is_finite() || !fm.finite(radius) || radius <= 0.0 || segments < 4 {
+        >> errors.new("nexus mesh: invalid DebugDraw3D capsule parameters")
+    }
+    d.sphere(p0, radius, segments, color, duration) or >>
+    d.sphere(p1, radius, segments, color, duration) or >>
+    axis := p1.sub(p0)
+    if axis.length_sq() > 1e-12 {
+        dir := axis.normalized() or >>
+        $up := fm.vec3(0.0, 1.0, 0.0)
+        if math.abs(dir.y) > 0.9 { up = fm.vec3(1.0, 0.0, 0.0) }
+        s0 := dir.cross(up).normalized() or >>
+        s1 := dir.cross(s0)
+        d.line(p0.add(s0.scaled(radius)), p1.add(s0.scaled(radius)), color, duration) or >>
+        d.line(p0.sub(s0.scaled(radius)), p1.sub(s0.scaled(radius)), color, duration) or >>
+        d.line(p0.add(s1.scaled(radius)), p1.add(s1.scaled(radius)), color, duration) or >>
+        d.line(p0.sub(s1.scaled(radius)), p1.sub(s1.scaled(radius)), color, duration) or >>
+    }
+    << 0
+}
+
+fn unproject_corner(inv_vp &fm.Mat4, x f64, y f64, z f64) fm.Vec3 {
+    c := inv_vp.transform(fm.vec4(x, y, z, 1.0))
+    if math.abs(c.w) <= 1e-12 { >> errors.new("nexus mesh: degenerate frustum unprojection") }
+    << c.xyz().scaled(1.0 / c.w)
+}
+
+pub fn (d $&DebugDraw3D) frustum(inv_vp fm.Mat4, color int, duration f64) int {
+    if !inv_vp.is_finite() { >> errors.new("nexus mesh: frustum requires finite inv_vp") }
+    // Reverse-Z NDC: near = 1.0, far = 0.0.
+    n0 := unproject_corner(&inv_vp, -1.0, -1.0, 1.0) or >>
+    n1 := unproject_corner(&inv_vp, 1.0, -1.0, 1.0) or >>
+    n2 := unproject_corner(&inv_vp, 1.0, 1.0, 1.0) or >>
+    n3 := unproject_corner(&inv_vp, -1.0, 1.0, 1.0) or >>
+    f0 := unproject_corner(&inv_vp, -1.0, -1.0, 0.0) or >>
+    f1 := unproject_corner(&inv_vp, 1.0, -1.0, 0.0) or >>
+    f2 := unproject_corner(&inv_vp, 1.0, 1.0, 0.0) or >>
+    f3 := unproject_corner(&inv_vp, -1.0, 1.0, 0.0) or >>
+    d.line(n0, n1, color, duration) or >>
+    d.line(n1, n2, color, duration) or >>
+    d.line(n2, n3, color, duration) or >>
+    d.line(n3, n0, color, duration) or >>
+    d.line(f0, f1, color, duration) or >>
+    d.line(f1, f2, color, duration) or >>
+    d.line(f2, f3, color, duration) or >>
+    d.line(f3, f0, color, duration) or >>
+    d.line(n0, f0, color, duration) or >>
+    d.line(n1, f1, color, duration) or >>
+    d.line(n2, f2, color, duration) or >>
+    d.line(n3, f3, color, duration) or >>
+    << 0
+}
+
+pub fn (d $&DebugDraw3D) axes(transform fm.Mat4, axis_length f64, duration f64) int {
+    if !transform.is_finite() || !fm.finite(axis_length) || axis_length <= 0.0 {
+        >> errors.new("nexus mesh: invalid DebugDraw3D axes parameters")
+    }
+    origin := transform.translation()
+    red := (255 << 24) | (64 << 16) | (64 << 8) | 255
+    green := (64 << 24) | (255 << 16) | (64 << 8) | 255
+    blue := (64 << 24) | (128 << 16) | (255 << 8) | 255
+    d.arrow(origin, origin.add(transform.basis_x().normalized_or_zero().scaled(axis_length)), red, duration) or >>
+    d.arrow(origin, origin.add(transform.basis_y().normalized_or_zero().scaled(axis_length)), green, duration) or >>
+    d.arrow(origin, origin.add(transform.basis_z().normalized_or_zero().scaled(axis_length)), blue, duration) or >>
+    << 0
+}
+
+pub fn (d $&DebugDraw3D) grid(center fm.Vec3, half_extent f64, step f64, color int, duration f64) int {
+    if !center.is_finite() || !fm.finite(half_extent) || half_extent <= 0.0 || !fm.finite(step) || step <= 0.0 {
+        >> errors.new("nexus mesh: invalid DebugDraw3D grid parameters")
+    }
+    count := int(math.floor((half_extent * 2.0) / step))
+    if count > 128 { >> errors.new("nexus mesh: DebugDraw3D grid subdivisions exceed 128") }
+    x0 := center.x - half_extent
+    z0 := center.z - half_extent
+    for i in 0:(count + 1) {
+        offset := f64(i) * step
+        d.line(fm.vec3(x0 + offset, center.y, z0), fm.vec3(x0 + offset, center.y, z0 + half_extent * 2.0), color, duration) or >>
+        d.line(fm.vec3(x0, center.y, z0 + offset), fm.vec3(x0 + half_extent * 2.0, center.y, z0 + offset), color, duration) or >>
+    }
+    << 0
+}
+
+pub fn (d $&DebugDraw3D) polyline(points &[]fm.Vec3, closed bool, color int, duration f64) int {
+    if points.len < 2 { >> errors.new("nexus mesh: polyline requires >= 2 points") }
+    for i in 0:(points.len - 1) {
+        d.line(points[i], points[i + 1], color, duration) or >>
+    }
+    if closed && points.len >= 3 {
+        d.line(points[points.len - 1], points[0], color, duration) or >>
+    }
+    << 0
+}
+
+pub fn (d $&DebugDraw3D) cross(center fm.Vec3, half_size f64, color int, duration f64) int {
+    if !center.is_finite() || !fm.finite(half_size) || half_size <= 0.0 {
+        >> errors.new("nexus mesh: invalid DebugDraw3D cross parameters")
+    }
+    d.line(center.add(fm.vec3(-half_size, 0.0, 0.0)), center.add(fm.vec3(half_size, 0.0, 0.0)), color, duration) or >>
+    d.line(center.add(fm.vec3(0.0, -half_size, 0.0)), center.add(fm.vec3(0.0, half_size, 0.0)), color, duration) or >>
+    d.line(center.add(fm.vec3(0.0, 0.0, -half_size)), center.add(fm.vec3(0.0, 0.0, half_size)), color, duration) or >>
+    << 0
+}
+
+// Builds an unlit vertex-colored 3-sided prism mesh usable with Device3D.upload/draw.
+pub fn (d &DebugDraw3D) build_mesh() MeshData3D {
+    if d.segments.len == 0 {
+        >> errors.new("nexus mesh: DebugDraw3D has no segments to build")
+    }
+    $mesh := new_mesh_data_3d()
+    r := d.line_radius
+    c0 := 1.0
+    s0 := 0.0
+    c1 := -0.5
+    s1 := 0.8660254037844386
+    c2 := -0.5
+    s2 := -0.8660254037844386
+
+    for seg in d.segments {
+        dir := seg.b.sub(seg.a).normalized_or_zero()
+        if dir.length_sq() <= 1e-12 { -> }
+        $up := fm.vec3(0.0, 1.0, 0.0)
+        if math.abs(dir.y) > 0.9 { up = fm.vec3(1.0, 0.0, 0.0) }
+        u := dir.cross(up).normalized() or >>
+        v := dir.cross(u)
+
+        o0 := u.scaled(r * c0).add(v.scaled(r * s0))
+        o1 := u.scaled(r * c1).add(v.scaled(r * s1))
+        o2 := u.scaled(r * c2).add(v.scaled(r * s2))
+
+        base := mesh.vertex_count()
+        if base + 6 > MAX_VERTICES || mesh.indices.len + 18 > MAX_INDICES { <- }
+
+        mesh.vertex(seg.a.add(o0), seg.color) or >>
+        mesh.vertex(seg.a.add(o1), seg.color) or >>
+        mesh.vertex(seg.a.add(o2), seg.color) or >>
+        mesh.vertex(seg.b.add(o0), seg.color) or >>
+        mesh.vertex(seg.b.add(o1), seg.color) or >>
+        mesh.vertex(seg.b.add(o2), seg.color) or >>
+
+        // Side faces connecting ring A (0,1,2) and ring B (3,4,5)
+        mesh.triangle(base, base + 1, base + 4) or >>
+        mesh.triangle(base, base + 4, base + 3) or >>
+        mesh.triangle(base + 1, base + 2, base + 5) or >>
+        mesh.triangle(base + 1, base + 5, base + 4) or >>
+        mesh.triangle(base + 2, base, base + 3) or >>
+        mesh.triangle(base + 2, base + 3, base + 5) or >>
+    }
+    << mesh
+}

@@ -42,6 +42,7 @@ fn bad_load(device &ren.Device3D, name string) bool {
         if name == "source-budget" { assert(strings.contains(&message, "snapshot exceeds byte limit")) }
         if name == "late-hash" { assert(strings.contains(&message, "hash mismatch")) }
         if name == "actual-primitive" { assert(strings.contains(&message, "primitive outside GLB")) }
+        if name == "actual-lod-primitive" { assert(strings.contains(&message, "LOD primitive outside GLB")) }
         << true }
     << false
 }
@@ -72,7 +73,7 @@ fn snapshot(tree &nexus.SceneTree) string {
 fn rollback() int {
     mesh_program_0 := mesh_shaders.load_mesh("build/mesh-shaders") or >>
     $device := ren.open_3d("Scene model rollback", 32, 32, gpu.AUTO, &mesh_program_0) or >>
-    for name in ["missing", "hash", "late-hash", "bad-png", "bad-basis", "actual-primitive", "source-budget"] {
+    for name in ["missing", "hash", "late-hash", "bad-png", "bad-basis", "actual-primitive", "actual-lod-primitive", "source-budget"] {
         assert(bad_load(&device, name))
     }
     // All preceding failures must return every mesh slot and the image budget.
@@ -84,6 +85,62 @@ fn rollback() int {
     $textures := []ren.Texture3D{}
     for i in 0:4 { textures.push(device.texture_rgba(2048, 2048, &pixels, false, false, false) or >>) }
     device.close() or >>
+    << 0
+}
+fn lod_restore(device $&ren.Device3D, red_mesh &ren.Mesh3D, red ren.Material3D) int {
+    $set := loader.load(device, "build/scene-asset-fixtures/lod-authored.xuscene") or >>
+    assert(set.model_count() == 2 && set.surface_count() == 1)
+    $tree := nexus.new_scene_tree_3d("LOD", 32) or >>
+    $scene := scene_render.new_scene_3d(device) or >>
+    parent := tree.root()
+    root := set.instantiate($&scene, $&tree, parent, "Loaded") or >>
+    panel := tree.find_child(root, "Panel") or >>
+    assert((scene.lod_level(panel) or >>) == -1)
+    near := fm.vec3(0.0, 0.0, 2.0)
+    band := fm.vec3(0.0, 0.0, 2.2)
+    scene.select_lods(&tree, near) or >>
+    scene.select_lods(&tree, band) or >>
+    assert((scene.lod_level(panel) or >>) == 0)
+
+    set.save("build/scene-asset-fixtures/lod-history.xuscene", &tree, root) or >>
+    $restored := loader.load(device, "build/scene-asset-fixtures/lod-history.xuscene") or >>
+    $fresh_tree := nexus.new_scene_tree_3d("Fresh", 16) or >>
+    $fresh_scene := scene_render.new_scene_3d(device) or >>
+    fresh_parent := fresh_tree.root()
+    fresh_root := restored.instantiate($&fresh_scene, $&fresh_tree, fresh_parent, "Restored") or >>
+    fresh_panel := fresh_tree.find_child(fresh_root, "Panel") or >>
+    assert((fresh_scene.lod_level(fresh_panel) or >>) == -1)
+    fresh_scene.select_lods(&fresh_tree, band) or >>
+    assert((fresh_scene.lod_level(fresh_panel) or >>) == 1)
+    lighting := light_data.environment(fm.vec3(1.0, 1.0, 1.0), band, 1.0, []light_data.Light3D{}) or >>
+    device.begin(255) or >>
+    draws := fresh_scene.draw_lit(device, &fresh_tree, fm.identity_3d(), &lighting) or >>
+    assert(draws.instances == 1 && draws.triangles == 1 && draws.lod_triangles_saved == 1)
+    // The coarse primitive is untextured in its own GLB. The restored surface
+    // still uses the highest-detail primitive's gray texture.
+    check(device.read_pixel(48, 40) or >>, 117, 117, 117)
+    check(device.read_pixel(16, 18) or >>, 0, 0, 0)
+    device.present() or >>
+
+    $increasing := loader.load(device, "build/scene-asset-fixtures/lod-increasing.xuscene") or >>
+    before := snapshot(&tree) or >>
+    tree.take_ready() or >>
+    assert(bad_mount(&increasing, $&scene, $&tree, parent, "Increasing"))
+    assert(before == (snapshot(&tree) or >>) && (tree.take_ready() or >>).len == 0 && scene.binding_count() == 1)
+    $incompatible := loader.load(device, "build/scene-asset-fixtures/lod-material.xuscene") or >>
+    document := files.load("build/scene-asset-fixtures/lod-material.xuscene") or >>
+    packed := files.to_packed_nodes(&document) or >>
+    staged := packed.instantiate($&tree, parent, "Incompatible") or >>
+    second := tree.find_child(staged, "Second") or >>
+    $target := scene_render.new_scene_3d(device) or >>
+    target.attach_surface(&tree, second, red_mesh, red) or >>
+    assert(bad_bind(&incompatible, $&target, &tree, staged) && target.binding_count() == 1)
+    check(draw(device, &target, &tree, 1) or >>, 188, 0, 0)
+    incompatible.close() or >>
+    increasing.close() or >>
+    restored.close() or >>
+    set.close() or >>
+    println("PASS: persisted cross-GLB LOD selects by current distance, preserves the base material, and rolls back invalid levels")
     << 0
 }
 fn run() int {
@@ -159,6 +216,7 @@ fn run() int {
     assert(bad_bind(&sharing, $&replacement, &shared_tree, shared) && replacement.binding_count() == 1)
     assert(bad_capture(&sharing, &shared_tree, shared))
     check(draw($&device, &replacement, &shared_tree, 1) or >>, 188, 0, 0)
+    lod_restore($&device, &red_mesh, red) or >>
     sharing.close() or >>
     red_mesh.close() or >>
     device.close() or >>

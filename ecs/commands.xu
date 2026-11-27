@@ -1,0 +1,401 @@
+@"github.com/xulang-org/nexus/ecs"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+
+pub const CMD_SPAWN = 0
+pub const CMD_SPAWN_TEMPLATE = 1
+pub const CMD_DESPAWN = 2
+pub const CMD_ADD_COMPONENT = 3
+pub const CMD_REMOVE_COMPONENT = 4
+pub const CMD_SET_TRANSFORM = 5
+pub const CMD_SET_VELOCITY = 6
+pub const CMD_SET_HEALTH = 7
+
+pub struct EntityTemplate {
+    pub mask int
+    pub position fm.Vec3
+    pub scale fm.Vec3
+    pub velocity fm.Vec3
+    pub bounds fm.Aabb3
+    pub hp f64
+    pub max_hp f64
+    pub regen f64
+    pub particle_age f64
+    pub particle_lifetime f64
+    pub particle_damping f64
+    pub audio_max_dist f64
+    pub audio_gain f64
+}
+
+pub fn default_entity_template(mask int) EntityTemplate {
+    if mask < 0 || (mask & COMP_ALL_MASK) != mask {
+        >> errors.new("nexus ecs: invalid component mask in entity template")
+    }
+    << EntityTemplate{
+        mask: mask,
+        position: fm.vec3(0.0, 0.0, 0.0),
+        scale: fm.vec3(1.0, 1.0, 1.0),
+        velocity: fm.vec3(0.0, 0.0, 0.0),
+        bounds: fm.aabb3(fm.vec3(-0.5, -0.5, -0.5), fm.vec3(0.5, 0.5, 0.5)) or >>,
+        hp: 100.0,
+        max_hp: 100.0,
+        regen: 0.0,
+        particle_age: 0.0,
+        particle_lifetime: 1.0,
+        particle_damping: 0.0,
+        audio_max_dist: 32.0,
+        audio_gain: 1.0
+    }
+}
+
+fn clone_template(tpl &EntityTemplate) EntityTemplate {
+    << EntityTemplate{
+        mask: tpl.mask,
+        position: tpl.position,
+        scale: tpl.scale,
+        velocity: tpl.velocity,
+        bounds: tpl.bounds,
+        hp: tpl.hp,
+        max_hp: tpl.max_hp,
+        regen: tpl.regen,
+        particle_age: tpl.particle_age,
+        particle_lifetime: tpl.particle_lifetime,
+        particle_damping: tpl.particle_damping,
+        audio_max_dist: tpl.audio_max_dist,
+        audio_gain: tpl.audio_gain
+    }
+}
+
+fn try_despawn_ignore(world $&EcsWorld, h EntityHandle) {
+    _ := world.despawn(h) or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn spawn_template_internal(world $&EcsWorld, tpl &EntityTemplate, pos fm.Vec3) EntityHandle {
+    if tpl.mask < 0 || (tpl.mask & COMP_ALL_MASK) != tpl.mask {
+        >> errors.new("nexus ecs: invalid component mask in entity template")
+    }
+    h := world.spawn(tpl.mask) or >>
+    if (tpl.mask & COMP_TRANSFORM) != 0 {
+        world.set_transform(h, pos, tpl.scale) or (err) {
+            try_despawn_ignore(world, h)
+            >> err
+        }
+    }
+    if (tpl.mask & COMP_VELOCITY) != 0 {
+        world.set_velocity(h, tpl.velocity) or (err) {
+            try_despawn_ignore(world, h)
+            >> err
+        }
+    }
+    if (tpl.mask & COMP_BOUNDS) != 0 {
+        world.set_bounds(h, tpl.bounds) or (err) {
+            try_despawn_ignore(world, h)
+            >> err
+        }
+    }
+    if (tpl.mask & COMP_HEALTH) != 0 {
+        world.set_health(h, tpl.hp, tpl.max_hp, tpl.regen) or (err) {
+            try_despawn_ignore(world, h)
+            >> err
+        }
+    }
+    if (tpl.mask & COMP_PARTICLE) != 0 {
+        world.set_particle(h, tpl.particle_age, tpl.particle_lifetime, tpl.particle_damping) or (err) {
+            try_despawn_ignore(world, h)
+            >> err
+        }
+    }
+    if (tpl.mask & COMP_AUDIO) != 0 {
+        world.set_audio(h, tpl.audio_max_dist, tpl.audio_gain) or (err) {
+            try_despawn_ignore(world, h)
+            >> err
+        }
+    }
+    << h
+}
+
+pub fn (world $&EcsWorld) spawn_from_template(tpl &EntityTemplate) EntityHandle {
+    << spawn_template_internal(world, tpl, tpl.position)
+}
+
+pub fn (world $&EcsWorld) spawn_from_template_at(tpl &EntityTemplate, pos fm.Vec3) EntityHandle {
+    << spawn_template_internal(world, tpl, pos)
+}
+
+struct EcsQueuedCommand {
+    kind int
+    mask int
+    comp_bit int
+    handle EntityHandle
+    pos fm.Vec3
+    scale fm.Vec3
+    vel fm.Vec3
+    hp f64
+    max_hp f64
+    regen f64
+    tpl EntityTemplate
+}
+
+pub struct EcsFlushReport {
+    pub applied int
+    pub skipped_stale int
+    pub failed int
+    pub spawned []EntityHandle
+}
+
+pub struct EcsCommandBuffer {
+    commands []EcsQueuedCommand
+}
+
+pub fn new_command_buffer() EcsCommandBuffer {
+    << EcsCommandBuffer{commands: []EcsQueuedCommand{}}
+}
+
+pub fn (buf &EcsCommandBuffer) pending_count() int {
+    << buf.commands.len
+}
+
+pub fn (buf $&EcsCommandBuffer) clear() {
+    buf.commands = []EcsQueuedCommand{}
+}
+
+fn empty_queued_command(kind int) EcsQueuedCommand {
+    << EcsQueuedCommand{
+        kind: kind,
+        mask: 0,
+        comp_bit: 0,
+        handle: EntityHandle{id: -1, generation: -1},
+        pos: fm.vec3(0.0, 0.0, 0.0),
+        scale: fm.vec3(1.0, 1.0, 1.0),
+        vel: fm.vec3(0.0, 0.0, 0.0),
+        hp: 0.0,
+        max_hp: 0.0,
+        regen: 0.0,
+        tpl: EntityTemplate{
+            mask: 0,
+            position: fm.vec3(0.0, 0.0, 0.0),
+            scale: fm.vec3(1.0, 1.0, 1.0),
+            velocity: fm.vec3(0.0, 0.0, 0.0),
+            bounds: fm.Aabb3{minimum: fm.vec3(-0.5, -0.5, -0.5), maximum: fm.vec3(0.5, 0.5, 0.5)},
+            hp: 100.0,
+            max_hp: 100.0,
+            regen: 0.0,
+            particle_age: 0.0,
+            particle_lifetime: 1.0,
+            particle_damping: 0.0,
+            audio_max_dist: 32.0,
+            audio_gain: 1.0
+        }
+    }
+}
+
+pub fn (buf $&EcsCommandBuffer) queue_spawn(mask int) int {
+    if mask < 0 || (mask & COMP_ALL_MASK) != mask {
+        >> errors.new("nexus ecs: invalid component mask in queued spawn")
+    }
+    $cmd := empty_queued_command(CMD_SPAWN)
+    cmd.mask = mask
+    buf.commands.push(cmd)
+    << buf.commands.len - 1
+}
+
+pub fn (buf $&EcsCommandBuffer) queue_spawn_template(tpl &EntityTemplate, pos fm.Vec3) int {
+    if tpl.mask < 0 || (tpl.mask & COMP_ALL_MASK) != tpl.mask {
+        >> errors.new("nexus ecs: invalid component mask in queued template spawn")
+    }
+    if !pos.is_finite() {
+        >> errors.new("nexus ecs: non-finite position in queued template spawn")
+    }
+    $c := clone_template(tpl)
+    c.position = pos
+    $cmd := empty_queued_command(CMD_SPAWN_TEMPLATE)
+    cmd.tpl = c
+    cmd.pos = pos
+    buf.commands.push(cmd)
+    << buf.commands.len - 1
+}
+
+pub fn (buf $&EcsCommandBuffer) queue_despawn(h EntityHandle) int {
+    $cmd := empty_queued_command(CMD_DESPAWN)
+    cmd.handle = h
+    buf.commands.push(cmd)
+    << buf.commands.len - 1
+}
+
+pub fn (buf $&EcsCommandBuffer) queue_add_component(h EntityHandle, comp_bit int) int {
+    if !valid_single_component_bit(comp_bit) {
+        >> errors.new("nexus ecs: invalid component bit in queued add_component")
+    }
+    $cmd := empty_queued_command(CMD_ADD_COMPONENT)
+    cmd.handle = h
+    cmd.comp_bit = comp_bit
+    buf.commands.push(cmd)
+    << buf.commands.len - 1
+}
+
+pub fn (buf $&EcsCommandBuffer) queue_remove_component(h EntityHandle, comp_bit int) int {
+    if !valid_single_component_bit(comp_bit) {
+        >> errors.new("nexus ecs: invalid component bit in queued remove_component")
+    }
+    $cmd := empty_queued_command(CMD_REMOVE_COMPONENT)
+    cmd.handle = h
+    cmd.comp_bit = comp_bit
+    buf.commands.push(cmd)
+    << buf.commands.len - 1
+}
+
+pub fn (buf $&EcsCommandBuffer) queue_set_transform(h EntityHandle, pos fm.Vec3, scale fm.Vec3) int {
+    $cmd := empty_queued_command(CMD_SET_TRANSFORM)
+    cmd.handle = h
+    cmd.pos = pos
+    cmd.scale = scale
+    buf.commands.push(cmd)
+    << buf.commands.len - 1
+}
+
+pub fn (buf $&EcsCommandBuffer) queue_set_velocity(h EntityHandle, vel fm.Vec3) int {
+    $cmd := empty_queued_command(CMD_SET_VELOCITY)
+    cmd.handle = h
+    cmd.vel = vel
+    buf.commands.push(cmd)
+    << buf.commands.len - 1
+}
+
+pub fn (buf $&EcsCommandBuffer) queue_set_health(h EntityHandle, hp f64, max_hp f64, regen f64) int {
+    $cmd := empty_queued_command(CMD_SET_HEALTH)
+    cmd.handle = h
+    cmd.hp = hp
+    cmd.max_hp = max_hp
+    cmd.regen = regen
+    buf.commands.push(cmd)
+    << buf.commands.len - 1
+}
+
+struct TrySpawnResult {
+    ok bool
+    handle EntityHandle
+}
+
+fn try_spawn_mask(world $&EcsWorld, mask int) TrySpawnResult {
+    h := world.spawn(mask) or (err) {
+        _ := err
+        << TrySpawnResult{ok: false, handle: EntityHandle{id: -1, generation: -1}}
+    }
+    << TrySpawnResult{ok: true, handle: h}
+}
+
+fn try_spawn_template(world $&EcsWorld, tpl &EntityTemplate) TrySpawnResult {
+    h := world.spawn_from_template(tpl) or (err) {
+        _ := err
+        << TrySpawnResult{ok: false, handle: EntityHandle{id: -1, generation: -1}}
+    }
+    << TrySpawnResult{ok: true, handle: h}
+}
+
+fn try_despawn(world $&EcsWorld, h EntityHandle) int {
+    << world.despawn(h) or (err) {
+        _ := err
+        << -1
+    }
+}
+
+fn try_add_comp(world $&EcsWorld, h EntityHandle, bit int) int {
+    << world.add_component(h, bit) or (err) {
+        _ := err
+        << -1
+    }
+}
+
+fn try_remove_comp(world $&EcsWorld, h EntityHandle, bit int) int {
+    << world.remove_component(h, bit) or (err) {
+        _ := err
+        << -1
+    }
+}
+
+fn try_set_xform(world $&EcsWorld, h EntityHandle, pos fm.Vec3, scale fm.Vec3) int {
+    << world.set_transform(h, pos, scale) or (err) {
+        _ := err
+        << -1
+    }
+}
+
+fn try_set_vel(world $&EcsWorld, h EntityHandle, vel fm.Vec3) int {
+    << world.set_velocity(h, vel) or (err) {
+        _ := err
+        << -1
+    }
+}
+
+fn try_set_hp(world $&EcsWorld, h EntityHandle, hp f64, max_hp f64, regen f64) int {
+    << world.set_health(h, hp, max_hp, regen) or (err) {
+        _ := err
+        << -1
+    }
+}
+
+pub fn (buf $&EcsCommandBuffer) flush(world $&EcsWorld) EcsFlushReport {
+    $applied := 0
+    $skipped_stale := 0
+    $failed := 0
+    $spawned := []EntityHandle{}
+
+    for i in 0:buf.commands.len {
+        cmd := &buf.commands[i]
+        if cmd.kind == CMD_SPAWN {
+            res := try_spawn_mask(world, cmd.mask)
+            if res.ok {
+                spawned.push(res.handle)
+                applied += 1
+            } else {
+                failed += 1
+            }
+        } else if cmd.kind == CMD_SPAWN_TEMPLATE {
+            res := try_spawn_template(world, &cmd.tpl)
+            if res.ok {
+                spawned.push(res.handle)
+                applied += 1
+            } else {
+                failed += 1
+            }
+        } else {
+            if !world.is_alive(cmd.handle) {
+                skipped_stale += 1
+                ->
+            }
+            if cmd.kind == CMD_DESPAWN {
+                rc := try_despawn(world, cmd.handle)
+                if rc == 0 { applied += 1 } else { failed += 1 }
+            } else if cmd.kind == CMD_ADD_COMPONENT {
+                rc := try_add_comp(world, cmd.handle, cmd.comp_bit)
+                if rc == 0 { applied += 1 } else { failed += 1 }
+            } else if cmd.kind == CMD_REMOVE_COMPONENT {
+                rc := try_remove_comp(world, cmd.handle, cmd.comp_bit)
+                if rc == 0 { applied += 1 } else { failed += 1 }
+            } else if cmd.kind == CMD_SET_TRANSFORM {
+                rc := try_set_xform(world, cmd.handle, cmd.pos, cmd.scale)
+                if rc == 0 { applied += 1 } else { failed += 1 }
+            } else if cmd.kind == CMD_SET_VELOCITY {
+                rc := try_set_vel(world, cmd.handle, cmd.vel)
+                if rc == 0 { applied += 1 } else { failed += 1 }
+            } else if cmd.kind == CMD_SET_HEALTH {
+                rc := try_set_hp(world, cmd.handle, cmd.hp, cmd.max_hp, cmd.regen)
+                if rc == 0 { applied += 1 } else { failed += 1 }
+            } else {
+                failed += 1
+            }
+        }
+    }
+
+    buf.commands = []EcsQueuedCommand{}
+    << EcsFlushReport{
+        applied: applied,
+        skipped_stale: skipped_stale,
+        failed: failed,
+        spawned: spawned
+    }
+}

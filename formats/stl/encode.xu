@@ -1,0 +1,111 @@
+@"github.com/xulang-org/nexus/formats/stl"
+
+mesh #"github.com/xulang-org/nexus/resources/mesh"
+fm #"github.com/xulang-org/nexus/foundation/math"
+#encoding/binary
+#errors
+#strconv
+#strings
+#unicode/utf8
+
+fn fmt_stl_float(v f64) string {
+    << strconv.format_float(v, 103, 9) or >>
+}
+
+fn validate_solid_name(solid_name string) string {
+    if solid_name.len == 0 { << "nexus_mesh" }
+    if !utf8.valid(&solid_name) {
+        >> errors.new("nexus STL encode: solid name must be valid UTF-8")
+    }
+    for i in 0:solid_name.len {
+        b := solid_name[i] & 255
+        if b <= 32 || b == 127 {
+            >> errors.new("nexus STL encode: solid name cannot contain whitespace or control characters")
+        }
+    }
+    << solid_name + ""
+}
+
+pub fn encode_binary(m &mesh.MeshData3D, header_text string) string {
+    m.validate() or >>
+    tri_count := m.triangle_count()
+    if tri_count < 1 || tri_count > mesh.MAX_VERTICES / 3 {
+        >> errors.new("nexus STL encode: invalid triangle count")
+    }
+    total_bytes := 84 + tri_count * 50
+    if total_bytes > MAX_BYTES {
+        >> errors.new("nexus STL encode: binary byte budget exceeded")
+    }
+
+    $hdr := header_text + ""
+    if hdr.len == 0 { hdr = "Nexus Binary STL" }
+    if !utf8.valid(&hdr) {
+        >> errors.new("nexus STL encode: header must be valid UTF-8")
+    }
+
+    $bytes := []u8{}
+    for _ in 0:total_bytes { bytes.push(u8(0)) }
+
+    $hdr_limit := hdr.len
+    if hdr_limit > 80 { hdr_limit = 80 }
+    for i in 0:hdr_limit {
+        bytes[i] = u8(hdr[i] & 255)
+    }
+    binary.little_endian().put_u32_bytes($&bytes, 80, tri_count) or >>
+
+    for ti in 0:tri_count {
+        base_idx := ti * 3
+        a := m.vertices[m.indices[base_idx]].position
+        b := m.vertices[m.indices[base_idx + 1]].position
+        c := m.vertices[m.indices[base_idx + 2]].position
+        n := mesh.triangle_normal(a, b, c) or >>
+        off := 84 + ti * 50
+        vals := [n.x, n.y, n.z, a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z]
+        for vi in 0:12 {
+            binary.little_endian().put_f32($&bytes, off + vi * 4, vals[vi]) or >>
+        }
+    }
+
+    $sb := strings.new_byte_builder(total_bytes)
+    for b in bytes {
+        sb.write_byte(int(b) & 255)
+    }
+    << sb.to_string()
+}
+
+pub fn encode_ascii(m &mesh.MeshData3D, solid_name string) string {
+    m.validate() or >>
+    tri_count := m.triangle_count()
+    if tri_count < 1 || tri_count > mesh.MAX_VERTICES / 3 {
+        >> errors.new("nexus STL encode: invalid triangle count")
+    }
+    name := validate_solid_name(solid_name) or >>
+
+    $sb := strings.new_byte_builder(256 + tri_count * 220)
+    sb.write_str("solid " + name + "\n")
+    for ti in 0:tri_count {
+        base_idx := ti * 3
+        a := m.vertices[m.indices[base_idx]].position
+        b := m.vertices[m.indices[base_idx + 1]].position
+        c := m.vertices[m.indices[base_idx + 2]].position
+        n := mesh.triangle_normal(a, b, c) or >>
+        sb.write_str("  facet normal " + (fmt_stl_float(n.x) or >>) + " " +
+            (fmt_stl_float(n.y) or >>) + " " + (fmt_stl_float(n.z) or >>) + "\n")
+        sb.write_str("    outer loop\n")
+        for p in [a, b, c] {
+            sb.write_str("      vertex " + (fmt_stl_float(p.x) or >>) + " " +
+                (fmt_stl_float(p.y) or >>) + " " + (fmt_stl_float(p.z) or >>) + "\n")
+        }
+        sb.write_str("    endloop\n")
+        sb.write_str("  endfacet\n")
+        if sb.len + name.len + 16 > MAX_BYTES {
+            >> errors.new("nexus STL encode: ASCII byte budget exceeded")
+        }
+    }
+    sb.write_str("endsolid " + name + "\n")
+    raw := sb.to_string()
+    if raw.len > MAX_BYTES {
+        >> errors.new("nexus STL encode: ASCII byte budget exceeded")
+    }
+    << raw
+}

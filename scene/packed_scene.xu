@@ -1,6 +1,7 @@
 @"github.com/xulang-org/nexus/scene"
 
 fm #"github.com/xulang-org/nexus/foundation/math"
+camera_data #"github.com/xulang-org/nexus/resources/camera"
 #errors
 
 struct PackedNode {
@@ -8,9 +9,19 @@ struct PackedNode {
     name string
     local fm.Transform2D
     local_3d fm.Mat4
+    camera camera_data.Perspective
+    orthographic camera_data.Orthographic
+    camera_2d camera_data.View2D
     kind int
     visible bool
     process_mode int
+    groups []string
+    meta_keys []string
+    meta_kinds []int
+    meta_strs []string
+    meta_ints []int
+    meta_f64s []f64
+    meta_bools []bool
 }
 // Immutable in-memory scene resource. Instances own independent node storage.
 // This resource records node data, not application behavior or GPU attachments.
@@ -31,11 +42,40 @@ pub fn pack_scene(tree &SceneTree, root int) PackedScene {
         component := tree.slots[index].spatial
         $local := fm.identity()
         $local_3d := fm.identity_3d()
-        if kind == NODE_2D { local = tree.spatial_2d[component].local }
-        if kind == NODE_3D { local_3d = tree.spatial_3d[component].local }
+        $camera := camera_data.Perspective{}
+        $orthographic := camera_data.Orthographic{}
+        $camera_2d := camera_data.View2D{}
+        if kind == NODE_2D {
+            local = tree.spatial_2d[component].local
+            camera_2d = tree.spatial_2d[component].camera
+        }
+        if kind == NODE_3D {
+            local_3d = tree.spatial_3d[component].local
+            camera = tree.spatial_3d[component].camera
+            orthographic = tree.spatial_3d[component].orthographic
+        }
+        $groups := []string{}
+        for g in tree.slot_groups[index] { groups.push(g + "") }
+        $mk := []string{}
+        $mkd := []int{}
+        $ms := []string{}
+        $mi := []int{}
+        $mf := []f64{}
+        $mb := []bool{}
+        for k in 0:tree.slot_meta_keys[index].len {
+            mk.push(tree.slot_meta_keys[index][k] + "")
+            mkd.push(tree.slot_meta_kinds[index][k])
+            ms.push(tree.slot_meta_strs[index][k] + "")
+            mi.push(tree.slot_meta_ints[index][k])
+            mf.push(tree.slot_meta_f64s[index][k])
+            mb.push(tree.slot_meta_bools[index][k])
+        }
         nodes.push(PackedNode{parent_index: parent_index, name: tree.slots[index].name + "",
-            local: local, local_3d: local_3d, kind: kind, visible: tree.slots[index].visible,
-            process_mode: tree.slots[index].process_mode})
+            local: local, local_3d: local_3d, camera: camera, orthographic: orthographic,
+            camera_2d: camera_2d, kind: kind, visible: tree.slots[index].visible,
+            process_mode: tree.slots[index].process_mode,
+            groups: groups, meta_keys: mk, meta_kinds: mkd,
+            meta_strs: ms, meta_ints: mi, meta_f64s: mf, meta_bools: mb})
     }
     << PackedScene{nodes: nodes}
 }
@@ -59,10 +99,34 @@ pub fn (scene &PackedScene) instantiate(tree $&SceneTree, parent int, name strin
         }
         kind := scene.nodes[i].kind
         id := tree.add_typed_child(node_parent, node_name, kind) or >>
-        if kind == NODE_2D { tree.set_transform(id, scene.nodes[i].local) or >> }
-        if kind == NODE_3D { tree.set_transform_3d(id, scene.nodes[i].local_3d) or >> }
+        if kind == NODE_2D {
+            tree.set_transform(id, scene.nodes[i].local) or >>
+            tree.set_camera_2d(id, scene.nodes[i].camera_2d) or >>
+        }
+        if kind == NODE_3D {
+            tree.set_transform_3d(id, scene.nodes[i].local_3d) or >>
+            if scene.nodes[i].orthographic.is_set() {
+                tree.set_orthographic_camera_3d(id, scene.nodes[i].orthographic) or >>
+            } else { tree.set_camera_3d(id, scene.nodes[i].camera) or >> }
+        }
         tree.set_visible(id, scene.nodes[i].visible) or >>
         tree.set_process_mode(id, scene.nodes[i].process_mode) or >>
+        for g in scene.nodes[i].groups {
+            tree.add_to_group(id, g + "") or >>
+        }
+        for k in 0:scene.nodes[i].meta_keys.len {
+            mk := scene.nodes[i].meta_keys[k] + ""
+            kind_m := scene.nodes[i].meta_kinds[k]
+            if kind_m == META_STRING {
+                tree.set_meta_str(id, mk, scene.nodes[i].meta_strs[k] + "") or >>
+            } else if kind_m == META_INT {
+                tree.set_meta_int(id, mk, scene.nodes[i].meta_ints[k]) or >>
+            } else if kind_m == META_FLOAT {
+                tree.set_meta_f64(id, mk, scene.nodes[i].meta_f64s[k]) or >>
+            } else if kind_m == META_BOOL {
+                tree.set_meta_bool(id, mk, scene.nodes[i].meta_bools[k]) or >>
+            }
+        }
         ids.push(id)
     }
     << ids[0]

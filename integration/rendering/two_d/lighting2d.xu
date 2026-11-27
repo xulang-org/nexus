@@ -1,0 +1,214 @@
+@"github.com/xulang-org/nexus/integration/rendering/two_d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+l2d #"github.com/xulang-org/nexus/resources/lighting2d"
+nexus #"github.com/xulang-org/nexus/scene"
+#errors
+#math
+
+struct BoundOccluder2D {
+    node int
+    segment l2d.OccluderSegment2D
+}
+
+pub struct SceneLights2D {
+    lights map[int]l2d.Light2D
+    light_nodes []int
+    occluders []BoundOccluder2D
+}
+
+pub fn new_scene_lights_2d() SceneLights2D {
+    << SceneLights2D{
+        lights: map[int]l2d.Light2D{},
+        light_nodes: []int{},
+        occluders: []BoundOccluder2D{}
+    }
+}
+
+pub fn (s $&SceneLights2D) attach_light(tree &nexus.SceneTree, node int, light l2d.Light2D) int {
+    light.validate() or >>
+    info := tree.node_info(node) or >>
+    if info.kind != nexus.NODE_2D || info.queued_free {
+        >> errors.new("nexus 2D lighting: light attachment requires editable Node2D")
+    }
+    if !s.lights.has(node) {
+        if s.light_nodes.len >= l2d.MAX_LIGHTS_2D {
+            >> errors.new("nexus 2D lighting: bound light capacity exceeded")
+        }
+        s.light_nodes.push(node)
+    }
+    s.lights[node] = light
+    << 0
+}
+
+pub fn (s $&SceneLights2D) detach_light(node int) int {
+    if !s.lights.has(node) { << 0 }
+    lm := $&s.lights
+    lm.delete(node)
+    $kept := []int{}
+    for i in 0:s.light_nodes.len {
+        n := s.light_nodes[i]
+        if n != node { kept.push(n) }
+    }
+    s.light_nodes = kept
+    << 1
+}
+
+pub fn (s $&SceneLights2D) attach_occluder_segment(
+    tree &nexus.SceneTree,
+    node int,
+    seg l2d.OccluderSegment2D
+) int {
+    info := tree.node_info(node) or >>
+    if info.kind != nexus.NODE_2D || info.queued_free {
+        >> errors.new("nexus 2D lighting: occluder attachment requires editable Node2D")
+    }
+    if s.occluders.len >= l2d.MAX_OCCLUDERS_2D {
+        >> errors.new("nexus 2D lighting: occluder capacity exceeded")
+    }
+    s.occluders.push(BoundOccluder2D{node: node, segment: seg})
+    << 0
+}
+
+pub fn (s $&SceneLights2D) attach_occluder_box(
+    tree &nexus.SceneTree,
+    node int,
+    local_rect fm.Rect2,
+    layer_mask int
+) int {
+    segs := l2d.occluder_box_2d(local_rect) or >>
+    if s.occluders.len + segs.len > l2d.MAX_OCCLUDERS_2D {
+        >> errors.new("nexus 2D lighting: occluder box exceeds capacity")
+    }
+    for i in 0:segs.len {
+        s.attach_occluder_segment(tree, node, segs[i].with_layer_mask(layer_mask) or >>) or >>
+    }
+    << segs.len
+}
+
+pub fn (s $&SceneLights2D) detach_occluders_for_node(node int) int {
+    $kept := []BoundOccluder2D{}
+    $removed := 0
+    for i in 0:s.occluders.len {
+        item := s.occluders[i]
+        if item.node == node {
+            removed += 1
+        } else {
+            kept.push(item)
+        }
+    }
+    s.occluders = kept
+    << removed
+}
+
+pub fn (s $&SceneLights2D) prune(tree &nexus.SceneTree) int {
+    $pruned := 0
+    $kept_nodes := []int{}
+    lm := $&s.lights
+    for i in 0:s.light_nodes.len {
+        n := s.light_nodes[i]
+        $alive := tree.is_alive(n)
+        if alive {
+            info := tree.node_info(n) or >>
+            if info.queued_free { alive = false }
+        }
+        if !alive {
+            lm.delete(n)
+            pruned += 1
+        } else {
+            kept_nodes.push(n)
+        }
+    }
+    s.light_nodes = kept_nodes
+
+    $kept_occ := []BoundOccluder2D{}
+    for i in 0:s.occluders.len {
+        item := s.occluders[i]
+        $alive := tree.is_alive(item.node)
+        if alive {
+            info := tree.node_info(item.node) or >>
+            if info.queued_free { alive = false }
+        }
+        if !alive {
+            pruned += 1
+        } else {
+            kept_occ.push(item)
+        }
+    }
+    s.occluders = kept_occ
+    << pruned
+}
+
+pub fn (s &SceneLights2D) collect(
+    tree &nexus.SceneTree,
+    ambient fm.Vec3,
+    exposure f64,
+    shadow_bias f64
+) l2d.LightEnvironment2D {
+    $env := l2d.new_environment_2d(ambient) or >>
+    env.set_exposure(exposure) or >>
+    env.set_shadow_bias(shadow_bias) or >>
+
+    for i in 0:s.light_nodes.len {
+        node := s.light_nodes[i]
+        if !tree.is_alive(node) || !(tree.is_visible(node) or >>) { -> }
+        local_l := &s.lights[node]
+        if !local_l.enabled { -> }
+        world := tree.global_transform(node) or >>
+        wpos := world.point(local_l.position)
+        wtip := world.point(local_l.position.add(local_l.direction))
+        $wdir := wtip.sub(wpos).normalized()
+        if wdir.length() <= 1e-6 { wdir = local_l.direction }
+        sx := world.point(fm.vec2(1.0, 0.0)).sub(world.point(fm.vec2(0.0, 0.0))).length()
+        sy := world.point(fm.vec2(0.0, 1.0)).sub(world.point(fm.vec2(0.0, 0.0))).length()
+        wradius := math.max(1e-3, local_l.radius * math.max(sx, sy))
+
+        $wl := local_l.clone()
+        wl.position = wpos
+        wl.direction = wdir
+        wl.radius = wradius
+        env.add_light(wl) or >>
+    }
+
+    for i in 0:s.occluders.len {
+        item := &s.occluders[i]
+        if !tree.is_alive(item.node) || !(tree.is_visible(item.node) or >>) { -> }
+        world := tree.global_transform(item.node) or >>
+        wa := world.point(item.segment.a)
+        wb := world.point(item.segment.b)
+        if wb.sub(wa).length() > 1e-6 {
+            wseg := l2d.occluder_segment_2d(wa, wb) or >>
+            env.add_occluder(wseg.with_layer_mask(item.segment.layer_mask) or >>) or >>
+        }
+    }
+    << env
+}
+
+pub fn record_visibility_fan_2d(
+    env &l2d.LightEnvironment2D,
+    light_index int,
+    view fm.Transform2D,
+    color int,
+    angular_samples int,
+    batch $&canvas.Batch2D
+) int {
+    if light_index < 0 || light_index >= env.lights.len {
+        >> errors.new("nexus 2D lighting: light_index out of bounds")
+    }
+    l := &env.lights[light_index]
+    pts := l2d.visibility_polygon_2d(l.position, l.radius, &env.occluders, l.layer_mask, angular_samples) or >>
+    if pts.len < 3 { << 0 }
+    center := view.point(l.position)
+    n := pts.len
+    $tris := 0
+    for i in 0:n {
+        $j := i + 1
+        if j >= n { j = 0 }
+        pa := view.point(pts[i])
+        pb := view.point(pts[j])
+        batch.triangle(center, pa, pb, color) or >>
+        tris += 1
+    }
+    << tris
+}

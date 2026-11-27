@@ -1,0 +1,380 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+resource #"github.com/xulang-org/nexus/resources/scene"
+tiles #"github.com/xulang-org/nexus/resources/tilemap"
+#crypto/sha256
+#errors
+#math
+#path/filepath
+#ui
+#ui/draw
+
+const TOP = 52
+const BOTTOM = 30
+const LEFT = 190
+const RIGHT = 214
+const SWATCH = 44
+const PALETTE_COLUMNS = 4
+const MAX_ZOOM = 128
+
+struct TileEditor {
+    draft TileDraft
+    layer resource.TileMap2DAttachment
+    layer_names []string
+    atlas draw.Image
+    order []tiles.CellCoord
+    index int
+    layer_scroll int
+    tile int
+    page int
+    erasing bool
+    zoom f64
+    center fm.Vec2
+    size fm.Vec2
+    pointer fm.Vec2
+    stroke bool
+    changed bool
+    panning bool
+    status string
+    exit_index int
+    exit_local fm.Vec2
+    placing_exit bool
+}
+
+fn load_atlas(context &draw.Context, path &string, document &resource.Document, uid &string) draw.Image {
+    for i in 0:document.resource_count() {
+        ref := document.resource(i) or >>
+        if ref.uid != *uid { -> }
+        directory := filepath.dir(path)
+        source := filepath.join([directory, ref.path + ""])
+        raw := snapshot.read(source, snapshot.MAX_BYTES) or >>
+        if sha256.sum256(raw + "") != ref.content_hash { >> errors.new("tileset hash mismatch: " + ref.path) }
+        << context.image_encoded(&raw) or >>
+    }
+    >> errors.new("tileset resource is missing from the scene")
+}
+
+fn open_editor(context &draw.Context, draft TileDraft, width f64, height f64) TileEditor {
+    document := draft.document() or >>
+    $names := []string{}
+    for i in 0:document.tilemap_2d_count() {
+        item := document.tilemap_2d(i) or >>
+        node := document.describe_node(item.node) or >>
+        names.push(node.name + "")
+    }
+    layer := document.tilemap_2d(0) or >>
+    order := layer.grid.draw_order() or >>
+    atlas := load_atlas(context, &draft.path, &document, &layer.resource_uid) or >>
+    $editor := TileEditor{draft: draft, layer: layer, layer_names: names, atlas: atlas, order: order,
+        index: 0, layer_scroll: 0, tile: 0, page: 0, erasing: false, zoom: 1.0, center: fm.vec2(0.0, 0.0),
+        size: fm.vec2(width, height), pointer: fm.vec2(-1.0, -1.0), stroke: false, changed: false, panning: false, status: "",
+        exit_index: -1, exit_local: fm.vec2(0.0, 0.0), placing_exit: false}
+    editor.refresh_exit(&document) or >>
+    editor.fit() or >>
+    << editor
+}
+
+fn (editor &TileEditor) canvas() fm.Rect2 {
+    << fm.rect2(f64(LEFT), f64(TOP), editor.size.x - f64(LEFT + RIGHT), editor.size.y - f64(TOP + BOTTOM))
+}
+
+fn (editor &TileEditor) screen(local fm.Vec2) fm.Vec2 {
+    panel := editor.canvas()
+    << panel.position.add(panel.size.scaled(0.5)).add(local.sub(editor.center).scaled(editor.zoom))
+}
+
+fn (editor &TileEditor) local(screen fm.Vec2) fm.Vec2 {
+    panel := editor.canvas()
+    << editor.center.add(screen.sub(panel.position).sub(panel.size.scaled(0.5)).scaled(1.0 / editor.zoom))
+}
+
+fn (editor &TileEditor) min_zoom() f64 {
+    << 8.0 / math.min(editor.layer.grid.tile_width, editor.layer.grid.tile_height)
+}
+
+fn (editor $&TileEditor) fit() int {
+    panel := editor.canvas()
+    grid := &editor.layer.grid
+    quad := grid.tileset.local_quad_bounds() or >>
+    $low := fm.vec2(1.0e100, 1.0e100)
+    $high := fm.vec2(-1.0e100, -1.0e100)
+    for cell in editor.order {
+        ground := grid.cell_center(cell.col, cell.row)
+        draw_at := (grid.cell_visual_center(cell.col, cell.row) or >>).add(quad.position)
+        low.x = math.min(low.x, math.min(ground.x - grid.tile_width * 0.5, draw_at.x))
+        low.y = math.min(low.y, math.min(ground.y - grid.tile_height * 0.5, draw_at.y))
+        high.x = math.max(high.x, math.max(ground.x + grid.tile_width * 0.5, draw_at.x + quad.size.x))
+        high.y = math.max(high.y, math.max(ground.y + grid.tile_height * 0.5, draw_at.y + quad.size.y))
+    }
+    span := high.sub(low)
+    editor.center = low.add(span.scaled(0.5))
+    ideal := math.min((panel.size.x - 56.0) / span.x, (panel.size.y - 56.0) / span.y)
+    editor.zoom = math.min(f64(MAX_ZOOM), math.max(editor.min_zoom(), ideal))
+    << 0
+}
+
+fn (editor $&TileEditor) refresh_layer() int {
+    document := editor.draft.document() or >>
+    editor.layer = document.tilemap_2d(editor.index) or >>
+    editor.refresh_exit(&document) or >>
+    << 0
+}
+
+fn (editor $&TileEditor) refresh_exit(document &resource.Document) int {
+    editor.exit_index = exit_node(document) or >>
+    if editor.exit_index >= 0 {
+        layer := layer_to_map(document, editor.layer.node) or >>
+        inverse := layer.inverse() or >>
+        gate := document.describe_node(editor.exit_index) or >>
+        editor.exit_local = inverse.point(fm.vec2(gate.local.tx, gate.local.ty))
+    }
+    << 0
+}
+
+fn (editor $&TileEditor) move_exit(point fm.Vec2) int {
+    local := editor.local(point)
+    cell := editor.layer.grid.point_to_cell(local) or >>
+    if !editor.layer.grid.in_bounds(cell.col, cell.row) { << 0 }
+    document := editor.draft.document() or >>
+    layer := layer_to_map(&document, editor.layer.node) or >>
+    index := editor.exit_index
+    place_exit($&editor.draft, index, layer.point(local)) or >>
+    editor.exit_local = local
+    editor.placing_exit = false
+    editor.status = "Exit moved"
+    << 0
+}
+
+fn dispose_atlas(image $&draw.Image) int { << image.dispose() or >> }
+
+fn (editor $&TileEditor) select_layer(context &draw.Context, index int) int {
+    if index == editor.index { << 0 }
+    document := editor.draft.document() or >>
+    layer := document.tilemap_2d(index) or >>
+    order := layer.grid.draw_order() or >>
+    if layer.resource_uid != editor.layer.resource_uid {
+        $atlas := load_atlas(context, &editor.draft.path, &document, &layer.resource_uid) or >>
+        dispose_atlas($&editor.atlas) or (err) {
+            _ := atlas.dispose()
+            >> err
+        }
+        editor.atlas = atlas
+    }
+    editor.index = index
+    editor.layer = layer
+    editor.order = order
+    editor.refresh_exit(&document) or >>
+    if editor.tile >= editor.layer.grid.tileset.tile_count() { editor.tile = 0 }
+    capacity := editor.palette_capacity()
+    if capacity > 0 { editor.page = editor.tile / capacity }
+    editor.status = ""
+    << editor.fit() or >>
+}
+
+fn (editor $&TileEditor) paint_cell(point fm.Vec2) int {
+    cell := editor.layer.grid.point_to_cell(editor.local(point)) or >>
+    if !editor.layer.grid.in_bounds(cell.col, cell.row) { << 0 }
+    $tile := editor.tile
+    if editor.erasing { tile = tiles.EMPTY_TILE }
+    if (editor.layer.grid.cell(cell.col, cell.row) or >>) == tile { << 0 }
+    layer := $&editor.layer
+    grid := $&layer.grid
+    grid.set_cell(cell.col, cell.row, tile) or >>
+    editor.changed = true
+    << 0
+}
+
+fn (editor $&TileEditor) paint_move(point fm.Vec2) int {
+    panel := editor.canvas()
+    if !panel.contains(point) { << 0 }
+    if panel.contains(editor.pointer) {
+        start := editor.pointer
+        delta := point.sub(start)
+        spacing := math.max(1.0, math.min(editor.layer.grid.tile_width, editor.layer.grid.tile_height) * editor.zoom * 0.2)
+        steps := int(math.ceil(delta.length() / spacing))
+        for i in 1:steps { editor.paint_cell(start.add(delta.scaled(f64(i) / f64(steps)))) or >> }
+    }
+    << editor.paint_cell(point) or >>
+}
+
+fn (editor $&TileEditor) commit() int {
+    editor.stroke = false
+    if !editor.changed { << 0 }
+    editor.changed = false
+    index := editor.index
+    layer := copy_layer(&editor.layer) or >>
+    save_stroke($&editor.draft, index, &layer) or (err) {
+        editor.refresh_layer() or >>
+        >> err
+    }
+    editor.status = ""
+    << 0
+}
+
+fn (editor $&TileEditor) cancel_stroke() int {
+    editor.panning = false
+    editor.stroke = false
+    editor.placing_exit = false
+    if editor.changed {
+        editor.refresh_layer() or >>
+        editor.changed = false
+    }
+    << 0
+}
+
+fn (editor $&TileEditor) history(redo bool) int {
+    editor.cancel_stroke() or >>
+    done := change_history($&editor.draft, redo)
+    if done { editor.refresh_layer() or >> }
+    editor.status = ""
+    << 0
+}
+
+fn (editor $&TileEditor) save() int {
+    editor.commit() or >>
+    save_draft($&editor.draft) or >>
+    editor.status = "Saved scene"
+    << 0
+}
+
+fn (editor &TileEditor) layer_rows() int { << int((editor.size.y - f64(TOP + BOTTOM) - 50.0) / 31.0) }
+fn (editor &TileEditor) palette_capacity() int {
+    << PALETTE_COLUMNS * int(math.max(1.0, (editor.size.y - f64(TOP + BOTTOM) - 146.0) / f64(SWATCH)))
+}
+
+fn (editor &TileEditor) palette_pages() int {
+    capacity := editor.palette_capacity()
+    if capacity <= 0 { << 1 }
+    << (editor.layer.grid.tileset.tile_count() + capacity - 1) / capacity
+}
+
+fn (editor $&TileEditor) page_by(delta int) {
+    editor.page = int(math.max(0.0, math.min(f64(editor.palette_pages() - 1), f64(editor.page + delta))))
+}
+
+fn (editor $&TileEditor) resize(size fm.Vec2) {
+    editor.size = size
+    editor.page_by(0)
+    editor.scroll_layers(0)
+}
+
+fn (editor $&TileEditor) scroll_layers(delta int) {
+    editor.layer_scroll = int(math.max(0.0, math.min(f64(editor.layer_names.len - editor.layer_rows()), f64(editor.layer_scroll + delta))))
+}
+
+fn toolbar_button(width f64, id int) fm.Rect2 {
+    if id == 4 { << fm.rect2(width - 340.0, 10.0, 80.0, 30.0) }
+    if id == 0 { << fm.rect2(width - 252.0, 10.0, 58.0, 30.0) }
+    if id == 1 { << fm.rect2(width - 188.0, 10.0, 58.0, 30.0) }
+    if id == 2 { << fm.rect2(width - 124.0, 10.0, 44.0, 30.0) }
+    << fm.rect2(width - 74.0, 10.0, 60.0, 30.0)
+}
+
+fn (editor &TileEditor) layer_row(row int) fm.Rect2 {
+    << fm.rect2(10.0, f64(TOP) + 38.0 + f64(row) * 31.0, f64(LEFT) - 20.0, 28.0)
+}
+
+fn (editor &TileEditor) swatch(index int) fm.Rect2 {
+    << fm.rect2(editor.size.x - f64(RIGHT) + 17.0 + f64(index % PALETTE_COLUMNS * SWATCH),
+        f64(TOP + 78) + f64(index / PALETTE_COLUMNS * SWATCH), f64(SWATCH - 4), f64(SWATCH - 4))
+}
+
+fn (editor &TileEditor) palette_control(id int) fm.Rect2 {
+    x := editor.size.x - f64(RIGHT) + 17.0
+    if id == 0 { << fm.rect2(x, f64(TOP + 38), 81.0, 28.0) }
+    if id == 1 { << fm.rect2(x + 90.0, f64(TOP + 38), 81.0, 28.0) }
+    bottom := editor.size.y - f64(BOTTOM) - 40.0
+    if id == 2 { << fm.rect2(x, bottom, 40.0, 28.0) }
+    << fm.rect2(x + 132.0, bottom, 40.0, 28.0)
+}
+
+fn (editor $&TileEditor) click(context &draw.Context, point fm.Vec2) int {
+    if point.y < f64(TOP) {
+        if editor.exit_index >= 0 && toolbar_button(editor.size.x, 4).contains(point) {
+            editor.placing_exit = !editor.placing_exit
+            editor.status = ""
+        }
+        if toolbar_button(editor.size.x, 0).contains(point) { editor.history(false) or >> }
+        if toolbar_button(editor.size.x, 1).contains(point) { editor.history(true) or >> }
+        if toolbar_button(editor.size.x, 2).contains(point) { editor.fit() or >> }
+        if toolbar_button(editor.size.x, 3).contains(point) { editor.save() or >> }
+    } else if point.x < f64(LEFT) {
+        for row in 0:editor.layer_rows() {
+            index := editor.layer_scroll + row
+            if index < editor.layer_names.len && editor.layer_row(row).contains(point) {
+                editor.select_layer(context, index) or >>
+                <-
+            }
+        }
+    } else if editor.canvas().contains(point) {
+        if editor.placing_exit { << editor.move_exit(point) or >> }
+        editor.stroke = true
+        editor.paint_cell(point) or >>
+    } else if point.x >= editor.size.x - f64(RIGHT) {
+        if editor.palette_control(0).contains(point) { editor.erasing = false }
+        else if editor.palette_control(1).contains(point) { editor.erasing = true }
+        else if editor.palette_control(2).contains(point) { editor.page_by(-1) }
+        else if editor.palette_control(3).contains(point) { editor.page_by(1) }
+        else {
+            capacity := editor.palette_capacity()
+            for i in 0:capacity {
+                tile := editor.page * capacity + i
+                if tile < editor.layer.grid.tileset.tile_count() && editor.swatch(i).contains(point) {
+                    editor.tile = tile
+                    editor.erasing = false
+                    <-
+                }
+            }
+        }
+    }
+    << 0
+}
+
+fn (editor $&TileEditor) wheel(point fm.Vec2, dy f64) {
+    if dy == 0.0 { << }
+    $step := 1
+    if dy < 0.0 { step = -1 }
+    if editor.canvas().contains(point) {
+        anchor := editor.local(point)
+        delta := math.max(-0.6, math.min(0.6, dy * -0.012))
+        editor.zoom = math.min(f64(MAX_ZOOM), math.max(editor.min_zoom(), editor.zoom * math.exp(delta)))
+        editor.center = editor.center.add(anchor.sub(editor.local(point)))
+    } else if point.y > f64(TOP) && point.y < editor.size.y - f64(BOTTOM) {
+        if point.x < f64(LEFT) { editor.scroll_layers(step) }
+        if point.x >= editor.size.x - f64(RIGHT) { editor.page_by(step) }
+    }
+}
+
+fn (editor $&TileEditor) input(context &draw.Context, kind int, button int, point fm.Vec2, dy f64, key int, modifiers int) bool {
+    if kind == ui.EV_KEY_DOWN {
+        command := (modifiers & (ui.MOD_META | ui.MOD_CONTROL)) != 0
+        if command && (key == 83 || key == 115) { editor.save() or >> }
+        else if command && (key == 90 || key == 122) { editor.history((modifiers & ui.MOD_SHIFT) != 0) or >> }
+        else if key == 70 || key == 102 { editor.fit() or >> }
+        else if key == 69 || key == 101 { editor.erasing = !editor.erasing }
+        else if key == ui.KEY_ESCAPE { editor.cancel_stroke() or >> }
+        else { << false }
+    } else if kind == ui.EV_POINTER_DOWN {
+        if editor.stroke || editor.panning { << false }
+        if button == ui.BUTTON_LEFT { editor.click(context, point) or >> }
+        else if (button == ui.BUTTON_RIGHT || button == ui.BUTTON_MIDDLE) && editor.canvas().contains(point) { editor.panning = true }
+        editor.pointer = point
+    } else if kind == ui.EV_POINTER_MOVE {
+        if editor.stroke { editor.paint_move(point) or >> }
+        if editor.panning { editor.center = editor.center.sub(point.sub(editor.pointer).scaled(1.0 / editor.zoom)) }
+        editor.pointer = point
+    } else if kind == ui.EV_POINTER_UP {
+        if button == ui.BUTTON_LEFT && editor.stroke {
+            editor.paint_move(point) or >>
+            editor.commit() or >>
+        } else if button == ui.BUTTON_RIGHT || button == ui.BUTTON_MIDDLE { editor.panning = false }
+        editor.pointer = point
+    } else if kind == ui.EV_POINTER_SCROLL {
+        if !editor.stroke { editor.wheel(point, dy) }
+    } else if kind == ui.EV_POINTER_CANCEL { editor.cancel_stroke() or >> }
+    else if kind == ui.EV_POINTER_LEAVE && !editor.panning && !editor.stroke { editor.pointer = fm.vec2(-1.0, -1.0) }
+    else { << false }
+    << true
+}

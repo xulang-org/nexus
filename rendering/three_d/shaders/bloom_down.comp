@@ -1,0 +1,66 @@
+#version 450
+
+layout(set = 0, binding = 0) uniform sampler2D src_tex;
+layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D dst_tex;
+
+layout(set = 2, binding = 0, std140) uniform BloomDownParams {
+    vec4 dims;
+    vec4 cfg;
+} params;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+float karis_weight(vec3 c) {
+    float l = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+    return 1.0 / (1.0 + l);
+}
+
+vec3 soft_threshold(vec3 c, float thresh, float knee) {
+    float lum = max(c.r, max(c.g, c.b));
+    float soft = clamp(lum - thresh + knee, 0.0, 2.0 * knee);
+    soft = (soft * soft) / (4.0 * knee);
+    float contrib = max(soft, lum - thresh) / max(lum, 1e-5);
+    return c * max(contrib, 0.0);
+}
+
+void main() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    uint dw = uint(params.dims.z), dh = uint(params.dims.w);
+    if (gid.x >= dw || gid.y >= dh) return;
+
+    vec2 uv = (vec2(gid) + 0.5) / vec2(params.dims.z, params.dims.w);
+    vec2 dx = vec2(1.0 / params.dims.x, 0.0);
+    vec2 dy = vec2(0.0, 1.0 / params.dims.y);
+
+    vec3 a = textureLod(src_tex, uv - 2.0 * dx - 2.0 * dy, 0.0).rgb;
+    vec3 b = textureLod(src_tex, uv - 2.0 * dy, 0.0).rgb;
+    vec3 c = textureLod(src_tex, uv + 2.0 * dx - 2.0 * dy, 0.0).rgb;
+    vec3 d = textureLod(src_tex, uv - 2.0 * dx, 0.0).rgb;
+    vec3 e = textureLod(src_tex, uv, 0.0).rgb;
+    vec3 f = textureLod(src_tex, uv + 2.0 * dx, 0.0).rgb;
+    vec3 g = textureLod(src_tex, uv - 2.0 * dx + 2.0 * dy, 0.0).rgb;
+    vec3 h = textureLod(src_tex, uv + 2.0 * dy, 0.0).rgb;
+    vec3 i = textureLod(src_tex, uv + 2.0 * dx + 2.0 * dy, 0.0).rgb;
+
+    vec3 j = textureLod(src_tex, uv - dx - dy, 0.0).rgb;
+    vec3 k = textureLod(src_tex, uv + dx - dy, 0.0).rgb;
+    vec3 l = textureLod(src_tex, uv - dx + dy, 0.0).rgb;
+    vec3 m = textureLod(src_tex, uv + dx + dy, 0.0).rgb;
+
+    vec3 out_rgb;
+    if (params.cfg.z > 0.5) {
+        float thresh = params.cfg.x;
+        float knee = max(params.cfg.y, 1e-4);
+        vec3 g0 = soft_threshold((a + b + d + e) * 0.25, thresh, knee);
+        vec3 g1 = soft_threshold((b + c + e + f) * 0.25, thresh, knee);
+        vec3 g2 = soft_threshold((d + e + g + h) * 0.25, thresh, knee);
+        vec3 g3 = soft_threshold((e + f + h + i) * 0.25, thresh, knee);
+        vec3 g4 = soft_threshold((j + k + l + m) * 0.25, thresh, knee);
+        float w0 = karis_weight(g0), w1 = karis_weight(g1), w2 = karis_weight(g2), w3 = karis_weight(g3), w4 = karis_weight(g4);
+        out_rgb = (g0 * w0 + g1 * w1 + g2 * w2 + g3 * w3 + g4 * w4) / max(w0 + w1 + w2 + w3 + w4, 1e-5);
+    } else {
+        out_rgb = e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h) * 0.0625 + (j + k + l + m) * 0.125;
+    }
+
+    imageStore(dst_tex, ivec2(gid), vec4(max(out_rgb, vec3(0.0)), 1.0));
+}

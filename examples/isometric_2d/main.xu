@@ -1,0 +1,460 @@
+@main
+
+#app
+#gpu
+#window
+window_events #window/events
+
+gpu_info #"github.com/xulang-org/nexus/platform/gpu"
+canvas_shaders #"github.com/xulang-org/nexus/assets/shaders/two_d"
+images #"github.com/xulang-org/nexus/assets/image"
+sprite_anim #"github.com/xulang-org/nexus/animation/sprite"
+scene_codec #"github.com/xulang-org/nexus/formats/scene"
+colors #"github.com/xulang-org/nexus/foundation/color"
+fm #"github.com/xulang-org/nexus/foundation/math"
+controls #"github.com/xulang-org/nexus/input"
+image_render #"github.com/xulang-org/nexus/integration/image_render/two_d"
+app_host #"github.com/xulang-org/nexus/integration/application"
+phone_controls #"github.com/xulang-org/nexus/integration/phone_controls"
+vp #"github.com/xulang-org/nexus/integration/viewport"
+scene_render #"github.com/xulang-org/nexus/integration/rendering/two_d"
+tilemap_files #"github.com/xulang-org/nexus/integration/scene_tilemap2d"
+physics #"github.com/xulang-org/nexus/physics2d"
+ren #"github.com/xulang-org/nexus/rendering/two_d"
+ren_data #"github.com/xulang-org/nexus/resources/canvas"
+nexus #"github.com/xulang-org/nexus/scene"
+#crypto/sha256
+#errors
+#math
+#os
+#strconv
+#path/filepath
+#strings
+files #"github.com/xulang-org/nexus/internal/file_snapshot"
+
+const ASSETS = "examples/isometric_2d/assets"
+
+struct Options {
+    path string
+    save string
+    capture string
+    shaders string
+    frames int
+    backend int
+    has_hero_y bool
+    hero_y f64
+    autoplay bool
+    touch bool
+    campaign bool
+    data string
+}
+
+fn options() Options {
+    args := os.args()
+    packaged := app.is_hosted() || os.getenv("XU_PHONE_RESOURCE_ROOT").len > 0
+    $config := Options{
+        path: ASSETS + "/world.xuscene",
+        save: "",
+        capture: "",
+        shaders: "build/canvas-shaders",
+        frames: 0,
+        backend: gpu.AUTO,
+        has_hero_y: false,
+        hero_y: 276.0,
+        autoplay: false,
+        touch: packaged,
+        campaign: false,
+        data: ""
+    }
+    if packaged {
+        config.path = app_host.resolve_resource("map/world.xuscene", "build") or >>
+        config.shaders = app_host.resolve_resource("canvas", "build") or >>
+        entry_path := app_host.resolve_resource("map/campaign.entry", "build") or >>
+        if map_exists(&entry_path) {
+            raw := files.read(entry_path, 128) or >>
+            entry := strings.trim_space(&raw)
+            relative := map_path(&"map", &entry) or >>
+            config.path = app_host.resolve_resource(relative, "build") or >>
+            config.campaign = true
+        }
+    }
+    $i := 1
+    while i < args.len {
+        if args[i] == "--autoplay" {
+            config.autoplay = true
+            i += 1
+            ->
+        }
+        if args[i] == "--touch" {
+            config.touch = true
+            i += 1
+            ->
+        }
+        if args[i] == "--campaign" {
+            config.campaign = true
+            i += 1
+            ->
+        }
+        if i + 1 >= args.len { >> errors.new("missing option value") }
+        next := i + 1
+        if args[i] == "--scene" { config.path = args[next] + ""
+        } else if args[i] == "--data" { config.data = args[next] + ""
+        } else if args[i] == "--save" { config.save = args[next] + ""
+        } else if args[i] == "--shaders" { config.shaders = args[next] + ""
+        } else if args[i] == "--capture" { config.capture = args[next] + ""
+        } else if args[i] == "--hero-y" {
+            config.hero_y = f64(strconv.atoi(&args[next]) or >>)
+            config.has_hero_y = true
+        } else if args[i] == "--frames" {
+            config.frames = strconv.atoi(&args[next]) or >>
+            if config.frames < 1 || config.frames > 1000000 { >> errors.new("invalid frames") }
+        } else if args[i] == "--backend" {
+            if args[next] == "metal" { config.backend = gpu.METAL
+            } else if args[next] == "vulkan" { config.backend = gpu.VULKAN
+            } else if args[next] == "d3d12" { config.backend = gpu.D3D12
+            } else if args[next] != "auto" { >> errors.new("unknown backend") }
+        } else { >> errors.new("unknown option: " + args[i]) }
+        i = i + 2
+    }
+    if config.capture.len > 0 && config.frames == 0 { >> errors.new("capture requires --frames") }
+    if config.autoplay && config.frames == 0 { >> errors.new("autoplay requires --frames") }
+    << config
+}
+
+fn record_parallax_backdrop(camera &nexus.Camera2D, area fm.Rect2, shift fm.Transform2D, batch $&ren_data.Batch2D) int {
+    far_layer := scene_render.new_parallax_layer_2d(0.35, 0.25, 0.0, 0.0) or >>
+    far_view := shift.multiply(far_layer.view_transform(camera, area.size.x, area.size.y) or >>)
+    ridge_far := colors.rgba8(24, 38, 62, 255) or >>
+    ridge_near := colors.rgba8(32, 52, 78, 255) or >>
+    for i in 0:6 {
+        x := -200.0 + f64(i) * 240.0
+        h := 110.0 + f64((i * 37) % 70)
+        batch.quad(fm.rect2(x, 60.0 + (180.0 - h), 200.0, h + 180.0), far_view, ridge_far) or >>
+    }
+    mid_layer := scene_render.new_parallax_layer_2d(0.65, 0.45, 0.0, 0.0) or >>
+    mid_view := shift.multiply(mid_layer.view_transform(camera, area.size.x, area.size.y) or >>)
+    for i in 0:7 {
+        x := -180.0 + f64(i) * 190.0
+        h := 70.0 + f64((i * 53) % 50)
+        batch.quad(fm.rect2(x, 140.0 + (120.0 - h), 150.0, h + 140.0), mid_view, ridge_near) or >>
+    }
+    << 0
+}
+
+fn tint_ground(layer $&scene_render.TileMapLayer2D, tree &nexus.SceneTree, camera &nexus.Camera2D,
+    area fm.Rect2, pixel fm.Vec2) bool {
+    local := pixel.sub(area.position)
+    width := area.size.x
+    height := area.size.y
+    if !(camera.viewport(width, height) or >>).contains(local) { << false }
+    picked := layer.pick_cell(tree, camera, local, width, height) or >>
+    if !layer.grid.in_bounds(picked.col, picked.row) { << false }
+    grid := $&layer.grid
+    grid.set_tint(picked.col, picked.row, 4293165311) or >>
+    println("Isometric tile picked: " + str(picked.col) + "," + str(picked.row))
+    << true
+}
+
+fn parent_world_2d(tree &nexus.SceneTree, node int) fm.Transform2D {
+    $parent := (tree.node_info(node) or >>).parent
+    while parent > 0 {
+        info := tree.node_info(parent) or >>
+        if info.kind == nexus.NODE_2D { << tree.global_transform(parent) or >> }
+        if info.kind == nexus.NODE_3D { <- }
+        parent = info.parent
+    }
+    << fm.identity()
+}
+
+fn isometric_pose(tree &nexus.SceneTree, hero_node int, cam_node int) IsometricCheckpoint {
+    hero_node_data := tree.node(hero_node) or >>
+    camera_node_data := tree.node(cam_node) or >>
+    hero := hero_node_data.transform
+    camera := camera_node_data.transform
+    << IsometricCheckpoint{hero: fm.vec2(hero.tx, hero.ty), camera: fm.vec2(camera.tx, camera.ty), paused: tree.paused}
+}
+
+struct MapResult { gate string
+    frames int }
+
+fn run() int {
+    config := options() or >>
+    hero_img := images.load_png(app_host.resolve_resource("hero_iso.png", ASSETS) or >>) or >>
+    canvas_program := canvas_shaders.load_canvas(config.shaders + "") or >>
+    $window_options := window.Options{title: "Nexus Engine Isometric 2.5D", width: 960, height: 640,
+        resizable: true, high_pixel_density: false, hidden: false}
+    if config.touch {
+        window_options.width = 420
+        window_options.height = 780
+        window_options.high_pixel_density = app.is_hosted()
+    }
+    $renderer := ren.open_2d_window(window_options, config.backend, &canvas_program) or >>
+    println("Isometric 2D GPU backend: " + gpu_info.backend_name(renderer.backend() or >>))
+
+    $hero_tex := image_render.upload_image_2d(&renderer, &hero_img, false) or >>
+    directory := filepath.dir(&config.path)
+    $path := config.path + ""
+    $checkpoint_path := config.data + ""
+    if checkpoint_path.len == 0 && config.touch && (app.is_hosted() || os.getenv("XU_PHONE_DATA_ROOT").len > 0) {
+        $name := "isometric-v1.json"
+        if config.campaign { name = "isometric-campaign-v1.json" }
+        checkpoint_path = app_host.resolve_data(name, "build") or >>
+    }
+    if config.campaign && checkpoint_path.len > 0 {
+        saved_level := checkpoint_map(&checkpoint_path)
+        if saved_level.len > 0 {
+            saved_path := map_path(&directory, &saved_level) or >>
+            if map_exists(&saved_path) { path = saved_path }
+        }
+    }
+    $frames := 0
+    while true {
+        result := run_map($&renderer, &hero_tex, &config, path + "", &directory, &checkpoint_path, frames) or >>
+        if result.gate.len == 0 { <- }
+        path = map_path(&directory, &result.gate) or >>
+        frames = result.frames
+    }
+    hero_tex.close() or >>
+    renderer.close() or >>
+    << 0
+}
+
+fn run_map(renderer $&ren.Renderer2D, hero_tex &ren.Texture2D, config &Options, path string,
+    directory &string, checkpoint_path &string, first_frame int) MapResult {
+    $tilemaps := tilemap_files.load(renderer, path + "") or >>
+    hero_slot := tilemaps.texture_count()
+
+    $tree := nexus.new_scene_tree("Root", 64) or >>
+    root := tree.root()
+    instance := tilemaps.instantiate($&tree, root, "IsoWorld") or >>
+    $layers := tilemaps.bind(&tree, instance) or >>
+    $collision_layers := []physics.TileMapCollider2D{}
+    for i in 0:layers.len {
+        layer := &layers[i]
+        if layer.grid.solid_tile_count() == 0 { -> }
+        if collision_layers.len > 0 { >> errors.new("the isometric demo accepts one collision layer") }
+        world := tree.global_transform(layer.node) or >>
+        collision_layers.push(physics.new_tilemap_collider_2d(&layer.grid, world) or >>)
+    }
+    cam_node := tree.find_node(instance, "Camera2D") or >>
+    hero_node := tree.find_node(instance, "Hero") or >>
+    hero_parent := parent_world_2d(&tree, hero_node) or >>
+    hero_local := hero_parent.inverse() or >>
+    camera_local := (parent_world_2d(&tree, cam_node) or >>).inverse() or >>
+    hero_footprint := fm.vec2(0.12, 0.12)
+    $scene_key := ""
+    $level := ""
+    $gates := []Gate{}
+    if config.campaign {
+        level = filepath.base(&path)
+        gates = scene_gates(tilemaps.document(), &tree, instance, directory) or >>
+        println("Isometric map: " + level)
+    }
+    if checkpoint_path.len > 0 {
+        scene_key = sha256.sum256(scene_codec.encode(tilemaps.document()) or >>)
+        initial_pose := isometric_pose(&tree, hero_node, cam_node) or >>
+        state := load_isometric_checkpoint(*checkpoint_path, &scene_key, &level, initial_pose,
+            hero_parent, &collision_layers, hero_footprint)
+        tree.set_position(hero_node, state.hero) or >>
+        tree.set_position(cam_node, state.camera) or >>
+        tree.paused = state.paused
+        hx := strconv.format_float(state.hero.x, 102, 3) or >>
+        hy := strconv.format_float(state.hero.y, 102, 3) or >>
+        cx := strconv.format_float(state.camera.x, 102, 3) or >>
+        cy := strconv.format_float(state.camera.y, 102, 3) or >>
+        println("Isometric Phone state: hero=" + hx + "," + hy + "; camera=" + cx + "," + cy +
+            "; paused=" + str(state.paused))
+    }
+    if config.has_hero_y {
+        cur := tree.node(hero_node) or >>
+        tree.set_position(hero_node, fm.vec2(cur.transform.tx, config.hero_y)) or >>
+    }
+
+    white := colors.rgba8(255, 255, 255, 255) or >>
+    $hero_sprite := scene_render.Sprite2D{
+        node: hero_node,
+        bounds: fm.rect2(-24.0, -44.0, 48.0, 48.0),
+        region: fm.rect2(0.0, 0.0, 0.25, 1.0),
+        tint: white
+    }
+    clip := sprite_anim.new_atlas_animation(4, 1, 0, 4, 6.0, true) or >>
+    $animator := sprite_anim.new_sprite_animator(clip) or >>
+
+    $input := controls.new_input_map()
+    actions := ["left", "right", "up", "down", "pause"]
+    keys := [window_events.KEY_A, window_events.KEY_D, window_events.KEY_W, window_events.KEY_S, window_events.KEY_SPACE]
+    for i in 0:actions.len {
+        input.bind(actions[i] + "", keys[i]) or >>
+        input.bind_source(actions[i] + "", i) or >>
+    }
+    input.bind("quit", window_events.KEY_ESCAPE) or >>
+    $host := app_host.new_app_host(60, 8, 1, 1) or >>
+    host.enable_back_handling() or >>
+    initial := vp.from_window(renderer.window() or >>) or >>
+    $layout := phone_controls.layout(&initial, false)
+    $touch := layout.controls() or >>
+    $tap := no_tap()
+    $backdrop := ren_data.new_batch()
+    $hud := ren_data.new_batch()
+    $queue := scene_render.new_ysort_queue_2d()
+    background := colors.rgba8(14, 22, 36, 255) or >>
+    $frame := first_frame
+    $destination := ""
+    $last_checkpoint := now_ns()
+    $checkpoint_dirty := first_frame > 0
+    while (config.frames == 0 || frame < config.frames) && (host.next_frame() or >>) {
+        step := host.begin_step(renderer.window() or >>, $&input, $&touch, now_ns()) or >>
+        if !step.running || (input.just_pressed("quit") or >>) || (step.back_requested && tree.paused) {
+            host.finish_step(true) or >>
+            <-
+        }
+        if !step.drawable {
+            tap = no_tap()
+            host.finish_step(true) or >>
+            if !host.is_hosted() { sleep_ns(10000000) }
+            ->
+        }
+        if step.resumed || step.input_reset_reason != 0 { tap = no_tap() }
+        viewport := &step.viewport
+        if step.layout_changed {
+            touch.cancel($&input) or >>
+            layout = phone_controls.layout(viewport, false)
+            touch = layout.controls() or >>
+            tap = no_tap()
+        }
+        if step.back_requested || (input.just_pressed("pause") or >>) {
+            tree.paused = !tree.paused
+            checkpoint_dirty = true
+            tap = no_tap()
+            println("Isometric paused=" + str(tree.paused))
+        }
+        area := scene_area(viewport, config.touch) or >>
+        pixels := viewport.screen_transform()
+        if layers.len > 0 && !tree.paused {
+            pick_camera := nexus.new_camera_node_2d(&tree, cam_node) or >>
+            for event in step.events {
+                if event.kind == window_events.EVENT_FOCUS_LOST || event.kind == window_events.EVENT_INPUT_RESET {
+                    tap = no_tap()
+                    ->
+                }
+                $picked := !host.is_hosted() && event.kind == window_events.EVENT_POINTER_DOWN && event.button == window_events.BUTTON_LEFT
+                if config.touch && !step.layout_changed && !step.resumed && tap.feed(&event, &layout) { picked = true }
+                if picked {
+                    point := fm.vec2(event.x, event.y)
+                    tint_ground($&layers[0], &tree, &pick_camera, area, pixels.point(point)) or >>
+                }
+            }
+        }
+        if config.autoplay { input.feed_key(window_events.KEY_W, true) or >> }
+        $ticks := host.finish_step(tree.paused) or >>
+        if config.frames > 0 && !tree.paused { ticks.steps = 1 }
+        for tick in 0:ticks.steps {
+            move := input.vector("left", "right", "up", "down") or >>
+            if move.x != 0.0 || move.y != 0.0 {
+                cur := tree.node(hero_node) or >>
+                start := fm.vec2(cur.transform.tx, cur.transform.ty)
+                motion := fm.vec2(move.x * 160.0 * ticks.fixed_delta, move.y * 120.0 * ticks.fixed_delta)
+                target := start.add(motion)
+                bounded := fm.vec2(math.max(260.0, math.min(700.0, target.x)), math.max(180.0, math.min(410.0, target.y)))
+                $next := hero_parent.point(bounded)
+                if collision_layers.len > 0 {
+                    world_start := hero_parent.point(start)
+                    next = (collision_layers[0].move_and_slide(world_start, next.sub(world_start), hero_footprint) or >>).position
+                }
+                tree.set_position(hero_node, hero_local.point(next)) or >>
+                tree.set_position(cam_node, camera_local.point(next.add(fm.vec2(0.0, 14.0)))) or >>
+                checkpoint_dirty = true
+                for gate in gates {
+                    if next.sub(gate.position).length() <= 8.0 {
+                        destination = gate.map_name + ""
+                        <-
+                    }
+                }
+            }
+            if config.frames == 0 || frame > 0 {
+                animator.advance(ticks.fixed_delta) or >>
+                hero_sprite.region = animator.region() or >>
+            }
+            if destination.len > 0 { <- }
+        }
+        if config.touch && step.touch_ended {
+            hero_pose := tree.node(hero_node) or >>
+            hx := strconv.format_float(hero_pose.transform.tx, 102, 3) or >>
+            hy := strconv.format_float(hero_pose.transform.ty, 102, 3) or >>
+            println("Isometric hero: " + hx + "," + hy)
+        }
+        camera := nexus.new_camera_node_2d(&tree, cam_node) or >>
+        shift := fm.transform_2d(area.position, 0.0, fm.vec2(1.0, 1.0))
+        view := shift.multiply(camera.view_transform(area.size.x, area.size.y) or >>)
+        clip_area := camera.viewport(area.size.x, area.size.y) or >>
+        world_clip := fm.rect2(clip_area.position.x + area.position.x, clip_area.position.y + area.position.y,
+            clip_area.size.x, clip_area.size.y)
+
+        backdrop.clear()
+        record_parallax_backdrop(&camera, area, shift, $&backdrop) or >>
+
+        queue.clear()
+        for i in 0:layers.len {
+            slot := tilemaps.texture_slot(i) or >>
+            layers[i].enqueue(&tree, $&queue, slot) or >>
+        }
+        queue.push_sprite(&tree, &hero_sprite, hero_slot, 0, 0.0) or >>
+        runs := queue.record_runs(view) or >>
+
+        renderer.begin(background) or >>
+        renderer.clip_rect(world_clip) or >>
+        renderer.submit(&backdrop) or >>
+        for i in 0:runs.len {
+            run := &runs[i]
+            if run.texture_id == hero_slot {
+                renderer.submit_texture(&run.batch, hero_tex) or >>
+            } else {
+                tex := tilemaps.texture(run.texture_id) or >>
+                renderer.submit_texture(&run.batch, tex) or >>
+            }
+        }
+        if gates.len > 0 {
+            hud.clear()
+            for gate in gates {
+                p := gate.position
+                hud.triangle(view.point(p.add(fm.vec2(-12.0, 0.0))), view.point(p.add(fm.vec2(0.0, -8.0))),
+                    view.point(p.add(fm.vec2(12.0, 0.0))), 4280223231) or >>
+                hud.triangle(view.point(p.add(fm.vec2(-12.0, 0.0))), view.point(p.add(fm.vec2(12.0, 0.0))),
+                    view.point(p.add(fm.vec2(0.0, 8.0))), 4280223231) or >>
+            }
+            renderer.submit(&hud) or >>
+        }
+        if config.touch {
+            phone_controls.record($&hud, &touch, &layout, viewport, tree.paused, false) or >>
+            renderer.clip_rect(fm.rect2(0.0, 0.0, f64(viewport.pixel_width), f64(viewport.pixel_height))) or >>
+            renderer.submit(&hud) or >>
+        }
+        if config.capture.len > 0 && frame + 1 == config.frames {
+            renderer.capture(config.capture + "") or >>
+        }
+        renderer.present() or >>
+        frame += 1
+        if destination.len > 0 { <- }
+        if checkpoint_path.len > 0 && checkpoint_dirty &&
+            (step.touch_ended || step.back_requested || tree.paused || frame == first_frame + 1 || now_ns() - last_checkpoint >= 1000000000) {
+            persist_isometric_checkpoint(*checkpoint_path, &scene_key, &level, isometric_pose(&tree, hero_node, cam_node) or >>)
+            checkpoint_dirty = false
+            last_checkpoint = now_ns()
+        }
+    }
+    if checkpoint_path.len > 0 && destination.len == 0 {
+        persist_isometric_checkpoint(*checkpoint_path, &scene_key, &level, isometric_pose(&tree, hero_node, cam_node) or >>)
+    }
+    if config.save.len > 0 {
+        tilemaps.save(config.save + "", &layers, &tree, instance) or >>
+    }
+    tilemaps.close() or >>
+    << MapResult{gate: destination, frames: frame}
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

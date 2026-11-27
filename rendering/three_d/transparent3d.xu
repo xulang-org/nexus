@@ -1,0 +1,189 @@
+@"github.com/xulang-org/nexus/rendering/three_d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const MAX_TRANSPARENT_DRAWS = 4096
+
+pub struct TransparentDraw3D {
+    pub mesh MeshRef3D
+    pub world fm.Mat4
+    pub material Material3D
+    pub order_bias f64
+}
+
+pub struct TransparentSortStats3D {
+    pub submitted int
+    pub visible int
+    pub frustum_culled int
+}
+
+pub struct TransparentQueue3D {
+    draws []TransparentDraw3D
+}
+
+pub fn new_transparent_queue_3d() TransparentQueue3D {
+    << TransparentQueue3D{draws: []TransparentDraw3D{}}
+}
+
+pub fn (q $&TransparentQueue3D) clear() {
+    q.draws = []TransparentDraw3D{}
+}
+
+pub fn (q &TransparentQueue3D) count() int {
+    << q.draws.len
+}
+
+pub fn (q $&TransparentQueue3D) submit(
+    mesh MeshRef3D,
+    world fm.Mat4,
+    material Material3D,
+    order_bias f64
+) int {
+    if q.draws.len >= MAX_TRANSPARENT_DRAWS {
+        >> errors.new("nexus 3D: transparent queue exceeds 4096 draws")
+    }
+    if !world.is_affine() {
+        >> errors.new("nexus 3D: transparent draw requires finite affine world matrix")
+    }
+    if !fm.finite(order_bias) {
+        >> errors.new("nexus 3D: transparent draw order_bias must be finite")
+    }
+    material.validate() or >>
+    q.draws.push(TransparentDraw3D{
+        mesh: mesh,
+        world: world,
+        material: material,
+        order_bias: order_bias
+    })
+    << q.draws.len - 1
+}
+
+fn transparent_comes_before(
+    ia int, depth_a f64, bias_a f64,
+    ib int, depth_b f64, bias_b f64
+) bool {
+    diff := depth_a - depth_b
+    if diff > 1e-6 { << true }
+    if diff < -1e-6 { << false }
+    if bias_a < bias_b - 1e-9 { << true }
+    if bias_a > bias_b + 1e-9 { << false }
+    << ia < ib
+}
+
+// Sorts submitted transparent draws back-to-front in camera view space (-Z forward),
+// breaking depth ties by ascending order_bias then original submission index.
+pub fn (q &TransparentQueue3D) sorted_indices(view fm.Mat4) []int {
+    if !view.is_affine() {
+        >> errors.new("nexus 3D: transparent sort requires finite affine view matrix")
+    }
+    n := q.draws.len
+    if n == 0 { << []int{} }
+    $depths := []f64{}
+    $order := []int{}
+    $scratch := []int{}
+    for i in 0:n {
+        wb := q.draws[i].mesh.world_bounds(q.draws[i].world) or >>
+        center := wb.minimum.add(wb.maximum).scaled(0.5)
+        vpos := view.transform(fm.vec4(center.x, center.y, center.z, 1.0))
+        if !vpos.is_finite() {
+            >> errors.new("nexus 3D: transparent draw bounds overflow view transform")
+        }
+        depths.push(-vpos.z)
+        order.push(i)
+        scratch.push(i)
+    }
+    // Bottom-up iterative merge sort for O(n log n) deterministic sorting.
+    $width := 1
+    while width < n {
+        $left := 0
+        while left < n {
+            $mid := left + width
+            if mid > n { mid = n }
+            $right := left + width * 2
+            if right > n { right = n }
+            $li := left
+            $ri := mid
+            $out := left
+            while li < mid && ri < right {
+                ia := order[li]
+                ib := order[ri]
+                if transparent_comes_before(ia, depths[ia], q.draws[ia].order_bias,
+                        ib, depths[ib], q.draws[ib].order_bias) {
+                    scratch[out] = ia
+                    li += 1
+                } else {
+                    scratch[out] = ib
+                    ri += 1
+                }
+                out += 1
+            }
+            while li < mid {
+                scratch[out] = order[li]
+                li += 1
+                out += 1
+            }
+            while ri < right {
+                scratch[out] = order[ri]
+                ri += 1
+                out += 1
+            }
+            for k in left:right {
+                order[k] = scratch[k]
+            }
+            left += width * 2
+        }
+        width = width * 2
+    }
+    << order
+}
+
+// Frustum-culls and renders sorted transparent draws into an existing HdrTarget3D
+// using alpha blending with depth writes disabled.
+pub fn (q &TransparentQueue3D) flush_into_hdr(
+    device &Device3D,
+    hdr $&HdrTarget3D,
+    clustered &ClusteredRenderer3D,
+    use_gi bool,
+    irr &IrradianceGpu3D,
+    gi_strength f64,
+    view fm.Mat4,
+    view_projection fm.Mat4
+) TransparentSortStats3D {
+    device.alive() or >>
+    if !view.is_affine() || !view_projection.is_finite() {
+        >> errors.new("nexus 3D: transparent flush requires valid view and view-projection")
+    }
+    if q.draws.len == 0 {
+        << TransparentSortStats3D{submitted: 0, visible: 0, frustum_culled: 0}
+    }
+    order := q.sorted_indices(view) or >>
+    dref := device.reference()
+    $visible_order := []int{}
+    for idx in order {
+        d := &q.draws[idx]
+        dref.validate_material(d.mesh, &d.material) or >>
+        mvp := view_projection.multiply(d.world)
+        if dref.mesh_in_view(d.mesh, mvp) or >> {
+            visible_order.push(idx)
+        }
+    }
+    if visible_order.len > 0 {
+        hdr.begin_transparent_overlay(device) or >>
+        for idx in visible_order {
+            d := &q.draws[idx]
+            if use_gi {
+                hdr.draw_clustered_gi(device, clustered, irr, gi_strength, d.mesh, d.world, view, view_projection, &d.material) or >>
+            } else {
+                hdr.draw_clustered(device, clustered, d.mesh, d.world, view, view_projection, &d.material) or >>
+            }
+        }
+        hdr.end() or >>
+    }
+    << TransparentSortStats3D{
+        submitted: q.draws.len,
+        visible: visible_order.len,
+        frustum_culled: q.draws.len - visible_order.len
+    }
+}

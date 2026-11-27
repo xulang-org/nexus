@@ -1,0 +1,971 @@
+@main
+
+proj #"github.com/xulang-org/nexus/integration/project"
+rp #"github.com/xulang-org/nexus/resources/project"
+bm #"github.com/xulang-org/nexus/integration/bundle"
+rc #"github.com/xulang-org/nexus/resources/console"
+rs #"github.com/xulang-org/nexus/resources/steam"
+rt #"github.com/xulang-org/nexus/resources/taptap"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#crypto/sha256
+#encoding/json
+#path/filepath
+#os
+#strconv
+#strings
+#errors
+
+fn print_help() {
+    println("usage: nexus-project <command> [args]")
+    println("  init <dir> --name <Name> [--id <com.studio.game>] [--module <mod>] [--template 3d|2d|25d|blank] [--locale <en-US>] [--platforms <all|none|csv>] [--nexus-path <path>] [--force]")
+    println("  doctor <project.json> [--json] [--strict]")
+    println("  layout")
+    println("  build <project.json> --output <dir> [--validator <bin>]")
+    println("  scene <name> --output <dir>")
+    println("  register <project.json> <source>")
+    println("  relocate <project.json> <uid> <source>")
+    println("  bundle-pack <project.json> --output <dir> --bundle-id <id> --sequence <N> --key <secret>")
+    println("  bundle-verify <bundle_dir> --key <secret>")
+    println("  steam-validate <steam.json>")
+    println("  steam-stage <project.json> [--steam <steam.json>] --output <dir> [--desc <text>] [--preview] [--binary <path>]")
+    println("  xbox-validate <xbox.json>")
+    println("  xbox-stage <project.json> [--xbox <xbox.json>] --output <dir> [--binary <path>]")
+    println("  ps-validate <ps.json>")
+    println("  ps-stage <project.json> [--ps <ps.json>] --output <dir> [--binary <path>]")
+    println("  switch-validate <switch.json>")
+    println("  switch-stage <project.json> [--switch <switch.json>] --output <dir> [--binary <path>]")
+    println("  taptap-validate <taptap.json>")
+    println("  taptap-stage <project.json> [--taptap <taptap.json>] --output <dir> [--binary <path>]")
+}
+
+fn has_help_flag(args &[]string, start int) bool {
+    for i in start:args.len {
+        if args[i] == "-h" || args[i] == "--help" {
+            << true
+        }
+    }
+    << false
+}
+
+fn run_build(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project build <project.json> --output <dir> [--validator <bin>]")
+        << 0
+    }
+    $project_path := ""
+    $output_dir := ""
+    $validator := ""
+    $i := 2
+    while i < args.len {
+        arg := args[i] + ""
+        if arg == "--output" {
+            i = i + 1
+            if i >= args.len { >> errors.new("missing value for --output") }
+            output_dir = args[i] + ""
+        } else if arg == "--validator" {
+            i = i + 1
+            if i >= args.len { >> errors.new("missing value for --validator") }
+            validator = args[i] + ""
+        } else if project_path.len == 0 {
+            project_path = arg
+        } else {
+            >> errors.new("unexpected argument: " + arg)
+        }
+        i = i + 1
+    }
+    if project_path.len == 0 || output_dir.len == 0 {
+        >> errors.new("usage: nexus-project build <project.json> --output <dir> [--validator <bin>]")
+    }
+    res := proj.publish(project_path, output_dir, validator) or >>
+    println(res.generation + " rebuilt=" + str(res.rebuilt_assets) + " reused=" + str(res.reused_assets))
+    << 0
+}
+
+fn run_scene(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project scene <name> --output <dir>")
+        << 0
+    }
+    $name := ""
+    $output_dir := ""
+    $i := 2
+    while i < args.len {
+        arg := args[i] + ""
+        if arg == "--output" {
+            i = i + 1
+            if i >= args.len { >> errors.new("missing value for --output") }
+            output_dir = args[i] + ""
+        } else if name.len == 0 {
+            name = arg
+        } else {
+            >> errors.new("unexpected argument: " + arg)
+        }
+        i = i + 1
+    }
+    if name.len == 0 || output_dir.len == 0 {
+        >> errors.new("usage: nexus-project scene <name> --output <dir>")
+    }
+    resolved := proj.published_scene(output_dir, name) or >>
+    println(resolved)
+    << 0
+}
+
+fn run_register(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project register <project.json> <source>")
+        << 0
+    }
+    if args.len != 4 {
+        >> errors.new("usage: nexus-project register <project.json> <source>")
+    }
+    uid := proj.register_asset(args[2] + "", args[3] + "") or >>
+    println(uid)
+    << 0
+}
+
+fn run_relocate(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project relocate <project.json> <uid> <source>")
+        << 0
+    }
+    if args.len != 5 {
+        >> errors.new("usage: nexus-project relocate <project.json> <uid> <source>")
+    }
+    proj.relocate_asset(args[2] + "", args[3] + "", args[4] + "") or >>
+    println(args[3] + "")
+    << 0
+}
+
+fn run_bundle_pack(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project bundle-pack <project.json> --output <dir> --bundle-id <id> --sequence <N> --key <secret>")
+        << 0
+    }
+    $project_path := ""
+    $output_dir := ""
+    $bundle_id := ""
+    $seq_str := ""
+    $signing_key := ""
+    $i := 2
+    while i < args.len {
+        arg := args[i] + ""
+        if arg == "--output" && i + 1 < args.len {
+            output_dir = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--bundle-id" && i + 1 < args.len {
+            bundle_id = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--sequence" && i + 1 < args.len {
+            seq_str = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--key" && i + 1 < args.len {
+            signing_key = args[i + 1] + ""
+            i = i + 2
+        } else if project_path.len == 0 {
+            project_path = arg
+            i = i + 1
+        } else {
+            >> errors.new("unexpected argument in bundle-pack: " + arg)
+        }
+    }
+    if project_path.len == 0 || output_dir.len == 0 || bundle_id.len == 0 || seq_str.len == 0 || signing_key.len == 0 {
+        >> errors.new("usage: nexus-project bundle-pack <project.json> --output <dir> --bundle-id <id> --sequence <N> --key <secret>")
+    }
+    seq := strconv.atoi(&seq_str) or >>
+    project := proj.load_project(project_path + "") or >>
+    $sources := []bm.BundleSource{}
+    proj_bytes := snapshot.read(project.path + "", bm.MAX_ASSET_BYTES) or >>
+    sources.push(bm.BundleSource{key: "project", rel_path: "project.json", bytes: proj_bytes})
+    for si in 0:project.scenes.len {
+        ent := &project.scenes[si]
+        raw := snapshot.read(ent.resolved + "", bm.MAX_ASSET_BYTES) or >>
+        sources.push(bm.BundleSource{key: "scene:" + ent.key, rel_path: ent.path + "", bytes: raw})
+    }
+    for ai in 0:project.assets.len {
+        ent := &project.assets[ai]
+        raw := snapshot.read(ent.resolved + "", bm.MAX_ASSET_BYTES) or >>
+        sources.push(bm.BundleSource{key: "asset:" + ent.key, rel_path: ent.path + "", bytes: raw})
+    }
+    cfgs := collect_project_runtime_configs(&project)
+    for ci in 0:cfgs.len {
+        ent := &cfgs[ci]
+        raw := snapshot.read(ent.resolved + "", bm.MAX_ASSET_BYTES) or >>
+        sources.push(bm.BundleSource{key: "config:" + ent.key, rel_path: ent.path + "", bytes: raw})
+    }
+    manifest := bm.pack_bundle(output_dir + "", bundle_id + "", seq, &sources, &signing_key) or >>
+    println("PACKED " + manifest.bundle_id + " seq=" + str(manifest.sequence) + " entries=" + str(manifest.entries.len))
+    << 0
+}
+
+fn run_bundle_verify(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project bundle-verify <bundle_dir> --key <secret>")
+        << 0
+    }
+    $bundle_dir := ""
+    $signing_key := ""
+    $i := 2
+    while i < args.len {
+        arg := args[i] + ""
+        if arg == "--key" && i + 1 < args.len {
+            signing_key = args[i + 1] + ""
+            i = i + 2
+        } else if bundle_dir.len == 0 {
+            bundle_dir = arg
+            i = i + 1
+        } else {
+            >> errors.new("unexpected argument in bundle-verify: " + arg)
+        }
+    }
+    if bundle_dir.len == 0 || signing_key.len == 0 {
+        >> errors.new("usage: nexus-project bundle-verify <bundle_dir> --key <secret>")
+    }
+    $mount := bm.new_mount()
+    mount.verify_and_stage(bundle_dir + "", &signing_key) or >>
+    println("VERIFIED " + mount.manifest.bundle_id + " seq=" + str(mount.manifest.sequence) + " entries=" + str(mount.manifest.entries.len))
+    << 0
+}
+
+fn run_steam_validate(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project steam-validate <steam.json>")
+        << 0
+    }
+    if args.len != 3 {
+        >> errors.new("usage: nexus-project steam-validate <steam.json>")
+    }
+    raw := snapshot.read(args[2] + "", 1048576) or >>
+    cfg := rs.decode_config_json(&raw) or >>
+    println("VALID app_id=" + str(cfg.app_id) + " depot_id=" + str(cfg.depot_id) +
+        " achievements=" + str(cfg.achievement_ids.len) +
+        " stats=" + str(cfg.stat_defs.len) +
+        " dlcs=" + str(cfg.dlc_ids.len))
+    << 0
+}
+
+fn write_staged_file(content_dir &string, rel_path &string, raw &string, manifest_entries $&[]string) int {
+    clean := proj.relative_file(rel_path) or >>
+    dest := filepath.join([content_dir + "", clean + ""])
+    os.mkdir_all(filepath.dir(dest)) or >>
+    snapshot.write_atomic(dest + "", raw) or >>
+    digest := sha256.sum256(raw + "")
+    c_s := clean + ""
+    d_s := digest + ""
+    manifest_entries.push("    {\"path\": " + json.quote(&c_s) + ", \"bytes\": " + str(raw.len) + ", \"sha256\": " + json.quote(&d_s) + "}")
+    << 0
+}
+
+fn try_optional_config_entry(project &proj.Project, key string, rel &string, out $&[]proj.Entry) {
+    if rel.len == 0 { << }
+    resolved := proj.project_source(&project.directory, rel) or (err) {
+        _ := err.msg()
+        <<
+    }
+    out.push(proj.Entry{key: key + "", path: *rel + "", resolved: resolved})
+}
+
+fn collect_project_runtime_configs(project &proj.Project) []proj.Entry {
+    $out := []proj.Entry{}
+    if !project.has_paths { << out }
+    try_optional_config_entry(project, "locales", &project.paths.locales, $&out)
+    try_optional_config_entry(project, "input_bindings", &project.paths.input_bindings, $&out)
+    try_optional_config_entry(project, "perf_budgets", &project.paths.perf_budgets, $&out)
+    try_optional_config_entry(project, "platform_mapping", &project.paths.platform_mapping, $&out)
+    << out
+}
+
+fn resolve_platform_cfg(project &proj.Project, explicit &string, configured &string, flag_name string) string {
+    if explicit.len > 0 {
+        << *explicit + ""
+    }
+    if project.has_platforms && configured.len > 0 {
+        << proj.project_source(&project.directory, configured) or >>
+    }
+    >> errors.new("missing required " + flag_name + " (or declare it in project.json platforms)")
+    << ""
+}
+
+fn run_init(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project init <dir> --name <Name> [--id <com.studio.game>] [--module <mod>] [--template 3d|2d|25d|blank] [--locale <en-US>] [--platforms <all|none|csv>] [--nexus-path <path>] [--force]")
+        << 0
+    }
+    $dir := ""
+    $name := ""
+    $id := ""
+    $mod_name := ""
+    $template := "3d"
+    $locale := "en-US"
+    $plats_raw := "all"
+    $nexus_path := ""
+    $force := false
+    $i := 2
+    while i < args.len {
+        arg := args[i] + ""
+        if arg == "--name" && i + 1 < args.len {
+            name = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--id" && i + 1 < args.len {
+            id = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--module" && i + 1 < args.len {
+            mod_name = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--template" && i + 1 < args.len {
+            template = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--locale" && i + 1 < args.len {
+            locale = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--platforms" && i + 1 < args.len {
+            plats_raw = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--nexus-path" && i + 1 < args.len {
+            nexus_path = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--force" {
+            force = true
+            i = i + 1
+        } else if dir.len == 0 {
+            dir = arg
+            i = i + 1
+        } else {
+            >> errors.new("unexpected argument in init: " + arg)
+        }
+    }
+    if dir.len == 0 || name.len == 0 {
+        >> errors.new("usage: nexus-project init <dir> --name <Name> [--id <com.studio.game>] [--module <mod>] [--template 3d|2d|25d|blank] [--locale <en-US>] [--platforms <all|none|csv>] [--nexus-path <path>] [--force]")
+    }
+    plats := rp.parse_platform_list(&plats_raw) or >>
+    opts := proj.InitOptions{
+        dir: dir,
+        name: name,
+        id: id,
+        module_name: mod_name,
+        template: template + "",
+        default_locale: locale,
+        nexus_path: nexus_path,
+        platforms: plats,
+        force: force
+    }
+    res := proj.init_project(&opts) or >>
+    println("INITIALIZED " + res.project_dir + " template=" + template +
+        " dirs=" + str(res.dirs_created) + " files=" + str(res.files_created.len))
+    << 0
+}
+
+fn println_block(text &string) {
+    if text.len > 0 && (text[text.len - 1] & 255) == 10 {
+        println(text[0 : text.len - 1] + "")
+        <<
+    }
+    println(*text + "")
+}
+
+fn run_doctor(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project doctor <project.json> [--json] [--strict]")
+        << 0
+    }
+    $project_path := ""
+    $as_json := false
+    $strict := false
+    $i := 2
+    while i < args.len {
+        arg := args[i] + ""
+        if arg == "--json" {
+            as_json = true
+            i = i + 1
+        } else if arg == "--strict" {
+            strict = true
+            i = i + 1
+        } else if project_path.len == 0 {
+            project_path = arg
+            i = i + 1
+        } else {
+            >> errors.new("unexpected argument in doctor: " + arg)
+        }
+    }
+    if project_path.len == 0 {
+        >> errors.new("usage: nexus-project doctor <project.json> [--json] [--strict]")
+    }
+    rep := proj.diagnose_project(project_path)
+    if as_json {
+        println_block(&proj.encode_doctor_report_json(&rep))
+    } else {
+        println_block(&proj.format_doctor_report(&rep))
+    }
+    if !rep.passed || (strict && rep.warning_count > 0) {
+        >> errors.new("nexus project doctor found errors=" + str(rep.error_count) + " warnings=" + str(rep.warning_count))
+    }
+    << 0
+}
+
+fn run_layout(args &[]string) int {
+    _ := args
+    println_block(&rp.format_layout_spec())
+    << 0
+}
+
+fn run_steam_stage(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project steam-stage <project.json> [--steam <steam.json>] --output <dir> [--desc <text>] [--preview] [--binary <path>]")
+        << 0
+    }
+    $project_path := ""
+    $steam_path := ""
+    $output_dir := ""
+    $desc := "Nexus SteamPipe build"
+    $preview := false
+    $bin_path := ""
+    $i := 2
+    while i < args.len {
+        arg := args[i] + ""
+        if arg == "--steam" && i + 1 < args.len {
+            steam_path = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--output" && i + 1 < args.len {
+            output_dir = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--desc" && i + 1 < args.len {
+            desc = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--binary" && i + 1 < args.len {
+            bin_path = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--preview" {
+            preview = true
+            i = i + 1
+        } else if project_path.len == 0 {
+            project_path = arg
+            i = i + 1
+        } else {
+            >> errors.new("unexpected argument in steam-stage: " + arg)
+        }
+    }
+    if project_path.len == 0 || output_dir.len == 0 {
+        >> errors.new("usage: nexus-project steam-stage <project.json> [--steam <steam.json>] --output <dir> [--desc <text>] [--preview] [--binary <path>]")
+    }
+    project := proj.load_project(project_path + "") or >>
+    resolved_steam := resolve_platform_cfg(&project, &steam_path, &project.platforms.steam, "--steam") or >>
+    steam_raw := snapshot.read(resolved_steam + "", 1048576) or >>
+    $cfg := rs.decode_config_json(&steam_raw) or >>
+    cfg.content_root = "../content"
+    cfg.build_output = "../output"
+    content_dir := filepath.join([output_dir + "", "content"])
+    scripts_dir := filepath.join([output_dir + "", "scripts"])
+    depot_out_dir := filepath.join([output_dir + "", "output"])
+    os.mkdir_all(content_dir + "") or >>
+    os.mkdir_all(scripts_dir + "") or >>
+    os.mkdir_all(depot_out_dir + "") or >>
+
+    $manifest_entries := []string{}
+    proj_raw := snapshot.read(project.path + "", bm.MAX_ASSET_BYTES) or >>
+    write_staged_file(&content_dir, &"project.json", &proj_raw, $&manifest_entries) or >>
+    for si in 0:project.scenes.len {
+        ent := &project.scenes[si]
+        raw := snapshot.read(ent.resolved + "", bm.MAX_ASSET_BYTES) or >>
+        write_staged_file(&content_dir, &ent.path, &raw, $&manifest_entries) or >>
+    }
+    for ai in 0:project.assets.len {
+        ent := &project.assets[ai]
+        raw := snapshot.read(ent.resolved + "", bm.MAX_ASSET_BYTES) or >>
+        write_staged_file(&content_dir, &ent.path, &raw, $&manifest_entries) or >>
+    }
+    cfgs := collect_project_runtime_configs(&project)
+    for ci in 0:cfgs.len {
+        ent := &cfgs[ci]
+        raw := snapshot.read(ent.resolved + "", bm.MAX_ASSET_BYTES) or >>
+        write_staged_file(&content_dir, &ent.path, &raw, $&manifest_entries) or >>
+    }
+    if bin_path.len > 0 {
+        b_raw := snapshot.read(bin_path + "", bm.MAX_ASSET_BYTES) or >>
+        bin_arg := bin_path + ""
+        b_name := filepath.base(bin_arg)
+        write_staged_file(&content_dir, &b_name, &b_raw, $&manifest_entries) or >>
+    }
+    appid_txt := rs.generate_steam_appid_txt(cfg.app_id) or >>
+    write_staged_file(&content_dir, &"steam_appid.txt", &appid_txt, $&manifest_entries) or >>
+
+    depot_vdf := rs.generate_depot_build_vdf(&cfg) or >>
+    app_vdf := rs.generate_app_build_vdf(&cfg, desc + "", preview) or >>
+    snapshot.write_atomic(filepath.join([scripts_dir + "", "depot_build_" + str(cfg.depot_id) + ".vdf"]), &depot_vdf) or >>
+    snapshot.write_atomic(filepath.join([scripts_dir + "", "app_build_" + str(cfg.app_id) + ".vdf"]), &app_vdf) or >>
+
+    br_s := cfg.branch + ""
+    staged_count := manifest_entries.len
+    $mb := strings.new_byte_builder(512)
+    mb.write_str("{\n")
+    mb.write_str("  \"app_id\": " + str(cfg.app_id) + ",\n")
+    mb.write_str("  \"depot_id\": " + str(cfg.depot_id) + ",\n")
+    mb.write_str("  \"branch\": " + json.quote(&br_s) + ",\n")
+    mb.write_str("  \"files\": [\n")
+    mb.write_str(strings.join(manifest_entries, ",\n"))
+    mb.write_str("\n  ]\n}\n")
+    mraw := mb.to_string()
+    snapshot.write_atomic(filepath.join([output_dir + "", "steam_stage_manifest.json"]), &mraw) or >>
+
+    println("STAGED app_id=" + str(cfg.app_id) + " depot_id=" + str(cfg.depot_id) + " files=" + str(staged_count))
+    << 0
+}
+
+fn copy_project_into_content(project &proj.Project, content_dir &string, bin_path &string,
+        manifest_entries $&[]string, rel_list $&[]string) int {
+    proj_raw := snapshot.read(project.path + "", bm.MAX_ASSET_BYTES) or >>
+    write_staged_file(content_dir, &"project.json", &proj_raw, manifest_entries) or >>
+    rel_list.push("project.json")
+    for si in 0:project.scenes.len {
+        ent := &project.scenes[si]
+        raw := snapshot.read(ent.resolved + "", bm.MAX_ASSET_BYTES) or >>
+        write_staged_file(content_dir, &ent.path, &raw, manifest_entries) or >>
+        rel_list.push(ent.path + "")
+    }
+    for ai in 0:project.assets.len {
+        ent := &project.assets[ai]
+        raw := snapshot.read(ent.resolved + "", bm.MAX_ASSET_BYTES) or >>
+        write_staged_file(content_dir, &ent.path, &raw, manifest_entries) or >>
+        rel_list.push(ent.path + "")
+    }
+    cfgs := collect_project_runtime_configs(project)
+    for ci in 0:cfgs.len {
+        ent := &cfgs[ci]
+        raw := snapshot.read(ent.resolved + "", bm.MAX_ASSET_BYTES) or >>
+        write_staged_file(content_dir, &ent.path, &raw, manifest_entries) or >>
+        rel_list.push(ent.path + "")
+    }
+    if bin_path.len > 0 {
+        b_raw := snapshot.read(bin_path + "", bm.MAX_ASSET_BYTES) or >>
+        bin_arg := bin_path + ""
+        b_name := filepath.base(bin_arg)
+        write_staged_file(content_dir, &b_name, &b_raw, manifest_entries) or >>
+        rel_list.push(b_name)
+    }
+    << 0
+}
+
+fn run_xbox_validate(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project xbox-validate <xbox.json>")
+        << 0
+    }
+    if args.len != 3 { >> errors.new("usage: nexus-project xbox-validate <xbox.json>") }
+    raw := snapshot.read(args[2] + "", 1048576) or >>
+    cfg := rc.decode_xbox_config_json(&raw) or >>
+    rep := rc.audit_xbox_certification(&cfg, 90)
+    if !rep.passed {
+        >> errors.new("nexus xbox: certification audit failed: " + rep.issues[0].message)
+    }
+    println("VALID_XBOX store_id=" + cfg.store_id + " title_id=" + cfg.title_id_hex +
+        " achievements=" + str(cfg.achievement_ids.len) + " dlcs=" + str(cfg.dlc_store_ids.len) + " xr_pass=true")
+    << 0
+}
+
+fn run_xbox_stage(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project xbox-stage <project.json> --xbox <xbox.json> --output <dir> [--binary <path>]")
+        << 0
+    }
+    $project_path := ""
+    $xbox_path := ""
+    $output_dir := ""
+    $bin_path := ""
+    $i := 2
+    while i < args.len {
+        arg := args[i] + ""
+        if arg == "--xbox" && i + 1 < args.len {
+            xbox_path = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--output" && i + 1 < args.len {
+            output_dir = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--binary" && i + 1 < args.len {
+            bin_path = args[i + 1] + ""
+            i = i + 2
+        } else if project_path.len == 0 {
+            project_path = arg
+            i = i + 1
+        } else {
+            >> errors.new("unexpected argument in xbox-stage: " + arg)
+        }
+    }
+    if project_path.len == 0 || output_dir.len == 0 {
+        >> errors.new("usage: nexus-project xbox-stage <project.json> [--xbox <xbox.json>] --output <dir> [--binary <path>]")
+    }
+    project := proj.load_project(project_path + "") or >>
+    resolved_xbox := resolve_platform_cfg(&project, &xbox_path, &project.platforms.xbox, "--xbox") or >>
+    xraw := snapshot.read(resolved_xbox + "", 1048576) or >>
+    cfg := rc.decode_xbox_config_json(&xraw) or >>
+    rep := rc.audit_xbox_certification(&cfg, 90)
+    if !rep.passed { >> errors.new("nexus xbox: XR certification failed") }
+
+    content_dir := filepath.join([output_dir + "", "content"])
+    os.mkdir_all(content_dir + "") or >>
+    $manifest_entries := []string{}
+    $rel_list := []string{}
+    copy_project_into_content(&project, &content_dir, &bin_path, $&manifest_entries, $&rel_list) or >>
+
+    game_cfg_xml := rc.generate_microsoft_game_config_xml(&cfg) or >>
+    write_staged_file(&content_dir, &"MicrosoftGame.config", &game_cfg_xml, $&manifest_entries) or >>
+    rel_list.push("MicrosoftGame.config")
+
+    layout_xml := rc.generate_xbox_layout_xml(&cfg, &rel_list) or >>
+    snapshot.write_atomic(filepath.join([output_dir + "", "layout.xml"]), &layout_xml) or >>
+
+    tid_s := cfg.title_id_hex + ""
+    sid_s := cfg.store_id + ""
+    staged_count := manifest_entries.len
+    $mb := strings.new_byte_builder(512)
+    mb.write_str("{\n")
+    mb.write_str("  \"title_id\": " + json.quote(&tid_s) + ",\n")
+    mb.write_str("  \"store_id\": " + json.quote(&sid_s) + ",\n")
+    mb.write_str("  \"xr_passed\": true,\n")
+    mb.write_str("  \"files\": [\n" + strings.join(manifest_entries, ",\n") + "\n  ]\n}\n")
+    mraw := mb.to_string()
+    snapshot.write_atomic(filepath.join([output_dir + "", "xbox_stage_manifest.json"]), &mraw) or >>
+
+    println("STAGED_XBOX title_id=" + cfg.title_id_hex + " files=" + str(staged_count))
+    << 0
+}
+
+fn run_ps_validate(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project ps-validate <ps.json>")
+        << 0
+    }
+    if args.len != 3 { >> errors.new("usage: nexus-project ps-validate <ps.json>") }
+    raw := snapshot.read(args[2] + "", 1048576) or >>
+    cfg := rc.decode_ps_config_json(&raw) or >>
+    rep := rc.audit_ps_certification(&cfg, 90)
+    if !rep.passed {
+        >> errors.new("nexus ps: certification audit failed: " + rep.issues[0].message)
+    }
+    println("VALID_PS title_id=" + cfg.title_id + " content_id=" + cfg.content_id +
+        " trophies=" + str(cfg.trophies.len) + " activities=" + str(cfg.activities.len) + " trc_pass=true")
+    << 0
+}
+
+fn run_ps_stage(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project ps-stage <project.json> --ps <ps.json> --output <dir> [--binary <path>]")
+        << 0
+    }
+    $project_path := ""
+    $ps_path := ""
+    $output_dir := ""
+    $bin_path := ""
+    $i := 2
+    while i < args.len {
+        arg := args[i] + ""
+        if arg == "--ps" && i + 1 < args.len {
+            ps_path = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--output" && i + 1 < args.len {
+            output_dir = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--binary" && i + 1 < args.len {
+            bin_path = args[i + 1] + ""
+            i = i + 2
+        } else if project_path.len == 0 {
+            project_path = arg
+            i = i + 1
+        } else {
+            >> errors.new("unexpected argument in ps-stage: " + arg)
+        }
+    }
+    if project_path.len == 0 || output_dir.len == 0 {
+        >> errors.new("usage: nexus-project ps-stage <project.json> [--ps <ps.json>] --output <dir> [--binary <path>]")
+    }
+    project := proj.load_project(project_path + "") or >>
+    resolved_ps := resolve_platform_cfg(&project, &ps_path, &project.platforms.playstation, "--ps") or >>
+    praw := snapshot.read(resolved_ps + "", 1048576) or >>
+    cfg := rc.decode_ps_config_json(&praw) or >>
+    rep := rc.audit_ps_certification(&cfg, 90)
+    if !rep.passed { >> errors.new("nexus ps: TRC certification failed") }
+
+    content_dir := filepath.join([output_dir + "", "content"])
+    os.mkdir_all(content_dir + "") or >>
+    $manifest_entries := []string{}
+    $rel_list := []string{}
+    copy_project_into_content(&project, &content_dir, &bin_path, $&manifest_entries, $&rel_list) or >>
+
+    param_json := rc.generate_ps_param_json(&cfg) or >>
+    write_staged_file(&content_dir, &"sce_sys/param.json", &param_json, $&manifest_entries) or >>
+    rel_list.push("sce_sys/param.json")
+
+    uds_json := rc.generate_ps_uds_schema_json(&cfg) or >>
+    write_staged_file(&content_dir, &"sce_sys/trophy2/uds_schema.json", &uds_json, $&manifest_entries) or >>
+    rel_list.push("sce_sys/trophy2/uds_schema.json")
+
+    gp5_xml := rc.generate_ps_gp5_xml(&cfg, &rel_list) or >>
+    snapshot.write_atomic(filepath.join([output_dir + "", "package.gp5"]), &gp5_xml) or >>
+
+    tid_s := cfg.title_id + ""
+    cid_s := cfg.content_id + ""
+    staged_count := manifest_entries.len
+    $mb := strings.new_byte_builder(512)
+    mb.write_str("{\n")
+    mb.write_str("  \"title_id\": " + json.quote(&tid_s) + ",\n")
+    mb.write_str("  \"content_id\": " + json.quote(&cid_s) + ",\n")
+    mb.write_str("  \"trc_passed\": true,\n")
+    mb.write_str("  \"files\": [\n" + strings.join(manifest_entries, ",\n") + "\n  ]\n}\n")
+    mraw := mb.to_string()
+    snapshot.write_atomic(filepath.join([output_dir + "", "ps_stage_manifest.json"]), &mraw) or >>
+
+    println("STAGED_PS title_id=" + cfg.title_id + " files=" + str(staged_count))
+    << 0
+}
+
+fn run_switch_validate(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project switch-validate <switch.json>")
+        << 0
+    }
+    if args.len != 3 { >> errors.new("usage: nexus-project switch-validate <switch.json>") }
+    raw := snapshot.read(args[2] + "", 1048576) or >>
+    cfg := rc.decode_switch_config_json(&raw) or >>
+    rep := rc.audit_switch_certification(&cfg, 90, 100)
+    if !rep.passed {
+        >> errors.new("nexus switch: Lotcheck audit failed: " + rep.issues[0].message)
+    }
+    println("VALID_SWITCH app_id=" + cfg.application_id_hex + " gen=" + str(cfg.target_generation) +
+        " save_mb=" + str(cfg.save_quota_mb) + " aocs=" + str(cfg.aoc_indices.len) + " lotcheck_pass=true")
+    << 0
+}
+
+fn run_switch_stage(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project switch-stage <project.json> --switch <switch.json> --output <dir> [--binary <path>]")
+        << 0
+    }
+    $project_path := ""
+    $switch_path := ""
+    $output_dir := ""
+    $bin_path := ""
+    $i := 2
+    while i < args.len {
+        arg := args[i] + ""
+        if arg == "--switch" && i + 1 < args.len {
+            switch_path = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--output" && i + 1 < args.len {
+            output_dir = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--binary" && i + 1 < args.len {
+            bin_path = args[i + 1] + ""
+            i = i + 2
+        } else if project_path.len == 0 {
+            project_path = arg
+            i = i + 1
+        } else {
+            >> errors.new("unexpected argument in switch-stage: " + arg)
+        }
+    }
+    if project_path.len == 0 || output_dir.len == 0 {
+        >> errors.new("usage: nexus-project switch-stage <project.json> [--switch <switch.json>] --output <dir> [--binary <path>]")
+    }
+    project := proj.load_project(project_path + "") or >>
+    resolved_sw := resolve_platform_cfg(&project, &switch_path, &project.platforms.switch_cfg, "--switch") or >>
+    sraw := snapshot.read(resolved_sw + "", 1048576) or >>
+    cfg := rc.decode_switch_config_json(&sraw) or >>
+    rep := rc.audit_switch_certification(&cfg, 90, 100)
+    if !rep.passed { >> errors.new("nexus switch: Lotcheck audit failed") }
+
+    romfs_dir := filepath.join([output_dir + "", "romfs"])
+    meta_dir := filepath.join([output_dir + "", "meta"])
+    os.mkdir_all(romfs_dir + "") or >>
+    os.mkdir_all(meta_dir + "") or >>
+    $manifest_entries := []string{}
+    $rel_list := []string{}
+    copy_project_into_content(&project, &romfs_dir, &bin_path, $&manifest_entries, $&rel_list) or >>
+
+    nmeta_xml := rc.generate_switch_nmeta_xml(&cfg) or >>
+    snapshot.write_atomic(filepath.join([meta_dir + "", "application.nmeta"]), &nmeta_xml) or >>
+
+    aid_s := cfg.application_id_hex + ""
+    staged_count := manifest_entries.len
+    $mb := strings.new_byte_builder(512)
+    mb.write_str("{\n")
+    mb.write_str("  \"application_id_hex\": " + json.quote(&aid_s) + ",\n")
+    mb.write_str("  \"target_generation\": " + str(cfg.target_generation) + ",\n")
+    mb.write_str("  \"lotcheck_passed\": true,\n")
+    mb.write_str("  \"files\": [\n" + strings.join(manifest_entries, ",\n") + "\n  ]\n}\n")
+    mraw := mb.to_string()
+    snapshot.write_atomic(filepath.join([output_dir + "", "switch_stage_manifest.json"]), &mraw) or >>
+
+    println("STAGED_SWITCH app_id=" + cfg.application_id_hex + " files=" + str(staged_count))
+    << 0
+}
+
+fn run_taptap_validate(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project taptap-validate <taptap.json>")
+        << 0
+    }
+    if args.len != 3 { >> errors.new("usage: nexus-project taptap-validate <taptap.json>") }
+    raw := snapshot.read(args[2] + "", 1048576) or >>
+    cfg := rt.decode_config_json(&raw) or >>
+    rep := rt.audit_taptap_submission(&cfg)
+    if !rep.passed {
+        >> errors.new("nexus taptap: submission audit failed: " + rep.issues[0].message)
+    }
+    $reg_s := "cn"
+    if cfg.region == rt.REGION_GLOBAL { reg_s = "global" }
+    $tgt_s := "android"
+    if cfg.target_platform == rt.TARGET_IOS { tgt_s = "ios" }
+    else if cfg.target_platform == rt.TARGET_PC { tgt_s = "pc" }
+    println("VALID_TAPTAP client_id=" + cfg.client_id + " region=" + reg_s +
+        " target=" + tgt_s + " age_rating=" + str(cfg.age_rating))
+    << 0
+}
+
+fn run_taptap_stage(args &[]string) int {
+    if has_help_flag(args, 2) {
+        println("usage: nexus-project taptap-stage <project.json> --taptap <taptap.json> --output <dir> [--binary <path>]")
+        << 0
+    }
+    $project_path := ""
+    $taptap_path := ""
+    $output_dir := ""
+    $bin_path := ""
+    $i := 2
+    while i < args.len {
+        arg := args[i] + ""
+        if arg == "--taptap" && i + 1 < args.len {
+            taptap_path = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--output" && i + 1 < args.len {
+            output_dir = args[i + 1] + ""
+            i = i + 2
+        } else if arg == "--binary" && i + 1 < args.len {
+            bin_path = args[i + 1] + ""
+            i = i + 2
+        } else if project_path.len == 0 {
+            project_path = arg
+            i = i + 1
+        } else {
+            >> errors.new("unexpected argument in taptap-stage: " + arg)
+        }
+    }
+    if project_path.len == 0 || output_dir.len == 0 {
+        >> errors.new("usage: nexus-project taptap-stage <project.json> [--taptap <taptap.json>] --output <dir> [--binary <path>]")
+    }
+    project := proj.load_project(project_path + "") or >>
+    resolved_tap := resolve_platform_cfg(&project, &taptap_path, &project.platforms.taptap, "--taptap") or >>
+    traw := snapshot.read(resolved_tap + "", 1048576) or >>
+    cfg := rt.decode_config_json(&traw) or >>
+    rep := rt.audit_taptap_submission(&cfg)
+    if !rep.passed { >> errors.new("nexus taptap: submission audit failed") }
+
+    content_dir := filepath.join([output_dir + "", "content"])
+    tap_dir := filepath.join([output_dir + "", "taptap"])
+    os.mkdir_all(content_dir + "") or >>
+    os.mkdir_all(tap_dir + "") or >>
+    $manifest_entries := []string{}
+    $rel_list := []string{}
+    copy_project_into_content(&project, &content_dir, &bin_path, $&manifest_entries, $&rel_list) or >>
+
+    sdk_cfg := rt.generate_taptap_sdk_config_json(&cfg) or >>
+    snapshot.write_atomic(filepath.join([tap_dir + "", "taptap_sdk_config.json"]), &sdk_cfg) or >>
+
+    if cfg.target_platform == rt.TARGET_ANDROID {
+        man := rt.generate_android_manifest_snippet(&cfg) or >>
+        snapshot.write_atomic(filepath.join([tap_dir + "", "TapTapAndroidManifest.xml"]), &man) or >>
+    } else if cfg.target_platform == rt.TARGET_IOS {
+        plist := rt.generate_ios_info_plist_snippet(&cfg) or >>
+        snapshot.write_atomic(filepath.join([tap_dir + "", "TapTapInfo.plist"]), &plist) or >>
+    } else {
+        appid := rt.generate_pc_appid_txt(&cfg) or >>
+        snapshot.write_atomic(filepath.join([tap_dir + "", "taptap_client_id.txt"]), &appid) or >>
+    }
+
+    cid_s := cfg.client_id + ""
+    pkg_s := cfg.package_name + ""
+    staged_count := manifest_entries.len
+    $mb := strings.new_byte_builder(512)
+    mb.write_str("{\n")
+    mb.write_str("  \"client_id\": " + json.quote(&cid_s) + ",\n")
+    mb.write_str("  \"region\": " + str(cfg.region) + ",\n")
+    mb.write_str("  \"target_platform\": " + str(cfg.target_platform) + ",\n")
+    mb.write_str("  \"package_name\": " + json.quote(&pkg_s) + ",\n")
+    mb.write_str("  \"files\": [\n" + strings.join(manifest_entries, ",\n") + "\n  ]\n}\n")
+    mraw := mb.to_string()
+    snapshot.write_atomic(filepath.join([output_dir + "", "taptap_stage_manifest.json"]), &mraw) or >>
+
+    println("STAGED_TAPTAP client_id=" + cfg.client_id + " files=" + str(staged_count))
+    << 0
+}
+
+fn run() int {
+    args := os.args()
+    if args.len < 2 || args[1] == "-h" || args[1] == "--help" {
+        print_help()
+        << 0
+    }
+    sub := args[1] + ""
+    if sub == "init" {
+        << run_init(&args) or >>
+    }
+    if sub == "doctor" {
+        << run_doctor(&args) or >>
+    }
+    if sub == "layout" {
+        << run_layout(&args) or >>
+    }
+    if sub == "build" || sub == "publish" {
+        << run_build(&args) or >>
+    }
+    if sub == "scene" {
+        << run_scene(&args) or >>
+    }
+    if sub == "register" {
+        << run_register(&args) or >>
+    }
+    if sub == "relocate" {
+        << run_relocate(&args) or >>
+    }
+    if sub == "bundle-pack" {
+        << run_bundle_pack(&args) or >>
+    }
+    if sub == "bundle-verify" {
+        << run_bundle_verify(&args) or >>
+    }
+    if sub == "steam-validate" {
+        << run_steam_validate(&args) or >>
+    }
+    if sub == "steam-stage" {
+        << run_steam_stage(&args) or >>
+    }
+    if sub == "xbox-validate" {
+        << run_xbox_validate(&args) or >>
+    }
+    if sub == "xbox-stage" {
+        << run_xbox_stage(&args) or >>
+    }
+    if sub == "ps-validate" {
+        << run_ps_validate(&args) or >>
+    }
+    if sub == "ps-stage" {
+        << run_ps_stage(&args) or >>
+    }
+    if sub == "switch-validate" {
+        << run_switch_validate(&args) or >>
+    }
+    if sub == "switch-stage" {
+        << run_switch_stage(&args) or >>
+    }
+    if sub == "taptap-validate" {
+        << run_taptap_validate(&args) or >>
+    }
+    if sub == "taptap-stage" {
+        << run_taptap_stage(&args) or >>
+    }
+    >> errors.new("unknown subcommand: " + sub)
+    << 1
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

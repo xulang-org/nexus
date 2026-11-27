@@ -1,0 +1,171 @@
+@"github.com/xulang-org/nexus/formats/scene"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+resource #"github.com/xulang-org/nexus/resources/scene"
+tilemap #"github.com/xulang-org/nexus/resources/tilemap"
+#encoding/json
+#strconv
+#strings
+#errors
+
+fn tilemap_layout_name(layout int) string {
+    if layout == tilemap.LAYOUT_ORTHOGONAL { << "orthogonal" }
+    if layout == tilemap.LAYOUT_ISOMETRIC { << "isometric" }
+    << "staggered"
+}
+
+fn tilemap_layout_value(name string) int {
+    if name == "orthogonal" { << tilemap.LAYOUT_ORTHOGONAL }
+    if name == "isometric" { << tilemap.LAYOUT_ISOMETRIC }
+    if name == "staggered" { << tilemap.LAYOUT_STAGGERED }
+    >> errors.new("nexus scene: unsupported TileMap2D layout")
+}
+
+fn decode_tilemaps_2d(doc &json.Doc, root int, version int) []resource.TileMap2DAttachment {
+    if version < SPRITE_TILEMAP_VERSION { << []resource.TileMap2DAttachment{} }
+    rows := rows_min(doc, doc.get(root, "tilemaps_2d"), 0, resource.MAX_SCENE_TILEMAPS_2D) or >>
+    $expected := ["node", "resource", "layout", "width", "height", "tile_size", "elevation_step",
+        "tileset", "z_index", "y_sort_cells", "y_offset", "pixel_art", "cells", "elevations", "tints"]
+    if version >= TILE_COLLISION_VERSION { expected.push("solid_tiles") }
+    tileset_fields := ["columns", "rows", "draw_size", "origin"]
+    elev_fields := ["col", "row", "value"]
+    tint_fields := ["col", "row", "rgba"]
+    $out := []resource.TileMap2DAttachment{}
+    for at in rows {
+        fields(doc, at, &expected) or >>
+        node := doc.as_int(doc.get(at, "node")) or >>
+        uid := doc.as_string(doc.get(at, "resource")) or >>
+        layout := tilemap_layout_value(doc.as_string(doc.get(at, "layout")) or >>) or >>
+        width := doc.as_int(doc.get(at, "width")) or >>
+        height := doc.as_int(doc.get(at, "height")) or >>
+        tile_size := vector(doc, doc.get(at, "tile_size"), 2) or >>
+        elevation_step := doc.as_f64(doc.get(at, "elevation_step")) or >>
+        ts_node := doc.get(at, "tileset")
+        fields(doc, ts_node, &tileset_fields) or >>
+        ts_cols := doc.as_int(doc.get(ts_node, "columns")) or >>
+        ts_rows := doc.as_int(doc.get(ts_node, "rows")) or >>
+        draw_size := vector(doc, doc.get(ts_node, "draw_size"), 2) or >>
+        origin_v := vector(doc, doc.get(ts_node, "origin"), 2) or >>
+        tileset := tilemap.tileset_2d(ts_cols, ts_rows, draw_size[0], draw_size[1], fm.vec2(origin_v[0], origin_v[1])) or >>
+        $grid := tilemap.new_tilemap_2d(layout, width, height, tile_size[0], tile_size[1], elevation_step, tileset) or >>
+        if version >= TILE_COLLISION_VERSION {
+            solids := rows_min(doc, doc.get(at, "solid_tiles"), 0, tileset.tile_count()) or >>
+            for item in solids {
+                tile := doc.as_int(item) or >>
+                grid.set_tile_solid(tile, true) or >>
+            }
+            if grid.solid_tile_count() != solids.len { >> errors.new("nexus scene: duplicate TileMap2D solid tile") }
+        }
+        z_index := doc.as_int(doc.get(at, "z_index")) or >>
+        y_sort_cells := doc.as_bool(doc.get(at, "y_sort_cells")) or >>
+        y_offset := doc.as_f64(doc.get(at, "y_offset")) or >>
+        pixel_art := doc.as_bool(doc.get(at, "pixel_art")) or >>
+        cells_node := doc.get(at, "cells")
+        total := width * height
+        if width < 1 || height < 1 || cells_node < 0 || !doc.is_list(cells_node) || doc.count(cells_node) != total {
+            >> errors.new("nexus scene: TileMap2D cells length mismatch")
+        }
+        for row in 0:height {
+            for col in 0:width {
+                tile := doc.as_int(doc.at(cells_node, row * width + col)) or >>
+                grid.set_cell(col, row, tile) or >>
+            }
+        }
+        elev_nodes := rows_min(doc, doc.get(at, "elevations"), 0, total) or >>
+        $seen_elev := map[int]bool{}
+        for item in elev_nodes {
+            fields(doc, item, &elev_fields) or >>
+            col := doc.as_int(doc.get(item, "col")) or >>
+            row := doc.as_int(doc.get(item, "row")) or >>
+            val := doc.as_f64(doc.get(item, "value")) or >>
+            if !grid.in_bounds(col, row) { >> errors.new("nexus scene: TileMap2D elevation outside map bounds") }
+            key := row * width + col
+            if seen_elev.has(key) { >> errors.new("nexus scene: duplicate TileMap2D elevation entry") }
+            seen_elev[key] = true
+            grid.set_elevation(col, row, val) or >>
+        }
+        tint_nodes := rows_min(doc, doc.get(at, "tints"), 0, total) or >>
+        $seen_tint := map[int]bool{}
+        for item in tint_nodes {
+            fields(doc, item, &tint_fields) or >>
+            col := doc.as_int(doc.get(item, "col")) or >>
+            row := doc.as_int(doc.get(item, "row")) or >>
+            rgba := doc.as_int(doc.get(item, "rgba")) or >>
+            if !grid.in_bounds(col, row) { >> errors.new("nexus scene: TileMap2D tint outside map bounds") }
+            key := row * width + col
+            if seen_tint.has(key) { >> errors.new("nexus scene: duplicate TileMap2D tint entry") }
+            seen_tint[key] = true
+            grid.set_tint(col, row, rgba) or >>
+        }
+        out.push(resource.tilemap_2d_attachment(node, uid, z_index, y_sort_cells, y_offset, pixel_art, grid))
+    }
+    << out
+}
+
+fn encode_tilemaps_2d(document &resource.Document, version int) string {
+    $out := strings.new_byte_builder(1024)
+    out.write_str(",\"tilemaps_2d\":[\n")
+    for i in 0:document.tilemap_2d_count() {
+        if i > 0 { out.write_str(",\n") }
+        item := document.tilemap_2d(i) or >>
+        uid := item.resource_uid + ""
+        g := &item.grid
+        tile_s := fmt_f64_list(&[g.tile_width, g.tile_height]) or >>
+        step_s := strconv.format_float(g.elevation_step, 103, -1) or >>
+        draw_s := fmt_f64_list(&[g.tileset.draw_width, g.tileset.draw_height]) or >>
+        orig_s := fmt_f64_list(&[g.tileset.origin.x, g.tileset.origin.y]) or >>
+        yoff_s := strconv.format_float(item.y_offset, 103, -1) or >>
+        out.write_str("{\"node\":" + str(item.node) + ",\"resource\":" + json.quote(&uid) +
+            ",\"layout\":\"" + tilemap_layout_name(g.layout) + "\",\"width\":" + str(g.width) +
+            ",\"height\":" + str(g.height) + ",\"tile_size\":" + tile_s +
+            ",\"elevation_step\":" + step_s +
+            ",\"tileset\":{\"columns\":" + str(g.tileset.columns) + ",\"rows\":" + str(g.tileset.rows) +
+            ",\"draw_size\":" + draw_s + ",\"origin\":" + orig_s + "}" +
+            ",\"z_index\":" + str(item.z_index) + ",\"y_sort_cells\":" + str(item.y_sort_cells) +
+            ",\"y_offset\":" + yoff_s + ",\"pixel_art\":" + str(item.pixel_art) + ",\"cells\":[")
+        for row in 0:g.height {
+            for col in 0:g.width {
+                if row > 0 || col > 0 { out.write_str(",") }
+                out.write_str(str(g.cell(col, row) or >>))
+            }
+        }
+        out.write_str("],\"elevations\":[")
+        $elev_count := 0
+        for row in 0:g.height {
+            for col in 0:g.width {
+                e := g.elevation(col, row) or >>
+                if e != 0.0 {
+                    if elev_count > 0 { out.write_str(",") }
+                    val_s := strconv.format_float(e, 103, -1) or >>
+                    out.write_str("{\"col\":" + str(col) + ",\"row\":" + str(row) + ",\"value\":" + val_s + "}")
+                    elev_count += 1
+                }
+            }
+        }
+        out.write_str("],\"tints\":[")
+        $tint_count := 0
+        for row in 0:g.height {
+            for col in 0:g.width {
+                t := g.tint(col, row) or >>
+                if t != 4294967295 {
+                    if tint_count > 0 { out.write_str(",") }
+                    out.write_str("{\"col\":" + str(col) + ",\"row\":" + str(row) + ",\"rgba\":" + str(t) + "}")
+                    tint_count += 1
+                }
+            }
+        }
+        out.write_str("]")
+        if version >= TILE_COLLISION_VERSION {
+            solid_tiles := g.solid_tile_ids()
+            out.write_str(",\"solid_tiles\":[")
+            for j in 0:solid_tiles.len {
+                if j > 0 { out.write_str(",") }
+                out.write_str(str(solid_tiles[j]))
+            }
+            out.write_str("]")
+        }
+        out.write_str("}")
+    }
+    out.write_str("\n]")
+    << out.to_string()
+}

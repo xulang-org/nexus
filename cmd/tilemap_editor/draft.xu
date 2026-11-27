@@ -1,0 +1,147 @@
+@main
+
+codec #"github.com/xulang-org/nexus/formats/scene"
+fm #"github.com/xulang-org/nexus/foundation/math"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+resource #"github.com/xulang-org/nexus/resources/scene"
+#errors
+#path/filepath
+#strings
+
+const MAX_HISTORY = 32
+
+struct TileDraft {
+    path string
+    disk string
+    saved string
+    current string
+    undo []string
+    redo []string
+}
+
+fn open_draft(path string) TileDraft {
+    source := filepath.abs(&path) or >>
+    raw := snapshot.read(source + "", codec.MAX_BYTES) or >>
+    document := codec.decode(&raw) or >>
+    if document.tilemap_2d_count() == 0 { >> errors.new("scene has no TileMap2D layers") }
+    canonical := codec.encode(&document) or >>
+    << TileDraft{path: source, disk: raw, saved: canonical + "", current: canonical, undo: []string{}, redo: []string{}}
+}
+
+fn (draft &TileDraft) document() resource.Document { << codec.decode(&draft.current) or >> }
+fn (draft &TileDraft) dirty() bool { << draft.saved != draft.current }
+
+fn copy_layer(layer &resource.TileMap2DAttachment) resource.TileMap2DAttachment {
+    grid := layer.grid.clone() or >>
+    << resource.tilemap_2d_attachment(layer.node, layer.resource_uid + "", layer.z_index, layer.y_sort_cells,
+        layer.y_offset, layer.pixel_art, grid)
+}
+
+fn save_stroke(draft $&TileDraft, index int, layer &resource.TileMap2DAttachment) bool {
+    before := draft.document() or >>
+    if index < 0 || index >= before.tilemap_2d_count() || (before.tilemap_2d(index) or >>).node != layer.node {
+        >> errors.new("tile layer does not match the scene")
+    }
+    $refs := []resource.ResourceReference{}
+    for i in 0:before.resource_count() { refs.push(before.resource(i) or >>) }
+    $layers := []resource.TileMap2DAttachment{}
+    for i in 0:before.tilemap_2d_count() {
+        if i == index { layers.push(copy_layer(layer) or >>) }
+        else { layers.push(before.tilemap_2d(i) or >>) }
+    }
+    document := resource.with_tilemaps_2d(&before, refs, layers) or >>
+    << draft.replace_document(&document) or >>
+}
+
+fn (draft $&TileDraft) replace_document(document &resource.Document) bool {
+    next := codec.encode(document) or >>
+    if next == draft.current { << false }
+    $history := []string{}
+    $start := 0
+    if draft.undo.len >= MAX_HISTORY { start = draft.undo.len - MAX_HISTORY + 1 }
+    for i in start:draft.undo.len { history.push(draft.undo[i] + "") }
+    history.push(draft.current + "")
+    draft.undo = history
+    draft.redo = []string{}
+    draft.current = next
+    << true
+}
+
+fn exit_node(document &resource.Document) int {
+    for i in 1:document.node_count() {
+        node := document.describe_node(i) or >>
+        if node.parent == 0 && node.kind == resource.NODE_2D && strings.has_prefix(&node.name, "Exit_") { << i }
+    }
+    << -1
+}
+
+fn layer_to_map(document &resource.Document, layer_node int) fm.Transform2D {
+    $transform := fm.identity()
+    $index := layer_node
+    while index > 0 {
+        node := document.describe_node(index) or >>
+        if node.kind == resource.NODE_3D { >> errors.new("exit editing requires a 2D layer hierarchy") }
+        if node.kind == resource.NODE_2D { transform = node.local.multiply(transform) }
+        index = node.parent
+    }
+    << transform
+}
+
+fn place_exit(draft $&TileDraft, index int, position fm.Vec2) bool {
+    original := draft.document() or >>
+    $nodes := []resource.NodeData{}
+    $references := []resource.ResourceReference{}
+    for i in 0:original.node_count() {
+        $node := original.describe_node(i) or >>
+        if i == index {
+            $pose := node.local
+            pose.tx = position.x
+            pose.ty = position.y
+            node.local = pose
+        }
+        nodes.push(node)
+    }
+    for i in 0:original.resource_count() { references.push(original.resource(i) or >>) }
+    tree := resource.make_document(nodes) or >>
+    next := resource.with_references(&original, &tree, references) or >>
+    << draft.replace_document(&next) or >>
+}
+
+fn (draft $&TileDraft) undo_edit() bool {
+    if draft.undo.len == 0 { << false }
+    last := draft.undo.len - 1
+    previous := draft.undo[last] + ""
+    $remaining := []string{}
+    for i in 0:last { remaining.push(draft.undo[i] + "") }
+    draft.redo.push(draft.current + "")
+    draft.current = previous
+    draft.undo = remaining
+    << true
+}
+
+fn (draft $&TileDraft) redo_edit() bool {
+    if draft.redo.len == 0 { << false }
+    last := draft.redo.len - 1
+    next := draft.redo[last] + ""
+    $remaining := []string{}
+    for i in 0:last { remaining.push(draft.redo[i] + "") }
+    draft.undo.push(draft.current + "")
+    draft.current = next
+    draft.redo = remaining
+    << true
+}
+
+fn change_history(draft $&TileDraft, redo bool) bool {
+    if redo { << draft.redo_edit() }
+    << draft.undo_edit()
+}
+
+fn save_draft(draft $&TileDraft) int {
+    if !draft.dirty() { << 0 }
+    disk := snapshot.read(draft.path + "", codec.MAX_BYTES) or >>
+    if disk != draft.disk { >> errors.new("scene changed on disk. Reopen it before saving") }
+    snapshot.write_atomic(draft.path + "", &draft.current) or >>
+    draft.saved = draft.current + ""
+    draft.disk = draft.current + ""
+    << 0
+}

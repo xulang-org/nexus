@@ -56,6 +56,9 @@ def main():
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('--only-audio', action='store_true', help='build audio without GPU/shader tools')
     selection.add_argument('--only-image', action='store_true', help='build CPU PNG codec without GPU/audio/shaders')
+    selection.add_argument('--only-steam', action='store_true', help='build Steamworks C ABI bridge without SDL')
+    selection.add_argument('--only-console', action='store_true', help='build Xbox/PlayStation/Switch C ABI bridge without SDL')
+    selection.add_argument('--only-taptap', action='store_true', help='build TapTap TapSDK C ABI bridge without SDL')
     parser.add_argument('--cc', help='host clang executable')
     parser.add_argument('--target', choices=('ios-arm64', 'android-arm64'), help='add a Phone slice while preserving host slices')
     args = parser.parse_args()
@@ -69,14 +72,30 @@ def main():
     executable = shutil.which(args.xu)
     if not executable:
         raise SystemExit('Xu product SDK not found; set XU or pass --xu')
-    if args.sdl_include:
-        flags = ['-I' + str(args.sdl_include.resolve())]
-    else:
-        subprocess.run(['pkg-config', '--atleast-version=3.4.0', 'sdl3'], check=True)
-        flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', 'sdl3'], text=True))
-    available = [('audio.json','audio.c','nexus_audio'),('image.json','image.c','nexus_image')]
-    selected = 'nexus_audio' if args.only_audio else 'nexus_image' if args.only_image else None
+    available = [
+        ('audio.json', 'audio.c', 'nexus_audio'),
+        ('image.json', 'image.c', 'nexus_image'),
+        ('steam.json', 'steam.c', 'nexus_steam'),
+        ('console.json', 'console.c', 'nexus_console'),
+        ('taptap.json', 'taptap.c', 'nexus_taptap'),
+    ]
+    selected = (
+        'nexus_audio' if args.only_audio
+        else 'nexus_image' if args.only_image
+        else 'nexus_steam' if args.only_steam
+        else 'nexus_console' if args.only_console
+        else 'nexus_taptap' if args.only_taptap
+        else None
+    )
     modules = [entry for entry in available if selected is None or entry[2] == selected]
+    needs_sdl = any(entry[2] in ('nexus_audio', 'nexus_image') for entry in modules)
+    sdl_flags = []
+    if needs_sdl:
+        if args.sdl_include:
+            sdl_flags = ['-I' + str(args.sdl_include.resolve())]
+        else:
+            subprocess.run(['pkg-config', '--atleast-version=3.4.0', 'sdl3'], check=True)
+            sdl_flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', 'sdl3'], text=True))
     with tempfile.TemporaryDirectory(prefix='xu-nexus-native-') as temporary:
         for manifest, source, name in modules:
             archive = Path(temporary) / (name + '.a')
@@ -85,6 +104,7 @@ def main():
                        '--target', target, '-o', str(archive)]
             if args.cc:
                 command += ['--cc', args.cc]
+            flags = sdl_flags if name in ('nexus_audio', 'nexus_image') else []
             subprocess.run(command + ['-O2', '-std=c11', '-Wall', '-Wextra', '-Werror',
                                       '-I' + temporary, *flags, str(HERE / source)], check=True)
             destination = HERE / (name + '.xulib')

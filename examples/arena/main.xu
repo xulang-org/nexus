@@ -159,20 +159,23 @@ fn run() int {
     $batch := ren_data.new_batch()
     $sprite_batch := ren_data.new_batch()
 
-    $ctrl := xacp.GameControl{jobs: chan xacp.GameJob{cap: 1}, done: chan int{cap: 1}, active: false, paused: false, steps_remaining: 0, port: 0, has_screenshot_job: false, screenshot_job: xacp.GameJob{id: 0, op: "", body: "", permissions: 0, reply: chan xacp.GameReply{cap: 1}}}
+    $ctrl := xacp.inactive()
     if config.xacp_port > 0 {
         ctrl = xacp.attach_tcp(config.xacp_port)
-        println("XACP control listening on 127.0.0.1:" + str(config.xacp_port))
+        if ctrl.is_open() {
+            ctrl.set_canvas_size(config.width, config.height)
+            println("XACP control listening on 127.0.0.1:" + str(ctrl.port))
+        } else {
+            eprintln("XACP control failed to bind port " + str(config.xacp_port))
+        }
     }
 
     while !quit && (config.frames == 0 || frame_number < config.frames) {
         input.begin_frame()
         if ctrl.is_open() {
-            ctrl.poll($&tree, $&input)
-            if ctrl.screenshot_requested() {
-                shot_path := "build/arena_xacp.png"
-                renderer.capture(shot_path + "") or >>
-                ctrl.fulfill_screenshot(renderer.width() or >>, renderer.height() or >>, shot_path)
+            ctrl.set_frame(frame_number)
+            for _ in 0:8 {
+                if !ctrl.poll($&tree, $&input) { <- }
             }
         }
         window.pump() or >>
@@ -197,8 +200,14 @@ fn run() int {
         last_time = current_time
         if config.autoplay { elapsed = 1.0 / 60.0 }
         ticks := clock.advance(elapsed) or >>
+        $sim_steps := 0
         if tree.can_process(player) or >> {
-            for step in 0:ticks.steps {
+            sim_steps = ticks.steps
+        } else if ctrl.is_open() && ctrl.consume_step() {
+            sim_steps = 1
+        }
+        if sim_steps > 0 {
+            for step in 0:sim_steps {
                 animation_time = animation_time + ticks.fixed_delta
                 animator.advance(ticks.fixed_delta) or >>
                 direction := input.vector("left", "right", "up", "down") or >>
@@ -225,10 +234,12 @@ fn run() int {
             }
         }
         tree.flush_free() or >>
+        if ctrl.is_open() { _ := ctrl.complete_step_if_done(tree.paused) }
         width := renderer.width() or >>
         height := renderer.height() or >>
         if width < 1 || height < 1 { sleep_ns(10000000)
             -> }
+        if ctrl.is_open() { ctrl.set_canvas_size(width, height) }
         view := camera.view_transform(f64(width), f64(height)) or >>
         viewport := camera.viewport(f64(width), f64(height)) or >>
         batch.clear()
@@ -255,14 +266,25 @@ fn run() int {
         renderer.clip_rect(viewport) or >>
         renderer.submit(&batch) or >>
         renderer.submit_texture(&sprite_batch, &texture) or >>
+        if ctrl.is_open() && ctrl.screenshot_requested() {
+            capture_xacp_shot($&renderer, $&ctrl, width, height, "build/arena_xacp.png")
+        }
         if config.capture.len > 0 && frame_number + 1 == config.frames { renderer.capture(config.capture + "") or >> }
         renderer.present() or >>
         frame_number = frame_number + 1
     }
+    if ctrl.is_open() { ctrl.close() }
     texture.close() or >>
     renderer.close() or >>
     println("Finished " + str(frame_number) + " frames; score " + str(score))
     << 0
+}
+fn capture_xacp_shot(renderer $&ren.Renderer2D, ctrl $&xacp.GameControl, width int, height int, shot_path string) {
+    renderer.capture(shot_path + "") or (err) {
+        _ := ctrl.reject_screenshot("capture failed: " + err.msg())
+        <<
+    }
+    _ := ctrl.fulfill_screenshot(width, height, shot_path)
 }
 fn main() int { << run() or (err) { eprintln(err.msg())
     << 1 } }

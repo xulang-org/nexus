@@ -1,0 +1,106 @@
+name: Nexus CI
+
+on:
+  push:
+    branches: [dev, main]
+    tags-ignore:
+      - 'v*'
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nexus-ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  contracts:
+    name: Architecture, Layer & Version Contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 tools/ci_run.py --modes contracts
+
+  platform:
+    name: Build, Test & Tools (${{ matrix.target }})
+    needs: contracts
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            os: macos-latest
+          - target: macos-x64
+            os: macos-15-intel
+          - target: linux-x64
+            os: ubuntu-24.04
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+          - target: windows-x64
+            os: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: ${{ endsWith(matrix.target, '-arm64') && 'arm64' || 'x64' }}
+
+      - name: Python3 shim on Windows
+        if: runner.os == 'Windows'
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            PYTHON_BIN=$(command -v python)
+            cp "$PYTHON_BIN" "$(dirname "$PYTHON_BIN")/python3.exe"
+          fi
+
+      - name: Install Linux CI dependencies
+        if: runner.os == 'Linux'
+        run: bash tools/install_ubuntu_ci_packages.sh clang glslang-tools libgtk-4-dev
+
+      - name: Cache Xu SDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/xu-sdk
+          key: nexus-xu-sdk-${{ matrix.target }}-${{ hashFiles('xu.xun') }}
+
+      - name: Install pinned Xu SDK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/install_xu_sdk.py --target "${{ matrix.target }}" --dest "${{ runner.temp }}/xu-sdk" --github-env
+
+      - name: Cache SDL3 headers and minimal runtime
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sdl3
+          key: nexus-sdl3-3.4.14-rt-${{ matrix.target }}
+
+      - name: Fetch SDL3 headers and minimal runtime
+        run: python3 tools/fetch_sdl3_headers.py --dest "${{ runner.temp }}/sdl3" --with-runtime --github-env
+
+      - name: Run native, shaders, checks, headless tests, and tools
+        run: |
+          python3 tools/ci_run.py \
+            --modes native,shaders,check,test,build-tools \
+            --xu "$XU" \
+            --sdl-include "$NEXUS_SDL3_INCLUDE" \
+            --sdl-runtime "$NEXUS_SDL3_RUNTIME" \
+            --out-dir build/release-tools
+
+      - name: Verify release identity with installed SDK
+        run: python3 tools/check_release_identity.py --xu "$XU"

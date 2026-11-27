@@ -1,24 +1,190 @@
 @"github.com/xulang-org/nexus/xacp"
 
+diag #"github.com/xulang-org/nexus/foundation/diagnostics"
 scene #"github.com/xulang-org/nexus/scene"
 controls #"github.com/xulang-org/nexus/input"
+timing #"github.com/xulang-org/nexus/timing"
 #encoding/xun
+#net
 #os
 #strconv
 #strings
 #errors
 #time
 
+pub const MAX_FRAME_BYTES = 1048576
+pub const MAX_ERROR_MSG_BYTES = 256
+pub const DEFAULT_REQUEST_TIMEOUT_MS = 5000
+pub const MAX_REQUEST_TIMEOUT_MS = 600000
+pub const DEFAULT_WRITE_TIMEOUT_MS = 10000
+pub const MAX_WRITE_TIMEOUT_MS = 600000
+pub const DEFAULT_HELLO_TIMEOUT_MS = 5000
+pub const MAX_HELLO_TIMEOUT_MS = 600000
+pub const DEFAULT_IDLE_TIMEOUT_MS = 60000
+pub const MIN_IDLE_TIMEOUT_MS = 1000
+pub const MAX_IDLE_TIMEOUT_MS = 3600000
+pub const DEFAULT_NONCE_CACHE = 1024
+pub const MAX_NONCE_CACHE = 65536
+
+pub struct ServerLimits {
+    pub request_timeout_ms int
+    pub write_timeout_ms int
+    pub hello_timeout_ms int
+    pub idle_timeout_ms int
+    pub nonce_cache int
+    pub nonce_replay bool
+}
+
+struct NonceRegistry {
+    entries []string
+    capacity int
+    next int
+    enabled bool
+}
+
 struct FrameReader {
     fd int
     remainder string
+    stop chan int
+    stopped bool
+    timed_out bool
 }
 
-fn new_frame_reader(fd int) FrameReader {
-    << FrameReader{fd: fd, remainder: ""}
+fn timeout_from_env(name string, minimum int, maximum int, fallback int, allow_zero bool) int {
+    text := os.getenv(name)
+    if text.len == 0 { << fallback }
+    $value := 0
+    for i in 0:text.len {
+        c := text[i] & 255
+        if c < 48 || c > 57 { << fallback }
+        digit := c - 48
+        if value > (maximum - digit) / 10 { << fallback }
+        value = value * 10 + digit
+    }
+    if value == 0 && allow_zero { << 0 }
+    if value < minimum { << fallback }
+    << value
 }
 
-fn (r $&FrameReader) read_line() string {
+pub fn default_limits() ServerLimits {
+    << ServerLimits{
+        request_timeout_ms: timeout_from_env("XU_XACP_REQUEST_TIMEOUT_MS", 1, MAX_REQUEST_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS, false),
+        write_timeout_ms: timeout_from_env("XU_XACP_WRITE_TIMEOUT_MS", 1, MAX_WRITE_TIMEOUT_MS, DEFAULT_WRITE_TIMEOUT_MS, false),
+        hello_timeout_ms: timeout_from_env("XU_XACP_HELLO_TIMEOUT_MS", 1, MAX_HELLO_TIMEOUT_MS, DEFAULT_HELLO_TIMEOUT_MS, false),
+        idle_timeout_ms: timeout_from_env("XU_XACP_IDLE_TIMEOUT_MS", MIN_IDLE_TIMEOUT_MS, MAX_IDLE_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, true),
+        nonce_cache: timeout_from_env("XU_XACP_NONCE_CACHE", 1, MAX_NONCE_CACHE, DEFAULT_NONCE_CACHE, false),
+        nonce_replay: os.getenv("XU_XACP_NONCE_REPLAY") != "0"
+    }
+}
+
+fn new_nonce_registry(capacity int, enabled bool) NonceRegistry {
+    $limit := capacity
+    if limit < 1 || limit > MAX_NONCE_CACHE { limit = DEFAULT_NONCE_CACHE }
+    << NonceRegistry{entries: []string{}, capacity: limit, next: 0, enabled: enabled}
+}
+
+fn register_nonce(registry $&NonceRegistry, nonce &string) bool {
+    if !registry.enabled { << true }
+    if nonce.len == 0 { << false }
+    for i in 0:registry.entries.len {
+        if registry.entries[i] == *nonce { << false }
+    }
+    if registry.entries.len < registry.capacity {
+        registry.entries.push(*nonce + "")
+    } else {
+        registry.entries[registry.next] = *nonce + ""
+        registry.next += 1
+        if registry.next == registry.capacity { registry.next = 0 }
+    }
+    << true
+}
+
+fn new_frame_reader(fd int, stop chan int) FrameReader {
+    << FrameReader{fd: fd, remainder: "", stop: stop, stopped: false, timed_out: false}
+}
+
+fn should_stop(stop chan int) bool {
+    select {
+        _ := <-stop { << true }
+        else {}
+    }
+    << false
+}
+
+fn tokens_equal(a &string, b &string) bool {
+    if a.len != b.len { << false }
+    $diff := 0
+    for i in 0:a.len {
+        diff = diff | ((a[i] & 255) ^ (b[i] & 255))
+    }
+    << diff == 0
+}
+
+fn path_token_start(text &string, i int) bool {
+    if i == 0 { << true }
+    c := text[i - 1] & 255
+    if c <= 32 { << true }
+    if c >= 128 || (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) { << false }
+    << c != 47 && c != 46 && c != 45 && c != 95
+}
+
+pub fn redact_paths(text &string) string {
+    $out := strings.builder()
+    $i := 0
+    while i < text.len {
+        c := text[i] & 255
+        start := path_token_start(text, i)
+        drive := start && i + 2 < text.len && text[i + 1] == 58 && (text[i + 2] == 47 || text[i + 2] == 92)
+        home := i + 5 <= text.len && text[i:i + 5] == "\$HOME"
+        uri := i > 1 && text[i - 1] == 58 && i + 1 < text.len && text[i + 1] == 47
+        if (c == 47 && start && !uri) || drive || home || (start && c == 92 && i + 1 < text.len && text[i + 1] == 92) {
+            out.write_string(&"<path>")
+            i += 1
+            while i < text.len {
+                b := text[i] & 255
+                if b <= 32 || b == 34 || b == 39 || b == 41 || b == 93 || b == 125 { <- }
+                i += 1
+            }
+        } else {
+            out.write_byte(c)
+            i += 1
+        }
+    }
+    << out.text()
+}
+
+fn remaining_ns(authenticated bool, started int, last_frame int, limits &ServerLimits) int {
+    if !authenticated {
+        rem := limits.hello_timeout_ms * time.millisecond() - time.since(started)
+        if rem <= 0 { << -1 }
+        << rem
+    }
+    if limits.idle_timeout_ms == 0 { << 0 }
+    rem := limits.idle_timeout_ms * time.millisecond() - time.since(last_frame)
+    if rem <= 0 { << -1 }
+    << rem
+}
+
+fn (r $&FrameReader) wait_readable(authenticated bool, started int, last_frame int, limits &ServerLimits) int {
+    while true {
+        if should_stop(r.stop) {
+            r.stopped = true
+            >> errors.new("xacp: stopped")
+        }
+        rem := remaining_ns(authenticated, started, last_frame, limits)
+        if rem < 0 {
+            r.timed_out = true
+            >> errors.new("xacp: session deadline expired")
+        }
+        $slice := 25 * time.millisecond()
+        if rem > 0 && rem < slice { slice = rem }
+        ready := os.socket_wait_read(r.fd, slice) or >>
+        if ready != 0 { << 0 }
+    }
+    << 0
+}
+
+fn (r $&FrameReader) read_line(authenticated bool, started int, last_frame int, limits &ServerLimits) string {
     while true {
         idx := strings.index_byte(&r.remainder, 10)
         if idx >= 0 {
@@ -29,6 +195,7 @@ fn (r $&FrameReader) read_line() string {
             }
             << line
         }
+        r.wait_readable(authenticated, started, last_frame, limits) or >>
         chunk := os.socket_read(r.fd, 4096) or >>
         if chunk.len == 0 {
             >> errors.new("EOF")
@@ -37,8 +204,9 @@ fn (r $&FrameReader) read_line() string {
     }
 }
 
-fn (r $&FrameReader) read_bytes(count int) string {
+fn (r $&FrameReader) read_bytes(count int, authenticated bool, started int, last_frame int, limits &ServerLimits) string {
     while r.remainder.len < count {
+        r.wait_readable(authenticated, started, last_frame, limits) or >>
         chunk := os.socket_read(r.fd, 4096) or >>
         if chunk.len == 0 {
             >> errors.new("EOF")
@@ -50,83 +218,242 @@ fn (r $&FrameReader) read_bytes(count int) string {
     << body
 }
 
-fn (r $&FrameReader) read_frame() string {
-    magic := r.read_line() or >>
+fn (r $&FrameReader) read_frame(authenticated bool, started int, last_frame int, limits &ServerLimits) string {
+    magic := r.read_line(authenticated, started, last_frame, limits) or >>
     if magic != "XACP/1" {
         >> errors.new("invalid XACP/1 magic line: " + magic)
     }
-    len_line := r.read_line() or >>
+    len_line := r.read_line(authenticated, started, last_frame, limits) or >>
     length := strconv.atoi(&len_line) or >>
-    if length <= 0 || length > 1048576 {
+    if length <= 0 || length > MAX_FRAME_BYTES {
         >> errors.new("invalid XACP/1 frame length")
     }
-    body := r.read_bytes(length) or >>
+    body := r.read_bytes(length, authenticated, started, last_frame, limits) or >>
     << body
 }
 
-fn write_frame(fd int, body string) int {
+fn reset_sock_timeout(fd int) {
+    _ := os.set_sock_timeout(fd, 0) or (ce) { << }
+}
+
+fn write_frame_bounded(fd int, body string, timeout_ms int) int {
+    started := time.now()
+    budget := timeout_ms * time.millisecond()
     header := "XACP/1\n" + str(body.len) + "\n"
     full := header + body
     $offset := 0
     while offset < full.len {
-        $chunk_end := offset + 1024
+        remaining := budget - time.since(started)
+        if remaining <= 0 {
+            >> errors.new("xacp: write timed out after " + str(timeout_ms) + " ms")
+        }
+        ready := os.socket_poll(fd, 4) or >>
+        if ready == 0 {
+            $delay := time.millisecond()
+            if delay > remaining { delay = remaining }
+            time.sleep(delay)
+            ->
+        }
+        left := budget - time.since(started)
+        if left <= 0 {
+            >> errors.new("xacp: write timed out after " + str(timeout_ms) + " ms")
+        }
+        ms := (left + 999999) / 1000000
+        os.set_sock_timeout(fd, ms * time.millisecond()) or >>
+        $chunk_end := offset + 16384
         if chunk_end > full.len { chunk_end = full.len }
-        n := os.socket_write(fd, full[offset:chunk_end]) or >>
-        if n <= 0 { >> errors.new("xacp: socket write error") }
+        n := os.socket_write(fd, full[offset:chunk_end]) or (err) {
+            reset_sock_timeout(fd)
+            if time.since(started) >= budget {
+                >> errors.new("xacp: write timed out after " + str(timeout_ms) + " ms")
+            }
+            >> err
+        }
+        if time.since(started) >= budget {
+            reset_sock_timeout(fd)
+            >> errors.new("xacp: write timed out after " + str(timeout_ms) + " ms")
+        }
+        if n <= 0 {
+            reset_sock_timeout(fd)
+            >> errors.new("xacp: socket write error")
+        }
         offset += n
     }
+    reset_sock_timeout(fd)
     << 0
 }
 
-fn run_peer_session(peer int, jobs chan GameJob) int {
-    $reader := new_frame_reader(peer)
-    expected_token := os.getenv("XU_XACP_TOKEN")
-    $perms := 31
-    $perm_label := "development"
+fn write_error_frame(fd int, id int, code string, msg string, limits &ServerLimits) int {
+    safe := redact_paths(&msg)
+    $end := safe.len
+    if end > MAX_ERROR_MSG_BYTES {
+        end = MAX_ERROR_MSG_BYTES
+        while end > 0 && (safe[end] & 192) == 128 { end -= 1 }
+    }
+    bounded := safe[0:end]
+    res := "id: !i " + str(id) + "\n" +
+        "ok: !b false\n" +
+        "error:\n" +
+        "  code: " + code + "\n" +
+        "  msg: " + quote_xun_string(&bounded) + "\n"
+    << write_frame_bounded(fd, res, limits.write_timeout_ms) or >>
+}
+
+fn has_prefix(s &string, prefix string) bool {
+    if prefix.len > s.len { << false }
+    for i in 0:prefix.len {
+        if s[i] != prefix[i] { << false }
+    }
+    << true
+}
+
+fn submit_job(jobs chan GameJob, busy chan int, stop chan int, req_id int, req_op string, body string, perms int, timeout_ms int) GameReply {
+    started := time.now()
+    budget := timeout_ms * time.millisecond()
+    tok := <-busy
+    select {
+        pending := <-jobs {
+            jobs <- pending
+            busy <- tok
+            << GameReply{ok: false, err_code: "request_in_flight", err_msg: "one request is already active", data: ""}
+        }
+        else {}
+    }
+    reply_chan := chan GameReply{cap: 1}
+    jobs <- GameJob{
+        id: req_id,
+        op: req_op + "",
+        body: body + "",
+        permissions: perms,
+        reply: reply_chan
+    }
+    busy <- tok
+
+    $wait := budget - time.since(started)
+    if wait <= 0 { wait = time.millisecond() }
+    timer := time.new_timer(wait)
+    select {
+        r := <-reply_chan {
+            timer.stop()
+            << r
+        }
+        _ := <-stop {
+            timer.stop()
+            << GameReply{ok: false, err_code: "__interrupted__", err_msg: "xacp control closed", data: ""}
+        }
+        _ := <-timer.c {
+            drain_tok := <-busy
+            select {
+                pending := <-jobs {
+                    pending.reply <- GameReply{ok: false, err_code: "request_timeout", err_msg: "request exceeded " + str(timeout_ms) + " ms", data: ""}
+                }
+                else {}
+            }
+            busy <- drain_tok
+            << GameReply{ok: false, err_code: "request_timeout", err_msg: "request exceeded " + str(timeout_ms) + " ms", data: ""}
+        }
+    }
+    << GameReply{ok: false, err_code: "__interrupted__", err_msg: "xacp control closed", data: ""}
+}
+
+// Returns 1 if interrupted by control shutdown, 0 on normal disconnect/EOF.
+fn run_peer_session(peer int, expected_token string, jobs chan GameJob, busy chan int, stop chan int, limits &ServerLimits, nonces $&NonceRegistry) int {
+    $reader := new_frame_reader(peer, stop)
+    requires_token := expected_token.len > 0
+    $authenticated := false
+    $perms := 0
+    $perm_label := "none"
+    $next_id := 1
+    started := time.now()
+    $last_frame := started
 
     while true {
-        body := reader.read_frame() or (err) {
+        body := reader.read_frame(authenticated, started, last_frame, limits) or (err) {
+            if reader.stopped { << 1 }
+            if reader.timed_out {
+                if !authenticated {
+                    _ := write_error_frame(peer, 0, "hello_timeout", "hello not completed within " + str(limits.hello_timeout_ms) + " ms", limits) or (we) { << 0 }
+                } else {
+                    _ := write_error_frame(peer, 0, "session_idle", "no complete frame for " + str(limits.idle_timeout_ms) + " ms", limits) or (we) { << 0 }
+                }
+            }
             << 0
         }
+        last_frame = time.now()
         doc := xun.parse(&body)
         if !doc.ok() {
-            err_frame := "id: !i 0\nok: !b false\nerror:\n  code: frame_error\n  msg: \"invalid XUN body\"\n"
-            write_frame(peer, err_frame) or (err) { << 0 }
-            ->
+            write_error_frame(peer, 0, "frame_error", "invalid XUN body", limits) or (err) { << 0 }
+            << 0
         }
         root := doc.root()
-        req_id := doc.as_int(doc.get(root, "id"))
-        req_op := doc.text(doc.get(root, "op"))
+        id_node := doc.get(root, "id")
+        op_node := doc.get(root, "op")
+        if id_node < 0 || op_node < 0 {
+            write_error_frame(peer, 0, "frame_error", "missing id or op", limits) or (err) { << 0 }
+            << 0
+        }
+        req_id := doc.as_int(id_node)
+        req_op := doc.text(op_node)
         req_args := doc.get(root, "args")
 
         if req_op == "xacp.hello" {
-            nonce := doc.text(doc.get(req_args, "nonce"))
-            token_node := doc.get(req_args, "token")
+            if authenticated {
+                write_error_frame(peer, req_id, "schema_error", "hello already completed", limits) or (err) { << 0 }
+                << 0
+            }
+            if req_id <= 0 || req_id != next_id {
+                write_error_frame(peer, req_id, "invalid_request_id", "request id is not monotonic", limits) or (err) { << 0 }
+                ->
+            }
+            $nonce := ""
             $client_token := ""
-            if token_node >= 0 { client_token = doc.text(token_node) }
+            if req_args >= 0 {
+                nonce_node := doc.get(req_args, "nonce")
+                if nonce_node >= 0 { nonce = doc.text(nonce_node) }
+                token_node := doc.get(req_args, "token")
+                if token_node >= 0 { client_token = doc.text(token_node) }
+            }
 
-            if expected_token.len > 0 {
-                if client_token != expected_token {
-                    err_frame := "id: !i " + str(req_id) + "\nok: !b false\nerror:\n  code: auth_failed\n  msg: \"invalid token\"\n"
-                    write_frame(peer, err_frame) or (err) { << 0 }
+            if requires_token {
+                if !tokens_equal(&client_token, &expected_token) {
+                    write_error_frame(peer, req_id, "auth_failed", "invalid token", limits) or (err) { << 0 }
                     << 0
                 }
-                perms = 31
-                perm_label = "development"
             }
+            if !register_nonce(nonces, &nonce) {
+                write_error_frame(peer, req_id, "nonce_replay", "hello nonce already used", limits) or (err) { << 0 }
+                << 0
+            }
+            next_id = next_id + 1
+            authenticated = true
+            perms = 31
+            perm_label = "development"
+            safe_nonce := redact_paths(&nonce)
 
             hello_res := "id: !i " + str(req_id) + "\n" +
                 "ok: !b true\n" +
                 "data:\n" +
                 "  ver: !ver 1.0.0\n" +
-                "  nonce: \"" + nonce + "\"\n" +
+                "  state: OPEN\n" +
+                "  nonce: " + quote_xun_string(&safe_nonce) + "\n" +
                 "  permissions: !i " + str(perms) + "\n" +
-                "  permission_label: \"" + perm_label + "\"\n" +
+                "  permission_label: " + quote_xun_string(&perm_label) + "\n" +
                 "  target: \"nexus\"\n" +
                 "  engine: \"github.com/xulang-org/nexus\"\n"
-            write_frame(peer, hello_res) or (err) { << 0 }
+            write_frame_bounded(peer, hello_res, limits.write_timeout_ms) or (err) { << 0 }
             ->
         }
+
+        if requires_token && !authenticated {
+            write_error_frame(peer, req_id, "auth_required", "xacp.hello authentication required", limits) or (err) { << 0 }
+            ->
+        }
+
+        if req_id <= 0 || req_id != next_id {
+            write_error_frame(peer, req_id, "invalid_request_id", "request id is not monotonic", limits) or (err) { << 0 }
+            ->
+        }
+        next_id = next_id + 1
 
         if req_op == "proc.status" {
             status_res := "id: !i " + str(req_id) + "\n" +
@@ -134,89 +461,144 @@ fn run_peer_session(peer int, jobs chan GameJob) int {
                 "data:\n" +
                 "  pid: !i " + str(os.getpid()) + "\n" +
                 "  state: \"OPEN\"\n"
-            write_frame(peer, status_res) or (err) { << 0 }
+            write_frame_bounded(peer, status_res, limits.write_timeout_ms) or (err) { << 0 }
             ->
         }
 
-        reply_chan := chan GameReply{cap: 1}
-        jobs <- GameJob{
-            id: req_id,
-            op: req_op + "",
-            body: body + "",
-            permissions: perms,
-            reply: reply_chan
-        }
-
-        reply := <-reply_chan
+        if should_stop(stop) { << 1 }
+        reply := submit_job(jobs, busy, stop, req_id, req_op + "", body + "", perms, limits.request_timeout_ms)
+        if !reply.ok && reply.err_code == "__interrupted__" { << 1 }
         if reply.ok {
-            res := "id: !i " + str(req_id) + "\n" +
-                "ok: !b true\n" +
-                "data:\n" +
-                reply.data
-            write_frame(peer, res) or (err) { << 0 }
+            $header := "id: !i " + str(req_id) + "\nok: !b true\n"
+            if has_prefix(&reply.data, "  redacted: !b true\n") {
+                header = header + "redacted: !b true\n"
+            } else if has_prefix(&reply.data, "  redacted: !b false\n") {
+                header = header + "redacted: !b false\n"
+            }
+            res := header + "data:\n" + reply.data
+            write_frame_bounded(peer, res, limits.write_timeout_ms) or (err) { << 0 }
         } else {
-            res := "id: !i " + str(req_id) + "\n" +
-                "ok: !b false\n" +
-                "error:\n" +
-                "  code: " + reply.err_code + "\n" +
-                "  msg: \"" + reply.err_msg + "\"\n"
-            write_frame(peer, res) or (err) { << 0 }
+            write_error_frame(peer, req_id, reply.err_code, reply.err_msg, limits) or (err) { << 0 }
         }
     }
     << 0
 }
 
-fn tcp_server_worker(port int, jobs chan GameJob, done chan int) int {
-    listener := os.socket(2, 1, 0) or (err) {
-        done <- 1
-        << 1
-    }
-    os.bind4(listener, 127, 0, 0, 1, port) or (err) {
-        os.socket_close(listener) or (ce) { << 1 }
-        done <- 1
-        << 1
-    }
-    os.listen(listener, 8) or (err) {
-        os.socket_close(listener) or (ce) { << 1 }
-        done <- 1
-        << 1
-    }
-
+fn tcp_server_worker(lfd int, expected_token string, jobs chan GameJob, busy chan int, stop chan int, done chan int, limits ServerLimits) int {
+    $nonces := new_nonce_registry(limits.nonce_cache, limits.nonce_replay)
     while true {
-        peer := os.accept(listener) or (err) {
-            os.socket_close(listener) or (ce) { << 1 }
-            done <- 1
-            << 1
+        if should_stop(stop) { <- }
+        ready := os.socket_wait_read(lfd, 25 * time.millisecond()) or (err) { <- }
+        if ready == 0 { -> }
+        peer := net.accept(lfd) or (err) { <- }
+        session_rc := run_peer_session(peer, expected_token + "", jobs, busy, stop, &limits, $&nonces)
+        os.socket_close(peer) or (ce) {
+            if session_rc != 0 { <- }
+            ->
         }
-        _ := run_peer_session(peer, jobs)
-        os.socket_close(peer) or (ce) { << 1 }
+        if session_rc != 0 { <- }
     }
+    _ := os.socket_close(lfd) or (ce) { << 0 }
+    done <- 1
     << 0
 }
 
-pub fn attach_tcp(port int) GameControl {
+fn parse_bound_port(addr &string, fallback int) int {
+    idx := strings.last_index_byte(addr, 58)
+    if idx < 0 || idx + 1 >= addr.len { << fallback }
+    tail := addr[idx + 1:addr.len]
+    parsed := strconv.atoi(&tail) or (err) { << fallback }
+    << parsed
+}
+
+fn attach_tcp_internal(port int, expected_token string, limits ServerLimits) GameControl {
+    if port < 0 || port > 65535 {
+        << inactive()
+    }
+    lfd := net.listen("127.0.0.1:" + str(port)) or (err) {
+        << inactive()
+    }
+    $actual_port := port
+    if actual_port == 0 {
+        raw_addr := os.getsockname(lfd) or (err) {
+            _ := os.socket_close(lfd) or (ce) { << inactive() }
+            << inactive()
+        }
+        bound_addr := net.unpack_sockaddr(raw_addr)
+        actual_port = parse_bound_port(&bound_addr, port)
+    }
     jobs := chan GameJob{cap: 1}
+    busy := chan int{cap: 1}
+    busy <- 1
     done := chan int{cap: 1}
+    stop := chan int{cap: 1}
     dummy_reply := chan GameReply{cap: 1}
+    dummy_step_reply := chan GameReply{cap: 1}
     dummy_job := GameJob{id: 0, op: "", body: "", permissions: 0, reply: dummy_reply}
-    xu tcp_server_worker(port, jobs, done)
+    dummy_step := GameJob{id: 0, op: "", body: "", permissions: 0, reply: dummy_step_reply}
+    xu tcp_server_worker(lfd, expected_token + "", jobs, busy, stop, done, limits)
     << GameControl{
         jobs: jobs,
+        busy: busy,
         done: done,
+        stop: stop,
+        stopped: false,
         active: true,
         paused: false,
         steps_remaining: 0,
-        port: port,
+        port: actual_port,
+        canvas_width: 960,
+        canvas_height: 640,
+        frame_number: 0,
+        revision: 1,
         has_screenshot_job: false,
-        screenshot_job: dummy_job
+        screenshot_job: dummy_job,
+        has_step_job: false,
+        step_job: dummy_step,
+        ui_nodes: []UiNodeSnapshot{},
+        pending_ui_actions: []UiActionRequest{},
+        output_stdout: "",
+        output_stderr: "",
+        output_stdout_base: 0,
+        output_stderr_base: 0
     }
+}
+
+pub fn attach_tcp(port int) GameControl {
+    << attach_tcp_internal(port, os.getenv("XU_XACP_TOKEN"), default_limits())
+}
+
+pub fn attach_tcp_with_token(port int, token string) GameControl {
+    << attach_tcp_internal(port, token + "", default_limits())
+}
+
+pub fn attach_tcp_with_limits(port int, token string, limits ServerLimits) GameControl {
+    << attach_tcp_internal(port, token + "", limits)
 }
 
 pub fn (ctrl $&GameControl) poll(tree $&scene.SceneTree, input $&controls.InputMap) bool {
     if !ctrl.active { << false }
+    _ := ctrl.complete_step_if_done(tree.paused)
     select {
         job := <-ctrl.jobs {
             reply := ctrl.dispatch_job(&job, tree, input)
+            if reply.err_code == "deferred" {
+                << true
+            }
+            job.reply <- reply
+            << true
+        }
+        else {}
+    }
+    << false
+}
+
+pub fn (ctrl $&GameControl) poll_full(tree $&scene.SceneTree, input $&controls.InputMap, logger $&diag.Logger, cvars $&diag.CVarRegistry, profiler $&timing.FrameProfiler) bool {
+    if !ctrl.active { << false }
+    _ := ctrl.complete_step_if_done(tree.paused)
+    select {
+        job := <-ctrl.jobs {
+            reply := ctrl.dispatch_job_full(&job, tree, input, logger, cvars, profiler)
             if reply.err_code == "deferred" {
                 << true
             }

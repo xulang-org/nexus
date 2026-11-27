@@ -1,0 +1,405 @@
+@"github.com/xulang-org/nexus/networking"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const RPC_ARG_BOOL = 0
+pub const RPC_ARG_INT = 1
+pub const RPC_ARG_F32 = 2
+pub const RPC_ARG_VEC3 = 3
+pub const RPC_ARG_BYTES = 4
+
+pub const RPC_DIR_CLIENT_TO_SERVER = 0
+pub const RPC_DIR_SERVER_TO_CLIENT = 1
+pub const RPC_DIR_BIDIRECTIONAL = 2
+
+pub const RPC_WIRE_MAGIC = 82
+pub const RPC_MAX_BYTES = 1024
+
+pub struct RpcArg {
+    pub kind int
+    pub b bool
+    pub i int
+    pub f f64
+    pub v3 fm.Vec3
+    pub bytes []u8
+}
+
+fn clone_u8_slice(src &[]u8) []u8 {
+    $out := []u8{}
+    for i in 0:src.len {
+        out.push(src[i])
+    }
+    << out
+}
+
+pub fn rpc_bool(v bool) RpcArg {
+    << RpcArg{kind: RPC_ARG_BOOL, b: v, i: 0, f: 0.0, v3: fm.vec3(0.0, 0.0, 0.0), bytes: []u8{}}
+}
+
+pub fn rpc_int(v int) RpcArg {
+    << RpcArg{kind: RPC_ARG_INT, b: false, i: v, f: 0.0, v3: fm.vec3(0.0, 0.0, 0.0), bytes: []u8{}}
+}
+
+pub fn rpc_f32(v f64) RpcArg {
+    if !fm.finite(v) { >> errors.new("nexus rpc: non-finite f32 argument") }
+    << RpcArg{kind: RPC_ARG_F32, b: false, i: 0, f: v, v3: fm.vec3(0.0, 0.0, 0.0), bytes: []u8{}}
+}
+
+pub fn rpc_vec3(v fm.Vec3) RpcArg {
+    if !v.is_finite() { >> errors.new("nexus rpc: non-finite vec3 argument") }
+    << RpcArg{kind: RPC_ARG_VEC3, b: false, i: 0, f: 0.0, v3: v, bytes: []u8{}}
+}
+
+pub fn rpc_bytes(data []u8) RpcArg {
+    if data.len > RPC_MAX_BYTES {
+        >> errors.new("nexus rpc: byte payload exceeds RPC_MAX_BYTES")
+    }
+    << RpcArg{kind: RPC_ARG_BYTES, b: false, i: 0, f: 0.0, v3: fm.vec3(0.0, 0.0, 0.0), bytes: clone_u8_slice(&data)}
+}
+
+pub struct RpcCall {
+    pub rpc_id int
+    pub name string
+    pub target_id int
+    pub args []RpcArg
+}
+
+struct RpcSchema {
+    id int
+    name string
+    direction int
+    rate_cost f64
+    arg_kinds []int
+}
+
+pub struct RpcRegistry {
+    defs []RpcSchema
+    by_name map[string]int
+}
+
+pub fn new_rpc_registry() RpcRegistry {
+    << RpcRegistry{defs: []RpcSchema{}, by_name: map[string]int{}}
+}
+
+fn clone_ints(src &[]int) []int {
+    $out := []int{}
+    for i in 0:src.len {
+        out.push(src[i])
+    }
+    << out
+}
+
+pub fn (reg $&RpcRegistry) register(name string, direction int, arg_kinds []int, rate_cost f64) int {
+    if name.len == 0 {
+        >> errors.new("nexus rpc: RPC name cannot be empty")
+    }
+    if reg.by_name.has(name) {
+        >> errors.new("nexus rpc: duplicate RPC name")
+    }
+    if direction < RPC_DIR_CLIENT_TO_SERVER || direction > RPC_DIR_BIDIRECTIONAL {
+        >> errors.new("nexus rpc: invalid RPC direction")
+    }
+    if math.is_nan(rate_cost) || math.is_inf(rate_cost) || rate_cost < 0.0 {
+        >> errors.new("nexus rpc: invalid rate_cost")
+    }
+    for i in 0:arg_kinds.len {
+        k := arg_kinds[i]
+        if k < RPC_ARG_BOOL || k > RPC_ARG_BYTES {
+            >> errors.new("nexus rpc: invalid argument kind")
+        }
+    }
+    id := reg.defs.len
+    reg.defs.push(RpcSchema{
+        id: id,
+        name: name + "",
+        direction: direction,
+        rate_cost: rate_cost,
+        arg_kinds: clone_ints(&arg_kinds)
+    })
+    reg.by_name[name] = id
+    << id
+}
+
+pub fn (reg &RpcRegistry) rpc_id_of(name string) int {
+    if !reg.by_name.has(name) { >> errors.new("nexus rpc: unknown RPC name") }
+    << reg.by_name[name]
+}
+
+pub fn (reg &RpcRegistry) name_of(rpc_id int) string {
+    if rpc_id < 0 || rpc_id >= reg.defs.len { >> errors.new("nexus rpc: unknown RPC id") }
+    << reg.defs[rpc_id].name + ""
+}
+
+pub fn (reg &RpcRegistry) rate_cost(rpc_id int) f64 {
+    if rpc_id < 0 || rpc_id >= reg.defs.len { >> errors.new("nexus rpc: unknown RPC id") }
+    << reg.defs[rpc_id].rate_cost
+}
+
+fn check_rpc_direction(direction int, sender_is_server bool) int {
+    if direction == RPC_DIR_CLIENT_TO_SERVER && sender_is_server {
+        >> errors.new("nexus rpc: server cannot invoke client-to-server RPC")
+    }
+    if direction == RPC_DIR_SERVER_TO_CLIENT && !sender_is_server {
+        >> errors.new("nexus rpc: client cannot invoke server-to-client RPC")
+    }
+    << 0
+}
+
+pub fn (reg &RpcRegistry) encode_call(rpc_id int, sender_is_server bool, target_id int, args &[]RpcArg) []u8 {
+    if rpc_id < 0 || rpc_id >= reg.defs.len {
+        >> errors.new("nexus rpc: unknown RPC id")
+    }
+    def := &reg.defs[rpc_id]
+    _ := check_rpc_direction(def.direction, sender_is_server) or >>
+    if args.len != def.arg_kinds.len {
+        >> errors.new("nexus rpc: argument count mismatch")
+    }
+
+    $bw := new_bit_writer()
+    bw.write_u8(RPC_WIRE_MAGIC) or >>
+    bw.write_u16(rpc_id) or >>
+    bw.write_i32(target_id) or >>
+
+    for i in 0:args.len {
+        expected := def.arg_kinds[i]
+        arg := &args[i]
+        if arg.kind != expected {
+            >> errors.new("nexus rpc: argument kind mismatch")
+        }
+        if expected == RPC_ARG_BOOL {
+            bw.write_bool(arg.b) or >>
+        } else if expected == RPC_ARG_INT {
+            bw.write_i32(arg.i) or >>
+        } else if expected == RPC_ARG_F32 {
+            bw.write_f32(arg.f) or >>
+        } else if expected == RPC_ARG_VEC3 {
+            bw.write_f32(arg.v3.x) or >>
+            bw.write_f32(arg.v3.y) or >>
+            bw.write_f32(arg.v3.z) or >>
+        } else {
+            if arg.bytes.len > RPC_MAX_BYTES {
+                >> errors.new("nexus rpc: byte payload exceeds RPC_MAX_BYTES")
+            }
+            bw.write_bytes(&arg.bytes) or >>
+        }
+    }
+    << bw.finish()
+}
+
+pub fn (reg &RpcRegistry) decode_call(payload &[]u8, sender_is_server bool) RpcCall {
+    $br := new_bit_reader(payload)
+    magic := br.read_u8() or >>
+    if magic != RPC_WIRE_MAGIC {
+        >> errors.new("nexus rpc: invalid wire magic")
+    }
+    rpc_id := br.read_u16() or >>
+    if rpc_id < 0 || rpc_id >= reg.defs.len {
+        >> errors.new("nexus rpc: unknown RPC id in payload")
+    }
+    def := &reg.defs[rpc_id]
+    _ := check_rpc_direction(def.direction, sender_is_server) or >>
+    target_id := br.read_i32() or >>
+
+    $args := []RpcArg{}
+    for i in 0:def.arg_kinds.len {
+        k := def.arg_kinds[i]
+        if k == RPC_ARG_BOOL {
+            b := br.read_bool() or >>
+            args.push(rpc_bool(b))
+        } else if k == RPC_ARG_INT {
+            iv := br.read_i32() or >>
+            args.push(rpc_int(iv))
+        } else if k == RPC_ARG_F32 {
+            fv := br.read_f32() or >>
+            args.push(rpc_f32(fv) or >>)
+        } else if k == RPC_ARG_VEC3 {
+            x := br.read_f32() or >>
+            y := br.read_f32() or >>
+            z := br.read_f32() or >>
+            args.push(rpc_vec3(fm.vec3(x, y, z)) or >>)
+        } else {
+            raw := br.read_bytes(RPC_MAX_BYTES) or >>
+            args.push(rpc_bytes(raw) or >>)
+        }
+    }
+
+    if br.bits_remaining() >= 8 {
+        >> errors.new("nexus rpc: trailing unconsumed bytes in payload")
+    }
+
+    << RpcCall{
+        rpc_id: rpc_id,
+        name: def.name + "",
+        target_id: target_id,
+        args: args
+    }
+}
+
+struct PeerBucket {
+    peer_id int
+    active bool
+    tokens f64
+}
+
+pub struct PeerRateLimiter {
+    capacity f64
+    refill_per_sec f64
+    buckets []PeerBucket
+    peer_to_idx map[int]int
+}
+
+pub fn new_peer_rate_limiter(capacity f64, refill_per_sec f64) PeerRateLimiter {
+    if math.is_nan(capacity) || math.is_inf(capacity) || capacity <= 0.0 {
+        >> errors.new("nexus rpc: rate limiter capacity must be finite and > 0")
+    }
+    if math.is_nan(refill_per_sec) || math.is_inf(refill_per_sec) || refill_per_sec < 0.0 {
+        >> errors.new("nexus rpc: rate limiter refill_per_sec must be finite and >= 0")
+    }
+    << PeerRateLimiter{
+        capacity: capacity,
+        refill_per_sec: refill_per_sec,
+        buckets: []PeerBucket{},
+        peer_to_idx: map[int]int{}
+    }
+}
+
+pub fn (rl $&PeerRateLimiter) step(dt f64) int {
+    if math.is_nan(dt) || math.is_inf(dt) || dt < 0.0 {
+        >> errors.new("nexus rpc: rate limiter dt must be finite and >= 0")
+    }
+    if dt == 0.0 || rl.refill_per_sec == 0.0 { << 0 }
+    gain := dt * rl.refill_per_sec
+    for i in 0:rl.buckets.len {
+        if !rl.buckets[i].active { -> }
+        rl.buckets[i].tokens = math.min(rl.capacity, rl.buckets[i].tokens + gain)
+    }
+    << 0
+}
+
+pub fn (rl $&PeerRateLimiter) allow(peer_id int, cost f64) bool {
+    if math.is_nan(cost) || math.is_inf(cost) || cost < 0.0 {
+        >> errors.new("nexus rpc: rate limiter cost must be finite and >= 0")
+    }
+    if cost > rl.capacity {
+        << false
+    }
+    $idx := -1
+    if rl.peer_to_idx.has(peer_id) {
+        idx = rl.peer_to_idx[peer_id]
+    } else {
+        idx = rl.buckets.len
+        rl.buckets.push(PeerBucket{peer_id: peer_id, active: true, tokens: rl.capacity})
+        rl.peer_to_idx[peer_id] = idx
+    }
+    if !rl.buckets[idx].active {
+        rl.buckets[idx].active = true
+        rl.buckets[idx].tokens = rl.capacity
+    }
+    if rl.buckets[idx].tokens + 1e-12 < cost {
+        << false
+    }
+    rl.buckets[idx].tokens = math.max(0.0, rl.buckets[idx].tokens - cost)
+    << true
+}
+
+pub fn (rl &PeerRateLimiter) tokens(peer_id int) f64 {
+    if !rl.peer_to_idx.has(peer_id) { << rl.capacity }
+    idx := rl.peer_to_idx[peer_id]
+    if !rl.buckets[idx].active { << rl.capacity }
+    << rl.buckets[idx].tokens
+}
+
+pub fn (rl $&PeerRateLimiter) remove_peer(peer_id int) {
+    if !rl.peer_to_idx.has(peer_id) { << }
+    idx := rl.peer_to_idx[peer_id]
+    rl.buckets[idx].active = false
+    rl.buckets[idx].tokens = rl.capacity
+}
+
+struct HeartbeatEntry {
+    peer_id int
+    active bool
+    silence_s f64
+}
+
+pub struct HeartbeatReport {
+    pub stale_peers []int
+    pub timed_out_peers []int
+}
+
+pub struct PeerHeartbeatTracker {
+    stale_timeout_s f64
+    disconnect_timeout_s f64
+    peers []HeartbeatEntry
+    peer_to_idx map[int]int
+}
+
+pub fn new_heartbeat_tracker(stale_timeout_s f64, disconnect_timeout_s f64) PeerHeartbeatTracker {
+    if math.is_nan(stale_timeout_s) || math.is_inf(stale_timeout_s) || stale_timeout_s <= 0.0 {
+        >> errors.new("nexus rpc: stale_timeout_s must be finite and > 0")
+    }
+    if math.is_nan(disconnect_timeout_s) || math.is_inf(disconnect_timeout_s) || disconnect_timeout_s <= stale_timeout_s {
+        >> errors.new("nexus rpc: disconnect_timeout_s must be finite and > stale_timeout_s")
+    }
+    << PeerHeartbeatTracker{
+        stale_timeout_s: stale_timeout_s,
+        disconnect_timeout_s: disconnect_timeout_s,
+        peers: []HeartbeatEntry{},
+        peer_to_idx: map[int]int{}
+    }
+}
+
+pub fn (ht $&PeerHeartbeatTracker) touch(peer_id int) {
+    if ht.peer_to_idx.has(peer_id) {
+        idx := ht.peer_to_idx[peer_id]
+        ht.peers[idx].active = true
+        ht.peers[idx].silence_s = 0.0
+        <<
+    }
+    idx := ht.peers.len
+    ht.peers.push(HeartbeatEntry{peer_id: peer_id, active: true, silence_s: 0.0})
+    ht.peer_to_idx[peer_id] = idx
+}
+
+pub fn (ht $&PeerHeartbeatTracker) remove_peer(peer_id int) {
+    if !ht.peer_to_idx.has(peer_id) { << }
+    idx := ht.peer_to_idx[peer_id]
+    ht.peers[idx].active = false
+    ht.peers[idx].silence_s = 0.0
+}
+
+pub fn (ht &PeerHeartbeatTracker) silence(peer_id int) f64 {
+    if !ht.peer_to_idx.has(peer_id) { >> errors.new("nexus rpc: unknown peer_id") }
+    idx := ht.peer_to_idx[peer_id]
+    if !ht.peers[idx].active { >> errors.new("nexus rpc: peer is not active") }
+    << ht.peers[idx].silence_s
+}
+
+pub fn (ht &PeerHeartbeatTracker) peer_count() int {
+    $n := 0
+    for i in 0:ht.peers.len {
+        if ht.peers[i].active { n += 1 }
+    }
+    << n
+}
+
+pub fn (ht $&PeerHeartbeatTracker) step(dt f64) HeartbeatReport {
+    if math.is_nan(dt) || math.is_inf(dt) || dt < 0.0 {
+        >> errors.new("nexus rpc: heartbeat dt must be finite and >= 0")
+    }
+    $stale := []int{}
+    $timed_out := []int{}
+    for i in 0:ht.peers.len {
+        if !ht.peers[i].active { -> }
+        ht.peers[i].silence_s += dt
+        if ht.peers[i].silence_s >= ht.disconnect_timeout_s {
+            timed_out.push(ht.peers[i].peer_id)
+            ht.peers[i].active = false
+        } else if ht.peers[i].silence_s >= ht.stale_timeout_s {
+            stale.push(ht.peers[i].peer_id)
+        }
+    }
+    << HeartbeatReport{stale_peers: stale, timed_out_peers: timed_out}
+}

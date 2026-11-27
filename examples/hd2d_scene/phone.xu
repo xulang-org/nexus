@@ -1,0 +1,61 @@
+@main
+
+#gpu
+events #window/events
+fm #"github.com/xulang-org/nexus/foundation/math"
+controls #"github.com/xulang-org/nexus/input"
+input_bridge #"github.com/xulang-org/nexus/integration/input"
+phone_controls #"github.com/xulang-org/nexus/integration/phone_controls"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+ren2 #"github.com/xulang-org/nexus/rendering/two_d"
+
+const PHONE_RENDER_PIXELS = 921600
+const PHONE_SHADOW_RESOLUTION = 256
+
+// Keep the authored horizontal framing on narrow displays. Scaling both clip
+// axes preserves the display aspect and leaves the depth projection intact.
+fn phone_projection(projection fm.Mat4, aspect f64) fm.Mat4 {
+    if aspect >= 1.5 { << projection }
+    fit := aspect / 1.5
+    << fm.scale_3d(fm.vec3(fit, fit, 1.0)).multiply(projection)
+}
+
+fn present_phone(device $&ren.Device3D, overlay $&ren2.Overlay2D, hud &canvas.Batch2D) int {
+    overlay.clear() or >>
+    overlay.submit(hud) or >>
+    $frame := device.begin_present_frame() or >>
+    if frame.has_image() {
+        width := frame.width()
+        height := frame.height()
+        overlay.flush_gpu_frame(device.gpu_device() or >>, $&frame, width, height, gpu.LOAD, 0) or >>
+    }
+    << device.finish_present_frame($&frame) or >>
+}
+
+fn touch_event(kind int, finger int, point fm.Vec2) events.Event {
+    $event := events.empty()
+    event.kind = kind
+    event.touch_id = finger
+    event.x = point.x
+    event.y = point.y
+    << event
+}
+
+// Deterministic bounded demo input uses the same two-finger controls as Phone.
+fn autoplay_input(input $&controls.InputMap, touch $&input_bridge.TouchControls, layout &phone_controls.TouchLayout, frame int) int {
+    if frame == 0 {
+        down := touch_event(events.EVENT_TOUCH_DOWN, 1, layout.stick_center)
+        right := layout.stick_center.add(fm.vec2(layout.stick_radius, 0.0))
+        move := touch_event(events.EVENT_TOUCH_MOVE, 1, right)
+        touch.apply(input, &down) or >>
+        touch.apply(input, &move) or >>
+    }
+    if frame == 6 {
+        down := touch_event(events.EVENT_TOUCH_DOWN, 2, layout.camera_center)
+        up := touch_event(events.EVENT_TOUCH_UP, 2, layout.camera_center)
+        touch.apply(input, &down) or >>
+        touch.apply(input, &up) or >>
+    }
+    << 0
+}

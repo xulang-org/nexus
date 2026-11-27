@@ -1,0 +1,87 @@
+@main
+
+rs #"github.com/xulang-org/nexus/resources/steam"
+#strings
+
+fn validate_config_fails(cfg &rs.SteamAppConfig) bool {
+    _ := rs.validate_config(cfg) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn cloud_name_fails(name &string) bool {
+    _ := rs.validate_cloud_filename(name) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn app_vdf_fails(cfg &rs.SteamAppConfig, desc string) bool {
+    _ := rs.generate_app_build_vdf(cfg, desc, false) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn run() int {
+    $cfg := rs.default_config(480, 481)
+    cfg.branch = "beta"
+    cfg.dlc_ids = [482, 483]
+    cfg.achievement_ids = ["ACH_FIRST_WIN", "ACH_BOSS_CLEAR"]
+    cfg.stat_defs = [
+        rs.SteamStatDef{id: "kills", is_float: false, default_int: 0, default_float: 0.0},
+        rs.SteamStatDef{id: "distance_km", is_float: true, default_int: 0, default_float: 1.5}
+    ]
+    cfg.leaderboard_names = ["speedrun_any"]
+
+    raw_json := rs.encode_config_json(&cfg) or >>
+    decoded := rs.decode_config_json(&raw_json) or >>
+    assert(decoded.app_id == 480 && decoded.depot_id == 481 && decoded.branch == "beta")
+    assert(decoded.dlc_ids.len == 2 && decoded.dlc_ids[1] == 483)
+    assert(decoded.achievement_ids.len == 2 && decoded.achievement_ids[0] == "ACH_FIRST_WIN")
+    assert(decoded.stat_defs.len == 2 && decoded.stat_defs[1].is_float && decoded.stat_defs[1].default_float == 1.5)
+    assert(decoded.leaderboard_names.len == 1 && decoded.leaderboard_names[0] == "speedrun_any")
+
+    appid_txt := rs.generate_steam_appid_txt(480) or >>
+    assert(appid_txt == "480\n")
+
+    depot_vdf := rs.generate_depot_build_vdf(&cfg) or >>
+    assert(strings.contains(&depot_vdf, "\"DepotBuild\""))
+    assert(strings.contains(&depot_vdf, "\"DepotID\"\t\t\"481\""))
+
+    app_vdf := rs.generate_app_build_vdf(&cfg, "Nightly RC1", true) or >>
+    assert(strings.contains(&app_vdf, "\"AppBuild\""))
+    assert(strings.contains(&app_vdf, "\"AppID\"\t\t\t\"480\""))
+    assert(strings.contains(&app_vdf, "\"SetLive\"\t\t\"beta\""))
+    assert(strings.contains(&app_vdf, "\"Preview\"\t\t\"1\""))
+    assert(strings.contains(&app_vdf, "\"481\"\t\"depot_build_481.vdf\""))
+
+    clean := rs.validate_cloud_filename(&"saves\\slot_1.bin") or >>
+    assert(clean == "saves/slot_1.bin")
+
+    $bad_app := rs.default_config(0, 481)
+    assert(validate_config_fails(&bad_app))
+
+    $dup_ach := rs.default_config(480, 481)
+    dup_ach.achievement_ids = ["DUP", "DUP"]
+    assert(validate_config_fails(&dup_ach))
+
+    assert(cloud_name_fails(&"../secret.dat"))
+    assert(cloud_name_fails(&"/etc/passwd"))
+    assert(app_vdf_fails(&cfg, "bad\ninject"))
+
+    println("PASS: steam_data_checks")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

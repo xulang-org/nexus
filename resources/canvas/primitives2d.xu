@@ -1,0 +1,187 @@
+@"github.com/xulang-org/nexus/resources/canvas"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+fn valid_stroke_color(color int) int {
+    if color < 0 || color > 4294967295 {
+        >> errors.new("nexus canvas: invalid RGBA8 color")
+    }
+    << 0
+}
+
+pub fn (batch $&Batch2D) line(a fm.Vec2, b fm.Vec2, thickness f64, color int) int {
+    valid_stroke_color(color) or >>
+    if !valid_point(a) || !valid_point(b) || !fm.finite(thickness) || thickness <= 0.0 {
+        >> errors.new("nexus canvas: invalid 2D line parameters")
+    }
+    d := b.sub(a)
+    len := d.length()
+    if len <= 1e-9 { << 0 }
+    half := thickness * 0.5
+    perp := fm.vec2(-d.y / len, d.x / len).scaled(half)
+    p0 := a.sub(perp)
+    p1 := b.sub(perp)
+    p2 := b.add(perp)
+    p3 := a.add(perp)
+    batch.triangle(p0, p1, p2, color) or >>
+    batch.triangle(p0, p2, p3, color) or >>
+    << 0
+}
+
+pub fn (batch $&Batch2D) polyline(points &[]fm.Vec2, thickness f64, closed bool, color int) int {
+    valid_stroke_color(color) or >>
+    if points.len < 2 || !fm.finite(thickness) || thickness <= 0.0 {
+        >> errors.new("nexus canvas: polyline requires >= 2 points and positive thickness")
+    }
+    for i in 0:(points.len - 1) {
+        batch.line(points[i], points[i + 1], thickness, color) or >>
+    }
+    if closed && points.len >= 3 {
+        batch.line(points[points.len - 1], points[0], thickness, color) or >>
+    }
+    << 0
+}
+
+pub fn (batch $&Batch2D) rect_outline(bounds fm.Rect2, thickness f64, color int) int {
+    valid_stroke_color(color) or >>
+    if !bounds.valid() || !fm.finite(thickness) || thickness <= 0.0 {
+        >> errors.new("nexus canvas: invalid rect_outline parameters")
+    }
+    x := bounds.position.x
+    y := bounds.position.y
+    w := bounds.size.x
+    h := bounds.size.y
+    t := math.min(thickness, math.min(w, h) * 0.5)
+    id := fm.identity()
+    // Top bar
+    batch.quad(fm.rect2(x, y, w, t), id, color) or >>
+    // Bottom bar
+    batch.quad(fm.rect2(x, y + h - t, w, t), id, color) or >>
+    inner_h := h - t * 2.0
+    if inner_h > 1e-6 {
+        // Left & right bars between top and bottom (no corner overdraw).
+        batch.quad(fm.rect2(x, y + t, t, inner_h), id, color) or >>
+        batch.quad(fm.rect2(x + w - t, y + t, t, inner_h), id, color) or >>
+    }
+    << 0
+}
+
+pub fn (batch $&Batch2D) circle_fill(center fm.Vec2, radius f64, segments int, color int) int {
+    valid_stroke_color(color) or >>
+    if !valid_point(center) || !fm.finite(radius) || radius <= 0.0 || segments < 3 || segments > 256 {
+        >> errors.new("nexus canvas: invalid circle_fill parameters")
+    }
+    step := (math.pi() * 2.0) / f64(segments)
+    for i in 0:segments {
+        a0 := f64(i) * step
+        a1 := f64(i + 1) * step
+        p1 := center.add(fm.vec2(math.cos(a0) * radius, math.sin(a0) * radius))
+        p2 := center.add(fm.vec2(math.cos(a1) * radius, math.sin(a1) * radius))
+        batch.triangle(center, p1, p2, color) or >>
+    }
+    << 0
+}
+
+pub fn (batch $&Batch2D) arc_outline(center fm.Vec2, radius f64, start_rad f64, end_rad f64, thickness f64, segments int, color int) int {
+    valid_stroke_color(color) or >>
+    if !valid_point(center) || !fm.finite(radius) || radius <= 0.0 ||
+        !fm.finite(start_rad) || !fm.finite(end_rad) || !fm.finite(thickness) ||
+        thickness <= 0.0 || segments < 1 || segments > 256 {
+        >> errors.new("nexus canvas: invalid arc_outline parameters")
+    }
+    half := thickness * 0.5
+    r_in := math.max(0.0, radius - half)
+    r_out := radius + half
+    span := end_rad - start_rad
+    for i in 0:segments {
+        a0 := start_rad + span * (f64(i) / f64(segments))
+        a1 := start_rad + span * (f64(i + 1) / f64(segments))
+        c0 := math.cos(a0)
+        s0 := math.sin(a0)
+        c1 := math.cos(a1)
+        s1 := math.sin(a1)
+        in0 := center.add(fm.vec2(c0 * r_in, s0 * r_in))
+        out0 := center.add(fm.vec2(c0 * r_out, s0 * r_out))
+        out1 := center.add(fm.vec2(c1 * r_out, s1 * r_out))
+        in1 := center.add(fm.vec2(c1 * r_in, s1 * r_in))
+        batch.triangle(in0, out0, out1, color) or >>
+        batch.triangle(in0, out1, in1, color) or >>
+    }
+    << 0
+}
+
+pub fn (batch $&Batch2D) circle_outline(center fm.Vec2, radius f64, thickness f64, segments int, color int) int {
+    if segments < 3 { >> errors.new("nexus canvas: circle_outline requires >= 3 segments") }
+    << batch.arc_outline(center, radius, 0.0, math.pi() * 2.0, thickness, segments, color) or >>
+}
+
+pub fn (batch $&Batch2D) arrow(from fm.Vec2, to fm.Vec2, thickness f64, head_length f64, head_width f64, color int) int {
+    valid_stroke_color(color) or >>
+    if !valid_point(from) || !valid_point(to) || !fm.finite(thickness) || thickness <= 0.0 ||
+        !fm.finite(head_length) || head_length <= 0.0 || !fm.finite(head_width) || head_width <= 0.0 {
+        >> errors.new("nexus canvas: invalid 2D arrow parameters")
+    }
+    d := to.sub(from)
+    len := d.length()
+    if len <= 1e-9 { << 0 }
+    dir := d.scaled(1.0 / len)
+    perp := fm.vec2(-dir.y, dir.x)
+    actual_head := math.min(head_length, len * 0.75)
+    base := to.sub(dir.scaled(actual_head))
+    if len > actual_head + 1e-6 {
+        batch.line(from, base, thickness, color) or >>
+    }
+    hw := head_width * 0.5
+    left := base.add(perp.scaled(hw))
+    right := base.sub(perp.scaled(hw))
+    batch.triangle(to, left, right, color) or >>
+    << 0
+}
+
+pub fn (batch $&Batch2D) cross(center fm.Vec2, half_size f64, thickness f64, color int) int {
+    if !valid_point(center) || !fm.finite(half_size) || half_size <= 0.0 {
+        >> errors.new("nexus canvas: invalid cross parameters")
+    }
+    batch.line(fm.vec2(center.x - half_size, center.y), fm.vec2(center.x + half_size, center.y), thickness, color) or >>
+    batch.line(fm.vec2(center.x, center.y - half_size), fm.vec2(center.x, center.y + half_size), thickness, color) or >>
+    << 0
+}
+
+pub fn (batch $&Batch2D) grid(bounds fm.Rect2, cell_size f64, thickness f64, color int) int {
+    valid_stroke_color(color) or >>
+    if !bounds.valid() || !fm.finite(cell_size) || cell_size <= 0.0 || !fm.finite(thickness) || thickness <= 0.0 {
+        >> errors.new("nexus canvas: invalid grid parameters")
+    }
+    nx := int(math.floor(bounds.size.x / cell_size)) + 1
+    ny := int(math.floor(bounds.size.y / cell_size)) + 1
+    if nx + ny > 1024 {
+        >> errors.new("nexus canvas: grid line count exceeds 1024 limit")
+    }
+    x0 := bounds.position.x
+    y0 := bounds.position.y
+    x1 := x0 + bounds.size.x
+    y1 := y0 + bounds.size.y
+    for ix in 0:nx {
+        x := x0 + f64(ix) * cell_size
+        batch.line(fm.vec2(x, y0), fm.vec2(x, y1), thickness, color) or >>
+    }
+    for iy in 0:ny {
+        y := y0 + f64(iy) * cell_size
+        batch.line(fm.vec2(x0, y), fm.vec2(x1, y), thickness, color) or >>
+    }
+    << 0
+}
+
+pub fn (batch $&Batch2D) polygon_fill(points &[]fm.Vec2, color int) int {
+    valid_stroke_color(color) or >>
+    if points.len < 3 {
+        >> errors.new("nexus canvas: polygon_fill requires >= 3 vertices")
+    }
+    p0 := points[0]
+    for i in 1:(points.len - 1) {
+        batch.triangle(p0, points[i], points[i + 1], color) or >>
+    }
+    << 0
+}

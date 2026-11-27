@@ -1,0 +1,239 @@
+@"github.com/xulang-org/nexus/input"
+
+#encoding/json
+#errors
+#math
+#strconv
+#strings
+
+pub const BINDINGS_FORMAT = "nexus.input"
+pub const BINDINGS_VERSION = 1
+
+pub fn (input $&InputMap) unbind_key(name string, key int) int {
+    index := input.action_index(&name) or >>
+    $next := []InputBinding{}
+    for b in input.bindings {
+        if !(b.action == index && b.key == key) {
+            next.push(b)
+        }
+    }
+    input.bindings = next
+    input.refresh()
+    << 0
+}
+
+pub fn (input $&InputMap) unbind_mouse(name string, button int) int {
+    index := input.action_index(&name) or >>
+    $next := []MouseBinding{}
+    for b in input.mouse_bindings {
+        if !(b.action == index && b.button == button) {
+            next.push(b)
+        }
+    }
+    input.mouse_bindings = next
+    input.refresh()
+    << 0
+}
+
+pub fn (input $&InputMap) unbind_action(name string) int {
+    index := input.action_index(&name) or >>
+    $next_k := []InputBinding{}
+    for b in input.bindings {
+        if b.action != index { next_k.push(b) }
+    }
+    $next_s := []SourceBinding{}
+    for s in input.source_bindings {
+        if s.action != index { next_s.push(s) }
+    }
+    $next_m := []MouseBinding{}
+    for m in input.mouse_bindings {
+        if m.action != index { next_m.push(m) }
+    }
+    $next_c := []ChordBinding{}
+    for c in input.chord_bindings {
+        if c.action != index { next_c.push(c) }
+    }
+    input.bindings = next_k
+    input.source_bindings = next_s
+    input.mouse_bindings = next_m
+    input.chord_bindings = next_c
+    input.refresh()
+    << 0
+}
+
+pub fn (input $&InputMap) rebind_key(name string, old_key int, new_key int) int {
+    if new_key < 0 || new_key >= MAX_KEYS {
+        >> errors.new("nexus: new key outside input range")
+    }
+    _ := input.unbind_key(name + "", old_key) or >>
+    << input.bind(name + "", new_key) or >>
+}
+
+pub fn (input &InputMap) action_keys(name string) []int {
+    index := input.action_index(&name) or >>
+    $out := []int{}
+    for b in input.bindings {
+        if b.action == index { out.push(b.key) }
+    }
+    << out
+}
+
+pub fn (input &InputMap) action_sources(name string) []int {
+    index := input.action_index(&name) or >>
+    $out := []int{}
+    for s in input.source_bindings {
+        if s.action == index { out.push(s.source) }
+    }
+    << out
+}
+
+pub fn (input &InputMap) action_mouse_buttons(name string) []int {
+    index := input.action_index(&name) or >>
+    $out := []int{}
+    for m in input.mouse_bindings {
+        if m.action == index { out.push(m.button) }
+    }
+    << out
+}
+
+pub fn (input &InputMap) export_bindings_json() string {
+    $b := strings.new_byte_builder(512)
+    fmt_s := BINDINGS_FORMAT + ""
+    b.write_str("{\"format\":" + json.quote(&fmt_s) +
+        ",\"version\":" + str(BINDINGS_VERSION) +
+        ",\"actions\":[")
+    for i in 0:input.actions.len {
+        if i > 0 { b.write_str(",") }
+        act_name := input.actions[i].name + ""
+        keys := input.action_keys(act_name + "") or >>
+        srcs := input.action_sources(act_name + "") or >>
+        mbs := input.action_mouse_buttons(act_name + "") or >>
+        b.write_str("{\"name\":" + json.quote(&act_name) + ",\"keys\":[")
+        for ki in 0:keys.len {
+            if ki > 0 { b.write_str(",") }
+            b.write_str(str(keys[ki]))
+        }
+        b.write_str("],\"sources\":[")
+        for si in 0:srcs.len {
+            if si > 0 { b.write_str(",") }
+            b.write_str(str(srcs[si]))
+        }
+        b.write_str("],\"mouse_buttons\":[")
+        for mi in 0:mbs.len {
+            if mi > 0 { b.write_str(",") }
+            b.write_str(str(mbs[mi]))
+        }
+        b.write_str("],\"chords\":[")
+        $first_c := true
+        for ch in input.chord_bindings {
+            if ch.action != i { -> }
+            if !first_c { b.write_str(",") }
+            first_c = false
+            b.write_str("{\"key\":" + str(ch.key) + ",\"modifiers\":" + str(ch.modifiers) + "}")
+        }
+        b.write_str("]}")
+    }
+    b.write_str("]}")
+    << b.to_string()
+}
+
+pub fn (input $&InputMap) import_bindings_json(raw &string) int {
+    doc := json.parse_max(raw, 262144)
+    if !doc.ok() { >> errors.new("nexus input JSON: " + doc.error()) }
+    root := doc.root()
+    if !doc.is_dict(root) || !doc.has(root, "format") || !doc.has(root, "version") || !doc.has(root, "actions") {
+        >> errors.new("nexus input: missing required binding manifest fields")
+    }
+    if (doc.as_string(doc.get(root, "format")) or >>) != BINDINGS_FORMAT ||
+       (doc.as_int(doc.get(root, "version")) or >>) != BINDINGS_VERSION {
+        >> errors.new("nexus input: unsupported bindings format/version")
+    }
+    acts := doc.get(root, "actions")
+    if acts < 0 || !doc.is_list(acts) || doc.count(acts) > MAX_ACTIONS {
+        >> errors.new("nexus input: invalid actions list")
+    }
+
+    input.actions = []Action{}
+    input.bindings = []InputBinding{}
+    input.source_bindings = []SourceBinding{}
+    input.mouse_bindings = []MouseBinding{}
+    input.chord_bindings = []ChordBinding{}
+
+    for i in 0:doc.count(acts) {
+        node := doc.at(acts, i)
+        if !doc.is_dict(node) || !doc.has(node, "name") || !doc.has(node, "keys") || !doc.has(node, "sources") {
+            >> errors.new("nexus input: invalid action binding object")
+        }
+        name := doc.as_string(doc.get(node, "name")) or >>
+        _ := input.ensure_action(name + "") or >>
+        klist := doc.get(node, "keys")
+        slist := doc.get(node, "sources")
+        if klist < 0 || !doc.is_list(klist) || slist < 0 || !doc.is_list(slist) {
+            >> errors.new("nexus input: keys/sources must be arrays")
+        }
+        for ki in 0:doc.count(klist) {
+            key := doc.as_int(doc.at(klist, ki)) or >>
+            input.bind(name + "", key) or >>
+        }
+        for si in 0:doc.count(slist) {
+            src := doc.as_int(doc.at(slist, si)) or >>
+            input.bind_source(name + "", src) or >>
+        }
+        if doc.has(node, "mouse_buttons") {
+            mlist := doc.get(node, "mouse_buttons")
+            if mlist < 0 || !doc.is_list(mlist) {
+                >> errors.new("nexus input: mouse_buttons must be array")
+            }
+            for mi in 0:doc.count(mlist) {
+                btn := doc.as_int(doc.at(mlist, mi)) or >>
+                input.bind_mouse(name + "", btn) or >>
+            }
+        }
+        if doc.has(node, "chords") {
+            clist := doc.get(node, "chords")
+            if clist < 0 || !doc.is_list(clist) {
+                >> errors.new("nexus input: chords must be array")
+            }
+            for ci in 0:doc.count(clist) {
+                cnode := doc.at(clist, ci)
+                if !doc.is_dict(cnode) || !doc.has(cnode, "key") || !doc.has(cnode, "modifiers") {
+                    >> errors.new("nexus input: invalid chord binding object")
+                }
+                ckey := doc.as_int(doc.get(cnode, "key")) or >>
+                cmods := doc.as_int(doc.get(cnode, "modifiers")) or >>
+                input.bind_chord(name + "", ckey, cmods) or >>
+            }
+        }
+    }
+    input.refresh()
+    << 0
+}
+
+// Applies radial/axial deadzone in [0, 0.95] to a normalized [-1, 1] axis value,
+// returning 0.0 inside deadzone and linearly rescaling outer values to 0..1.
+pub fn apply_deadzone(raw f64, deadzone f64) f64 {
+    if !math_finite(raw) || !math_finite(deadzone) || deadzone < 0.0 || deadzone >= 0.99 {
+        >> errors.new("nexus input: invalid axis or deadzone")
+    }
+    clamped := math.max(-1.0, math.min(1.0, raw))
+    mag := math.abs(clamped)
+    if mag <= deadzone { << 0.0 }
+    scaled := (mag - deadzone) / (1.0 - deadzone)
+    if clamped < 0.0 { << -math.min(1.0, scaled) }
+    << math.min(1.0, scaled)
+}
+
+pub fn (input $&InputMap) feed_axis_pair(neg_source int, pos_source int, raw f64, deadzone f64) int {
+    shaped := apply_deadzone(raw, deadzone) or >>
+    $neg_val := 0.0
+    $pos_val := 0.0
+    if shaped < 0.0 { neg_val = -shaped }
+    else if shaped > 0.0 { pos_val = shaped }
+    input.feed_source(neg_source, neg_val) or >>
+    input.feed_source(pos_source, pos_val) or >>
+    << 0
+}
+
+fn math_finite(v f64) bool {
+    << !math.is_nan(v) && !math.is_inf(v)
+}

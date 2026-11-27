@@ -1,0 +1,85 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct FoliageCullParams {
+    float4x4 view_proj;
+    float4 camera_pos_count; // xyz=cam, w=instance_count
+    float4 dist_params;      // x=max_draw_dist, y=fade_start, z=bound_radius, w=bound_half_y
+    float4 extra;            // x=cull_margin, yzw=0
+};
+
+struct FoliageInstanceGpu {
+    float4 pos_scale; // xyz=world_pos, w=scale
+    float4 rot_wind;  // x=cos_y, y=sin_y, z=bend_phase, w=height_scale
+    float4 tint_var;  // rgb=tint, w=variation
+};
+
+struct FoliageIndirectState {
+    uint num_indices;
+    atomic_uint num_instances;
+    uint first_index;
+    int vertex_offset;
+    uint first_instance;
+    atomic_uint frustum_culled;
+    atomic_uint distance_culled;
+    uint pad;
+};
+
+kernel void main0(
+    constant FoliageCullParams& params [[buffer(0)]],
+    device const FoliageInstanceGpu* instances [[buffer(1)]],
+    device uint* visible_indices [[buffer(2)]],
+    device FoliageIndirectState* state [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint count = uint(params.camera_pos_count.w);
+    if (gid >= count) return;
+
+    FoliageInstanceGpu inst = instances[gid];
+    float s = inst.pos_scale.w;
+    float sy = s * inst.rot_wind.w;
+    float half_y = params.dist_params.w * sy;
+    float radius = max(s, sy) * params.dist_params.z + params.extra.x;
+    float3 center = inst.pos_scale.xyz + float3(0.0, half_y, 0.0);
+
+    float dist = length(center - params.camera_pos_count.xyz);
+    if (dist - radius > params.dist_params.x) {
+        atomic_fetch_add_explicit(&state->distance_culled, 1u, memory_order_relaxed);
+        return;
+    }
+
+    float3 bmin = center - float3(radius, half_y + params.extra.x, radius);
+    float3 bmax = center + float3(radius, half_y + params.extra.x, radius);
+
+    uint out_left = 1u;
+    uint out_right = 1u;
+    uint out_bottom = 1u;
+    uint out_top = 1u;
+    uint out_far = 1u;
+    uint out_near = 1u;
+    uint all_behind = 1u;
+
+    for (uint corner = 0u; corner < 8u; ++corner) {
+        float3 p = float3(
+            (corner & 1u) != 0u ? bmax.x : bmin.x,
+            (corner & 2u) != 0u ? bmax.y : bmin.y,
+            (corner & 4u) != 0u ? bmax.z : bmin.z
+        );
+        float4 c = params.view_proj * float4(p, 1.0);
+        if (c.x + c.w >= 0.0) out_left = 0u;
+        if (-c.x + c.w >= 0.0) out_right = 0u;
+        if (c.y + c.w >= 0.0) out_bottom = 0u;
+        if (-c.y + c.w >= 0.0) out_top = 0u;
+        if (c.z >= 0.0) out_far = 0u;
+        if (c.w - c.z >= 0.0) out_near = 0u;
+        if (c.w > 0.0) all_behind = 0u;
+    }
+
+    if ((out_left | out_right | out_bottom | out_top | out_far | out_near | all_behind) != 0u) {
+        atomic_fetch_add_explicit(&state->frustum_culled, 1u, memory_order_relaxed);
+        return;
+    }
+
+    uint slot = atomic_fetch_add_explicit(&state->num_instances, 1u, memory_order_relaxed);
+    visible_indices[slot] = gid;
+}

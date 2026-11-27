@@ -1,0 +1,341 @@
+@"github.com/xulang-org/nexus/resources/persistence"
+
+#crypto/sha256
+#encoding/json
+#errors
+#strconv
+#strings
+
+pub const MANIFEST_MAX_BYTES = 4194304
+
+pub struct EntityGuid {
+    pub value string
+}
+
+fn hex_nibble_char(v int) string {
+    digits := "0123456789abcdef"
+    idx := v & 15
+    << digits[idx:idx + 1]
+}
+
+fn byte_to_hex(b int) string {
+    << hex_nibble_char(b >> 4) + hex_nibble_char(b & 15)
+}
+
+fn normalize_hex_char(c int) string {
+    if c >= 48 && c <= 57 {
+        s := "0123456789"
+        i := c - 48
+        << s[i:i + 1]
+    }
+    if c >= 97 && c <= 102 {
+        s := "abcdef"
+        i := c - 97
+        << s[i:i + 1]
+    }
+    if c >= 65 && c <= 70 {
+        s := "abcdef"
+        i := c - 65
+        << s[i:i + 1]
+    }
+    >> errors.new("nexus persistence: invalid hex character in GUID")
+}
+
+pub fn parse_guid(raw string) EntityGuid {
+    if raw.len != 36 {
+        >> errors.new("nexus persistence: GUID must be 36 characters (8-4-4-4-12)")
+    }
+    $out := strings.new_byte_builder(36)
+    for i in 0:36 {
+        c := int(raw[i])
+        if i == 8 || i == 13 || i == 18 || i == 23 {
+            if c != 45 {
+                >> errors.new("nexus persistence: GUID missing hyphen delimiter")
+            }
+            out.write_str("-")
+        } else {
+            ch := normalize_hex_char(c) or >>
+            out.write_str(ch)
+        }
+    }
+    << EntityGuid{value: out.to_string()}
+}
+
+pub fn guid_from_bytes(raw &[]u8) EntityGuid {
+    if raw.len != 16 {
+        >> errors.new("nexus persistence: GUID requires exactly 16 bytes")
+    }
+    $b := []int{}
+    for i in 0:16 { b.push(int(raw[i])) }
+    // Set UUID v4 version & RFC 4122 variant bits.
+    b[6] = (b[6] & 15) | 64
+    b[8] = (b[8] & 63) | 128
+    $out := strings.new_byte_builder(36)
+    for i in 0:16 {
+        if i == 4 || i == 6 || i == 8 || i == 10 {
+            out.write_str("-")
+        }
+        out.write_str(byte_to_hex(b[i]))
+    }
+    << EntityGuid{value: out.to_string()}
+}
+
+pub fn deterministic_guid(namespace string, key string) EntityGuid {
+    if namespace.len == 0 || key.len == 0 {
+        >> errors.new("nexus persistence: deterministic_guid requires non-empty namespace and key")
+    }
+    digest := sha256.sum256(namespace + ":" + key)
+    formatted := digest[0:8] + "-" + digest[8:12] + "-5" + digest[13:16] + "-8" + digest[17:20] + "-" + digest[20:32]
+    << parse_guid(formatted) or >>
+}
+
+pub fn (g &EntityGuid) validate() int {
+    _ := parse_guid(g.value + "") or >>
+    << 0
+}
+
+pub fn (g &EntityGuid) equals(other &EntityGuid) bool {
+    << g.value == other.value
+}
+
+pub struct PersistentEntityRef {
+    pub guid EntityGuid
+    pub world_id string
+    pub fallback_path string
+    pub tag string
+}
+
+pub fn new_entity_ref(
+    guid EntityGuid,
+    world_id string,
+    fallback_path string,
+    tag string
+) PersistentEntityRef {
+    r := PersistentEntityRef{
+        guid: guid,
+        world_id: world_id,
+        fallback_path: fallback_path,
+        tag: tag
+    }
+    r.validate() or >>
+    << r
+}
+
+pub fn (r &PersistentEntityRef) validate() int {
+    r.guid.validate() or >>
+    if r.world_id.len == 0 || r.world_id.len > 128 {
+        >> errors.new("nexus persistence: world_id must be 1...128 bytes")
+    }
+    if r.fallback_path.len > 1024 || r.tag.len > 128 {
+        >> errors.new("nexus persistence: fallback_path or tag exceeds limits")
+    }
+    << 0
+}
+
+pub fn (r &PersistentEntityRef) equals(other &PersistentEntityRef) bool {
+    << r.guid.value == other.guid.value && r.world_id == other.world_id
+}
+
+pub struct CrossWorldLink {
+    pub source EntityGuid
+    pub target PersistentEntityRef
+    pub relation string
+}
+
+pub fn (l &CrossWorldLink) validate() int {
+    l.source.validate() or >>
+    l.target.validate() or >>
+    if l.relation.len == 0 || l.relation.len > 64 {
+        >> errors.new("nexus persistence: cross-world link relation must be 1...64 bytes")
+    }
+    << 0
+}
+
+pub struct EntitySnapshot {
+    pub ref PersistentEntityRef
+    pub node_kind int
+    pub alive bool
+    pub retired bool
+    pub persistent_across_worlds bool
+    pub state_json string
+}
+
+pub fn (s &EntitySnapshot) validate() int {
+    s.ref.validate() or >>
+    if s.node_kind != 0 && s.node_kind != 2 && s.node_kind != 3 {
+        >> errors.new("nexus persistence: unsupported entity node_kind")
+    }
+    if s.state_json.len > 0 {
+        parsed := json.parse_max(&s.state_json, MANIFEST_MAX_BYTES)
+        if !parsed.ok() {
+            >> errors.new("nexus persistence: invalid entity state_json: " + parsed.error())
+        }
+    }
+    << 0
+}
+
+pub struct WorldPersistenceManifest {
+    pub schema_version int
+    pub active_world string
+    pub worlds []string
+    pub entities []EntitySnapshot
+    pub links []CrossWorldLink
+}
+
+pub fn (m &WorldPersistenceManifest) validate() int {
+    if m.schema_version < 1 {
+        >> errors.new("nexus persistence: schema_version must be >= 1")
+    }
+    if m.active_world.len == 0 || m.active_world.len > 128 {
+        >> errors.new("nexus persistence: active_world must be non-empty")
+    }
+    $seen_worlds := map[string]bool{}
+    for i in 0:m.worlds.len {
+        w := m.worlds[i] + ""
+        if w.len == 0 || w.len > 128 || seen_worlds.has(w) {
+            >> errors.new("nexus persistence: invalid or duplicate world id: " + w)
+        }
+        seen_worlds[w] = true
+    }
+    if !seen_worlds.has(m.active_world + "") {
+        >> errors.new("nexus persistence: active_world missing from worlds list")
+    }
+    $seen_guids := map[string]bool{}
+    for i in 0:m.entities.len {
+        e := &m.entities[i]
+        e.validate() or >>
+        gid := e.ref.guid.value + ""
+        if seen_guids.has(gid) {
+            >> errors.new("nexus persistence: duplicate entity GUID in manifest: " + gid)
+        }
+        seen_guids[gid] = true
+    }
+    for i in 0:m.links.len {
+        lnk := &m.links[i]
+        lnk.validate() or >>
+        if !seen_guids.has(lnk.source.value + "") {
+            >> errors.new("nexus persistence: link source GUID not in manifest entities")
+        }
+    }
+    << 0
+}
+
+pub fn encode_manifest(m &WorldPersistenceManifest) string {
+    m.validate() or >>
+    $out := strings.new_byte_builder(2048)
+    out.write_str("{\"schema_version\":" + str(m.schema_version))
+    aw := m.active_world + ""
+    out.write_str(",\"active_world\":" + json.quote(&aw))
+    out.write_str(",\"worlds\":[")
+    for i in 0:m.worlds.len {
+        if i > 0 { out.write_str(",") }
+        w := m.worlds[i] + ""
+        out.write_str(json.quote(&w))
+    }
+    out.write_str("],\"entities\":[")
+    for i in 0:m.entities.len {
+        if i > 0 { out.write_str(",") }
+        e := &m.entities[i]
+        gv := e.ref.guid.value + ""
+        wid := e.ref.world_id + ""
+        fpath := e.ref.fallback_path + ""
+        tag := e.ref.tag + ""
+        st := e.state_json + ""
+        out.write_str("{\"guid\":" + json.quote(&gv) +
+            ",\"world_id\":" + json.quote(&wid) +
+            ",\"fallback_path\":" + json.quote(&fpath) +
+            ",\"tag\":" + json.quote(&tag) +
+            ",\"node_kind\":" + str(e.node_kind) +
+            ",\"alive\":" + str(e.alive) +
+            ",\"retired\":" + str(e.retired) +
+            ",\"persistent_across_worlds\":" + str(e.persistent_across_worlds) +
+            ",\"state_json\":" + json.quote(&st) + "}")
+    }
+    out.write_str("],\"links\":[")
+    for i in 0:m.links.len {
+        if i > 0 { out.write_str(",") }
+        l := &m.links[i]
+        sg := l.source.value + ""
+        tg := l.target.guid.value + ""
+        tw := l.target.world_id + ""
+        tp := l.target.fallback_path + ""
+        tt := l.target.tag + ""
+        rel := l.relation + ""
+        out.write_str("{\"source\":" + json.quote(&sg) +
+            ",\"target_guid\":" + json.quote(&tg) +
+            ",\"target_world\":" + json.quote(&tw) +
+            ",\"target_path\":" + json.quote(&tp) +
+            ",\"target_tag\":" + json.quote(&tt) +
+            ",\"relation\":" + json.quote(&rel) + "}")
+    }
+    out.write_str("]}")
+    << out.to_string()
+}
+
+pub fn decode_manifest(raw &string) WorldPersistenceManifest {
+    doc := json.parse_max(raw, MANIFEST_MAX_BYTES)
+    if !doc.ok() { >> errors.new("nexus persistence: manifest JSON parse error: " + doc.error()) }
+    root := doc.root()
+    if !doc.is_dict(root) { >> errors.new("nexus persistence: manifest root must be object") }
+    ver := doc.as_int(doc.get(root, "schema_version")) or >>
+    aw := doc.as_string(doc.get(root, "active_world")) or >>
+
+    wn := doc.get(root, "worlds")
+    if !doc.is_list(wn) { >> errors.new("nexus persistence: worlds must be list") }
+    $worlds := []string{}
+    for i in 0:doc.count(wn) {
+        worlds.push(doc.as_string(doc.at(wn, i)) or >>)
+    }
+
+    en := doc.get(root, "entities")
+    if !doc.is_list(en) { >> errors.new("nexus persistence: entities must be list") }
+    $entities := []EntitySnapshot{}
+    for i in 0:doc.count(en) {
+        it := doc.at(en, i)
+        if !doc.is_dict(it) { >> errors.new("nexus persistence: entity entry must be object") }
+        guid := parse_guid(doc.as_string(doc.get(it, "guid")) or >>) or >>
+        wid := doc.as_string(doc.get(it, "world_id")) or >>
+        fpath := doc.as_string(doc.get(it, "fallback_path")) or >>
+        tag := doc.as_string(doc.get(it, "tag")) or >>
+        kind := doc.as_int(doc.get(it, "node_kind")) or >>
+        alive := doc.as_bool(doc.get(it, "alive")) or >>
+        retired := doc.as_bool(doc.get(it, "retired")) or >>
+        across := doc.as_bool(doc.get(it, "persistent_across_worlds")) or >>
+        st := doc.as_string(doc.get(it, "state_json")) or >>
+        ref := new_entity_ref(guid, wid, fpath, tag) or >>
+        entities.push(EntitySnapshot{
+            ref: ref,
+            node_kind: kind,
+            alive: alive,
+            retired: retired,
+            persistent_across_worlds: across,
+            state_json: st
+        })
+    }
+
+    ln := doc.get(root, "links")
+    if !doc.is_list(ln) { >> errors.new("nexus persistence: links must be list") }
+    $links := []CrossWorldLink{}
+    for i in 0:doc.count(ln) {
+        it := doc.at(ln, i)
+        if !doc.is_dict(it) { >> errors.new("nexus persistence: link entry must be object") }
+        src := parse_guid(doc.as_string(doc.get(it, "source")) or >>) or >>
+        tg := parse_guid(doc.as_string(doc.get(it, "target_guid")) or >>) or >>
+        tw := doc.as_string(doc.get(it, "target_world")) or >>
+        tp := doc.as_string(doc.get(it, "target_path")) or >>
+        tt := doc.as_string(doc.get(it, "target_tag")) or >>
+        rel := doc.as_string(doc.get(it, "relation")) or >>
+        tref := new_entity_ref(tg, tw, tp, tt) or >>
+        links.push(CrossWorldLink{source: src, target: tref, relation: rel})
+    }
+
+    m := WorldPersistenceManifest{
+        schema_version: ver,
+        active_world: aw,
+        worlds: worlds,
+        entities: entities,
+        links: links
+    }
+    m.validate() or >>
+    << m
+}

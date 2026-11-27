@@ -1,0 +1,257 @@
+@"github.com/xulang-org/nexus/input"
+
+#errors
+#strings
+
+struct InputContextLayer {
+    name string
+    priority int
+    order int
+    enabled bool
+    blocks_lower bool
+    actions map[string]bool
+}
+
+pub struct InputContextStack {
+    layers []InputContextLayer
+    by_name map[string]int
+    next_order int
+}
+
+pub fn new_input_context_stack() InputContextStack {
+    << InputContextStack{
+        layers: []InputContextLayer{},
+        by_name: map[string]int{},
+        next_order: 1
+    }
+}
+
+pub fn (s $&InputContextStack) register_context(name string, priority int, blocks_lower bool) int {
+    trimmed := strings.trim_space(&name)
+    if trimmed.len == 0 {
+        >> errors.new("nexus input: context name must be non-empty")
+    }
+    if s.by_name.has(trimmed + "") {
+        >> errors.new("nexus input: duplicate context name '" + trimmed + "'")
+    }
+    idx := s.layers.len
+    ord := s.next_order
+    s.next_order += 1
+    s.layers.push(InputContextLayer{
+        name: trimmed + "",
+        priority: priority,
+        order: ord,
+        enabled: true,
+        blocks_lower: blocks_lower,
+        actions: map[string]bool{}
+    })
+    s.by_name[trimmed + ""] = idx
+    << idx
+}
+
+pub fn (s $&InputContextStack) set_enabled(name string, enabled bool) int {
+    if !s.by_name.has(name + "") {
+        >> errors.new("nexus input: unknown context '" + name + "'")
+    }
+    idx := s.by_name[name + ""]
+    s.layers[idx].enabled = enabled
+    << 0
+}
+
+pub fn (s $&InputContextStack) set_blocks_lower(name string, blocks bool) int {
+    if !s.by_name.has(name + "") {
+        >> errors.new("nexus input: unknown context '" + name + "'")
+    }
+    idx := s.by_name[name + ""]
+    s.layers[idx].blocks_lower = blocks
+    << 0
+}
+
+pub fn (s $&InputContextStack) add_action(context_name string, action_name string) int {
+    if !s.by_name.has(context_name + "") {
+        >> errors.new("nexus input: unknown context '" + context_name + "'")
+    }
+    if action_name.len == 0 {
+        >> errors.new("nexus input: context action name must be non-empty")
+    }
+    idx := s.by_name[context_name + ""]
+    am := $&s.layers[idx].actions
+    am[action_name + ""] = true
+    << 0
+}
+
+pub fn (s $&InputContextStack) remove_action(context_name string, action_name string) int {
+    if !s.by_name.has(context_name + "") {
+        >> errors.new("nexus input: unknown context '" + context_name + "'")
+    }
+    idx := s.by_name[context_name + ""]
+    am := $&s.layers[idx].actions
+    if am.has(action_name + "") {
+        am.delete(action_name + "")
+    }
+    << 0
+}
+
+fn (s &InputContextStack) ordered_enabled_indices() []int {
+    $idxs := []int{}
+    for i in 0:s.layers.len {
+        if s.layers[i].enabled { idxs.push(i) }
+    }
+    for i in 1:idxs.len {
+        cur := idxs[i]
+        cp := s.layers[cur].priority
+        co := s.layers[cur].order
+        $j := i - 1
+        while j >= 0 {
+            prev := idxs[j]
+            pp := s.layers[prev].priority
+            po := s.layers[prev].order
+            if pp < cp || (pp == cp && po < co) {
+                idxs[j + 1] = prev
+                j -= 1
+            } else {
+                <-
+            }
+        }
+        idxs[j + 1] = cur
+    }
+    << idxs
+}
+
+pub fn (s &InputContextStack) active_context_for(action_name string) string {
+    order := s.ordered_enabled_indices()
+    for idx in order {
+        layer := &s.layers[idx]
+        if layer.actions.has(action_name + "") {
+            << layer.name + ""
+        }
+        if layer.blocks_lower {
+            << ""
+        }
+    }
+    << ""
+}
+
+pub fn (s &InputContextStack) is_action_allowed(action_name string) bool {
+    << s.active_context_for(action_name) != ""
+}
+
+pub fn (s &InputContextStack) pressed(input &InputMap, action_name string) bool {
+    if !s.is_action_allowed(action_name + "") { << false }
+    << input.pressed(action_name) or (err) {
+        _ := err
+        << false
+    }
+}
+
+pub fn (s &InputContextStack) just_pressed(input &InputMap, action_name string) bool {
+    if !s.is_action_allowed(action_name + "") { << false }
+    << input.just_pressed(action_name) or (err) {
+        _ := err
+        << false
+    }
+}
+
+pub fn (s &InputContextStack) value(input &InputMap, action_name string) f64 {
+    if !s.is_action_allowed(action_name + "") { << 0.0 }
+    << input.value(action_name) or (err) {
+        _ := err
+        << 0.0
+    }
+}
+
+fn str_gt(a &string, b &string) bool {
+    $limit := a.len
+    if b.len < limit { limit = b.len }
+    for i in 0:limit {
+        ca := (*a)[i] & 255
+        cb := (*b)[i] & 255
+        if ca > cb { << true }
+        if ca < cb { << false }
+    }
+    << a.len > b.len
+}
+
+pub fn (s &InputContextStack) find_key_conflicts(
+    input &InputMap,
+    context_name string,
+    key int,
+    exclude_action string
+) []string {
+    if !s.by_name.has(context_name + "") {
+        >> errors.new("nexus input: unknown context '" + context_name + "'")
+    }
+    if key < 0 || key >= MAX_KEYS {
+        >> errors.new("nexus input: key outside input range")
+    }
+    idx := s.by_name[context_name + ""]
+    layer := &s.layers[idx]
+    $conflicts := []string{}
+    for act, _ in layer.actions {
+        if act == exclude_action { -> }
+        if !input.has_action(act + "") { -> }
+        keys := input.action_keys(act + "") or (err) {
+            _ := err
+            ->
+        }
+        for k in keys {
+            if k == key {
+                conflicts.push(act + "")
+                <-
+            }
+        }
+    }
+    // Sort lexicographically for deterministic test & UI display order.
+    for i in 1:conflicts.len {
+        cur := conflicts[i] + ""
+        $j := i - 1
+        while j >= 0 && str_gt(&conflicts[j], &cur) {
+            conflicts[j + 1] = conflicts[j]
+            j -= 1
+        }
+        conflicts[j + 1] = cur
+    }
+    << conflicts
+}
+
+pub fn (s $&InputContextStack) rebind_in_context(
+    input $&InputMap,
+    context_name string,
+    action_name string,
+    old_key int,
+    new_key int,
+    allow_swap bool
+) []string {
+    if !s.by_name.has(context_name + "") {
+        >> errors.new("nexus input: unknown context '" + context_name + "'")
+    }
+    idx := s.by_name[context_name + ""]
+    if !s.layers[idx].actions.has(action_name + "") {
+        >> errors.new("nexus input: action '" + action_name + "' is not registered in context '" + context_name + "'")
+    }
+    if new_key < 0 || new_key >= MAX_KEYS {
+        >> errors.new("nexus input: new key outside input range")
+    }
+    if old_key >= MAX_KEYS {
+        >> errors.new("nexus input: old key outside input range")
+    }
+    conflicts := s.find_key_conflicts(input, context_name + "", new_key, action_name + "") or >>
+    if conflicts.len > 0 && !allow_swap {
+        >> errors.new("nexus input: key conflict in context '" + context_name + "' with action '" + conflicts[0] + "'")
+    }
+    $swapped := []string{}
+    if conflicts.len > 0 && allow_swap {
+        for other in conflicts {
+            _ := input.unbind_key(other + "", new_key) or >>
+            if old_key >= 0 {
+                _ := input.bind(other + "", old_key) or >>
+            }
+            swapped.push(other + "")
+        }
+    }
+    if old_key >= 0 {
+        _ := input.unbind_key(action_name + "", old_key) or >>
+    }
+    _ := input.bind(action_name + "", new_key) or >>
+    << swapped
+}

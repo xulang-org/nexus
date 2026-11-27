@@ -1,0 +1,617 @@
+@"github.com/xulang-org/nexus/physics3d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const XPBD_MAX_BODIES = 4096
+pub const XPBD_MAX_CONSTRAINTS = 16384
+
+struct XpbdDistanceConstraint {
+    a int
+    b int
+    rest_length f64
+    compliance f64
+    is_max_only bool
+}
+
+pub struct XpbdWorld3D {
+    gravity fm.Vec3
+    linear_damping f64
+    // Static geometry accelerated by BVH (reuses StaticBvh3D from bvh.xu).
+    static_boxes []fm.Aabb3
+    static_box_layers []int
+    box_bvh StaticBvh3D
+    static_triangles []StaticTriangle3D
+    tri_bounds []fm.Aabb3
+    tri_bvh StaticBvh3D
+    // SoA body storage for cache-friendly XPBD sub-stepping.
+    positions []fm.Vec3
+    prev_positions []fm.Vec3
+    velocities []fm.Vec3
+    inv_mass []f64
+    radii []f64
+    half_extents []fm.Vec3
+    is_box []bool
+    restitutions []f64
+    frictions []f64
+    layers []int
+    masks []int
+    // Constraint storage.
+    constraints []XpbdDistanceConstraint
+    tet_constraints []XpbdTetVolumeConstraint
+    bend_constraints []XpbdDihedralBendConstraint
+    aero_triangles []XpbdAeroTriangle
+    wind_velocity fm.Vec3
+    air_density f64
+}
+
+pub fn new_xpbd_world_3d(
+    gravity fm.Vec3,
+    linear_damping f64,
+    solids &[]fm.Aabb3,
+    solid_layers &[]int,
+    triangles &[]StaticTriangle3D
+) XpbdWorld3D {
+    if !gravity.is_finite() || !fm.finite(linear_damping) || linear_damping < 0.0 || linear_damping > 20.0 {
+        >> errors.new("nexus xpbd: invalid gravity or linear damping")
+    }
+    if solids.len != solid_layers.len || solids.len > MAX_COLLIDERS {
+        >> errors.new("nexus xpbd: solid boxes/layers mismatch or exceeds budget")
+    }
+    check_solids(solids) or >>
+    $sboxes := []fm.Aabb3{}
+    $slayers := []int{}
+    for i in 0:solids.len {
+        if solid_layers[i] <= 0 { >> errors.new("nexus xpbd: solid collision layer must be positive") }
+        sboxes.push(solids[i])
+        slayers.push(solid_layers[i])
+    }
+    if triangles.len > MAX_COLLIDERS {
+        >> errors.new("nexus xpbd: static triangle budget exceeded")
+    }
+    $tris := []StaticTriangle3D{}
+    $tbounds := []fm.Aabb3{}
+    for i in 0:triangles.len {
+        check_triangle(triangles[i]) or >>
+        tris.push(triangles[i])
+        tbounds.push(triangle_bounds_unchecked(triangles[i]))
+    }
+    box_bvh := build_static_bvh(&sboxes)
+    tri_bvh := build_static_bvh(&tbounds)
+
+    << XpbdWorld3D{
+        gravity: gravity,
+        linear_damping: linear_damping,
+        static_boxes: sboxes,
+        static_box_layers: slayers,
+        box_bvh: box_bvh,
+        static_triangles: tris,
+        tri_bounds: tbounds,
+        tri_bvh: tri_bvh,
+        positions: []fm.Vec3{},
+        prev_positions: []fm.Vec3{},
+        velocities: []fm.Vec3{},
+        inv_mass: []f64{},
+        radii: []f64{},
+        half_extents: []fm.Vec3{},
+        is_box: []bool{},
+        restitutions: []f64{},
+        frictions: []f64{},
+        layers: []int{},
+        masks: []int{},
+        constraints: []XpbdDistanceConstraint{},
+        tet_constraints: []XpbdTetVolumeConstraint{},
+        bend_constraints: []XpbdDihedralBendConstraint{},
+        aero_triangles: []XpbdAeroTriangle{},
+        wind_velocity: zero(),
+        air_density: 1.225
+    }
+}
+
+pub fn (world $&XpbdWorld3D) add_particle(
+    position fm.Vec3,
+    radius f64,
+    mass f64,
+    restitution f64,
+    friction f64,
+    layer int,
+    mask int
+) int {
+    if !valid_point(position) || !fm.finite(radius) || radius <= 0.0 || radius > 100.0 ||
+        !fm.finite(mass) || mass < 0.0 ||
+        !fm.finite(restitution) || restitution < 0.0 || restitution > 1.0 ||
+        !fm.finite(friction) || friction < 0.0 || friction > 4.0 ||
+        layer <= 0 || mask < 0 {
+        >> errors.new("nexus xpbd: invalid particle parameters")
+    }
+    if world.positions.len >= XPBD_MAX_BODIES {
+        >> errors.new("nexus xpbd: body capacity exceeded")
+    }
+    id := world.positions.len
+    $im := 0.0
+    if mass > 0.0 { im = 1.0 / mass }
+    world.positions.push(position)
+    world.prev_positions.push(position)
+    world.velocities.push(zero())
+    world.inv_mass.push(im)
+    world.radii.push(radius)
+    world.half_extents.push(fm.vec3(radius, radius, radius))
+    world.is_box.push(false)
+    world.restitutions.push(restitution)
+    world.frictions.push(friction)
+    world.layers.push(layer)
+    world.masks.push(mask)
+    << id
+}
+
+pub fn (world $&XpbdWorld3D) add_box(
+    position fm.Vec3,
+    half_extents fm.Vec3,
+    mass f64,
+    restitution f64,
+    friction f64,
+    layer int,
+    mask int
+) int {
+    if !valid_point(position) || !half_extents.is_finite() ||
+        half_extents.x <= 0.0 || half_extents.y <= 0.0 || half_extents.z <= 0.0 ||
+        !fm.finite(mass) || mass < 0.0 ||
+        !fm.finite(restitution) || restitution < 0.0 || restitution > 1.0 ||
+        !fm.finite(friction) || friction < 0.0 || friction > 4.0 ||
+        layer <= 0 || mask < 0 {
+        >> errors.new("nexus xpbd: invalid box body parameters")
+    }
+    if world.positions.len >= XPBD_MAX_BODIES {
+        >> errors.new("nexus xpbd: body capacity exceeded")
+    }
+    id := world.positions.len
+    $im := 0.0
+    if mass > 0.0 { im = 1.0 / mass }
+    world.positions.push(position)
+    world.prev_positions.push(position)
+    world.velocities.push(zero())
+    world.inv_mass.push(im)
+    world.radii.push(math.max(half_extents.x, math.max(half_extents.y, half_extents.z)))
+    world.half_extents.push(half_extents)
+    world.is_box.push(true)
+    world.restitutions.push(restitution)
+    world.frictions.push(friction)
+    world.layers.push(layer)
+    world.masks.push(mask)
+    << id
+}
+
+pub fn (world $&XpbdWorld3D) set_velocity(id int, velocity fm.Vec3) int {
+    if id < 0 || id >= world.positions.len || !velocity.is_finite() {
+        >> errors.new("nexus xpbd: invalid body id or non-finite velocity")
+    }
+    world.velocities[id] = velocity
+    << 0
+}
+
+fn (world $&XpbdWorld3D) add_constraint_internal(a int, b int, rest f64, compliance f64, max_only bool) int {
+    if a < 0 || a >= world.positions.len || b < 0 || b >= world.positions.len || a == b {
+        >> errors.new("nexus xpbd: invalid constraint body indices")
+    }
+    if !fm.finite(rest) || rest < 0.0 || !fm.finite(compliance) || compliance < 0.0 {
+        >> errors.new("nexus xpbd: invalid constraint rest length or compliance")
+    }
+    if world.constraints.len >= XPBD_MAX_CONSTRAINTS {
+        >> errors.new("nexus xpbd: constraint capacity exceeded")
+    }
+    id := world.constraints.len
+    world.constraints.push(XpbdDistanceConstraint{a: a, b: b, rest_length: rest, compliance: compliance, is_max_only: max_only})
+    << id
+}
+
+pub fn (world $&XpbdWorld3D) add_distance_constraint(a int, b int, rest_length f64, compliance f64) int {
+    << world.add_constraint_internal(a, b, rest_length, compliance, false) or >>
+}
+
+pub fn (world $&XpbdWorld3D) add_tether_constraint(a int, b int, max_length f64, compliance f64) int {
+    << world.add_constraint_internal(a, b, max_length, compliance, true) or >>
+}
+
+// Builds a rectangular XPBD cloth grid (particles + structural + shear + 2-hop bend constraints).
+pub fn (world $&XpbdWorld3D) add_cloth_grid(
+    origin fm.Vec3,
+    step_u fm.Vec3,
+    step_v fm.Vec3,
+    cols int,
+    rows int,
+    radius f64,
+    particle_mass f64,
+    stretch_compliance f64,
+    bend_compliance f64,
+    pin_top_corners bool,
+    layer int,
+    mask int
+) []int {
+    if cols < 2 || rows < 2 || cols * rows > 1024 ||
+        !valid_point(origin) || !step_u.is_finite() || !step_v.is_finite() ||
+        !fm.finite(particle_mass) || particle_mass <= 0.0 {
+        >> errors.new("nexus xpbd: invalid cloth grid dimensions or parameters")
+    }
+    $ids := []int{}
+    for r in 0:rows {
+        for c in 0:cols {
+            p := origin.add(step_u.scaled(f64(c))).add(step_v.scaled(f64(r)))
+            $m := particle_mass
+            if pin_top_corners && r == 0 && (c == 0 || c == cols - 1) { m = 0.0 }
+            id := world.add_particle(p, radius, m, 0.05, 0.4, layer, mask) or >>
+            ids.push(id)
+        }
+    }
+    du := step_u.length()
+    dv := step_v.length()
+    dd := math.sqrt(du * du + dv * dv)
+    for r in 0:rows {
+        for c in 0:cols {
+            idx := ids[r * cols + c]
+            if c + 1 < cols {
+                world.add_distance_constraint(idx, ids[r * cols + c + 1], du, stretch_compliance) or >>
+            }
+            if r + 1 < rows {
+                world.add_distance_constraint(idx, ids[(r + 1) * cols + c], dv, stretch_compliance) or >>
+            }
+            if c + 1 < cols && r + 1 < rows {
+                world.add_distance_constraint(idx, ids[(r + 1) * cols + c + 1], dd, stretch_compliance) or >>
+                world.add_distance_constraint(ids[r * cols + c + 1], ids[(r + 1) * cols + c], dd, stretch_compliance) or >>
+            }
+            if c + 2 < cols {
+                world.add_distance_constraint(idx, ids[r * cols + c + 2], du * 2.0, bend_compliance) or >>
+            }
+            if r + 2 < rows {
+                world.add_distance_constraint(idx, ids[(r + 2) * cols + c], dv * 2.0, bend_compliance) or >>
+            }
+        }
+    }
+    << ids
+}
+
+fn (world &XpbdWorld3D) body_aabb(id int) fm.Aabb3 {
+    p := world.positions[id]
+    h := world.half_extents[id]
+    << fm.Aabb3{minimum: p.sub(h), maximum: p.add(h)}
+}
+
+fn clamp_f(v f64, lo f64, hi f64) f64 {
+    if v < lo { << lo }
+    if v > hi { << hi }
+    << v
+}
+
+fn apply_contact_friction(world $&XpbdWorld3D, id int, n fm.Vec3, pen f64, mu f64) {
+    if world.inv_mass[id] <= 0.0 || pen <= 0.0 { << }
+    delta := world.positions[id].sub(world.prev_positions[id])
+    vn := delta.dot(n)
+    vt := delta.sub(n.scaled(vn))
+    tlen := vt.length()
+    if tlen > 1e-12 && mu > 0.0 {
+        damp := clamp_f(mu * pen / tlen, 0.0, 0.9)
+        world.positions[id] = world.positions[id].sub(vt.scaled(damp))
+    }
+}
+
+fn solve_static_box_contact(world $&XpbdWorld3D, id int, box fm.Aabb3) {
+    im := world.inv_mass[id]
+    if im <= 0.0 { << }
+    p := world.positions[id]
+    if !world.is_box[id] {
+        r := world.radii[id]
+        cx := clamp_f(p.x, box.minimum.x, box.maximum.x)
+        cy := clamp_f(p.y, box.minimum.y, box.maximum.y)
+        cz := clamp_f(p.z, box.minimum.z, box.maximum.z)
+        closest := fm.vec3(cx, cy, cz)
+        diff := p.sub(closest)
+        d2 := diff.dot(diff)
+        if d2 >= r * r { << }
+        if d2 > 1e-16 {
+            d := math.sqrt(d2)
+            n := diff.scaled(1.0 / d)
+            pen := r - d
+            world.positions[id] = p.add(n.scaled(pen))
+            apply_contact_friction(world, id, n, pen, world.frictions[id])
+        } else {
+            // Center inside AABB: push out along shallowest axis.
+            dx0 := math.abs(p.x - box.minimum.x)
+            dx1 := math.abs(box.maximum.x - p.x)
+            dy0 := math.abs(p.y - box.minimum.y)
+            dy1 := math.abs(box.maximum.y - p.y)
+            dz0 := math.abs(p.z - box.minimum.z)
+            dz1 := math.abs(box.maximum.z - p.z)
+            $best := dx0
+            $n := fm.vec3(-1.0, 0.0, 0.0)
+            if dx1 < best {
+                best = dx1
+                n = fm.vec3(1.0, 0.0, 0.0)
+            }
+            if dy0 < best {
+                best = dy0
+                n = fm.vec3(0.0, -1.0, 0.0)
+            }
+            if dy1 < best {
+                best = dy1
+                n = fm.vec3(0.0, 1.0, 0.0)
+            }
+            if dz0 < best {
+                best = dz0
+                n = fm.vec3(0.0, 0.0, -1.0)
+            }
+            if dz1 < best {
+                best = dz1
+                n = fm.vec3(0.0, 0.0, 1.0)
+            }
+            pen := best + r
+            world.positions[id] = p.add(n.scaled(pen))
+            apply_contact_friction(world, id, n, pen, world.frictions[id])
+        }
+        <<
+    }
+    h := world.half_extents[id]
+    bmin := p.sub(h)
+    bmax := p.add(h)
+    ox := math.min(bmax.x, box.maximum.x) - math.max(bmin.x, box.minimum.x)
+    oy := math.min(bmax.y, box.maximum.y) - math.max(bmin.y, box.minimum.y)
+    oz := math.min(bmax.z, box.maximum.z) - math.max(bmin.z, box.minimum.z)
+    if ox <= 0.0 || oy <= 0.0 || oz <= 0.0 { << }
+    c_box := box.minimum.add(box.maximum).scaled(0.5)
+    $pen := oy
+    $n := fm.vec3(0.0, 1.0, 0.0)
+    if p.y < c_box.y { n = fm.vec3(0.0, -1.0, 0.0) }
+    if ox < pen {
+        pen = ox
+        n = fm.vec3(1.0, 0.0, 0.0)
+        if p.x < c_box.x { n = fm.vec3(-1.0, 0.0, 0.0) }
+    }
+    if oz < pen {
+        pen = oz
+        n = fm.vec3(0.0, 0.0, 1.0)
+        if p.z < c_box.z { n = fm.vec3(0.0, 0.0, -1.0) }
+    }
+    world.positions[id] = p.add(n.scaled(pen))
+    apply_contact_friction(world, id, n, pen, world.frictions[id])
+}
+
+fn solve_static_triangle_contact(world $&XpbdWorld3D, id int, tri StaticTriangle3D) {
+    if world.inv_mass[id] <= 0.0 { << }
+    p := world.positions[id]
+    // For sphere/particle or box, approximate conservative support along triangle normal/closest point.
+    $r := world.radii[id]
+    if world.is_box[id] {
+        h := world.half_extents[id]
+        r = h.y
+    }
+    q := closest_on_triangle(p, tri.a, tri.b, tri.c)
+    diff := p.sub(q)
+    d2 := diff.dot(diff)
+    if d2 >= r * r { << }
+    tn := tri.b.sub(tri.a).cross(tri.c.sub(tri.a))
+    tlen := tn.length()
+    $tri_n := fm.vec3(0.0, 1.0, 0.0)
+    if tlen > 1e-12 { tri_n = tn.scaled(1.0 / tlen) }
+    if d2 > 1e-16 {
+        d := math.sqrt(d2)
+        $n := diff.scaled(1.0 / d)
+        // Prefer front-facing triangle normal if particle crossed slightly below mid-plane.
+        if n.dot(tri_n) < 0.0 && d < r * 0.25 { n = tri_n }
+        pen := r - d
+        world.positions[id] = p.add(n.scaled(pen))
+        apply_contact_friction(world, id, n, pen, world.frictions[id])
+    } else {
+        world.positions[id] = p.add(tri_n.scaled(r))
+        apply_contact_friction(world, id, tri_n, r, world.frictions[id])
+    }
+}
+
+fn solve_dynamic_pair(world $&XpbdWorld3D, a int, b int) {
+    wa := world.inv_mass[a]
+    wb := world.inv_mass[b]
+    wsum := wa + wb
+    if wsum <= 0.0 { << }
+    if ((world.masks[a] & world.layers[b]) == 0) && ((world.masks[b] & world.layers[a]) == 0) { << }
+
+    pa := world.positions[a]
+    pb := world.positions[b]
+    if world.is_box[a] && world.is_box[b] {
+        ha := world.half_extents[a]
+        hb := world.half_extents[b]
+        ox := math.min(pa.x + ha.x, pb.x + hb.x) - math.max(pa.x - ha.x, pb.x - hb.x)
+        oy := math.min(pa.y + ha.y, pb.y + hb.y) - math.max(pa.y - ha.y, pb.y - hb.y)
+        oz := math.min(pa.z + ha.z, pb.z + hb.z) - math.max(pa.z - ha.z, pb.z - hb.z)
+        if ox <= 0.0 || oy <= 0.0 || oz <= 0.0 { << }
+        $pen := oy
+        $n := fm.vec3(0.0, 1.0, 0.0)
+        if pb.y > pa.y { n = fm.vec3(0.0, -1.0, 0.0) }
+        if ox < pen {
+            pen = ox
+            n = fm.vec3(1.0, 0.0, 0.0)
+            if pb.x > pa.x { n = fm.vec3(-1.0, 0.0, 0.0) }
+        }
+        if oz < pen {
+            pen = oz
+            n = fm.vec3(0.0, 0.0, 1.0)
+            if pb.z > pa.z { n = fm.vec3(0.0, 0.0, -1.0) }
+        }
+        // n points from b into a -> push a +n, b -n proportional to inv_mass!
+        corr := n.scaled(pen / wsum)
+        world.positions[a] = pa.add(corr.scaled(wa))
+        world.positions[b] = pb.sub(corr.scaled(wb))
+        mu := math.min(world.frictions[a], world.frictions[b])
+        if mu > 0.0 {
+            apply_contact_friction(world, a, n, pen * (wa / wsum), mu)
+            apply_contact_friction(world, b, n.scaled(-1.0), pen * (wb / wsum), mu)
+        }
+        <<
+    }
+
+    // Sphere-sphere or box-sphere pair fallback using conservative radii/extents.
+    rsum := world.radii[a] + world.radii[b]
+    if world.is_box[a] && !world.is_box[b] {
+        // Clamp b center against box a.
+        ha := world.half_extents[a]
+        rb := world.radii[b]
+        cx := clamp_f(pb.x, pa.x - ha.x, pa.x + ha.x)
+        cy := clamp_f(pb.y, pa.y - ha.y, pa.y + ha.y)
+        cz := clamp_f(pb.z, pa.z - ha.z, pa.z + ha.z)
+        diff := pb.sub(fm.vec3(cx, cy, cz))
+        d2 := diff.dot(diff)
+        if d2 >= rb * rb { << }
+        $n := fm.vec3(0.0, 1.0, 0.0)
+        $pen := rb
+        if d2 > 1e-16 {
+            d := math.sqrt(d2)
+            n = diff.scaled(1.0 / d)
+            pen = rb - d
+        }
+        corr := n.scaled(pen / wsum)
+        world.positions[b] = pb.add(corr.scaled(wb))
+        world.positions[a] = pa.sub(corr.scaled(wa))
+        <<
+    }
+    diff := pb.sub(pa)
+    d2 := diff.dot(diff)
+    if d2 >= rsum * rsum { << }
+    $n := fm.vec3(0.0, 1.0, 0.0)
+    $d := 0.0
+    if d2 > 1e-16 {
+        d = math.sqrt(d2)
+        n = diff.scaled(1.0 / d)
+    }
+    pen := rsum - d
+    corr := n.scaled(pen / wsum)
+    world.positions[a] = pa.sub(corr.scaled(wa))
+    world.positions[b] = pb.add(corr.scaled(wb))
+}
+
+pub fn (world $&XpbdWorld3D) step(dt f64, substeps int, solver_iters int) int {
+    if !fm.finite(dt) || dt <= 0.0 || dt > 0.25 || substeps < 1 || substeps > 64 || solver_iters < 1 || solver_iters > 32 {
+        >> errors.new("nexus xpbd: invalid dt, substeps (1..64) or solver_iters (1..32)")
+    }
+    n := world.positions.len
+    if n == 0 { << 0 }
+    h := dt / f64(substeps)
+    inv_h2 := 1.0 / (h * h)
+    damp_factor := math.max(0.0, 1.0 - world.linear_damping * h)
+
+    $lambdas := []f64{}
+    for _ in 0:world.constraints.len { lambdas.push(0.0) }
+    $tet_lambdas := []f64{}
+    for _ in 0:world.tet_constraints.len { tet_lambdas.push(0.0) }
+    $bend_lambdas := []f64{}
+    for _ in 0:world.bend_constraints.len { bend_lambdas.push(0.0) }
+
+    for _ in 0:substeps {
+        if world.aero_triangles.len > 0 {
+            apply_aero_forces(world, h)
+        }
+        // 1. Semi-implicit prediction + save prev_positions.
+        for i in 0:n {
+            world.prev_positions[i] = world.positions[i]
+            if world.inv_mass[i] > 0.0 {
+                world.velocities[i] = world.velocities[i].add(world.gravity.scaled(h)).scaled(damp_factor)
+                world.positions[i] = world.positions[i].add(world.velocities[i].scaled(h))
+            }
+        }
+
+        for k in 0:lambdas.len { lambdas[k] = 0.0 }
+        for k in 0:tet_lambdas.len { tet_lambdas[k] = 0.0 }
+        for k in 0:bend_lambdas.len { bend_lambdas[k] = 0.0 }
+
+        // Compute dynamic broadphase pairs via SAP once per substep (padded by velocity margin).
+        $dyn_bounds := []fm.Aabb3{}
+        for i in 0:n { dyn_bounds.push(world.body_aabb(i)) }
+        sap_pairs := sap_broadphase_pairs(&dyn_bounds)
+
+        // 2. XPBD Gauss-Seidel constraint + contact iterations.
+        for _ in 0:solver_iters {
+            for ci in 0:world.constraints.len {
+                c := world.constraints[ci]
+                wa := world.inv_mass[c.a]
+                wb := world.inv_mass[c.b]
+                wsum := wa + wb
+                if wsum <= 0.0 { -> }
+                delta := world.positions[c.a].sub(world.positions[c.b])
+                dist := delta.length()
+                if dist <= 1e-12 { -> }
+                if c.is_max_only && dist <= c.rest_length { -> }
+                err_val := dist - c.rest_length
+                alpha_tilde := c.compliance * inv_h2
+                d_lambda := (-err_val - alpha_tilde * lambdas[ci]) / (wsum + alpha_tilde)
+                lambdas[ci] += d_lambda
+                grad := delta.scaled(1.0 / dist)
+                corr := grad.scaled(d_lambda)
+                if wa > 0.0 { world.positions[c.a] = world.positions[c.a].add(corr.scaled(wa)) }
+                if wb > 0.0 { world.positions[c.b] = world.positions[c.b].sub(corr.scaled(wb)) }
+            }
+            for ci in 0:world.tet_constraints.len {
+                solve_tet_volume_constraint(world, ci, $&tet_lambdas, inv_h2)
+            }
+            for ci in 0:world.bend_constraints.len {
+                solve_dihedral_bend_constraint(world, ci, $&bend_lambdas, inv_h2)
+            }
+
+            // Static BVH box & triangle contacts.
+            for i in 0:n {
+                if world.inv_mass[i] <= 0.0 { -> }
+                bb := world.body_aabb(i)
+                if world.static_boxes.len > 0 {
+                    hits := world.box_bvh.query_aabb(bb, &world.static_boxes)
+                    for bi in hits {
+                        if (world.masks[i] & world.static_box_layers[bi]) != 0 {
+                            solve_static_box_contact(world, i, world.static_boxes[bi])
+                        }
+                    }
+                }
+                if world.static_triangles.len > 0 {
+                    thits := world.tri_bvh.query_aabb(bb, &world.tri_bounds)
+                    for ti in thits {
+                        if (world.masks[i] & world.static_triangles[ti].layer) != 0 {
+                            solve_static_triangle_contact(world, i, world.static_triangles[ti])
+                        }
+                    }
+                }
+            }
+
+            // Dynamic body pairs from SAP broadphase.
+            for pk in 0:(sap_pairs.len / 2) {
+                a := sap_pairs[pk * 2]
+                b := sap_pairs[pk * 2 + 1]
+                solve_dynamic_pair(world, a, b)
+            }
+        }
+
+        // 3. First-order XPBD velocity recovery.
+        for i in 0:n {
+            if world.inv_mass[i] > 0.0 {
+                world.velocities[i] = world.positions[i].sub(world.prev_positions[i]).scaled(1.0 / h)
+            }
+        }
+    }
+    << n
+}
+
+pub fn (world &XpbdWorld3D) position(id int) fm.Vec3 {
+    if id < 0 || id >= world.positions.len { >> errors.new("nexus xpbd: invalid body id") }
+    << world.positions[id]
+}
+
+pub fn (world &XpbdWorld3D) velocity(id int) fm.Vec3 {
+    if id < 0 || id >= world.velocities.len { >> errors.new("nexus xpbd: invalid body id") }
+    << world.velocities[id]
+}
+
+pub fn (world &XpbdWorld3D) constraint_error(ci int) f64 {
+    if ci < 0 || ci >= world.constraints.len { >> errors.new("nexus xpbd: invalid constraint id") }
+    c := world.constraints[ci]
+    dist := world.positions[c.a].sub(world.positions[c.b]).length()
+    if c.is_max_only {
+        if dist <= c.rest_length { << 0.0 }
+        << dist - c.rest_length
+    }
+    << math.abs(dist - c.rest_length)
+}
+
+pub fn (world &XpbdWorld3D) body_count() int { << world.positions.len }
+pub fn (world &XpbdWorld3D) constraint_count() int { << world.constraints.len }

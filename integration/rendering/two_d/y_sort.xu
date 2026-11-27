@@ -1,0 +1,173 @@
+@"github.com/xulang-org/nexus/integration/rendering/two_d"
+
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+fm #"github.com/xulang-org/nexus/foundation/math"
+nexus #"github.com/xulang-org/nexus/scene"
+#errors
+
+pub const MAX_YSORT_ITEMS = 65536
+
+pub struct DrawEntry2D {
+    pub bounds fm.Rect2
+    pub region fm.Rect2
+    pub world fm.Transform2D
+    pub tint int
+    pub z_index int
+    pub sort_y f64
+    pub texture_id int
+    order int
+}
+
+pub struct SortedBatch2D {
+    pub texture_id int
+    pub batch canvas.Batch2D
+}
+
+// Collects 2D / 2.5D quads across sprites and tilemap cells, sorts deterministically
+// by (z_index, sort_y, insertion_order), and emits merged same-texture draw runs.
+pub struct YSortQueue2D {
+    items []DrawEntry2D
+}
+
+pub fn new_ysort_queue_2d() YSortQueue2D {
+    << YSortQueue2D{items: []DrawEntry2D{}}
+}
+
+pub fn (queue $&YSortQueue2D) clear() {
+    queue.items = []DrawEntry2D{}
+}
+
+pub fn (queue &YSortQueue2D) len() int { << queue.items.len }
+
+pub fn (queue $&YSortQueue2D) push_quad(bounds fm.Rect2, region fm.Rect2, world fm.Transform2D,
+    tint int, texture_id int, z_index int, sort_y f64) int {
+    if queue.items.len >= MAX_YSORT_ITEMS {
+        >> errors.new("nexus ysort: queue capacity exceeded")
+    }
+    if !bounds.valid() || !region.valid() || !world.is_finite() || !fm.finite(sort_y) ||
+        tint < 0 || tint > 4294967295 {
+        >> errors.new("nexus ysort: invalid quad bounds, region, transform, sort_y or tint")
+    }
+    entry := DrawEntry2D{
+        bounds: bounds,
+        region: region,
+        world: world,
+        tint: tint,
+        z_index: z_index,
+        sort_y: sort_y,
+        texture_id: texture_id,
+        order: queue.items.len
+    }
+    queue.items.push(entry)
+    << 0
+}
+
+// Enqueue a Sprite2D using its Node2D world position + y_offset as its depth key.
+pub fn (queue $&YSortQueue2D) push_sprite(tree &nexus.SceneTree, sprite &Sprite2D,
+    texture_id int, z_index int, y_offset f64) int {
+    if !fm.finite(y_offset) { >> errors.new("nexus ysort: non-finite y_offset") }
+    if !tree.is_alive(sprite.node) || !(tree.is_visible(sprite.node) or >>) { << 0 }
+    world := tree.global_transform(sprite.node) or >>
+    sort_y := world.ty + y_offset
+    << queue.push_quad(sprite.bounds, sprite.region, world, sprite.tint, texture_id, z_index, sort_y) or >>
+}
+
+// Enqueue a solid-colored rectangle bound to a Node2D (use texture_id = -1 for untextured draws).
+pub fn (queue $&YSortQueue2D) push_rect(tree &nexus.SceneTree, node int, bounds fm.Rect2,
+    color int, texture_id int, z_index int, y_offset f64) int {
+    if !fm.finite(y_offset) { >> errors.new("nexus ysort: non-finite y_offset") }
+    if !tree.is_alive(node) || !(tree.is_visible(node) or >>) { << 0 }
+    world := tree.global_transform(node) or >>
+    sort_y := world.ty + y_offset
+    << queue.push_quad(bounds, fm.rect2(0.0, 0.0, 1.0, 1.0), world, color, texture_id, z_index, sort_y) or >>
+}
+
+fn entry_before(a &DrawEntry2D, b &DrawEntry2D) bool {
+    if a.z_index != b.z_index { << a.z_index < b.z_index }
+    if a.sort_y != b.sort_y { << a.sort_y < b.sort_y }
+    << a.order < b.order
+}
+
+// Stable bottom-up iterative merge sort for deterministic equal-Y ordering.
+fn sorted_indices(items &[]DrawEntry2D) []int {
+    n := items.len
+    $src := []int{}
+    $dst := []int{}
+    for i in 0:n {
+        src.push(i)
+        dst.push(i)
+    }
+    $width := 1
+    while width < n {
+        $left := 0
+        while left < n {
+            $mid := left + width
+            if mid > n { mid = n }
+            $right := left + width * 2
+            if right > n { right = n }
+            $i := left
+            $j := mid
+            $k := left
+            while i < mid && j < right {
+                si := src[i]
+                sj := src[j]
+                if !entry_before(&items[sj], &items[si]) {
+                    dst[k] = si
+                    i += 1
+                } else {
+                    dst[k] = sj
+                    j += 1
+                }
+                k += 1
+            }
+            while i < mid {
+                dst[k] = src[i]
+                i += 1
+                k += 1
+            }
+            while j < right {
+                dst[k] = src[j]
+                j += 1
+                k += 1
+            }
+            left = right
+        }
+        for p in 0:n { src[p] = dst[p] }
+        width = width * 2
+    }
+    << src
+}
+
+// Record all queued quads in sorted order into one Batch2D (for single-atlas scenes).
+pub fn (queue &YSortQueue2D) record_single(camera fm.Transform2D, batch $&canvas.Batch2D) int {
+    if !camera.is_finite() { >> errors.new("nexus ysort: invalid camera transform") }
+    order := sorted_indices(&queue.items)
+    for idx in order {
+        entry := &queue.items[idx]
+        batch.quad_region(entry.bounds, camera.multiply(entry.world), entry.tint, entry.region) or >>
+    }
+    << order.len
+}
+
+// Record sorted quads split into minimal consecutive same-texture batches so
+// multiple atlases interleave with exact 2.5D Y-Sort occlusion.
+pub fn (queue &YSortQueue2D) record_runs(camera fm.Transform2D) []SortedBatch2D {
+    if !camera.is_finite() { >> errors.new("nexus ysort: invalid camera transform") }
+    order := sorted_indices(&queue.items)
+    $runs := []SortedBatch2D{}
+    $pos := 0
+    while pos < order.len {
+        first_idx := order[pos]
+        current_tex := queue.items[first_idx].texture_id
+        $current_batch := canvas.new_batch()
+        while pos < order.len {
+            idx := order[pos]
+            entry := &queue.items[idx]
+            if entry.texture_id != current_tex { <- }
+            current_batch.quad_region(entry.bounds, camera.multiply(entry.world), entry.tint, entry.region) or >>
+            pos += 1
+        }
+        runs.push(SortedBatch2D{texture_id: current_tex, batch: current_batch})
+    }
+    << runs
+}

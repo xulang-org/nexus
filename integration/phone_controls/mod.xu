@@ -1,0 +1,98 @@
+@"github.com/xulang-org/nexus/integration/phone_controls"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+input_bridge #"github.com/xulang-org/nexus/integration/input"
+vp #"github.com/xulang-org/nexus/integration/viewport"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+#math
+
+pub const PAUSE_SOURCE = 4
+pub const CAMERA_SOURCE = 5
+
+pub struct TouchLayout {
+    pub stick_zone fm.Rect2
+    pub stick_center fm.Vec2
+    pub stick_radius f64
+    pub pause_center fm.Vec2
+    pub button_radius f64
+    pub camera_center fm.Vec2
+    pub camera_button bool
+}
+
+pub fn layout(view &vp.Viewport, camera_button bool) TouchLayout {
+    safe := view.safe_rect
+    unit := math.max(0.2, math.min(2.0, math.min(safe.size.x, safe.size.y) / 360.0))
+    bottom := safe.position.y + safe.size.y
+    right := safe.position.x + safe.size.x
+    top := safe.position.y + 35.0 * unit
+    << TouchLayout{stick_zone: fm.rect2(safe.position.x, bottom - 130.0 * unit, 132.0 * unit, 130.0 * unit),
+        stick_center: fm.vec2(safe.position.x + 66.0 * unit, bottom - 65.0 * unit), stick_radius: 38.0 * unit,
+        pause_center: fm.vec2(right - 35.0 * unit, top), button_radius: 23.0 * unit,
+        camera_center: fm.vec2(safe.position.x + 35.0 * unit, top), camera_button: camera_button}
+}
+
+pub fn (layout &TouchLayout) controls() input_bridge.TouchControls {
+    $touch := input_bridge.new_touch_controls(layout.stick_center, layout.stick_radius, 0.1, 0) or >>
+    touch.enable_floating(layout.stick_zone) or >>
+    touch.add_button(layout.pause_center, layout.button_radius, PAUSE_SOURCE, input_bridge.BUTTON_TAP) or >>
+    if layout.camera_button {
+        touch.add_button(layout.camera_center, layout.button_radius, CAMERA_SOURCE, input_bridge.BUTTON_TAP) or >>
+    }
+    << touch
+}
+
+pub fn (layout &TouchLayout) hits_control(point fm.Vec2) bool {
+    << layout.stick_zone.contains(point) || point.sub(layout.pause_center).length() <= layout.button_radius ||
+        (layout.camera_button && point.sub(layout.camera_center).length() <= layout.button_radius)
+}
+
+fn disc(batch $&canvas.Batch2D, center fm.Vec2, radius f64, pixels fm.Transform2D, color int) int {
+    middle := pixels.point(center)
+    for i in 0:28 {
+        a := f64(i) * 6.283185307179586 / 28.0
+        b := f64(i + 1) * 6.283185307179586 / 28.0
+        edge_a := center.add(fm.vec2(math.cos(a), math.sin(a)).scaled(radius))
+        edge_b := center.add(fm.vec2(math.cos(b), math.sin(b)).scaled(radius))
+        batch.triangle(middle, pixels.point(edge_a), pixels.point(edge_b), color) or >>
+    }
+    << 0
+}
+
+fn record_camera(batch $&canvas.Batch2D, center fm.Vec2, radius f64, pixels fm.Transform2D, perspective bool) int {
+    disc(batch, center, radius, pixels, 322388460) or >>
+    // The parallel and tapered view volumes distinguish the two lenses.
+    $top := 0.54 * radius
+    if perspective { top = 0.28 * radius }
+    tl := pixels.point(center.add(fm.vec2(-top, -0.44 * radius)))
+    tr := pixels.point(center.add(fm.vec2(top, -0.44 * radius)))
+    br := pixels.point(center.add(fm.vec2(0.54 * radius, 0.44 * radius)))
+    bl := pixels.point(center.add(fm.vec2(-0.54 * radius, 0.44 * radius)))
+    batch.triangle(tl, tr, br, 4294967295) or >>
+    batch.triangle(tl, br, bl, 4294967295) or >>
+    << 0
+}
+
+pub fn record(batch $&canvas.Batch2D, touch &input_bridge.TouchControls, layout &TouchLayout,
+    view &vp.Viewport, paused bool, perspective bool) int {
+    pixels := view.screen_transform()
+    batch.clear()
+    if paused { batch.quad(view.safe_rect, pixels, 236068485) or >> }
+    disc(batch, touch.center, touch.radius, pixels, 1381918944) or >>
+    disc(batch, touch.center, touch.radius * 0.92, pixels, 322388436) or >>
+    knob := touch.center.add(touch.offset.scaled(touch.radius * 0.62))
+    disc(batch, knob, touch.radius * 0.38, pixels, 3123303154) or >>
+
+    p := layout.pause_center
+    r := layout.button_radius
+    disc(batch, p, r, pixels, 322388460) or >>
+    white := 4294967295
+    if paused {
+        batch.triangle(pixels.point(p.add(fm.vec2(-0.27 * r, -0.47 * r))),
+            pixels.point(p.add(fm.vec2(-0.27 * r, 0.47 * r))), pixels.point(p.add(fm.vec2(0.5 * r, 0.0))), white) or >>
+    } else {
+        batch.quad(fm.rect2(p.x - 0.34 * r, p.y - 0.46 * r, 0.22 * r, 0.92 * r), pixels, white) or >>
+        batch.quad(fm.rect2(p.x + 0.12 * r, p.y - 0.46 * r, 0.22 * r, 0.92 * r), pixels, white) or >>
+    }
+    if layout.camera_button { record_camera(batch, layout.camera_center, r, pixels, perspective) or >> }
+    << 0
+}

@@ -1,0 +1,471 @@
+@main
+
+// Combined Gameplay + Feedback + Platform Effects Integration Checks:
+// 1. Multi-slot GamepadManager (Switch + Xbox) + radial stick deadzone shaping + InputBuffer motion combo
+// 2. Coupled ScaledClock (1.0x -> Hitstop 0.08s freeze -> 0.25x slow-mo) + ASM JSON roundtrip +
+//    Two-Bone IK + MorphSet3D hit flinch + Timeline + CapsuleController3D + ParticleSystem2D +
+//    Spatial Mixer SFX + SkeletonRagdoll3D lethal blend
+// 3. Switch Handheld (100% safe area) <-> Docked (90% safe area) + UiControlTree layout bounds +
+//    Constrained auto-pause & key release + NXSV1 save persistence + i18n hot locale switch (RTL) +
+//    FrameProfiler & PerfBudget regression gates.
+
+#errors
+#math
+#os
+#path/filepath
+#strings
+#ui/layout
+fm #"github.com/xulang-org/nexus/foundation/math"
+anim #"github.com/xulang-org/nexus/animation/skeletal"
+rag #"github.com/xulang-org/nexus/integration/gltf_render"
+tl #"github.com/xulang-org/nexus/animation/timeline"
+gltf #"github.com/xulang-org/nexus/formats/gltf"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+pcm #"github.com/xulang-org/nexus/resources/audio"
+mixer #"github.com/xulang-org/nexus/audio/mixer"
+phys #"github.com/xulang-org/nexus/physics3d"
+vfx #"github.com/xulang-org/nexus/vfx"
+inp #"github.com/xulang-org/nexus/input"
+timing #"github.com/xulang-org/nexus/timing"
+rc #"github.com/xulang-org/nexus/resources/console"
+ps #"github.com/xulang-org/nexus/integration/platform_services"
+vp #"github.com/xulang-org/nexus/integration/viewport"
+ui_bridge #"github.com/xulang-org/nexus/integration/ui"
+ri #"github.com/xulang-org/nexus/resources/i18n"
+li #"github.com/xulang-org/nexus/i18n"
+
+fn check(cond bool, msg string) int {
+    if !cond { >> errors.new("combined gameplay check failed: " + msg) }
+    << 0
+}
+
+fn clean_dir(path string) int {
+    os.remove_all(path) or (err) {
+        _ := err.msg()
+        << 0
+    }
+    << 0
+}
+
+fn to_bytes(s string) []u8 {
+    $out := []u8{}
+    for i in 0:s.len { out.push(u8(s[i] & 255)) }
+    << out
+}
+
+fn from_bytes(buf &[]u8) string {
+    $s := ""
+    for i in 0:buf.len { s = s + string_from_byte(int(buf[i])) }
+    << s
+}
+
+fn push_u16_b(buf $&[]int, v int) {
+    buf.push(v & 255)
+    buf.push((v >> 8) & 255)
+}
+
+fn push_u32_b(buf $&[]int, v int) {
+    buf.push(v & 255)
+    buf.push((v >> 8) & 255)
+    buf.push((v >> 16) & 255)
+    buf.push((v >> 24) & 255)
+}
+
+fn push_f32_b(buf $&[]int, v f64) {
+    push_u32_b(buf, math.float32_bits(v))
+}
+
+fn push_ascii_b(buf $&[]int, s string) {
+    for i in 0:s.len { buf.push(s[i] & 255) }
+}
+
+fn pad4_zeros(buf $&[]int) {
+    while buf.len % 4 != 0 { buf.push(0) }
+}
+
+fn push_ibm(buf $&[]int, tx f64, ty f64, tz f64) {
+    vals := [1.0, 0.0, 0.0, 0.0,
+             0.0, 1.0, 0.0, 0.0,
+             0.0, 0.0, 1.0, 0.0,
+             tx, ty, tz, 1.0]
+    for v in vals { push_f32_b(buf, v) }
+}
+
+// 3-node rig (Root -> Hips -> Spine) matching anim_serialize_budget_checks for ASM + Two-Bone IK.
+fn build_mini_char_glb() string {
+    $bin := []int{}
+    for idx in [0, 1, 2] { push_u16_b($&bin, idx) }
+    pad4_zeros($&bin)
+    pts := [0.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0, 0.0]
+    for v in pts { push_f32_b($&bin, v) }
+    push_ibm($&bin, 0.0, -1.0, 0.0)
+    push_ibm($&bin, 0.0, -2.0, 0.0)
+    push_f32_b($&bin, 0.0)
+    push_f32_b($&bin, 1.0)
+    // clip 0 (idle)
+    for v in [0.0, 0.0, 0.0, 1.0,  0.0, 0.0, 0.0, 1.0] { push_f32_b($&bin, v) }
+    // clip 1 (walk): Hips trans + Spine rot Y
+    for v in [0.0, 1.0, 0.0,  0.0, 1.0, 2.0] { push_f32_b($&bin, v) }
+    for v in [0.0, 0.0, 0.0, 1.0,  0.0, math.sin(0.25), 0.0, math.cos(0.25)] { push_f32_b($&bin, v) }
+    // clip 2 (slash/run): Spine rot X
+    for v in [0.0, 0.0, 0.0, 1.0,  math.sin(0.35), 0.0, 0.0, math.cos(0.35)] { push_f32_b($&bin, v) }
+    pad4_zeros($&bin)
+
+    js := "{\"asset\":{\"version\":\"2.0\"}," +
+        "\"buffers\":[{\"byteLength\":" + str(bin.len) + "}]," +
+        "\"bufferViews\":[" +
+        "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":8,\"target\":34963}," +
+        "{\"buffer\":0,\"byteOffset\":8,\"byteLength\":36,\"target\":34962}," +
+        "{\"buffer\":0,\"byteOffset\":44,\"byteLength\":128}," +
+        "{\"buffer\":0,\"byteOffset\":172,\"byteLength\":8}," +
+        "{\"buffer\":0,\"byteOffset\":180,\"byteLength\":32}," +
+        "{\"buffer\":0,\"byteOffset\":212,\"byteLength\":24}," +
+        "{\"buffer\":0,\"byteOffset\":236,\"byteLength\":32}," +
+        "{\"buffer\":0,\"byteOffset\":268,\"byteLength\":32}]," +
+        "\"accessors\":[" +
+        "{\"bufferView\":0,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}," +
+        "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\",\"min\":[0,0,0],\"max\":[1,1,0]}," +
+        "{\"bufferView\":2,\"componentType\":5126,\"count\":2,\"type\":\"MAT4\"}," +
+        "{\"bufferView\":3,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\",\"min\":[0],\"max\":[1]}," +
+        "{\"bufferView\":4,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}," +
+        "{\"bufferView\":5,\"componentType\":5126,\"count\":2,\"type\":\"VEC3\"}," +
+        "{\"bufferView\":6,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}," +
+        "{\"bufferView\":7,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}]," +
+        "\"meshes\":[{\"primitives\":[{\"indices\":0,\"attributes\":{\"POSITION\":1}}]}]," +
+        "\"nodes\":[" +
+        "{\"name\":\"Root\",\"children\":[1]}," +
+        "{\"name\":\"Hips\",\"translation\":[0,1,0],\"children\":[2]}," +
+        "{\"name\":\"Spine\",\"translation\":[0,1,0]}]," +
+        "\"scenes\":[{\"nodes\":[0]}],\"scene\":0," +
+        "\"skins\":[{\"joints\":[1,2],\"inverseBindMatrices\":2}]," +
+        "\"animations\":[" +
+        "{\"name\":\"idle\",\"samplers\":[{\"input\":3,\"output\":4,\"interpolation\":\"LINEAR\"}],\"channels\":[{\"sampler\":0,\"target\":{\"node\":2,\"path\":\"rotation\"}}]}," +
+        "{\"name\":\"walk\",\"samplers\":[{\"input\":3,\"output\":5,\"interpolation\":\"LINEAR\"},{\"input\":3,\"output\":6,\"interpolation\":\"LINEAR\"}],\"channels\":[{\"sampler\":0,\"target\":{\"node\":1,\"path\":\"translation\"}},{\"sampler\":1,\"target\":{\"node\":2,\"path\":\"rotation\"}}]}," +
+        "{\"name\":\"slash\",\"samplers\":[{\"input\":3,\"output\":7,\"interpolation\":\"LINEAR\"}],\"channels\":[{\"sampler\":0,\"target\":{\"node\":2,\"path\":\"rotation\"}}]}" +
+        "]}"
+
+    $js_bytes := []int{}
+    push_ascii_b($&js_bytes, js)
+    while js_bytes.len % 4 != 0 { js_bytes.push(32) }
+    total := 12 + 8 + js_bytes.len + 8 + bin.len
+    $glb := []int{}
+    push_u32_b($&glb, 1179937895)
+    push_u32_b($&glb, 2)
+    push_u32_b($&glb, total)
+    push_u32_b($&glb, js_bytes.len)
+    push_u32_b($&glb, 1313821514)
+    for b in js_bytes { glb.push(b) }
+    push_u32_b($&glb, bin.len)
+    push_u32_b($&glb, 5130562)
+    for b in bin { glb.push(b) }
+    << string_from_bytes(glb)
+}
+
+fn build_mapping() rc.MultiPlatformMapping {
+    << rc.MultiPlatformMapping{
+        achievements: [
+            rc.LogicalAchievementMap{logical_id: "FIRST_BLOOD", steam_id: "ACH_FB", xbox_id: "XB_FB", ps_trophy_id: 1, taptap_id: "TAP_FB"}
+        ],
+        dlcs: [
+            rc.LogicalDlcMap{logical_id: "EXPANSION_1", steam_app_id: 100, xbox_store_id: "9NX", ps_entitlement: "PASS", switch_aoc_index: 1, taptap_dlc_id: "exp1"}
+        ]
+    }
+}
+
+fn safe_ui_bounds_check(safe_rect &fm.Rect2, b &layout.Rect) bool {
+    << b.x >= safe_rect.position.x - 0.01 &&
+       b.y >= safe_rect.position.y - 0.01 &&
+       b.x + b.width <= safe_rect.position.x + safe_rect.size.x + 0.01 &&
+       b.y + b.height <= safe_rect.position.y + safe_rect.size.y + 0.01
+}
+
+fn run_checks() int {
+    tmp := filepath.join(["build", "combined-gameplay-tmp"])
+    clean_dir(tmp + "") or >>
+    os.mkdir_all(tmp + "") or >>
+
+    // =========================================================================
+    // 1. Multi-slot Input (Switch + Xbox) + Radial Deadzone + InputBuffer Motion Combo
+    // =========================================================================
+    $gm := inp.new_gamepad_manager()
+    gm.connect(0, inp.LAYOUT_SWITCH, "Switch Pro P1") or >>
+    gm.connect(1, inp.LAYOUT_XBOX, "Xbox Series P2") or >>
+
+    $p1_map := inp.new_input_map()
+    $p2_map := inp.new_input_map()
+    gm.bind_template_to_input_map(0, $&p1_map, 0) or >>
+    gm.bind_template_to_input_map(1, $&p2_map, 16) or >>
+
+    stick_dead := inp.shape_stick_radial(0.08, -0.05, 0.15, 0.05, 1.4) or >>
+    check(stick_dead.x == 0.0 && stick_dead.y == 0.0, "micro stick jitter must clamp inside deadzone") or >>
+    stick_move := inp.shape_stick_radial(0.65, 0.0, 0.15, 0.05, 1.4) or >>
+    check(stick_move.x > 0.3 && stick_move.x < 1.0, "shaped stick deflection must be smooth") or >>
+
+    gm.begin_frame()
+    gm.set_button(0, inp.BTN_EAST, true) or >>
+    gm.set_button(1, inp.BTN_SOUTH, true) or >>
+    gm.sync_slot_to_input_map(0, $&p1_map, 0) or >>
+    gm.sync_slot_to_input_map(1, $&p2_map, 16) or >>
+    p1_ok := p1_map.pressed("confirm") or >>
+    p2_ok := p2_map.pressed("confirm") or >>
+    check(p1_ok && p2_ok, "Switch East and Xbox South must both map to confirm") or >>
+
+    $ib := inp.new_input_buffer(16)
+    ib.push_frame(12, &["down"])
+    ib.push_frame(15, &["forward"])
+    ib.push_frame(17, &["attack"])
+    combo_triggered := ib.match_sequence(&["down", "forward", "attack"], 20, 4)
+    check(combo_triggered, "3-step quarter-circle combat sequence should match inside frame window") or >>
+
+    // =========================================================================
+    // 2. Coupled Simulation Loop: ScaledClock + Hitstop + Slow-Mo + ASM + IK + Morph +
+    //    Timeline + Capsule3D + Particle2D + Spatial Audio + Ragdoll Blend
+    // =========================================================================
+    glb_raw := build_mini_char_glb()
+    asset := gltf.decode_glb_geometry(&glb_raw) or >>
+
+    $sm := anim.new_state_machine()
+    s_idle := sm.add_clip_state("idle", 0, true, 1.0) or >>
+    s_walk := sm.add_clip_state("walk", 1, true, 1.0) or >>
+    c_go := [anim.TransitionCondition{kind: anim.COND_GT, param: "speed", threshold: 0.2}]
+    sm.add_transition(s_idle, s_walk, 0.15, false, 0.0, &c_go) or >>
+    sm_json := anim.encode_state_machine_json(&sm) or >>
+    $sm_rt := anim.decode_state_machine_json(&sm_json) or >>
+    sm_rt.set_float("speed", 1.5)
+
+    // MorphTarget3D for hit flinch squash/recoil
+    $m_base := meshes.new_mesh_data_3d()
+    m_base.vertex_lit(fm.vec3(0.0, 0.0, 0.0), 4294967295, fm.vec3(0.0, 1.0, 0.0)) or >>
+    m_base.vertex_lit(fm.vec3(1.0, 0.0, 0.0), 4294967295, fm.vec3(0.0, 1.0, 0.0)) or >>
+    m_base.vertex_lit(fm.vec3(0.0, 1.0, 0.0), 4294967295, fm.vec3(0.0, 1.0, 0.0)) or >>
+    m_base.triangle(0, 1, 2) or >>
+    m_base.validate() or >>
+    $morphs := anim.new_morph_set_3d(m_base) or >>
+    p_deltas := [fm.vec3(0.0, -0.05, 0.0), fm.vec3(0.10, -0.05, 0.0), fm.vec3(0.0, -0.18, 0.0)]
+    n_deltas := [fm.vec3(0.0, 0.0, 0.0), fm.vec3(0.0, 0.0, 0.0), fm.vec3(0.0, 0.0, 0.0)]
+    morphs.add_target("flinch", &p_deltas, &n_deltas) or >>
+
+    // Timeline flash + hitstop intensity track
+    $clip := tl.new_clip("heavy_hit", 0.5) or >>
+    clip.add_scalar_track("morph", "flinch", tl.INTERP_LINEAR, [
+        tl.ScalarKey{time: 0.0, value: 0.0, in_tangent: 0.0, out_tangent: 0.0},
+        tl.ScalarKey{time: 0.1, value: 1.0, in_tangent: 0.0, out_tangent: 0.0},
+        tl.ScalarKey{time: 0.5, value: 0.0, in_tangent: 0.0, out_tangent: 0.0}
+    ]) or >>
+    clip.add_color_track("flash", "tint", [
+        tl.ColorKey{time: 0.0, rgba: 4294967295},
+        tl.ColorKey{time: 0.1, rgba: 4280295423}
+    ]) or >>
+    $tlp := tl.new_player(false)
+    tlp.play()
+
+    // Physics3D capsule + VFX 2D burst + Spatial hit SFX
+    floor_box := fm.aabb3(fm.vec3(-12.0, -1.0, -12.0), fm.vec3(12.0, 0.0, 12.0)) or >>
+    cworld := phys.new_capsule_world([phys.StaticBox3D{bounds: floor_box, layer: 1, trigger: false}], []phys.StaticRamp3D{}) or >>
+    cpol := phys.CapsuleController3D{solid_mask: 1, trigger_mask: 0, step_height: 0.35, ground_snap: 0.05, min_floor_y: 0.7}
+    $hero := phys.capsule_3d(fm.vec3(0.0, 0.9, 0.0), 0.35, 0.55) or >>
+
+    $e2 := vfx.default_emitter_2d(fm.vec2(100.0, 100.0))
+    e2.emitting = false
+    e2.life_min = 1.0
+    e2.life_max = 1.5
+    $ps2 := vfx.new_particle_system_2d(64, 99, e2) or >>
+    $aud := mixer.new_mixer(48000, 16) or >>
+    $sine_pcm := []int{}
+    for k in 0:16800 {
+        t := f64(k) / 48000.0
+        v := int(math.round_to_even(math.sin(6.283185307179586 * 260.0 * t) * 20000.0))
+        sine_pcm.push(v)
+    }
+    beep := pcm.pcm16(48000, 1, sine_pcm) or >>
+    cid := aud.add_clip(beep) or >>
+    sfx_bus := aud.add_bus(0, "SFX", 1.0) or >>
+
+    $clock := timing.new_scaled_clock(60, 4) or >>
+    raw_dt := 1.0 / 60.0
+    $hitstop_frozen_x := 0.0
+    $hitstop_frames := 0
+    $slowmo_dist := 0.0
+    $normal_dist := 0.0
+    $hit_sfx_id := -1
+
+    for f_i in 0:90 {
+        if f_i == 30 {
+            clock.trigger_hitstop(0.08) or >>
+            ps2.burst(24) or >>
+            sp := mixer.default_spatial_3d_params(
+                fm.vec3(2.5, 1.5, 0.0),
+                fm.vec3(0.0, 1.5, 5.0),
+                fm.vec3(1.0, 0.0, 0.0),
+                fm.vec3(0.0, 0.0, -1.0)
+            )
+            sres := mixer.spatial_3d_advanced(&sp)
+            hit_sfx_id = aud.play(cid, sfx_bus, 0.9, sres.pan, false) or >>
+            aud.apply_spatial_3d(hit_sfx_id, &sres) or >>
+        }
+        if f_i == 31 {
+            clock.set_time_scale(0.25) or >>
+        }
+        step := clock.advance(raw_dt) or >>
+
+        if f_i < 30 {
+            res := cworld.move_capsule(hero, fm.vec3(6.0 * step.scaled_delta, -9.8 * step.scaled_delta, 0.0), cpol) or >>
+            hero = res.body
+            normal_dist = hero.center.x
+            _ := sm_rt.advance(&asset, step.scaled_delta) or >>
+            _ := tlp.advance(&clip, step.scaled_delta) or >>
+        } else if step.in_hitstop {
+            hitstop_frames = hitstop_frames + 1
+            if hitstop_frames == 1 { hitstop_frozen_x = hero.center.x }
+            check(math.abs(hero.center.x - hitstop_frozen_x) < 1e-9, "physics position must stay completely frozen during hitstop") or >>
+            check(step.scaled_delta == 0.0 && step.steps == 0, "ScaledClock hitstop must emit zero scaled_delta and zero fixed steps") or >>
+        } else {
+            res := cworld.move_capsule(hero, fm.vec3(6.0 * step.scaled_delta, -9.8 * step.scaled_delta, 0.0), cpol) or >>
+            hero = res.body
+            slowmo_dist = hero.center.x - normal_dist
+            $ar := sm_rt.advance(&asset, step.scaled_delta) or >>
+            anim.solve_two_bone_ik(&asset, $&ar.pose, 0, 1, 2, fm.vec3(0.6, 1.75, 0.4), fm.vec3(0.0, 1.5, 0.5), 1.0) or >>
+            tls := tlp.advance(&clip, step.scaled_delta) or >>
+            w_morph := tls.scalar_values[0]
+            morphed := morphs.evaluate(&[w_morph]) or >>
+            check(morphed.vertices.len == 3, "MorphSet3D evaluated mesh vertex count must stay 3") or >>
+            ps2.step(step.scaled_delta) or >>
+        }
+        _mix_pcm := aud.render(256) or >>
+    }
+    check(hitstop_frames >= 4 && hit_sfx_id > 0, "0.08s hitstop at 60Hz should freeze at least 4 frames with spatial SFX") or >>
+    check(ps2.alive_count() == 24, "2D hit sparks must survive across hitstop and quarter-speed slow-mo") or >>
+    check(slowmo_dist > 0.5 && slowmo_dist < normal_dist * 0.50, "0.25x slow-mo should cover less horizontal distance per frame than 1x run") or >>
+
+    // Lethal strike -> SkeletonRagdoll3D simulation & skin palette blend
+    parents := [-1, 0, 1, 2]
+    bw0 := fm.translation_3d(fm.vec3(0.0, 3.6, 0.0))
+    bw1 := fm.translation_3d(fm.vec3(0.0, 2.7, 0.0))
+    bw2 := fm.translation_3d(fm.vec3(0.0, 1.8, 0.0))
+    bw3 := fm.translation_3d(fm.vec3(0.0, 0.9, 0.0))
+    bind_worlds := [bw0, bw1, bw2, bw3]
+    inv_binds := [
+        bw0.affine_inverse() or >>, bw1.affine_inverse() or >>,
+        bw2.affine_inverse() or >>, bw3.affine_inverse() or >>
+    ]
+    iw0 := fm.translation_3d(fm.vec3(0.0, 2.65, 0.0)).multiply(fm.rotation_x(-0.55))
+    iw1 := fm.translation_3d(fm.vec3(0.0, 1.88, 0.47)).multiply(fm.rotation_x(-0.55))
+    iw2 := fm.translation_3d(fm.vec3(0.0, 1.12, 0.94)).multiply(fm.rotation_x(-0.55))
+    iw3 := fm.translation_3d(fm.vec3(0.0, 0.35, 1.41)).multiply(fm.rotation_x(-0.55))
+    init_worlds := [iw0, iw1, iw2, iw3]
+    $ragdoll := rag.create_ragdoll_from_skeleton(&parents, &bind_worlds, &inv_binds, 0.22, 1.25, &[floor_box], &[1]) or >>
+    ragdoll.sync_from_world_pose(&init_worlds) or >>
+    y_start := ragdoll.joint_position(0).y
+    for _ in 0:90 { ragdoll.step(1.0 / 60.0, 6, 8) or >> }
+    y_end := ragdoll.joint_position(0).y
+    pal_mid := ragdoll.blend_skin_palette(&init_worlds, 0.5, fm.identity_3d()) or >>
+    check(y_end < y_start - 1.0 && pal_mid.len == 4, "ragdoll should collapse onto floor and produce 4 skin matrices") or >>
+
+    // =========================================================================
+    // 3. Switch Handheld <-> Docked Safe Area + UiControlTree + Auto-Pause + Save + i18n RTL + Perf Gate
+    // =========================================================================
+    $sw_cfg := rc.default_switch_config()
+    sw_dir := filepath.join([tmp + "", "switch"])
+    $sw := ps.open_switch(sw_cfg.clone(), rc.PLATFORM_SWITCH, sw_dir + "", build_mapping()) or >>
+    $bridge := ps.new_unified_bridge(true)
+    $sw_clock := timing.new_scaled_clock(60, 4) or >>
+    $sw_imap := inp.new_input_map()
+
+    // Handheld mode (100% safe area, 1280x720)
+    vp_hh := vp.from_metrics(1280, 720, 1280, 720, 0, 0, 1280, 720) or >>
+    st_hh := bridge.step($&sw, $&sw_clock, $&sw_imap, &vp_hh)
+    check(st_hh.safe_area_percent == 100 && st_hh.touch_enabled, "Switch handheld should expose 100% safe area & touch") or >>
+
+    // Dock onto 1920x1080 TV -> 90% safe area! Rebuild UiControlTree inside docked safe_rect.
+    sw.simulate_operation_mode(rc.OPERATION_MODE_DOCKED) or >>
+    vp_dock := vp.from_metrics(1920, 1080, 1920, 1080, 96, 54, 1728, 972) or >>
+    st_dock := bridge.step($&sw, $&sw_clock, $&sw_imap, &vp_dock)
+    check(st_dock.safe_area_percent == 90 && !st_dock.touch_enabled, "Switch docked should expose 90% TV safe area") or >>
+
+    $ui_t := ui_bridge.new_control_tree()
+    hud_p := ui_t.add_panel(-1, layout.Rect{
+        x: vp_dock.safe_rect.position.x + 12.0,
+        y: vp_dock.safe_rect.position.y + 12.0,
+        width: 320.0,
+        height: 160.0
+    }, ui_bridge.UI_LAYOUT_COLUMN, 8.0, 6.0) or >>
+    hud_b := ui_t.add_button(hud_p, layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 34.0}, "Resume", 1) or >>
+    ui_t.compute_layout(vp_dock.logical_width, vp_dock.logical_height) or >>
+    pb := ui_t.node_bounds(hud_p)
+    bb := ui_t.node_bounds(hud_b)
+    check(safe_ui_bounds_check(&vp_dock.safe_rect, &pb) && safe_ui_bounds_check(&vp_dock.safe_rect, &bb),
+        "UiControlTree docked HUD must stay strictly inside 90% safe_rect") or >>
+
+    // Simulate OS Constrained / Home overlay mid-combat -> clock pauses and input_map releases held keys;
+    // saving NXSV1 slot works reliably and reloads cleanly.
+    sw_imap.bind("jump", 32) or >>
+    sw_imap.feed_key(32, true) or >>
+    sw.set_mock_overlay_or_constrained(true)
+    st_paused := bridge.step($&sw, $&sw_clock, $&sw_imap, &vp_dock)
+    jump_down := sw_imap.pressed("jump") or >>
+    check(st_paused.should_pause && sw_clock.is_paused() && !jump_down,
+        "Constrained overlay must auto-pause clock and clear held input actions") or >>
+
+    store := ps.new_unified_save_store("")
+    pos_cm := int(math.round_to_even(hero.center.x * 100.0))
+    payload := to_bytes("combo_score=999;pos_cm=" + str(pos_cm))
+    store.write_slot($&sw, "autosave/combat.sav", &payload) or >>
+    sw.set_mock_overlay_or_constrained(false)
+    _ := bridge.step($&sw, $&sw_clock, $&sw_imap, &vp_dock)
+    check(!sw_clock.is_paused(), "Exiting constrained mode must restore unpaused gameplay clock") or >>
+    sw.shutdown() or >>
+
+    $sw2 := ps.open_switch(sw_cfg.clone(), rc.PLATFORM_SWITCH, sw_dir + "", build_mapping()) or >>
+    loaded := store.read_slot(&sw2, "autosave/combat.sav") or >>
+    check(from_bytes(&loaded) == "combo_score=999;pos_cm=" + str(pos_cm), "NXSV1 save must survive shutdown/reload intact") or >>
+    sw2.shutdown() or >>
+
+    // Hot i18n locale switching (en-US -> zh-Hans-CN -> ar-SA RTL)
+    $cat := ri.new_catalog("en-US") or >>
+    cat.set_entry("en-US", "hud.combo", "{count} Hits!") or >>
+    cat.set_entry("zh-Hans-CN", "hud.combo", "{count} 连击!") or >>
+    cat.set_entry("ar-SA", "hud.combo", "ضربة {count}!") or >>
+    cat_raw := ri.encode_catalog_json(&cat)
+    cat_path := filepath.join([tmp + "", "loc.json"])
+    $lf := os.create(cat_path + "") or >>
+    _ := lf.write(cat_raw + "") or >>
+    lf.close() or >>
+    $pm := map[string]string{}
+    pm["count"] = "3"
+    $loc := li.load_json_file(cat_path + "", "en-US") or >>
+    s_en := loc.tr_fmt("hud.combo", &pm) or >>
+    check(s_en == "3 Hits!" && !loc.is_rtl(), "en-US formatting check") or >>
+    loc.set_locale("zh-Hans-CN") or >>
+    s_zh := loc.tr_fmt("hud.combo", &pm) or >>
+    check(s_zh == "3 连击!" && !loc.is_rtl(), "zh-Hans-CN hot switch check") or >>
+    loc.set_locale("ar-SA") or >>
+    check(loc.is_rtl() && loc.revision() == 3, "ar-SA RTL switch check") or >>
+
+    // FrameProfiler + PerfBudget regression gate (+3% passes, +25% triggers regression violation)
+    $base_prof := timing.new_frame_profiler()
+    for _ in 0:15 { base_prof.record_frame_ms(10.0) }
+    baseline := base_prof.summary()
+    desk_budget := timing.budget_desktop_60fps()
+
+    $prof_ok := timing.new_frame_profiler()
+    for _ in 0:15 { prof_ok.record_frame_ms(10.3) }
+    rep_ok := timing.evaluate_perf_regression(&prof_ok, &baseline, &desk_budget) or >>
+    check(rep_ok.passed, "+3% variance must pass 10% desktop regression budget") or >>
+
+    $prof_bad := timing.new_frame_profiler()
+    for _ in 0:15 { prof_bad.record_frame_ms(12.5) }
+    rep_bad := timing.evaluate_perf_regression(&prof_bad, &baseline, &desk_budget) or >>
+    check(!rep_bad.passed && rep_bad.violations.len > 0, "+25% spike must trigger PerfGate regression failure") or >>
+
+    clean_dir(tmp + "") or >>
+    << 0
+}
+
+fn main() int {
+    run_checks() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    println("PASS: combined_gameplay_effects_checks")
+    << 0
+}

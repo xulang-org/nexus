@@ -10,7 +10,8 @@ ROOT=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='xu light persistence ') as directory:
     root=Path(directory)
     shutil.copyfile(ROOT/'xu.xun',root/'xu.xun')
-    for package in ('foundation/math','resources/lighting','resources/scene','formats/scene',
+    for package in ('foundation/math', 'resources/camera','resources/lighting','resources/shadow','resources/scene','resources/lod',
+                    'resources/persistence','resources/sprite3d','resources/tilemap','formats/scene',
                     'internal/file_snapshot','scene','integration/lighting','integration/scene','integration/scene_lighting'):
         shutil.copytree(ROOT/package,root/package)
     shutil.copytree(ROOT/'build/scene-lighting-fixtures',root/'build/scene-lighting-fixtures')
@@ -31,14 +32,20 @@ with tempfile.TemporaryDirectory(prefix='xu light persistence ') as directory:
             subprocess.run([os.environ.get('XU','xu'),'build',str(checks/'main.xu'),level,'-o',str(binary)],cwd=root,env=env,check=True,timeout=60)
             if name=='checks':
                 subprocess.run([str(binary)],cwd=root,env=env,check=True,timeout=60)
-            else:
-                saved=root/('saved light scene '+level+'.xuscene')
-                original=root/'build/scene-lighting-fixtures/base.xuscene'
+                continue
+            for profile, version in (('cascades', 4), ('punctual', 5)):
+                saved = root / f'saved {profile} scene {level}.xuscene'
+                original = root / 'build/scene-lighting-fixtures' / f'{profile}.xuscene'
                 for operation,path in (('write',original),('read',saved)):
                     result=subprocess.run([str(binary),operation,str(path),str(saved)],cwd=root,env=env,check=True,
                                           capture_output=True,text=True,timeout=30)
                     assert result.stdout.strip()==('saved' if operation=='write' else 'loaded'),result.stdout+result.stderr
                 data=json.loads(saved.read_text())
+                authored=json.loads(original.read_text())
+                assert data['version']==version
+                for before, after in zip(authored['lights'], data['lights'], strict=True):
+                    assert after.get('cascades') == before.get('cascades')
+                    assert after.get('shadow') == before.get('shadow')
                 assert len(data['lights'])==4 and data['lights'][1]['position'][0]==.75
                 assert data['lights'][1]['radiance']==[9,8,7] and data['nodes'][3]['transform'][12]==4
                 assert data['nodes'][0]['transform'][12]==5 and data['nodes'][5]['visible'] is False

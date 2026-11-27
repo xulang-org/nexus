@@ -1,0 +1,36 @@
+#version 450
+
+layout(set = 0, binding = 0) uniform sampler2D src_low;
+layout(set = 0, binding = 1) uniform sampler2D src_curr;
+layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D dst_tex;
+
+layout(set = 2, binding = 0, std140) uniform BloomUpParams {
+    vec4 dims;
+    vec4 weight;
+} params;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    uint dw = uint(params.dims.z), dh = uint(params.dims.w);
+    if (gid.x >= dw || gid.y >= dh) return;
+
+    vec2 uv = (vec2(gid) + 0.5) / vec2(params.dims.z, params.dims.w);
+    vec2 texel = vec2(1.0 / params.dims.x, 1.0 / params.dims.y);
+
+    vec3 low =
+        textureLod(src_low, uv + vec2(-texel.x, -texel.y), 0.0).rgb * 1.0 +
+        textureLod(src_low, uv + vec2( 0.0,     -texel.y), 0.0).rgb * 2.0 +
+        textureLod(src_low, uv + vec2( texel.x, -texel.y), 0.0).rgb * 1.0 +
+        textureLod(src_low, uv + vec2(-texel.x,  0.0    ), 0.0).rgb * 2.0 +
+        textureLod(src_low, uv,                            0.0).rgb * 4.0 +
+        textureLod(src_low, uv + vec2( texel.x,  0.0    ), 0.0).rgb * 2.0 +
+        textureLod(src_low, uv + vec2(-texel.x,  texel.y), 0.0).rgb * 1.0 +
+        textureLod(src_low, uv + vec2( 0.0,      texel.y), 0.0).rgb * 2.0 +
+        textureLod(src_low, uv + vec2( texel.x,  texel.y), 0.0).rgb * 1.0;
+    low *= (1.0 / 16.0);
+
+    vec3 curr = textureLod(src_curr, uv, 0.0).rgb;
+    imageStore(dst_tex, ivec2(gid), vec4(curr + low * params.weight.x, 1.0));
+}

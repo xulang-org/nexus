@@ -1,0 +1,454 @@
+@"github.com/xulang-org/nexus/resources/lighting2d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const MAX_LIGHTS_2D = 64
+pub const MAX_GPU_LIGHTS_2D = 32
+pub const MAX_OCCLUDERS_2D = 512
+pub const MAX_GPU_OCCLUDERS_2D = 128
+
+pub const LIGHT_2D_POINT = 0
+pub const LIGHT_2D_SPOT = 1
+pub const LIGHT_2D_DIRECTIONAL = 2
+
+fn clamp_f(v f64, lo f64, hi f64) f64 {
+    if v < lo { << lo }
+    if v > hi { << hi }
+    << v
+}
+
+fn min_i(a int, b int) int {
+    if a < b { << a }
+    << b
+}
+
+fn max_i(a int, b int) int {
+    if a > b { << a }
+    << b
+}
+
+fn valid_color3(c fm.Vec3, max_v f64) bool {
+    << c.is_finite() && c.x >= 0.0 && c.y >= 0.0 && c.z >= 0.0 &&
+        c.x <= max_v && c.y <= max_v && c.z <= max_v
+}
+
+pub struct Light2D {
+    pub kind int
+    pub position fm.Vec2
+    pub direction fm.Vec2
+    pub color fm.Vec3
+    pub intensity f64
+    pub radius f64
+    pub falloff f64
+    pub inner_cos f64
+    pub outer_cos f64
+    pub height f64
+    pub cast_shadows bool
+    pub shadow_softness f64
+    pub layer_mask int
+    pub enabled bool
+}
+
+pub fn point_light_2d(pos fm.Vec2, color fm.Vec3, intensity f64, radius f64) Light2D {
+    l := Light2D{
+        kind: LIGHT_2D_POINT,
+        position: pos,
+        direction: fm.vec2(1.0, 0.0),
+        color: color,
+        intensity: intensity,
+        radius: radius,
+        falloff: 2.0,
+        inner_cos: 1.0,
+        outer_cos: -1.0,
+        height: 24.0,
+        cast_shadows: true,
+        shadow_softness: 0.0,
+        layer_mask: 1,
+        enabled: true
+    }
+    l.validate() or >>
+    << l
+}
+
+pub fn spot_light_2d(
+    pos fm.Vec2,
+    dir fm.Vec2,
+    color fm.Vec3,
+    intensity f64,
+    radius f64,
+    inner_angle f64,
+    outer_angle f64
+) Light2D {
+    if !fm.finite(dir.x) || !fm.finite(dir.y) || dir.length() <= 1e-9 {
+        >> errors.new("nexus lighting2d: spot light requires finite non-zero direction")
+    }
+    if !fm.finite(inner_angle) || !fm.finite(outer_angle) ||
+        inner_angle < 0.0 || outer_angle < inner_angle || outer_angle > 3.141592653589793 {
+        >> errors.new("nexus lighting2d: spot cone angles must satisfy 0 <= inner <= outer <= pi")
+    }
+    ndir := dir.normalized()
+    l := Light2D{
+        kind: LIGHT_2D_SPOT,
+        position: pos,
+        direction: ndir,
+        color: color,
+        intensity: intensity,
+        radius: radius,
+        falloff: 2.0,
+        inner_cos: math.cos(inner_angle),
+        outer_cos: math.cos(outer_angle),
+        height: 24.0,
+        cast_shadows: true,
+        shadow_softness: 0.0,
+        layer_mask: 1,
+        enabled: true
+    }
+    l.validate() or >>
+    << l
+}
+
+pub fn directional_light_2d(dir fm.Vec2, color fm.Vec3, intensity f64) Light2D {
+    if !fm.finite(dir.x) || !fm.finite(dir.y) || dir.length() <= 1e-9 {
+        >> errors.new("nexus lighting2d: directional light requires finite non-zero direction")
+    }
+    ndir := dir.normalized()
+    l := Light2D{
+        kind: LIGHT_2D_DIRECTIONAL,
+        position: fm.vec2(0.0, 0.0),
+        direction: ndir,
+        color: color,
+        intensity: intensity,
+        radius: 1.0,
+        falloff: 1.0,
+        inner_cos: 1.0,
+        outer_cos: -1.0,
+        height: 32.0,
+        cast_shadows: false,
+        shadow_softness: 0.0,
+        layer_mask: 1,
+        enabled: true
+    }
+    l.validate() or >>
+    << l
+}
+
+pub fn (l &Light2D) validate() int {
+    if l.kind < LIGHT_2D_POINT || l.kind > LIGHT_2D_DIRECTIONAL {
+        >> errors.new("nexus lighting2d: unsupported Light2D kind")
+    }
+    if !fm.finite(l.position.x) || !fm.finite(l.position.y) ||
+        !fm.finite(l.direction.x) || !fm.finite(l.direction.y) ||
+        l.direction.length() <= 1e-9 {
+        >> errors.new("nexus lighting2d: light position and direction must be finite")
+    }
+    if !valid_color3(l.color, 4.0) || !fm.finite(l.intensity) || l.intensity < 0.0 || l.intensity > 32.0 {
+        >> errors.new("nexus lighting2d: invalid light color or intensity")
+    }
+    if !fm.finite(l.radius) || l.radius <= 0.0 || l.radius > 100000.0 {
+        >> errors.new("nexus lighting2d: light radius must be finite and > 0")
+    }
+    if !fm.finite(l.falloff) || l.falloff < 0.1 || l.falloff > 8.0 {
+        >> errors.new("nexus lighting2d: light falloff must be in 0.1...8")
+    }
+    if !fm.finite(l.inner_cos) || !fm.finite(l.outer_cos) ||
+        l.inner_cos < -1.0 || l.inner_cos > 1.0 ||
+        l.outer_cos < -1.0 || l.outer_cos > 1.0 ||
+        l.outer_cos > l.inner_cos + 1e-9 {
+        >> errors.new("nexus lighting2d: invalid spot cone cosines")
+    }
+    if !fm.finite(l.height) || l.height < 0.0 || l.height > 4096.0 {
+        >> errors.new("nexus lighting2d: light height must be in 0...4096")
+    }
+    if !fm.finite(l.shadow_softness) || l.shadow_softness < 0.0 || l.shadow_softness > 128.0 {
+        >> errors.new("nexus lighting2d: shadow softness must be in 0...128")
+    }
+    if l.layer_mask == 0 {
+        >> errors.new("nexus lighting2d: light layer_mask must be non-zero")
+    }
+    << 0
+}
+
+pub fn (l &Light2D) clone() Light2D {
+    << Light2D{
+        kind: l.kind,
+        position: l.position,
+        direction: l.direction,
+        color: l.color,
+        intensity: l.intensity,
+        radius: l.radius,
+        falloff: l.falloff,
+        inner_cos: l.inner_cos,
+        outer_cos: l.outer_cos,
+        height: l.height,
+        cast_shadows: l.cast_shadows,
+        shadow_softness: l.shadow_softness,
+        layer_mask: l.layer_mask,
+        enabled: l.enabled
+    }
+}
+
+pub fn (l &Light2D) with_shadows(enabled bool, softness f64) Light2D {
+    $next := l.clone()
+    next.cast_shadows = enabled
+    next.shadow_softness = softness
+    next.validate() or >>
+    << next
+}
+
+pub fn (l &Light2D) with_height(height f64) Light2D {
+    $next := l.clone()
+    next.height = height
+    next.validate() or >>
+    << next
+}
+
+pub fn (l &Light2D) with_falloff(falloff f64) Light2D {
+    $next := l.clone()
+    next.falloff = falloff
+    next.validate() or >>
+    << next
+}
+
+pub fn (l &Light2D) with_layer_mask(mask int) Light2D {
+    $next := l.clone()
+    next.layer_mask = mask
+    next.validate() or >>
+    << next
+}
+
+pub fn (l &Light2D) with_enabled(enabled bool) Light2D {
+    $next := l.clone()
+    next.enabled = enabled
+    next.validate() or >>
+    << next
+}
+
+pub struct OccluderSegment2D {
+    pub a fm.Vec2
+    pub b fm.Vec2
+    pub layer_mask int
+    pub two_sided bool
+}
+
+pub fn occluder_segment_2d(a fm.Vec2, b fm.Vec2) OccluderSegment2D {
+    if !fm.finite(a.x) || !fm.finite(a.y) || !fm.finite(b.x) || !fm.finite(b.y) {
+        >> errors.new("nexus lighting2d: occluder endpoints must be finite")
+    }
+    if b.sub(a).length() <= 1e-6 {
+        >> errors.new("nexus lighting2d: occluder segment length must be > 0")
+    }
+    << OccluderSegment2D{a: a, b: b, layer_mask: 1, two_sided: true}
+}
+
+pub fn (s &OccluderSegment2D) with_layer_mask(mask int) OccluderSegment2D {
+    if mask == 0 { >> errors.new("nexus lighting2d: occluder layer_mask must be non-zero") }
+    << OccluderSegment2D{a: s.a, b: s.b, layer_mask: mask, two_sided: s.two_sided}
+}
+
+pub fn occluder_box_2d(rect fm.Rect2) []OccluderSegment2D {
+    if !rect.valid() { >> errors.new("nexus lighting2d: occluder box must have valid positive rect") }
+    p0 := rect.position
+    p1 := fm.vec2(rect.position.x + rect.size.x, rect.position.y)
+    p2 := fm.vec2(rect.position.x + rect.size.x, rect.position.y + rect.size.y)
+    p3 := fm.vec2(rect.position.x, rect.position.y + rect.size.y)
+    << [
+        occluder_segment_2d(p0, p1) or >>,
+        occluder_segment_2d(p1, p2) or >>,
+        occluder_segment_2d(p2, p3) or >>,
+        occluder_segment_2d(p3, p0) or >>
+    ]
+}
+
+pub fn occluder_polygon_2d(points &[]fm.Vec2, closed bool) []OccluderSegment2D {
+    if points.len < 2 {
+        >> errors.new("nexus lighting2d: occluder polygon requires at least 2 points")
+    }
+    $out := []OccluderSegment2D{}
+    for i in 0:(points.len - 1) {
+        out.push(occluder_segment_2d(points[i], points[i + 1]) or >>)
+    }
+    if closed && points.len >= 3 {
+        out.push(occluder_segment_2d(points[points.len - 1], points[0]) or >>)
+    }
+    << out
+}
+
+pub struct LightEnvironment2D {
+    pub ambient fm.Vec3
+    pub lights []Light2D
+    pub occluders []OccluderSegment2D
+    pub exposure f64
+    pub shadow_bias f64
+    pub soft_tonemap bool
+    pub specular_strength f64
+}
+
+pub fn new_environment_2d(ambient fm.Vec3) LightEnvironment2D {
+    if !valid_color3(ambient, 4.0) {
+        >> errors.new("nexus lighting2d: invalid ambient color")
+    }
+    << LightEnvironment2D{
+        ambient: ambient,
+        lights: []Light2D{},
+        occluders: []OccluderSegment2D{},
+        exposure: 1.0,
+        shadow_bias: 0.5,
+        soft_tonemap: false,
+        specular_strength: 0.0
+    }
+}
+
+pub fn (env &LightEnvironment2D) validate() int {
+    if !valid_color3(env.ambient, 4.0) || !fm.finite(env.exposure) || env.exposure <= 0.0 || env.exposure > 16.0 ||
+        !fm.finite(env.shadow_bias) || env.shadow_bias < 0.0 || env.shadow_bias > 16.0 ||
+        !fm.finite(env.specular_strength) || env.specular_strength < 0.0 || env.specular_strength > 4.0 {
+        >> errors.new("nexus lighting2d: invalid environment ambient, exposure, shadow_bias, or specular_strength")
+    }
+    if env.lights.len > MAX_LIGHTS_2D || env.occluders.len > MAX_OCCLUDERS_2D {
+        >> errors.new("nexus lighting2d: environment exceeds MAX_LIGHTS_2D or MAX_OCCLUDERS_2D")
+    }
+    for i in 0:env.lights.len {
+        env.lights[i].validate() or >>
+    }
+    for i in 0:env.occluders.len {
+        seg := &env.occluders[i]
+        if seg.layer_mask == 0 || seg.b.sub(seg.a).length() <= 1e-6 {
+            >> errors.new("nexus lighting2d: invalid occluder segment in environment")
+        }
+    }
+    << 0
+}
+
+pub fn (env $&LightEnvironment2D) set_exposure(exposure f64) int {
+    if !fm.finite(exposure) || exposure <= 0.0 || exposure > 16.0 {
+        >> errors.new("nexus lighting2d: exposure must be in (0, 16]")
+    }
+    env.exposure = exposure
+    << 0
+}
+
+pub fn (env $&LightEnvironment2D) set_shadow_bias(bias f64) int {
+    if !fm.finite(bias) || bias < 0.0 || bias > 16.0 {
+        >> errors.new("nexus lighting2d: shadow_bias must be in 0...16")
+    }
+    env.shadow_bias = bias
+    << 0
+}
+
+pub fn (env $&LightEnvironment2D) set_soft_tonemap(enabled bool) {
+    env.soft_tonemap = enabled
+}
+
+pub fn (env $&LightEnvironment2D) set_specular_strength(strength f64) int {
+    if !fm.finite(strength) || strength < 0.0 || strength > 4.0 {
+        >> errors.new("nexus lighting2d: specular_strength must be in 0...4")
+    }
+    env.specular_strength = strength
+    << 0
+}
+
+pub fn (env $&LightEnvironment2D) clear() {
+    env.lights = []Light2D{}
+    env.occluders = []OccluderSegment2D{}
+}
+
+pub fn (env $&LightEnvironment2D) add_light(light Light2D) int {
+    light.validate() or >>
+    if env.lights.len >= MAX_LIGHTS_2D {
+        >> errors.new("nexus lighting2d: light count exceeds MAX_LIGHTS_2D (64)")
+    }
+    env.lights.push(light)
+    << env.lights.len - 1
+}
+
+pub fn (env $&LightEnvironment2D) add_occluder(seg OccluderSegment2D) int {
+    if seg.layer_mask == 0 || !fm.finite(seg.a.x) || !fm.finite(seg.a.y) ||
+        !fm.finite(seg.b.x) || !fm.finite(seg.b.y) || seg.b.sub(seg.a).length() <= 1e-6 {
+        >> errors.new("nexus lighting2d: invalid occluder segment")
+    }
+    if env.occluders.len >= MAX_OCCLUDERS_2D {
+        >> errors.new("nexus lighting2d: occluder count exceeds MAX_OCCLUDERS_2D (512)")
+    }
+    env.occluders.push(seg)
+    << env.occluders.len - 1
+}
+
+pub fn (env $&LightEnvironment2D) add_occluder_box(rect fm.Rect2) int {
+    segs := occluder_box_2d(rect) or >>
+    if env.occluders.len + segs.len > MAX_OCCLUDERS_2D {
+        >> errors.new("nexus lighting2d: occluder box exceeds MAX_OCCLUDERS_2D")
+    }
+    for i in 0:segs.len {
+        env.occluders.push(segs[i])
+    }
+    << segs.len
+}
+
+fn circle_intersects_rect(center fm.Vec2, radius f64, rect fm.Rect2) bool {
+    cx := clamp_f(center.x, rect.position.x, rect.position.x + rect.size.x)
+    cy := clamp_f(center.y, rect.position.y, rect.position.y + rect.size.y)
+    dx := center.x - cx
+    dy := center.y - cy
+    << dx * dx + dy * dy <= radius * radius
+}
+
+fn segment_intersects_rect(seg &OccluderSegment2D, rect fm.Rect2) bool {
+    min_x := math.min(seg.a.x, seg.b.x)
+    max_x := math.max(seg.a.x, seg.b.x)
+    min_y := math.min(seg.a.y, seg.b.y)
+    max_y := math.max(seg.a.y, seg.b.y)
+    << max_x >= rect.position.x && min_x <= rect.position.x + rect.size.x &&
+        max_y >= rect.position.y && min_y <= rect.position.y + rect.size.y
+}
+
+pub fn (env &LightEnvironment2D) visible_lights(view_bounds fm.Rect2, layer_mask int, max_count int) []Light2D {
+    if !view_bounds.valid() { >> errors.new("nexus lighting2d: view_bounds must be valid") }
+    if max_count < 0 { >> errors.new("nexus lighting2d: max_count must be >= 0") }
+    cap := min_i(max_count, MAX_LIGHTS_2D)
+    $out := []Light2D{}
+    for i in 0:env.lights.len {
+        if out.len >= cap { <- }
+        l := &env.lights[i]
+        if !l.enabled || (l.layer_mask & layer_mask) == 0 { -> }
+        if l.kind == LIGHT_2D_DIRECTIONAL || circle_intersects_rect(l.position, l.radius, view_bounds) {
+            out.push(l.clone())
+        }
+    }
+    << out
+}
+
+pub fn (env &LightEnvironment2D) visible_occluders(view_bounds fm.Rect2, layer_mask int, max_count int) []OccluderSegment2D {
+    if !view_bounds.valid() { >> errors.new("nexus lighting2d: view_bounds must be valid") }
+    if max_count < 0 { >> errors.new("nexus lighting2d: max_count must be >= 0") }
+    cap := min_i(max_count, MAX_OCCLUDERS_2D)
+    // Expand view bounds by active shadow-casting light radii so off-screen walls still cast shadows into view.
+    $min_x := view_bounds.position.x
+    $min_y := view_bounds.position.y
+    $max_x := view_bounds.position.x + view_bounds.size.x
+    $max_y := view_bounds.position.y + view_bounds.size.y
+    for i in 0:env.lights.len {
+        l := &env.lights[i]
+        if !l.enabled || !l.cast_shadows || (l.layer_mask & layer_mask) == 0 || l.kind == LIGHT_2D_DIRECTIONAL {
+            ->
+        }
+        if circle_intersects_rect(l.position, l.radius, view_bounds) {
+            min_x = math.min(min_x, l.position.x - l.radius)
+            min_y = math.min(min_y, l.position.y - l.radius)
+            max_x = math.max(max_x, l.position.x + l.radius)
+            max_y = math.max(max_y, l.position.y + l.radius)
+        }
+    }
+    expanded := fm.rect2(min_x, min_y, math.max(1.0, max_x - min_x), math.max(1.0, max_y - min_y))
+    $out := []OccluderSegment2D{}
+    for i in 0:env.occluders.len {
+        if out.len >= cap { <- }
+        seg := &env.occluders[i]
+        if (seg.layer_mask & layer_mask) == 0 { -> }
+        if segment_intersects_rect(seg, expanded) {
+            out.push(OccluderSegment2D{a: seg.a, b: seg.b, layer_mask: seg.layer_mask, two_sided: seg.two_sided})
+        }
+    }
+    << out
+}

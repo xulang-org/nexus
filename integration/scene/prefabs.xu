@@ -1,0 +1,168 @@
+@"github.com/xulang-org/nexus/integration/scene"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+nexus #"github.com/xulang-org/nexus/scene"
+resource #"github.com/xulang-org/nexus/resources/scene"
+codec #"github.com/xulang-org/nexus/formats/scene"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#crypto/sha256
+#errors
+filepath #"path/filepath"
+#strings
+
+pub const MAX_PREFAB_DEPTH = 16
+
+pub struct PrefabInstantiateResult {
+    pub root_id int
+    pub spawned_prefabs int
+    pub applied_overrides int
+}
+
+// Walks slash-separated relative child names beneath `root`.
+// Supports "" or "." to select `root` directly.
+pub fn resolve_node_path(tree &nexus.SceneTree, root int, path string) int {
+    _ := tree.node_info(root) or >>
+    if path.len == 0 || path == "." { << root }
+    if path[0] == 47 || strings.contains(&path, "..") {
+        >> errors.new("nexus scene: invalid relative prefab override path: " + path)
+    }
+    parts := strings.split(&path, "/")
+    $cur := root
+    for i in 0:parts.len {
+        seg := parts[i] + ""
+        if seg.len == 0 || seg == "." {
+            >> errors.new("nexus scene: empty or dot segment in prefab path: " + path)
+        }
+        next := tree.find_child(cur, seg) or >>
+        if next == 0 {
+            >> errors.new("nexus scene: prefab override target not found: " + path)
+        }
+        cur = next
+    }
+    << cur
+}
+
+fn find_scene_ref(document &resource.Document, uid &string) resource.ResourceReference {
+    for i in 0:document.resource_count() {
+        r := document.resource(i) or >>
+        if r.uid == *uid && r.kind == "scene_file" {
+            << r
+        }
+    }
+    >> errors.new("nexus scene: missing scene_file resource reference for prefab uid: " + *uid)
+}
+
+fn apply_override(tree $&nexus.SceneTree, child_root int, ov &resource.PrefabOverride) int {
+    target_id := resolve_node_path(tree, child_root, ov.target_path + "") or >>
+    if ov.visible_set {
+        tree.set_visible(target_id, ov.visible) or >>
+    }
+    if ov.position_set {
+        kind := tree.node_kind(target_id) or >>
+        if kind == nexus.NODE_3D {
+            tree.set_position_3d(target_id, ov.position) or >>
+        } else if kind == nexus.NODE_2D {
+            n2 := tree.node(target_id) or >>
+            $t := n2.transform
+            t.tx = ov.position.x
+            t.ty = ov.position.y
+            tree.set_transform(target_id, t) or >>
+        } else {
+            >> errors.new("nexus scene: position override requires Node2D or Node3D")
+        }
+    }
+    << 0
+}
+
+fn contains_path(stack &[]string, p &string) bool {
+    for i in 0:stack.len {
+        if stack[i] == *p { << true }
+    }
+    << false
+}
+
+fn canon_path(p &string) string {
+    << filepath.abs(p) or (err) {
+        _ := err.msg()
+        << *p + ""
+    }
+}
+
+fn instantiate_prefab_recursive(
+    document &resource.Document,
+    base_dir string,
+    tree $&nexus.SceneTree,
+    parent int,
+    name string,
+    active_stack &[]string,
+    depth int
+) PrefabInstantiateResult {
+    if depth >= MAX_PREFAB_DEPTH {
+        >> errors.new("nexus scene: nested prefab instantiation depth exceeds limit")
+    }
+    packed := to_packed_nodes(document) or >>
+    root_id := packed.instantiate(tree, parent, name) or >>
+    node_ids := matching_nodes(document, tree, root_id) or >>
+
+    $total_prefabs := 0
+    $total_overrides := 0
+    count := document.prefab_instance_count()
+    for i in 0:count {
+        pf := document.prefab_instance(i) or >>
+        host_id := node_ids[pf.node]
+        uid := pf.scene_uid + ""
+        ref := find_scene_ref(document, &uid) or >>
+
+        joined := filepath.join([base_dir + "", ref.path + ""])
+        canon := canon_path(&joined)
+        if contains_path(active_stack, &canon) {
+            >> errors.new("nexus scene: cyclic prefab reference detected: " + ref.path)
+        }
+
+        raw := snapshot.read(joined + "", codec.MAX_BYTES) or >>
+        if ref.content_hash.len > 0 {
+            digest := sha256.sum256(raw + "")
+            if digest != ref.content_hash {
+                >> errors.new("nexus scene: prefab content_hash mismatch for " + ref.path)
+            }
+        }
+        child_doc := codec.decode(&raw) or >>
+
+        $next_stack := []string{}
+        for s in active_stack { next_stack.push(s + "") }
+        next_stack.push(canon + "")
+
+        child_dir := filepath.dir(&joined)
+        sub_name := "Prefab_" + str(i) + "_" + (tree.node_info(host_id) or >>).name
+        sub_res := instantiate_prefab_recursive(&child_doc, child_dir + "", tree, host_id, sub_name, &next_stack, depth + 1) or >>
+
+        total_prefabs = total_prefabs + 1 + sub_res.spawned_prefabs
+        total_overrides = total_overrides + sub_res.applied_overrides
+
+        for oi in 0:pf.overrides.len {
+            ov := &pf.overrides[oi]
+            apply_override(tree, sub_res.root_id, ov) or >>
+            total_overrides = total_overrides + 1
+        }
+    }
+
+    << PrefabInstantiateResult{
+        root_id: root_id,
+        spawned_prefabs: total_prefabs,
+        applied_overrides: total_overrides
+    }
+}
+
+// Instantiates `document` into `tree` under `parent`, recursively resolving any
+// `PrefabInstance` scene_file references beneath `base_dir` (with SHA-256 verification
+// and cycle protection) and applying all property overrides.
+pub fn instantiate_with_prefabs(
+    document &resource.Document,
+    base_dir string,
+    tree $&nexus.SceneTree,
+    parent int,
+    name string
+) PrefabInstantiateResult {
+    empty_stack := []string{}
+    << instantiate_prefab_recursive(document, base_dir, tree, parent, name, &empty_stack, 0) or >>
+}

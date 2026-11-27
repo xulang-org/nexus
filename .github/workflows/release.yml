@@ -1,0 +1,377 @@
+name: Nexus Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.1). Defaults to v + xu.xun version"
+        required: false
+        type: string
+      custom_notes:
+        description: "Optional custom highlights (Markdown)"
+        required: false
+        type: string
+      previous_tag:
+        description: "Previous release tag for changelog"
+        required: false
+        type: string
+      prerelease:
+        description: "Mark as pre-release (auto: true if tag contains -dev/-rc/-alpha/-beta)"
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - true
+          - false
+      draft:
+        description: "Create release as draft"
+        required: false
+        default: false
+        type: boolean
+      build_only:
+        description: "Build and validate release artifacts without publishing GitHub Release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nexus-release-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  release-policy:
+    name: Check Release Identity & Policy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      published: ${{ steps.policy.outputs.published }}
+      tag: ${{ steps.policy.outputs.tag }}
+      version: ${{ steps.policy.outputs.version }}
+      source_sha: ${{ steps.policy.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate release tag, identity, and publication state
+        id: policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+          BUILD_ONLY: ${{ inputs.build_only }}
+        run: |
+          VERSION=$(python3 -c 'import pathlib, re; t = pathlib.Path("xu.xun").read_text(); print(re.search(r"^version:\s*!ver\s+([^\s]+)$", t, re.M).group(1))')
+          EXPECTED_TAG="v${VERSION}"
+          TAG="${REQUESTED_TAG:-$GITHUB_REF_NAME}"
+          if [[ "$GITHUB_REF_TYPE" != tag && -z "$REQUESTED_TAG" ]]; then
+            TAG="$EXPECTED_TAG"
+          fi
+          if [[ "$TAG" != "$EXPECTED_TAG" ]]; then
+            echo "Release tag $TAG does not match xu.xun version ($EXPECTED_TAG)" >&2
+            exit 1
+          fi
+          python3 tools/check_release_identity.py --check-release --expected-tag "$TAG"
+          if [[ "$BUILD_ONLY" != true ]] && [[ ! "$TAG" =~ -(dev|rc|alpha|beta) ]]; then
+            git fetch origin main
+            git merge-base --is-ancestor HEAD origin/main
+          fi
+          ERROR_FILE="$RUNNER_TEMP/nexus-release-pub-err.txt"
+          if PUBLISHED=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+              --jq '.draft == false and .published_at != null' 2>"$ERROR_FILE"); then
+            case "$PUBLISHED" in
+              true|false) ;;
+              *) echo "Invalid release state response" >&2; exit 1 ;;
+            esac
+          elif grep -q 'HTTP 404' "$ERROR_FILE"; then
+            PUBLISHED=false
+          else
+            cat "$ERROR_FILE" >&2
+            exit 1
+          fi
+          echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [[ "$PUBLISHED" == true ]]; then
+            echo "Release $TAG is already published; skipping rebuild."
+          fi
+
+  build-platform:
+    name: Build & Stage (${{ matrix.target }})
+    needs: release-policy
+    if: needs.release-policy.outputs.published == 'false'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            os: macos-latest
+          - target: macos-x64
+            os: macos-15-intel
+          - target: linux-x64
+            os: ubuntu-24.04
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+          - target: windows-x64
+            os: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: ${{ endsWith(matrix.target, '-arm64') && 'arm64' || 'x64' }}
+
+      - name: Python3 shim on Windows
+        if: runner.os == 'Windows'
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            PYTHON_BIN=$(command -v python)
+            cp "$PYTHON_BIN" "$(dirname "$PYTHON_BIN")/python3.exe"
+          fi
+
+      - name: Install Linux CI dependencies
+        if: runner.os == 'Linux'
+        run: bash tools/install_ubuntu_ci_packages.sh clang glslang-tools libgtk-4-dev
+
+      - name: Cache Xu SDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/xu-sdk
+          key: nexus-xu-sdk-${{ matrix.target }}-${{ hashFiles('xu.xun') }}
+
+      - name: Install pinned Xu SDK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/install_xu_sdk.py --target "${{ matrix.target }}" --dest "${{ runner.temp }}/xu-sdk" --github-env
+
+      - name: Cache SDL3 headers and minimal runtime
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sdl3
+          key: nexus-sdl3-3.4.14-rt-${{ matrix.target }}
+
+      - name: Fetch SDL3 headers and minimal runtime
+        run: python3 tools/fetch_sdl3_headers.py --dest "${{ runner.temp }}/sdl3" --with-runtime --github-env
+
+      - name: Build native bridges, shaders, test suite, and release tools
+        run: |
+          python3 tools/ci_run.py \
+            --modes contracts,native,shaders,test,build-tools \
+            --xu "$XU" \
+            --sdl-include "$NEXUS_SDL3_INCLUDE" \
+            --sdl-runtime "$NEXUS_SDL3_RUNTIME" \
+            --out-dir build/release-tools
+
+      - name: Stage & verify single-target archive
+        run: |
+          python3 tools/pack_release.py stage-target \
+            --target "${{ matrix.target }}" \
+            --version "${{ needs.release-policy.outputs.version }}" \
+            --tools-dir build/release-tools \
+            --out-dir dist/staged
+          python3 tools/verify_release_bundle.py \
+            --root dist/staged \
+            --version "${{ needs.release-policy.outputs.version }}" \
+            --single-target "${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-staged-${{ matrix.target }}
+          path: dist/staged/
+          if-no-files-found: error
+
+  assemble-release:
+    name: Assemble Unified .xulib & Verify Receipt
+    needs: [release-policy, build-platform]
+    if: needs.release-policy.outputs.published == 'false' && needs.build-platform.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_id: ${{ steps.bundle.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download all staged target artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nexus-staged-*
+          merge-multiple: true
+          path: staged-in
+
+      - name: Install pinned Xu SDK (linux-x64)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/install_xu_sdk.py --target linux-x64 --dest "${{ runner.temp }}/xu-sdk" --github-env
+
+      - name: Assemble unified native-all, SHA256SUMS, release notes, and receipt
+        env:
+          CUSTOM_NOTES: ${{ inputs.custom_notes }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
+        run: |
+          EXTRA_ARGS=()
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            EXTRA_ARGS+=(--prev-tag "$PREVIOUS_TAG")
+          fi
+          if [[ -n "$CUSTOM_NOTES" ]]; then
+            NOTES_FILE="$RUNNER_TEMP/nexus-custom-notes.md"
+            printf '%s\n' "$CUSTOM_NOTES" > "$NOTES_FILE"
+            EXTRA_ARGS+=(--custom-notes "$NOTES_FILE")
+          fi
+          python3 tools/pack_release.py assemble \
+            --staged-dir staged-in \
+            --out-dir dist/release \
+            --xu "$XU" \
+            --version "${{ needs.release-policy.outputs.version }}" \
+            --commit "${{ needs.release-policy.outputs.source_sha }}" \
+            --receipt dist/validation.json \
+            "${EXTRA_ARGS[@]}"
+          cat dist/release/RELEASE_NOTES.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verified release bundle
+        id: bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-release-bundle-${{ needs.release-policy.outputs.tag }}-${{ github.run_attempt }}
+          path: |
+            dist/release/
+            dist/validation.json
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish Verified GitHub Release
+    needs: [release-policy, assemble-release]
+    if: always() && !cancelled() && needs.assemble-release.result == 'success' && inputs.build_only != true
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      # Isolated publish job: never checks out or executes repository code.
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.assemble-release.outputs.artifact_id }}
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          path: verified
+
+      - name: Verify receipt and publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_SHA: ${{ needs.release-policy.outputs.source_sha }}
+          EXPECTED_TAG: ${{ needs.release-policy.outputs.tag }}
+          EXPECTED_VERSION: ${{ needs.release-policy.outputs.version }}
+          RELEASE_PRERELEASE: ${{ inputs.prerelease || 'auto' }}
+          RELEASE_DRAFT: ${{ inputs.draft }}
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, json, os, pathlib, re, subprocess
+          root = pathlib.Path("verified/release")
+          receipt = json.loads(pathlib.Path("verified/validation.json").read_text())
+          tag, version, sha = (os.environ[k] for k in ("EXPECTED_TAG", "EXPECTED_VERSION", "EXPECTED_SHA"))
+          assert re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?", tag)
+          assert receipt["tag"] == tag == "v" + version
+          assert receipt["version"] == version and receipt["source_commit"] == sha
+          assets = receipt["assets"]
+          assert {p.name for p in root.iterdir()} == set(assets)
+          for name, record in assets.items():
+              assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name)
+              path = root / name
+              assert path.is_file() and not path.is_symlink()
+              with path.open("rb") as src:
+                  digest = hashlib.file_digest(src, "sha256").hexdigest()
+              assert digest == record["sha256"] and path.stat().st_size == record["size"], name
+
+          def gh(*args):
+              return subprocess.check_output(["gh", *args], text=True)
+
+          def api(path, method="GET", data=None):
+              cmd = ["gh", "api", "--method", method, path]
+              if data is not None:
+                  cmd += ["--input", "-"]
+              return json.loads(subprocess.check_output(cmd, input=json.dumps(data) if data is not None else None, text=True))
+
+          repo = os.environ["GH_REPO"]
+          release, page = None, 1
+          while release is None:
+              batch = api(f"repos/{repo}/releases?per_page=100&page={page}")
+              release = next((r for r in batch if r["tag_name"] == tag), None)
+              if len(batch) < 100:
+                  break
+              page += 1
+
+          prerelease = os.environ["RELEASE_PRERELEASE"]
+          is_prerelease = prerelease == "true" or (prerelease == "auto" and bool(re.search(r"-(dev|rc|alpha|beta)", tag)))
+          if release is None:
+              release = api(f"repos/{repo}/releases", "POST", {
+                  "tag_name": tag,
+                  "target_commitish": sha,
+                  "name": f"Nexus Engine {tag}",
+                  "body": (root / "RELEASE_NOTES.md").read_text(encoding="utf-8"),
+                  "draft": True,
+                  "prerelease": is_prerelease,
+              })
+          release_id = release["id"]
+          assert release["target_commitish"] == sha, "existing release targets a different commit"
+          published = {a["name"]: a for a in release["assets"]}
+          assert set(published) <= set(assets), "draft has unexpected assets"
+          for name, asset in published.items():
+              assert asset["size"] == assets[name]["size"]
+              assert asset.get("digest") == "sha256:" + assets[name]["sha256"], name
+
+          if not release["draft"]:
+              assert set(published) == set(assets), "published release differs from verified bundle"
+              print(f"{tag} is already published; preserving existing release")
+              raise SystemExit(0)
+
+          for name in sorted(set(assets) - set(published)):
+              uploaded = json.loads(gh(
+                  "api", "--method", "POST",
+                  f"https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={name}",
+                  "--header", "Content-Type: application/octet-stream",
+                  "--input", str(root / name),
+              ))
+              assert uploaded["size"] == assets[name]["size"]
+              assert uploaded["digest"] == "sha256:" + assets[name]["sha256"], name
+
+          refreshed = api(f"repos/{repo}/releases/{release_id}")
+          assert len(refreshed["assets"]) == len(assets)
+          assert all(a["digest"] == "sha256:" + assets[a["name"]]["sha256"] for a in refreshed["assets"])
+          final = api(f"repos/{repo}/releases/{release_id}", "PATCH", {
+              "body": (root / "RELEASE_NOTES.md").read_text(encoding="utf-8"),
+              "prerelease": is_prerelease,
+              "draft": os.environ["RELEASE_DRAFT"] == "true",
+          })
+          assert len(final["assets"]) == len(assets)
+          print("Published Nexus Release: " + final["html_url"])
+          PYTHON

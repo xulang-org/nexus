@@ -1,0 +1,152 @@
+@"github.com/xulang-org/nexus/modeling"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+#errors
+#math
+
+pub struct FacePickHit {
+    pub hit bool
+    pub face_id int
+    pub distance f64
+    pub point fm.Vec3
+    pub normal fm.Vec3
+}
+
+pub struct EdgePickHit {
+    pub hit bool
+    pub v0 int
+    pub v1 int
+    pub distance f64
+    pub point fm.Vec3
+}
+
+pub struct VertexPickHit {
+    pub hit bool
+    pub vertex_id int
+    pub distance f64
+    pub point fm.Vec3
+}
+
+fn no_face_hit() FacePickHit {
+    << FacePickHit{hit: false, face_id: -1, distance: 0.0, point: fm.vec3(0.0, 0.0, 0.0), normal: fm.vec3(0.0, 0.0, 0.0)}
+}
+
+fn no_edge_hit() EdgePickHit {
+    << EdgePickHit{hit: false, v0: -1, v1: -1, distance: 0.0, point: fm.vec3(0.0, 0.0, 0.0)}
+}
+
+fn no_vert_hit() VertexPickHit {
+    << VertexPickHit{hit: false, vertex_id: -1, distance: 0.0, point: fm.vec3(0.0, 0.0, 0.0)}
+}
+
+pub fn pick_face(m &rm.EditableMesh, model fm.Mat4, world_ray fm.Ray3D) FacePickHit {
+    $best := no_face_hit()
+    $best_t := 1e30
+    for fi in 0:m.faces.len {
+        f := &m.faces[fi]
+        tris := triangulate_face_indices(m, fi)
+        for k in 0:(tris.len / 3) {
+            a := model.transform_point(m.vertices[m.corners[f.corners[tris[k * 3]]].vertex].position)
+            b := model.transform_point(m.vertices[m.corners[f.corners[tris[k * 3 + 1]]].vertex].position)
+            c := model.transform_point(m.vertices[m.corners[f.corners[tris[k * 3 + 2]]].vertex].position)
+            hit := fm.ray_triangle_intersect(world_ray, a, b, c, true)
+            if hit.hit && hit.t < best_t {
+                best_t = hit.t
+                best = FacePickHit{hit: true, face_id: fi, distance: hit.t, point: hit.point, normal: hit.normal}
+            }
+        }
+    }
+    << best
+}
+
+fn ray_segment_closest(ray fm.Ray3D, a fm.Vec3, b fm.Vec3) fm.Vec3 {
+    u := ray.direction
+    v := b.sub(a)
+    w := ray.origin.sub(a)
+    a_dot := u.dot(u)
+    b_dot := u.dot(v)
+    c_dot := v.dot(v)
+    d_dot := u.dot(w)
+    e_dot := v.dot(w)
+    denom := a_dot * c_dot - b_dot * b_dot
+    $sc := 0.0
+    $tc := 0.0
+    if denom < 1e-12 {
+        sc = 0.0
+        if c_dot > 1e-12 { tc = math.max(0.0, math.min(1.0, e_dot / c_dot)) }
+    } else {
+        sc = (b_dot * e_dot - c_dot * d_dot) / denom
+        tc = (a_dot * e_dot - b_dot * d_dot) / denom
+        if sc < 0.0 {
+            sc = 0.0
+            if c_dot > 1e-12 { tc = math.max(0.0, math.min(1.0, e_dot / c_dot)) }
+        }
+        if tc < 0.0 {
+            tc = 0.0
+            sc = math.max(0.0, -d_dot / math.max(1e-12, a_dot))
+        } else if tc > 1.0 {
+            tc = 1.0
+            sc = math.max(0.0, (b_dot - d_dot) / math.max(1e-12, a_dot))
+        }
+    }
+    p_seg := a.add(v.scaled(tc))
+    p_ray := ray.point_at(sc)
+    dist := p_seg.distance(p_ray)
+    << fm.vec3(sc, dist, tc)
+}
+
+pub fn pick_edge(m &rm.EditableMesh, model fm.Mat4, world_ray fm.Ray3D, max_world_dist f64) EdgePickHit {
+    edges := m.build_edges()
+    $best := no_edge_hit()
+    $best_score := 1e30
+    for e in edges {
+        a := model.transform_point(m.vertices[e.v0].position)
+        b := model.transform_point(m.vertices[e.v1].position)
+        res := ray_segment_closest(world_ray, a, b)
+        ray_t := res.x
+        perp := res.y
+        seg_t := res.z
+        if perp <= max_world_dist && ray_t >= 0.0 {
+            score := perp + ray_t * 0.001
+            if score < best_score {
+                best_score = score
+                pt := a.lerp(b, seg_t)
+                best = EdgePickHit{hit: true, v0: e.v0, v1: e.v1, distance: ray_t, point: pt}
+            }
+        }
+    }
+    << best
+}
+
+pub fn pick_vertex(m &rm.EditableMesh, model fm.Mat4, world_ray fm.Ray3D, max_world_dist f64) VertexPickHit {
+    $best := no_vert_hit()
+    $best_score := 1e30
+    for vi in 0:m.vertices.len {
+        wp := model.transform_point(m.vertices[vi].position)
+        to_v := wp.sub(world_ray.origin)
+        proj := to_v.dot(world_ray.direction)
+        if proj < 0.0 { -> }
+        closest := world_ray.point_at(proj)
+        perp := closest.distance(wp)
+        if perp <= max_world_dist {
+            score := perp + proj * 0.001
+            if score < best_score {
+                best_score = score
+                best = VertexPickHit{hit: true, vertex_id: vi, distance: proj, point: wp}
+            }
+        }
+    }
+    << best
+}
+
+pub fn marquee_vertices(m &rm.EditableMesh, model fm.Mat4, frustum &fm.Frustum3D) []int {
+    $out := []int{}
+    for vi in 0:m.vertices.len {
+        wp := model.transform_point(m.vertices[vi].position)
+        if frustum.contains_point(wp) {
+            out.push(vi)
+        }
+    }
+    << out
+}

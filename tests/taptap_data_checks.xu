@@ -1,0 +1,124 @@
+@main
+
+rt #"github.com/xulang-org/nexus/resources/taptap"
+#strings
+
+fn payment_fails(age int, amount int, spent int) bool {
+    _ := rt.check_minor_payment_limit(age, amount, spent) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn validate_fails(cfg &rt.TapTapAppConfig) bool {
+    _ := rt.validate_config(cfg) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn decode_fails(raw string) bool {
+    _ := rt.decode_config_json(&raw) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn archive_fails(name string) bool {
+    _ := rt.validate_archive_name(&name) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn run() int {
+    // 1. Config JSON roundtrip & validation rejections
+    $cfg := rt.default_config("tap_client_001", "tok_secret_xyz_123", rt.REGION_CN)
+    cfg.package_name = "com.nexus.tapdemo"
+    cfg.app_name = "NexusTapDemo"
+    cfg.app_version = "1.2.3"
+    cfg.isbn_code = "ISBN-978-7-0000-0001-1"
+    cfg.age_rating = 12
+    cfg.enable_license_check = true
+    cfg.achievement_ids = ["TAP_FIRST", "TAP_MASTER"]
+    cfg.dlc_ids = ["tap_dlc_1"]
+    cfg.leaderboard_ids = ["lb_speedrun"]
+
+    encoded := rt.encode_config_json(&cfg) or >>
+    decoded := rt.decode_config_json(&encoded) or >>
+    assert(decoded.client_id == "tap_client_001" && decoded.region == rt.REGION_CN)
+    assert(decoded.package_name == "com.nexus.tapdemo" && decoded.age_rating == 12)
+    assert(decoded.achievement_ids.len == 2 && decoded.dlc_ids.len == 1 && decoded.leaderboard_ids.len == 1)
+
+    $bad := cfg.clone()
+    bad.package_name = "invalid_pkg_no_dot"
+    assert(validate_fails(&bad))
+    bad = cfg.clone()
+    bad.age_rating = 13
+    assert(validate_fails(&bad))
+    assert(decode_fails("{\"format\":\"wrong\",\"version\":1,\"client_id\":\"a\",\"client_token\":\"b\"}"))
+    assert(archive_fails("../escape") && archive_fails("/abs/path") && archive_fails(""))
+
+    // 2. CN minor payment cap matrix (Notice of NAPP)
+    assert(payment_fails(rt.AGE_UNKNOWN, 100, 0))
+    assert(payment_fails(rt.AGE_UNDER_8, 100, 0))
+    _ := rt.check_minor_payment_limit(rt.AGE_8_TO_15, 5000, 15000) or >>
+    assert(payment_fails(rt.AGE_8_TO_15, 5001, 0))
+    assert(payment_fails(rt.AGE_8_TO_15, 3000, 18000))
+    _ := rt.check_minor_payment_limit(rt.AGE_16_TO_17, 10000, 30000) or >>
+    assert(payment_fails(rt.AGE_16_TO_17, 10001, 0))
+    assert(payment_fails(rt.AGE_16_TO_17, 6000, 35000))
+    _ := rt.check_minor_payment_limit(rt.AGE_ADULT, 999999, 5000000) or >>
+
+    // 3. Submission audit (CN compliance/CADPA vs Global)
+    rep_ok := rt.audit_taptap_submission(&cfg)
+    assert(rep_ok.passed && rep_ok.issues.len == 0)
+
+    $no_isbn := cfg.clone()
+    no_isbn.isbn_code = ""
+    rep_warn := rt.audit_taptap_submission(&no_isbn)
+    assert(rep_warn.passed && rep_warn.issues.len == 1 && rep_warn.issues[0].code == "TAP-005")
+
+    $no_comp := cfg.clone()
+    no_comp.enable_compliance = false
+    rep_fail_comp := rt.audit_taptap_submission(&no_comp)
+    assert(!rep_fail_comp.passed && rep_fail_comp.issues[0].code == "TAP-003")
+
+    $bad_age := cfg.clone()
+    bad_age.age_rating = 0
+    rep_fail_age := rt.audit_taptap_submission(&bad_age)
+    assert(!rep_fail_age.passed && rep_fail_age.issues[0].code == "TAP-004")
+
+    $global_cfg := rt.default_config("tap_global_01", "tok_g_456", rt.REGION_GLOBAL)
+    global_cfg.target_platform = rt.TARGET_IOS
+    assert(rt.audit_taptap_submission(&global_cfg).passed)
+
+    // 4. Manifest generators (SDK JSON, Android Manifest, iOS Info.plist, PC AppID)
+    sdk_json := rt.generate_taptap_sdk_config_json(&cfg) or >>
+    assert(strings.contains(&sdk_json, "\"clientId\": \"tap_client_001\""))
+    assert(strings.contains(&sdk_json, "\"complianceEnabled\": true"))
+
+    and_xml := rt.generate_android_manifest_snippet(&cfg) or >>
+    assert(strings.contains(&and_xml, "com.taptap") && strings.contains(&and_xml, "tttap_client_001"))
+
+    ios_plist := rt.generate_ios_info_plist_snippet(&global_cfg) or >>
+    assert(strings.contains(&ios_plist, "tttap_global_01") && strings.contains(&ios_plist, "tapiosdk"))
+
+    pc_txt := rt.generate_pc_appid_txt(&cfg) or >>
+    assert(pc_txt == "tap_client_001\n")
+
+    println("PASS: taptap_data_checks")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

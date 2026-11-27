@@ -1,0 +1,320 @@
+@"github.com/xulang-org/nexus/physics3d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#math
+#errors
+
+pub const MAX_COLLIDERS = 4096
+const WORLD_LIMIT = 1000000000
+
+pub struct RayHit3D {
+    pub collider int
+    pub distance f64
+    pub point fm.Vec3
+    pub normal fm.Vec3
+    pub started_inside bool
+}
+pub struct SweepHit3D {
+    pub hit bool
+    pub time f64
+    pub normal fm.Vec3
+    pub started_overlapping bool
+}
+pub struct MotionResult3D {
+    pub bounds fm.Aabb3
+    pub travelled fm.Vec3
+    pub collisions int
+    pub on_floor bool
+    pub on_wall bool
+    pub on_ceiling bool
+}
+
+struct AxisInterval { entry f64
+    exit f64
+    separated bool }
+struct Cast { hit bool
+    time f64
+    normal fm.Vec3 }
+
+fn zero() fm.Vec3 { << fm.vec3(0.0, 0.0, 0.0) }
+fn valid_point(p fm.Vec3) bool {
+    limit := f64(WORLD_LIMIT)
+    << p.is_finite() && math.abs(p.x) <= limit && math.abs(p.y) <= limit && math.abs(p.z) <= limit
+}
+fn check_box(box fm.Aabb3) int {
+    if !valid_point(box.minimum) || !valid_point(box.maximum) || box.minimum.x >= box.maximum.x ||
+        box.minimum.y >= box.maximum.y || box.minimum.z >= box.maximum.z {
+        >> errors.new("nexus physics3d: collider must be a finite nonempty AABB within world bounds")
+    }
+    << 0
+}
+fn check_solids(solids &[]fm.Aabb3) int {
+    if solids.len > MAX_COLLIDERS { >> errors.new("nexus physics3d: static collider budget exceeded") }
+    for solid in solids { check_box(solid) or >> }
+    << 0
+}
+fn intersects_open(a fm.Aabb3, b fm.Aabb3) bool {
+    << a.minimum.x < b.maximum.x && a.maximum.x > b.minimum.x &&
+        a.minimum.y < b.maximum.y && a.maximum.y > b.minimum.y &&
+        a.minimum.z < b.maximum.z && a.maximum.z > b.minimum.z
+}
+fn translated(box fm.Aabb3, motion fm.Vec3) fm.Aabb3 {
+    << fm.Aabb3{minimum: box.minimum.add(motion), maximum: box.maximum.add(motion)}
+}
+
+// Times outside the segment only need to preserve ordering with [0, 1].
+// Saturating before division also handles subnormal nonzero motions.
+fn clipped_ratio(numerator f64, speed f64) f64 {
+    if numerator <= -speed * 2.0 { << -2.0 }
+    if numerator >= speed * 2.0 { << 2.0 }
+    << numerator / speed
+}
+fn slab(low f64, high f64, target_low f64, target_high f64, motion f64, closed bool) AxisInterval {
+    if motion == 0.0 {
+        $separated := high <= target_low || low >= target_high
+        if closed { separated = high < target_low || low > target_high }
+        << AxisInterval{entry: -2.0, exit: 2.0, separated: separated}
+    }
+    if motion > 0.0 {
+        << AxisInterval{entry: clipped_ratio(target_low - high, motion),
+            exit: clipped_ratio(target_high - low, motion), separated: false}
+    }
+    << AxisInterval{entry: clipped_ratio(low - target_high, -motion),
+        exit: clipped_ratio(high - target_low, -motion), separated: false}
+}
+fn entry_normal(motion f64) f64 {
+    if motion > 0.0 { << -1.0 }
+    << 1.0
+}
+fn cast_box(body fm.Aabb3, motion fm.Vec3, solid fm.Aabb3, closed bool) Cast {
+    x := slab(body.minimum.x, body.maximum.x, solid.minimum.x, solid.maximum.x, motion.x, closed)
+    y := slab(body.minimum.y, body.maximum.y, solid.minimum.y, solid.maximum.y, motion.y, closed)
+    z := slab(body.minimum.z, body.maximum.z, solid.minimum.z, solid.maximum.z, motion.z, closed)
+    entry := math.max(x.entry, math.max(y.entry, z.entry))
+    exit := math.min(x.exit, math.min(y.exit, z.exit))
+    // Rays can touch the edge of a closed box. A box sweep blocks only if
+    // continuing the motion would produce a positive-duration overlap.
+    if x.separated || y.separated || z.separated || entry < 0.0 || entry > 1.0 ||
+        entry > exit || (!closed && entry == exit) {
+        << Cast{hit: false, time: 1.0, normal: zero()}
+    }
+    if x.entry == entry { << Cast{hit: true, time: entry, normal: fm.vec3(entry_normal(motion.x), 0.0, 0.0)} }
+    if y.entry == entry { << Cast{hit: true, time: entry, normal: fm.vec3(0.0, entry_normal(motion.y), 0.0)} }
+    << Cast{hit: true, time: entry, normal: fm.vec3(0.0, 0.0, entry_normal(motion.z))}
+}
+
+// A point on or inside a solid hits at distance zero with a zero normal.
+// Equal-distance colliders retain input order. A miss has collider == -1.
+pub fn raycast(origin fm.Vec3, direction fm.Vec3, distance f64, solids &[]fm.Aabb3) RayHit3D {
+    if !fm.finite(distance) || distance <= 0.0 || !valid_point(origin) {
+        >> errors.new("nexus physics3d: invalid ray origin or distance")
+    }
+    motion := (direction.normalized() or >>).scaled(distance)
+    end := origin.add(motion)
+    if !valid_point(end) { >> errors.new("nexus physics3d: ray endpoint outside world bounds") }
+    check_solids(solids) or >>
+    point := fm.Aabb3{minimum: origin, maximum: origin}
+    $best := Cast{hit: false, time: 1.0, normal: zero()}
+    $collider := -1
+    for i in 0:solids.len {
+        solid := solids[i]
+        if solid.contains(origin) or >> { << RayHit3D{collider: i, distance: 0.0, point: origin, normal: zero(), started_inside: true} }
+        candidate := cast_box(point, motion, solid, true)
+        if candidate.hit && (!best.hit || candidate.time < best.time) {
+            collider = i
+            best = candidate
+        }
+    }
+    << RayHit3D{collider: collider, distance: best.time * distance,
+        point: origin.add(motion.scaled(best.time)), normal: best.normal, started_inside: false}
+}
+
+fn check_motion(body fm.Aabb3, motion fm.Vec3) int {
+    check_box(body) or >>
+    check_box(translated(body, motion)) or >>
+    << 0
+}
+pub fn sweep_aabb(body fm.Aabb3, motion fm.Vec3, solid fm.Aabb3) SweepHit3D {
+    check_motion(body, motion) or >>
+    check_box(solid) or >>
+    if intersects_open(body, solid) {
+        << SweepHit3D{hit: true, time: 0.0, normal: zero(), started_overlapping: true}
+    }
+    result := cast_box(body, motion, solid, false)
+    << SweepHit3D{hit: result.hit, time: result.time, normal: result.normal, started_overlapping: false}
+}
+
+struct Contact3D { hit bool
+    time f64
+    normals fm.Vec3
+    planes fm.Vec3 }
+
+fn contact_plane(normal f64, previous f64, plane f64, low f64, high f64) f64 {
+    if normal < 0.0 {
+        if previous != 0.0 { << math.min(plane, low) }
+        << low
+    }
+    if previous != 0.0 { << math.max(plane, high) }
+    << high
+}
+fn nearest_contact(body fm.Aabb3, motion fm.Vec3, solids &[]fm.Aabb3) Contact3D {
+    $contact := Contact3D{hit: false, time: 1.0, normals: zero(), planes: zero()}
+    for solid in solids {
+        candidate := cast_box(body, motion, solid, false)
+        if !candidate.hit || candidate.time > contact.time { -> }
+        if !contact.hit || candidate.time < contact.time {
+            contact = Contact3D{hit: true, time: candidate.time, normals: zero(), planes: zero()}
+        }
+        // Different solids reached simultaneously can block different axes.
+        // On the same axis the most restrictive face wins a numeric tie.
+        n := candidate.normal
+        if n.x != 0.0 {
+            contact.planes.x = contact_plane(n.x, contact.normals.x, contact.planes.x, solid.minimum.x, solid.maximum.x)
+            contact.normals.x = n.x
+        } else if n.y != 0.0 {
+            contact.planes.y = contact_plane(n.y, contact.normals.y, contact.planes.y, solid.minimum.y, solid.maximum.y)
+            contact.normals.y = n.y
+        } else {
+            contact.planes.z = contact_plane(n.z, contact.normals.z, contact.planes.z, solid.minimum.z, solid.maximum.z)
+            contact.normals.z = n.z
+        }
+    }
+    << contact
+}
+fn snap_contacts(box fm.Aabb3, contact Contact3D) fm.Aabb3 {
+    $out := box
+    n := contact.normals
+    p := contact.planes
+    // Translate both faces by the correction. Rebuilding the opposite face
+    // from a rounded width can enlarge a box at a zero-time contact.
+    if n.x < 0.0 {
+        out.minimum.x += p.x - box.maximum.x
+        out.maximum.x = p.x
+    } else if n.x > 0.0 {
+        out.maximum.x += p.x - box.minimum.x
+        out.minimum.x = p.x
+    }
+    if n.y < 0.0 {
+        out.minimum.y += p.y - box.maximum.y
+        out.maximum.y = p.y
+    } else if n.y > 0.0 {
+        out.maximum.y += p.y - box.minimum.y
+        out.minimum.y = p.y
+    }
+    if n.z < 0.0 {
+        out.minimum.z += p.z - box.maximum.z
+        out.maximum.z = p.z
+    } else if n.z > 0.0 {
+        out.maximum.z += p.z - box.minimum.z
+        out.minimum.z = p.z
+    }
+    << out
+}
+fn reject_overlap(body fm.Aabb3, solids &[]fm.Aabb3) int {
+    for solid in solids {
+        if intersects_open(body, solid) { >> errors.new("nexus physics3d: moving box overlaps a static collider") }
+    }
+    << 0
+}
+
+// +Y up. Each blocking pass removes at least one motion component. Snap only
+// the contacted faces, so tangential motion works even in an exact-width gap.
+pub fn move_and_slide(body fm.Aabb3, motion fm.Vec3, solids &[]fm.Aabb3) MotionResult3D {
+    check_motion(body, motion) or >>
+    check_solids(solids) or >>
+    reject_overlap(body, solids) or >>
+    $bounds := body
+    $remaining := motion
+    $floor := false
+    $wall := false
+    $ceiling := false
+    $collisions := 0
+    for pass in 0:3 {
+        if remaining.x == 0.0 && remaining.y == 0.0 && remaining.z == 0.0 { <- }
+        contact := nearest_contact(bounds, remaining, solids)
+        if !contact.hit {
+            bounds = translated(bounds, remaining)
+            <-
+        }
+        bounds = snap_contacts(translated(bounds, remaining.scaled(contact.time)), contact)
+        reject_overlap(bounds, solids) or >>
+        remaining = remaining.scaled(1.0 - contact.time)
+        n := contact.normals
+        if n.x != 0.0 { remaining.x = 0.0 }
+        if n.y != 0.0 { remaining.y = 0.0 }
+        if n.z != 0.0 { remaining.z = 0.0 }
+        floor = floor || n.y > 0.0
+        wall = wall || n.x != 0.0 || n.z != 0.0
+        ceiling = ceiling || n.y < 0.0
+        collisions += 1
+    }
+    check_box(bounds) or >>
+    reject_overlap(bounds, solids) or >>
+    << MotionResult3D{bounds: bounds, travelled: bounds.minimum.sub(body.minimum), collisions: collisions,
+        on_floor: floor, on_wall: wall, on_ceiling: ceiling}
+}
+
+pub fn raycast_all(origin fm.Vec3, direction fm.Vec3, distance f64, solids &[]fm.Aabb3) []RayHit3D {
+    if !fm.finite(distance) || distance <= 0.0 || !valid_point(origin) {
+        >> errors.new("nexus physics3d: invalid ray origin or distance")
+    }
+    motion := (direction.normalized() or >>).scaled(distance)
+    end := origin.add(motion)
+    if !valid_point(end) { >> errors.new("nexus physics3d: ray endpoint outside world bounds") }
+    check_solids(solids) or >>
+    point := fm.Aabb3{minimum: origin, maximum: origin}
+    $hits := []RayHit3D{}
+    for i in 0:solids.len {
+        solid := solids[i]
+        if solid.contains(origin) or >> {
+            hits.push(RayHit3D{collider: i, distance: 0.0, point: origin, normal: zero(), started_inside: true})
+            ->
+        }
+        candidate := cast_box(point, motion, solid, true)
+        if candidate.hit {
+            hits.push(RayHit3D{
+                collider: i,
+                distance: candidate.time * distance,
+                point: origin.add(motion.scaled(candidate.time)),
+                normal: candidate.normal,
+                started_inside: false
+            })
+        }
+    }
+    if hits.len > 1 {
+        for i in 0:(hits.len - 1) {
+            for j in (i + 1):hits.len {
+                if hits[j].distance < hits[i].distance {
+                    tmp := hits[i]
+                    hits[i] = hits[j]
+                    hits[j] = tmp
+                }
+            }
+        }
+    }
+    << hits
+}
+
+pub fn overlap_aabb(query fm.Aabb3, solids &[]fm.Aabb3) []int {
+    check_box(query) or >>
+    check_solids(solids) or >>
+    $ids := []int{}
+    for i in 0:solids.len {
+        if intersects_open(query, solids[i]) { ids.push(i) }
+    }
+    << ids
+}
+
+pub fn overlap_sphere(center fm.Vec3, radius f64, solids &[]fm.Aabb3) []int {
+    if !valid_point(center) || !fm.finite(radius) || radius < 0.0 {
+        >> errors.new("nexus physics3d: invalid overlap sphere parameters")
+    }
+    check_solids(solids) or >>
+    rsq := radius * radius
+    $ids := []int{}
+    for i in 0:solids.len {
+        dsq := solids[i].distance_squared(center) or >>
+        if dsq <= rsq { ids.push(i) }
+    }
+    << ids
+}

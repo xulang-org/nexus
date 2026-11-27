@@ -1,0 +1,193 @@
+@"github.com/xulang-org/nexus/foundation/math"
+
+#math
+
+// Pure deterministic 32-bit-masked integer hashing and procedural Perlin/Value/fBm noise.
+fn mix32(v int) int {
+    $h := v & 0xFFFFFFFF
+    h = ((h ^ (h >> 16)) * 0x45d9f3b) & 0xFFFFFFFF
+    h = ((h ^ (h >> 16)) * 0x45d9f3b) & 0xFFFFFFFF
+    h = (h ^ (h >> 16)) & 0xFFFFFFFF
+    << h
+}
+
+pub fn hash_u32(x int, seed int) int {
+    $h := mix32(seed)
+    h = mix32(h ^ (x & 0xFFFFFFFF))
+    << h & 0x7FFFFFFF
+}
+
+pub fn hash_2d(x int, y int, seed int) int {
+    $h := mix32(seed)
+    h = mix32(h ^ (x & 0xFFFFFFFF))
+    h = mix32(h ^ (y & 0xFFFFFFFF))
+    << h & 0x7FFFFFFF
+}
+
+pub fn hash_3d(x int, y int, z int, seed int) int {
+    $h := mix32(seed)
+    h = mix32(h ^ (x & 0xFFFFFFFF))
+    h = mix32(h ^ (y & 0xFFFFFFFF))
+    h = mix32(h ^ (z & 0xFFFFFFFF))
+    << h & 0x7FFFFFFF
+}
+
+fn hash01_2d(x int, y int, seed int) f64 {
+    << f64(hash_2d(x, y, seed)) / 2147483647.0
+}
+
+fn fade(t f64) f64 {
+    << t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+fn grad_2d(h int, dx f64, dy f64) f64 {
+    g := h & 7
+    $u := dx
+    $v := dy
+    if g >= 4 {
+        u = dy
+        v = dx
+    }
+    $s1 := u
+    $s2 := v
+    if (g & 1) != 0 { s1 = -u }
+    if (g & 2) != 0 { s2 = -v }
+    << s1 + s2
+}
+
+fn grad_3d(h int, dx f64, dy f64, dz f64) f64 {
+    g := h & 15
+    $u := dy
+    if g < 8 { u = dx }
+    $v := dz
+    if g < 4 { v = dy }
+    if g == 12 || g == 14 { v = dx }
+    $a := -u
+    if (g & 1) == 0 { a = u }
+    $b := -v
+    if (g & 2) == 0 { b = v }
+    << a + b
+}
+
+// Returns deterministic smooth value noise in [0, 1].
+pub fn value_noise_2d(x f64, y f64, seed int) f64 {
+    if !finite(x) || !finite(y) { << 0.5 }
+    ix := int(math.floor(x))
+    iy := int(math.floor(y))
+    fx := x - f64(ix)
+    fy := y - f64(iy)
+    u := fade(fx)
+    v := fade(fy)
+    a := hash01_2d(ix, iy, seed)
+    b := hash01_2d(ix + 1, iy, seed)
+    c := hash01_2d(ix, iy + 1, seed)
+    d := hash01_2d(ix + 1, iy + 1, seed)
+    ab := a + (b - a) * u
+    cd := c + (d - c) * u
+    << ab + (cd - ab) * v
+}
+
+// Returns 2D gradient Perlin noise in roughly [-1, 1].
+pub fn perlin_2d(x f64, y f64, seed int) f64 {
+    if !finite(x) || !finite(y) { << 0.0 }
+    ix := int(math.floor(x))
+    iy := int(math.floor(y))
+    fx := x - f64(ix)
+    fy := y - f64(iy)
+    u := fade(fx)
+    v := fade(fy)
+    n00 := grad_2d(hash_2d(ix, iy, seed), fx, fy)
+    n10 := grad_2d(hash_2d(ix + 1, iy, seed), fx - 1.0, fy)
+    n01 := grad_2d(hash_2d(ix, iy + 1, seed), fx, fy - 1.0)
+    n11 := grad_2d(hash_2d(ix + 1, iy + 1, seed), fx - 1.0, fy - 1.0)
+    nx0 := n00 + (n10 - n00) * u
+    nx1 := n01 + (n11 - n01) * u
+    << clamp((nx0 + (nx1 - nx0) * v) * 0.70710678, -1.0, 1.0)
+}
+
+// Returns 3D gradient Perlin noise in roughly [-1, 1].
+pub fn perlin_3d(x f64, y f64, z f64, seed int) f64 {
+    if !finite(x) || !finite(y) || !finite(z) { << 0.0 }
+    ix := int(math.floor(x))
+    iy := int(math.floor(y))
+    iz := int(math.floor(z))
+    fx := x - f64(ix)
+    fy := y - f64(iy)
+    fz := z - f64(iz)
+    u := fade(fx)
+    v := fade(fy)
+    w := fade(fz)
+
+    c000 := grad_3d(hash_3d(ix, iy, iz, seed), fx, fy, fz)
+    c100 := grad_3d(hash_3d(ix + 1, iy, iz, seed), fx - 1.0, fy, fz)
+    c010 := grad_3d(hash_3d(ix, iy + 1, iz, seed), fx, fy - 1.0, fz)
+    c110 := grad_3d(hash_3d(ix + 1, iy + 1, iz, seed), fx - 1.0, fy - 1.0, fz)
+    c001 := grad_3d(hash_3d(ix, iy, iz + 1, seed), fx, fy, fz - 1.0)
+    c101 := grad_3d(hash_3d(ix + 1, iy, iz + 1, seed), fx - 1.0, fy, fz - 1.0)
+    c011 := grad_3d(hash_3d(ix, iy + 1, iz + 1, seed), fx, fy - 1.0, fz - 1.0)
+    c111 := grad_3d(hash_3d(ix + 1, iy + 1, iz + 1, seed), fx - 1.0, fy - 1.0, fz - 1.0)
+
+    x00 := c000 + (c100 - c000) * u
+    x10 := c010 + (c110 - c010) * u
+    x01 := c001 + (c101 - c001) * u
+    x11 := c011 + (c111 - c011) * u
+    y0 := x00 + (x10 - x00) * v
+    y1 := x01 + (x11 - x01) * v
+    << clamp(y0 + (y1 - y0) * w, -1.0, 1.0)
+}
+
+pub fn fbm_2d(x f64, y f64, seed int, octaves int, lacunarity f64, gain f64) f64 {
+    if octaves <= 0 { << 0.0 }
+    $count := octaves
+    if count > 12 { count = 12 }
+    $sum := 0.0
+    $amp := 1.0
+    $freq := 1.0
+    $norm := 0.0
+    for o in 0:count {
+        sum = sum + amp * perlin_2d(x * freq, y * freq, seed + o * 1013)
+        norm = norm + amp
+        freq = freq * lacunarity
+        amp = amp * gain
+    }
+    if norm <= 1e-12 { << 0.0 }
+    << sum / norm
+}
+
+pub fn fbm_3d(x f64, y f64, z f64, seed int, octaves int, lacunarity f64, gain f64) f64 {
+    if octaves <= 0 { << 0.0 }
+    $count := octaves
+    if count > 12 { count = 12 }
+    $sum := 0.0
+    $amp := 1.0
+    $freq := 1.0
+    $norm := 0.0
+    for o in 0:count {
+        sum = sum + amp * perlin_3d(x * freq, y * freq, z * freq, seed + o * 1013)
+        norm = norm + amp
+        freq = freq * lacunarity
+        amp = amp * gain
+    }
+    if norm <= 1e-12 { << 0.0 }
+    << sum / norm
+}
+
+pub fn ridged_fbm_2d(x f64, y f64, seed int, octaves int, lacunarity f64, gain f64) f64 {
+    if octaves <= 0 { << 0.0 }
+    $count := octaves
+    if count > 12 { count = 12 }
+    $sum := 0.0
+    $amp := 1.0
+    $freq := 1.0
+    $norm := 0.0
+    for o in 0:count {
+        n := perlin_2d(x * freq, y * freq, seed + o * 1013)
+        ridge := 1.0 - math.abs(n)
+        sum = sum + amp * ridge * ridge
+        norm = norm + amp
+        freq = freq * lacunarity
+        amp = amp * gain
+    }
+    if norm <= 1e-12 { << 0.0 }
+    << sum / norm
+}

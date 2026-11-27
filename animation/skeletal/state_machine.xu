@@ -1,0 +1,910 @@
+@"github.com/xulang-org/nexus/animation/skeletal"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+gltf #"github.com/xulang-org/nexus/formats/gltf"
+#errors
+#math
+
+pub const STATE_CLIP = 0
+pub const STATE_BLEND_1D = 1
+pub const STATE_BLEND_2D = 2
+
+pub const COND_GT = 0
+pub const COND_LT = 1
+pub const COND_GE = 2
+pub const COND_LE = 3
+pub const COND_BOOL_TRUE = 4
+pub const COND_BOOL_FALSE = 5
+pub const COND_TRIGGER = 6
+
+pub struct BlendSample1D {
+    pub clip int
+    pub coord f64
+    pub speed f64
+}
+
+pub struct BlendSpace1D {
+    samples []BlendSample1D
+}
+
+pub fn new_blend_space_1d() BlendSpace1D {
+    << BlendSpace1D{samples: []BlendSample1D{}}
+}
+
+pub fn (bs $&BlendSpace1D) add_sample(clip int, coord f64, speed f64) int {
+    if clip < 0 || !fm.finite(coord) || !fm.finite(speed) || speed <= 0.0 {
+        >> errors.new("nexus anim: invalid 1D blend sample")
+    }
+    bs.samples.push(BlendSample1D{clip: clip, coord: coord, speed: speed})
+    // Insertion step keeps samples ordered by coord.
+    $i := bs.samples.len - 1
+    while i > 0 {
+        j := i - 1
+        if bs.samples[j].coord <= bs.samples[i].coord { <- }
+        tmp := bs.samples[i]
+        bs.samples[i] = bs.samples[j]
+        bs.samples[j] = tmp
+        i -= 1
+    }
+    << bs.samples.len - 1
+}
+
+pub fn (bs &BlendSpace1D) sample_count() int {
+    << bs.samples.len
+}
+
+pub fn (bs &BlendSpace1D) effective_duration(asset &gltf.GlbGeometry, param f64) f64 {
+    if bs.samples.len == 0 || !fm.finite(param) {
+        >> errors.new("nexus anim: 1D blend space is empty or non-finite")
+    }
+    if bs.samples.len == 1 || param <= bs.samples[0].coord {
+        d := asset.animation_duration(bs.samples[0].clip) or >>
+        << math.max(0.001, d / bs.samples[0].speed)
+    }
+    last := bs.samples.len - 1
+    if param >= bs.samples[last].coord {
+        d := asset.animation_duration(bs.samples[last].clip) or >>
+        << math.max(0.001, d / bs.samples[last].speed)
+    }
+    for i in 0:last {
+        s0 := &bs.samples[i]
+        ni := i + 1
+        s1 := &bs.samples[ni]
+        if param <= s1.coord {
+            span := s1.coord - s0.coord
+            $t := 0.0
+            if span > 1e-9 { t = (param - s0.coord) / span }
+            d0 := math.max(0.001, (asset.animation_duration(s0.clip) or >>) / s0.speed)
+            d1 := math.max(0.001, (asset.animation_duration(s1.clip) or >>) / s1.speed)
+            << d0 * (1.0 - t) + d1 * t
+        }
+    }
+    << 1.0
+}
+
+pub fn (bs &BlendSpace1D) evaluate(asset &gltf.GlbGeometry, param f64, normalized_phase f64) []gltf.NodeTrs {
+    if bs.samples.len == 0 || !fm.finite(param) || !fm.finite(normalized_phase) {
+        >> errors.new("nexus anim: invalid 1D blend space evaluation inputs")
+    }
+    phase := clamp_f(normalized_phase, 0.0, 1.0)
+    if bs.samples.len == 1 || param <= bs.samples[0].coord {
+        s0 := &bs.samples[0]
+        d0 := asset.animation_duration(s0.clip) or >>
+        << asset.sample_trs_pose(s0.clip, phase * d0) or >>
+    }
+    last := bs.samples.len - 1
+    if param >= bs.samples[last].coord {
+        sl := &bs.samples[last]
+        dl := asset.animation_duration(sl.clip) or >>
+        << asset.sample_trs_pose(sl.clip, phase * dl) or >>
+    }
+    for i in 0:last {
+        s0 := &bs.samples[i]
+        ni := i + 1
+        s1 := &bs.samples[ni]
+        if param <= s1.coord {
+            span := s1.coord - s0.coord
+            $t := 0.0
+            if span > 1e-9 { t = clamp_f((param - s0.coord) / span, 0.0, 1.0) }
+            d0 := asset.animation_duration(s0.clip) or >>
+            d1 := asset.animation_duration(s1.clip) or >>
+            p0 := asset.sample_trs_pose(s0.clip, phase * d0) or >>
+            p1 := asset.sample_trs_pose(s1.clip, phase * d1) or >>
+            << blend_poses(&p0, &p1, t) or >>
+        }
+    }
+    << []gltf.NodeTrs{}
+}
+
+pub struct BlendSample2D {
+    pub clip int
+    pub x f64
+    pub y f64
+    pub speed f64
+}
+
+pub struct BlendSpace2D {
+    samples []BlendSample2D
+}
+
+pub fn new_blend_space_2d() BlendSpace2D {
+    << BlendSpace2D{samples: []BlendSample2D{}}
+}
+
+pub fn (bs $&BlendSpace2D) add_sample(clip int, x f64, y f64, speed f64) int {
+    if clip < 0 || !fm.finite(x) || !fm.finite(y) || !fm.finite(speed) || speed <= 0.0 {
+        >> errors.new("nexus anim: invalid 2D blend sample")
+    }
+    bs.samples.push(BlendSample2D{clip: clip, x: x, y: y, speed: speed})
+    << bs.samples.len - 1
+}
+
+// Gradient-band Cartesian influence weights (with inverse-distance fallback) summing to 1.0.
+pub fn (bs &BlendSpace2D) compute_weights(px f64, py f64) []f64 {
+    n := bs.samples.len
+    if n == 0 || !fm.finite(px) || !fm.finite(py) {
+        >> errors.new("nexus anim: empty 2D blend space or non-finite coordinates")
+    }
+    $weights := []f64{}
+    for _ in 0:n { weights.push(0.0) }
+    if n == 1 {
+        weights[0] = 1.0
+        << weights
+    }
+    for i in 0:n {
+        dx := px - bs.samples[i].x
+        dy := py - bs.samples[i].y
+        if dx * dx + dy * dy < 1e-12 {
+            weights[i] = 1.0
+            << weights
+        }
+    }
+    $sum_w := 0.0
+    for i in 0:n {
+        si := &bs.samples[i]
+        $band := 1.0
+        for j in 0:n {
+            if i == j { -> }
+            sj := &bs.samples[j]
+            vx := sj.x - si.x
+            vy := sj.y - si.y
+            len2 := vx * vx + vy * vy
+            if len2 <= 1e-12 { -> }
+            proj := ((px - si.x) * vx + (py - si.y) * vy) / len2
+            w_pair := clamp_f(1.0 - proj, 0.0, 1.0)
+            if w_pair < band { band = w_pair }
+        }
+        weights[i] = band
+        sum_w += band
+    }
+    if sum_w <= 1e-9 {
+        sum_w = 0.0
+        for i in 0:n {
+            dx := px - bs.samples[i].x
+            dy := py - bs.samples[i].y
+            w_inv := 1.0 / math.max(dx * dx + dy * dy, 1e-9)
+            weights[i] = w_inv
+            sum_w += w_inv
+        }
+    }
+    for i in 0:n { weights[i] = weights[i] / sum_w }
+    << weights
+}
+
+pub fn (bs &BlendSpace2D) effective_duration(asset &gltf.GlbGeometry, px f64, py f64) f64 {
+    w := bs.compute_weights(px, py) or >>
+    $dur := 0.0
+    for i in 0:bs.samples.len {
+        if w[i] <= 1e-6 { -> }
+        s := &bs.samples[i]
+        d := math.max(0.001, (asset.animation_duration(s.clip) or >>) / s.speed)
+        dur += w[i] * d
+    }
+    << math.max(0.001, dur)
+}
+
+pub fn (bs &BlendSpace2D) evaluate(asset &gltf.GlbGeometry, px f64, py f64, normalized_phase f64) []gltf.NodeTrs {
+    if !fm.finite(normalized_phase) {
+        >> errors.new("nexus anim: non-finite phase in 2D blend space")
+    }
+    phase := clamp_f(normalized_phase, 0.0, 1.0)
+    w := bs.compute_weights(px, py) or >>
+    $accum := []gltf.NodeTrs{}
+    $accum_w := 0.0
+    for i in 0:bs.samples.len {
+        wi := w[i]
+        if wi <= 1e-6 { -> }
+        s := &bs.samples[i]
+        d := asset.animation_duration(s.clip) or >>
+        pose := asset.sample_trs_pose(s.clip, phase * d) or >>
+        if accum_w <= 0.0 {
+            for pi in 0:pose.len { accum.push(pose[pi]) }
+            accum_w = wi
+        } else {
+            next_total := accum_w + wi
+            accum = blend_poses(&accum, &pose, wi / next_total) or >>
+            accum_w = next_total
+        }
+    }
+    << accum
+}
+
+pub struct AnimationEvent {
+    pub clip int
+    pub time f64
+    pub name string
+    pub tag int
+}
+
+pub struct FiredEvent {
+    pub name string
+    pub tag int
+    pub clip int
+    pub time f64
+}
+
+pub struct TransitionCondition {
+    pub kind int
+    pub param string
+    pub threshold f64
+}
+
+struct AnimState {
+    name string
+    kind int
+    clip int
+    space1d BlendSpace1D
+    space2d BlendSpace2D
+    param_x string
+    param_y string
+    looping bool
+    speed f64
+    sync_group int
+}
+
+struct AnimTransition {
+    from_state int
+    to_state int
+    fade_duration f64
+    has_exit_time bool
+    exit_time f64
+    conditions []TransitionCondition
+}
+
+pub struct AnimStepResult {
+    pub pose []gltf.NodeTrs
+    pub events []FiredEvent
+    pub root_motion RootMotionDelta
+    pub active_state int
+    pub blending bool
+    pub blend_alpha f64
+}
+
+pub struct AnimationStateMachine {
+    states []AnimState
+    transitions []AnimTransition
+    events []AnimationEvent
+    floats map[string]f64
+    bools map[string]bool
+    triggers map[string]bool
+    current_state int
+    prev_state int
+    current_phase f64
+    prev_phase f64
+    fade_elapsed f64
+    fade_duration f64
+    blending bool
+    has_overlay bool
+    overlay_clip int
+    overlay_mask BoneMask
+    overlay_weight f64
+    overlay_looping bool
+    overlay_speed f64
+    overlay_time f64
+    has_additive bool
+    add_clip int
+    add_ref_clip int
+    add_ref_time f64
+    add_weight f64
+    add_looping bool
+    add_speed f64
+    add_time f64
+    rm_enabled bool
+    rm_root_node int
+    rm_lock_xz bool
+    rm_lock_y bool
+    inertial_enabled bool
+    inertial_half_life f64
+    inertial_active bool
+    inertial_elapsed f64
+    inertial_duration f64
+    has_last_pose bool
+    last_pose []gltf.NodeTrs
+    offset_pos []fm.Vec3
+    offset_rot []fm.Vec4
+    offset_scale []fm.Vec3
+}
+
+pub fn new_state_machine() AnimationStateMachine {
+    << AnimationStateMachine{
+        states: []AnimState{},
+        transitions: []AnimTransition{},
+        events: []AnimationEvent{},
+        floats: map[string]f64{},
+        bools: map[string]bool{},
+        triggers: map[string]bool{},
+        current_state: -1,
+        prev_state: -1,
+        current_phase: 0.0,
+        prev_phase: 0.0,
+        fade_elapsed: 0.0,
+        fade_duration: 0.0,
+        blending: false,
+        has_overlay: false,
+        overlay_clip: -1,
+        overlay_mask: BoneMask{weights: []f64{}},
+        overlay_weight: 0.0,
+        overlay_looping: true,
+        overlay_speed: 1.0,
+        overlay_time: 0.0,
+        has_additive: false,
+        add_clip: -1,
+        add_ref_clip: -1,
+        add_ref_time: 0.0,
+        add_weight: 0.0,
+        add_looping: false,
+        add_speed: 1.0,
+        add_time: 0.0,
+        rm_enabled: false,
+        rm_root_node: 0,
+        rm_lock_xz: true,
+        rm_lock_y: false,
+        inertial_enabled: false,
+        inertial_half_life: 0.12,
+        inertial_active: false,
+        inertial_elapsed: 0.0,
+        inertial_duration: 0.0,
+        has_last_pose: false,
+        last_pose: []gltf.NodeTrs{},
+        offset_pos: []fm.Vec3{},
+        offset_rot: []fm.Vec4{},
+        offset_scale: []fm.Vec3{}
+    }
+}
+
+pub fn (sm $&AnimationStateMachine) add_clip_state(name string, clip int, looping bool, speed f64) int {
+    if clip < 0 || !fm.finite(speed) || speed <= 0.0 {
+        >> errors.new("nexus anim: invalid clip state")
+    }
+    sm.states.push(AnimState{
+        name: name + "",
+        kind: STATE_CLIP,
+        clip: clip,
+        space1d: new_blend_space_1d(),
+        space2d: new_blend_space_2d(),
+        param_x: "",
+        param_y: "",
+        looping: looping,
+        speed: speed,
+        sync_group: -1
+    })
+    id := sm.states.len - 1
+    if sm.current_state < 0 { sm.current_state = id }
+    << id
+}
+
+pub fn (sm $&AnimationStateMachine) add_blend_1d_state(
+    name string,
+    space BlendSpace1D,
+    param_name string,
+    looping bool,
+    speed f64
+) int {
+    if space.samples.len == 0 || !fm.finite(speed) || speed <= 0.0 {
+        >> errors.new("nexus anim: invalid 1D blend state")
+    }
+    sm.states.push(AnimState{
+        name: name + "",
+        kind: STATE_BLEND_1D,
+        clip: -1,
+        space1d: space,
+        space2d: new_blend_space_2d(),
+        param_x: param_name + "",
+        param_y: "",
+        looping: looping,
+        speed: speed,
+        sync_group: -1
+    })
+    id := sm.states.len - 1
+    if sm.current_state < 0 { sm.current_state = id }
+    << id
+}
+
+pub fn (sm $&AnimationStateMachine) add_blend_2d_state(
+    name string,
+    space BlendSpace2D,
+    param_x string,
+    param_y string,
+    looping bool,
+    speed f64
+) int {
+    if space.samples.len == 0 || !fm.finite(speed) || speed <= 0.0 {
+        >> errors.new("nexus anim: invalid 2D blend state")
+    }
+    sm.states.push(AnimState{
+        name: name + "",
+        kind: STATE_BLEND_2D,
+        clip: -1,
+        space1d: new_blend_space_1d(),
+        space2d: space,
+        param_x: param_x + "",
+        param_y: param_y + "",
+        looping: looping,
+        speed: speed,
+        sync_group: -1
+    })
+    id := sm.states.len - 1
+    if sm.current_state < 0 { sm.current_state = id }
+    << id
+}
+
+pub fn (sm $&AnimationStateMachine) add_transition(
+    from_state int,
+    to_state int,
+    fade_duration f64,
+    has_exit_time bool,
+    exit_time f64,
+    conditions &[]TransitionCondition
+) int {
+    if from_state < -1 || from_state >= sm.states.len || to_state < 0 || to_state >= sm.states.len ||
+        !fm.finite(fade_duration) || fade_duration < 0.0 || !fm.finite(exit_time) || exit_time < 0.0 || exit_time > 1.0 {
+        >> errors.new("nexus anim: invalid transition endpoint or fade/exit timing")
+    }
+    $copy_c := []TransitionCondition{}
+    for c in conditions {
+        if !fm.finite(c.threshold) || c.kind < COND_GT || c.kind > COND_TRIGGER {
+            >> errors.new("nexus anim: invalid transition condition")
+        }
+        copy_c.push(TransitionCondition{kind: c.kind, param: c.param + "", threshold: c.threshold})
+    }
+    sm.transitions.push(AnimTransition{
+        from_state: from_state,
+        to_state: to_state,
+        fade_duration: fade_duration,
+        has_exit_time: has_exit_time,
+        exit_time: exit_time,
+        conditions: copy_c
+    })
+    << sm.transitions.len - 1
+}
+
+pub fn (sm $&AnimationStateMachine) add_event(clip int, time f64, name string, tag int) int {
+    if clip < 0 || !fm.finite(time) || time < 0.0 {
+        >> errors.new("nexus anim: invalid animation event")
+    }
+    sm.events.push(AnimationEvent{clip: clip, time: time, name: name + "", tag: tag})
+    << sm.events.len - 1
+}
+
+pub fn (sm $&AnimationStateMachine) set_initial_state(state int) int {
+    if state < 0 || state >= sm.states.len {
+        >> errors.new("nexus anim: initial state out of range")
+    }
+    sm.current_state = state
+    sm.prev_state = -1
+    sm.current_phase = 0.0
+    sm.prev_phase = 0.0
+    sm.fade_elapsed = 0.0
+    sm.fade_duration = 0.0
+    sm.blending = false
+    << 0
+}
+
+pub fn (sm $&AnimationStateMachine) enable_root_motion(root_node int, lock_xz bool, lock_y bool) int {
+    if root_node < 0 { >> errors.new("nexus anim: invalid root motion node") }
+    sm.rm_enabled = true
+    sm.rm_root_node = root_node
+    sm.rm_lock_xz = lock_xz
+    sm.rm_lock_y = lock_y
+    << 0
+}
+
+pub fn (sm $&AnimationStateMachine) set_float(name string, value f64) {
+    sm.floats[name + ""] = value
+}
+
+pub fn (sm &AnimationStateMachine) get_float(name string) f64 {
+    if sm.floats.has(name + "") { << sm.floats[name + ""] }
+    << 0.0
+}
+
+pub fn (sm $&AnimationStateMachine) set_bool(name string, value bool) {
+    sm.bools[name + ""] = value
+}
+
+pub fn (sm &AnimationStateMachine) get_bool(name string) bool {
+    if sm.bools.has(name + "") { << sm.bools[name + ""] }
+    << false
+}
+
+pub fn (sm $&AnimationStateMachine) set_trigger(name string) {
+    sm.triggers[name + ""] = true
+}
+
+pub fn (sm $&AnimationStateMachine) set_overlay_layer(
+    clip int,
+    mask BoneMask,
+    weight f64,
+    looping bool,
+    speed f64
+) int {
+    if clip < 0 || !fm.finite(weight) || weight < 0.0 || weight > 1.0 || !fm.finite(speed) || speed <= 0.0 {
+        >> errors.new("nexus anim: invalid overlay layer")
+    }
+    sm.has_overlay = true
+    sm.overlay_clip = clip
+    sm.overlay_mask = mask
+    sm.overlay_weight = weight
+    sm.overlay_looping = looping
+    sm.overlay_speed = speed
+    sm.overlay_time = 0.0
+    << 0
+}
+
+pub fn (sm $&AnimationStateMachine) clear_overlay_layer() {
+    sm.has_overlay = false
+    sm.overlay_weight = 0.0
+}
+
+pub fn (sm $&AnimationStateMachine) set_additive_layer(
+    clip int,
+    ref_clip int,
+    ref_time f64,
+    weight f64,
+    looping bool,
+    speed f64
+) int {
+    if clip < 0 || ref_clip < -1 || !fm.finite(ref_time) || ref_time < 0.0 ||
+        !fm.finite(weight) || weight < 0.0 || weight > 1.0 || !fm.finite(speed) || speed <= 0.0 {
+        >> errors.new("nexus anim: invalid additive layer")
+    }
+    sm.has_additive = true
+    sm.add_clip = clip
+    sm.add_ref_clip = ref_clip
+    sm.add_ref_time = ref_time
+    sm.add_weight = weight
+    sm.add_looping = looping
+    sm.add_speed = speed
+    sm.add_time = 0.0
+    << 0
+}
+
+pub fn (sm $&AnimationStateMachine) clear_additive_layer() {
+    sm.has_additive = false
+    sm.add_weight = 0.0
+}
+
+pub fn (sm &AnimationStateMachine) active_state() int {
+    << sm.current_state
+}
+
+pub fn (sm &AnimationStateMachine) is_blending() bool {
+    << sm.blending || sm.inertial_active
+}
+
+pub fn (sm $&AnimationStateMachine) set_state_sync_group(state_id int, group_id int) int {
+    if state_id < 0 || state_id >= sm.states.len || group_id < -1 {
+        >> errors.new("nexus anim: invalid state_id or sync_group")
+    }
+    st := $&sm.states[state_id]
+    st.sync_group = group_id
+    << 0
+}
+
+pub fn (sm &AnimationStateMachine) state_sync_group(state_id int) int {
+    if state_id < 0 || state_id >= sm.states.len {
+        >> errors.new("nexus anim: state_id out of range")
+    }
+    << sm.states[state_id].sync_group
+}
+
+pub fn (sm &AnimationStateMachine) current_phase() f64 {
+    << sm.current_phase
+}
+
+pub fn (sm $&AnimationStateMachine) enable_inertialization(half_life f64) int {
+    if !fm.finite(half_life) || half_life < 0.005 || half_life > 2.0 {
+        >> errors.new("nexus anim: inertialization half_life must be in [0.005, 2.0]")
+    }
+    sm.inertial_enabled = true
+    sm.inertial_half_life = half_life
+    << 0
+}
+
+pub fn (sm $&AnimationStateMachine) disable_inertialization() {
+    sm.inertial_enabled = false
+    sm.inertial_active = false
+}
+
+pub fn (sm &AnimationStateMachine) is_inertializing() bool {
+    << sm.inertial_active
+}
+
+fn (sm &AnimationStateMachine) condition_met(c &TransitionCondition) bool {
+    if c.kind == COND_GT { << sm.get_float(c.param) > c.threshold }
+    if c.kind == COND_LT { << sm.get_float(c.param) < c.threshold }
+    if c.kind == COND_GE { << sm.get_float(c.param) >= c.threshold }
+    if c.kind == COND_LE { << sm.get_float(c.param) <= c.threshold }
+    if c.kind == COND_BOOL_TRUE { << sm.get_bool(c.param) }
+    if c.kind == COND_BOOL_FALSE { << !sm.get_bool(c.param) }
+    if c.kind == COND_TRIGGER {
+        if sm.triggers.has(c.param + "") { << sm.triggers[c.param + ""] }
+        << false
+    }
+    << false
+}
+
+fn (sm &AnimationStateMachine) state_duration(asset &gltf.GlbGeometry, sid int) f64 {
+    st := &sm.states[sid]
+    if st.kind == STATE_CLIP {
+        d := asset.animation_duration(st.clip) or >>
+        << math.max(0.001, d / st.speed)
+    }
+    if st.kind == STATE_BLEND_1D {
+        d := st.space1d.effective_duration(asset, sm.get_float(st.param_x)) or >>
+        << math.max(0.001, d / st.speed)
+    }
+    d := st.space2d.effective_duration(asset, sm.get_float(st.param_x), sm.get_float(st.param_y)) or >>
+    << math.max(0.001, d / st.speed)
+}
+
+fn (sm &AnimationStateMachine) sample_state(asset &gltf.GlbGeometry, sid int, phase f64) []gltf.NodeTrs {
+    st := &sm.states[sid]
+    if st.kind == STATE_CLIP {
+        dur := asset.animation_duration(st.clip) or >>
+        << asset.sample_trs_pose(st.clip, phase * dur) or >>
+    }
+    if st.kind == STATE_BLEND_1D {
+        << st.space1d.evaluate(asset, sm.get_float(st.param_x), phase) or >>
+    }
+    << st.space2d.evaluate(asset, sm.get_float(st.param_x), sm.get_float(st.param_y), phase) or >>
+}
+
+fn collect_clip_events(
+    events &[]AnimationEvent,
+    clip int,
+    t0 f64,
+    t1 f64,
+    dur f64,
+    looped bool,
+    out $&[]FiredEvent
+) {
+    for ev in events {
+        if ev.clip != clip { -> }
+        et := ev.time
+        if et > dur { -> }
+        $hit := false
+        if !looped {
+            if et > t0 && et <= t1 { hit = true }
+            if t0 == 0.0 && et == 0.0 && t1 > 0.0 { hit = true }
+        } else {
+            if (et > t0 && et <= dur) || (et >= 0.0 && et <= t1) {
+                hit = true
+            }
+        }
+        if hit {
+            out.push(FiredEvent{name: ev.name + "", tag: ev.tag, clip: clip, time: et})
+        }
+    }
+}
+
+fn advance_phase(phase f64, dur f64, dt f64, looping bool) f64 {
+    $next := phase + dt / math.max(0.001, dur)
+    if looping {
+        next = next - math.floor(next)
+        if next >= 1.0 { next = 0.0 }
+        << next
+    }
+    << clamp_f(next, 0.0, 1.0)
+}
+
+pub fn (sm $&AnimationStateMachine) advance(asset &gltf.GlbGeometry, dt f64) AnimStepResult {
+    if sm.current_state < 0 || sm.current_state >= sm.states.len || !fm.finite(dt) || dt < 0.0 || dt > 60.0 {
+        >> errors.new("nexus anim: invalid state machine advance")
+    }
+
+    // 1. Evaluate transitions (inertialization supports immediate interruption mid-transition).
+    if !sm.blending || sm.inertial_enabled {
+        for ti in 0:sm.transitions.len {
+            tr := &sm.transitions[ti]
+            if tr.to_state == sm.current_state { -> }
+            if tr.from_state != -1 && tr.from_state != sm.current_state { -> }
+            if tr.has_exit_time && sm.current_phase < tr.exit_time { -> }
+            $ok := true
+            for ci in 0:tr.conditions.len {
+                if !sm.condition_met(&tr.conditions[ci]) {
+                    ok = false
+                    <-
+                }
+            }
+            if !ok { -> }
+            for ci in 0:tr.conditions.len {
+                if tr.conditions[ci].kind == COND_TRIGGER {
+                    sm.triggers[tr.conditions[ci].param + ""] = false
+                }
+            }
+            old_sid := sm.current_state
+            new_sid := tr.to_state
+            old_sg := sm.states[old_sid].sync_group
+            new_sg := sm.states[new_sid].sync_group
+            $next_phase := 0.0
+            if old_sg >= 0 && old_sg == new_sg {
+                next_phase = sm.current_phase
+            }
+            if sm.inertial_enabled && tr.fade_duration > 0.0 && sm.has_last_pose {
+                sm.current_state = new_sid
+                sm.prev_state = -1
+                sm.current_phase = next_phase
+                sm.fade_elapsed = 0.0
+                sm.fade_duration = tr.fade_duration
+                sm.blending = false
+                target0 := sm.sample_state(asset, new_sid, next_phase) or >>
+                $op := []fm.Vec3{}
+                $or_q := []fm.Vec4{}
+                $os := []fm.Vec3{}
+                for j in 0:target0.len {
+                    if j < sm.last_pose.len {
+                        lp := &sm.last_pose[j]
+                        tp := &target0[j]
+                        op.push(lp.translation.sub(tp.translation))
+                        $dq := quat_norm(quat_mul(quat_conj(tp.rotation), lp.rotation)) or >>
+                        if dq.w < 0.0 {
+                            dq = fm.vec4(-dq.x, -dq.y, -dq.z, -dq.w)
+                        }
+                        or_q.push(dq)
+                        os.push(lp.scale.sub(tp.scale))
+                    } else {
+                        op.push(fm.vec3(0.0, 0.0, 0.0))
+                        or_q.push(quat_identity())
+                        os.push(fm.vec3(0.0, 0.0, 0.0))
+                    }
+                }
+                sm.offset_pos = op
+                sm.offset_rot = or_q
+                sm.offset_scale = os
+                sm.inertial_active = true
+                sm.inertial_elapsed = 0.0
+                sm.inertial_duration = math.max(tr.fade_duration, sm.inertial_half_life * 6.0)
+            } else if tr.fade_duration > 0.0 {
+                sm.prev_state = old_sid
+                sm.prev_phase = sm.current_phase
+                sm.current_state = new_sid
+                sm.current_phase = next_phase
+                sm.fade_elapsed = 0.0
+                sm.fade_duration = tr.fade_duration
+                sm.blending = true
+                sm.inertial_active = false
+            } else {
+                sm.current_state = new_sid
+                sm.prev_state = -1
+                sm.current_phase = next_phase
+                sm.blending = false
+                sm.inertial_active = false
+            }
+            <-
+        }
+    }
+
+    // 2. Advance active state (and previous state if cross-fading).
+    curr_sid := sm.current_state
+    curr_dur := sm.state_duration(asset, curr_sid) or >>
+    old_phase := sm.current_phase
+    new_phase := advance_phase(old_phase, curr_dur, dt, sm.states[curr_sid].looping)
+    sm.current_phase = new_phase
+    curr_looped := sm.states[curr_sid].looping && new_phase < old_phase
+
+    $fired := []FiredEvent{}
+    if sm.states[curr_sid].kind == STATE_CLIP {
+        clip := sm.states[curr_sid].clip
+        clip_dur := asset.animation_duration(clip) or >>
+        collect_clip_events(&sm.events, clip, old_phase * clip_dur, new_phase * clip_dur, clip_dur, curr_looped, $&fired)
+    }
+
+    $alpha := 1.0
+    if sm.blending {
+        prev_sid := sm.prev_state
+        prev_dur := sm.state_duration(asset, prev_sid) or >>
+        sm.prev_phase = advance_phase(sm.prev_phase, prev_dur, dt, sm.states[prev_sid].looping)
+        sm.fade_elapsed += dt
+        if sm.fade_elapsed >= sm.fade_duration {
+            sm.blending = false
+            sm.prev_state = -1
+            alpha = 1.0
+        } else {
+            alpha = clamp_f(sm.fade_elapsed / sm.fade_duration, 0.0, 1.0)
+        }
+    }
+
+    // 3. Evaluate pose & cross-fade / inertialization.
+    curr_pose := sm.sample_state(asset, curr_sid, new_phase) or >>
+    $out_pose := []gltf.NodeTrs{}
+    if sm.blending && sm.prev_state >= 0 {
+        prev_pose := sm.sample_state(asset, sm.prev_state, sm.prev_phase) or >>
+        out_pose = blend_poses(&prev_pose, &curr_pose, alpha) or >>
+    } else {
+        for i in 0:curr_pose.len { out_pose.push(curr_pose[i]) }
+    }
+    if sm.inertial_active {
+        sm.inertial_elapsed += dt
+        omega := 1.67834699 / math.max(0.005, sm.inertial_half_life)
+        x := omega * sm.inertial_elapsed
+        k := (1.0 + x) * math.exp(-x)
+        if sm.inertial_elapsed >= sm.inertial_duration || k <= 0.0005 {
+            sm.inertial_active = false
+            alpha = 1.0
+        } else {
+            alpha = clamp_f(1.0 - k, 0.0, 1.0)
+            for ji in 0:out_pose.len {
+                if ji >= sm.offset_pos.len { <- }
+                jnode := $&out_pose[ji]
+                jnode.translation = jnode.translation.add(sm.offset_pos[ji].scaled(k))
+                dq_k := quat_slerp(quat_identity(), sm.offset_rot[ji], k) or >>
+                jnode.rotation = quat_norm(quat_mul(jnode.rotation, dq_k)) or >>
+                jnode.scale = jnode.scale.add(sm.offset_scale[ji].scaled(k))
+            }
+        }
+    }
+    $saved_last := []gltf.NodeTrs{}
+    for i in 0:out_pose.len { saved_last.push(out_pose[i]) }
+    sm.last_pose = saved_last
+    sm.has_last_pose = out_pose.len > 0
+
+    // 4. Optional root motion extraction (on active clip state).
+    $rm := zero_root_motion()
+    if sm.rm_enabled && sm.states[curr_sid].kind == STATE_CLIP {
+        clip := sm.states[curr_sid].clip
+        clip_dur := asset.animation_duration(clip) or >>
+        rm = extract_root_motion(
+            asset, clip, old_phase * clip_dur, new_phase * clip_dur,
+            sm.states[curr_sid].looping, sm.rm_root_node, $&out_pose, sm.rm_lock_xz, sm.rm_lock_y
+        ) or >>
+    }
+
+    // 5. Optional masked overlay layer.
+    if sm.has_overlay && sm.overlay_weight > 0.0 {
+        ov_dur := math.max(0.001, asset.animation_duration(sm.overlay_clip) or >>)
+        $next_ot := sm.overlay_time + dt * sm.overlay_speed
+        if sm.overlay_looping {
+            while next_ot >= ov_dur { next_ot -= ov_dur }
+        } else {
+            next_ot = clamp_f(next_ot, 0.0, ov_dur)
+        }
+        sm.overlay_time = next_ot
+        ov_pose := asset.sample_trs_pose(sm.overlay_clip, next_ot) or >>
+        out_pose = blend_poses_masked(&out_pose, &ov_pose, &sm.overlay_mask, sm.overlay_weight) or >>
+    }
+
+    // 6. Optional additive layer.
+    if sm.has_additive && sm.add_weight > 0.0 {
+        ad_dur := math.max(0.001, asset.animation_duration(sm.add_clip) or >>)
+        $next_at := sm.add_time + dt * sm.add_speed
+        if sm.add_looping {
+            while next_at >= ad_dur { next_at -= ad_dur }
+        } else {
+            next_at = clamp_f(next_at, 0.0, ad_dur)
+        }
+        sm.add_time = next_at
+        ad_pose := asset.sample_trs_pose(sm.add_clip, next_at) or >>
+        ref_pose := asset.sample_trs_pose(sm.add_ref_clip, sm.add_ref_time) or >>
+        out_pose = apply_additive_pose(&out_pose, &ad_pose, &ref_pose, sm.add_weight) or >>
+    }
+
+    << AnimStepResult{
+        pose: out_pose,
+        events: fired,
+        root_motion: rm,
+        active_state: sm.current_state,
+        blending: sm.blending || sm.inertial_active,
+        blend_alpha: alpha
+    }
+}

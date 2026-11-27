@@ -1,0 +1,59 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct FroxelAccumParams {
+    float4x4 inv_vp;
+    float4 eye_near;    // xyz=eye, w=fog_near
+    float4 cam_fwd_far; // xyz=cam_forward, w=fog_far
+    float4 grid_pad;    // x=FX, y=FY, z=FZ, w=0
+};
+
+kernel void main0(
+    constant FroxelAccumParams& p [[buffer(0)]],
+    device const float4* froxel_scatter [[buffer(1)]],
+    device float4* froxel_accum [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint fx_n = uint(p.grid_pad.x);
+    uint fy_n = uint(p.grid_pad.y);
+    uint fz_n = uint(p.grid_pad.z);
+    uint slice_xy = fx_n * fy_n;
+    if (gid >= slice_xy) return;
+
+    uint fy = gid / fx_n;
+    uint fx = gid - fy * fx_n;
+
+    float2 uv = float2((float(fx) + 0.5) / float(fx_n), (float(fy) + 0.5) / float(fy_n));
+    float ndc_x = uv.x * 2.0 - 1.0;
+    float ndc_y = 1.0 - uv.y * 2.0;
+    float4 far4 = p.inv_vp * float4(ndc_x, ndc_y, 0.001, 1.0);
+    float3 far_p = far4.xyz / max(far4.w, 1e-6);
+    float3 ray_dir = normalize(far_p - p.eye_near.xyz);
+    float3 cam_fwd = normalize(p.cam_fwd_far.xyz);
+    float cos_ang = max(dot(ray_dir, cam_fwd), 0.1);
+
+    float fog_near = p.eye_near.w;
+    float fog_far = p.cam_fwd_far.w;
+    float ratio = fog_far / max(fog_near, 1e-4);
+
+    float3 accum_rgb = float3(0.0);
+    float trans = 1.0;
+
+    for (uint fz = 0u; fz < fz_n; ++fz) {
+        float t0 = float(fz) / float(fz_n);
+        float t1 = float(fz + 1u) / float(fz_n);
+        float z0 = fog_near * pow(ratio, t0);
+        float z1 = fog_near * pow(ratio, t1);
+        float ds = (z1 - z0) / cos_ang;
+
+        uint idx = fz * slice_xy + gid;
+        float4 scat_ext = froxel_scatter[idx];
+        float ext = max(scat_ext.w, 1e-6);
+        float slice_t = exp(-ext * ds);
+        float3 slice_s = (scat_ext.rgb - scat_ext.rgb * slice_t) / ext;
+        accum_rgb += trans * slice_s;
+        trans *= slice_t;
+
+        froxel_accum[idx] = float4(accum_rgb, trans);
+    }
+}

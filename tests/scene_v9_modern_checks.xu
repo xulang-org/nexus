@@ -1,0 +1,134 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+resource #"github.com/xulang-org/nexus/resources/scene"
+codec #"github.com/xulang-org/nexus/formats/scene"
+#math
+#strings
+
+fn rejected(raw &string) bool {
+    codec.decode(raw) or (err) { << true }
+    << false
+}
+
+fn run() int {
+    // 1. Build a rich v9 scene with all 6 modern attachment types.
+    $n0 := resource.node(-1, "World", resource.NODE_3D)
+    $n1 := resource.node(0, "TerrainNode", resource.NODE_3D)
+    $n2 := resource.node(0, "BoxBody", resource.NODE_3D)
+    $n3 := resource.node(0, "SwingBody", resource.NODE_3D)
+    $n4 := resource.node(0, "SparkEmitter", resource.NODE_3D)
+    $n5 := resource.node(0, "TurretPrefab", resource.NODE_3D)
+    base := resource.make_document([n0, n1, n2, n3, n4, n5]) or >>
+
+    prefab_uid := "aabbccddeeff00112233445566778899"
+    prefab_hash := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    refs := [resource.ResourceReference{
+        uid: prefab_uid + "",
+        kind: "scene_file",
+        path: "prefabs/turret.xuscene",
+        content_hash: prefab_hash + ""
+    }]
+
+    $env := resource.default_environment_attachment(0)
+    env.exposure = 1.25
+    env.ssr_enabled = true
+
+    $rb := resource.default_rigid_body_3d(2)
+    rb.body_type = resource.BODY_DYNAMIC
+    rb.shape_kind = resource.SHAPE_CAPSULE
+    rb.mass = 12.5
+    rb.radius = 0.4
+    rb.height = 1.8
+
+    $rb_static := resource.default_rigid_body_3d(3)
+    rb_static.body_type = resource.BODY_STATIC
+    rb_static.mass = 0.0
+    rb_static.is_trigger = true
+
+    $jnt := resource.default_joint_3d(2, 3)
+    jnt.kind = resource.JOINT_HINGE
+    jnt.motor_speed = 1.5
+    jnt.motor_torque = 25.0
+
+    $terr := resource.default_terrain_attachment(1)
+    terr.grid_x = 65
+    terr.grid_z = 65
+    terr.height_scale = 4.5
+
+    $vfx := resource.default_particle_emitter_3d(4)
+    vfx.max_particles = 512
+    vfx.additive = false
+
+    ov := resource.PrefabOverride{
+        target_path: "Barrel",
+        visible_set: true,
+        visible: false,
+        position_set: true,
+        position: fm.vec3(1.0, 2.0, 3.0)
+    }
+    pf := resource.prefab_instance_attachment(5, prefab_uid + "", [ov])
+
+    doc9 := resource.with_modern_attachments(&base, refs, []resource.Surface{}, []resource.AudioBus{},
+        []resource.AudioEmitter{}, []resource.ScriptAttachment{}, []resource.ScriptConnection{},
+        []resource.LightAttachment{}, []resource.Sprite3DAttachment{}, []resource.TileMap2DAttachment{},
+        [env], [rb, rb_static], [jnt], [terr], [vfx], [pf]) or >>
+
+    assert(doc9.has_modern_attachments())
+    encoded := codec.encode(&doc9) or >>
+    assert(strings.contains(&encoded, "\"version\":9"))
+    decoded := codec.decode(&encoded) or >>
+    reencoded := codec.encode(&decoded) or >>
+    assert(encoded == reencoded)
+
+    assert(decoded.environment_count() == 1)
+    assert(math.abs((decoded.environment(0) or >>).exposure - 1.25) < 1e-12)
+    assert((decoded.environment(0) or >>).ssr_enabled)
+    assert(decoded.rigid_body_3d_count() == 2)
+    assert((decoded.rigid_body_3d(0) or >>).shape_kind == resource.SHAPE_CAPSULE)
+    assert((decoded.rigid_body_3d(1) or >>).is_trigger)
+    assert(decoded.joint_3d_count() == 1)
+    assert((decoded.joint_3d(0) or >>).kind == resource.JOINT_HINGE)
+    assert(decoded.terrain_count() == 1 && (decoded.terrain(0) or >>).grid_x == 65)
+    assert(decoded.particle_emitter_3d_count() == 1 && (decoded.particle_emitter_3d(0) or >>).max_particles == 512)
+    assert(decoded.prefab_instance_count() == 1 && (decoded.prefab_instance(0) or >>).overrides[0].target_path == "Barrel")
+
+    // 2. Verify with_references preserves all v9 attachments.
+    refs2 := [resource.ResourceReference{
+        uid: prefab_uid + "",
+        kind: "scene_file",
+        path: "prefabs/turret.xuscene",
+        content_hash: prefab_hash + ""
+    }]
+    preserved := resource.with_references(&decoded, &decoded, refs2) or >>
+    assert(preserved.environment_count() == 1 && preserved.rigid_body_3d_count() == 2 && preserved.prefab_instance_count() == 1)
+
+    // 3. Verify v1 scene backward compatibility stays at version 1 without v9 keys.
+    plain_raw := codec.encode(&base) or >>
+    assert(strings.contains(&plain_raw, "\"version\":1"))
+    assert(!strings.contains(&plain_raw, "\"environments\""))
+    plain_dec := codec.decode(&plain_raw) or >>
+    assert(!plain_dec.has_modern_attachments())
+
+    // 4. Reject invalid v9 mutations (missing arrays, bad version, negative mass/radius, duplicate node, bad enum).
+    bad_ver := strings.replace(&encoded, "\"version\":9", "\"version\":10", 1)
+    assert(rejected(&bad_ver))
+    bad_missing := strings.replace(&encoded, "\"environments\":", "\"env_bad\":", 1)
+    assert(rejected(&bad_missing))
+    bad_mass := strings.replace(&encoded, "\"mass\":12.5", "\"mass\":-1.0", 1)
+    assert(rejected(&bad_mass))
+    bad_enum := strings.replace(&encoded, "\"shape_kind\":\"capsule\"", "\"shape_kind\":\"prism\"", 1)
+    assert(rejected(&bad_enum))
+    bad_v8_scene_ref := "{\"format\":\"xu.scene\",\"version\":8,\"nodes\":[{\"parent\":-1,\"name\":\"W\",\"type\":\"Node3D\",\"visible\":true,\"process\":\"inherit\",\"transform\":[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]}],\"resources\":[{\"uid\":\"" + prefab_uid + "\",\"type\":\"scene_file\",\"path\":\"a.xuscene\",\"sha256\":\"" + prefab_hash + "\"}],\"surfaces\":[],\"audio_buses\":[],\"audio_emitters\":[],\"scripts\":[],\"script_connections\":[],\"lights\":[],\"sprites_3d\":[],\"tilemaps_2d\":[]}"
+    assert(rejected(&bad_v8_scene_ref))
+
+    println("PASS: Scene v9 modern components (Environment/RigidBody3D/Joint3D/Terrain/Particles3D/PrefabInstance) roundtrip, v1-v8 compat & strict rejections")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

@@ -1,0 +1,57 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct BlurParams {
+    float4 info; // x=width, y=height, z=z_near, w=z_far
+};
+
+static inline float linearize_reverse_z(float d, float z_near, float z_far) {
+    return (z_near * z_far) / max(z_near + d * (z_far - z_near), 1e-5);
+}
+
+kernel void main0(
+    texture2d<float> src_ao [[texture(0)]],
+    depth2d<float> src_depth [[texture(1)]],
+    texture2d<float, access::write> dst_ao [[texture(2)]],
+    sampler ao_sampler [[sampler(0)]],
+    sampler depth_sampler [[sampler(1)]],
+    constant BlurParams& params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint w = uint(params.info.x);
+    uint h = uint(params.info.y);
+    if (gid.x >= w || gid.y >= h) return;
+
+    float2 inv_res = float2(1.0 / params.info.x, 1.0 / params.info.y);
+    float2 uv = (float2(gid) + 0.5) * inv_res;
+    float center_d = src_depth.sample(depth_sampler, uv);
+    float center_ao = src_ao.sample(ao_sampler, uv, level(0.0)).r;
+    if (center_d <= 1e-6) {
+        dst_ao.write(float4(1.0, 0.0, 0.0, 1.0), gid);
+        return;
+    }
+
+    float z_near = max(params.info.z, 1e-4);
+    float z_far = max(params.info.w, z_near + 0.1);
+    float center_lin = linearize_reverse_z(center_d, z_near, z_far);
+    float norm_scale = 1.0 / max(center_lin * 0.05, 0.04);
+
+    float sum_ao = 0.0;
+    float sum_w = 0.0;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            float2 suv = clamp(uv + float2(float(dx), float(dy)) * inv_res, float2(0.0001), float2(0.9999));
+            float sd = src_depth.sample(depth_sampler, suv);
+            if (sd <= 1e-6) continue;
+            float sao = src_ao.sample(ao_sampler, suv, level(0.0)).r;
+            float lin_sd = linearize_reverse_z(sd, z_near, z_far);
+            float depth_diff = abs(lin_sd - center_lin) * norm_scale;
+            float spatial = exp(-float(dx * dx + dy * dy) * 0.2);
+            float weight = spatial * exp(-depth_diff * depth_diff);
+            sum_ao += sao * weight;
+            sum_w += weight;
+        }
+    }
+    float out_ao = (sum_w > 1e-5) ? (sum_ao / sum_w) : center_ao;
+    dst_ao.write(float4(clamp(out_ao, 0.0, 1.0), 0.0, 0.0, 1.0), gid);
+}

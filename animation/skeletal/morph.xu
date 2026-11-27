@@ -1,0 +1,102 @@
+@"github.com/xulang-org/nexus/animation/skeletal"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+#errors
+#math
+
+pub struct MorphTarget3D {
+    pub name string
+    pub position_deltas []fm.Vec3
+    pub normal_deltas []fm.Vec3
+}
+
+pub struct MorphSet3D {
+    base meshes.MeshData3D
+    targets []MorphTarget3D
+}
+
+pub fn new_morph_set_3d(base meshes.MeshData3D) MorphSet3D {
+    base.validate() or >>
+    << MorphSet3D{base: base, targets: []MorphTarget3D{}}
+}
+
+pub fn (ms $&MorphSet3D) add_target(
+    name string,
+    pos_deltas &[]fm.Vec3,
+    norm_deltas &[]fm.Vec3
+) int {
+    nv := ms.base.vertices.len
+    if pos_deltas.len != nv || (norm_deltas.len != 0 && norm_deltas.len != nv) {
+        >> errors.new("nexus anim: morph target vertex count mismatch")
+    }
+    $p_copy := []fm.Vec3{}
+    for p in pos_deltas {
+        if !p.is_finite() { >> errors.new("nexus anim: non-finite morph position delta") }
+        p_copy.push(p)
+    }
+    $n_copy := []fm.Vec3{}
+    for n in norm_deltas {
+        if !n.is_finite() { >> errors.new("nexus anim: non-finite morph normal delta") }
+        n_copy.push(n)
+    }
+    ms.targets.push(MorphTarget3D{
+        name: name + "",
+        position_deltas: p_copy,
+        normal_deltas: n_copy
+    })
+    << ms.targets.len - 1
+}
+
+pub fn (ms &MorphSet3D) target_count() int {
+    << ms.targets.len
+}
+
+pub fn (ms &MorphSet3D) evaluate(weights &[]f64) meshes.MeshData3D {
+    if weights.len != ms.targets.len {
+        >> errors.new("nexus anim: morph weight count mismatch")
+    }
+    for w in weights {
+        if !fm.finite(w) || w < -2.0 || w > 2.0 {
+            >> errors.new("nexus anim: morph weight out of [-2, 2] range")
+        }
+    }
+    $out := meshes.new_mesh_data_3d()
+    for vi in 0:ms.base.vertices.len {
+        bv := &ms.base.vertices[vi]
+        $pos := bv.position
+        $nrm := bv.normal
+        for ti in 0:ms.targets.len {
+            w := weights[ti]
+            if math.abs(w) <= 1e-9 { -> }
+            t := &ms.targets[ti]
+            pos = pos.add(t.position_deltas[vi].scaled(w))
+            if t.normal_deltas.len > 0 {
+                nrm = nrm.add(t.normal_deltas[vi].scaled(w))
+            }
+        }
+        $n_out := fm.vec3(0.0, 0.0, 0.0)
+        if nrm.dot(nrm) > 1e-12 {
+            n_out = nrm.normalized() or >>
+        }
+        if bv.has_tangent {
+            t_xyz := bv.tangent.xyz()
+            ortho := t_xyz.sub(n_out.scaled(t_xyz.dot(n_out))).normalized() or >>
+            out.vertex_tangent(pos, bv.color, n_out, bv.uv, fm.vec4(ortho.x, ortho.y, ortho.z, bv.tangent.w)) or >>
+        } else if bv.has_uv && n_out.dot(n_out) > 1e-12 {
+            out.vertex_lit_uv(pos, bv.color, n_out, bv.uv) or >>
+        } else if n_out.dot(n_out) > 1e-12 {
+            out.vertex_lit(pos, bv.color, n_out) or >>
+        } else {
+            out.vertex(pos, bv.color) or >>
+        }
+    }
+    for ti in 0:(ms.base.indices.len / 3) {
+        a := ti * 3
+        b := a + 1
+        c := a + 2
+        out.triangle(ms.base.indices[a], ms.base.indices[b], ms.base.indices[c]) or >>
+    }
+    out.validate() or >>
+    << out
+}

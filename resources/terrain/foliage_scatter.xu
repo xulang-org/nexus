@@ -1,0 +1,240 @@
+@"github.com/xulang-org/nexus/resources/terrain"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+#errors
+#math
+
+pub const MAX_SCATTER_INSTANCES = 65536
+
+pub struct FoliageScatterConfig {
+    pub seed int
+    pub spacing f64
+    pub jitter f64
+    pub min_height f64
+    pub max_height f64
+    pub min_normal_y f64
+    pub splat_channel int
+    pub min_splat_weight f64
+    pub density_probability f64
+    pub scale_min f64
+    pub scale_max f64
+    pub height_scale_min f64
+    pub height_scale_max f64
+    pub base_tint fm.Vec3
+    pub tint_variation f64
+    pub max_instances int
+}
+
+pub struct FoliagePlacement {
+    pub position fm.Vec3
+    pub yaw f64
+    pub scale f64
+    pub height_scale f64
+    pub bend_phase f64
+    pub tint fm.Vec3
+    pub variation f64
+}
+
+fn two_pi_f() f64 { << 6.283185307179586 }
+
+pub fn default_foliage_scatter_config(seed int) FoliageScatterConfig {
+    << FoliageScatterConfig{
+        seed: seed,
+        spacing: 0.45,
+        jitter: 0.42,
+        min_height: -10000.0,
+        max_height: 10000.0,
+        min_normal_y: 0.78,
+        splat_channel: 0,
+        min_splat_weight: 0.25,
+        density_probability: 0.95,
+        scale_min: 0.85,
+        scale_max: 1.25,
+        height_scale_min: 0.80,
+        height_scale_max: 1.35,
+        base_tint: fm.vec3(0.32, 0.72, 0.24),
+        tint_variation: 0.14,
+        max_instances: MAX_SCATTER_INSTANCES
+    }
+}
+
+pub fn (cfg &FoliageScatterConfig) validate() int {
+    if !fm.finite(cfg.spacing) || cfg.spacing <= 0.02 || cfg.spacing > 500.0 {
+        >> errors.new("nexus terrain: foliage spacing must be in (0.02, 500]")
+    }
+    if !fm.finite(cfg.jitter) || cfg.jitter < 0.0 || cfg.jitter > 0.5 {
+        >> errors.new("nexus terrain: foliage jitter must be in [0, 0.5]")
+    }
+    if !fm.finite(cfg.min_height) || !fm.finite(cfg.max_height) || cfg.max_height < cfg.min_height {
+        >> errors.new("nexus terrain: invalid foliage altitude range")
+    }
+    if !fm.finite(cfg.min_normal_y) || cfg.min_normal_y < -1.0 || cfg.min_normal_y > 1.0 {
+        >> errors.new("nexus terrain: min_normal_y must be in [-1, 1]")
+    }
+    if cfg.splat_channel < -1 || cfg.splat_channel > 3 ||
+        !fm.finite(cfg.min_splat_weight) || cfg.min_splat_weight < 0.0 || cfg.min_splat_weight > 1.0 {
+        >> errors.new("nexus terrain: splat_channel must be -1..3 and weight in [0, 1]")
+    }
+    if !fm.finite(cfg.density_probability) || cfg.density_probability < 0.0 || cfg.density_probability > 1.0 {
+        >> errors.new("nexus terrain: density_probability must be in [0, 1]")
+    }
+    if !fm.finite(cfg.scale_min) || !fm.finite(cfg.scale_max) || cfg.scale_min <= 0.0 || cfg.scale_max < cfg.scale_min ||
+        !fm.finite(cfg.height_scale_min) || !fm.finite(cfg.height_scale_max) || cfg.height_scale_min <= 0.0 || cfg.height_scale_max < cfg.height_scale_min {
+        >> errors.new("nexus terrain: invalid foliage scale range")
+    }
+    if !cfg.base_tint.is_finite() || !fm.finite(cfg.tint_variation) || cfg.tint_variation < 0.0 || cfg.tint_variation > 1.0 {
+        >> errors.new("nexus terrain: invalid foliage tint")
+    }
+    if cfg.max_instances < 1 || cfg.max_instances > MAX_SCATTER_INSTANCES {
+        >> errors.new("nexus terrain: max_instances must be in 1..65536")
+    }
+    << 0
+}
+
+fn splat_channel_val(sp fm.Vec4, ch int) f64 {
+    if ch == 0 { << sp.x }
+    if ch == 1 { << sp.y }
+    if ch == 2 { << sp.z }
+    if ch == 3 { << sp.w }
+    << 1.0
+}
+
+pub fn (t &HeightmapTerrain) scatter_foliage(cfg &FoliageScatterConfig) []FoliagePlacement {
+    cfg.validate() or >>
+    sx := t.world_size_x()
+    sz := t.world_size_z()
+    cols := int(math.floor(sx / cfg.spacing))
+    rows := int(math.floor(sz / cfg.spacing))
+    $out := []FoliagePlacement{}
+    if cols <= 0 || rows <= 0 { << out }
+
+    for iz in 0:rows {
+        for ix in 0:cols {
+            if out.len >= cfg.max_instances { << out }
+            rjx := hash2d_01(ix, iz, cfg.seed) * 2.0 - 1.0
+            rjz := hash2d_01(ix, iz, cfg.seed + 1013) * 2.0 - 1.0
+            wx := clamp_f(t.origin.x + (f64(ix) + 0.5 + rjx * cfg.jitter) * cfg.spacing, t.origin.x + 0.01, t.origin.x + sx - 0.01)
+            wz := clamp_f(t.origin.z + (f64(iz) + 0.5 + rjz * cfg.jitter) * cfg.spacing, t.origin.z + 0.01, t.origin.z + sz - 0.01)
+
+            wy := t.sample_height(wx, wz)
+            if wy < cfg.min_height || wy > cfg.max_height { -> }
+            n := t.sample_normal(wx, wz)
+            if n.y < cfg.min_normal_y { -> }
+
+            sp := t.sample_splat(wx, wz)
+            $weight := 1.0
+            if cfg.splat_channel >= 0 {
+                weight = splat_channel_val(sp, cfg.splat_channel)
+                if weight < cfg.min_splat_weight { -> }
+            }
+
+            prob_roll := hash2d_01(ix, iz, cfg.seed + 2029)
+            if prob_roll > cfg.density_probability * weight { -> }
+
+            u_yaw := hash2d_01(ix, iz, cfg.seed + 3041)
+            u_scl := hash2d_01(ix, iz, cfg.seed + 4057)
+            u_hscl := hash2d_01(ix, iz, cfg.seed + 5077)
+            u_phase := hash2d_01(ix, iz, cfg.seed + 6089)
+            u_tint := hash2d_01(ix, iz, cfg.seed + 7103)
+
+            yaw := u_yaw * two_pi_f()
+            scl := cfg.scale_min + (cfg.scale_max - cfg.scale_min) * u_scl
+            hscl := cfg.height_scale_min + (cfg.height_scale_max - cfg.height_scale_min) * u_hscl
+            phase := u_phase * two_pi_f()
+            tshift := 1.0 + (u_tint * 2.0 - 1.0) * cfg.tint_variation
+            tint := fm.vec3(
+                math.max(0.0, cfg.base_tint.x * tshift),
+                math.max(0.0, cfg.base_tint.y * tshift),
+                math.max(0.0, cfg.base_tint.z * tshift)
+            )
+            out.push(FoliagePlacement{
+                position: fm.vec3(wx, wy, wz),
+                yaw: yaw,
+                scale: scl,
+                height_scale: hscl,
+                bend_phase: phase,
+                tint: tint,
+                variation: u_tint
+            })
+        }
+    }
+    << out
+}
+
+pub fn build_grass_clump_mesh(blades int, width f64, height f64) meshes.MeshData3D {
+    if blades < 1 || blades > 8 || !fm.finite(width) || width <= 0.0 || !fm.finite(height) || height <= 0.0 {
+        >> errors.new("nexus terrain: invalid grass clump dimensions")
+    }
+    $mesh := meshes.new_mesh_data_3d()
+    white := (255 << 24) | (255 << 16) | (255 << 8) | 255
+    for b in 0:blades {
+        ang := f64(b) * 3.141592653589793 / f64(blades)
+        ca := math.cos(ang)
+        sa := math.sin(ang)
+        // Radial tangent across the blade width and outward bend direction perpendicular to blade plane.
+        right := fm.vec3(ca, 0.0, sa)
+        out_dir := fm.vec3(-sa, 0.0, ca)
+        half_w := width * 0.5
+        mid_w := width * 0.30
+        lean_mid := height * 0.08
+        lean_tip := height * 0.22
+
+        n := fm.vec3(out_dir.x * 0.35, 0.9367496997597597, out_dir.z * 0.35).normalized() or >>
+        tang := fm.vec4(right.x, right.y, right.z, 1.0)
+
+        base := mesh.vertices.len
+        p0 := right.scaled(-half_w)
+        p1 := right.scaled(half_w)
+        p2 := right.scaled(-mid_w).add(fm.vec3(out_dir.x * lean_mid, height * 0.55, out_dir.z * lean_mid))
+        p3 := right.scaled(mid_w).add(fm.vec3(out_dir.x * lean_mid, height * 0.55, out_dir.z * lean_mid))
+        p4 := fm.vec3(out_dir.x * lean_tip, height, out_dir.z * lean_tip)
+
+        mesh.vertices.push(meshes.Vertex3D{position: p0, color: white, normal: n, uv: fm.vec2(0.0, 0.0), tangent: tang, has_uv: true, has_tangent: true})
+        mesh.vertices.push(meshes.Vertex3D{position: p1, color: white, normal: n, uv: fm.vec2(1.0, 0.0), tangent: tang, has_uv: true, has_tangent: true})
+        mesh.vertices.push(meshes.Vertex3D{position: p2, color: white, normal: n, uv: fm.vec2(0.15, 0.55), tangent: tang, has_uv: true, has_tangent: true})
+        mesh.vertices.push(meshes.Vertex3D{position: p3, color: white, normal: n, uv: fm.vec2(0.85, 0.55), tangent: tang, has_uv: true, has_tangent: true})
+        mesh.vertices.push(meshes.Vertex3D{position: p4, color: white, normal: n, uv: fm.vec2(0.5, 1.0), tangent: tang, has_uv: true, has_tangent: true})
+
+        mesh.triangle(base, base + 1, base + 3) or >>
+        mesh.triangle(base, base + 3, base + 2) or >>
+        mesh.triangle(base + 2, base + 3, base + 4) or >>
+    }
+    mesh.validate() or >>
+    << mesh
+}
+
+pub fn build_bush_mesh(radius f64, height f64) meshes.MeshData3D {
+    if !fm.finite(radius) || radius <= 0.0 || !fm.finite(height) || height <= 0.0 {
+        >> errors.new("nexus terrain: invalid bush mesh dimensions")
+    }
+    $mesh := meshes.new_mesh_data_3d()
+    white := (255 << 24) | (255 << 16) | (255 << 8) | 255
+    for k in 0:3 {
+        ang := f64(k) * 3.141592653589793 / 3.0
+        ca := math.cos(ang)
+        sa := math.sin(ang)
+        right := fm.vec3(ca, 0.0, sa)
+        n_dir := fm.vec3(-sa * 0.25, 0.9682458365518543, ca * 0.25).normalized() or >>
+        tang := fm.vec4(right.x, right.y, right.z, 1.0)
+        base := mesh.vertices.len
+
+        bl := right.scaled(-radius * 0.65)
+        br := right.scaled(radius * 0.65)
+        ml := right.scaled(-radius).add(fm.vec3(0.0, height * 0.52, 0.0))
+        mr := right.scaled(radius).add(fm.vec3(0.0, height * 0.52, 0.0))
+        top := fm.vec3(0.0, height, 0.0)
+
+        mesh.vertices.push(meshes.Vertex3D{position: bl, color: white, normal: n_dir, uv: fm.vec2(0.15, 0.0), tangent: tang, has_uv: true, has_tangent: true})
+        mesh.vertices.push(meshes.Vertex3D{position: br, color: white, normal: n_dir, uv: fm.vec2(0.85, 0.0), tangent: tang, has_uv: true, has_tangent: true})
+        mesh.vertices.push(meshes.Vertex3D{position: ml, color: white, normal: n_dir, uv: fm.vec2(0.0, 0.52), tangent: tang, has_uv: true, has_tangent: true})
+        mesh.vertices.push(meshes.Vertex3D{position: mr, color: white, normal: n_dir, uv: fm.vec2(1.0, 0.52), tangent: tang, has_uv: true, has_tangent: true})
+        mesh.vertices.push(meshes.Vertex3D{position: top, color: white, normal: n_dir, uv: fm.vec2(0.5, 1.0), tangent: tang, has_uv: true, has_tangent: true})
+
+        mesh.triangle(base, base + 1, base + 3) or >>
+        mesh.triangle(base, base + 3, base + 2) or >>
+        mesh.triangle(base + 2, base + 3, base + 4) or >>
+    }
+    mesh.validate() or >>
+    << mesh
+}

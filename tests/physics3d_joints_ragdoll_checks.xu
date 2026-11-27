@@ -1,0 +1,264 @@
+@main
+
+#gpu
+#math
+#time
+fm #"github.com/xulang-org/nexus/foundation/math"
+phys #"github.com/xulang-org/nexus/physics3d"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+shd #"github.com/xulang-org/nexus/assets/shaders/three_d"
+anim #"github.com/xulang-org/nexus/integration/gltf_render"
+nexus #"github.com/xulang-org/nexus/scene"
+light_data #"github.com/xulang-org/nexus/resources/lighting"
+
+fn ch_g(c int) int { << (c >> 16) & 255 }
+fn ch_r(c int) int { << (c >> 24) & 255 }
+
+fn run() int {
+    // 1. DynamicBvh3D: 512 incremental proxies, O(1) fat-AABB updates, balanced height & 1000 ray queries.
+    $dbvh := phys.new_dynamic_bvh_3d()
+    $proxies := []int{}
+    for i in 0:512 {
+        gx := f64(i % 16) * 2.0
+        gy := f64((i / 16) % 8) * 2.0
+        gz := f64(i / 128) * 2.0
+        bb := fm.aabb3(fm.vec3(gx - 0.3, gy - 0.3, gz - 0.3), fm.vec3(gx + 0.3, gy + 0.3, gz + 0.3)) or >>
+        proxies.push(dbvh.create_proxy(bb, i) or >>)
+    }
+    assert(dbvh.proxy_count() == 512)
+    tree_h := dbvh.tree_height()
+    assert(tree_h >= 8 && tree_h <= 18)
+
+    // Tiny displacement inside fat margin returns false (zero tree rebalance!).
+    small_bb := fm.aabb3(fm.vec3(-0.28, -0.28, -0.28), fm.vec3(0.32, 0.32, 0.32)) or >>
+    assert(!dbvh.move_proxy(proxies[0], small_bb, fm.vec3(0.02, 0.0, 0.0)))
+
+    // Large move relocates proxy 0 cleanly.
+    far_bb := fm.aabb3(fm.vec3(100.0, 100.0, 100.0), fm.vec3(101.0, 101.0, 101.0)) or >>
+    assert(dbvh.move_proxy(proxies[0], far_bb, fm.vec3(10.0, 10.0, 10.0)))
+    far_hits := dbvh.query_aabb(fm.aabb3(fm.vec3(99.5, 99.5, 99.5), fm.vec3(101.5, 101.5, 101.5)) or >>) or >>
+    assert(far_hits.len == 1 && far_hits[0] == 0)
+
+    t_ray0 := time.now()
+    $total_ray_hits := 0
+    for k in 0:1000 {
+        z := f64(k % 4) * 2.0
+        rh := dbvh.query_ray(fm.vec3(-5.0, 2.0, z), fm.vec3(40.0, 0.0, 0.0)) or >>
+        total_ray_hits += rh.len
+    }
+    ray_us := (time.now() - t_ray0) / 1000
+    assert(total_ray_hits > 1000)
+
+    // 2. XPBD Articulated Joints: Fixed Pivot + 2-Link Pendulum + Angle-Limited Hinge Arm.
+    empty_solids := []fm.Aabb3{}
+    empty_layers := []int{}
+    empty_tris := []phys.StaticTriangle3D{}
+    $jw := phys.new_jointed_world_3d(fm.vec3(0.0, -9.81, 0.0), 0.05, 0.05, &empty_solids, &empty_layers, &empty_tris) or >>
+    qi := fm.quaternion(0.0, 0.0, 0.0, 1.0)
+    // Static root at origin, two pendulum bars along +X, then hinge door along +X.
+    b_anchor := jw.add_body(fm.vec3(0.0, 4.0, 0.0), qi, fm.vec3(0.2, 0.2, 0.2), 0.0, 0.0, 0.5, 1, 1) or >>
+    b_arm1 := jw.add_body(fm.vec3(0.5, 4.0, 0.0), qi, fm.vec3(0.5, 0.1, 0.1), 1.5, 0.0, 0.5, 1, 1) or >>
+    b_arm2 := jw.add_body(fm.vec3(1.5, 4.0, 0.0), qi, fm.vec3(0.5, 0.1, 0.1), 1.5, 0.0, 0.5, 1, 1) or >>
+
+    // Hinge axis along +Z, angle clamped to [-0.6, +0.6] radians around Z!
+    hj0 := jw.add_hinge_joint(b_anchor, b_arm1, fm.vec3(0.0, 4.0, 0.0), fm.vec3(0.0, 0.0, 1.0), -0.6, 0.6, 0.0) or >>
+    bj1 := jw.add_ball_socket_joint(b_arm1, b_arm2, fm.vec3(1.0, 4.0, 0.0), fm.vec3(1.0, 0.0, 0.0), 1.2, 0.0) or >>
+
+    for _ in 0:60 {
+        jw.step(1.0 / 60.0, 8, 8) or >>
+    }
+    assert(jw.joint_anchor_error(hj0) < 0.01)
+    assert(jw.joint_anchor_error(bj1) < 0.01)
+    // Hinge limit prevents arm1 from rotating all the way down (-pi/2): center Y stays well above vertical drop!
+    assert(jw.position(b_arm1).y > 3.55 && jw.position(b_arm2).y < jw.position(b_arm1).y)
+    // High-speed ray through dynamic BVH locates moving pendulum arm.
+    dyn_hits := jw.query_bodies_ray(fm.vec3(-2.0, 3.8, 0.0), fm.vec3(6.0, -2.0, 0.0)) or >>
+    assert(dyn_hits.len >= 1)
+
+    // 3. SkeletonRagdoll3D + Real GPU Compute LBS Skinning verification!
+    // Vertical 4-bone articulated limb/spine starting standing upright at y=1.5..4.5 above floor y=0.
+    floor_box := fm.aabb3(fm.vec3(-8.0, -1.0, -8.0), fm.vec3(8.0, 0.0, 8.0)) or >>
+    parents := [-1, 0, 1, 2]
+    bw0 := fm.translation_3d(fm.vec3(0.0, 3.6, 0.0))
+    bw1 := fm.translation_3d(fm.vec3(0.0, 2.7, 0.0))
+    bw2 := fm.translation_3d(fm.vec3(0.0, 1.8, 0.0))
+    bw3 := fm.translation_3d(fm.vec3(0.0, 0.9, 0.0))
+    bind_worlds := [bw0, bw1, bw2, bw3]
+    ib0 := bw0.affine_inverse() or >>
+    ib1 := bw1.affine_inverse() or >>
+    ib2 := bw2.affine_inverse() or >>
+    ib3 := bw3.affine_inverse() or >>
+    inv_binds := [ib0, ib1, ib2, ib3]
+    // Give slightly tipped initial pose so gravity folds and collapses the ragdoll chain onto floor!
+    iw0 := fm.translation_3d(fm.vec3(0.0, 2.65, 0.0)).multiply(fm.rotation_x(-0.55))
+    iw1 := fm.translation_3d(fm.vec3(0.0, 1.88, 0.47)).multiply(fm.rotation_x(-0.55))
+    iw2 := fm.translation_3d(fm.vec3(0.0, 1.12, 0.94)).multiply(fm.rotation_x(-0.55))
+    iw3 := fm.translation_3d(fm.vec3(0.0, 0.35, 1.41)).multiply(fm.rotation_x(-0.55))
+    init_worlds := [iw0, iw1, iw2, iw3]
+    $ragdoll := anim.create_ragdoll_from_skeleton(
+        &parents, &bind_worlds, &inv_binds, 0.22, 1.25,
+        &[floor_box], &[1]
+    ) or >>
+    ragdoll.sync_from_world_pose(&init_worlds) or >>
+    head_y_before := ragdoll.joint_position(0).y
+
+    // Simulate 2.0s of ragdoll gravity collapse onto the BVH floor!
+    for _ in 0:120 {
+        ragdoll.step(1.0 / 60.0, 6, 8) or >>
+    }
+    head_y_after := ragdoll.joint_position(0).y
+    foot_y_after := ragdoll.joint_position(3).y
+    // Head falls significantly toward ground, yet floor prevents infinite falling (y >= -0.05)!
+    assert(head_y_after < head_y_before - 1.2 && head_y_after > -0.15 && foot_y_after > -0.15)
+
+    // Reconstruct GPU skinning palette from collapsed ragdoll and test animated <-> ragdoll pose blending!
+    palette := ragdoll.build_skin_palette(fm.identity_3d()) or >>
+    assert(palette.len == 4)
+    p0 := ragdoll.blend_skin_palette(&init_worlds, 0.0, fm.identity_3d()) or >>
+    p50 := ragdoll.blend_skin_palette(&init_worlds, 0.5, fm.identity_3d()) or >>
+    p100 := ragdoll.blend_skin_palette(&init_worlds, 1.0, fm.identity_3d()) or >>
+    // Check joint 0 blended Y position is strictly between animated init pose and collapsed ragdoll pose!
+    anim_w0 := p0[0].multiply(bind_worlds[0]).c3.y
+    blend_w0 := p50[0].multiply(bind_worlds[0]).c3.y
+    rag_w0 := p100[0].multiply(bind_worlds[0]).c3.y
+    assert(math.abs(rag_w0 - head_y_after) < 0.02)
+    assert(blend_w0 < anim_w0 - 0.5 && blend_w0 > rag_w0 + 0.5)
+
+    // 4. Dynamic OBB-OBB Stacking + Off-center Projectile Knock + Body Raycast!
+    $stack_w := phys.new_jointed_world_3d(fm.vec3(0.0, -9.81, 0.0), 0.1, 0.25, &[floor_box], &[1], &empty_tris) or >>
+    sb0 := stack_w.add_body(fm.vec3(0.0, 0.42, 0.0), qi, fm.vec3(0.4, 0.4, 0.4), 2.0, 0.05, 0.7, 1, 1) or >>
+    sb1 := stack_w.add_body(fm.vec3(0.0, 1.28, 0.0), phys.quaternion_from_mat4(fm.rotation_y(0.35)) or >>, fm.vec3(0.38, 0.4, 0.38), 2.0, 0.05, 0.7, 1, 1) or >>
+    sb2 := stack_w.add_body(fm.vec3(0.0, 2.15, 0.0), phys.quaternion_from_mat4(fm.rotation_y(-0.2)) or >>, fm.vec3(0.36, 0.4, 0.36), 2.0, 0.05, 0.7, 1, 1) or >>
+    // Standing tower target at x=4.0 and projectile box fired from x=1.8 with upper-corner offset!
+    tgt := stack_w.add_body(fm.vec3(4.0, 0.52, 0.0), qi, fm.vec3(0.35, 0.5, 0.35), 2.0, 0.1, 0.4, 1, 1) or >>
+    proj_b := stack_w.add_body(fm.vec3(2.2, 0.85, 0.0), qi, fm.vec3(0.25, 0.25, 0.25), 2.5, 0.3, 0.2, 1, 1) or >>
+    stack_w.apply_impulse_at_point(proj_b, fm.vec3(22.0, 1.5, 0.0), fm.vec3(2.2, 0.85, 0.0)) or >>
+    for _ in 0:25 {
+        stack_w.step(1.0 / 60.0, 6, 8) or >>
+    }
+    assert(stack_w.linear_velocity(tgt).x > 0.5 && stack_w.angular_velocity(tgt).length() > 1.0)
+    for _ in 0:95 {
+        stack_w.step(1.0 / 60.0, 6, 8) or >>
+    }
+    assert(math.abs(stack_w.position(sb0).y - 0.40) < 0.06)
+    assert(math.abs(stack_w.position(sb1).y - 1.20) < 0.08)
+    assert(math.abs(stack_w.position(sb2).y - 2.00) < 0.10)
+    // Target box was knocked over (0.50m standing half-height toppled onto 0.35m side!) and pushed past x=4.4.
+    assert(stack_w.position(tgt).x > 4.4 && stack_w.position(tgt).y < 0.42)
+    rhit := stack_w.raycast_bodies(fm.vec3(-3.0, 1.2, 0.0), fm.vec3(1.0, 0.0, 0.0), 10.0) or >>
+    assert(rhit.body_id == sb1 && math.abs(rhit.normal.x + 1.0) < 0.45 && rhit.distance > 2.0 && rhit.distance < 3.5)
+
+    // 5. StaticTriangle3D Sloped Ramp Sliding + Motorized Hinge Servo/Velocity Drive!
+    t_a := fm.vec3(-4.0, 2.0, 0.0)
+    t_b := fm.vec3(-4.0, 0.0, 3.5)
+    t_c := fm.vec3(4.0, 0.0, 3.5)
+    t_d := fm.vec3(4.0, 2.0, 0.0)
+    ramp_tris := [phys.static_triangle_3d(t_a, t_b, t_c, 1) or >>, phys.static_triangle_3d(t_a, t_c, t_d, 1) or >>]
+    $ramp_w := phys.new_jointed_world_3d(fm.vec3(0.0, -9.81, 0.0), 0.02, 0.05, &[floor_box], &[1], &ramp_tris) or >>
+    slider := ramp_w.add_body(fm.vec3(0.0, 1.9, 0.7), qi, fm.vec3(0.25, 0.25, 0.25), 1.5, 0.0, 0.08, 1, 1) or >>
+    for _ in 0:45 {
+        ramp_w.step(1.0 / 60.0, 6, 8) or >>
+    }
+    assert(ramp_w.position(slider).z > 1.35 && ramp_w.position(slider).y < 1.55 && ramp_w.position(slider).y > 0.70)
+    for _ in 0:45 {
+        ramp_w.step(1.0 / 60.0, 6, 8) or >>
+    }
+    assert(ramp_w.position(slider).z > 3.2 && ramp_w.position(slider).y > 0.15)
+
+    $motor_w := phys.new_jointed_world_3d(fm.vec3(0.0, 0.0, 0.0), 0.05, 0.05, &empty_solids, &empty_layers, &empty_tris) or >>
+    m_base := motor_w.add_body(fm.vec3(0.0, 2.0, 0.0), qi, fm.vec3(0.2, 0.2, 0.2), 0.0, 0.0, 0.5, 1, 1) or >>
+    m_blade := motor_w.add_body(fm.vec3(0.5, 2.0, 0.0), qi, fm.vec3(0.5, 0.1, 0.1), 1.0, 0.0, 0.5, 1, 1) or >>
+    mj := motor_w.add_hinge_joint(m_base, m_blade, fm.vec3(0.0, 2.0, 0.0), fm.vec3(0.0, 0.0, 1.0), -2.5, 2.5, 0.0) or >>
+    motor_w.set_hinge_servo(mj, true, 1.2, 0.0, 30.0) or >>
+    for _ in 0:90 {
+        motor_w.step(1.0 / 60.0, 6, 8) or >>
+    }
+    servo_ang := motor_w.hinge_angle(mj) or >>
+    assert(math.abs(servo_ang - 1.2) < 0.08)
+    motor_w.set_hinge_motor(mj, true, -3.5, 30.0) or >>
+    for _ in 0:30 {
+        motor_w.step(1.0 / 60.0, 6, 8) or >>
+    }
+    motor_ang := motor_w.hinge_angle(mj) or >>
+    assert(motor_ang < servo_ang - 0.8)
+
+    $sk_mesh := meshes.new_mesh_data_3d()
+    $ji := []int{}
+    $jw_v := []f64{}
+    $b_boxes := []fm.Aabb3{}
+    for b in 0:4 {
+        by := 3.6 - f64(b) * 0.9
+        w := 0.35
+        h := 0.4
+        nrm := fm.vec3(0.0, 0.0, 1.0)
+        vbase := b * 4
+        sk_mesh.vertex_lit_uv(fm.vec3(-w, by - h, 0.0), 4294967295, nrm, fm.vec2(0.0, 1.0)) or >>
+        sk_mesh.vertex_lit_uv(fm.vec3(w, by - h, 0.0), 4294967295, nrm, fm.vec2(1.0, 1.0)) or >>
+        sk_mesh.vertex_lit_uv(fm.vec3(w, by + h, 0.0), 4294967295, nrm, fm.vec2(1.0, 0.0)) or >>
+        sk_mesh.vertex_lit_uv(fm.vec3(-w, by + h, 0.0), 4294967295, nrm, fm.vec2(0.0, 0.0)) or >>
+        sk_mesh.triangle(vbase, vbase + 1, vbase + 2) or >>
+        sk_mesh.triangle(vbase, vbase + 2, vbase + 3) or >>
+        for _ in 0:4 {
+            ji.push(b)
+            ji.push(0)
+            ji.push(0)
+            ji.push(0)
+            jw_v.push(1.0)
+            jw_v.push(0.0)
+            jw_v.push(0.0)
+            jw_v.push(0.0)
+        }
+        b_boxes.push(fm.aabb3(fm.vec3(-w, by - h, -0.05), fm.vec3(w, by + h, 0.05)) or >>)
+    }
+    sk_mesh.validate() or >>
+
+    program := shd.load_mesh("build/mesh-shaders") or >>
+    sprog := shd.load_skin_program("build/mesh-shaders") or >>
+    $device := ren.open_3d("Ragdoll GPU Skinning", 128, 128, gpu.METAL, &program) or >>
+    $skin_pipe := device.skin_pipeline(&sprog) or >>
+    $skinned := device.upload_skinned_mesh(&sk_mesh, &ji, &jw_v, 4, &b_boxes, &[true, true, true, true]) or >>
+
+    rag_ref := skinned.pose(&device, &skin_pipe, &palette) or >>
+    rag_bounds := skinned.current_bounds()
+    assert(rag_bounds.maximum.y < 2.2) // Conservative skinned bounds visibly lower after ragdoll collapse!
+
+    eye := fm.vec3(0.0, 1.2, 5.5)
+    view := nexus.look_at_3d(eye, fm.vec3(0.0, 0.5, 0.5), fm.vec3(0.0, 1.0, 0.0)) or >>
+    proj := nexus.perspective_3d(0.9, 1.0, 0.25, 40.0) or >>
+    vp := proj.multiply(view)
+    $mat := ren.material_3d(fm.vec3(0.15, 0.92, 0.30), 0.0, 0.7, fm.vec3(0.02, 0.10, 0.02)) or >>
+    mat = mat.with_double_sided(true)
+    sun_dir := fm.vec3(0.3, 0.8, 0.6).normalized() or >>
+    sun := light_data.directional(sun_dir, fm.vec3(2.0, 2.0, 2.0)) or >>
+    l_desc := light_data.environment(fm.vec3(0.35, 0.35, 0.35), fm.vec3(0.0, 0.0, 0.0), 1.0, [sun]) or >>
+
+    device.begin(255) or >>
+    device.draw_material_reference(rag_ref, fm.identity_3d(), vp, &mat, &l_desc) or >>
+    $hits := 0
+    for y in 40:120 {
+        for x in 20:108 {
+            px := device.read_pixel(x, y) or >>
+            if ch_g(px) > ch_r(px) + 30 && ch_g(px) > 70 { hits += 1 }
+        }
+    }
+    assert(hits > 20)
+    device.capture("build/ragdoll-gpu-skinned.png") or >>
+    device.present() or >>
+
+    skinned.close() or >>
+    skin_pipe.close() or >>
+    device.close() or >>
+
+    println("PASS: DynamicBvh3D (512 proxies h=" + str(tree_h) + ", 1000 rays=" + str(ray_us) +
+        "us) + XPBD Hinge/Ball Joints + GPU Ragdoll Collapse (y=" +
+        str(int(head_y_before * 100.0)) + "cm->" + str(int(head_y_after * 100.0)) + "cm, hits=" + str(hits) + ")")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

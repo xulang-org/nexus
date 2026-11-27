@@ -1,0 +1,150 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+#math
+
+const GIZMO_MOVE = 1
+const GIZMO_ROTATE = 2
+const GIZMO_SCALE = 3
+
+struct ScreenSegment { begin fm.Vec2
+    end fm.Vec2 }
+struct GizmoBasis {
+    x fm.Vec3
+    y fm.Vec3
+    z fm.Vec3
+}
+struct AxisHandle {
+    index int
+    axis fm.Vec3
+    begin fm.Vec2
+    end fm.Vec2
+    length f64
+    color int
+    ring []ScreenSegment
+}
+
+fn world_basis() GizmoBasis {
+    << GizmoBasis{x: fm.vec3(1.0, 0.0, 0.0), y: fm.vec3(0.0, 1.0, 0.0), z: fm.vec3(0.0, 0.0, 1.0)}
+}
+
+fn (basis GizmoBasis) axis(index int) fm.Vec3 {
+    if index == 0 { << basis.x }
+    if index == 1 { << basis.y }
+    << basis.z
+}
+
+fn ring_point(pivot fm.Vec3, basis GizmoBasis, axis_index int, radius f64, angle f64) fm.Vec3 {
+    u := basis.axis((axis_index + 1) % 3)
+    // Use the same positive rotation convention for reflected local frames.
+    v := basis.axis(axis_index).cross(u)
+    << pivot.add(u.scaled(radius * math.cos(angle))).add(v.scaled(radius * math.sin(angle)))
+}
+
+fn rotation_ring(frame CameraFrame, pivot fm.Vec3, basis GizmoBasis, index int, radius f64) []ScreenSegment {
+    $segments := []ScreenSegment{}
+    eye := frame.position.sub(pivot).normalized() or (err) { << segments }
+    if math.abs(eye.dot(basis.axis(index))) < 0.08 { << segments }
+    $from := frame.project(ring_point(pivot, basis, index, radius, 0.0))
+    for i in 1:49 {
+        point := frame.project(ring_point(pivot, basis, index, radius, f64(i) * 6.283185307179586 / 48.0))
+        if from.visible && point.visible { segments.push(ScreenSegment{begin: from.position, end: point.position}) }
+        from = point
+    }
+    << segments
+}
+fn ring_handle(frame CameraFrame, pivot fm.Vec3, center fm.Vec2, basis GizmoBasis, index int, radius f64, color int) AxisHandle {
+    ring := rotation_ring(frame, pivot, basis, index, radius)
+    << AxisHandle{index: index, axis: basis.axis(index), begin: center, end: center, length: radius, color: color, ring: ring}
+}
+
+fn axis_handles(frame CameraFrame, pivot fm.Vec3, basis GizmoBasis, mode int) []AxisHandle {
+    center := frame.project(pivot)
+    $result := []AxisHandle{}
+    if !center.visible { << result }
+    length := center.depth * frame.tangent * 148.0 / frame.size.y
+    colors := [EDITOR_CHART_1, EDITOR_CHART_3, EDITOR_CHART_2]
+    for i in 0:3 {
+        axis := basis.axis(i)
+        if mode == GIZMO_ROTATE {
+            result.push(ring_handle(frame, pivot, center.position, basis, i, length, colors[i]))
+            ->
+        }
+        tip := frame.project(pivot.add(axis.scaled(length)))
+        delta := tip.position.sub(center.position)
+        if tip.visible && delta.dot(delta) >= 144.0 {
+            result.push(AxisHandle{index: i, axis: axis, begin: center.position, end: tip.position,
+                length: length, color: colors[i], ring: []ScreenSegment{}})
+        }
+    }
+    if mode == GIZMO_SCALE {
+        result.push(AxisHandle{index: 3, axis: fm.vec3(0.0, 0.0, 0.0), begin: center.position, end: center.position,
+            length: length, color: EDITOR_TEXT, ring: []ScreenSegment{}})
+    }
+    << result
+}
+
+fn segment_distance2(begin fm.Vec2, end fm.Vec2, point fm.Vec2, lower f64) f64 {
+    line := end.sub(begin)
+    length2 := line.dot(line)
+    $at := 0.0
+    if length2 > 0.0 { at = clamp(point.sub(begin).dot(line) / length2, lower, 1.0) }
+    delta := point.sub(begin.add(line.scaled(at)))
+    << delta.dot(delta)
+}
+
+fn handle_at(handles &[]AxisHandle, point fm.Vec2, mode int) int {
+    $chosen := -1
+    $distance := 64.0
+    for i in 0:handles.len {
+        handle := &handles[i]
+        $d := 64.0
+        if mode == GIZMO_ROTATE {
+            for edge in handle.ring { d = math.min(d, segment_distance2(edge.begin, edge.end, point, 0.0)) }
+        } else { d = segment_distance2(handle.begin, handle.end, point, 0.25) }
+        if d < distance { distance = d
+            chosen = i }
+    }
+    << chosen
+}
+
+fn draw_stroke(batch $&canvas.Batch2D, begin fm.Vec2, end fm.Vec2, width f64, color int) int {
+    forward := end.sub(begin).normalized() or (err) { << 0 }
+    side := fm.vec2(-forward.y * width, forward.x * width)
+    a := begin.add(side)
+    b := begin.sub(side)
+    c := end.add(side)
+    d := end.sub(side)
+    batch.triangle(a, b, c, color) or >>
+    batch.triangle(c, b, d, color) or >>
+    << 0
+}
+
+fn draw_square(batch $&canvas.Batch2D, at fm.Vec2, size f64, color int) int {
+    a := at.sub(fm.vec2(size, size))
+    b := at.add(fm.vec2(size, -size))
+    c := at.add(fm.vec2(size, size))
+    d := at.add(fm.vec2(-size, size))
+    batch.triangle(a, b, c, color) or >>
+    batch.triangle(a, c, d, color) or >>
+    << 0
+}
+
+fn draw_handle(batch $&canvas.Batch2D, handle &AxisHandle, mode int, active bool) int {
+    $color := handle.color
+    if active { color = EDITOR_CHART_4 }
+    if mode == GIZMO_ROTATE {
+        for edge in handle.ring { draw_stroke(batch, edge.begin, edge.end, 1.8, color) or >> }
+    } else if mode == GIZMO_SCALE {
+        draw_stroke(batch, handle.begin, handle.end, 1.8, color) or >>
+        draw_square(batch, handle.end, 5.0, color) or >>
+    } else {
+        forward := handle.end.sub(handle.begin).normalized() or >>
+        side := fm.vec2(-forward.y, forward.x)
+        shaft := handle.end.sub(forward.scaled(8.0))
+        draw_stroke(batch, handle.begin, shaft, 2.0, color) or >>
+        batch.triangle(handle.end, shaft.add(side.scaled(6.0)), shaft.sub(side.scaled(6.0)), color) or >>
+    }
+    << 0
+}

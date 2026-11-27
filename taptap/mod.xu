@@ -1,0 +1,905 @@
+@"github.com/xulang-org/nexus/taptap"
+
+plat #"github.com/xulang-org/nexus/platform/taptap"
+rt #"github.com/xulang-org/nexus/resources/taptap"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#encoding/json
+#errors
+#os
+#path/filepath
+#strconv
+#strings
+
+pub const BACKEND_NONE = 0
+pub const BACKEND_NATIVE = 1
+pub const BACKEND_LOCAL_MOCK = 2
+
+const MAX_EVENTS = 256
+
+struct TapLeaderboardRow {
+    board_id string
+    open_id string
+    name string
+    score int
+}
+
+pub struct TapTapClient {
+    cfg rt.TapTapAppConfig
+    backend int
+    initialized bool
+    save_dir string
+    user_state rt.TapTapUser
+    compliance rt.TapTapComplianceState
+    licensed bool
+    moment_open bool
+    achievements map[string]rt.TapTapAchievement
+    ach_keys []string
+    dlc_owned map[string]bool
+    dlc_keys []string
+    cloud_mem map[string][]u8
+    cloud_meta map[string]rt.TapTapCloudArchive
+    cloud_keys []string
+    lb_rows []TapLeaderboardRow
+    events []rt.TapTapEvent
+}
+
+fn push_unique_str(list $&[]string, key string) {
+    for i in 0:list.len {
+        if list[i] == key { << }
+    }
+    list.push(key)
+}
+
+fn new_shell(cfg rt.TapTapAppConfig, backend int) TapTapClient {
+    << TapTapClient{
+        cfg: cfg,
+        backend: backend,
+        initialized: true,
+        save_dir: "",
+        user_state: rt.TapTapUser{
+            open_id: "",
+            union_id: "",
+            name: "",
+            avatar_url: "",
+            logged_in: false,
+            access_token: ""
+        },
+        compliance: rt.TapTapComplianceState{
+            verified: false,
+            age_range: rt.AGE_UNKNOWN,
+            remaining_seconds: -1,
+            restricted: false,
+            restriction_reason: rt.RESTRICT_NONE,
+            monthly_spent_cents: 0
+        },
+        licensed: true,
+        moment_open: false,
+        achievements: map[string]rt.TapTapAchievement{},
+        ach_keys: []string{},
+        dlc_owned: map[string]bool{},
+        dlc_keys: []string{},
+        cloud_mem: map[string][]u8{},
+        cloud_meta: map[string]rt.TapTapCloudArchive{},
+        cloud_keys: []string{},
+        lb_rows: []TapLeaderboardRow{},
+        events: []rt.TapTapEvent{}
+    }
+}
+
+pub fn empty_client() TapTapClient {
+    $c := new_shell(rt.default_config("empty_tap", "empty_tok", rt.REGION_CN), BACKEND_NONE)
+    c.initialized = false
+    << c
+}
+
+fn push_event(c $&TapTapClient, kind int, code int, text string) {
+    if c.events.len >= MAX_EVENTS { << }
+    c.events.push(rt.TapTapEvent{kind: kind, code: code, text: text})
+}
+
+fn slice_to_string(data &[]u8, start int, stop int) string {
+    $b := strings.new_byte_builder(stop - start + 1)
+    for i in start:stop { b.write_byte(int(data[i])) }
+    << b.to_string()
+}
+
+fn string_to_bytes(raw &string) []u8 {
+    $out := []u8{}
+    for i in 0:raw.len { out.push(u8(raw[i] & 255)) }
+    << out
+}
+
+fn init_defaults(c $&TapTapClient) {
+    for i in 0:c.cfg.achievement_ids.len {
+        aid := c.cfg.achievement_ids[i] + ""
+        c.achievements[aid + ""] = rt.TapTapAchievement{
+            display_id: aid + "",
+            unlocked: false,
+            steps: 0,
+            max_steps: 1
+        }
+        push_unique_str($&c.ach_keys, aid + "")
+    }
+    for i in 0:c.cfg.dlc_ids.len {
+        did := c.cfg.dlc_ids[i] + ""
+        c.dlc_owned[did + ""] = false
+        push_unique_str($&c.dlc_keys, did + "")
+    }
+}
+
+fn persist_mock_state(c &TapTapClient) int {
+    if c.backend != BACKEND_LOCAL_MOCK || c.save_dir.len == 0 { << 0 }
+    os.mkdir_all(c.save_dir + "") or >>
+    $b := strings.new_byte_builder(1024)
+    b.write_str("{\n")
+    b.write_str("  \"monthly_spent_cents\": " + str(c.compliance.monthly_spent_cents) + ",\n")
+    b.write_str("  \"achievements\": [")
+    for i in 0:c.ach_keys.len {
+        if i > 0 { b.write_str(", ") }
+        k := c.ach_keys[i] + ""
+        rec := &c.achievements[k]
+        dk := k + ""
+        $us := "false"
+        if rec.unlocked { us = "true" }
+        b.write_str("{\"id\": " + json.quote(&dk) + ", \"unlocked\": " + us +
+            ", \"steps\": " + str(rec.steps) + ", \"max_steps\": " + str(rec.max_steps) + "}")
+    }
+    b.write_str("],\n  \"owned_dlcs\": [")
+    $first_d := true
+    for i in 0:c.dlc_keys.len {
+        k := c.dlc_keys[i] + ""
+        if c.dlc_owned[k] {
+            if !first_d { b.write_str(", ") }
+            first_d = false
+            dk := k + ""
+            b.write_str(json.quote(&dk))
+        }
+    }
+    b.write_str("],\n  \"leaderboards\": [")
+    for i in 0:c.lb_rows.len {
+        if i > 0 { b.write_str(", ") }
+        row := &c.lb_rows[i]
+        bid := row.board_id + ""
+        oid := row.open_id + ""
+        nm := row.name + ""
+        b.write_str("{\"board\": " + json.quote(&bid) + ", \"open_id\": " + json.quote(&oid) +
+            ", \"name\": " + json.quote(&nm) + ", \"score\": " + str(row.score) + "}")
+    }
+    b.write_str("],\n  \"cloud\": [")
+    for i in 0:c.cloud_keys.len {
+        if i > 0 { b.write_str(", ") }
+        ck := c.cloud_keys[i] + ""
+        arc := &c.cloud_meta[ck]
+        cn := arc.name + ""
+        cs := arc.summary + ""
+        cu := arc.uuid + ""
+        b.write_str("{\"uuid\": " + json.quote(&cu) + ", \"name\": " + json.quote(&cn) +
+            ", \"summary\": " + json.quote(&cs) + ", \"size_bytes\": " + str(arc.size_bytes) + "}")
+    }
+    b.write_str("]\n}\n")
+    raw := b.to_string()
+    snapshot.write_atomic(filepath.join([c.save_dir + "", "taptap_state.json"]), &raw) or >>
+    << 0
+}
+
+fn json_int_or(doc &json.Doc, h int, fallback int) int {
+    v := doc.as_int(h) or (err) {
+        _ := err.msg()
+        << fallback
+    }
+    << v
+}
+
+fn json_str_or(doc &json.Doc, h int, fallback string) string {
+    v := doc.as_string(h) or (err) {
+        _ := err.msg()
+        << fallback + ""
+    }
+    << v
+}
+
+fn json_bool_or(doc &json.Doc, h int, fallback bool) bool {
+    v := doc.as_bool(h) or (err) {
+        _ := err.msg()
+        << fallback
+    }
+    << v
+}
+
+fn snap_read_or(path string, max_bytes int) string {
+    raw := snapshot.read(path, max_bytes) or (err) {
+        _ := err.msg()
+        << ""
+    }
+    << raw
+}
+
+fn path_exists(p &string) bool {
+    _ := os.stat(p + "") or (err) {
+        _ := err.msg()
+        << false
+    }
+    << true
+}
+
+fn load_mock_state(c $&TapTapClient) {
+    if c.save_dir.len == 0 { << }
+    path := filepath.join([c.save_dir + "", "taptap_state.json"])
+    if !path_exists(&path) { << }
+    raw := snap_read_or(path + "", 2097152)
+    if raw.len == 0 { << }
+    doc := json.parse_max(&raw, 2097152)
+    if !doc.ok() { << }
+    root := doc.root()
+    if !doc.is_dict(root) { << }
+    if doc.has(root, "monthly_spent_cents") {
+        c.compliance.monthly_spent_cents = json_int_or(&doc, doc.get(root, "monthly_spent_cents"), 0)
+    }
+    if doc.has(root, "achievements") {
+        al := doc.get(root, "achievements")
+        if doc.is_list(al) {
+            for i in 0:doc.count(al) {
+                item := doc.at(al, i)
+                id := json_str_or(&doc, doc.get(item, "id"), "")
+                if id.len > 0 {
+                    unl := json_bool_or(&doc, doc.get(item, "unlocked"), false)
+                    st := json_int_or(&doc, doc.get(item, "steps"), 0)
+                    mx := json_int_or(&doc, doc.get(item, "max_steps"), 1)
+                    c.achievements[id + ""] = rt.TapTapAchievement{
+                        display_id: id + "", unlocked: unl, steps: st, max_steps: mx
+                    }
+                    push_unique_str($&c.ach_keys, id + "")
+                }
+            }
+        }
+    }
+    if doc.has(root, "owned_dlcs") {
+        dl := doc.get(root, "owned_dlcs")
+        if doc.is_list(dl) {
+            for i in 0:doc.count(dl) {
+                sku := json_str_or(&doc, doc.at(dl, i), "")
+                if sku.len > 0 {
+                    c.dlc_owned[sku + ""] = true
+                    push_unique_str($&c.dlc_keys, sku + "")
+                }
+            }
+        }
+    }
+    if doc.has(root, "leaderboards") {
+        ll := doc.get(root, "leaderboards")
+        if doc.is_list(ll) {
+            for i in 0:doc.count(ll) {
+                item := doc.at(ll, i)
+                bd := json_str_or(&doc, doc.get(item, "board"), "")
+                oid := json_str_or(&doc, doc.get(item, "open_id"), "")
+                nm := json_str_or(&doc, doc.get(item, "name"), "")
+                sc := json_int_or(&doc, doc.get(item, "score"), 0)
+                if bd.len > 0 {
+                    c.lb_rows.push(TapLeaderboardRow{board_id: bd, open_id: oid, name: nm, score: sc})
+                }
+            }
+        }
+    }
+    if doc.has(root, "cloud") {
+        cl := doc.get(root, "cloud")
+        if doc.is_list(cl) {
+            for i in 0:doc.count(cl) {
+                item := doc.at(cl, i)
+                cn := json_str_or(&doc, doc.get(item, "name"), "")
+                cs := json_str_or(&doc, doc.get(item, "summary"), "")
+                cu := json_str_or(&doc, doc.get(item, "uuid"), "")
+                if cn.len > 0 {
+                    disk_path := filepath.join([c.save_dir + "", "cloud", cn + ""])
+                    if path_exists(&disk_path) {
+                        craw := snap_read_or(disk_path + "", rt.MAX_CLOUDSAVE_FILE_BYTES)
+                        bytes := string_to_bytes(&craw)
+                        blen := bytes.len
+                        c.cloud_mem[cn + ""] = bytes
+                        c.cloud_meta[cn + ""] = rt.TapTapCloudArchive{
+                            uuid: cu + "", name: cn + "", summary: cs + "", extra: "",
+                            playtime_sec: 0, size_bytes: blen, modified_epoch: 1
+                        }
+                        push_unique_str($&c.cloud_keys, cn + "")
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn populate_native_state(c $&TapTapClient) {
+    c.user_state.logged_in = plat.raw_is_logged_in() == 1
+    $oid_buf := plat.alloc_u8(256)
+    oid_n := plat.raw_user_open_id($&oid_buf)
+    if oid_n > 0 { c.user_state.open_id = plat.u8_to_str(&oid_buf, oid_n) }
+    $uid_buf := plat.alloc_u8(256)
+    uid_n := plat.raw_user_union_id($&uid_buf)
+    if uid_n > 0 { c.user_state.union_id = plat.u8_to_str(&uid_buf, uid_n) }
+    $nm_buf := plat.alloc_u8(256)
+    nm_n := plat.raw_user_name($&nm_buf)
+    if nm_n > 0 { c.user_state.name = plat.u8_to_str(&nm_buf, nm_n) }
+    age := plat.raw_compliance_age_range()
+    rem := plat.raw_compliance_remaining_time()
+    cst := plat.raw_compliance_status()
+    c.compliance.age_range = age
+    c.compliance.remaining_seconds = rem
+    c.compliance.verified = age >= 0
+    c.compliance.restricted = cst != rt.RESTRICT_NONE
+    c.compliance.restriction_reason = cst
+    c.licensed = plat.raw_verify_license() == 1
+    c.moment_open = plat.raw_moment_is_open() == 1
+}
+
+pub fn init_native(cfg rt.TapTapAppConfig, save_dir string) TapTapClient {
+    rt.validate_config(&cfg) or >>
+    if plat.raw_is_available() != 1 {
+        >> errors.new(plat.last_error())
+    }
+    cid_b := plat.str_to_u8(&cfg.client_id)
+    ctok_b := plat.str_to_u8(&cfg.client_token)
+    plat.checked(plat.raw_init(&cid_b, &ctok_b, cfg.region, cfg.target_platform)) or >>
+    $c := new_shell(cfg.clone(), BACKEND_NATIVE)
+    c.save_dir = save_dir + ""
+    init_defaults($&c)
+    populate_native_state($&c)
+    << c
+}
+
+pub fn init_mock(cfg rt.TapTapAppConfig, save_dir string) TapTapClient {
+    rt.validate_config(&cfg) or >>
+    $c := new_shell(cfg.clone(), BACKEND_LOCAL_MOCK)
+    c.save_dir = save_dir + ""
+    c.user_state = rt.TapTapUser{
+        open_id: "tap_mock_" + c.cfg.client_id,
+        union_id: "tap_union_1",
+        name: "TapPlayer",
+        avatar_url: "https://example.invalid/avatar.png",
+        logged_in: true,
+        access_token: "mock_token_" + c.cfg.client_id
+    }
+    c.compliance = rt.TapTapComplianceState{
+        verified: true,
+        age_range: rt.AGE_ADULT,
+        remaining_seconds: -1,
+        restricted: false,
+        restriction_reason: rt.RESTRICT_NONE,
+        monthly_spent_cents: 0
+    }
+    init_defaults($&c)
+    load_mock_state($&c)
+    << c
+}
+
+pub fn init_auto(cfg rt.TapTapAppConfig, save_dir string) TapTapClient {
+    rt.validate_config(&cfg) or >>
+    if plat.raw_is_available() == 1 {
+        << init_native(cfg, save_dir + "") or >>
+    }
+    << init_mock(cfg, save_dir + "") or >>
+}
+
+pub fn (c &TapTapClient) backend_kind() int { << c.backend }
+pub fn (c &TapTapClient) is_initialized() bool { << c.initialized }
+pub fn (c &TapTapClient) config() rt.TapTapAppConfig { << c.cfg.clone() }
+pub fn (c &TapTapClient) user() rt.TapTapUser {
+    << rt.TapTapUser{
+        open_id: c.user_state.open_id + "",
+        union_id: c.user_state.union_id + "",
+        name: c.user_state.name + "",
+        avatar_url: c.user_state.avatar_url + "",
+        logged_in: c.user_state.logged_in,
+        access_token: c.user_state.access_token + ""
+    }
+}
+pub fn (c &TapTapClient) is_logged_in() bool { << c.user_state.logged_in }
+pub fn (c &TapTapClient) compliance_state() rt.TapTapComplianceState {
+    << rt.TapTapComplianceState{
+        verified: c.compliance.verified,
+        age_range: c.compliance.age_range,
+        remaining_seconds: c.compliance.remaining_seconds,
+        restricted: c.compliance.restricted,
+        restriction_reason: c.compliance.restriction_reason,
+        monthly_spent_cents: c.compliance.monthly_spent_cents
+    }
+}
+pub fn (c &TapTapClient) is_licensed() bool { << c.licensed }
+pub fn (c &TapTapClient) is_moment_open() bool { << c.moment_open }
+
+fn require_ready(c &TapTapClient) int {
+    if !c.initialized || c.backend == BACKEND_NONE {
+        >> errors.new("nexus taptap: client not initialized")
+    }
+    << 0
+}
+
+pub fn (c &TapTapClient) restart_if_necessary() bool {
+    if c.backend == BACKEND_NATIVE {
+        cid_b := plat.str_to_u8(&c.cfg.client_id)
+        << plat.raw_restart_if_necessary(&cid_b) == 1
+    }
+    << false
+}
+
+pub fn (c $&TapTapClient) login(scopes string) int {
+    require_ready(c) or >>
+    if c.backend == BACKEND_NATIVE {
+        sc_b := plat.str_to_u8(&scopes)
+        plat.checked(plat.raw_login(&sc_b)) or >>
+        populate_native_state(c)
+        push_event(c, rt.EVENT_LOGIN_SUCCEEDED, 0, scopes + "")
+        << 0
+    }
+    c.user_state.logged_in = true
+    if c.user_state.open_id.len == 0 {
+        c.user_state.open_id = "tap_mock_" + c.cfg.client_id
+    }
+    push_event(c, rt.EVENT_LOGIN_SUCCEEDED, 0, scopes + "")
+    << 0
+}
+
+pub fn (c $&TapTapClient) logout() int {
+    require_ready(c) or >>
+    if c.backend == BACKEND_NATIVE {
+        plat.checked(plat.raw_logout()) or >>
+    }
+    c.user_state.logged_in = false
+    push_event(c, rt.EVENT_LOGIN_CANCELLED, 0, "logout")
+    << 0
+}
+
+pub fn (c $&TapTapClient) start_compliance() int {
+    require_ready(c) or >>
+    if c.backend == BACKEND_NATIVE {
+        plat.checked(plat.raw_compliance_startup()) or >>
+        populate_native_state(c)
+        push_event(c, rt.EVENT_COMPLIANCE_LOGIN_SUCCESS, 0, "")
+        << 0
+    }
+    c.compliance.verified = true
+    c.compliance.restricted = false
+    c.compliance.restriction_reason = rt.RESTRICT_NONE
+    push_event(c, rt.EVENT_COMPLIANCE_LOGIN_SUCCESS, 0, "")
+    << 0
+}
+
+pub fn (c $&TapTapClient) exit_compliance() int {
+    require_ready(c) or >>
+    if c.backend == BACKEND_NATIVE {
+        plat.checked(plat.raw_compliance_exit()) or >>
+    }
+    c.compliance.verified = false
+    push_event(c, rt.EVENT_COMPLIANCE_EXITED, 0, "exit")
+    << 0
+}
+
+pub fn (c $&TapTapClient) simulate_minor_profile(age_range int, remaining_seconds int, restricted bool, reason int) int {
+    require_ready(c) or >>
+    c.compliance.verified = age_range >= 0
+    c.compliance.age_range = age_range
+    c.compliance.remaining_seconds = remaining_seconds
+    c.compliance.restricted = restricted
+    c.compliance.restriction_reason = reason
+    if reason == rt.RESTRICT_PERIOD {
+        push_event(c, rt.EVENT_COMPLIANCE_PERIOD_RESTRICT, reason, "curfew")
+    } else if reason == rt.RESTRICT_DURATION {
+        push_event(c, rt.EVENT_COMPLIANCE_DURATION_LIMIT, reason, "duration")
+    } else if reason == rt.RESTRICT_AGE || reason == rt.RESTRICT_UNVERIFIED {
+        push_event(c, rt.EVENT_COMPLIANCE_AGE_LIMIT, reason, "age_limit")
+    }
+    << 0
+}
+
+pub fn (c $&TapTapClient) simulate_switch_account() int {
+    require_ready(c) or >>
+    c.user_state.logged_in = false
+    c.compliance.verified = false
+    push_event(c, rt.EVENT_COMPLIANCE_SWITCH_ACCOUNT, 0, "switch_account")
+    << 0
+}
+
+pub fn (c &TapTapClient) check_payment(amount_cents int) int {
+    require_ready(c) or >>
+    if amount_cents <= 0 {
+        >> errors.new("nexus taptap: payment amount must be positive")
+    }
+    if c.backend == BACKEND_NATIVE {
+        plat.checked(plat.raw_compliance_check_payment(amount_cents)) or >>
+        << 0
+    }
+    if c.cfg.region == rt.REGION_CN && c.cfg.enable_payment_check {
+        rt.check_minor_payment_limit(c.compliance.age_range, amount_cents, c.compliance.monthly_spent_cents) or >>
+    }
+    << 0
+}
+
+pub fn (c $&TapTapClient) submit_payment(amount_cents int) int {
+    c.check_payment(amount_cents) or >>
+    if c.backend == BACKEND_NATIVE {
+        plat.checked(plat.raw_compliance_submit_payment(amount_cents)) or >>
+        << 0
+    }
+    c.compliance.monthly_spent_cents = c.compliance.monthly_spent_cents + amount_cents
+    persist_mock_state(c) or >>
+    << 0
+}
+
+pub fn (c $&TapTapClient) verify_license() bool {
+    if !c.initialized || c.backend == BACKEND_NONE { << false }
+    if c.backend == BACKEND_NATIVE {
+        c.licensed = plat.raw_verify_license() == 1
+    }
+    if c.licensed {
+        push_event(c, rt.EVENT_LICENSE_VERIFIED, 0, "ok")
+    }
+    << c.licensed
+}
+
+pub fn (c &TapTapClient) has_dlc(sku string) bool {
+    if !c.initialized || c.backend == BACKEND_NONE { << false }
+    if c.backend == BACKEND_NATIVE {
+        sb := plat.str_to_u8(&sku)
+        << plat.raw_has_dlc(&sb) == 1
+    }
+    k := sku + ""
+    if !c.dlc_owned.has(k + "") { << false }
+    << c.dlc_owned[k]
+}
+
+pub fn (c $&TapTapClient) query_dlc_page(sku string) int {
+    require_ready(c) or >>
+    if c.backend == BACKEND_NATIVE {
+        sb := plat.str_to_u8(&sku)
+        plat.checked(plat.raw_query_dlc_page(&sb)) or >>
+        << 0
+    }
+    << 0
+}
+
+pub fn (c $&TapTapClient) grant_mock_dlc(sku string) int {
+    require_ready(c) or >>
+    k := sku + ""
+    c.dlc_owned[k + ""] = true
+    push_unique_str($&c.dlc_keys, k + "")
+    persist_mock_state(c) or >>
+    << 0
+}
+
+pub fn (c $&TapTapClient) set_mock_licensed(licensed bool) {
+    c.licensed = licensed
+}
+
+pub fn (c $&TapTapClient) unlock_achievement(display_id string) int {
+    require_ready(c) or >>
+    if display_id.len == 0 { >> errors.new("nexus taptap: empty achievement display_id") }
+    if c.backend == BACKEND_NATIVE {
+        ab := plat.str_to_u8(&display_id)
+        plat.checked(plat.raw_unlock_achievement(&ab)) or >>
+    }
+    k := display_id + ""
+    c.achievements[k + ""] = rt.TapTapAchievement{
+        display_id: k + "",
+        unlocked: true,
+        steps: 1,
+        max_steps: 1
+    }
+    push_unique_str($&c.ach_keys, k + "")
+    push_event(c, rt.EVENT_ACHIEVEMENT_UNLOCKED, 0, k + "")
+    persist_mock_state(c) or >>
+    << 0
+}
+
+pub fn (c $&TapTapClient) increment_achievement(display_id string, steps int, max_steps int) int {
+    require_ready(c) or >>
+    if display_id.len == 0 || steps <= 0 || max_steps <= 0 {
+        >> errors.new("nexus taptap: invalid achievement increment arguments")
+    }
+    if c.backend == BACKEND_NATIVE {
+        ab := plat.str_to_u8(&display_id)
+        plat.checked(plat.raw_increment_achievement(&ab, steps, max_steps)) or >>
+    }
+    k := display_id + ""
+    $cur := 0
+    if c.achievements.has(k + "") {
+        rec := &c.achievements[k]
+        cur = rec.steps
+    }
+    $nxt := cur + steps
+    if nxt > max_steps { nxt = max_steps }
+    done := nxt >= max_steps
+    c.achievements[k + ""] = rt.TapTapAchievement{
+        display_id: k + "",
+        unlocked: done,
+        steps: nxt,
+        max_steps: max_steps
+    }
+    push_unique_str($&c.ach_keys, k + "")
+    if done { push_event(c, rt.EVENT_ACHIEVEMENT_UNLOCKED, 0, k + "") }
+    persist_mock_state(c) or >>
+    << 0
+}
+
+pub fn (c &TapTapClient) has_achievement(display_id string) bool {
+    if !c.initialized || c.backend == BACKEND_NONE { << false }
+    if c.backend == BACKEND_NATIVE {
+        ab := plat.str_to_u8(&display_id)
+        << plat.raw_has_achievement(&ab) == 1
+    }
+    k := display_id + ""
+    if !c.achievements.has(k + "") { << false }
+    rec := &c.achievements[k]
+    << rec.unlocked
+}
+
+fn current_cloud_bytes(c &TapTapClient, exclude &string) int {
+    $total := 0
+    for i in 0:c.cloud_keys.len {
+        k := c.cloud_keys[i] + ""
+        if k != *exclude && c.cloud_mem.has(k + "") {
+            mem := &c.cloud_mem[k]
+            total = total + mem.len
+        }
+    }
+    << total
+}
+
+pub fn (c $&TapTapClient) cloud_write(name string, summary string, data &[]u8) int {
+    require_ready(c) or >>
+    clean := rt.validate_archive_name(&name) or >>
+    if data.len > rt.MAX_CLOUDSAVE_FILE_BYTES {
+        >> errors.new("nexus taptap: archive exceeds max file size")
+    }
+    if c.backend == BACKEND_NATIVE {
+        nb := plat.str_to_u8(&clean)
+        sb := plat.str_to_u8(&summary)
+        plat.checked(plat.raw_cloud_write(&nb, &sb, data)) or >>
+        push_event(c, rt.EVENT_CLOUDSAVE_SYNCED, 0, clean + "")
+        << 0
+    }
+    used := current_cloud_bytes(c, &clean)
+    if used + data.len > c.cfg.cloud_quota_bytes {
+        >> errors.new("nexus taptap: cloudsave quota exceeded")
+    }
+    if c.cloud_keys.len >= rt.MAX_CLOUDSAVE_ARCHIVES && !c.cloud_mem.has(clean + "") {
+        >> errors.new("nexus taptap: cloudsave archive count limit reached")
+    }
+    $copy := []u8{}
+    for i in 0:data.len { copy.push(data[i]) }
+    c.cloud_mem[clean + ""] = copy
+    c.cloud_meta[clean + ""] = rt.TapTapCloudArchive{
+        uuid: "arc_" + clean,
+        name: clean + "",
+        summary: summary + "",
+        extra: "",
+        playtime_sec: 0,
+        size_bytes: data.len,
+        modified_epoch: 1
+    }
+    push_unique_str($&c.cloud_keys, clean + "")
+    if c.save_dir.len > 0 {
+        dest := filepath.join([c.save_dir + "", "cloud", clean + ""])
+        parent := dest + ""
+        os.mkdir_all(filepath.dir(parent)) or >>
+        raw := slice_to_string(data, 0, data.len)
+        snapshot.write_atomic(dest + "", &raw) or >>
+    }
+    push_event(c, rt.EVENT_CLOUDSAVE_SYNCED, 0, clean + "")
+    persist_mock_state(c) or >>
+    << 0
+}
+
+pub fn (c &TapTapClient) cloud_read(name string) []u8 {
+    require_ready(c) or >>
+    clean := rt.validate_archive_name(&name) or >>
+    if c.backend == BACKEND_NATIVE {
+        nb := plat.str_to_u8(&clean)
+        $buf := plat.alloc_u8(rt.MAX_CLOUDSAVE_FILE_BYTES)
+        n := plat.checked(plat.raw_cloud_read(&nb, $&buf)) or >>
+        $out := []u8{}
+        for i in 0:n { out.push(buf[i]) }
+        << out
+    }
+    if !c.cloud_mem.has(clean + "") {
+        >> errors.new("nexus taptap: cloudsave archive missing: " + clean)
+    }
+    src := &c.cloud_mem[clean]
+    $out := []u8{}
+    for i in 0:src.len { out.push(src[i]) }
+    << out
+}
+
+pub fn (c &TapTapClient) cloud_exists(name string) bool {
+    if !c.initialized || c.backend == BACKEND_NONE { << false }
+    clean := rt.validate_archive_name(&name) or (err) {
+        _ := err.msg()
+        << false
+    }
+    if clean.len == 0 { << false }
+    if c.backend == BACKEND_NATIVE {
+        nb := plat.str_to_u8(&clean)
+        << plat.raw_cloud_exists(&nb) == 1
+    }
+    << c.cloud_mem.has(clean + "")
+}
+
+pub fn (c $&TapTapClient) cloud_delete(name string) int {
+    require_ready(c) or >>
+    clean := rt.validate_archive_name(&name) or >>
+    if c.backend == BACKEND_NATIVE {
+        nb := plat.str_to_u8(&clean)
+        plat.checked(plat.raw_cloud_delete(&nb)) or >>
+        << 0
+    }
+    if !c.cloud_mem.has(clean + "") {
+        >> errors.new("nexus taptap: cloudsave archive not found: " + clean)
+    }
+    $new_keys := []string{}
+    for i in 0:c.cloud_keys.len {
+        if c.cloud_keys[i] != clean { new_keys.push(c.cloud_keys[i] + "") }
+    }
+    c.cloud_keys = new_keys
+    cm := $&c.cloud_mem
+    cm.delete(clean + "")
+    cmeta := $&c.cloud_meta
+    cmeta.delete(clean + "")
+    if c.save_dir.len > 0 {
+        dest := filepath.join([c.save_dir + "", "cloud", clean + ""])
+        if path_exists(&dest) { os.remove(dest + "") or >> }
+    }
+    persist_mock_state(c) or >>
+    << 0
+}
+
+pub fn (c &TapTapClient) cloud_archives() []rt.TapTapCloudArchive {
+    $out := []rt.TapTapCloudArchive{}
+    for i in 0:c.cloud_keys.len {
+        k := c.cloud_keys[i] + ""
+        if c.cloud_meta.has(k + "") {
+            arc := &c.cloud_meta[k]
+            out.push(rt.TapTapCloudArchive{
+                uuid: arc.uuid + "",
+                name: arc.name + "",
+                summary: arc.summary + "",
+                extra: arc.extra + "",
+                playtime_sec: arc.playtime_sec,
+                size_bytes: arc.size_bytes,
+                modified_epoch: arc.modified_epoch
+            })
+        }
+    }
+    << out
+}
+
+pub fn (c $&TapTapClient) submit_leaderboard_score(board_id string, score int) int {
+    require_ready(c) or >>
+    if board_id.len == 0 { >> errors.new("nexus taptap: empty leaderboard board_id") }
+    if c.backend == BACKEND_NATIVE {
+        bb := plat.str_to_u8(&board_id)
+        plat.checked(plat.raw_leaderboard_submit(&bb, score)) or >>
+    }
+    $found := false
+    for i in 0:c.lb_rows.len {
+        if c.lb_rows[i].board_id == board_id && c.lb_rows[i].open_id == c.user_state.open_id {
+            if score > c.lb_rows[i].score { c.lb_rows[i].score = score }
+            found = true
+        }
+    }
+    if !found {
+        c.lb_rows.push(TapLeaderboardRow{
+            board_id: board_id + "",
+            open_id: c.user_state.open_id + "",
+            name: c.user_state.name + "",
+            score: score
+        })
+    }
+    persist_mock_state(c) or >>
+    << 0
+}
+
+pub fn (c &TapTapClient) leaderboard_entries(board_id string) []rt.TapTapLeaderboardEntry {
+    $entries := []rt.TapTapLeaderboardEntry{}
+    for i in 0:c.lb_rows.len {
+        r := &c.lb_rows[i]
+        if r.board_id == board_id {
+            entries.push(rt.TapTapLeaderboardEntry{
+                open_id: r.open_id + "",
+                name: r.name + "",
+                rank: 0,
+                score: r.score
+            })
+        }
+    }
+    // Insertion sort descending by score
+    for i in 1:entries.len {
+        $j := i
+        while j > 0 && entries[j - 1].score < entries[j].score {
+            prev := rt.TapTapLeaderboardEntry{
+                open_id: entries[j - 1].open_id + "",
+                name: entries[j - 1].name + "",
+                rank: entries[j - 1].rank,
+                score: entries[j - 1].score
+            }
+            cur := rt.TapTapLeaderboardEntry{
+                open_id: entries[j].open_id + "",
+                name: entries[j].name + "",
+                rank: entries[j].rank,
+                score: entries[j].score
+            }
+            entries[j - 1] = cur
+            entries[j] = prev
+            j = j - 1
+        }
+    }
+    for i in 0:entries.len {
+        entries[i].rank = i + 1
+    }
+    << entries
+}
+
+pub fn (c $&TapTapClient) open_moment(page string) int {
+    require_ready(c) or >>
+    if c.backend == BACKEND_NATIVE {
+        pb := plat.str_to_u8(&page)
+        plat.checked(plat.raw_open_moment(&pb)) or >>
+        c.moment_open = true
+        push_event(c, rt.EVENT_MOMENT_OPENED, 0, page + "")
+        << 0
+    }
+    c.moment_open = true
+    push_event(c, rt.EVENT_MOMENT_OPENED, 0, page + "")
+    << 0
+}
+
+pub fn (c $&TapTapClient) close_mock_moment() {
+    if c.moment_open {
+        c.moment_open = false
+        push_event(c, rt.EVENT_MOMENT_CLOSED, 0, "")
+    }
+}
+
+pub fn (c &TapTapClient) check_update() int {
+    require_ready(c) or >>
+    if c.backend == BACKEND_NATIVE {
+        << plat.checked(plat.raw_check_update()) or >>
+    }
+    << 0
+}
+
+pub fn (c $&TapTapClient) poll() int {
+    require_ready(c) or >>
+    if c.backend == BACKEND_NATIVE {
+        $raw := []int{}
+        for _ in 0:64 { raw.push(0) }
+        n := plat.raw_poll_events($&raw)
+        if n > 0 {
+            $lim := n
+            if lim > 64 { lim = 64 }
+            for i in 0:lim {
+                push_event(c, raw[i], 0, "native")
+            }
+        }
+        populate_native_state(c)
+    }
+    << 0
+}
+
+pub fn (c $&TapTapClient) drain_events() []rt.TapTapEvent {
+    $out := []rt.TapTapEvent{}
+    for i in 0:c.events.len {
+        ev := &c.events[i]
+        out.push(rt.TapTapEvent{kind: ev.kind, code: ev.code, text: ev.text + ""})
+    }
+    c.events = []rt.TapTapEvent{}
+    << out
+}
+
+pub fn (c $&TapTapClient) shutdown() int {
+    if !c.initialized { << 0 }
+    if c.backend == BACKEND_NATIVE {
+        _ := plat.raw_shutdown()
+    } else {
+        persist_mock_state(c) or >>
+    }
+    c.initialized = false
+    c.moment_open = false
+    << 0
+}

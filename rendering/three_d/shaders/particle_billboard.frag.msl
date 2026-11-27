@@ -1,0 +1,72 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct ParticleFragUniform {
+    float4x4 inv_proj;
+    float4 vp_soft_mode; // x=width, y=height, z=soft_distance, w=visual_mode (0=Textured, 1=SoftDisc, 2=Ring)
+    float4 flags;        // x=depth_test_enabled, y=radial_power, z=ring_inner, w=0
+    float4 pad;
+};
+
+struct FragIn {
+    float4 position [[position]];
+    float4 color;
+    float2 atlas_uv;
+    float2 local_uv;
+    float view_z;
+    float additive;
+};
+
+static inline float reconstruct_view_dist(float4x4 inv_proj, float2 uv, float depth) {
+    float ndc_x = uv.x * 2.0 - 1.0;
+    float ndc_y = 1.0 - uv.y * 2.0;
+    float4 v = inv_proj * float4(ndc_x, ndc_y, depth, 1.0);
+    return -(v.z / max(v.w, 1e-6));
+}
+
+fragment float4 main0(
+    FragIn in [[stage_in]],
+    texture2d<float> sprite_tex [[texture(0)]],
+    depth2d<float> scene_depth_tex [[texture(1)]],
+    sampler sprite_samp [[sampler(0)]],
+    sampler depth_samp [[sampler(1)]],
+    constant ParticleFragUniform& u [[buffer(0)]]
+) {
+    float2 screen_uv = clamp(in.position.xy / max(u.vp_soft_mode.xy, float2(1.0)), float2(0.0), float2(1.0));
+
+    float soft_fade = 1.0;
+    if (u.flags.x > 0.5) {
+        float scene_d = scene_depth_tex.sample(depth_samp, screen_uv);
+        if (scene_d > 1e-6) {
+            if (in.position.z <= scene_d) {
+                discard_fragment();
+            }
+            if (u.vp_soft_mode.z > 1e-4) {
+                float scene_view_z = reconstruct_view_dist(u.inv_proj, screen_uv, scene_d);
+                float diff = scene_view_z - in.view_z;
+                soft_fade = clamp(diff / u.vp_soft_mode.z, 0.0, 1.0);
+            }
+        }
+    }
+
+    float4 tex_c = sprite_tex.sample(sprite_samp, in.atlas_uv);
+    float2 centered = in.local_uv * 2.0 - 1.0;
+    float r2 = dot(centered, centered);
+    float shape_a = 1.0;
+    int vmode = int(u.vp_soft_mode.w + 0.5);
+    if (vmode == 1) {
+        shape_a = pow(clamp(1.0 - r2, 0.0, 1.0), max(u.flags.y, 0.25));
+    } else if (vmode == 2) {
+        float r = sqrt(r2);
+        float inner = clamp(u.flags.z, 0.05, 0.8);
+        shape_a = smoothstep(inner, inner + 0.15, r) * (1.0 - smoothstep(0.85, 1.0, r));
+    }
+
+    float alpha = clamp(in.color.a * tex_c.a * shape_a * soft_fade, 0.0, 1.0);
+    if (alpha <= 1e-4) {
+        discard_fragment();
+    }
+    float3 rgb = in.color.rgb * tex_c.rgb * alpha;
+    float a_out = alpha * (1.0 - clamp(in.additive, 0.0, 1.0));
+    return float4(rgb, a_out);
+}

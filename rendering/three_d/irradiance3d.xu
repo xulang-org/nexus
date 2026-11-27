@@ -1,0 +1,256 @@
+@"github.com/xulang-org/nexus/rendering/three_d"
+
+#gpu
+#errors
+#math
+fm #"github.com/xulang-org/nexus/foundation/math"
+light_data #"github.com/xulang-org/nexus/resources/lighting"
+
+pub const MAX_IRRADIANCE_PROBES = 4096
+
+// World-space regular lattice storing L1 Spherical Harmonics (4 x Vec3 per probe):
+// irradiance(n) = max(0, dc + px * n.x + py * n.y + pz * n.z).
+pub struct IrradianceGrid3D {
+    origin fm.Vec3
+    spacing fm.Vec3
+    nx int
+    ny int
+    nz int
+    dc []fm.Vec3
+    px []fm.Vec3
+    py []fm.Vec3
+    pz []fm.Vec3
+}
+
+pub struct IrradianceGpu3D {
+    owner DeviceRef3D
+    buffers []gpu.Buffer
+    origin fm.Vec3
+    spacing fm.Vec3
+    nx int
+    ny int
+    nz int
+    closed bool
+}
+
+fn clamp_i(v int, lo int, hi int) int {
+    if v < lo { << lo }
+    if v > hi { << hi }
+    << v
+}
+
+fn clamp_f(v f64, lo f64, hi f64) f64 {
+    if v < lo { << lo }
+    if v > hi { << hi }
+    << v
+}
+
+fn max3(a fm.Vec3, b fm.Vec3) fm.Vec3 {
+    << fm.vec3(math.max(a.x, b.x), math.max(a.y, b.y), math.max(a.z, b.z))
+}
+
+fn lerp3(a fm.Vec3, b fm.Vec3, t f64) fm.Vec3 {
+    << a.add(b.sub(a).scaled(t))
+}
+
+pub fn irradiance_grid_3d(origin fm.Vec3, spacing fm.Vec3, nx int, ny int, nz int) IrradianceGrid3D {
+    if !origin.is_finite() || !spacing.is_finite() || spacing.x <= 0.0 || spacing.y <= 0.0 || spacing.z <= 0.0 {
+        >> errors.new("nexus GI: irradiance grid requires finite origin and positive spacing")
+    }
+    if nx < 1 || ny < 1 || nz < 1 || nx * ny * nz > MAX_IRRADIANCE_PROBES {
+        >> errors.new("nexus GI: irradiance grid dimensions must be >= 1 and total <= 4096")
+    }
+    total := nx * ny * nz
+    $dc := []fm.Vec3{}
+    $px := []fm.Vec3{}
+    $py := []fm.Vec3{}
+    $pz := []fm.Vec3{}
+    zero := fm.vec3(0.0, 0.0, 0.0)
+    for _ in 0:total {
+        dc.push(zero)
+        px.push(zero)
+        py.push(zero)
+        pz.push(zero)
+    }
+    << IrradianceGrid3D{origin: origin, spacing: spacing, nx: nx, ny: ny, nz: nz, dc: dc, px: px, py: py, pz: pz}
+}
+
+fn (grid &IrradianceGrid3D) probe_index(ix int, iy int, iz int) int {
+    if ix < 0 || ix >= grid.nx || iy < 0 || iy >= grid.ny || iz < 0 || iz >= grid.nz {
+        >> errors.new("nexus GI: probe index out of range")
+    }
+    << (iz * grid.ny + iy) * grid.nx + ix
+}
+
+pub fn (grid &IrradianceGrid3D) probe_position(ix int, iy int, iz int) fm.Vec3 {
+    _ := grid.probe_index(ix, iy, iz) or >>
+    << fm.vec3(
+        grid.origin.x + f64(ix) * grid.spacing.x,
+        grid.origin.y + f64(iy) * grid.spacing.y,
+        grid.origin.z + f64(iz) * grid.spacing.z
+    )
+}
+
+pub fn (grid $&IrradianceGrid3D) set_probe_sh(
+    ix int, iy int, iz int,
+    dc fm.Vec3, px fm.Vec3, py fm.Vec3, pz fm.Vec3
+) int {
+    idx := grid.probe_index(ix, iy, iz) or >>
+    if !dc.is_finite() || !px.is_finite() || !py.is_finite() || !pz.is_finite() {
+        >> errors.new("nexus GI: non-finite SH probe coefficients")
+    }
+    grid.dc[idx] = dc
+    grid.px[idx] = px
+    grid.py[idx] = py
+    grid.pz[idx] = pz
+    << 0
+}
+
+pub fn (grid $&IrradianceGrid3D) bake_hemisphere(
+    sky fm.Vec3, ground fm.Vec3, key_dir fm.Vec3, key_radiance fm.Vec3
+) int {
+    if !sky.is_finite() || !ground.is_finite() || !key_dir.is_finite() || !key_radiance.is_finite() {
+        >> errors.new("nexus GI: hemisphere bake inputs must be finite")
+    }
+    kdir := key_dir.normalized() or >>
+    hemi_dc := sky.add(ground).scaled(0.5)
+    hemi_y := sky.sub(ground).scaled(0.5)
+    dc_total := hemi_dc.add(key_radiance.scaled(0.25))
+    kx := key_radiance.scaled(0.5 * kdir.x)
+    ky := hemi_y.add(key_radiance.scaled(0.5 * kdir.y))
+    kz := key_radiance.scaled(0.5 * kdir.z)
+    for i in 0:grid.dc.len {
+        grid.dc[i] = dc_total
+        grid.px[i] = kx
+        grid.py[i] = ky
+        grid.pz[i] = kz
+    }
+    << grid.dc.len
+}
+
+pub fn (grid $&IrradianceGrid3D) inject_point_lights(sources &[]light_data.Light3D, bounce_scale f64) int {
+    if !fm.finite(bounce_scale) || bounce_scale < 0.0 || bounce_scale > 16.0 {
+        >> errors.new("nexus GI: invalid point-light bounce scale")
+    }
+    for i in 0:sources.len {
+        sources[i].validate() or >>
+    }
+    for iz in 0:grid.nz {
+        for iy in 0:grid.ny {
+            for ix in 0:grid.nx {
+                idx := (iz * grid.ny + iy) * grid.nx + ix
+                p := grid.probe_position(ix, iy, iz) or >>
+                for li in 0:sources.len {
+                    src := &sources[li]
+                    if src.kind() == light_data.DIRECTIONAL { -> }
+                    delta := src.position().sub(p)
+                    r := src.radius()
+                    d2 := delta.dot(delta)
+                    if d2 >= r * r { -> }
+                    d := math.sqrt(math.max(d2, 1e-6))
+                    dir := delta.scaled(1.0 / d)
+                    rel2 := d2 / (r * r)
+                    edge := math.max(0.0, 1.0 - rel2 * rel2)
+                    att := bounce_scale * edge * edge / math.max(d2, 0.25)
+                    rad := src.radiance().scaled(att)
+                    grid.dc[idx] = grid.dc[idx].add(rad.scaled(0.35))
+                    grid.px[idx] = grid.px[idx].add(rad.scaled(0.65 * dir.x))
+                    grid.py[idx] = grid.py[idx].add(rad.scaled(0.65 * dir.y))
+                    grid.pz[idx] = grid.pz[idx].add(rad.scaled(0.65 * dir.z))
+                }
+            }
+        }
+    }
+    << grid.dc.len
+}
+
+fn (grid &IrradianceGrid3D) eval_single(idx int, n fm.Vec3) fm.Vec3 {
+    v := grid.dc[idx].add(grid.px[idx].scaled(n.x)).add(grid.py[idx].scaled(n.y)).add(grid.pz[idx].scaled(n.z))
+    << max3(v, fm.vec3(0.0, 0.0, 0.0))
+}
+
+pub fn (grid &IrradianceGrid3D) evaluate_sh(world fm.Vec3, normal fm.Vec3) fm.Vec3 {
+    n := normal.normalized() or >>
+    fx := (world.x - grid.origin.x) / grid.spacing.x
+    fy := (world.y - grid.origin.y) / grid.spacing.y
+    fz := (world.z - grid.origin.z) / grid.spacing.z
+
+    x0 := clamp_i(int(math.floor(fx)), 0, grid.nx - 1)
+    y0 := clamp_i(int(math.floor(fy)), 0, grid.ny - 1)
+    z0 := clamp_i(int(math.floor(fz)), 0, grid.nz - 1)
+    x1 := clamp_i(x0 + 1, 0, grid.nx - 1)
+    y1 := clamp_i(y0 + 1, 0, grid.ny - 1)
+    z1 := clamp_i(z0 + 1, 0, grid.nz - 1)
+
+    tx := clamp_f(fx - f64(x0), 0.0, 1.0)
+    ty := clamp_f(fy - f64(y0), 0.0, 1.0)
+    tz := clamp_f(fz - f64(z0), 0.0, 1.0)
+
+    c000 := grid.eval_single((z0 * grid.ny + y0) * grid.nx + x0, n)
+    c100 := grid.eval_single((z0 * grid.ny + y0) * grid.nx + x1, n)
+    c010 := grid.eval_single((z0 * grid.ny + y1) * grid.nx + x0, n)
+    c110 := grid.eval_single((z0 * grid.ny + y1) * grid.nx + x1, n)
+    c001 := grid.eval_single((z1 * grid.ny + y0) * grid.nx + x0, n)
+    c101 := grid.eval_single((z1 * grid.ny + y0) * grid.nx + x1, n)
+    c011 := grid.eval_single((z1 * grid.ny + y1) * grid.nx + x0, n)
+    c111 := grid.eval_single((z1 * grid.ny + y1) * grid.nx + x1, n)
+
+    c00 := lerp3(c000, c100, tx)
+    c10 := lerp3(c010, c110, tx)
+    c01 := lerp3(c001, c101, tx)
+    c11 := lerp3(c011, c111, tx)
+    c0 := lerp3(c00, c10, ty)
+    c1 := lerp3(c01, c11, ty)
+    << lerp3(c0, c1, tz)
+}
+
+pub fn (grid &IrradianceGrid3D) upload(device &Device3D) IrradianceGpu3D {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus GI: upload irradiance probes outside a frame") }
+    if !device.is_gpu() { >> errors.new("nexus GI: GPU irradiance upload requires GPU backend") }
+    dev := device.gpu_device() or >>
+    byte_len := grid.dc.len * 64
+    stats := dev.stats() or >>
+    if stats.buffer_count + 1 > 1024 || byte_len > 67108864 - stats.buffer_bytes {
+        >> errors.new("nexus GI: irradiance buffer exceeds 1024-buffer or 64 MiB budget")
+    }
+    $bytes := zero_bytes(byte_len)
+    for i in 0:grid.dc.len {
+        base := i * 64
+        vals := [grid.dc[i].x, grid.dc[i].y, grid.dc[i].z, 0.0,
+            grid.px[i].x, grid.px[i].y, grid.px[i].z, 0.0,
+            grid.py[i].x, grid.py[i].y, grid.py[i].z, 0.0,
+            grid.pz[i].x, grid.pz[i].y, grid.pz[i].z, 0.0]
+        for k in 0:16 { put_scalar($&bytes, base + k * 4, vals[k]) or >> }
+    }
+    $buf := dev.buffer(byte_len, gpu.BUFFER_GRAPHICS_STORAGE_READ | gpu.BUFFER_COMPUTE_STORAGE_READ) or >>
+    $up := dev.upload(&buf, 0, &bytes) or >>
+    up.close() or >>
+    << IrradianceGpu3D{
+        owner: device.reference(),
+        buffers: [buf],
+        origin: grid.origin,
+        spacing: grid.spacing,
+        nx: grid.nx,
+        ny: grid.ny,
+        nz: grid.nz,
+        closed: false
+    }
+}
+
+pub fn (grid &IrradianceGrid3D) probe_count() int { << grid.dc.len }
+
+pub fn (gpu_grid $&IrradianceGpu3D) close() int {
+    if gpu_grid.closed { << 0 }
+    for i in 0:gpu_grid.buffers.len {
+        b := $&gpu_grid.buffers[i]
+        b.close() or >>
+    }
+    gpu_grid.buffers = []gpu.Buffer{}
+    gpu_grid.closed = true
+    << 0
+}
+
+fn (gpu_grid $&IrradianceGpu3D) drop() {
+    gpu_grid.close() or (err) { << }
+}

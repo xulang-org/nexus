@@ -1,0 +1,148 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+gltf #"github.com/xulang-org/nexus/formats/gltf"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+scene #"github.com/xulang-org/nexus/scene"
+webgl #"github.com/xulang-org/nexus/integration/rendering/webgl"
+#math
+#image/png
+#os
+#errors
+
+const WIDTH = 360
+const HEIGHT = 240
+
+fn quad(mesh $&meshes.MeshData3D, a fm.Vec3, b fm.Vec3, c fm.Vec3, d fm.Vec3, color int) int {
+    base := mesh.vertex_count()
+    for p in [a, b, c, d] { mesh.vertex(p, color) or >> }
+    mesh.triangle(base, base + 1, base + 2) or >>
+    mesh.triangle(base, base + 2, base + 3) or >>
+    << 0
+}
+
+fn sphere(mesh $&meshes.MeshData3D, center fm.Vec3, radius f64, color int) int {
+    shape := meshes.sphere_mesh_3d(radius, 16, 8, color) or >>
+    base := mesh.vertex_count()
+    light := fm.vec3(-0.5, 0.8, 0.3)
+    for vertex in shape.vertices {
+        shade := 0.4 + 0.6 * math.max(0.0, light.dot(vertex.normal))
+        r := int(f64((color >> 24) & 255) * shade)
+        g := int(f64((color >> 16) & 255) * shade)
+        b := int(f64((color >> 8) & 255) * shade)
+        mesh.vertex(center.add(vertex.position), (r << 24) | (g << 16) | (b << 8) | 255) or >>
+    }
+    for i in 0:shape.triangle_count() {
+        mesh.triangle(base + shape.indices[i * 3], base + shape.indices[i * 3 + 1],
+            base + shape.indices[i * 3 + 2]) or >>
+    }
+    << 0
+}
+
+fn floor(mesh $&meshes.MeshData3D) int {
+    for row in 0:6 {
+        z := f64(row - 3)
+        for column in 0:6 {
+            x := f64(column - 3)
+            $color := 0x273c53ff
+            if (row + column) % 2 == 0 { color = 0x354d65ff }
+            quad(mesh, fm.vec3(x, 0.0, z), fm.vec3(x, 0.0, z + 1.0),
+                fm.vec3(x + 1.0, 0.0, z + 1.0), fm.vec3(x + 1.0, 0.0, z), color) or >>
+        }
+    }
+    << 0
+}
+
+pub fn nexus_reset() int { << 180 | (120 << 9) }
+
+fn png_dimension(data &[]int, offset int) int {
+    << (data[offset] << 24) | (data[offset + 1] << 16) | (data[offset + 2] << 8) | data[offset + 3]
+}
+
+fn write_packet(packet string) int {
+    expected := packet.len
+    if (os.fd_write(1, packet) or >>) != expected { >> errors.new("Nexus WebGL 3D: short packet write") }
+    << 0
+}
+
+fn load_model(length int) int {
+    if length < 1 || length > 524288 { >> errors.new("Nexus WebGL 3D: invalid GLB size") }
+    raw := os.fd_read(0, length) or >>
+    if raw.len != length { >> errors.new("Nexus WebGL 3D: short GLB read") }
+    asset := gltf.decode_glb_geometry(&raw) or >>
+    if asset.primitive_count() != 1 || asset.node_count() != 1 || asset.skin_count() != 0 ||
+        !(asset.has_uvs(0) or >>) || !(asset.has_normals(0) or >>) {
+        >> errors.new("Nexus WebGL 3D: expected one static textured primitive with UV and normals")
+    }
+    material := asset.material(asset.primitive_material(0) or >>) or >>
+    texture := asset.texture(material.base_texture) or >>
+    if (asset.image_mime(texture.image) or >>) != "image/png" {
+        >> errors.new("Nexus WebGL 3D: expected an embedded PNG")
+    }
+    bytes := asset.image_bytes(texture.image) or >>
+    if bytes.len < 33 || png_dimension(&bytes, 12) != 0x49484452 {
+        >> errors.new("Nexus WebGL 3D: missing PNG header")
+    }
+    width := png_dimension(&bytes, 16)
+    height := png_dimension(&bytes, 20)
+    if width < 1 || width > 256 || height < 1 || height > 256 {
+        >> errors.new("Nexus WebGL 3D: embedded texture exceeds 256 × 256")
+    }
+    $encoded := ""
+    for value in bytes { encoded.push_byte(value) }
+    decoded := png.decode(&encoded) or >>
+
+    $model := meshes.new_mesh_data_3d()
+    light := fm.vec3(0.45, 0.8, 0.35)
+    count := asset.vertex_count(0) or >>
+    for i in 0:count {
+        normal := asset.normal(0, i) or >>
+        shade := int(255.0 * (0.46 + 0.54 * math.max(0.0, light.dot(normal))))
+        tint := (shade << 24) | (shade << 16) | (shade << 8) | 255
+        model.vertex_uv(asset.position(0, i) or >>, tint, asset.uv(0, i) or >>) or >>
+    }
+    indices := asset.index_count(0) or >>
+    for i in 0:indices / 3 {
+        at := i * 3
+        model.triangle(asset.index(0, at) or >>, asset.index(0, at + 1) or >>, asset.index(0, at + 2) or >>) or >>
+    }
+    $solid := meshes.new_mesh_data_3d()
+    sphere($&solid, fm.vec3(0.74, 0.73, 1.34), 0.73, 0xffbd61ff) or >>
+    sphere($&solid, fm.vec3(-1.5, 0.68, -0.8), 0.68, 0xa498ffff) or >>
+    floor($&solid) or >>
+    packet := webgl.encode_mesh_asset(&solid, &model, width, height, &decoded.pix) or >>
+    << write_packet(packet) or >>
+}
+
+pub fn nexus_load_model(length int) int {
+    << load_model(length) or (err) {
+        eprintln(err.msg())
+        << -1
+    }
+}
+
+fn render(state int) int {
+    yaw := 0.58 + f64((state & 511) - 180) * 0.014
+    pitch := 0.22 + f64(HEIGHT - (state >> 9)) * 0.0024
+    $camera := scene.new_camera_3d()
+    camera.target = fm.vec3(0.0, 0.65, 0.0)
+    orbit := fm.rotation_y(yaw).multiply(fm.rotation_x(-pitch))
+    camera.position = camera.target.add(orbit.transform(fm.vec4(0.0, 0.0, 9.2, 1.0)).xyz())
+    camera.vertical_fov = 0.87
+    camera.far = 40.0
+    view_projection := camera.view_projection(f64(WIDTH) / f64(HEIGHT)) or >>
+
+    write_packet(webgl.encode_camera_frame(view_projection) or >>) or >>
+    << state
+}
+
+pub fn nexus_frame(state int, x int, y int, delta_us int) int {
+    $next := state
+    if x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT { next = x | (y << 9) }
+    << render(next) or (err) {
+        eprintln(err.msg())
+        << -1
+    }
+}
+
+fn main() int { << 0 }

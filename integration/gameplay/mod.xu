@@ -1,0 +1,513 @@
+@"github.com/xulang-org/nexus/integration/gameplay"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+gp #"github.com/xulang-org/nexus/gameplay"
+scenes #"github.com/xulang-org/nexus/scene"
+timing #"github.com/xulang-org/nexus/timing"
+phys #"github.com/xulang-org/nexus/physics3d"
+vfx #"github.com/xulang-org/nexus/vfx"
+mix #"github.com/xulang-org/nexus/audio/mixer"
+li #"github.com/xulang-org/nexus/i18n"
+#errors
+#math
+
+pub const FEEDBACK_DAMAGE = 0
+pub const FEEDBACK_KILL = 1
+pub const FEEDBACK_STAGGER = 2
+pub const FEEDBACK_DOT_TICK = 3
+pub const FEEDBACK_LOOT_DROP = 4
+pub const FEEDBACK_QUEST_READY = 5
+
+pub struct GameplayFeedbackEvent {
+    pub kind int
+    pub actor_id int
+    pub source_id int
+    pub position fm.Vec3
+    pub value f64
+    pub is_crit bool
+    pub label string
+}
+
+pub struct CombatActor {
+    pub id int
+    pub scene_node int
+    pub archetype string
+    pub team int
+    pub hurtbox_radius f64
+    pub hurtbox_mult f64
+    pub stats gp.StatSheet
+    pub statuses gp.StatusManager
+    pub health gp.HealthComponent
+    pub abilities gp.AbilitySet
+    pub fsm gp.GameplayFsm
+}
+
+// Unified scene-coupled gameplay coordinator linking SceneTree transforms, ScaledClock hitstop,
+// OrbitCamera3D trauma/occlusion, WaveDirector, QuestJournal, LootTable, and AV feedback.
+pub struct GameplayWorld {
+    pub actors []CombatActor
+    pub rng gp.GameplayRng
+    pub hitboxes []gp.Hitbox3D
+    feedback []GameplayFeedbackEvent
+    next_actor_id int
+    next_attack_id int
+    pub hitstop_on_crit f64
+    pub hitstop_on_stagger f64
+    pub shake_on_hit f64
+}
+
+pub fn new_gameplay_world(seed int) GameplayWorld {
+    << GameplayWorld{
+        actors: []CombatActor{},
+        rng: gp.new_rng(seed),
+        hitboxes: []gp.Hitbox3D{},
+        feedback: []GameplayFeedbackEvent{},
+        next_actor_id: 1,
+        next_attack_id: 1,
+        hitstop_on_crit: 0.06,
+        hitstop_on_stagger: 0.09,
+        shake_on_hit: 0.35
+    }
+}
+
+pub fn (w $&GameplayWorld) spawn_actor(
+    scene_node int,
+    archetype string,
+    team int,
+    hurtbox_radius f64,
+    stats gp.StatSheet,
+    health gp.HealthComponent,
+    initial_state string
+) int {
+    if archetype.len == 0 || hurtbox_radius <= 0.0 {
+        >> errors.new("nexus integration gameplay: invalid actor archetype or hurtbox radius")
+    }
+    id := w.next_actor_id
+    w.next_actor_id += 1
+    w.actors.push(CombatActor{
+        id: id,
+        scene_node: scene_node,
+        archetype: archetype,
+        team: team,
+        hurtbox_radius: hurtbox_radius,
+        hurtbox_mult: 1.0,
+        stats: stats,
+        statuses: gp.new_status_manager(),
+        health: health,
+        abilities: gp.new_ability_set(),
+        fsm: gp.new_gameplay_fsm(initial_state) or >>
+    })
+    << id
+}
+
+fn find_actor_idx(w &GameplayWorld, actor_id int) int {
+    for i in 0:w.actors.len {
+        if w.actors[i].id == actor_id { << i }
+    }
+    << -1
+}
+
+pub fn (w &GameplayWorld) actor_alive(actor_id int) bool {
+    idx := find_actor_idx(w, actor_id)
+    if idx < 0 { >> errors.new("nexus integration gameplay: unknown actor_id") }
+    << w.actors[idx].health.alive
+}
+
+pub fn (w &GameplayWorld) actor_hp(actor_id int) f64 {
+    idx := find_actor_idx(w, actor_id)
+    if idx < 0 { >> errors.new("nexus integration gameplay: unknown actor_id") }
+    << w.actors[idx].health.hp
+}
+
+pub fn (w &GameplayWorld) actor_shield(actor_id int) f64 {
+    idx := find_actor_idx(w, actor_id)
+    if idx < 0 { >> errors.new("nexus integration gameplay: unknown actor_id") }
+    << w.actors[idx].health.shield
+}
+
+pub fn (w &GameplayWorld) actor_stat(actor_id int, name string) f64 {
+    idx := find_actor_idx(w, actor_id)
+    if idx < 0 { >> errors.new("nexus integration gameplay: unknown actor_id") }
+    << w.actors[idx].stats.get(name) or >>
+}
+
+pub fn (w &GameplayWorld) actor_fsm_state(actor_id int) string {
+    idx := find_actor_idx(w, actor_id)
+    if idx < 0 { >> errors.new("nexus integration gameplay: unknown actor_id") }
+    << w.actors[idx].fsm.current()
+}
+
+pub fn (w $&GameplayWorld) set_actor_hurtbox_mult(actor_id int, mult f64) int {
+    idx := find_actor_idx(w, actor_id)
+    if idx < 0 { >> errors.new("nexus integration gameplay: unknown actor_id") }
+    if mult < 0.0 || math.is_nan(mult) || math.is_inf(mult) {
+        >> errors.new("nexus integration gameplay: invalid hurtbox multiplier")
+    }
+    w.actors[idx].hurtbox_mult = mult
+    << 0
+}
+
+pub fn (w $&GameplayWorld) register_actor_ability(actor_id int, def gp.AbilityDef) int {
+    idx := find_actor_idx(w, actor_id)
+    if idx < 0 { >> errors.new("nexus integration gameplay: unknown actor_id") }
+    ab := $&w.actors[idx].abilities
+    << ab.register(def) or >>
+}
+
+pub fn (w $&GameplayWorld) cast_actor_ability(actor_id int, ability_id string, resource f64) gp.AbilityCastResult {
+    idx := find_actor_idx(w, actor_id)
+    if idx < 0 { >> errors.new("nexus integration gameplay: unknown actor_id") }
+    act := $&w.actors[idx]
+    silenced := act.statuses.has_tag(gp.TAG_SILENCED)
+    ab := $&act.abilities
+    << ab.try_cast(ability_id, resource, silenced)
+}
+
+pub fn (w $&GameplayWorld) apply_status_to_actor(actor_id int, spec &gp.StatusSpec) int {
+    idx := find_actor_idx(w, actor_id)
+    if idx < 0 { >> errors.new("nexus integration gameplay: unknown actor_id") }
+    act := $&w.actors[idx]
+    sts := $&act.statuses
+    << sts.apply(spec, $&act.stats) or >>
+}
+
+pub fn (w $&GameplayWorld) sync_equipment_to_actor(
+    actor_id int,
+    eq &gp.EquipmentLoadout,
+    reg &gp.ItemRegistry
+) int {
+    idx := find_actor_idx(w, actor_id)
+    if idx < 0 { >> errors.new("nexus integration gameplay: unknown actor_id") }
+    act := $&w.actors[idx]
+    << eq.apply_to_stats(reg, $&act.stats) or >>
+}
+
+pub fn (w $&GameplayWorld) equip_actor_item_from_inventory(
+    actor_id int,
+    eq $&gp.EquipmentLoadout,
+    inv $&gp.Inventory,
+    reg &gp.ItemRegistry,
+    item_id string,
+    slot_override int
+) string {
+    idx := find_actor_idx(w, actor_id)
+    if idx < 0 { >> errors.new("nexus integration gameplay: unknown actor_id") }
+    act := $&w.actors[idx]
+    << eq.equip_from_inventory(inv, reg, $&act.stats, item_id, slot_override) or >>
+}
+
+pub fn (w $&GameplayWorld) spawn_attack_hitbox(
+    attacker_id int,
+    center fm.Vec3,
+    radius f64,
+    spec gp.DamageSpec
+) int {
+    idx := find_actor_idx(w, attacker_id)
+    if idx < 0 { >> errors.new("nexus integration gameplay: unknown attacker_id") }
+    if radius <= 0.0 { >> errors.new("nexus integration gameplay: hitbox radius must be positive") }
+    $sp := spec
+    if sp.attack_id <= 0 {
+        sp.attack_id = w.next_attack_id
+        w.next_attack_id += 1
+    }
+    sp.source_id = attacker_id
+    sp.source_team = w.actors[idx].team
+    aid := sp.attack_id
+    w.hitboxes.push(gp.Hitbox3D{
+        id: aid,
+        owner_id: attacker_id,
+        team: w.actors[idx].team,
+        attack_id: aid,
+        center: center,
+        radius: radius,
+        active: true,
+        spec: sp
+    })
+    << aid
+}
+
+pub fn (w $&GameplayWorld) clear_hitboxes() {
+    w.hitboxes = []gp.Hitbox3D{}
+}
+
+fn safe_global_3d(tree &scenes.SceneTree, node_id int) fm.Mat4 {
+    << tree.global_transform_3d(node_id) or (err) {
+        _ := err.msg()
+        << fm.identity_3d()
+    }
+}
+
+fn node_world_pos(tree &scenes.SceneTree, node_id int) fm.Vec3 {
+    if !tree.is_alive(node_id) { << fm.vec3(0.0, 0.0, 0.0) }
+    m := safe_global_3d(tree, node_id)
+    << fm.vec3(m.c3.x, m.c3.y, m.c3.z)
+}
+
+fn safe_fsm_force(fsm $&gp.GameplayFsm, state string) int {
+    << fsm.force_transition(state) or (err) {
+        _ := err.msg()
+        << 0
+    }
+}
+
+fn handle_actor_killed(
+    w $&GameplayWorld,
+    actor_idx int,
+    source_id int,
+    hit_pos fm.Vec3,
+    is_crit bool,
+    waves $&gp.WaveDirector,
+    journal $&gp.QuestJournal,
+    loot $&gp.LootTable,
+    player_inv $&gp.Inventory,
+    item_reg &gp.ItemRegistry
+) int {
+    waves.notify_enemy_killed()
+    act := $&w.actors[actor_idx]
+    fsm_k := $&act.fsm
+    _ := fsm_k.force_transition("dead") or (err) {
+        _ := err.msg()
+        << 0
+    }
+    arch := act.archetype + ""
+    aid := act.id
+    w.feedback.push(GameplayFeedbackEvent{
+        kind: FEEDBACK_KILL,
+        actor_id: aid,
+        source_id: source_id,
+        position: hit_pos,
+        value: 0.0,
+        is_crit: is_crit,
+        label: arch + ""
+    })
+    ready_qs := journal.notify_event(gp.OBJ_KILL, arch + "", 1)
+    for qi in 0:ready_qs.len {
+        w.feedback.push(GameplayFeedbackEvent{
+            kind: FEEDBACK_QUEST_READY,
+            actor_id: aid,
+            source_id: source_id,
+            position: hit_pos,
+            value: 0.0,
+            is_crit: false,
+            label: ready_qs[qi] + ""
+        })
+    }
+    drops := loot.roll($&w.rng)
+    for di in 0:drops.len {
+        d := &drops[di]
+        if item_reg.has(d.item_id + "") {
+            _ := player_inv.add_item(item_reg, d.item_id + "", d.count) or >>
+        }
+        w.feedback.push(GameplayFeedbackEvent{
+            kind: FEEDBACK_LOOT_DROP,
+            actor_id: aid,
+            source_id: source_id,
+            position: hit_pos,
+            value: f64(d.count),
+            is_crit: false,
+            label: d.item_id + ""
+        })
+    }
+    << 0
+}
+
+pub fn (w $&GameplayWorld) step_frame(
+    tree &scenes.SceneTree,
+    clock $&timing.ScaledClock,
+    raw_dt f64,
+    camera $&gp.OrbitCamera3D,
+    journal $&gp.QuestJournal,
+    waves $&gp.WaveDirector,
+    loot $&gp.LootTable,
+    player_inv $&gp.Inventory,
+    item_reg &gp.ItemRegistry
+) timing.ScaledFrameStep {
+    step := clock.advance(raw_dt) or >>
+    dt := step.scaled_delta
+    if step.paused || step.in_hitstop || dt <= 0.0 {
+        << step
+    }
+
+    // 1. Update statuses (DoT/HoT), health regen, abilities, and FSMs per actor.
+    for i in 0:w.actors.len {
+        act := $&w.actors[i]
+        apos := node_world_pos(tree, act.scene_node)
+        sts := $&act.statuses
+        ticks := sts.step(dt, $&act.stats) or >>
+        for ti in 0:ticks.len {
+            tk := &ticks[ti]
+            if tk.damage > 0.0 && act.health.alive {
+                $dot_spec := gp.default_damage_spec(0, gp.TEAM_NONE, tk.damage)
+                dot_spec.element = tk.element
+                dot_spec.poise_damage = 0.0
+                dot_spec.ignore_invuln = true
+                dr := gp.apply_damage($&act.health, act.team, &act.stats, &act.statuses, &dot_spec, $&w.rng) or >>
+                if dr.applied {
+                    w.feedback.push(GameplayFeedbackEvent{
+                        kind: FEEDBACK_DOT_TICK,
+                        actor_id: act.id,
+                        source_id: 0,
+                        position: apos,
+                        value: dr.hp_damage + dr.shield_absorbed,
+                        is_crit: false,
+                        label: tk.effect_id + ""
+                    })
+                    if dr.killed {
+                        handle_actor_killed(w, i, 0, apos, false, waves, journal, loot, player_inv, item_reg) or >>
+                    }
+                }
+            }
+            if tk.heal > 0.0 && act.health.alive {
+                hl := $&act.health
+                _ := hl.heal(tk.heal)
+            }
+        }
+        hl_s := $&act.health
+        hl_s.step(dt)
+        ab_s := $&act.abilities
+        ab_s.step(dt)
+        fsm_s := $&act.fsm
+        fsm_s.step(dt)
+    }
+
+    // 2. Gather hurtboxes from live SceneTree node transforms and resolve hitbox overlaps.
+    $hurtboxes := []gp.Hurtbox3D{}
+    for i in 0:w.actors.len {
+        act := &w.actors[i]
+        if act.health.alive {
+            pos := node_world_pos(tree, act.scene_node)
+            hurtboxes.push(gp.Hurtbox3D{
+                id: act.id,
+                owner_id: act.id,
+                team: act.team,
+                center: pos,
+                radius: act.hurtbox_radius,
+                damage_multiplier: act.hurtbox_mult,
+                active: true,
+                tag: act.archetype + ""
+            })
+        }
+    }
+
+    overlaps := gp.resolve_combat_overlaps_3d(&w.hitboxes, &hurtboxes)
+    for oi in 0:overlaps.len {
+        ov := &overlaps[oi]
+        t_idx := find_actor_idx(w, ov.target_id)
+        if t_idx < 0 { -> }
+        t_act := $&w.actors[t_idx]
+        $dmg_spec := w.hitboxes[ov.hitbox_index].spec
+        dmg_spec.hit_multiplier *= ov.multiplier
+        res := gp.apply_damage($&t_act.health, t_act.team, &t_act.stats, &t_act.statuses, &dmg_spec, $&w.rng) or >>
+        if res.applied {
+            w.feedback.push(GameplayFeedbackEvent{
+                kind: FEEDBACK_DAMAGE,
+                actor_id: t_act.id,
+                source_id: ov.attacker_id,
+                position: ov.hit_point,
+                value: res.hp_damage + res.shield_absorbed,
+                is_crit: res.is_crit,
+                label: t_act.archetype + ""
+            })
+            if res.is_crit && w.hitstop_on_crit > 0.0 {
+                _ := clock.trigger_hitstop(w.hitstop_on_crit)
+            }
+            if res.staggered {
+                if w.hitstop_on_stagger > 0.0 {
+                    _ := clock.trigger_hitstop(w.hitstop_on_stagger)
+                }
+                fsm_t := $&t_act.fsm
+                _ := safe_fsm_force(fsm_t, "staggered")
+                w.feedback.push(GameplayFeedbackEvent{
+                    kind: FEEDBACK_STAGGER,
+                    actor_id: t_act.id,
+                    source_id: ov.attacker_id,
+                    position: ov.hit_point,
+                    value: 0.0,
+                    is_crit: res.is_crit,
+                    label: t_act.archetype + ""
+                })
+            }
+            if w.shake_on_hit > 0.0 {
+                camera.add_trauma(w.shake_on_hit)
+            }
+            if res.killed {
+                handle_actor_killed(w, t_idx, ov.attacker_id, ov.hit_point, res.is_crit, waves, journal, loot, player_inv, item_reg) or >>
+            }
+        }
+    }
+
+    << step
+}
+
+pub fn (w $&GameplayWorld) drain_feedback() []GameplayFeedbackEvent {
+    $out := []GameplayFeedbackEvent{}
+    for i in 0:w.feedback.len {
+        e := &w.feedback[i]
+        out.push(GameplayFeedbackEvent{
+            kind: e.kind,
+            actor_id: e.actor_id,
+            source_id: e.source_id,
+            position: e.position,
+            value: e.value,
+            is_crit: e.is_crit,
+            label: e.label + ""
+        })
+    }
+    w.feedback = []GameplayFeedbackEvent{}
+    << out
+}
+
+pub fn sync_orbit_camera_with_static_boxes(
+    camera $&gp.OrbitCamera3D,
+    tree &scenes.SceneTree,
+    anchor_node int,
+    boxes &[]phys.StaticBox3D,
+    dt f64
+) gp.OrbitCamera3DPose {
+    anchor := node_world_pos(tree, anchor_node)
+    $solids := []fm.Aabb3{}
+    for i in 0:boxes.len {
+        if !boxes[i].trigger {
+            solids.push(boxes[i].bounds)
+        }
+    }
+    << camera.step(anchor, &solids, dt)
+}
+
+pub fn trigger_feedback_av(
+    events &[]GameplayFeedbackEvent,
+    listener_pos fm.Vec3,
+    listener_right fm.Vec3,
+    listener_forward fm.Vec3,
+    aud $&mix.Mixer,
+    hit_clip int,
+    sfx_bus int,
+    sparks $&vfx.ParticleSystem2D
+) int {
+    $triggered := 0
+    for i in 0:events.len {
+        ev := &events[i]
+        if ev.kind == FEEDBACK_DAMAGE || ev.kind == FEEDBACK_KILL || ev.kind == FEEDBACK_STAGGER {
+            $sp := mix.default_spatial_3d_params(ev.position, listener_pos, listener_right, listener_forward)
+            sres := mix.spatial_3d_advanced(&sp)
+            if hit_clip >= 0 {
+                vid := aud.play(hit_clip, sfx_bus, 0.9, sres.pan, false) or >>
+                aud.apply_spatial_3d(vid, &sres) or >>
+            }
+            $burst_n := 8
+            if ev.is_crit || ev.kind == FEEDBACK_KILL { burst_n = 16 }
+            sparks.burst(burst_n) or >>
+            triggered += 1
+        }
+    }
+    << triggered
+}
+
+pub fn localized_quest_title(loc $&li.Localizer, def &gp.QuestDef) string {
+    << loc.tr(def.title_key + "")
+}
+
+pub fn localized_interact_prompt(loc $&li.Localizer, sel &gp.InteractSelection) string {
+    if !sel.found { << "" }
+    << loc.tr(sel.prompt_key + "")
+}

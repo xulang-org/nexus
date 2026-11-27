@@ -1,0 +1,128 @@
+@main
+
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+rt #"github.com/xulang-org/nexus/resources/taptap"
+#errors
+#os
+exec #os/exec
+#path/filepath
+#strings
+
+struct CmdOutcome {
+    ok bool
+    output string
+}
+
+fn check(ok bool, msg string) int {
+    if !ok { >> errors.new("taptap_cli_checks: " + msg) }
+    << 0
+}
+
+fn clean_dir(path string) int {
+    os.remove_all(path) or (err) {
+        _ := err.msg()
+        << 0
+    }
+    << 0
+}
+
+fn run_cmd(bin string, args &[]string) CmdOutcome {
+    $cmd := exec.command(bin + "")
+    for i in 0:args.len {
+        cmd.args.push(args[i] + "")
+    }
+    out := cmd.combined_output() or (err) {
+        << CmdOutcome{ok: false, output: err.msg()}
+    }
+    << CmdOutcome{ok: true, output: out}
+}
+
+fn resolve_cli() string {
+    args := os.args()
+    $i := 1
+    while i < args.len {
+        if args[i] == "--project-cli" && i + 1 < args.len {
+            << args[i + 1] + ""
+        }
+        i = i + 1
+    }
+    << "build/nexus-project"
+}
+
+fn run() int {
+    cli := resolve_cli()
+    tmp := filepath.join(["build", "taptap-cli-tmp"])
+    clean_dir(tmp + "")
+    os.mkdir_all(tmp + "") or >>
+
+    // 1. Valid CN Android config -> taptap-validate & taptap-stage
+    $and_cfg := rt.default_config("tap_cli_and", "tok_and_123", rt.REGION_CN)
+    and_cfg.package_name = "com.nexus.taptapcli"
+    and_cfg.isbn_code = "ISBN-978-7-1111-2222-3"
+    and_json := filepath.join([tmp + "", "tap_android.json"])
+    and_raw := rt.encode_config_json(&and_cfg)
+    snapshot.write_atomic(and_json + "", &and_raw) or >>
+
+    val_and := ["taptap-validate", and_json + ""]
+    res_and := run_cmd(cli + "", &val_and)
+    check(res_and.ok && strings.contains(&res_and.output, "VALID_TAPTAP client_id=tap_cli_and region=cn target=android"),
+        "taptap-validate android: " + res_and.output) or >>
+
+    out_and := filepath.join([tmp + "", "staged_android"])
+    st_and := ["taptap-stage", "examples/modern_sandbox/project.json", "--taptap", and_json + "", "--output", out_and + ""]
+    res_st_and := run_cmd(cli + "", &st_and)
+    check(res_st_and.ok && strings.contains(&res_st_and.output, "STAGED_TAPTAP client_id=tap_cli_and"),
+        "taptap-stage android: " + res_st_and.output) or >>
+
+    sdk_cfg := snapshot.read(filepath.join([out_and + "", "taptap", "taptap_sdk_config.json"]), 65536) or >>
+    and_man := snapshot.read(filepath.join([out_and + "", "taptap", "TapTapAndroidManifest.xml"]), 65536) or >>
+    st_man := snapshot.read(filepath.join([out_and + "", "taptap_stage_manifest.json"]), 65536) or >>
+    check(strings.contains(&sdk_cfg, "\"clientId\": \"tap_cli_and\""), "taptap_sdk_config.json") or >>
+    check(strings.contains(&and_man, "tttap_cli_and"), "TapTapAndroidManifest.xml") or >>
+    check(strings.contains(&st_man, "\"package_name\": \"com.nexus.taptapcli\""), "taptap_stage_manifest.json") or >>
+
+    // 2. Reject CN config without compliance
+    $bad_cfg := and_cfg.clone()
+    bad_cfg.enable_compliance = false
+    bad_json := filepath.join([tmp + "", "bad_cn.json"])
+    bad_raw := rt.encode_config_json(&bad_cfg)
+    snapshot.write_atomic(bad_json + "", &bad_raw) or >>
+    bad_args := ["taptap-validate", bad_json + ""]
+    check(!run_cmd(cli + "", &bad_args).ok, "taptap-validate must reject CN without compliance") or >>
+
+    // 3. Global iOS & CN PC targets
+    $ios_cfg := rt.default_config("tap_cli_ios", "tok_ios_123", rt.REGION_GLOBAL)
+    ios_cfg.target_platform = rt.TARGET_IOS
+    ios_json := filepath.join([tmp + "", "tap_ios.json"])
+    ios_raw := rt.encode_config_json(&ios_cfg)
+    snapshot.write_atomic(ios_json + "", &ios_raw) or >>
+    out_ios := filepath.join([tmp + "", "staged_ios"])
+    st_ios := ["taptap-stage", "examples/modern_sandbox/project.json", "--taptap", ios_json + "", "--output", out_ios + ""]
+    check(run_cmd(cli + "", &st_ios).ok, "taptap-stage ios") or >>
+    plist := snapshot.read(filepath.join([out_ios + "", "taptap", "TapTapInfo.plist"]), 65536) or >>
+    check(strings.contains(&plist, "tapiosdk") && strings.contains(&plist, "tttap_cli_ios"), "TapTapInfo.plist") or >>
+
+    $pc_cfg := rt.default_config("tap_cli_pc", "tok_pc_123", rt.REGION_CN)
+    pc_cfg.target_platform = rt.TARGET_PC
+    pc_cfg.isbn_code = "ISBN-978-7-1111-3333-4"
+    pc_json := filepath.join([tmp + "", "tap_pc.json"])
+    pc_raw := rt.encode_config_json(&pc_cfg)
+    snapshot.write_atomic(pc_json + "", &pc_raw) or >>
+    out_pc := filepath.join([tmp + "", "staged_pc"])
+    st_pc := ["taptap-stage", "examples/modern_sandbox/project.json", "--taptap", pc_json + "", "--output", out_pc + ""]
+    check(run_cmd(cli + "", &st_pc).ok, "taptap-stage pc") or >>
+    appid_txt := snapshot.read(filepath.join([out_pc + "", "taptap", "taptap_client_id.txt"]), 4096) or >>
+    check(appid_txt == "tap_cli_pc\n", "taptap_client_id.txt") or >>
+
+    clean_dir(tmp + "")
+    println("PASS: taptap_cli_checks")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

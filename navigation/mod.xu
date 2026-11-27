@@ -1,0 +1,524 @@
+@"github.com/xulang-org/nexus/navigation"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const MAX_NAVMESH_POLYS = 16384
+pub const MAX_AREA_TYPES = 16
+
+pub struct NavPoint3D {
+    pub poly_id int
+    pub point fm.Vec3
+    pub distance f64
+}
+
+pub struct NavPoly3D {
+    pub v0 int
+    pub v1 int
+    pub v2 int
+    pub n0 int      // neighbor across edge v0->v1 (-1 if border)
+    pub n1 int      // neighbor across edge v1->v2 (-1 if border)
+    pub n2 int      // neighbor across edge v2->v0 (-1 if border)
+    pub center fm.Vec3
+    pub area_id int
+    pub flags int
+}
+
+pub struct NavMesh3D {
+    vertices []fm.Vec3
+    polys []NavPoly3D
+    bounds_min fm.Vec3
+    bounds_max fm.Vec3
+}
+
+struct NavEdgeKey {
+    a int
+    b int
+    poly int
+    edge_idx int
+}
+
+struct PortalPair {
+    left fm.Vec3
+    right fm.Vec3
+}
+
+fn turn_xz(a fm.Vec3, b fm.Vec3, c fm.Vec3) f64 {
+    << (b.x - a.x) * (c.z - a.z) - (b.z - a.z) * (c.x - a.x)
+}
+
+fn dist_xz2(a fm.Vec3, b fm.Vec3) f64 {
+    dx := a.x - b.x
+    dz := a.z - b.z
+    << dx * dx + dz * dz
+}
+
+fn clamp_f(v f64, lo f64, hi f64) f64 {
+    if v < lo { << lo }
+    if v > hi { << hi }
+    << v
+}
+
+fn closest_point_tri(p fm.Vec3, a fm.Vec3, b fm.Vec3, c fm.Vec3) fm.Vec3 {
+    ab := b.sub(a)
+    ac := c.sub(a)
+    ap := p.sub(a)
+    d1 := ab.dot(ap)
+    d2 := ac.dot(ap)
+    if d1 <= 0.0 && d2 <= 0.0 { << a }
+
+    bp := p.sub(b)
+    d3 := ab.dot(bp)
+    d4 := ac.dot(bp)
+    if d3 >= 0.0 && d4 <= d3 { << b }
+
+    vc := d1 * d4 - d3 * d2
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        v := d1 / (d1 - d3)
+        << a.add(ab.scaled(v))
+    }
+
+    cp := p.sub(c)
+    d5 := ab.dot(cp)
+    d6 := ac.dot(cp)
+    if d6 >= 0.0 && d5 <= d6 { << c }
+
+    vb := d5 * d2 - d1 * d6
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        w := d2 / (d2 - d6)
+        << a.add(ac.scaled(w))
+    }
+
+    va := d3 * d6 - d5 * d4
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        w := (d4 - d3) / ((d4 - d3) + (d5 - d6))
+        << b.add(c.sub(b).scaled(w))
+    }
+
+    denom := 1.0 / (va + vb + vc)
+    v := vb * denom
+    w := vc * denom
+    << a.add(ab.scaled(v)).add(ac.scaled(w))
+}
+
+fn point_in_tri_xz(p fm.Vec3, a fm.Vec3, b fm.Vec3, c fm.Vec3) bool {
+    t0 := turn_xz(a, b, p)
+    t1 := turn_xz(b, c, p)
+    t2 := turn_xz(c, a, p)
+    has_neg := (t0 < -1e-6) || (t1 < -1e-6) || (t2 < -1e-6)
+    has_pos := (t0 > 1e-6) || (t1 > 1e-6) || (t2 > 1e-6)
+    << !(has_neg && has_pos)
+}
+
+fn canonical_vertex_index(verts $&[]fm.Vec3, p fm.Vec3) int {
+    // Merge vertices closer than 0.5mm so triangle soups stitch shared edges seamlessly.
+    for i in 0:verts.len {
+        diff := verts[i].sub(p)
+        if diff.dot(diff) <= 2.5e-7 {
+            << i
+        }
+    }
+    idx := verts.len
+    verts.push(p)
+    << idx
+}
+
+fn sort_edges(edges $&[]NavEdgeKey, lo int, hi int) {
+    if lo >= hi { << }
+    pivot := edges[(lo + hi) / 2]
+    $i := lo
+    $j := hi
+    while i <= j {
+        while edges[i].a < pivot.a || (edges[i].a == pivot.a && edges[i].b < pivot.b) { i += 1 }
+        while edges[j].a > pivot.a || (edges[j].a == pivot.a && edges[j].b > pivot.b) { j -= 1 }
+        if i <= j {
+            tmp := edges[i]
+            edges[i] = edges[j]
+            edges[j] = tmp
+            i += 1
+            j -= 1
+        }
+    }
+    if lo < j { sort_edges(edges, lo, j) }
+    if i < hi { sort_edges(edges, i, hi) }
+}
+
+fn set_poly_neighbor(poly $&NavPoly3D, edge_idx int, nbr int) {
+    if edge_idx == 0 {
+        poly.n0 = nbr
+    } else if edge_idx == 1 {
+        poly.n1 = nbr
+    } else {
+        poly.n2 = nbr
+    }
+}
+
+fn poly_neighbor(poly &NavPoly3D, edge_idx int) int {
+    if edge_idx == 0 { << poly.n0 }
+    if edge_idx == 1 { << poly.n1 }
+    << poly.n2
+}
+
+fn poly_edge_verts(nav &NavMesh3D, poly_idx int, edge_idx int) []int {
+    p := &nav.polys[poly_idx]
+    if edge_idx == 0 { << [p.v0, p.v1] }
+    if edge_idx == 1 { << [p.v1, p.v2] }
+    << [p.v2, p.v0]
+}
+
+// Builds a connected walkable triangle NavMesh from arbitrary 3D triangles.
+// Non-walkable steep triangles (normal.y < cos(max_slope_rad)) are filtered out automatically.
+pub fn build_navmesh(
+    vertices &[]fm.Vec3,
+    tri_indices &[]int,
+    max_slope_rad f64,
+    area_ids &[]int,
+    flags &[]int
+) NavMesh3D {
+    if vertices.len < 3 || tri_indices.len < 3 || (tri_indices.len % 3) != 0 {
+        >> errors.new("nexus nav: invalid vertex or triangle index array")
+    }
+    tri_count := tri_indices.len / 3
+    if tri_count > MAX_NAVMESH_POLYS {
+        >> errors.new("nexus nav: navmesh polygon budget exceeded")
+    }
+    if !fm.finite(max_slope_rad) || max_slope_rad < 0.0 || max_slope_rad > 1.57079632679 {
+        >> errors.new("nexus nav: invalid max slope angle")
+    }
+    if (area_ids.len > 0 && area_ids.len != tri_count) || (flags.len > 0 && flags.len != tri_count) {
+        >> errors.new("nexus nav: area_ids/flags length must match triangle count or be empty")
+    }
+    for v in vertices {
+        if !v.is_finite() { >> errors.new("nexus nav: non-finite vertex coordinate") }
+    }
+    for idx in tri_indices {
+        if idx < 0 || idx >= vertices.len { >> errors.new("nexus nav: triangle index out of range") }
+    }
+
+    min_ny := math.cos(max_slope_rad)
+    $canon_verts := []fm.Vec3{}
+    $polys := []NavPoly3D{}
+    $edges := []NavEdgeKey{}
+    $bmin := fm.vec3(1e30, 1e30, 1e30)
+    $bmax := fm.vec3(-1e30, -1e30, -1e30)
+
+    for t in 0:tri_count {
+        a_raw := vertices[tri_indices[t * 3]]
+        b_raw := vertices[tri_indices[t * 3 + 1]]
+        c_raw := vertices[tri_indices[t * 3 + 2]]
+        n_raw := b_raw.sub(a_raw).cross(c_raw.sub(a_raw))
+        n_len := n_raw.length()
+        if n_len <= 1e-8 { -> }
+        ny := n_raw.y / n_len
+        if ny < min_ny { -> }
+
+        va := canonical_vertex_index($&canon_verts, a_raw)
+        vb := canonical_vertex_index($&canon_verts, b_raw)
+        vc := canonical_vertex_index($&canon_verts, c_raw)
+        if va == vb || vb == vc || vc == va { -> }
+
+        $aid := 0
+        if area_ids.len > 0 { aid = area_ids[t] }
+        if aid < 0 || aid >= MAX_AREA_TYPES { >> errors.new("nexus nav: area id out of range 0..15") }
+        $flg := 1
+        if flags.len > 0 { flg = flags[t] }
+
+        center := a_raw.add(b_raw).add(c_raw).scaled(1.0 / 3.0)
+        pid := polys.len
+        polys.push(NavPoly3D{
+            v0: va, v1: vb, v2: vc,
+            n0: -1, n1: -1, n2: -1,
+            center: center, area_id: aid, flags: flg
+        })
+
+        vs := [va, vb, vc]
+        for e in 0:3 {
+            u0 := vs[e]
+            u1 := vs[(e + 1) % 3]
+            $ka := u0
+            $kb := u1
+            if u0 > u1 {
+                ka = u1
+                kb = u0
+            }
+            edges.push(NavEdgeKey{a: ka, b: kb, poly: pid, edge_idx: e})
+        }
+
+        pts := [a_raw, b_raw, c_raw]
+        for pt in pts {
+            bmin = fm.vec3(math.min(bmin.x, pt.x), math.min(bmin.y, pt.y), math.min(bmin.z, pt.z))
+            bmax = fm.vec3(math.max(bmax.x, pt.x), math.max(bmax.y, pt.y), math.max(bmax.z, pt.z))
+        }
+    }
+
+    if polys.len == 0 {
+        >> errors.new("nexus nav: no walkable polygons matched slope threshold")
+    }
+
+    if edges.len > 1 {
+        sort_edges($&edges, 0, edges.len - 1)
+        $k := 0
+        while k + 1 < edges.len {
+            e0 := edges[k]
+            e1 := edges[k + 1]
+            if e0.a == e1.a && e0.b == e1.b && e0.poly != e1.poly {
+                idx0 := e0.poly
+                idx1 := e1.poly
+                p0 := $&polys[idx0]
+                set_poly_neighbor(p0, e0.edge_idx, idx1)
+                p1 := $&polys[idx1]
+                set_poly_neighbor(p1, e1.edge_idx, idx0)
+                k += 2
+            } else {
+                k += 1
+            }
+        }
+    }
+
+    << NavMesh3D{vertices: canon_verts, polys: polys, bounds_min: bmin, bounds_max: bmax}
+}
+
+pub fn (nav &NavMesh3D) poly_count() int { << nav.polys.len }
+
+pub fn (nav &NavMesh3D) poly(id int) NavPoly3D {
+    if id < 0 || id >= nav.polys.len { >> errors.new("nexus nav: invalid polygon id") }
+    << nav.polys[id]
+}
+
+pub fn (nav &NavMesh3D) find_nearest_point(pos fm.Vec3, include_mask int) NavPoint3D {
+    if !pos.is_finite() { >> errors.new("nexus nav: non-finite query position") }
+    if nav.polys.len == 0 { >> errors.new("nexus nav: empty navmesh") }
+    $best_poly := -1
+    $best_pt := pos
+    $best_d2 := 1e30
+    for i in 0:nav.polys.len {
+        p := &nav.polys[i]
+        if (p.flags & include_mask) == 0 { -> }
+        a := nav.vertices[p.v0]
+        b := nav.vertices[p.v1]
+        c := nav.vertices[p.v2]
+        cp := closest_point_tri(pos, a, b, c)
+        diff := cp.sub(pos)
+        $d2 := diff.dot(diff)
+        // Slightly prefer vertically aligned triangles containing pos in XZ.
+        if point_in_tri_xz(pos, a, b, c) {
+            d2 = d2 * 0.85
+        }
+        if d2 < best_d2 {
+            best_d2 = d2
+            best_poly = i
+            best_pt = cp
+        }
+    }
+    if best_poly < 0 {
+        >> errors.new("nexus nav: no walkable polygon matching mask")
+    }
+    << NavPoint3D{poly_id: best_poly, point: best_pt, distance: best_pt.sub(pos).length()}
+}
+
+fn portal_left_right(nav &NavMesh3D, from_poly int, to_poly int) PortalPair {
+    p := &nav.polys[from_poly]
+    for e in 0:3 {
+        if poly_neighbor(p, e) == to_poly {
+            ev := poly_edge_verts(nav, from_poly, e)
+            va := nav.vertices[ev[0]]
+            vb := nav.vertices[ev[1]]
+            c := p.center
+            if turn_xz(c, va, vb) < 0.0 {
+                << PortalPair{left: vb, right: va}
+            }
+            << PortalPair{left: va, right: vb}
+        }
+    }
+    << PortalPair{left: p.center, right: p.center}
+}
+
+fn string_pull_funnel(
+    nav &NavMesh3D,
+    poly_corridor &[]int,
+    start fm.Vec3,
+    goal fm.Vec3
+) []fm.Vec3 {
+    if poly_corridor.len <= 1 {
+        << [start, goal]
+    }
+    $portals := [PortalPair{left: start, right: start}]
+    for i in 0:(poly_corridor.len - 1) {
+        pp := portal_left_right(nav, poly_corridor[i], poly_corridor[i + 1])
+        portals.push(pp)
+    }
+    portals.push(PortalPair{left: goal, right: goal})
+
+    $out := [start]
+    $apex := start
+    $p_left := start
+    $p_right := start
+    $apex_idx := 0
+    $left_idx := 0
+    $right_idx := 0
+    $i := 1
+    $guard := 0
+
+    while i < portals.len && guard < 16384 {
+        guard += 1
+        left := portals[i].left
+        right := portals[i].right
+        $restarted := false
+
+        // Tighten right boundary inward (left of current right edge).
+        if dist_xz2(right, p_right) > 1e-10 && turn_xz(apex, p_right, right) <= 0.0 {
+            if dist_xz2(apex, p_left) <= 1e-12 || turn_xz(apex, p_left, right) > 0.0 {
+                p_right = right
+                right_idx = i
+            } else {
+                if dist_xz2(out[out.len - 1], p_left) > 1e-8 {
+                    out.push(p_left)
+                }
+                apex = p_left
+                apex_idx = left_idx
+                p_left = apex
+                p_right = apex
+                left_idx = apex_idx
+                right_idx = apex_idx
+                i = apex_idx + 1
+                restarted = true
+            }
+        }
+
+        if !restarted {
+            // Tighten left boundary inward (right of current left edge).
+            if dist_xz2(left, p_left) > 1e-10 && turn_xz(apex, p_left, left) >= 0.0 {
+                if dist_xz2(apex, p_right) <= 1e-12 || turn_xz(apex, p_right, left) < 0.0 {
+                    p_left = left
+                    left_idx = i
+                } else {
+                    if dist_xz2(out[out.len - 1], p_right) > 1e-8 {
+                        out.push(p_right)
+                    }
+                    apex = p_right
+                    apex_idx = right_idx
+                    p_left = apex
+                    p_right = apex
+                    left_idx = apex_idx
+                    right_idx = apex_idx
+                    i = apex_idx + 1
+                    restarted = true
+                }
+            }
+        }
+
+        if !restarted {
+            i += 1
+        }
+    }
+
+    if dist_xz2(out[out.len - 1], goal) > 1e-8 || math.abs(out[out.len - 1].y - goal.y) > 1e-4 {
+        out.push(goal)
+    } else {
+        out[out.len - 1] = goal
+    }
+    << out
+}
+
+// Finds an A* shortest cost path over NavMesh polygons and smooths it with 3D Funnel string pulling.
+// Returns an empty slice if start and goal are on disconnected islands.
+pub fn (nav &NavMesh3D) find_path(
+    start fm.Vec3,
+    goal fm.Vec3,
+    include_mask int,
+    area_costs &[]f64
+) []fm.Vec3 {
+    if !start.is_finite() || !goal.is_finite() {
+        >> errors.new("nexus nav: invalid start or goal coordinate")
+    }
+    s_hit := nav.find_nearest_point(start, include_mask) or >>
+    g_hit := nav.find_nearest_point(goal, include_mask) or >>
+    if s_hit.poly_id == g_hit.poly_id {
+        << [s_hit.point, g_hit.point]
+    }
+
+    n := nav.polys.len
+    $g_score := []f64{}
+    $f_score := []f64{}
+    $parent := []int{}
+    $state := []int{} // 0=unvisited, 1=open, 2=closed
+    for _ in 0:n {
+        g_score.push(1e30)
+        f_score.push(1e30)
+        parent.push(-1)
+        state.push(0)
+    }
+
+    g_score[s_hit.poly_id] = 0.0
+    f_score[s_hit.poly_id] = s_hit.point.sub(g_hit.point).length()
+    state[s_hit.poly_id] = 1
+    $open_list := [s_hit.poly_id]
+    $open_len := 1
+    $found := false
+
+    while open_len > 0 {
+        $best_pos := 0
+        $best_f := f_score[open_list[0]]
+        for oi in 1:open_len {
+            cand := open_list[oi]
+            if f_score[cand] < best_f {
+                best_f = f_score[cand]
+                best_pos = oi
+            }
+        }
+        cur := open_list[best_pos]
+        open_len -= 1
+        open_list[best_pos] = open_list[open_len]
+        if cur == g_hit.poly_id {
+            found = true
+            <-
+        }
+        state[cur] = 2
+
+        cur_poly := &nav.polys[cur]
+        for e in 0:3 {
+            nbr := poly_neighbor(cur_poly, e)
+            if nbr < 0 || state[nbr] == 2 { -> }
+            nbr_poly := &nav.polys[nbr]
+            if (nbr_poly.flags & include_mask) == 0 { -> }
+
+            $cost_mul := 1.0
+            if area_costs.len > nbr_poly.area_id && area_costs[nbr_poly.area_id] > 0.0 {
+                cost_mul = area_costs[nbr_poly.area_id]
+            }
+            step_cost := cur_poly.center.sub(nbr_poly.center).length() * cost_mul
+            tentative_g := g_score[cur] + step_cost
+            if tentative_g < g_score[nbr] {
+                parent[nbr] = cur
+                g_score[nbr] = tentative_g
+                h := nbr_poly.center.sub(g_hit.point).length()
+                f_score[nbr] = tentative_g + h
+                if state[nbr] == 0 {
+                    state[nbr] = 1
+                    if open_len == open_list.len {
+                        open_list.push(nbr)
+                    } else {
+                        open_list[open_len] = nbr
+                    }
+                    open_len += 1
+                }
+            }
+        }
+    }
+
+    if !found { << []fm.Vec3{} }
+
+    $rev_corridor := []int{}
+    $walk := g_hit.poly_id
+    while walk >= 0 {
+        rev_corridor.push(walk)
+        if walk == s_hit.poly_id { <- }
+        walk = parent[walk]
+    }
+    $corridor := []int{}
+    for ri in 0:rev_corridor.len {
+        corridor.push(rev_corridor[rev_corridor.len - 1 - ri])
+    }
+    << string_pull_funnel(nav, &corridor, s_hit.point, g_hit.point)
+}

@@ -1,0 +1,527 @@
+@"github.com/xulang-org/nexus/rendering/three_d"
+
+#gpu
+#encoding/binary
+#errors
+#math
+fm #"github.com/xulang-org/nexus/foundation/math"
+light_data #"github.com/xulang-org/nexus/resources/lighting"
+
+pub const CLUSTER_GRID_X = 16
+pub const CLUSTER_GRID_Y = 16
+pub const CLUSTER_GRID_Z = 24
+pub const CLUSTER_TOTAL = 6144
+pub const MAX_CLUSTERED_LIGHTS = 1024
+pub const MAX_LIGHTS_PER_CLUSTER = 64
+
+pub struct ClusteredProgram3D {
+    pub format int
+    pub entrypoint string
+    pub compute []u8
+    pub vertex []u8
+    pub fragment []u8
+}
+
+pub fn empty_clustered_program_3d() ClusteredProgram3D {
+    << ClusteredProgram3D{
+        format: 0, entrypoint: "",
+        compute: []u8{}, vertex: []u8{}, fragment: []u8{}
+    }
+}
+
+pub struct ClusteredRenderer3D {
+    owner DeviceRef3D
+    compute []gpu.ComputePipeline
+    pipelines []gpu.GraphicsPipeline
+    buffers []gpu.Buffer
+    ambient fm.Vec3
+    eye fm.Vec3
+    exposure f64
+    light_count int
+    screen_width int
+    screen_height int
+    z_near f64
+    z_far f64
+    slice_mode int
+    log_ratio f64
+    ready bool
+    closed bool
+}
+
+// General 4x4 matrix inverse for perspective and orthographic projections.
+fn mat4_inverse(m fm.Mat4) fm.Mat4 {
+    m00 := m.c0.x
+    m01 := m.c0.y
+    m02 := m.c0.z
+    m03 := m.c0.w
+    m10 := m.c1.x
+    m11 := m.c1.y
+    m12 := m.c1.z
+    m13 := m.c1.w
+    m20 := m.c2.x
+    m21 := m.c2.y
+    m22 := m.c2.z
+    m23 := m.c2.w
+    m30 := m.c3.x
+    m31 := m.c3.y
+    m32 := m.c3.z
+    m33 := m.c3.w
+
+    c00 := m22 * m33 - m32 * m23
+    c02 := m12 * m33 - m32 * m13
+    c03 := m12 * m23 - m22 * m13
+    c04 := m21 * m33 - m31 * m23
+    c06 := m11 * m33 - m31 * m13
+    c07 := m11 * m23 - m21 * m13
+    c08 := m21 * m32 - m31 * m22
+    c10 := m11 * m32 - m31 * m12
+    c11 := m11 * m22 - m21 * m12
+    c12 := m20 * m33 - m30 * m23
+    c14 := m10 * m33 - m30 * m13
+    c15 := m10 * m23 - m20 * m13
+    c16 := m20 * m32 - m30 * m22
+    c18 := m10 * m32 - m30 * m12
+    c19 := m10 * m22 - m20 * m12
+    c20 := m20 * m31 - m30 * m21
+    c22 := m10 * m31 - m30 * m11
+    c23 := m10 * m21 - m20 * m11
+
+    f0 := fm.vec4(c00, c00, c02, c03)
+    f1 := fm.vec4(c04, c04, c06, c07)
+    f2 := fm.vec4(c08, c08, c10, c11)
+    f3 := fm.vec4(c12, c12, c14, c15)
+    f4 := fm.vec4(c16, c16, c18, c19)
+    f5 := fm.vec4(c20, c20, c22, c23)
+
+    v0 := fm.vec4(m10, m00, m00, m00)
+    v1 := fm.vec4(m11, m01, m01, m01)
+    v2 := fm.vec4(m12, m02, m02, m02)
+    v3 := fm.vec4(m13, m03, m03, m03)
+
+    i0 := fm.vec4(v1.x * f0.x - v2.x * f1.x + v3.x * f2.x,
+                  v1.y * f0.y - v2.y * f1.y + v3.y * f2.y,
+                  v1.z * f0.z - v2.z * f1.z + v3.z * f2.z,
+                  v1.w * f0.w - v2.w * f1.w + v3.w * f2.w)
+    i1 := fm.vec4(v0.x * f0.x - v2.x * f3.x + v3.x * f4.x,
+                  v0.y * f0.y - v2.y * f3.y + v3.y * f4.y,
+                  v0.z * f0.z - v2.z * f3.z + v3.z * f4.z,
+                  v0.w * f0.w - v2.w * f3.w + v3.w * f4.w)
+    i2 := fm.vec4(v0.x * f1.x - v1.x * f3.x + v3.x * f5.x,
+                  v0.y * f1.y - v1.y * f3.y + v3.y * f5.y,
+                  v0.z * f1.z - v1.z * f3.z + v3.z * f5.z,
+                  v0.w * f1.w - v1.w * f3.w + v3.w * f5.w)
+    i3 := fm.vec4(v0.x * f2.x - v1.x * f4.x + v2.x * f5.x,
+                  v0.y * f2.y - v1.y * f4.y + v2.y * f5.y,
+                  v0.z * f2.z - v1.z * f4.z + v2.z * f5.z,
+                  v0.w * f2.w - v1.w * f4.w + v2.w * f5.w)
+
+    r0 := fm.vec4(i0.x, -i0.y, i0.z, -i0.w)
+    r1 := fm.vec4(-i1.x, i1.y, -i1.z, i1.w)
+    r2 := fm.vec4(i2.x, -i2.y, i2.z, -i2.w)
+    r3 := fm.vec4(-i3.x, i3.y, -i3.z, i3.w)
+
+    det := m00 * r0.x + m01 * r1.x + m02 * r2.x + m03 * r3.x
+    if !fm.finite(det) || math.abs(det) <= 1e-18 {
+        >> errors.new("nexus 3D: singular projection matrix cannot be inverted")
+    }
+    inv := 1.0 / det
+    out := fm.Mat4{
+        c0: fm.vec4(r0.x * inv, r0.y * inv, r0.z * inv, r0.w * inv),
+        c1: fm.vec4(r1.x * inv, r1.y * inv, r1.z * inv, r1.w * inv),
+        c2: fm.vec4(r2.x * inv, r2.y * inv, r2.z * inv, r2.w * inv),
+        c3: fm.vec4(r3.x * inv, r3.y * inv, r3.z * inv, r3.w * inv)
+    }
+    if !out.is_finite() { >> errors.new("nexus 3D: non-finite projection inverse") }
+    << out
+}
+
+pub fn (device &Device3D) clustered_renderer(program &ClusteredProgram3D) ClusteredRenderer3D {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: create clustered renderer outside a frame") }
+    if !device.is_gpu() { >> errors.new("nexus 3D: clustered renderer requires GPU backend") }
+    dev := device.gpu_device() or >>
+    if (dev.shader_formats() & program.format) == 0 || program.entrypoint.len == 0 ||
+        program.compute.len == 0 || program.vertex.len == 0 || program.fragment.len == 0 {
+        >> errors.new("nexus 3D: invalid or unsupported clustered shader program")
+    }
+
+    lights_bytes := MAX_CLUSTERED_LIGHTS * 64
+    counts_bytes := (CLUSTER_TOTAL + 1) * 4
+    indices_bytes := (CLUSTER_TOTAL + 1) * MAX_LIGHTS_PER_CLUSTER * 4
+    total_bytes := lights_bytes + counts_bytes + indices_bytes
+    stats := dev.stats() or >>
+    if stats.buffer_count + 3 > 1024 || total_bytes > 67108864 - stats.buffer_bytes {
+        >> errors.new("nexus 3D: clustered lighting exceeds 1024-buffer or 64 MiB budget")
+    }
+
+    cdesc := gpu.ComputeResourcesDesc{
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 0,
+        read_textures: 0,
+        read_buffers: 1,
+        write_textures: 0,
+        write_buffers: 2,
+        uniform_sizes: [176],
+        threads_x: 64,
+        threads_y: 1,
+        threads_z: 1
+    }
+    $comp := dev.compute_pipeline_with_resources(&cdesc, &program.compute) or >>
+
+    vs_desc := gpu.ShaderResourcesDesc{
+        stage: gpu.VERTEX,
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 0,
+        storage_textures: 0,
+        storage_buffers: 0,
+        uniform_sizes: [256]
+    }
+    fs_desc := gpu.ShaderResourcesDesc{
+        stage: gpu.FRAGMENT,
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 6,
+        storage_textures: 0,
+        storage_buffers: 3,
+        uniform_sizes: [80, 80, 416]
+    }
+    $vs := dev.shader_with_resources(&vs_desc, &program.vertex) or >>
+    $fs := dev.shader_with_resources(&fs_desc, &program.fragment) or >>
+
+    $pdesc := mesh_pipeline()
+    $p_none := dev.graphics_pipeline(&vs, &fs, &pdesc) or >>
+    pdesc.cull = gpu.CULL_BACK
+    $p_back := dev.graphics_pipeline(&vs, &fs, &pdesc) or >>
+    pdesc.cull = gpu.CULL_FRONT
+    $p_front := dev.graphics_pipeline(&vs, &fs, &pdesc) or >>
+    vs.close() or >>
+    fs.close() or >>
+
+    $lights_buf := dev.buffer(lights_bytes, gpu.BUFFER_COMPUTE_STORAGE_READ | gpu.BUFFER_GRAPHICS_STORAGE_READ) or >>
+    $counts_buf := dev.buffer(counts_bytes, gpu.BUFFER_COMPUTE_STORAGE_WRITE | gpu.BUFFER_COMPUTE_STORAGE_READ | gpu.BUFFER_GRAPHICS_STORAGE_READ) or >>
+    $indices_buf := dev.buffer(indices_bytes, gpu.BUFFER_COMPUTE_STORAGE_WRITE | gpu.BUFFER_COMPUTE_STORAGE_READ | gpu.BUFFER_GRAPHICS_STORAGE_READ) or >>
+
+    << ClusteredRenderer3D{
+        owner: device.reference(),
+        compute: [comp],
+        pipelines: [p_none, p_back, p_front],
+        buffers: [lights_buf, counts_buf, indices_buf],
+        ambient: fm.vec3(0.0, 0.0, 0.0),
+        eye: fm.vec3(0.0, 0.0, 0.0),
+        exposure: 1.0,
+        light_count: 0,
+        screen_width: device.target_width * device.render_scale,
+        screen_height: device.target_height * device.render_scale,
+        z_near: 0.1,
+        z_far: 100.0,
+        slice_mode: 0,
+        log_ratio: math.log(1000.0),
+        ready: false,
+        closed: false
+    }
+}
+
+pub fn (renderer $&ClusteredRenderer3D) bin_lights(
+    device &Device3D,
+    ambient fm.Vec3,
+    eye fm.Vec3,
+    exposure f64,
+    sources &[]light_data.Light3D,
+    view fm.Mat4,
+    projection fm.Mat4,
+    z_near f64,
+    z_far f64,
+    slice_mode int
+) int {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: bin_lights must run before device.begin") }
+    if renderer.closed || !renderer.owner.matches(device) {
+        >> errors.new("nexus 3D: closed or foreign clustered renderer")
+    }
+    if !color_range(ambient, 1.0) || !eye.is_finite() || !fm.finite(exposure) || exposure <= 0.0 || exposure > 64.0 {
+        >> errors.new("nexus 3D: invalid clustered environment ambient, eye or exposure")
+    }
+    if sources.len > MAX_CLUSTERED_LIGHTS {
+        >> errors.new("nexus 3D: clustered lighting supports at most 1024 lights")
+    }
+    if !view.is_affine() || !projection.is_finite() || !fm.finite(z_near) || !fm.finite(z_far) || z_near <= 0.0 || z_far <= z_near {
+        >> errors.new("nexus 3D: invalid clustered camera matrices or depth range")
+    }
+    if slice_mode < 0 || slice_mode > 1 {
+        >> errors.new("nexus 3D: invalid cluster Z slice mode")
+    }
+    for i in 0:sources.len {
+        sources[i].validate() or >>
+    }
+    inv_proj := mat4_inverse(projection) or >>
+
+    $light_words := []int{}
+    if sources.len == 0 {
+        for j in 0:16 { light_words.push(0) }
+    } else {
+        for i in 0:sources.len {
+            src := &sources[i]
+            pos := src.position()
+            dir := src.direction()
+            rad := src.radiance()
+            for v in [pos.x, pos.y, pos.z, f64(src.kind()),
+                      dir.x, dir.y, dir.z, src.radius(),
+                      rad.x, rad.y, rad.z, src.inner_cosine(),
+                      src.outer_cosine(), 0.0, 0.0, 0.0] {
+                light_words.push(scalar_word(v) or >>)
+            }
+        }
+    }
+    light_bytes := word_bytes(&light_words) or >>
+
+    sw := device.target_width * device.render_scale
+    sh := device.target_height * device.render_scale
+    log_ratio := math.log(z_far / z_near)
+
+    $param_words := []int{}
+    for w in matrix_words(view) or >> { param_words.push(w) }
+    for w in matrix_words(inv_proj) or >> { param_words.push(w) }
+    for v in [f64(CLUSTER_GRID_X), f64(CLUSTER_GRID_Y), f64(CLUSTER_GRID_Z), f64(sources.len),
+              f64(sw), f64(sh), z_near, z_far,
+              f64(slice_mode), log_ratio, 0.0, 0.0] {
+        param_words.push(scalar_word(v) or >>)
+    }
+    param_bytes := word_bytes(&param_words) or >>
+
+    dev := device.gpu_device() or >>
+    $up := dev.upload(&renderer.buffers[0], 0, &light_bytes) or >>
+    up.close() or >>
+
+    $enc := dev.command_encoder() or >>
+    writes := [gpu.write_buffer(&renderer.buffers[1], false),
+        gpu.write_buffer(&renderer.buffers[2], false)]
+    $pass := enc.begin_compute(&writes) or >>
+    pass.pipeline(&renderer.compute[0]) or >>
+    pass.read_buffer(0, &renderer.buffers[0]) or >>
+    pass.uniform(0, &param_bytes) or >>
+    groups := (CLUSTER_TOTAL + 1 + 63) / 64
+    pass.dispatch(groups, 1, 1) or >>
+    pass.end() or >>
+    $fence := enc.submit() or >>
+    fence.wait() or >>
+    fence.close() or >>
+
+    renderer.ambient = ambient
+    renderer.eye = eye
+    renderer.exposure = exposure
+    renderer.light_count = sources.len
+    renderer.screen_width = sw
+    renderer.screen_height = sh
+    renderer.z_near = z_near
+    renderer.z_far = z_far
+    renderer.slice_mode = slice_mode
+    renderer.log_ratio = log_ratio
+    renderer.ready = true
+    << 0
+}
+
+pub fn (renderer $&ClusteredRenderer3D) bin_environment(
+    device &Device3D,
+    env &light_data.Environment3D,
+    view fm.Mat4,
+    projection fm.Mat4,
+    z_near f64,
+    z_far f64,
+    slice_mode int
+) int {
+    env.validate() or >>
+    $srcs := []light_data.Light3D{}
+    for i in 0:env.source_count() {
+        srcs.push(env.source(i) or >>)
+    }
+    << renderer.bin_lights(device, env.ambient(), env.eye(), env.exposure(), &srcs, view, projection, z_near, z_far, slice_mode) or >>
+}
+
+fn (renderer &ClusteredRenderer3D) lighting_uniform_bytes() []u8 {
+    $words := []int{}
+    for v in [renderer.ambient.x, renderer.ambient.y, renderer.ambient.z, f64(renderer.light_count),
+        renderer.eye.x, renderer.eye.y, renderer.eye.z, renderer.exposure,
+        f64(renderer.screen_width), f64(renderer.screen_height), renderer.z_near, renderer.z_far,
+        f64(CLUSTER_GRID_X), f64(CLUSTER_GRID_Y), f64(CLUSTER_GRID_Z), f64(renderer.slice_mode),
+        renderer.log_ratio, 0.0, 0.0, 0.0] {
+        words.push(scalar_word(v) or >>)
+    }
+    << word_bytes(&words) or >>
+}
+
+pub fn (renderer &ClusteredRenderer3D) draw_material(
+    device $&Device3D,
+    mesh &Mesh3D,
+    world fm.Mat4,
+    view fm.Mat4,
+    view_projection fm.Mat4,
+    material &Material3D
+) int {
+    << renderer.draw_material_reference(device, mesh.reference(), world, view, view_projection, material) or >>
+}
+
+pub fn (renderer &ClusteredRenderer3D) draw_material_reference(
+    device $&Device3D,
+    mesh MeshRef3D,
+    world fm.Mat4,
+    view fm.Mat4,
+    view_projection fm.Mat4,
+    material &Material3D
+) int {
+    shadow_bytes := zero_bytes(416)
+    $no_shadow_img := []gpu.TextureRef{}
+    << renderer.draw_clustered_internal(device, mesh, world, view, view_projection, material, &shadow_bytes, &no_shadow_img) or >>
+}
+
+pub fn (renderer &ClusteredRenderer3D) draw_material_reference_shadowed(
+    device $&Device3D,
+    mesh MeshRef3D,
+    world fm.Mat4,
+    view fm.Mat4,
+    view_projection fm.Mat4,
+    material &Material3D,
+    shadow &ShadowBinding3D,
+    shadow_light_index int
+) int {
+    if !shadow.present {
+        shadow_bytes := zero_bytes(416)
+        $no_shadow_img := []gpu.TextureRef{}
+        << renderer.draw_clustered_internal(device, mesh, world, view, view_projection, material, &shadow_bytes, &no_shadow_img) or >>
+    }
+    if !shadow.has_gpu { >> errors.new("nexus 3D: clustered shadow binding requires GPU texture") }
+    if shadow_light_index < 0 || shadow_light_index >= renderer.light_count {
+        >> errors.new("nexus 3D: clustered shadow light index out of range")
+    }
+    shadow.validate_camera(view_projection) or >>
+    swords := shadow_words(shadow, shadow_light_index) or >>
+    shadow_bytes := word_bytes(&swords) or >>
+    shadow_img := [shadow.image]
+    << renderer.draw_clustered_internal(device, mesh, world, view, view_projection, material, &shadow_bytes, &shadow_img) or >>
+}
+
+fn (renderer &ClusteredRenderer3D) draw_clustered_internal(
+    device $&Device3D,
+    mesh MeshRef3D,
+    world fm.Mat4,
+    view fm.Mat4,
+    view_projection fm.Mat4,
+    material &Material3D,
+    shadow_bytes &[]u8,
+    shadow_img &[]gpu.TextureRef
+) int {
+    device.drawing() or >>
+    if renderer.closed || !renderer.owner.matches(device) || !renderer.ready {
+        >> errors.new("nexus 3D: closed, foreign or unbinned clustered renderer")
+    }
+    if !view.is_affine() || !view_projection.is_finite() {
+        >> errors.new("nexus 3D: invalid view or view-projection matrix")
+    }
+    device.reference().validate_material(mesh, material) or >>
+    base_mats := lit_matrix_words(world, view_projection) or >>
+    $mat_words := []int{}
+    for w in base_mats { mat_words.push(w) }
+    for w in matrix_words(view) or >> { mat_words.push(w) }
+    vert_bytes := word_bytes(&mat_words) or >>
+
+    sign := view_projection.multiply(world).determinant_sign() or >>
+    $orientation := 1.0
+    if sign < 0 { orientation = -1.0 }
+    params := material_words(material, orientation) or >>
+    frag_bytes := word_bytes(&params) or >>
+    light_bytes := renderer.lighting_uniform_bytes() or >>
+
+    pass := $&device.passes[0]
+    if material.surface_mode == 0 {
+        if orientation < 0.0 {
+            pass.pipeline(&renderer.pipelines[2]) or >>
+        } else {
+            pass.pipeline(&renderer.pipelines[1]) or >>
+        }
+    } else {
+        pass.pipeline(&renderer.pipelines[0]) or >>
+    }
+    pass.vertex_buffer_ref(0, mesh.vertices, 0) or >>
+    pass.index_buffer_ref(mesh.indices, 0, gpu.INDEX32) or >>
+    maps := material.maps()
+    for i in 0:5 {
+        tex := &maps[i]
+        if tex.present {
+            pass.sampler_ref(gpu.FRAGMENT, i, tex.image, tex.sampler) or >>
+        } else {
+            pass.sampler(gpu.FRAGMENT, i, &device.whites[0], &device.white_samplers[0]) or >>
+        }
+    }
+    if shadow_img.len > 0 {
+        pass.sampler_ref(gpu.FRAGMENT, 5, shadow_img[0], device.white_samplers[0].reference()) or >>
+    } else {
+        pass.sampler(gpu.FRAGMENT, 5, &device.whites[0], &device.white_samplers[0]) or >>
+    }
+    pass.uniform(gpu.VERTEX, 0, &vert_bytes) or >>
+    pass.uniform(gpu.FRAGMENT, 0, &frag_bytes) or >>
+    pass.uniform(gpu.FRAGMENT, 1, &light_bytes) or >>
+    pass.uniform(gpu.FRAGMENT, 2, shadow_bytes) or >>
+    pass.storage_buffer(gpu.FRAGMENT, 0, &renderer.buffers[0]) or >>
+    pass.storage_buffer(gpu.FRAGMENT, 1, &renderer.buffers[1]) or >>
+    pass.storage_buffer(gpu.FRAGMENT, 2, &renderer.buffers[2]) or >>
+    pass.draw_indexed(mesh.count, 0, 0, 1, 0) or >>
+
+    device.cached = false
+    device.draw_count += 1
+    device.lit_draws += 1
+    device.light_candidates += renderer.light_count
+    device.selected_lights += renderer.light_count
+    << mesh.count / 3
+}
+
+pub fn (renderer &ClusteredRenderer3D) readback_cluster_counts(device &Device3D) []int {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: readback_cluster_counts must run outside a frame") }
+    if renderer.closed || !renderer.owner.matches(device) || !renderer.ready {
+        >> errors.new("nexus 3D: closed, foreign or unbinned clustered renderer")
+    }
+    dev := device.gpu_device() or >>
+    total := CLUSTER_TOTAL + 1
+    $rb := dev.download(&renderer.buffers[1], 0, total * 4) or >>
+    rb.wait() or >>
+    $raw := zero_bytes(total * 4)
+    rb.read($&raw) or >>
+    rb.close() or >>
+    order := binary.little_endian()
+    $out := []int{}
+    for i in 0:total {
+        out.push(order.get_u32_bytes(&raw, i * 4) or >>)
+    }
+    << out
+}
+
+pub fn (renderer &ClusteredRenderer3D) binned_light_count() int {
+    << renderer.light_count
+}
+
+pub fn (renderer $&ClusteredRenderer3D) close() int {
+    if renderer.closed { << 0 }
+    for i in 0:renderer.compute.len {
+        c := $&renderer.compute[i]
+        c.close() or >>
+    }
+    for i in 0:renderer.pipelines.len {
+        p := $&renderer.pipelines[i]
+        p.close() or >>
+    }
+    for i in 0:renderer.buffers.len {
+        b := $&renderer.buffers[i]
+        b.close() or >>
+    }
+    renderer.compute = []gpu.ComputePipeline{}
+    renderer.pipelines = []gpu.GraphicsPipeline{}
+    renderer.buffers = []gpu.Buffer{}
+    renderer.ready = false
+    renderer.closed = true
+    << 0
+}
+
+fn (renderer $&ClusteredRenderer3D) drop() {
+    renderer.close() or (err) { << }
+}

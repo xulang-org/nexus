@@ -6,7 +6,17 @@ fm #"github.com/xulang-org/nexus/foundation/math"
 #errors
 
 pub const FORMAT = "xu.scene"
-pub const VERSION = 1
+pub const VERSION = 10
+const MODELING_VERSION = 10
+const MODERN_COMPONENTS_VERSION = 9
+const TILE_COLLISION_VERSION = 8
+const SPRITE_TILEMAP_VERSION = 7
+const LOD_VERSION = 6
+const PUNCTUAL_SHADOW_VERSION = 5
+const CASCADE_VERSION = 4
+const CAMERA_VERSION = 3
+const PERSPECTIVE_VERSION = 2
+const LEGACY_VERSION = 1
 pub const MAX_BYTES = 4194304
 const MAX_JSON_NODES = 131072
 fn fields(doc &json.Doc, node int, expected &[]string) int {
@@ -38,16 +48,39 @@ fn process_mode(value string) int {
     if value == "disabled" { << resource.PROCESS_DISABLED }
     >> errors.new("nexus scene: unsupported process mode")
 }
-pub fn decode(raw &string) resource.Document {
-    if raw.len < 1 || raw.len > MAX_BYTES { >> errors.new("nexus scene: file size outside profile") }
+fn parse_scene_json(raw &string) json.Doc {
     doc := json.parse_max(raw, MAX_BYTES)
     if !doc.ok() { >> errors.new("nexus scene JSON: " + doc.error()) }
     if doc.kinds.len > MAX_JSON_NODES { >> errors.new("nexus scene: JSON node budget exceeded") }
+    << doc
+}
+pub fn decode(raw &string) resource.Document {
+    if raw.len < 1 || raw.len > MAX_BYTES { >> errors.new("nexus scene: file size outside profile") }
+    doc := parse_scene_json(raw) or >>
     root := doc.root()
     if !doc.is_dict(root) || !doc.has(root, "version") { >> errors.new("nexus scene: missing version object") }
     version := doc.as_int(doc.get(root, "version")) or >>
-    if version != VERSION { >> errors.new("nexus scene: unsupported format/version") }
-    header := ["format", "version", "nodes", "resources", "surfaces", "audio_buses", "audio_emitters", "scripts", "script_connections", "lights"]
+    if version < LEGACY_VERSION || version > VERSION {
+        >> errors.new("nexus scene: unsupported format/version")
+    }
+    $header := ["format", "version", "nodes", "resources", "surfaces", "audio_buses", "audio_emitters", "scripts", "script_connections", "lights"]
+    if version >= SPRITE_TILEMAP_VERSION {
+        header.push("sprites_3d")
+        header.push("tilemaps_2d")
+    }
+    if version >= MODERN_COMPONENTS_VERSION {
+        header.push("environments")
+        header.push("rigid_bodies_3d")
+        header.push("joints_3d")
+        header.push("terrains")
+        header.push("particles_3d")
+        header.push("prefab_instances")
+    }
+    if version >= MODELING_VERSION {
+        header.push("editable_meshes")
+        header.push("csg_brushes")
+        header.push("material_overrides")
+    }
     fields(&doc, root, &header) or >>
     if (doc.as_string(doc.get(root, "format")) or >>) != FORMAT { >> errors.new("nexus scene: unsupported format/version") }
     list := doc.get(root, "nodes")
@@ -61,6 +94,8 @@ pub fn decode(raw &string) resource.Document {
         node_kind := kind(doc.as_string(type_at) or >>) or >>
         $names := ["parent", "name", "type", "visible", "process"]
         if node_kind != resource.NODE_GROUP { names.push("transform") }
+        has_camera := version >= PERSPECTIVE_VERSION && node_kind != resource.NODE_GROUP && doc.has(at, "camera")
+        if has_camera { names.push("camera") }
         fields(&doc, at, &names) or >>
         parent := doc.as_int(doc.get(at, "parent")) or >>
         name := doc.as_string(doc.get(at, "name")) or >>
@@ -77,8 +112,11 @@ pub fn decode(raw &string) resource.Document {
                 c1: fm.vec4(values[4], values[5], values[6], values[7]), c2: fm.vec4(values[8], values[9], values[10], values[11]),
                 c3: fm.vec4(values[12], values[13], values[14], values[15])}
         }
+        if has_camera {
+            decode_camera(&doc, doc.get(at, "camera"), version, $&current) or >>
+        }
         nodes.push(current)
     }
     document := resource.make_document(nodes) or >>
-    << decode_attachments(&doc, root, &document) or >>
+    << decode_attachments(&doc, root, version, &document) or >>
 }

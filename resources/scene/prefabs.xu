@@ -1,0 +1,89 @@
+@"github.com/xulang-org/nexus/resources/scene"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+
+pub const MAX_SCENE_PREFAB_INSTANCES = 512
+pub const MAX_PREFAB_OVERRIDES = 64
+
+pub struct PrefabOverride {
+    pub target_path string
+    pub visible_set bool
+    pub visible bool
+    pub position_set bool
+    pub position fm.Vec3
+}
+
+pub struct PrefabInstanceAttachment {
+    pub node int
+    pub scene_uid string
+    pub overrides []PrefabOverride
+}
+
+pub fn prefab_instance_attachment(node int, scene_uid string, overrides []PrefabOverride) PrefabInstanceAttachment {
+    << PrefabInstanceAttachment{node: node, scene_uid: scene_uid, overrides: overrides}
+}
+
+pub fn (item &PrefabInstanceAttachment) validate() int {
+    if item.overrides.len > MAX_PREFAB_OVERRIDES {
+        >> errors.new("nexus scene: PrefabInstance override count exceeds 64")
+    }
+    $seen := map[string]bool{}
+    for ov in item.overrides {
+        p := ov.target_path + ""
+        if !valid_name(&p) && !relative_path(&p) {
+            >> errors.new("nexus scene: invalid PrefabOverride target_path")
+        }
+        if seen.has(p + "") {
+            >> errors.new("nexus scene: duplicate PrefabOverride target_path")
+        }
+        seen[p] = true
+        if !ov.visible_set && !ov.position_set {
+            >> errors.new("nexus scene: PrefabOverride must override at least one property")
+        }
+        if ov.position_set && (!fm.finite(ov.position.x) || !fm.finite(ov.position.y) || !fm.finite(ov.position.z)) {
+            >> errors.new("nexus scene: PrefabOverride position must be finite")
+        }
+    }
+    << 0
+}
+
+fn validate_prefab_instances(document &Document, prefabs &[]PrefabInstanceAttachment, kinds &map[string]string, used $&map[string]bool) int {
+    if prefabs.len > MAX_SCENE_PREFAB_INSTANCES {
+        >> errors.new("nexus scene: PrefabInstance attachment count exceeds 512")
+    }
+    $occupied := map[int]bool{}
+    for item in prefabs {
+        uid := item.scene_uid + ""
+        if item.node < 0 || item.node >= document.nodes.len || occupied.has(item.node) {
+            >> errors.new("nexus scene: PrefabInstance requires a unique node index")
+        }
+        if !kinds.has(uid + "") || kinds[uid + ""] != "scene_file" {
+            >> errors.new("nexus scene: PrefabInstance requires a scene_file resource")
+        }
+        item.validate() or >>
+        occupied[item.node] = true
+        used[uid] = true
+    }
+    << 0
+}
+
+pub fn (document &Document) prefab_instance_count() int { << document.prefab_instances.len }
+
+pub fn (document &Document) prefab_instance(index int) PrefabInstanceAttachment {
+    if index < 0 || index >= document.prefab_instances.len {
+        >> errors.new("nexus scene: PrefabInstance index outside document")
+    }
+    saved := &document.prefab_instances[index]
+    $ovs := []PrefabOverride{}
+    for ov in saved.overrides {
+        ovs.push(PrefabOverride{
+            target_path: ov.target_path + "",
+            visible_set: ov.visible_set,
+            visible: ov.visible,
+            position_set: ov.position_set,
+            position: ov.position
+        })
+    }
+    << PrefabInstanceAttachment{node: saved.node, scene_uid: saved.scene_uid + "", overrides: ovs}
+}

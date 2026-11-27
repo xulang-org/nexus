@@ -36,3 +36,63 @@ pub fn (bounds Aabb3) distance_squared(point Vec3) f64 {
     // Infinity denotes an unrepresentable squared distance, never a wraparound.
     << x*x+y*y+z*z
 }
+pub fn (bounds Aabb3) size() Vec3 {
+    bounds.validate() or >>
+    << bounds.maximum.sub(bounds.minimum)
+}
+pub fn (bounds Aabb3) volume() f64 {
+    s := bounds.size() or >>
+    << s.x * s.y * s.z
+}
+pub fn (bounds Aabb3) overlaps(other Aabb3) bool {
+    << bounds.minimum.x <= other.maximum.x && bounds.maximum.x >= other.minimum.x &&
+        bounds.minimum.y <= other.maximum.y && bounds.maximum.y >= other.minimum.y &&
+        bounds.minimum.z <= other.maximum.z && bounds.maximum.z >= other.minimum.z
+}
+pub fn (bounds Aabb3) expanded(margin f64) Aabb3 {
+    bounds.validate() or >>
+    if !finite(margin) { >> errors.new("nexus math: Aabb3 expansion requires finite margin") }
+    d := vec3(margin, margin, margin)
+    << aabb3(bounds.minimum.sub(d), bounds.maximum.add(d)) or >>
+}
+pub fn (bounds Aabb3) merged(other Aabb3) Aabb3 {
+    bounds.validate() or >>
+    other.validate() or >>
+    << aabb3(min_vec3(bounds.minimum, other.minimum), max_vec3(bounds.maximum, other.maximum)) or >>
+}
+pub fn (bounds Aabb3) include_point(point Vec3) Aabb3 {
+    bounds.validate() or >>
+    if !point.is_finite() { >> errors.new("nexus math: Aabb3.include_point requires a finite point") }
+    << aabb3(min_vec3(bounds.minimum, point), max_vec3(bounds.maximum, point)) or >>
+}
+pub fn (bounds Aabb3) clamp_point(point Vec3) Vec3 {
+    bounds.validate() or >>
+    << vec3(
+        math.max(bounds.minimum.x, math.min(bounds.maximum.x, point.x)),
+        math.max(bounds.minimum.y, math.min(bounds.maximum.y, point.y)),
+        math.max(bounds.minimum.z, math.min(bounds.maximum.z, point.z))
+    )
+}
+pub fn (bounds Aabb3) transformed(m Mat4) Aabb3 {
+    bounds.validate() or >>
+    if !m.is_finite() { >> errors.new("nexus math: Aabb3.transformed requires finite matrix") }
+    $lo := m.transform_point(bounds.minimum)
+    $hi := lo
+    for ix in 0:2 {
+        px := bounds.minimum.x
+        $vx := px
+        if ix == 1 { vx = bounds.maximum.x }
+        for iy in 0:2 {
+            $vy := bounds.minimum.y
+            if iy == 1 { vy = bounds.maximum.y }
+            for iz in 0:2 {
+                $vz := bounds.minimum.z
+                if iz == 1 { vz = bounds.maximum.z }
+                wp := m.transform_point(vec3(vx, vy, vz))
+                lo = min_vec3(lo, wp)
+                hi = max_vec3(hi, wp)
+            }
+        }
+    }
+    << aabb3(lo, hi) or >>
+}

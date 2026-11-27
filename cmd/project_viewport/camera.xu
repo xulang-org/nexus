@@ -1,0 +1,97 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+scene #"github.com/xulang-org/nexus/scene"
+#math
+
+struct Orbit {
+    center fm.Vec3
+    distance f64
+    yaw f64
+    pitch f64
+}
+struct CameraFrame {
+    position fm.Vec3
+    right fm.Vec3
+    up fm.Vec3
+    forward fm.Vec3
+    view fm.Mat4
+    proj fm.Mat4
+    projection fm.Mat4
+    size fm.Vec2
+    tangent f64
+    near f64
+    far f64
+}
+struct ScreenPoint {
+    position fm.Vec2
+    depth f64
+    visible bool
+}
+struct ViewRay {
+    origin fm.Vec3
+    direction fm.Vec3
+    near f64
+    far f64
+}
+
+fn clamp(value f64, lower f64, upper f64) f64 { << math.min(upper, math.max(lower, value)) }
+
+fn frame_orbit(bounds fm.Aabb3) Orbit {
+    center := bounds.center() or >>
+    radius := (bounds.half_extent() or >>).length()
+    << Orbit{center: center, distance: math.max(0.75, radius * 2.85), yaw: 0.48, pitch: 0.38}
+}
+
+fn camera_frame(orbit Orbit, size fm.Vec2) CameraFrame {
+    direction := fm.vec3(math.sin(orbit.yaw) * math.cos(orbit.pitch), math.sin(orbit.pitch),
+        math.cos(orbit.yaw) * math.cos(orbit.pitch))
+    $camera := scene.new_camera_3d()
+    camera.position = orbit.center.add(direction.scaled(orbit.distance))
+    camera.target = orbit.center
+    camera.near = math.max(0.00015, orbit.distance * 0.002)
+    camera.far = math.max(1000.0, orbit.distance * 40.0)
+    forward := direction.scaled(-1.0)
+    right := forward.cross(camera.up).normalized() or >>
+    up := right.cross(forward)
+    aspect := size.x / size.y
+    view := scene.look_at_3d(camera.position, camera.target, camera.up) or >>
+    proj := scene.perspective_3d(camera.vertical_fov, aspect, camera.near, camera.far) or >>
+    projection := proj.multiply(view)
+    << CameraFrame{position: camera.position, forward: forward, right: right, up: up,
+        view: view, proj: proj, projection: projection,
+        size: size, tangent: math.tan(camera.vertical_fov * 0.5), near: camera.near, far: camera.far}
+}
+
+fn (frame CameraFrame) ray(point fm.Vec2) ViewRay {
+    x := (2.0 * point.x - frame.size.x) / frame.size.y * frame.tangent
+    y := (1.0 - 2.0 * point.y / frame.size.y) * frame.tangent
+    unit := frame.forward.add(frame.right.scaled(x)).add(frame.up.scaled(y)).normalized() or >>
+    cos := unit.dot(frame.forward)
+    << ViewRay{origin: frame.position, direction: unit, near: frame.near / cos, far: frame.far / cos}
+}
+
+fn (frame CameraFrame) project(world fm.Vec3) ScreenPoint {
+    clip := frame.projection.transform(fm.vec4(world.x, world.y, world.z, 1.0))
+    if !clip.is_finite() || clip.w < frame.near || clip.w > frame.far {
+        << ScreenPoint{position: fm.vec2(0.0, 0.0), depth: 0.0, visible: false}
+    }
+    point := fm.vec2((clip.x / clip.w + 1.0) * frame.size.x * 0.5, (1.0 - clip.y / clip.w) * frame.size.y * 0.5)
+    << ScreenPoint{position: point, depth: clip.w, visible: fm.finite(point.x) && fm.finite(point.y)}
+}
+
+fn (orbit Orbit) turned(delta fm.Vec2) Orbit {
+    << Orbit{center: orbit.center, distance: orbit.distance, yaw: orbit.yaw - delta.x * 0.008,
+        pitch: clamp(orbit.pitch + delta.y * 0.008, -1.48, 1.48)}
+}
+
+fn (orbit Orbit) panned(frame CameraFrame, delta fm.Vec2) Orbit {
+    world_per_pixel := 2.0 * orbit.distance * frame.tangent / frame.size.y
+    shift := frame.right.scaled(-delta.x * world_per_pixel).add(frame.up.scaled(delta.y * world_per_pixel))
+    << Orbit{center: orbit.center.add(shift), distance: orbit.distance, yaw: orbit.yaw, pitch: orbit.pitch}
+}
+
+fn (orbit Orbit) zoomed(delta f64) Orbit {
+    distance := clamp(orbit.distance * math.exp(clamp(-delta * 0.12, -5.0, 5.0)), 0.025, 10000000000.0)
+    << Orbit{center: orbit.center, distance: distance, yaw: orbit.yaw, pitch: orbit.pitch}
+}

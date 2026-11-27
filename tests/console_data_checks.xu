@@ -1,0 +1,177 @@
+@main
+
+rc #"github.com/xulang-org/nexus/resources/console"
+#strings
+
+fn xbox_fails(cfg &rc.XboxAppConfig) bool {
+    _ := rc.validate_xbox_config(cfg) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn ps_fails(cfg &rc.PlayStationAppConfig) bool {
+    _ := rc.validate_ps_config(cfg) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn switch_fails(cfg &rc.SwitchAppConfig) bool {
+    _ := rc.validate_switch_config(cfg) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn haptics_fails(cmd &rc.GamepadHapticCommand) bool {
+    _ := rc.validate_haptic_command(cmd) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn save_key_fails(c &string, b &string) bool {
+    _ := rc.validate_save_key(c, b) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn run() int {
+    // 1. Hardware budgets across all platforms
+    sx := rc.hardware_profile(rc.PLATFORM_XBOX_SERIES_X) or >>
+    assert(sx.gfx_api == rc.GFX_D3D12 && sx.target_width == 3840 && sx.tv_safe_area_pct == 90)
+    ss := rc.hardware_profile(rc.PLATFORM_XBOX_SERIES_S) or >>
+    assert(ss.target_width == 2560 && ss.memory_budget_mb == 8192)
+    ps5 := rc.hardware_profile(rc.PLATFORM_PS5) or >>
+    assert(ps5.gfx_api == rc.GFX_PS_AGC && ps5.target_width == 3840 && ps5.tv_safe_area_pct == 90)
+    ps4 := rc.hardware_profile(rc.PLATFORM_PS4) or >>
+    assert(ps4.gfx_api == rc.GFX_PS_GNM && ps4.target_height == 1080)
+    sw1 := rc.hardware_profile(rc.PLATFORM_SWITCH) or >>
+    assert(sw1.gfx_api == rc.GFX_SWITCH_NVN && sw1.memory_budget_mb == 3200)
+    sw2 := rc.hardware_profile(rc.PLATFORM_SWITCH_2) or >>
+    assert(sw2.gfx_api == rc.GFX_SWITCH_NVN && sw2.target_width == 3840 && sw2.supports_hdr)
+    res_hh := rc.switch_resolution(rc.PLATFORM_SWITCH, rc.OPERATION_MODE_HANDHELD)
+    res_dk := rc.switch_resolution(rc.PLATFORM_SWITCH, rc.OPERATION_MODE_DOCKED)
+    assert(res_hh[0] == 1280 && res_hh[1] == 720 && res_dk[0] == 1920 && res_dk[1] == 1080)
+    assert(rc.is_taptap_platform(rc.PLATFORM_TAPTAP_ANDROID) && rc.is_taptap_platform(rc.PLATFORM_TAPTAP_IOS) && rc.is_taptap_platform(rc.PLATFORM_TAPTAP_PC))
+    tt_and := rc.hardware_profile(rc.PLATFORM_TAPTAP_ANDROID) or >>
+    assert(tt_and.gfx_api == rc.GFX_VULKAN && tt_and.tv_safe_area_pct == 100)
+    tt_ios := rc.hardware_profile(rc.PLATFORM_TAPTAP_IOS) or >>
+    assert(tt_ios.gfx_api == rc.GFX_METAL && tt_ios.target_width == 2532)
+    tt_pc := rc.hardware_profile(rc.PLATFORM_TAPTAP_PC) or >>
+    assert(tt_pc.gfx_api == rc.GFX_VULKAN && tt_pc.max_refresh_hz == 144)
+
+    // 2. Xbox config roundtrip, XML generators & XR audit
+    $xcfg := rc.default_xbox_config()
+    xcfg.achievement_ids = ["ACH_BOSS_1", "ACH_CAMPAIGN"]
+    xcfg.dlc_store_ids = ["9NX0DLC00001"]
+    xjson := rc.encode_xbox_config_json(&xcfg) or >>
+    xdec := rc.decode_xbox_config_json(&xjson) or >>
+    assert(xdec.store_id == "9NX0DEMO0001" && xdec.title_id_hex == "75C31B92")
+    assert(xdec.achievement_ids.len == 2 && xdec.dlc_store_ids.len == 1)
+    gcfg := rc.generate_microsoft_game_config_xml(&xdec) or >>
+    assert(strings.contains(&gcfg, "<TitleId>75C31B92</TitleId>"))
+    assert(strings.contains(&gcfg, "<ExtendedAttribute Name=\"Scid\""))
+    lfiles := ["project.json", "NexusGame.exe"]
+    lxml := rc.generate_xbox_layout_xml(&xdec, &lfiles) or >>
+    assert(strings.contains(&lxml, "<Chunk Id=\"1000\""))
+    assert(rc.audit_xbox_certification(&xdec, 90).passed)
+    assert(!rc.audit_xbox_certification(&xdec, 100).passed)
+
+    // Xbox strict rejections
+    $bad_tid := rc.default_xbox_config()
+    bad_tid.title_id_hex = "BAD"
+    assert(xbox_fails(&bad_tid))
+    $bad_scid := rc.default_xbox_config()
+    bad_scid.scid = "not-a-uuid"
+    assert(xbox_fails(&bad_scid))
+
+    // 3. PlayStation config roundtrip, param.json/.gp5/UDS & TRC audit
+    $pcfg := rc.default_ps_config()
+    pcfg.trophies = [
+        rc.PsTrophyDef{trophy_id: 0, grade: rc.TROPHY_PLATINUM, name: "Nexus Legend", is_progress: false, target_value: 0, hidden: false},
+        rc.PsTrophyDef{trophy_id: 1, grade: rc.TROPHY_GOLD, name: "Final Boss", is_progress: false, target_value: 0, hidden: false},
+        rc.PsTrophyDef{trophy_id: 2, grade: rc.TROPHY_SILVER, name: "100 Wins", is_progress: true, target_value: 100, hidden: false}
+    ]
+    pcfg.activities = [
+        rc.PsActivityDef{activity_id: "ch1_boss", name: "Chapter 1 Citadel", category: "progress"}
+    ]
+    pcfg.entitlement_labels = ["SEASONPASS000001"]
+    pjson := rc.encode_ps_config_json(&pcfg) or >>
+    pdec := rc.decode_ps_config_json(&pjson) or >>
+    assert(pdec.title_id == "PPSA01234" && pdec.trophies.len == 3 && pdec.activities.len == 1)
+    p_param := rc.generate_ps_param_json(&pdec) or >>
+    assert(strings.contains(&p_param, "\"titleId\": \"PPSA01234\""))
+    uds := rc.generate_ps_uds_schema_json(&pdec) or >>
+    assert(strings.contains(&uds, "\"ch1_boss\""))
+    pfiles := ["project.json", "sce_sys/param.json"]
+    gp5 := rc.generate_ps_gp5_xml(&pdec, &pfiles) or >>
+    assert(strings.contains(&gp5, "UP9000-PPSA01234_00-NEXUSGAME0000001"))
+    assert(rc.audit_ps_certification(&pdec, 90).passed)
+    assert(!rc.audit_ps_certification(&pdec, 100).passed)
+
+    // PlayStation strict rejections
+    $bad_ps_id := rc.default_ps_config()
+    bad_ps_id.title_id = "bad"
+    assert(ps_fails(&bad_ps_id))
+    $two_plat := rc.default_ps_config()
+    two_plat.trophies = [
+        rc.PsTrophyDef{trophy_id: 0, grade: rc.TROPHY_PLATINUM, name: "P1", is_progress: false, target_value: 0, hidden: false},
+        rc.PsTrophyDef{trophy_id: 1, grade: rc.TROPHY_PLATINUM, name: "P2", is_progress: false, target_value: 0, hidden: false}
+    ]
+    assert(ps_fails(&two_plat))
+
+    // 4. Nintendo Switch config roundtrip, .nmeta XML & Lotcheck audit
+    $swcfg := rc.default_switch_config()
+    swcfg.aoc_indices = [1, 2]
+    swjson := rc.encode_switch_config_json(&swcfg) or >>
+    swdec := rc.decode_switch_config_json(&swjson) or >>
+    assert(swdec.application_id_hex == "0100abcd12340000" && swdec.aoc_indices.len == 2)
+    nmeta := rc.generate_switch_nmeta_xml(&swdec) or >>
+    assert(strings.contains(&nmeta, "<NintendoSdkMeta>"))
+    assert(strings.contains(&nmeta, "<ApplicationId>0x0100abcd12340000</ApplicationId>"))
+    assert(strings.contains(&nmeta, "<UserAccountSaveDataSize>0x2000000</UserAccountSaveDataSize>"))
+    assert(rc.audit_switch_certification(&swdec, 90, 100).passed)
+    assert(!rc.audit_switch_certification(&swdec, 100, 100).passed)
+
+    $bad_sw_id := rc.default_switch_config()
+    bad_sw_id.application_id_hex = "0100BAD"
+    assert(switch_fails(&bad_sw_id))
+    $bad_journal := rc.default_switch_config()
+    bad_journal.save_journal_mb = 1
+    assert(switch_fails(&bad_journal))
+
+    // 5. Haptics (incl. HD Rumble 40..1280 Hz) & SaveKey bounds
+    $good_h := rc.default_haptic_command()
+    good_h.low_freq_motor = 0.6
+    good_h.hd_rumble_freq_low = 160.0
+    good_h.hd_rumble_freq_high = 320.0
+    good_h.right_adaptive = rc.AdaptiveTriggerEffect{mode: rc.TRIGGER_WEAPON, start_position: 2, end_position: 6, strength: 8, frequency: 0}
+    rc.validate_haptic_command(&good_h) or >>
+
+    $bad_h := rc.default_haptic_command()
+    bad_h.high_freq_motor = 2.0
+    assert(haptics_fails(&bad_h))
+    $bad_hd := rc.default_haptic_command()
+    bad_hd.hd_rumble_freq_low = 10.0
+    assert(haptics_fails(&bad_hd))
+    assert(save_key_fails(&"../bad", &"slot0.sav"))
+
+    println("PASS: console_data_checks")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

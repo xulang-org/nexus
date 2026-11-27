@@ -1,0 +1,595 @@
+@"github.com/xulang-org/nexus/ecs"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const COMP_TRANSFORM = 1
+pub const COMP_VELOCITY = 2
+pub const COMP_BOUNDS = 4
+pub const COMP_HEALTH = 8
+pub const COMP_PARTICLE = 16
+pub const COMP_AUDIO = 32
+pub const COMP_ALL_MASK = 63
+
+pub const CHUNK_CAPACITY = 256
+pub const MAX_ENTITIES = 65536
+
+pub struct EntityHandle {
+    pub id int
+    pub generation int
+}
+
+pub struct TransformCol {
+    pub positions []fm.Vec3
+    pub scales []fm.Vec3
+    pub world_mats []fm.Mat4
+}
+
+pub struct VelocityCol {
+    pub lin []fm.Vec3
+    pub ang []fm.Vec3
+}
+
+pub struct BoundsCol {
+    pub local []fm.Aabb3
+    pub world []fm.Aabb3
+}
+
+pub struct HealthCol {
+    pub hp []f64
+    pub max_hp []f64
+    pub regen []f64
+    pub alive []bool
+}
+
+pub struct ParticleCol {
+    pub age []f64
+    pub lifetime []f64
+    pub damping []f64
+    pub alive []bool
+}
+
+pub struct AudioCol {
+    pub max_dist []f64
+    pub gain []f64
+    pub attenuated []f64
+}
+
+pub struct ChunkMeta {
+    pub mask int
+    pub count int
+    pub entity_ids []int
+}
+
+pub struct EcsChunk {
+    pub meta chan ChunkMeta
+    pub transforms chan TransformCol
+    pub velocities chan VelocityCol
+    pub bounds chan BoundsCol
+    pub healths chan HealthCol
+    pub particles chan ParticleCol
+    pub audios chan AudioCol
+}
+
+pub struct EcsArchetype {
+    pub mask int
+    pub chunks []EcsChunk
+    pub entity_count int
+}
+
+struct EntitySlot {
+    alive bool
+    generation int
+    archetype_idx int
+    chunk_idx int
+    row int
+}
+
+pub struct EcsWorld {
+    archetypes []EcsArchetype
+    mask_to_arch map[int]int
+    slots []EntitySlot
+    free_ids []int
+    live_count int
+}
+
+pub fn empty_transform_col() TransformCol {
+    << TransformCol{positions: []fm.Vec3{}, scales: []fm.Vec3{}, world_mats: []fm.Mat4{}}
+}
+
+pub fn empty_velocity_col() VelocityCol {
+    << VelocityCol{lin: []fm.Vec3{}, ang: []fm.Vec3{}}
+}
+
+pub fn empty_bounds_col() BoundsCol {
+    << BoundsCol{local: []fm.Aabb3{}, world: []fm.Aabb3{}}
+}
+
+pub fn empty_health_col() HealthCol {
+    << HealthCol{hp: []f64{}, max_hp: []f64{}, regen: []f64{}, alive: []bool{}}
+}
+
+pub fn empty_particle_col() ParticleCol {
+    << ParticleCol{age: []f64{}, lifetime: []f64{}, damping: []f64{}, alive: []bool{}}
+}
+
+pub fn empty_audio_col() AudioCol {
+    << AudioCol{max_dist: []f64{}, gain: []f64{}, attenuated: []f64{}}
+}
+
+fn new_chunk(mask int) EcsChunk {
+    m_ch := chan ChunkMeta{cap: 1}
+    m_ch <- ChunkMeta{mask: mask, count: 0, entity_ids: []int{}}
+
+    t_ch := chan TransformCol{cap: 1}
+    t_ch <- empty_transform_col()
+
+    v_ch := chan VelocityCol{cap: 1}
+    v_ch <- empty_velocity_col()
+
+    b_ch := chan BoundsCol{cap: 1}
+    b_ch <- empty_bounds_col()
+
+    h_ch := chan HealthCol{cap: 1}
+    h_ch <- empty_health_col()
+
+    p_ch := chan ParticleCol{cap: 1}
+    p_ch <- empty_particle_col()
+
+    a_ch := chan AudioCol{cap: 1}
+    a_ch <- empty_audio_col()
+
+    << EcsChunk{
+        meta: m_ch,
+        transforms: t_ch,
+        velocities: v_ch,
+        bounds: b_ch,
+        healths: h_ch,
+        particles: p_ch,
+        audios: a_ch
+    }
+}
+
+pub fn new_ecs_world() EcsWorld {
+    << EcsWorld{
+        archetypes: []EcsArchetype{},
+        mask_to_arch: map[int]int{},
+        slots: []EntitySlot{},
+        free_ids: []int{},
+        live_count: 0
+    }
+}
+
+fn (world $&EcsWorld) ensure_archetype(mask int) int {
+    if mask <= 0 || mask > COMP_ALL_MASK {
+        >> errors.new("nexus ecs: invalid component mask")
+    }
+    if world.mask_to_arch.has(mask) {
+        << world.mask_to_arch[mask]
+    }
+    idx := world.archetypes.len
+    world.archetypes.push(EcsArchetype{mask: mask, chunks: []EcsChunk{}, entity_count: 0})
+    world.mask_to_arch[mask] = idx
+    << idx
+}
+
+fn unit_box() fm.Aabb3 {
+    << fm.Aabb3{minimum: fm.vec3(-0.5, -0.5, -0.5), maximum: fm.vec3(0.5, 0.5, 0.5)}
+}
+
+fn append_default_row(ch &EcsChunk, mask int, eid int) int {
+    $meta := <-ch.meta
+    row := meta.count
+    meta.entity_ids.push(eid)
+    meta.count = row + 1
+    ch.meta <- meta
+
+    if (mask & COMP_TRANSFORM) != 0 {
+        $tc := <-ch.transforms
+        tc.positions.push(fm.vec3(0.0, 0.0, 0.0))
+        tc.scales.push(fm.vec3(1.0, 1.0, 1.0))
+        tc.world_mats.push(fm.identity_3d())
+        ch.transforms <- tc
+    }
+    if (mask & COMP_VELOCITY) != 0 {
+        $vc := <-ch.velocities
+        vc.lin.push(fm.vec3(0.0, 0.0, 0.0))
+        vc.ang.push(fm.vec3(0.0, 0.0, 0.0))
+        ch.velocities <- vc
+    }
+    if (mask & COMP_BOUNDS) != 0 {
+        $bc := <-ch.bounds
+        ub := unit_box()
+        bc.local.push(ub)
+        bc.world.push(ub)
+        ch.bounds <- bc
+    }
+    if (mask & COMP_HEALTH) != 0 {
+        $hc := <-ch.healths
+        hc.hp.push(100.0)
+        hc.max_hp.push(100.0)
+        hc.regen.push(0.0)
+        hc.alive.push(true)
+        ch.healths <- hc
+    }
+    if (mask & COMP_PARTICLE) != 0 {
+        $pc := <-ch.particles
+        pc.age.push(0.0)
+        pc.lifetime.push(1.0)
+        pc.damping.push(0.0)
+        pc.alive.push(true)
+        ch.particles <- pc
+    }
+    if (mask & COMP_AUDIO) != 0 {
+        $ac := <-ch.audios
+        ac.max_dist.push(10.0)
+        ac.gain.push(1.0)
+        ac.attenuated.push(1.0)
+        ch.audios <- ac
+    }
+    << row
+}
+
+pub fn (world $&EcsWorld) spawn(mask int) EntityHandle {
+    if world.live_count >= MAX_ENTITIES {
+        >> errors.new("nexus ecs: entity limit exceeded")
+    }
+    ai := world.ensure_archetype(mask) or >>
+    arch := $&world.archetypes[ai]
+    $ci := arch.chunks.len - 1
+    $need_new := ci < 0
+    if !need_new {
+        chk := &arch.chunks[ci]
+        $meta := <-chk.meta
+        full := meta.count >= CHUNK_CAPACITY
+        chk.meta <- meta
+        if full { need_new = true }
+    }
+    if need_new {
+        arch.chunks.push(new_chunk(mask))
+        ci = arch.chunks.len - 1
+    }
+
+    $eid := 0
+    $gen := 1
+    if world.free_ids.len > 0 {
+        last := world.free_ids.len - 1
+        eid = world.free_ids[last]
+        world.free_ids = truncate_ints(&world.free_ids, last)
+        gen = world.slots[eid].generation
+    } else {
+        eid = world.slots.len
+        world.slots.push(EntitySlot{alive: false, generation: 1, archetype_idx: -1, chunk_idx: -1, row: -1})
+    }
+
+    chk := &arch.chunks[ci]
+    row := append_default_row(chk, mask, eid)
+    arch.entity_count += 1
+    world.live_count += 1
+    world.slots[eid] = EntitySlot{alive: true, generation: gen, archetype_idx: ai, chunk_idx: ci, row: row}
+    << EntityHandle{id: eid, generation: gen}
+}
+
+pub fn (world $&EcsWorld) spawn_batch(mask int, count int) []EntityHandle {
+    if count < 0 || world.live_count + count > MAX_ENTITIES {
+        >> errors.new("nexus ecs: invalid batch count or exceeds capacity")
+    }
+    $out := []EntityHandle{}
+    for _ in 0:count {
+        out.push(world.spawn(mask) or >>)
+    }
+    << out
+}
+
+fn truncate_ints(src &[]int, new_len int) []int {
+    $out := []int{}
+    for i in 0:new_len { out.push(src[i]) }
+    << out
+}
+
+fn swap_pop_vec3(arr &[]fm.Vec3, row int, last int) []fm.Vec3 {
+    $next := []fm.Vec3{}
+    for i in 0:last {
+        if i == row { next.push(arr[last]) } else { next.push(arr[i]) }
+    }
+    << next
+}
+
+fn swap_pop_mat4(arr &[]fm.Mat4, row int, last int) []fm.Mat4 {
+    $next := []fm.Mat4{}
+    for i in 0:last {
+        if i == row { next.push(arr[last]) } else { next.push(arr[i]) }
+    }
+    << next
+}
+
+fn swap_pop_aabb(arr &[]fm.Aabb3, row int, last int) []fm.Aabb3 {
+    $next := []fm.Aabb3{}
+    for i in 0:last {
+        if i == row { next.push(arr[last]) } else { next.push(arr[i]) }
+    }
+    << next
+}
+
+fn swap_pop_f64(arr &[]f64, row int, last int) []f64 {
+    $next := []f64{}
+    for i in 0:last {
+        if i == row { next.push(arr[last]) } else { next.push(arr[i]) }
+    }
+    << next
+}
+
+fn swap_pop_bool(arr &[]bool, row int, last int) []bool {
+    $next := []bool{}
+    for i in 0:last {
+        if i == row { next.push(arr[last]) } else { next.push(arr[i]) }
+    }
+    << next
+}
+
+fn (world &EcsWorld) resolve_slot(h EntityHandle) EntitySlot {
+    if h.id < 0 || h.id >= world.slots.len { >> errors.new("nexus ecs: invalid entity id") }
+    s := world.slots[h.id]
+    if !s.alive || s.generation != h.generation { >> errors.new("nexus ecs: stale or dead entity handle") }
+    << s
+}
+
+pub fn (world &EcsWorld) is_alive(h EntityHandle) bool {
+    if h.id < 0 || h.id >= world.slots.len { << false }
+    s := world.slots[h.id]
+    << s.alive && s.generation == h.generation
+}
+
+pub fn (world $&EcsWorld) despawn(h EntityHandle) int {
+    s := world.resolve_slot(h) or >>
+    sai := s.archetype_idx
+    sci := s.chunk_idx
+    arch := $&world.archetypes[sai]
+    mask := arch.mask
+    chk := &arch.chunks[sci]
+
+    $meta := <-chk.meta
+    last := meta.count - 1
+    $moved_eid := -1
+    if s.row < last {
+        moved_eid = meta.entity_ids[last]
+        meta.entity_ids[s.row] = moved_eid
+    }
+    meta.entity_ids = truncate_ints(&meta.entity_ids, last)
+    meta.count = last
+    chk.meta <- meta
+
+    if (mask & COMP_TRANSFORM) != 0 {
+        $tc := <-chk.transforms
+        tc.positions = swap_pop_vec3(&tc.positions, s.row, last)
+        tc.scales = swap_pop_vec3(&tc.scales, s.row, last)
+        tc.world_mats = swap_pop_mat4(&tc.world_mats, s.row, last)
+        chk.transforms <- tc
+    }
+    if (mask & COMP_VELOCITY) != 0 {
+        $vc := <-chk.velocities
+        vc.lin = swap_pop_vec3(&vc.lin, s.row, last)
+        vc.ang = swap_pop_vec3(&vc.ang, s.row, last)
+        chk.velocities <- vc
+    }
+    if (mask & COMP_BOUNDS) != 0 {
+        $bc := <-chk.bounds
+        bc.local = swap_pop_aabb(&bc.local, s.row, last)
+        bc.world = swap_pop_aabb(&bc.world, s.row, last)
+        chk.bounds <- bc
+    }
+    if (mask & COMP_HEALTH) != 0 {
+        $hc := <-chk.healths
+        hc.hp = swap_pop_f64(&hc.hp, s.row, last)
+        hc.max_hp = swap_pop_f64(&hc.max_hp, s.row, last)
+        hc.regen = swap_pop_f64(&hc.regen, s.row, last)
+        hc.alive = swap_pop_bool(&hc.alive, s.row, last)
+        chk.healths <- hc
+    }
+    if (mask & COMP_PARTICLE) != 0 {
+        $pc := <-chk.particles
+        pc.age = swap_pop_f64(&pc.age, s.row, last)
+        pc.lifetime = swap_pop_f64(&pc.lifetime, s.row, last)
+        pc.damping = swap_pop_f64(&pc.damping, s.row, last)
+        pc.alive = swap_pop_bool(&pc.alive, s.row, last)
+        chk.particles <- pc
+    }
+    if (mask & COMP_AUDIO) != 0 {
+        $ac := <-chk.audios
+        ac.max_dist = swap_pop_f64(&ac.max_dist, s.row, last)
+        ac.gain = swap_pop_f64(&ac.gain, s.row, last)
+        ac.attenuated = swap_pop_f64(&ac.attenuated, s.row, last)
+        chk.audios <- ac
+    }
+
+    if moved_eid >= 0 {
+        world.slots[moved_eid].row = s.row
+    }
+    world.slots[h.id] = EntitySlot{alive: false, generation: s.generation + 1, archetype_idx: -1, chunk_idx: -1, row: -1}
+    world.free_ids.push(h.id)
+    arch.entity_count -= 1
+    world.live_count -= 1
+    << 0
+}
+
+pub fn (world $&EcsWorld) set_transform(h EntityHandle, pos fm.Vec3, scale fm.Vec3) int {
+    if !pos.is_finite() || !scale.is_finite() { >> errors.new("nexus ecs: non-finite transform") }
+    s := world.resolve_slot(h) or >>
+    sai := s.archetype_idx
+    sci := s.chunk_idx
+    arch := &world.archetypes[sai]
+    if (arch.mask & COMP_TRANSFORM) == 0 { >> errors.new("nexus ecs: entity lacks COMP_TRANSFORM") }
+    chk := &arch.chunks[sci]
+    $tc := <-chk.transforms
+    tc.positions[s.row] = pos
+    tc.scales[s.row] = scale
+    tc.world_mats[s.row] = fm.Mat4{
+        c0: fm.vec4(scale.x, 0.0, 0.0, 0.0),
+        c1: fm.vec4(0.0, scale.y, 0.0, 0.0),
+        c2: fm.vec4(0.0, 0.0, scale.z, 0.0),
+        c3: fm.vec4(pos.x, pos.y, pos.z, 1.0)
+    }
+    chk.transforms <- tc
+    << 0
+}
+
+pub fn (world &EcsWorld) get_position(h EntityHandle) fm.Vec3 {
+    s := world.resolve_slot(h) or >>
+    sai := s.archetype_idx
+    sci := s.chunk_idx
+    arch := &world.archetypes[sai]
+    if (arch.mask & COMP_TRANSFORM) == 0 { >> errors.new("nexus ecs: entity lacks COMP_TRANSFORM") }
+    chk := &arch.chunks[sci]
+    tc := <-chk.transforms
+    p := tc.positions[s.row]
+    chk.transforms <- tc
+    << p
+}
+
+pub fn (world $&EcsWorld) set_velocity(h EntityHandle, lin fm.Vec3) int {
+    if !lin.is_finite() { >> errors.new("nexus ecs: non-finite velocity") }
+    s := world.resolve_slot(h) or >>
+    sai := s.archetype_idx
+    sci := s.chunk_idx
+    arch := &world.archetypes[sai]
+    if (arch.mask & COMP_VELOCITY) == 0 { >> errors.new("nexus ecs: entity lacks COMP_VELOCITY") }
+    chk := &arch.chunks[sci]
+    $vc := <-chk.velocities
+    vc.lin[s.row] = lin
+    chk.velocities <- vc
+    << 0
+}
+
+pub fn (world $&EcsWorld) set_bounds(h EntityHandle, local fm.Aabb3) int {
+    if !local.minimum.is_finite() || !local.maximum.is_finite() { >> errors.new("nexus ecs: non-finite bounds") }
+    s := world.resolve_slot(h) or >>
+    sai := s.archetype_idx
+    sci := s.chunk_idx
+    arch := &world.archetypes[sai]
+    if (arch.mask & COMP_BOUNDS) == 0 { >> errors.new("nexus ecs: entity lacks COMP_BOUNDS") }
+    chk := &arch.chunks[sci]
+    $bc := <-chk.bounds
+    bc.local[s.row] = local
+    bc.world[s.row] = local
+    chk.bounds <- bc
+    << 0
+}
+
+pub fn (world &EcsWorld) get_world_bounds(h EntityHandle) fm.Aabb3 {
+    s := world.resolve_slot(h) or >>
+    sai := s.archetype_idx
+    sci := s.chunk_idx
+    arch := &world.archetypes[sai]
+    if (arch.mask & COMP_BOUNDS) == 0 { >> errors.new("nexus ecs: entity lacks COMP_BOUNDS") }
+    chk := &arch.chunks[sci]
+    bc := <-chk.bounds
+    b := bc.world[s.row]
+    chk.bounds <- bc
+    << b
+}
+
+pub fn (world $&EcsWorld) set_health(h EntityHandle, hp f64, max_hp f64, regen f64) int {
+    if !fm.finite(hp) || !fm.finite(max_hp) || !fm.finite(regen) || max_hp <= 0.0 {
+        >> errors.new("nexus ecs: invalid health values")
+    }
+    s := world.resolve_slot(h) or >>
+    sai := s.archetype_idx
+    sci := s.chunk_idx
+    arch := &world.archetypes[sai]
+    if (arch.mask & COMP_HEALTH) == 0 { >> errors.new("nexus ecs: entity lacks COMP_HEALTH") }
+    chk := &arch.chunks[sci]
+    $hc := <-chk.healths
+    hc.hp[s.row] = hp
+    hc.max_hp[s.row] = max_hp
+    hc.regen[s.row] = regen
+    hc.alive[s.row] = hp > 0.0
+    chk.healths <- hc
+    << 0
+}
+
+pub fn (world &EcsWorld) get_health(h EntityHandle) f64 {
+    s := world.resolve_slot(h) or >>
+    sai := s.archetype_idx
+    sci := s.chunk_idx
+    arch := &world.archetypes[sai]
+    if (arch.mask & COMP_HEALTH) == 0 { >> errors.new("nexus ecs: entity lacks COMP_HEALTH") }
+    chk := &arch.chunks[sci]
+    hc := <-chk.healths
+    v := hc.hp[s.row]
+    chk.healths <- hc
+    << v
+}
+
+pub fn (world $&EcsWorld) set_particle(h EntityHandle, age f64, lifetime f64, damping f64) int {
+    if !fm.finite(age) || !fm.finite(lifetime) || !fm.finite(damping) || lifetime <= 0.0 {
+        >> errors.new("nexus ecs: invalid particle parameters")
+    }
+    s := world.resolve_slot(h) or >>
+    sai := s.archetype_idx
+    sci := s.chunk_idx
+    arch := &world.archetypes[sai]
+    if (arch.mask & COMP_PARTICLE) == 0 { >> errors.new("nexus ecs: entity lacks COMP_PARTICLE") }
+    chk := &arch.chunks[sci]
+    $pc := <-chk.particles
+    pc.age[s.row] = age
+    pc.lifetime[s.row] = lifetime
+    pc.damping[s.row] = damping
+    pc.alive[s.row] = age < lifetime
+    chk.particles <- pc
+    << 0
+}
+
+pub fn (world &EcsWorld) get_particle_age(h EntityHandle) f64 {
+    s := world.resolve_slot(h) or >>
+    sai := s.archetype_idx
+    sci := s.chunk_idx
+    arch := &world.archetypes[sai]
+    if (arch.mask & COMP_PARTICLE) == 0 { >> errors.new("nexus ecs: entity lacks COMP_PARTICLE") }
+    chk := &arch.chunks[sci]
+    pc := <-chk.particles
+    v := pc.age[s.row]
+    chk.particles <- pc
+    << v
+}
+
+pub fn (world $&EcsWorld) set_audio(h EntityHandle, max_dist f64, gain f64) int {
+    if !fm.finite(max_dist) || max_dist <= 0.0 || !fm.finite(gain) || gain < 0.0 {
+        >> errors.new("nexus ecs: invalid audio emitter values")
+    }
+    s := world.resolve_slot(h) or >>
+    sai := s.archetype_idx
+    sci := s.chunk_idx
+    arch := &world.archetypes[sai]
+    if (arch.mask & COMP_AUDIO) == 0 { >> errors.new("nexus ecs: entity lacks COMP_AUDIO") }
+    chk := &arch.chunks[sci]
+    $ac := <-chk.audios
+    ac.max_dist[s.row] = max_dist
+    ac.gain[s.row] = gain
+    ac.attenuated[s.row] = gain
+    chk.audios <- ac
+    << 0
+}
+
+pub fn (world &EcsWorld) get_audio_attenuated(h EntityHandle) f64 {
+    s := world.resolve_slot(h) or >>
+    sai := s.archetype_idx
+    sci := s.chunk_idx
+    arch := &world.archetypes[sai]
+    if (arch.mask & COMP_AUDIO) == 0 { >> errors.new("nexus ecs: entity lacks COMP_AUDIO") }
+    chk := &arch.chunks[sci]
+    ac := <-chk.audios
+    v := ac.attenuated[s.row]
+    chk.audios <- ac
+    << v
+}
+
+pub fn (world &EcsWorld) entity_count() int { << world.live_count }
+pub fn (world &EcsWorld) archetype_count() int { << world.archetypes.len }
+pub fn (world &EcsWorld) chunk_count() int {
+    $total := 0
+    for i in 0:world.archetypes.len {
+        total += world.archetypes[i].chunks.len
+    }
+    << total
+}

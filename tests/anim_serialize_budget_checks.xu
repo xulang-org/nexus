@@ -1,0 +1,211 @@
+@main
+
+anim #"github.com/xulang-org/nexus/animation/skeletal"
+gltf #"github.com/xulang-org/nexus/formats/gltf"
+timing #"github.com/xulang-org/nexus/timing"
+#math
+#strings
+
+fn push_u16_b(buf $&[]int, v int) {
+    buf.push(v & 255)
+    buf.push((v >> 8) & 255)
+}
+
+fn push_u32_b(buf $&[]int, v int) {
+    buf.push(v & 255)
+    buf.push((v >> 8) & 255)
+    buf.push((v >> 16) & 255)
+    buf.push((v >> 24) & 255)
+}
+
+fn push_f32_b(buf $&[]int, v f64) {
+    push_u32_b(buf, math.float32_bits(v))
+}
+
+fn push_ascii_b(buf $&[]int, s string) {
+    for i in 0:s.len { buf.push(s[i] & 255) }
+}
+
+fn pad4_zeros(buf $&[]int) {
+    while buf.len % 4 != 0 { buf.push(0) }
+}
+
+fn push_ibm(buf $&[]int, tx f64, ty f64, tz f64) {
+    vals := [1.0, 0.0, 0.0, 0.0,
+             0.0, 1.0, 0.0, 0.0,
+             0.0, 0.0, 1.0, 0.0,
+             tx, ty, tz, 1.0]
+    for v in vals { push_f32_b(buf, v) }
+}
+
+fn build_mini_char_glb() string {
+    $bin := []int{}
+    for idx in [0, 1, 2] { push_u16_b($&bin, idx) }
+    pad4_zeros($&bin)
+    pts := [0.0, 0.0, 0.0,  1.0, 0.0, 0.0,  0.0, 1.0, 0.0]
+    for v in pts { push_f32_b($&bin, v) }
+    // IBM for 2 joints
+    push_ibm($&bin, 0.0, -1.0, 0.0)
+    push_ibm($&bin, 0.0, -2.0, 0.0)
+    // times 1.0s [0, 1]
+    push_f32_b($&bin, 0.0)
+    push_f32_b($&bin, 1.0)
+    // clip 0 rot (Spine): identity
+    for v in [0.0, 0.0, 0.0, 1.0,  0.0, 0.0, 0.0, 1.0] { push_f32_b($&bin, v) }
+    // clip 1 Hips trans: (0,1,0) -> (0,1,2)
+    for v in [0.0, 1.0, 0.0,  0.0, 1.0, 2.0] { push_f32_b($&bin, v) }
+    // clip 1 Spine rot Y
+    for v in [0.0, 0.0, 0.0, 1.0,  0.0, math.sin(0.25), 0.0, math.cos(0.25)] { push_f32_b($&bin, v) }
+    // clip 2 Spine rot X
+    for v in [0.0, 0.0, 0.0, 1.0,  math.sin(0.35), 0.0, 0.0, math.cos(0.35)] { push_f32_b($&bin, v) }
+    pad4_zeros($&bin)
+
+    js := "{\"asset\":{\"version\":\"2.0\"}," +
+        "\"buffers\":[{\"byteLength\":" + str(bin.len) + "}]," +
+        "\"bufferViews\":[" +
+        "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":8,\"target\":34963}," +
+        "{\"buffer\":0,\"byteOffset\":8,\"byteLength\":36,\"target\":34962}," +
+        "{\"buffer\":0,\"byteOffset\":44,\"byteLength\":128}," +
+        "{\"buffer\":0,\"byteOffset\":172,\"byteLength\":8}," +
+        "{\"buffer\":0,\"byteOffset\":180,\"byteLength\":32}," +
+        "{\"buffer\":0,\"byteOffset\":212,\"byteLength\":24}," +
+        "{\"buffer\":0,\"byteOffset\":236,\"byteLength\":32}," +
+        "{\"buffer\":0,\"byteOffset\":268,\"byteLength\":32}]," +
+        "\"accessors\":[" +
+        "{\"bufferView\":0,\"componentType\":5123,\"count\":3,\"type\":\"SCALAR\"}," +
+        "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\",\"min\":[0,0,0],\"max\":[1,1,0]}," +
+        "{\"bufferView\":2,\"componentType\":5126,\"count\":2,\"type\":\"MAT4\"}," +
+        "{\"bufferView\":3,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\",\"min\":[0],\"max\":[1]}," +
+        "{\"bufferView\":4,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}," +
+        "{\"bufferView\":5,\"componentType\":5126,\"count\":2,\"type\":\"VEC3\"}," +
+        "{\"bufferView\":6,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}," +
+        "{\"bufferView\":7,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}]," +
+        "\"meshes\":[{\"primitives\":[{\"indices\":0,\"attributes\":{\"POSITION\":1}}]}]," +
+        "\"nodes\":[" +
+        "{\"name\":\"Root\",\"children\":[1]}," +
+        "{\"name\":\"Hips\",\"translation\":[0,1,0],\"children\":[2]}," +
+        "{\"name\":\"Spine\",\"translation\":[0,1,0]}]," +
+        "\"scenes\":[{\"nodes\":[0]}],\"scene\":0," +
+        "\"skins\":[{\"joints\":[1,2],\"inverseBindMatrices\":2}]," +
+        "\"animations\":[" +
+        "{\"name\":\"idle\",\"samplers\":[{\"input\":3,\"output\":4,\"interpolation\":\"LINEAR\"}],\"channels\":[{\"sampler\":0,\"target\":{\"node\":2,\"path\":\"rotation\"}}]}," +
+        "{\"name\":\"walk\",\"samplers\":[{\"input\":3,\"output\":5,\"interpolation\":\"LINEAR\"},{\"input\":3,\"output\":6,\"interpolation\":\"LINEAR\"}],\"channels\":[{\"sampler\":0,\"target\":{\"node\":1,\"path\":\"translation\"}},{\"sampler\":1,\"target\":{\"node\":2,\"path\":\"rotation\"}}]}," +
+        "{\"name\":\"run\",\"samplers\":[{\"input\":3,\"output\":7,\"interpolation\":\"LINEAR\"}],\"channels\":[{\"sampler\":0,\"target\":{\"node\":2,\"path\":\"rotation\"}}]}" +
+        "]}"
+
+    $js_bytes := []int{}
+    push_ascii_b($&js_bytes, js)
+    while js_bytes.len % 4 != 0 { js_bytes.push(32) }
+    total := 12 + 8 + js_bytes.len + 8 + bin.len
+    $glb := []int{}
+    push_u32_b($&glb, 1179937895)
+    push_u32_b($&glb, 2)
+    push_u32_b($&glb, total)
+    push_u32_b($&glb, js_bytes.len)
+    push_u32_b($&glb, 1313821514)
+    for b in js_bytes { glb.push(b) }
+    push_u32_b($&glb, bin.len)
+    push_u32_b($&glb, 5130562)
+    for b in bin { glb.push(b) }
+    << string_from_bytes(glb)
+}
+
+fn asm_decode_fails(raw string) bool {
+    _ := anim.decode_state_machine_json(&raw) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn run() int {
+    glb_raw := build_mini_char_glb()
+    asset := gltf.decode_glb_geometry(&glb_raw) or >>
+
+    // 1. ASM Serialization roundtrip parity (Clip + BlendSpace1D + BlendSpace2D + transitions + events + RootMotion)
+    $sm := anim.new_state_machine()
+    s_idle := sm.add_clip_state("idle", 0, true, 1.0) or >>
+    $bs1 := anim.new_blend_space_1d()
+    bs1.add_sample(0, 0.0, 1.0) or >>
+    bs1.add_sample(1, 2.0, 1.0) or >>
+    s_walk := sm.add_blend_1d_state("locomotion", bs1, "speed", true, 1.0) or >>
+
+    $bs2 := anim.new_blend_space_2d()
+    bs2.add_sample(0, 0.0, 0.0, 1.0) or >>
+    bs2.add_sample(1, 0.0, 1.0, 1.0) or >>
+    bs2.add_sample(2, 1.0, 0.0, 1.0) or >>
+    s_aim := sm.add_blend_2d_state("aim_move", bs2, "strafe", "forward", true, 1.0) or >>
+
+    c_move := [anim.TransitionCondition{kind: anim.COND_GT, param: "speed", threshold: 0.2}]
+    c_aim := [anim.TransitionCondition{kind: anim.COND_TRIGGER, param: "aim", threshold: 0.0}]
+    sm.add_transition(s_idle, s_walk, 0.0, false, 0.0, &c_move) or >>
+    sm.add_transition(s_walk, s_aim, 0.2, false, 0.0, &c_aim) or >>
+    sm.add_event(0, 0.2, "idle_breathe", 7) or >>
+    sm.enable_root_motion(1, true, false) or >>
+
+    raw_json := anim.encode_state_machine_json(&sm) or >>
+    $sm_dec := anim.decode_state_machine_json(&raw_json) or >>
+    assert(asm_decode_fails("{\"format\":\"wrong\",\"version\":1,\"states\":[]}"))
+
+    sm.set_float("speed", 1.2)
+    sm.set_float("strafe", 0.5)
+    sm.set_float("forward", 0.5)
+    sm_dec.set_float("speed", 1.2)
+    sm_dec.set_float("strafe", 0.5)
+    sm_dec.set_float("forward", 0.5)
+
+    r_a0 := sm.advance(&asset, 0.25) or >>
+    r_b0 := sm_dec.advance(&asset, 0.25) or >>
+    assert(r_a0.active_state == r_b0.active_state && r_a0.active_state == s_walk)
+    assert(math.abs(r_a0.pose[2].rotation.y - r_b0.pose[2].rotation.y) < 1e-6)
+
+    sm.set_trigger("aim")
+    sm_dec.set_trigger("aim")
+    r_a1 := sm.advance(&asset, 0.1) or >>
+    r_b1 := sm_dec.advance(&asset, 0.1) or >>
+    assert(r_a1.active_state == s_aim && r_b1.active_state == s_aim && r_a1.blending == r_b1.blending)
+    assert(math.abs(r_a1.pose[2].rotation.x - r_b1.pose[2].rotation.x) < 1e-6)
+
+    // 2. Platform Performance Budget & Regression Gates
+    $prof := timing.new_frame_profiler()
+    for _ in 0:15 {
+        prof.record_frame_ms(8.0)
+        prof.record_scope_ms("physics", 2.0)
+    }
+    $desk := timing.budget_desktop_60fps()
+    desk.scope_budgets = [timing.ScopeBudget{name: "physics", max_avg_ms: 4.0, max_peak_ms: 6.0}]
+    rep_ok := timing.evaluate_perf_gate(&prof, &desk) or >>
+    assert(rep_ok.passed && rep_ok.violations.len == 0)
+
+    _ := timing.budget_console_120fps()
+    _ := timing.budget_switch_handheld_30fps()
+    _ := timing.budget_mobile_60fps()
+
+    // Baseline check (within 10% passes, > 10% fails regression gate)
+    baseline := prof.summary()
+    $prof_ok_reg := timing.new_frame_profiler()
+    for _ in 0:12 { prof_ok_reg.record_frame_ms(8.4) }
+    reg_ok := timing.evaluate_perf_regression(&prof_ok_reg, &baseline, &desk) or >>
+    assert(reg_ok.passed)
+
+    $prof_slow := timing.new_frame_profiler()
+    for _ in 0:12 {
+        prof_slow.record_frame_ms(18.0)
+        prof_slow.record_scope_ms("physics", 9.0)
+    }
+    reg_fail := timing.evaluate_perf_regression(&prof_slow, &baseline, &desk) or >>
+    assert(!reg_fail.passed && reg_fail.violations.len >= 4)
+    rep_js := timing.encode_gate_report_json(&reg_fail)
+    assert(strings.contains(&rep_js, "\"passed\": false") && strings.contains(&rep_js, "regression_p95_ms"))
+
+    println("PASS: anim_serialize_budget_checks")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

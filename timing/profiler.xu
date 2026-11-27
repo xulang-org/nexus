@@ -1,0 +1,272 @@
+@"github.com/xulang-org/nexus/timing"
+
+#math
+#strconv
+#strings
+#time
+
+pub const PROFILER_WINDOW = 120
+
+pub struct ScopeStats {
+    pub name string
+    pub last_ms f64
+    pub avg_ms f64
+    pub max_ms f64
+    pub samples int
+}
+
+pub struct ProfilerSummary {
+    pub frame_count int
+    pub fps f64
+    pub avg_ms f64
+    pub min_ms f64
+    pub max_ms f64
+    pub p50_ms f64
+    pub p95_ms f64
+    pub p99_ms f64
+}
+
+// Rolling 120-frame timing profiler with nested CPU scopes, counters,
+// p50/p95/p99 percentile statistics, and JSON export.
+pub struct FrameProfiler {
+    frame_ms []f64
+    write_idx int
+    sample_count int
+    total_frames int
+    frame_start_ns int
+    scope_names []string
+    scope_starts []int
+    scopes []ScopeStats
+    counter_names []string
+    counter_values []int
+}
+
+pub fn new_frame_profiler() FrameProfiler {
+    $buf := []f64{}
+    for _i in 0:PROFILER_WINDOW {
+        buf.push(0.0)
+    }
+    << FrameProfiler{
+        frame_ms: buf,
+        write_idx: 0,
+        sample_count: 0,
+        total_frames: 0,
+        frame_start_ns: 0,
+        scope_names: []string{},
+        scope_starts: []int{},
+        scopes: []ScopeStats{},
+        counter_names: []string{},
+        counter_values: []int{}
+    }
+}
+
+pub fn (p $&FrameProfiler) begin_frame() {
+    p.frame_start_ns = time.now()
+    p.scope_names = []string{}
+    p.scope_starts = []int{}
+}
+
+pub fn (p $&FrameProfiler) record_frame_ms(ms f64) {
+    clean := math.max(0.0, ms)
+    p.frame_ms[p.write_idx] = clean
+    p.write_idx = (p.write_idx + 1) % PROFILER_WINDOW
+    if p.sample_count < PROFILER_WINDOW {
+        p.sample_count = p.sample_count + 1
+    }
+    p.total_frames = p.total_frames + 1
+}
+
+pub fn (p $&FrameProfiler) end_frame() f64 {
+    if p.frame_start_ns <= 0 {
+        p.record_frame_ms(0.0)
+        << 0.0
+    }
+    elapsed_ns := time.now() - p.frame_start_ns
+    ms := math.max(0.0, f64(elapsed_ns) / 1000000.0)
+    p.record_frame_ms(ms)
+    p.frame_start_ns = 0
+    << ms
+}
+
+pub fn (p $&FrameProfiler) record_scope_ms(name string, ms f64) {
+    clean := math.max(0.0, ms)
+    for i in 0:p.scopes.len {
+        if p.scopes[i].name == name {
+            n := p.scopes[i].samples + 1
+            prev_avg := p.scopes[i].avg_ms
+            p.scopes[i].last_ms = clean
+            p.scopes[i].avg_ms = prev_avg + (clean - prev_avg) / f64(n)
+            p.scopes[i].max_ms = math.max(p.scopes[i].max_ms, clean)
+            p.scopes[i].samples = n
+            <<
+        }
+    }
+    p.scopes.push(ScopeStats{
+        name: name,
+        last_ms: clean,
+        avg_ms: clean,
+        max_ms: clean,
+        samples: 1
+    })
+}
+
+pub fn (p $&FrameProfiler) begin_scope(name string) {
+    p.scope_names.push(name)
+    p.scope_starts.push(time.now())
+}
+
+pub fn (p $&FrameProfiler) end_scope() f64 {
+    if p.scope_names.len == 0 { << 0.0 }
+    last := p.scope_names.len - 1
+    name := p.scope_names[last] + ""
+    start_ns := p.scope_starts[last]
+    $next_names := []string{}
+    $next_starts := []int{}
+    for i in 0:last {
+        next_names.push(p.scope_names[i] + "")
+        next_starts.push(p.scope_starts[i])
+    }
+    p.scope_names = next_names
+    p.scope_starts = next_starts
+    ms := math.max(0.0, f64(time.now() - start_ns) / 1000000.0)
+    p.record_scope_ms(name, ms)
+    << ms
+}
+
+pub fn (p $&FrameProfiler) set_counter(name string, value int) {
+    for i in 0:p.counter_names.len {
+        if p.counter_names[i] == name {
+            p.counter_values[i] = value
+            <<
+        }
+    }
+    p.counter_names.push(name)
+    p.counter_values.push(value)
+}
+
+pub fn (p $&FrameProfiler) add_counter(name string, delta int) {
+    for i in 0:p.counter_names.len {
+        if p.counter_names[i] == name {
+            p.counter_values[i] = p.counter_values[i] + delta
+            <<
+        }
+    }
+    p.counter_names.push(name)
+    p.counter_values.push(delta)
+}
+
+pub fn (p &FrameProfiler) counter(name string) int {
+    for i in 0:p.counter_names.len {
+        if p.counter_names[i] == name {
+            << p.counter_values[i]
+        }
+    }
+    << 0
+}
+
+pub fn (p &FrameProfiler) scope_stats(name string) ScopeStats {
+    for i in 0:p.scopes.len {
+        if p.scopes[i].name == name {
+            << p.scopes[i]
+        }
+    }
+    << ScopeStats{name: name, last_ms: 0.0, avg_ms: 0.0, max_ms: 0.0, samples: 0}
+}
+
+fn percentile_from_sorted(sorted &[]f64, q f64) f64 {
+    if sorted.len == 0 { << 0.0 }
+    if sorted.len == 1 { << sorted[0] }
+    $idx := int(math.ceil(q * f64(sorted.len))) - 1
+    if idx < 0 { idx = 0 }
+    if idx >= sorted.len { idx = sorted.len - 1 }
+    << sorted[idx]
+}
+
+pub fn (p &FrameProfiler) summary() ProfilerSummary {
+    if p.sample_count == 0 {
+        << ProfilerSummary{
+            frame_count: p.total_frames,
+            fps: 0.0,
+            avg_ms: 0.0,
+            min_ms: 0.0,
+            max_ms: 0.0,
+            p50_ms: 0.0,
+            p95_ms: 0.0,
+            p99_ms: 0.0
+        }
+    }
+    $vals := []f64{}
+    $sum := 0.0
+    for i in 0:p.sample_count {
+        v := p.frame_ms[i]
+        vals.push(v)
+        sum = sum + v
+    }
+    for i in 1:vals.len {
+        key := vals[i]
+        $j := i - 1
+        while j >= 0 && vals[j] > key {
+            vals[j + 1] = vals[j]
+            j = j - 1
+        }
+        vals[j + 1] = key
+    }
+    avg := sum / f64(p.sample_count)
+    $fps := 0.0
+    if avg > 1e-6 { fps = 1000.0 / avg }
+    << ProfilerSummary{
+        frame_count: p.total_frames,
+        fps: fps,
+        avg_ms: avg,
+        min_ms: vals[0],
+        max_ms: vals[vals.len - 1],
+        p50_ms: percentile_from_sorted(&vals, 0.50),
+        p95_ms: percentile_from_sorted(&vals, 0.95),
+        p99_ms: percentile_from_sorted(&vals, 0.99)
+    }
+}
+
+fn fmt_f64(v f64) string {
+    << strconv.format_float(v, 102, 2) or (err) { << "0.00" }
+}
+
+pub fn (p &FrameProfiler) summary_lines() []string {
+    s := p.summary()
+    $lines := [
+        "FPS " + fmt_f64(s.fps) + "  avg " + fmt_f64(s.avg_ms) + "ms  p50 " + fmt_f64(s.p50_ms) + "ms",
+        "p95 " + fmt_f64(s.p95_ms) + "ms  p99 " + fmt_f64(s.p99_ms) + "ms  max " + fmt_f64(s.max_ms) + "ms"
+    ]
+    for i in 0:p.scopes.len {
+        sc := p.scopes[i]
+        lines.push("scope " + sc.name + ": avg " + fmt_f64(sc.avg_ms) + "ms max " + fmt_f64(sc.max_ms) + "ms")
+    }
+    << lines
+}
+
+pub fn (p &FrameProfiler) to_json() string {
+    s := p.summary()
+    $b := strings.new_byte_builder(512)
+    b.write_str("{\"frame_count\":" + str(s.frame_count) +
+        ",\"fps\":" + fmt_f64(s.fps) +
+        ",\"avg_ms\":" + fmt_f64(s.avg_ms) +
+        ",\"min_ms\":" + fmt_f64(s.min_ms) +
+        ",\"max_ms\":" + fmt_f64(s.max_ms) +
+        ",\"p50_ms\":" + fmt_f64(s.p50_ms) +
+        ",\"p95_ms\":" + fmt_f64(s.p95_ms) +
+        ",\"p99_ms\":" + fmt_f64(s.p99_ms) +
+        ",\"scopes\":[")
+    for i in 0:p.scopes.len {
+        if i > 0 { b.write_str(",") }
+        sc := p.scopes[i]
+        b.write_str("{\"name\":\"" + sc.name + "\",\"last_ms\":" + fmt_f64(sc.last_ms) +
+            ",\"avg_ms\":" + fmt_f64(sc.avg_ms) + ",\"max_ms\":" + fmt_f64(sc.max_ms) +
+            ",\"samples\":" + str(sc.samples) + "}")
+    }
+    b.write_str("],\"counters\":{")
+    for i in 0:p.counter_names.len {
+        if i > 0 { b.write_str(",") }
+        b.write_str("\"" + p.counter_names[i] + "\":" + str(p.counter_values[i]))
+    }
+    b.write_str("}}")
+    << b.to_string()
+}

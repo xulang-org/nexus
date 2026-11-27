@@ -1,0 +1,602 @@
+@"github.com/xulang-org/nexus/integration/scene"
+
+#crypto/rand
+#errors
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+persist #"github.com/xulang-org/nexus/resources/persistence"
+nexus #"github.com/xulang-org/nexus/scene"
+#strings
+
+pub const RESOLVE_LIVE = 0
+pub const RESOLVE_UNLOADED_WORLD = 1
+pub const RESOLVE_RETIRED = 2
+pub const RESOLVE_MISSING = 3
+
+struct EntityRecord {
+    guid persist.EntityGuid
+    world_id string
+    node_id int
+    node_kind int
+    fallback_path string
+    tag string
+    retired bool
+    persistent_across_worlds bool
+    state_json string
+}
+
+pub struct ResolvedEntity {
+    pub status int
+    pub world_id string
+    pub node_id int
+    pub ref persist.PersistentEntityRef
+    pub state_json string
+}
+
+pub struct RebindReport {
+    pub world_id string
+    pub rebound int
+    pub retired_pruned int
+    pub missing int
+}
+
+pub struct PersistentEntityRegistry {
+    worlds map[string]bool
+    world_order []string
+    records []EntityRecord
+    guid_to_idx map[string]int
+    node_to_idx map[string]int
+    links []persist.CrossWorldLink
+}
+
+pub fn new_persistent_registry() PersistentEntityRegistry {
+    << PersistentEntityRegistry{
+        worlds: map[string]bool{},
+        world_order: []string{},
+        records: []EntityRecord{},
+        guid_to_idx: map[string]int{},
+        node_to_idx: map[string]int{},
+        links: []persist.CrossWorldLink{}
+    }
+}
+
+fn node_binding_key(world_id &string, node_id int) string {
+    << *world_id + ":" + str(node_id)
+}
+
+pub fn (r $&PersistentEntityRegistry) register_world(world_id string) int {
+    if world_id.len == 0 || world_id.len > 128 {
+        >> errors.new("nexus persistence: world_id must be 1...128 bytes")
+    }
+    if !r.worlds.has(world_id + "") {
+        r.worlds[world_id + ""] = true
+        r.world_order.push(world_id + "")
+    }
+    << 0
+}
+
+pub fn node_canonical_path(tree &nexus.SceneTree, node_id int) string {
+    _ := tree.node_info(node_id) or >>
+    $segs := []string{}
+    $cur := node_id
+    while cur > 0 {
+        info := tree.node_info(cur) or >>
+        segs.push(info.name + "")
+        cur = info.parent
+    }
+    $out := strings.new_byte_builder(128)
+    $idx := segs.len - 1
+    while idx >= 0 {
+        out.write_str("/" + segs[idx])
+        idx -= 1
+    }
+    << out.to_string()
+}
+
+fn find_node_by_path_opt(tree &nexus.SceneTree, path string) int {
+    if path.len == 0 || path[0] != 47 { << 0 }
+    parts := strings.split(&path, "/")
+    $non_empty := []string{}
+    for i in 0:parts.len {
+        seg := parts[i] + ""
+        if seg.len > 0 { non_empty.push(seg) }
+    }
+    if non_empty.len == 0 { << 0 }
+    root := tree.root()
+    root_info := tree.node_info(root) or (err) { << 0 }
+    if root_info.name != non_empty[0] { << 0 }
+    $cur := root
+    for i in 1:non_empty.len {
+        seg := non_empty[i] + ""
+        child := tree.find_child(cur, seg) or (err) { << 0 }
+        if child == 0 { << 0 }
+        cur = child
+    }
+    << cur
+}
+
+pub fn (r $&PersistentEntityRegistry) assign_guid(
+    world_id string,
+    tree &nexus.SceneTree,
+    node_id int,
+    guid persist.EntityGuid,
+    tag string,
+    persistent_across_worlds bool
+) persist.PersistentEntityRef {
+    r.register_world(world_id + "") or >>
+    canon := persist.parse_guid(guid.value + "") or >>
+    gstr := canon.value + ""
+    if tag.len > 128 {
+        >> errors.new("nexus persistence: entity tag exceeds 128 bytes")
+    }
+    info := tree.node_info(node_id) or >>
+    if info.queued_free {
+        >> errors.new("nexus persistence: cannot assign GUID to node queued for deletion")
+    }
+    nkey := node_binding_key(&world_id, node_id)
+    if r.node_to_idx.has(nkey + "") {
+        existing_idx := r.node_to_idx[nkey + ""]
+        if r.records[existing_idx].guid.value != gstr {
+            >> errors.new("nexus persistence: node already has a different persistent GUID")
+        }
+    }
+    fpath := node_canonical_path(tree, node_id) or >>
+    $rec_idx := -1
+    if r.guid_to_idx.has(gstr + "") {
+        rec_idx = r.guid_to_idx[gstr + ""]
+        prev := $&r.records[rec_idx]
+        if prev.retired {
+            >> errors.new("nexus persistence: cannot assign retired entity GUID")
+        }
+        if prev.node_id > 0 {
+            old_k := node_binding_key(&prev.world_id, prev.node_id)
+            nti := $&r.node_to_idx
+            if nti.has(old_k + "") { nti.delete(old_k + "") }
+        }
+        prev.world_id = world_id + ""
+        prev.node_id = node_id
+        prev.node_kind = info.kind
+        prev.fallback_path = fpath + ""
+        prev.tag = tag + ""
+        prev.persistent_across_worlds = persistent_across_worlds
+    } else {
+        rec_idx = r.records.len
+        r.records.push(EntityRecord{
+            guid: persist.EntityGuid{value: gstr + ""},
+            world_id: world_id + "",
+            node_id: node_id,
+            node_kind: info.kind,
+            fallback_path: fpath + "",
+            tag: tag + "",
+            retired: false,
+            persistent_across_worlds: persistent_across_worlds,
+            state_json: ""
+        })
+        r.guid_to_idx[gstr + ""] = rec_idx
+    }
+    r.node_to_idx[nkey] = rec_idx
+    << persist.new_entity_ref(persist.EntityGuid{value: gstr + ""}, world_id, fpath, tag) or >>
+}
+
+pub fn (r $&PersistentEntityRegistry) assign_new_guid(
+    world_id string,
+    tree &nexus.SceneTree,
+    node_id int,
+    tag string,
+    persistent_across_worlds bool
+) persist.PersistentEntityRef {
+    raw := rand.read(16) or >>
+    if raw.len != 16 { >> errors.new("nexus persistence: rng failed generating GUID") }
+    $bytes := []u8{}
+    for i in 0:16 { bytes.push(u8(raw[i])) }
+    guid := persist.guid_from_bytes(&bytes) or >>
+    << r.assign_guid(world_id, tree, node_id, guid, tag, persistent_across_worlds) or >>
+}
+
+pub fn (r &PersistentEntityRegistry) has_guid(guid &persist.EntityGuid) bool {
+    canon := persist.parse_guid(guid.value + "") or (err) { << false }
+    << r.guid_to_idx.has(canon.value + "")
+}
+
+pub fn (r &PersistentEntityRegistry) guid_for_node(world_id string, node_id int) persist.EntityGuid {
+    nkey := node_binding_key(&world_id, node_id)
+    if !r.node_to_idx.has(nkey + "") {
+        >> errors.new("nexus persistence: node has no persistent GUID in world " + world_id)
+    }
+    idx := r.node_to_idx[nkey + ""]
+    << persist.EntityGuid{value: r.records[idx].guid.value + ""}
+}
+
+pub fn (r &PersistentEntityRegistry) ref_for_guid(guid &persist.EntityGuid) persist.PersistentEntityRef {
+    canon := persist.parse_guid(guid.value + "") or >>
+    if !r.guid_to_idx.has(canon.value + "") {
+        >> errors.new("nexus persistence: unknown entity GUID: " + canon.value)
+    }
+    idx := r.guid_to_idx[canon.value + ""]
+    rec := &r.records[idx]
+    << persist.new_entity_ref(canon, rec.world_id + "", rec.fallback_path + "", rec.tag + "") or >>
+}
+
+pub fn (r $&PersistentEntityRegistry) set_entity_state(guid &persist.EntityGuid, state_json string) int {
+    canon := persist.parse_guid(guid.value + "") or >>
+    if !r.guid_to_idx.has(canon.value + "") {
+        >> errors.new("nexus persistence: unknown entity GUID for state update")
+    }
+    idx := r.guid_to_idx[canon.value + ""]
+    rec := $&r.records[idx]
+    snap := persist.EntitySnapshot{
+        ref: persist.new_entity_ref(canon, rec.world_id + "", rec.fallback_path + "", rec.tag + "") or >>,
+        node_kind: rec.node_kind,
+        alive: rec.node_id > 0,
+        retired: rec.retired,
+        persistent_across_worlds: rec.persistent_across_worlds,
+        state_json: state_json + ""
+    }
+    snap.validate() or >>
+    rec.state_json = state_json + ""
+    << 0
+}
+
+pub fn (r &PersistentEntityRegistry) entity_state(guid &persist.EntityGuid) string {
+    canon := persist.parse_guid(guid.value + "") or >>
+    if !r.guid_to_idx.has(canon.value + "") {
+        >> errors.new("nexus persistence: unknown entity GUID")
+    }
+    idx := r.guid_to_idx[canon.value + ""]
+    << r.records[idx].state_json + ""
+}
+
+pub fn (r $&PersistentEntityRegistry) retire_entity(guid &persist.EntityGuid) int {
+    canon := persist.parse_guid(guid.value + "") or >>
+    if !r.guid_to_idx.has(canon.value + "") {
+        >> errors.new("nexus persistence: unknown entity GUID to retire")
+    }
+    idx := r.guid_to_idx[canon.value + ""]
+    rec := $&r.records[idx]
+    if rec.node_id > 0 {
+        nkey := node_binding_key(&rec.world_id, rec.node_id)
+        nti := $&r.node_to_idx
+        if nti.has(nkey + "") { nti.delete(nkey + "") }
+    }
+    rec.node_id = 0
+    rec.retired = true
+    << 0
+}
+
+fn node_is_live_kind(tree &nexus.SceneTree, node_id int, kind int) bool {
+    if node_id <= 0 || !tree.is_alive(node_id) { << false }
+    info := tree.node_info(node_id) or (err) { << false }
+    << !info.queued_free && info.kind == kind
+}
+
+pub fn (r $&PersistentEntityRegistry) sync_world(world_id string, tree &nexus.SceneTree) int {
+    if !r.worlds.has(world_id + "") { << 0 }
+    $cleared := 0
+    for idx in 0:r.records.len {
+        rec := $&r.records[idx]
+        if rec.world_id != world_id || rec.node_id <= 0 { -> }
+        still_live := node_is_live_kind(tree, rec.node_id, rec.node_kind)
+        if !still_live {
+            nkey := node_binding_key(&world_id, rec.node_id)
+            nti := $&r.node_to_idx
+            if nti.has(nkey + "") { nti.delete(nkey + "") }
+            rec.node_id = 0
+            cleared += 1
+        } else {
+            latest_path := node_canonical_path(tree, rec.node_id) or >>
+            if latest_path != rec.fallback_path {
+                rec.fallback_path = latest_path
+            }
+        }
+    }
+    << cleared
+}
+
+pub fn (r &PersistentEntityRegistry) resolve(
+    ref &persist.PersistentEntityRef,
+    active_world string,
+    active_tree &nexus.SceneTree
+) ResolvedEntity {
+    canon := persist.parse_guid(ref.guid.value + "") or (err) {
+        << ResolvedEntity{
+            status: RESOLVE_MISSING, world_id: "", node_id: 0,
+            ref: persist.PersistentEntityRef{guid: persist.EntityGuid{value: ref.guid.value + ""}, world_id: ref.world_id + "", fallback_path: ref.fallback_path + "", tag: ref.tag + ""},
+            state_json: ""
+        }
+    }
+    gstr := canon.value + ""
+    if !r.guid_to_idx.has(gstr + "") {
+        << ResolvedEntity{
+            status: RESOLVE_MISSING, world_id: "", node_id: 0,
+            ref: persist.PersistentEntityRef{guid: persist.EntityGuid{value: gstr + ""}, world_id: ref.world_id + "", fallback_path: ref.fallback_path + "", tag: ref.tag + ""},
+            state_json: ""
+        }
+    }
+    idx := r.guid_to_idx[gstr + ""]
+    rec := &r.records[idx]
+    latest_ref := persist.new_entity_ref(persist.EntityGuid{value: gstr + ""}, rec.world_id + "", rec.fallback_path + "", rec.tag + "") or >>
+    if rec.retired {
+        << ResolvedEntity{status: RESOLVE_RETIRED, world_id: rec.world_id + "", node_id: 0, ref: latest_ref, state_json: rec.state_json + ""}
+    }
+    if rec.world_id != active_world {
+        << ResolvedEntity{status: RESOLVE_UNLOADED_WORLD, world_id: rec.world_id + "", node_id: 0, ref: latest_ref, state_json: rec.state_json + ""}
+    }
+    if rec.node_id > 0 && active_tree.is_alive(rec.node_id) {
+        info := active_tree.node_info(rec.node_id) or (err) {
+            << ResolvedEntity{status: RESOLVE_MISSING, world_id: rec.world_id + "", node_id: 0, ref: latest_ref, state_json: rec.state_json + ""}
+        }
+        if !info.queued_free {
+            << ResolvedEntity{status: RESOLVE_LIVE, world_id: rec.world_id + "", node_id: rec.node_id, ref: latest_ref, state_json: rec.state_json + ""}
+        }
+    }
+    << ResolvedEntity{status: RESOLVE_MISSING, world_id: rec.world_id + "", node_id: 0, ref: latest_ref, state_json: rec.state_json + ""}
+}
+
+pub fn (r $&PersistentEntityRegistry) rebind_world(
+    world_id string,
+    tree $&nexus.SceneTree,
+    prune_retired bool
+) RebindReport {
+    r.register_world(world_id + "") or >>
+    nti := $&r.node_to_idx
+    for idx in 0:r.records.len {
+        rec := &r.records[idx]
+        if rec.world_id == world_id && rec.node_id > 0 {
+            old_k := node_binding_key(&world_id, rec.node_id)
+            if nti.has(old_k + "") { nti.delete(old_k + "") }
+        }
+    }
+
+    $rebound := 0
+    $pruned := 0
+    $missing := 0
+    $needs_flush := false
+
+    for idx in 0:r.records.len {
+        rec := $&r.records[idx]
+        if rec.world_id != world_id { -> }
+        found := find_node_by_path_opt(tree, rec.fallback_path + "")
+        if rec.retired {
+            if prune_retired && found > 0 && found != tree.root() && tree.is_alive(found) {
+                info := tree.node_info(found) or >>
+                if !info.queued_free {
+                    tree.queue_free(found) or >>
+                    needs_flush = true
+                    pruned += 1
+                }
+            }
+            rec.node_id = 0
+            ->
+        }
+        if found > 0 && tree.is_alive(found) {
+            info := tree.node_info(found) or >>
+            if !info.queued_free {
+                rec.node_id = found
+                rec.node_kind = info.kind
+                nkey := node_binding_key(&world_id, found)
+                nti[nkey] = idx
+                rebound += 1
+                ->
+            }
+        }
+        rec.node_id = 0
+        missing += 1
+    }
+
+    if needs_flush {
+        _ := tree.flush_free() or >>
+    }
+    << RebindReport{world_id: world_id, rebound: rebound, retired_pruned: pruned, missing: missing}
+}
+
+pub fn (r $&PersistentEntityRegistry) add_link(
+    source &persist.EntityGuid,
+    target &persist.PersistentEntityRef,
+    relation string
+) int {
+    src := persist.parse_guid(source.value + "") or >>
+    if !r.guid_to_idx.has(src.value + "") {
+        >> errors.new("nexus persistence: link source GUID is not registered")
+    }
+    tg := persist.parse_guid(target.guid.value + "") or >>
+    tcopy := persist.new_entity_ref(tg, target.world_id + "", target.fallback_path + "", target.tag + "") or >>
+    lnk := persist.CrossWorldLink{source: src, target: tcopy, relation: relation}
+    lnk.validate() or >>
+    r.links.push(lnk)
+    << r.links.len - 1
+}
+
+pub fn (r &PersistentEntityRegistry) links_from(source &persist.EntityGuid) []persist.CrossWorldLink {
+    canon := persist.parse_guid(source.value + "") or >>
+    $out := []persist.CrossWorldLink{}
+    for i in 0:r.links.len {
+        l := &r.links[i]
+        if l.source.value == canon.value {
+            tg := persist.EntityGuid{value: l.target.guid.value + ""}
+            tref := persist.new_entity_ref(tg, l.target.world_id + "", l.target.fallback_path + "", l.target.tag + "") or >>
+            out.push(persist.CrossWorldLink{source: persist.EntityGuid{value: l.source.value + ""}, target: tref, relation: l.relation + ""})
+        }
+    }
+    << out
+}
+
+pub fn (r $&PersistentEntityRegistry) transfer_entity_world(
+    guid &persist.EntityGuid,
+    from_world string,
+    from_tree $&nexus.SceneTree,
+    to_world string,
+    to_tree $&nexus.SceneTree,
+    target_parent int
+) int {
+    canon := persist.parse_guid(guid.value + "") or >>
+    if !r.guid_to_idx.has(canon.value + "") {
+        >> errors.new("nexus persistence: unknown entity GUID for transfer")
+    }
+    root_idx := r.guid_to_idx[canon.value + ""]
+    root_world := r.records[root_idx].world_id + ""
+    root_retired := r.records[root_idx].retired
+    old_root := r.records[root_idx].node_id
+    if root_retired {
+        >> errors.new("nexus persistence: cannot transfer retired entity")
+    }
+    if root_world != from_world {
+        >> errors.new("nexus persistence: entity is not owned by from_world")
+    }
+    if old_root <= 0 || !from_tree.is_alive(old_root) {
+        >> errors.new("nexus persistence: transfer entity node is not live in from_tree")
+    }
+    if old_root == from_tree.root() {
+        >> errors.new("nexus persistence: cannot transfer SceneTree root node across worlds")
+    }
+    old_info := from_tree.node_info(old_root) or >>
+    if old_info.queued_free {
+        >> errors.new("nexus persistence: cannot transfer node queued for deletion")
+    }
+
+    r.register_world(to_world + "") or >>
+    old_sub := from_tree.subtree(old_root) or >>
+    $moved_sub_idx := []int{}
+    $moved_rec_idx := []int{}
+    for i in 0:old_sub.len {
+        oid := old_sub[i]
+        k := node_binding_key(&from_world, oid)
+        if r.node_to_idx.has(k + "") {
+            moved_sub_idx.push(i)
+            moved_rec_idx.push(r.node_to_idx[k + ""])
+        }
+    }
+
+    packed := nexus.pack_scene(from_tree, old_root) or >>
+    new_root := packed.instantiate(to_tree, target_parent, old_info.name + "") or >>
+    new_sub := to_tree.subtree(new_root) or >>
+    if new_sub.len != old_sub.len {
+        >> errors.new("nexus persistence: internal subtree mismatch after cross-world instantiate")
+    }
+
+    nti := $&r.node_to_idx
+    for i in 0:moved_sub_idx.len {
+        sub_idx := moved_sub_idx[i]
+        rec_idx := moved_rec_idx[i]
+        oid := old_sub[sub_idx]
+        nid := new_sub[sub_idx]
+        old_k := node_binding_key(&from_world, oid)
+        if nti.has(old_k + "") { nti.delete(old_k + "") }
+        new_k := node_binding_key(&to_world, nid)
+        nti[new_k] = rec_idx
+        new_path := node_canonical_path(to_tree, nid) or >>
+        rec := $&r.records[rec_idx]
+        rec.world_id = to_world + ""
+        rec.node_id = nid
+        rec.fallback_path = new_path
+    }
+
+    from_tree.queue_free(old_root) or >>
+    _ := from_tree.flush_free() or >>
+    << new_root
+}
+
+pub fn (r &PersistentEntityRegistry) export_manifest(
+    active_world string,
+    schema_version int
+) persist.WorldPersistenceManifest {
+    if !r.worlds.has(active_world + "") {
+        >> errors.new("nexus persistence: active_world not registered in registry")
+    }
+    $worlds := []string{}
+    for i in 0:r.world_order.len {
+        worlds.push(r.world_order[i] + "")
+    }
+    $entities := []persist.EntitySnapshot{}
+    for idx in 0:r.records.len {
+        rec := &r.records[idx]
+        g := persist.EntityGuid{value: rec.guid.value + ""}
+        ref := persist.new_entity_ref(g, rec.world_id + "", rec.fallback_path + "", rec.tag + "") or >>
+        entities.push(persist.EntitySnapshot{
+            ref: ref,
+            node_kind: rec.node_kind,
+            alive: rec.node_id > 0 && !rec.retired,
+            retired: rec.retired,
+            persistent_across_worlds: rec.persistent_across_worlds,
+            state_json: rec.state_json + ""
+        })
+    }
+    $links := []persist.CrossWorldLink{}
+    for i in 0:r.links.len {
+        l := &r.links[i]
+        sg := persist.EntityGuid{value: l.source.value + ""}
+        tg := persist.EntityGuid{value: l.target.guid.value + ""}
+        tref := persist.new_entity_ref(tg, l.target.world_id + "", l.target.fallback_path + "", l.target.tag + "") or >>
+        links.push(persist.CrossWorldLink{source: sg, target: tref, relation: l.relation + ""})
+    }
+    m := persist.WorldPersistenceManifest{
+        schema_version: schema_version,
+        active_world: active_world + "",
+        worlds: worlds,
+        entities: entities,
+        links: links
+    }
+    m.validate() or >>
+    << m
+}
+
+pub fn (r $&PersistentEntityRegistry) import_manifest(manifest &persist.WorldPersistenceManifest) int {
+    manifest.validate() or >>
+    r.worlds = map[string]bool{}
+    r.world_order = []string{}
+    r.records = []EntityRecord{}
+    r.guid_to_idx = map[string]int{}
+    r.node_to_idx = map[string]int{}
+    r.links = []persist.CrossWorldLink{}
+
+    for i in 0:manifest.worlds.len {
+        r.register_world(manifest.worlds[i] + "") or >>
+    }
+    for i in 0:manifest.entities.len {
+        e := &manifest.entities[i]
+        gkey := e.ref.guid.value + ""
+        r.guid_to_idx[gkey] = r.records.len
+        r.records.push(EntityRecord{
+            guid: persist.EntityGuid{value: gkey},
+            world_id: e.ref.world_id + "",
+            node_id: 0,
+            node_kind: e.node_kind,
+            fallback_path: e.ref.fallback_path + "",
+            tag: e.ref.tag + "",
+            retired: e.retired,
+            persistent_across_worlds: e.persistent_across_worlds,
+            state_json: e.state_json + ""
+        })
+    }
+    for i in 0:manifest.links.len {
+        l := &manifest.links[i]
+        sg := persist.EntityGuid{value: l.source.value + ""}
+        tg := persist.EntityGuid{value: l.target.guid.value + ""}
+        tref := persist.new_entity_ref(tg, l.target.world_id + "", l.target.fallback_path + "", l.target.tag + "") or >>
+        r.links.push(persist.CrossWorldLink{source: sg, target: tref, relation: l.relation + ""})
+    }
+    << r.records.len
+}
+
+pub fn (r &PersistentEntityRegistry) save_to_file(
+    path string,
+    active_world string,
+    schema_version int
+) int {
+    manifest := r.export_manifest(active_world, schema_version) or >>
+    payload := persist.encode_manifest(&manifest) or >>
+    env := persist.wrap_save_envelope(schema_version, payload) or >>
+    raw := persist.encode_envelope(&env) or >>
+    << snapshot.write_atomic(path, &raw) or >>
+}
+
+pub fn (r $&PersistentEntityRegistry) load_from_file(
+    path string,
+    chain &persist.SaveMigrationChain,
+    target_version int
+) persist.MigrationReport {
+    raw := snapshot.read(path, persist.MANIFEST_MAX_BYTES * 2) or >>
+    env := persist.decode_envelope(&raw) or >>
+    report := chain.migrate(&env, target_version) or >>
+    manifest := persist.decode_manifest(&report.envelope.payload) or >>
+    r.import_manifest(&manifest) or >>
+    << report
+}

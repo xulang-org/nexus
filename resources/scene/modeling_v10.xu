@@ -1,0 +1,232 @@
+@"github.com/xulang-org/nexus/resources/scene"
+
+rm #"github.com/xulang-org/nexus/resources/modeling"
+#errors
+
+pub const MAX_SCENE_EDITABLE_MESHES = 128
+pub const MAX_SCENE_CSG_TREES = 128
+pub const MAX_SCENE_MATERIAL_OVERRIDES = 512
+pub const MAX_INLINE_EDITABLE_VERTICES = 8192
+
+pub struct EditableMeshAttachment {
+    pub node int
+    pub mesh rm.EditableMesh
+}
+
+pub struct CsgTreeAttachment {
+    pub node int
+    pub tree rm.CsgTree
+}
+
+pub struct MaterialOverrideAttachment {
+    pub node int
+    pub slot int
+    pub material rm.MaterialAsset
+}
+
+pub fn editable_mesh_attachment(node int, mesh rm.EditableMesh) EditableMeshAttachment {
+    << EditableMeshAttachment{node: node, mesh: mesh}
+}
+
+pub fn csg_tree_attachment(node int, tree rm.CsgTree) CsgTreeAttachment {
+    << CsgTreeAttachment{node: node, tree: tree}
+}
+
+pub fn material_override_attachment(node int, slot int, material rm.MaterialAsset) MaterialOverrideAttachment {
+    << MaterialOverrideAttachment{node: node, slot: slot, material: material}
+}
+
+fn clone_material_asset(m &rm.MaterialAsset) rm.MaterialAsset {
+    << rm.MaterialAsset{
+        name: m.name + "",
+        base_color: m.base_color,
+        alpha: m.alpha,
+        metallic: m.metallic,
+        roughness: m.roughness,
+        emission: m.emission,
+        normal_scale: m.normal_scale,
+        occlusion_strength: m.occlusion_strength,
+        alpha_mode: m.alpha_mode,
+        alpha_cutoff: m.alpha_cutoff,
+        double_sided: m.double_sided,
+        clearcoat: m.clearcoat,
+        clearcoat_roughness: m.clearcoat_roughness,
+        sheen_color: m.sheen_color,
+        sheen_roughness: m.sheen_roughness,
+        ior: m.ior,
+        base_texture_uid: m.base_texture_uid + "",
+        orm_texture_uid: m.orm_texture_uid + "",
+        normal_texture_uid: m.normal_texture_uid + "",
+        emission_texture_uid: m.emission_texture_uid + "",
+        occlusion_texture_uid: m.occlusion_texture_uid + "",
+        uv_offset: m.uv_offset,
+        uv_scale: m.uv_scale,
+        flip_u: m.flip_u,
+        flip_v: m.flip_v
+    }
+}
+
+fn clone_ref_v10(r &ResourceReference) ResourceReference {
+    << ResourceReference{uid: r.uid + "", kind: r.kind + "", path: r.path + "", content_hash: r.content_hash + ""}
+}
+
+pub fn validate_modeling_v10(
+    document &Document,
+    editable_meshes &[]EditableMeshAttachment,
+    csg_trees &[]CsgTreeAttachment,
+    material_overrides &[]MaterialOverrideAttachment
+) int {
+    if editable_meshes.len > MAX_SCENE_EDITABLE_MESHES {
+        >> errors.new("nexus scene: editable_meshes count exceeds 128")
+    }
+    if csg_trees.len > MAX_SCENE_CSG_TREES {
+        >> errors.new("nexus scene: csg_brushes count exceeds 128")
+    }
+    if material_overrides.len > MAX_SCENE_MATERIAL_OVERRIDES {
+        >> errors.new("nexus scene: material_overrides count exceeds 512")
+    }
+    $geom_nodes := map[int]bool{}
+    for i in 0:editable_meshes.len {
+        att := &editable_meshes[i]
+        if att.node < 0 || att.node >= document.nodes.len || document.nodes[att.node].kind != NODE_3D {
+            >> errors.new("nexus scene: editable_mesh attachment requires valid Node3D")
+        }
+        if geom_nodes.has(att.node) {
+            >> errors.new("nexus scene: node cannot attach multiple editable/CSG geometries")
+        }
+        geom_nodes[att.node] = true
+        att.mesh.validate() or >>
+        if att.mesh.vertices.len > MAX_INLINE_EDITABLE_VERTICES {
+            >> errors.new("nexus scene: inline editable mesh exceeds 8192 vertices")
+        }
+    }
+    for i in 0:csg_trees.len {
+        att := &csg_trees[i]
+        if att.node < 0 || att.node >= document.nodes.len || document.nodes[att.node].kind != NODE_3D {
+            >> errors.new("nexus scene: csg_brushes attachment requires valid Node3D")
+        }
+        if geom_nodes.has(att.node) {
+            >> errors.new("nexus scene: node cannot attach multiple editable/CSG geometries")
+        }
+        geom_nodes[att.node] = true
+        if att.tree.brushes.len < 1 {
+            >> errors.new("nexus scene: csg_brushes tree requires at least one brush")
+        }
+        att.tree.validate() or >>
+    }
+    $mat_keys := map[string]bool{}
+    for i in 0:material_overrides.len {
+        att := &material_overrides[i]
+        if att.node < 0 || att.node >= document.nodes.len || document.nodes[att.node].kind != NODE_3D {
+            >> errors.new("nexus scene: material_override attachment requires valid Node3D")
+        }
+        if att.slot < 0 || att.slot >= rm.MAX_MATERIAL_SLOTS {
+            >> errors.new("nexus scene: material_override slot out of range")
+        }
+        key := str(att.node) + ":" + str(att.slot)
+        if mat_keys.has(key + "") {
+            >> errors.new("nexus scene: duplicate material_override for node/slot")
+        }
+        mat_keys[key] = true
+        att.material.validate() or >>
+    }
+    << 0
+}
+
+pub fn (document &Document) has_modeling_attachments() bool {
+    << document.editable_meshes.len > 0 || document.csg_trees.len > 0 || document.material_overrides.len > 0
+}
+
+pub fn (document &Document) editable_mesh_count() int { << document.editable_meshes.len }
+pub fn (document &Document) csg_tree_count() int { << document.csg_trees.len }
+pub fn (document &Document) material_override_count() int { << document.material_overrides.len }
+
+pub fn (document &Document) editable_mesh(index int) EditableMeshAttachment {
+    if index < 0 || index >= document.editable_meshes.len {
+        >> errors.new("nexus scene: editable_mesh index outside document")
+    }
+    saved := &document.editable_meshes[index]
+    << EditableMeshAttachment{node: saved.node, mesh: saved.mesh.clone()}
+}
+
+pub fn (document &Document) csg_tree(index int) CsgTreeAttachment {
+    if index < 0 || index >= document.csg_trees.len {
+        >> errors.new("nexus scene: csg_tree index outside document")
+    }
+    saved := &document.csg_trees[index]
+    << CsgTreeAttachment{node: saved.node, tree: saved.tree.clone()}
+}
+
+pub fn (document &Document) material_override(index int) MaterialOverrideAttachment {
+    if index < 0 || index >= document.material_overrides.len {
+        >> errors.new("nexus scene: material_override index outside document")
+    }
+    saved := &document.material_overrides[index]
+    << MaterialOverrideAttachment{node: saved.node, slot: saved.slot, material: clone_material_asset(&saved.material)}
+}
+
+pub fn with_modeling_attachments(
+    document &Document,
+    editable_meshes []EditableMeshAttachment,
+    csg_trees []CsgTreeAttachment,
+    material_overrides []MaterialOverrideAttachment
+) Document {
+    validate_modeling_v10(document, &editable_meshes, &csg_trees, &material_overrides) or >>
+    $nodes := []NodeData{}
+    for i in 0:document.node_count() { nodes.push(document.describe_node(i) or >>) }
+    $refs := []ResourceReference{}
+    for i in 0:document.resource_count() {
+        r := document.resource(i) or >>
+        refs.push(clone_ref_v10(&r))
+    }
+    $surfaces := []Surface{}
+    for i in 0:document.surface_count() { surfaces.push(document.surface(i) or >>) }
+    $buses := []AudioBus{}
+    for i in 0:document.audio_bus_count() { buses.push(document.audio_bus(i) or >>) }
+    $emitters := []AudioEmitter{}
+    for i in 0:document.audio_count() { emitters.push(document.audio_emitter(i) or >>) }
+    $scripts := []ScriptAttachment{}
+    for i in 0:document.script_count() { scripts.push(document.script(i) or >>) }
+    $conns := []ScriptConnection{}
+    for i in 0:document.script_connection_count() { conns.push(document.script_connection(i) or >>) }
+    $lights := []LightAttachment{}
+    for i in 0:document.light_count() { lights.push(document.light(i) or >>) }
+    $sprites := []Sprite3DAttachment{}
+    for i in 0:document.sprite_3d_count() { sprites.push(document.sprite_3d(i) or >>) }
+    $tilemaps := []TileMap2DAttachment{}
+    for i in 0:document.tilemap_2d_count() { tilemaps.push(document.tilemap_2d(i) or >>) }
+    $envs := []EnvironmentAttachment{}
+    for i in 0:document.environment_count() { envs.push(document.environment(i) or >>) }
+    $bodies := []RigidBody3DAttachment{}
+    for i in 0:document.rigid_body_3d_count() { bodies.push(document.rigid_body_3d(i) or >>) }
+    $joints := []Joint3DAttachment{}
+    for i in 0:document.joint_3d_count() { joints.push(document.joint_3d(i) or >>) }
+    $terrains := []TerrainAttachment{}
+    for i in 0:document.terrain_count() { terrains.push(document.terrain(i) or >>) }
+    $particles := []ParticleEmitter3DAttachment{}
+    for i in 0:document.particle_emitter_3d_count() { particles.push(document.particle_emitter_3d(i) or >>) }
+    $prefabs := []PrefabInstanceAttachment{}
+    for i in 0:document.prefab_instance_count() { prefabs.push(document.prefab_instance(i) or >>) }
+
+    << Document{
+        nodes: nodes,
+        references: refs,
+        surfaces: surfaces,
+        buses: buses,
+        emitters: emitters,
+        scripts: scripts,
+        connections: conns,
+        lights: lights,
+        sprites_3d: sprites,
+        tilemaps_2d: tilemaps,
+        environments: envs,
+        rigid_bodies_3d: bodies,
+        joints_3d: joints,
+        terrains: terrains,
+        particles_3d: particles,
+        prefab_instances: prefabs,
+        editable_meshes: editable_meshes,
+        csg_trees: csg_trees,
+        material_overrides: material_overrides
+    }
+}

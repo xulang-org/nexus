@@ -1,0 +1,63 @@
+@"github.com/xulang-org/nexus/formats/obj"
+
+mesh #"github.com/xulang-org/nexus/resources/mesh"
+#errors
+#math
+#strconv
+#strings
+
+fn fmt_obj_f64(v f64) string {
+    << strconv.format_float(v, 103, -1) or >>
+}
+
+// Encodes a validated MeshData3D into bounded OBJ text compatible with formats/obj.decode.
+pub fn encode(src &mesh.MeshData3D) string {
+    src.validate() or >>
+    $has_uv := true
+    $has_normal := true
+    for v in src.vertices {
+        if !v.has_uv { has_uv = false }
+        if v.normal.dot(v.normal) < 0.5 { has_normal = false }
+    }
+
+    $out := strings.new_byte_builder(4096)
+    out.write_str("# Exported by Nexus Engine\n")
+    for v in src.vertices {
+        out.write_str("v " + fmt_obj_f64(v.position.x) + " " + fmt_obj_f64(v.position.y) + " " + fmt_obj_f64(v.position.z) + "\n")
+    }
+    if has_uv {
+        for v in src.vertices {
+            out.write_str("vt " + fmt_obj_f64(v.uv.x) + " " + fmt_obj_f64(v.uv.y) + "\n")
+        }
+    }
+    if has_normal {
+        for v in src.vertices {
+            out.write_str("vn " + fmt_obj_f64(v.normal.x) + " " + fmt_obj_f64(v.normal.y) + " " + fmt_obj_f64(v.normal.z) + "\n")
+        }
+    }
+    for ti in 0:src.triangle_count() {
+        a := src.indices[ti * 3] + 1
+        b := src.indices[ti * 3 + 1] + 1
+        c := src.indices[ti * 3 + 2] + 1
+        if has_uv && has_normal {
+            out.write_str("f " + str(a) + "/" + str(a) + "/" + str(a) + " " +
+                str(b) + "/" + str(b) + "/" + str(b) + " " +
+                str(c) + "/" + str(c) + "/" + str(c) + "\n")
+        } else if has_uv {
+            out.write_str("f " + str(a) + "/" + str(a) + " " +
+                str(b) + "/" + str(b) + " " +
+                str(c) + "/" + str(c) + "\n")
+        } else if has_normal {
+            out.write_str("f " + str(a) + "//" + str(a) + " " +
+                str(b) + "//" + str(b) + " " +
+                str(c) + "//" + str(c) + "\n")
+        } else {
+            out.write_str("f " + str(a) + " " + str(b) + " " + str(c) + "\n")
+        }
+    }
+    raw := out.to_string()
+    if raw.len > MAX_BYTES {
+        >> errors.new("nexus OBJ encode: output exceeds 16 MiB budget")
+    }
+    << raw
+}

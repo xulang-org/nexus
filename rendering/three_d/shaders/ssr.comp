@@ -1,0 +1,117 @@
+#version 450
+
+layout(set = 0, binding = 0) uniform sampler2D src_color;
+layout(set = 0, binding = 1) uniform sampler2D src_normal;
+layout(set = 0, binding = 2) uniform sampler2D src_depth;
+layout(set = 0, binding = 3) uniform sampler2D hiz0;
+layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D dst_ssr;
+
+layout(set = 2, binding = 0, std140) uniform SsrParams {
+    mat4 view;
+    mat4 proj;
+    mat4 inv_proj;
+    vec4 info;
+    vec4 zinfo;
+} params;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+vec3 reconstruct_view(mat4 inv_proj, vec2 uv, float depth) {
+    float ndc_x = uv.x * 2.0 - 1.0;
+    float ndc_y = 1.0 - uv.y * 2.0;
+    vec4 v = inv_proj * vec4(ndc_x, ndc_y, depth, 1.0);
+    return v.xyz / max(v.w, 1e-6);
+}
+
+vec3 project_uv_z(mat4 proj, vec3 vp) {
+    vec4 c = proj * vec4(vp, 1.0);
+    if (c.w <= 1e-5) return vec3(-1.0);
+    vec3 ndc = c.xyz / c.w;
+    return vec3(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5, ndc.z);
+}
+
+float view_depth_from_ndc(mat4 inv_proj, vec2 uv, float depth) {
+    return -reconstruct_view(inv_proj, uv, depth).z;
+}
+
+void main() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    uint w = uint(params.info.x), h = uint(params.info.y);
+    if (gid.x >= w || gid.y >= h) return;
+
+    if (params.zinfo.w < 0.5) {
+        imageStore(dst_ssr, ivec2(gid), vec4(0.0));
+        return;
+    }
+
+    vec2 inv_res = vec2(1.0 / params.info.x, 1.0 / params.info.y);
+    vec2 uv = (vec2(gid) + 0.5) * inv_res;
+    float d = textureLod(src_depth, uv, 0.0).r;
+    vec4 nr = textureLod(src_normal, uv, 0.0);
+    float roughness = nr.w, nlen = length(nr.xyz);
+    if (d <= 1e-6 || nlen < 1e-4 || roughness > params.info.z) {
+        imageStore(dst_ssr, ivec2(gid), vec4(0.0));
+        return;
+    }
+
+    vec3 P = reconstruct_view(params.inv_proj, uv, d);
+    vec3 N = normalize((params.view * vec4(nr.xyz / nlen, 0.0)).xyz);
+    vec3 V = normalize(-P);
+    vec3 R = reflect(-V, N);
+    if (R.z > 0.3) {
+        imageStore(dst_ssr, ivec2(gid), vec4(0.0));
+        return;
+    }
+
+    float max_dist = params.info.w, thickness = params.zinfo.z;
+    const int STEPS = 32;
+    float step_len = max_dist / float(STEPS);
+    float jitter = fract(52.9829189 * fract(dot(vec2(gid), vec2(0.06711056, 0.00583715))));
+    bool hit = false;
+    vec2 hit_uv = vec2(0.0);
+    float prev_t = 0.0, hit_t = step_len * 0.5;
+
+    for (int i = 1; i <= STEPS; ++i) {
+        float t = step_len * (float(i) - 1.0 + max(jitter, 0.05));
+        vec3 sample_vp = P + R * t;
+        if (-sample_vp.z <= params.zinfo.x || -sample_vp.z >= params.zinfo.y) break;
+        vec3 uvd = project_uv_z(params.proj, sample_vp);
+        if (uvd.x <= 0.0 || uvd.x >= 1.0 || uvd.y <= 0.0 || uvd.y >= 1.0) break;
+
+        float coarse_z = textureLod(hiz0, uvd.xy, 0.0).r;
+        if (coarse_z <= 1e-6) { prev_t = t; continue; }
+        float fine_z = textureLod(src_depth, uvd.xy, 0.0).r;
+        if (fine_z <= 1e-6) { prev_t = t; continue; }
+        float ray_dist = -sample_vp.z;
+        float surf_dist = view_depth_from_ndc(params.inv_proj, uvd.xy, fine_z);
+        float delta = ray_dist - surf_dist;
+        if (delta > 0.0 && delta < thickness) { hit = true; hit_uv = uvd.xy; hit_t = t; break; }
+        prev_t = t;
+    }
+
+    if (!hit) { imageStore(dst_ssr, ivec2(gid), vec4(0.0)); return; }
+
+    float lo = prev_t, hi = hit_t;
+    for (int r = 0; r < 4; ++r) {
+        float mid = 0.5 * (lo + hi);
+        vec3 vp = P + R * mid;
+        vec3 uvd = project_uv_z(params.proj, vp);
+        if (uvd.x > 0.0 && uvd.x < 1.0 && uvd.y > 0.0 && uvd.y < 1.0) {
+            float fz = textureLod(src_depth, uvd.xy, 0.0).r;
+            float sd = view_depth_from_ndc(params.inv_proj, uvd.xy, fz);
+            if ((-vp.z) - sd > 0.0) { hi = mid; hit_uv = uvd.xy; }
+            else lo = mid;
+        }
+    }
+
+    vec3 refl_color = textureLod(src_color, hit_uv, 0.0).rgb;
+    float edge_x = min(hit_uv.x, 1.0 - hit_uv.x), edge_y = min(hit_uv.y, 1.0 - hit_uv.y);
+    float edge_fade = clamp(min(edge_x, edge_y) * 8.0, 0.0, 1.0);
+    float rough_fade = clamp(1.0 - (roughness / max(params.info.z, 1e-4)), 0.0, 1.0);
+    float nv = clamp(dot(N, V), 0.0, 1.0);
+    float fresnel = 0.04 + 0.96 * pow(1.0 - nv, 4.0);
+    float dist_fade = 1.0 - smoothstep(max_dist * 0.75, max_dist, hit_t);
+    float cam_fade = clamp(1.0 - max(R.z, 0.0) * 3.0, 0.0, 1.0);
+    float weight = clamp(edge_fade * rough_fade * fresnel * dist_fade * cam_fade, 0.0, 1.0);
+    imageStore(dst_ssr, ivec2(gid), vec4(refl_color, weight));
+}

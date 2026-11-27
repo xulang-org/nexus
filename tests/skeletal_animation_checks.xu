@@ -1,0 +1,426 @@
+@main
+
+#gpu
+#math
+fm #"github.com/xulang-org/nexus/foundation/math"
+gltf #"github.com/xulang-org/nexus/formats/gltf"
+mesh #"github.com/xulang-org/nexus/resources/mesh"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+nexus #"github.com/xulang-org/nexus/scene"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+shd #"github.com/xulang-org/nexus/assets/shaders/three_d"
+anim #"github.com/xulang-org/nexus/animation/skeletal"
+
+fn push_u16_b(buf $&[]int, v int) {
+    buf.push(v & 255)
+    buf.push((v >> 8) & 255)
+}
+
+fn push_u32_b(buf $&[]int, v int) {
+    buf.push(v & 255)
+    buf.push((v >> 8) & 255)
+    buf.push((v >> 16) & 255)
+    buf.push((v >> 24) & 255)
+}
+
+fn push_f32_b(buf $&[]int, v f64) {
+    push_u32_b(buf, math.float32_bits(v))
+}
+
+fn push_ascii_b(buf $&[]int, s string) {
+    for i in 0:s.len { buf.push(s[i] & 255) }
+}
+
+fn pad4_zeros(buf $&[]int) {
+    while buf.len % 4 != 0 { buf.push(0) }
+}
+
+fn push_ibm(buf $&[]int, tx f64, ty f64, tz f64) {
+    vals := [1.0, 0.0, 0.0, 0.0,
+             0.0, 1.0, 0.0, 0.0,
+             0.0, 0.0, 1.0, 0.0,
+             tx, ty, tz, 1.0]
+    for v in vals { push_f32_b(buf, v) }
+}
+
+fn build_character_glb() string {
+    $bin := []int{}
+    // BV 0: indices (6 * u16 = 12B, off=0)
+    for idx in [0, 1, 2, 0, 2, 3] { push_u16_b($&bin, idx) }
+    // BV 1: POSITION (4 * vec3 = 48B, off=12)
+    pts := [2.4, 1.4, 0.0,  3.6, 1.4, 0.0,  3.6, 2.6, 0.0,  2.4, 2.6, 0.0]
+    for v in pts { push_f32_b($&bin, v) }
+    // BV 2: NORMAL (4 * vec3 = 48B, off=60)
+    for _ in 0:4 {
+        push_f32_b($&bin, 0.0)
+        push_f32_b($&bin, 0.0)
+        push_f32_b($&bin, 1.0)
+    }
+    // BV 3: TEXCOORD_0 (4 * vec2 = 32B, off=108)
+    for v in [0.0, 0.0,  1.0, 0.0,  1.0, 1.0,  0.0, 1.0] { push_f32_b($&bin, v) }
+    // BV 4: JOINTS_0 u8 vec4 (16B, off=140) -> all bound to joint slot 3 (node 5 = Forearm)
+    for _ in 0:4 {
+        bin.push(3)
+        bin.push(0)
+        bin.push(0)
+        bin.push(0)
+    }
+    // BV 5: WEIGHTS_0 (64B, off=156)
+    for _ in 0:4 {
+        push_f32_b($&bin, 1.0)
+        push_f32_b($&bin, 0.0)
+        push_f32_b($&bin, 0.0)
+        push_f32_b($&bin, 0.0)
+    }
+    // BV 6: IBM for joints [1:Hips(0,1,0), 2:Spine(0,2,0), 4:UpperArm(1,2,0), 5:Forearm(2,2,0), 6:Hand(3,2,0)] (5*64 = 320B, off=220)
+    push_ibm($&bin, 0.0, -1.0, 0.0)
+    push_ibm($&bin, 0.0, -2.0, 0.0)
+    push_ibm($&bin, -1.0, -2.0, 0.0)
+    push_ibm($&bin, -2.0, -2.0, 0.0)
+    push_ibm($&bin, -3.0, -2.0, 0.0)
+
+    // BV 7: times 1.0s [0.0, 1.0] (8B, off=540)
+    push_f32_b($&bin, 0.0)
+    push_f32_b($&bin, 1.0)
+    // BV 8: times 0.5s [0.0, 0.5] (8B, off=548)
+    push_f32_b($&bin, 0.0)
+    push_f32_b($&bin, 0.5)
+
+    // BV 9: idle spine rot Y (0 -> 0.1 rad, off=556, 32B)
+    for v in [0.0, 0.0, 0.0, 1.0,  0.0, math.sin(0.05), 0.0, math.cos(0.05)] { push_f32_b($&bin, v) }
+    // BV 10: walk hips translation (0,1,0 -> 0,1,2, off=588, 24B)
+    for v in [0.0, 1.0, 0.0,  0.0, 1.0, 2.0] { push_f32_b($&bin, v) }
+    // BV 11: walk spine rot Y (0 -> 0.4 rad, off=612, 32B)
+    for v in [0.0, 0.0, 0.0, 1.0,  0.0, math.sin(0.2), 0.0, math.cos(0.2)] { push_f32_b($&bin, v) }
+    // BV 12: run hips translation (0,1,0 -> 0,1,4, off=644, 24B)
+    for v in [0.0, 1.0, 0.0,  0.0, 1.0, 4.0] { push_f32_b($&bin, v) }
+    // BV 13: run spine rot X (0 -> 0.6 rad, off=668, 32B)
+    for v in [0.0, 0.0, 0.0, 1.0,  math.sin(0.3), 0.0, 0.0, math.cos(0.3)] { push_f32_b($&bin, v) }
+    // BV 14: wave_arm upperArm rot Z (0 -> +90deg, off=700, 32B)
+    for v in [0.0, 0.0, 0.0, 1.0,  0.0, 0.0, math.sin(0.7853981633974483), math.cos(0.7853981633974483)] { push_f32_b($&bin, v) }
+    // BV 15: wave_arm forearm rot Z (0 -> +45deg, off=732, 32B)
+    for v in [0.0, 0.0, 0.0, 1.0,  0.0, 0.0, math.sin(0.39269908169872414), math.cos(0.39269908169872414)] { push_f32_b($&bin, v) }
+    pad4_zeros($&bin)
+
+    js := "{\"asset\":{\"version\":\"2.0\"}," +
+        "\"buffers\":[{\"byteLength\":" + str(bin.len) + "}]," +
+        "\"bufferViews\":[" +
+        "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":12,\"target\":34963}," +
+        "{\"buffer\":0,\"byteOffset\":12,\"byteLength\":48,\"target\":34962}," +
+        "{\"buffer\":0,\"byteOffset\":60,\"byteLength\":48,\"target\":34962}," +
+        "{\"buffer\":0,\"byteOffset\":108,\"byteLength\":32,\"target\":34962}," +
+        "{\"buffer\":0,\"byteOffset\":140,\"byteLength\":16,\"target\":34962}," +
+        "{\"buffer\":0,\"byteOffset\":156,\"byteLength\":64,\"target\":34962}," +
+        "{\"buffer\":0,\"byteOffset\":220,\"byteLength\":320}," +
+        "{\"buffer\":0,\"byteOffset\":540,\"byteLength\":8}," +
+        "{\"buffer\":0,\"byteOffset\":548,\"byteLength\":8}," +
+        "{\"buffer\":0,\"byteOffset\":556,\"byteLength\":32}," +
+        "{\"buffer\":0,\"byteOffset\":588,\"byteLength\":24}," +
+        "{\"buffer\":0,\"byteOffset\":612,\"byteLength\":32}," +
+        "{\"buffer\":0,\"byteOffset\":644,\"byteLength\":24}," +
+        "{\"buffer\":0,\"byteOffset\":668,\"byteLength\":32}," +
+        "{\"buffer\":0,\"byteOffset\":700,\"byteLength\":32}," +
+        "{\"buffer\":0,\"byteOffset\":732,\"byteLength\":32}]," +
+        "\"accessors\":[" +
+        "{\"bufferView\":0,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"}," +
+        "{\"bufferView\":1,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\",\"min\":[2.4,1.4,0],\"max\":[3.6,2.6,0]}," +
+        "{\"bufferView\":2,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"}," +
+        "{\"bufferView\":3,\"componentType\":5126,\"count\":4,\"type\":\"VEC2\"}," +
+        "{\"bufferView\":4,\"componentType\":5121,\"count\":4,\"type\":\"VEC4\"}," +
+        "{\"bufferView\":5,\"componentType\":5126,\"count\":4,\"type\":\"VEC4\"}," +
+        "{\"bufferView\":6,\"componentType\":5126,\"count\":5,\"type\":\"MAT4\"}," +
+        "{\"bufferView\":7,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\",\"min\":[0],\"max\":[1]}," +
+        "{\"bufferView\":8,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\",\"min\":[0],\"max\":[0.5]}," +
+        "{\"bufferView\":9,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}," +
+        "{\"bufferView\":10,\"componentType\":5126,\"count\":2,\"type\":\"VEC3\"}," +
+        "{\"bufferView\":11,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}," +
+        "{\"bufferView\":12,\"componentType\":5126,\"count\":2,\"type\":\"VEC3\"}," +
+        "{\"bufferView\":13,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}," +
+        "{\"bufferView\":14,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}," +
+        "{\"bufferView\":15,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}]," +
+        "\"meshes\":[{\"primitives\":[{\"indices\":0,\"attributes\":{\"POSITION\":1,\"NORMAL\":2,\"TEXCOORD_0\":3,\"JOINTS_0\":4,\"WEIGHTS_0\":5}}]}]," +
+        "\"nodes\":[" +
+        "{\"name\":\"Root\",\"children\":[1,7]}," +
+        "{\"name\":\"Hips\",\"translation\":[0,1,0],\"children\":[2]}," +
+        "{\"name\":\"Spine\",\"translation\":[0,1,0],\"children\":[3,4]}," +
+        "{\"name\":\"Head\",\"translation\":[0,1,0]}," +
+        "{\"name\":\"UpperArm\",\"translation\":[1,0,0],\"children\":[5]}," +
+        "{\"name\":\"Forearm\",\"translation\":[1,0,0],\"children\":[6]}," +
+        "{\"name\":\"Hand\",\"translation\":[1,0,0]}," +
+        "{\"name\":\"SkinnedBody\",\"mesh\":0,\"skin\":0}]," +
+        "\"scenes\":[{\"nodes\":[0]}],\"scene\":0," +
+        "\"skins\":[{\"joints\":[1,2,4,5,6],\"inverseBindMatrices\":6}]," +
+        "\"animations\":[" +
+        "{\"name\":\"idle\",\"samplers\":[{\"input\":7,\"output\":9,\"interpolation\":\"LINEAR\"}],\"channels\":[{\"sampler\":0,\"target\":{\"node\":2,\"path\":\"rotation\"}}]}," +
+        "{\"name\":\"walk\",\"samplers\":[{\"input\":7,\"output\":10,\"interpolation\":\"LINEAR\"},{\"input\":7,\"output\":11,\"interpolation\":\"LINEAR\"}],\"channels\":[{\"sampler\":0,\"target\":{\"node\":1,\"path\":\"translation\"}},{\"sampler\":1,\"target\":{\"node\":2,\"path\":\"rotation\"}}]}," +
+        "{\"name\":\"run\",\"samplers\":[{\"input\":8,\"output\":12,\"interpolation\":\"LINEAR\"},{\"input\":8,\"output\":13,\"interpolation\":\"LINEAR\"}],\"channels\":[{\"sampler\":0,\"target\":{\"node\":1,\"path\":\"translation\"}},{\"sampler\":1,\"target\":{\"node\":2,\"path\":\"rotation\"}}]}," +
+        "{\"name\":\"wave_arm\",\"samplers\":[{\"input\":7,\"output\":14,\"interpolation\":\"LINEAR\"},{\"input\":7,\"output\":15,\"interpolation\":\"LINEAR\"}],\"channels\":[{\"sampler\":0,\"target\":{\"node\":4,\"path\":\"rotation\"}},{\"sampler\":1,\"target\":{\"node\":5,\"path\":\"rotation\"}}]}" +
+        "]}"
+
+    $js_bytes := []int{}
+    push_ascii_b($&js_bytes, js)
+    while js_bytes.len % 4 != 0 { js_bytes.push(32) }
+
+    total := 12 + 8 + js_bytes.len + 8 + bin.len
+    $glb := []int{}
+    push_u32_b($&glb, 1179937895) // "glTF"
+    push_u32_b($&glb, 2)
+    push_u32_b($&glb, total)
+    push_u32_b($&glb, js_bytes.len)
+    push_u32_b($&glb, 1313821514) // "JSON"
+    for b in js_bytes { glb.push(b) }
+    push_u32_b($&glb, bin.len)
+    push_u32_b($&glb, 5130562) // "BIN\0"
+    for b in bin { glb.push(b) }
+    << string_from_bytes(glb)
+}
+
+fn world_pos_of(asset &gltf.GlbGeometry, pose &[]gltf.NodeTrs, node int) fm.Vec3 {
+    locals := asset.local_matrices_from_trs(pose) or >>
+    worlds := asset.world_pose(&locals) or >>
+    << worlds[node].c3.xyz()
+}
+
+fn build_arm_mesh_data() mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    n := fm.vec3(0.0, 0.0, 1.0)
+    // Quad around segment Forearm(2,2,0) -> Hand(3,2,0) with radius ~0.55.
+    d.vertex_lit_uv(fm.vec3(1.8, 1.4, 0.0), 4294967295, n, fm.vec2(0.0, 1.0)) or >>
+    d.vertex_lit_uv(fm.vec3(3.1, 1.4, 0.0), 4294967295, n, fm.vec2(1.0, 1.0)) or >>
+    d.vertex_lit_uv(fm.vec3(3.1, 2.6, 0.0), 4294967295, n, fm.vec2(1.0, 0.0)) or >>
+    d.vertex_lit_uv(fm.vec3(1.8, 2.6, 0.0), 4294967295, n, fm.vec2(0.0, 0.0)) or >>
+    d.triangle(0, 1, 2) or >>
+    d.triangle(0, 2, 3) or >>
+    d.validate() or >>
+    << d
+}
+
+fn build_morph_quad() mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    n := fm.vec3(0.0, 0.0, 1.0)
+    d.vertex_lit_uv(fm.vec3(-0.6, -0.6, 0.0), 4294967295, n, fm.vec2(0.0, 1.0)) or >>
+    d.vertex_lit_uv(fm.vec3(0.6, -0.6, 0.0), 4294967295, n, fm.vec2(1.0, 1.0)) or >>
+    d.vertex_lit_uv(fm.vec3(0.6, 0.6, 0.0), 4294967295, n, fm.vec2(1.0, 0.0)) or >>
+    d.vertex_lit_uv(fm.vec3(-0.6, 0.6, 0.0), 4294967295, n, fm.vec2(0.0, 0.0)) or >>
+    d.triangle(0, 1, 2) or >>
+    d.triangle(0, 2, 3) or >>
+    d.validate() or >>
+    << d
+}
+
+fn ch_r(c int) int { << (c >> 24) & 255 }
+fn ch_g(c int) int { << (c >> 16) & 255 }
+fn ch_b(c int) int { << (c >> 8) & 255 }
+
+fn run() int {
+    glb_raw := build_character_glb()
+    asset := gltf.decode_glb_geometry(&glb_raw) or >>
+    assert(asset.node_count() == 8 && asset.animation_count() == 4)
+
+    // 1. Animation State Machine + Transitions + Events + Loop Wrap:
+    $sm := anim.new_state_machine()
+    s_idle := sm.add_clip_state("idle", 0, true, 1.0) or >>
+    s_walk := sm.add_clip_state("walk", 1, true, 1.0) or >>
+    cond_walk := [anim.TransitionCondition{kind: anim.COND_GT, param: "speed", threshold: 0.5}]
+    sm.add_transition(s_idle, s_walk, 0.4, false, 0.0, &cond_walk) or >>
+    sm.add_event(1, 0.25, "footstep_l", 1) or >>
+    sm.add_event(1, 0.75, "footstep_r", 2) or >>
+
+    // Advance in Idle (speed=0): stays in Idle, no events.
+    r0 := sm.advance(&asset, 0.2) or >>
+    assert(r0.active_state == s_idle && !r0.blending && r0.events.len == 0)
+
+    // Trigger transition to Walk (fade=0.4s): at t=0.2s mid-fade blend_alpha=0.5, and step across 0.25s fires footstep_l once!
+    sm.set_float("speed", 1.5)
+    r1 := sm.advance(&asset, 0.2) or >>
+    assert(r1.active_state == s_walk && r1.blending && math.abs(r1.blend_alpha - 0.5) < 0.01)
+    assert(r1.events.len == 0)
+    r2 := sm.advance(&asset, 0.1) or >>
+    assert(r2.events.len == 1 && r2.events[0].name == "footstep_l" && r2.events[0].tag == 1)
+
+    // Finish fade at dt=0.2 (walk phase now 0.5) then advance 0.3 -> fires footstep_r cleanly!
+    r3 := sm.advance(&asset, 0.2) or >>
+    assert(!r3.blending && r3.events.len == 0)
+    r4 := sm.advance(&asset, 0.3) or >>
+    assert(r4.events.len == 1 && r4.events[0].name == "footstep_r" && r4.events[0].tag == 2)
+
+    // Loop wrap across 0.8 -> 1.3 (wraps to 0.3): fires footstep_l!
+    r5 := sm.advance(&asset, 0.5) or >>
+    assert(r5.events.len == 1 && r5.events[0].name == "footstep_l")
+
+    // 2. BlendSpace1D & BlendSpace2D:
+    $bs1 := anim.new_blend_space_1d()
+    bs1.add_sample(0, 0.0, 1.0) or >>
+    bs1.add_sample(1, 2.0, 1.0) or >>
+    bs1.add_sample(2, 6.0, 1.0) or >>
+    p_bs1 := bs1.evaluate(&asset, 4.0, 1.0) or >> // midpoint between Walk (Hips z=2) & Run (Hips z=4) -> Hips z=3.0!
+    assert(math.abs(p_bs1[1].translation.z - 3.0) < 0.01)
+
+    $bs2 := anim.new_blend_space_2d()
+    bs2.add_sample(0, 0.0, 0.0, 1.0) or >>
+    bs2.add_sample(1, 0.0, 1.0, 1.0) or >>
+    bs2.add_sample(2, 1.0, 0.0, 1.0) or >>
+    w2d := bs2.compute_weights(0.5, 0.5) or >>
+    assert(w2d.len == 3 && w2d[1] > 0.2 && w2d[2] > 0.2)
+    p_bs2 := bs2.evaluate(&asset, 0.0, 1.0, 1.0) or >>
+    assert(math.abs(p_bs2[1].translation.z - 2.0) < 0.01)
+
+    // 3. BoneMask Branch Overlay + Additive Layer:
+    $arm_mask := anim.new_bone_mask(asset.node_count(), 0.0)
+    arm_mask.set_branch_weight(&asset, 4, 1.0) or >> // UpperArm(4), Forearm(5), Hand(6) = 1.0; Spine/Hips/Head = 0.0
+    assert(arm_mask.weight(4) == 1.0 && arm_mask.weight(6) == 1.0 && arm_mask.weight(2) == 0.0 && arm_mask.weight(3) == 0.0)
+
+    walk_p := asset.sample_trs_pose(1, 1.0) or >>
+    wave_p := asset.sample_trs_pose(3, 1.0) or >>
+    masked_p := anim.blend_poses_masked(&walk_p, &wave_p, &arm_mask, 1.0) or >>
+    // Hips keeps walk translation (0,1,2), UpperArm takes wave_arm +90deg Z rotation!
+    assert(math.abs(masked_p[1].translation.z - 2.0) < 0.001)
+    assert(math.abs(masked_p[4].rotation.z - math.sin(0.7853981633974483)) < 0.001)
+
+    rest_p := asset.sample_trs_pose(-1, 0.0) or >>
+    run_p := asset.sample_trs_pose(2, 0.5) or >>
+    add_p := anim.apply_additive_pose(&walk_p, &run_p, &rest_p, 0.5) or >>
+    assert(math.abs(add_p[2].rotation.x) > 0.1)
+
+    // 4. Root Motion Extraction Across Loop Wrap (0.8s -> 0.2s on 1.0s walk clip (+2.0m/cycle)):
+    $rm_pose := asset.sample_trs_pose(1, 0.2) or >>
+    rm_delta := anim.extract_root_motion(&asset, 1, 0.8, 0.2, true, 1, $&rm_pose, true, false) or >>
+    // Over 0.4s of cycle (0.8->1.0 + 0.0->0.2), +Z delta = 0.4 * 2.0 = 0.8m; X/Z locked back to rest (0, 1, 0)!
+    assert(math.abs(rm_delta.delta_translation.z - 0.8) < 0.01)
+    assert(math.abs(rm_pose[1].translation.z) < 0.0001)
+
+    // 5A. Analytic Two-Bone IK (UpperArm(4) -> Forearm(5) -> Hand(6), target below-right (2.0, 1.0, 0.0), pole forward +Z):
+    $ik_pose := asset.sample_trs_pose(-1, 0.0) or >>
+    target_2b := fm.vec3(2.0, 1.0, 0.0)
+    pole_2b := fm.vec3(1.5, 1.5, 2.0)
+    anim.solve_two_bone_ik(&asset, $&ik_pose, 4, 5, 6, target_2b, pole_2b, 1.0) or >>
+    p_upper := world_pos_of(&asset, &ik_pose, 4)
+    p_elbow := world_pos_of(&asset, &ik_pose, 5)
+    p_hand := world_pos_of(&asset, &ik_pose, 6)
+    err_2b := p_hand.sub(target_2b).length()
+    assert(err_2b < 0.002)
+    assert(math.abs(p_elbow.sub(p_upper).length() - 1.0) < 0.001)
+    assert(math.abs(p_hand.sub(p_elbow).length() - 1.0) < 0.001)
+    assert(p_elbow.z > 0.3) // bent strictly toward +Z pole!
+
+    // 5B. Look-At IK (Head=3 looking from +Z toward (+2, +3, +2), and clamped 45deg against behind-head target):
+    $la_pose := asset.sample_trs_pose(-1, 0.0) or >>
+    anim.solve_look_at_ik(&asset, $&la_pose, 3, fm.vec3(0.0, 0.0, 1.0), fm.vec3(2.0, 3.0, 2.0), 1.57, 1.0) or >>
+    la_locals := asset.local_matrices_from_trs(&la_pose) or >>
+    la_worlds := asset.world_pose(&la_locals) or >>
+    head_q := anim.mat4_rotation_quat(la_worlds[3])
+    head_fwd := anim.quat_rotate_vec3(head_q, fm.vec3(0.0, 0.0, 1.0))
+    want_fwd := fm.vec3(2.0, 0.0, 2.0).normalized() or >>
+    assert(head_fwd.dot(want_fwd) > 0.999)
+
+    $la_clamp := asset.sample_trs_pose(-1, 0.0) or >>
+    max_rad := 0.7853981633974483 // 45 deg
+    anim.solve_look_at_ik(&asset, $&la_clamp, 3, fm.vec3(0.0, 0.0, 1.0), fm.vec3(0.0, 3.0, -5.0), max_rad, 1.0) or >>
+    lac_l := asset.local_matrices_from_trs(&la_clamp) or >>
+    lac_w := asset.world_pose(&lac_l) or >>
+    clamp_fwd := anim.quat_rotate_vec3(anim.mat4_rotation_quat(lac_w[3]), fm.vec3(0.0, 0.0, 1.0))
+    assert(math.abs(clamp_fwd.dot(fm.vec3(0.0, 0.0, 1.0)) - math.cos(max_rad)) < 0.002)
+
+    // 5C. Multi-Joint FABRIK IK (4-joint chain Spine(2) -> UpperArm(4) -> Forearm(5) -> Hand(6)):
+    $fab_pose := asset.sample_trs_pose(-1, 0.0) or >>
+    target_fab := fm.vec3(2.2, 3.3, 0.6)
+    chain_fab := [2, 4, 5, 6]
+    anim.solve_fabrik_ik(&asset, $&fab_pose, &chain_fab, target_fab, 24, 0.001, 1.0) or >>
+    p_hand_fab := world_pos_of(&asset, &fab_pose, 6)
+    err_fab := p_hand_fab.sub(target_fab).length()
+    assert(err_fab < 0.005)
+
+    // 6. MorphSet3D BlendShapes + Real Metal GPU Render (IK-posed SkinnedMesh3D + Morphed Mesh3D):
+    morph_base := build_morph_quad() or >>
+    $ms := anim.new_morph_set_3d(morph_base) or >>
+    zero_ns := []fm.Vec3{}
+    d_expand := [fm.vec3(-0.4, -0.4, 0.0), fm.vec3(0.4, -0.4, 0.0), fm.vec3(0.4, 0.4, 0.0), fm.vec3(-0.4, 0.4, 0.0)]
+    d_lift := [fm.vec3(0.0, 0.0, 0.2), fm.vec3(0.0, 0.0, 0.2), fm.vec3(0.0, 0.0, 0.2), fm.vec3(0.0, 0.0, 0.2)]
+    ms.add_target("expand", &d_expand, &zero_ns) or >>
+    ms.add_target("lift", &d_lift, &zero_ns) or >>
+    morph_w := [0.5, 1.0]
+    morphed_data := ms.evaluate(&morph_w) or >>
+    // Vertex 1 shifted (+0.2, -0.2, +0.2) from (0.6, -0.6, 0.0) -> (0.8, -0.8, 0.2)!
+    morph_dx := math.abs(morphed_data.vertices[1].position.x - 0.8)
+    morph_dz := math.abs(morphed_data.vertices[1].position.z - 0.2)
+    assert(morph_dx < 1e-6 && morph_dz < 1e-6)
+
+    // Metal GPU render check: pose arm quad with Two-Bone IK palette & render alongside Morphed quad!
+    mesh_prog := shd.load_mesh("build/mesh-shaders") or >>
+    skin_prog := shd.load_skin_program("build/mesh-shaders") or >>
+    $device := ren.open_3d("Skeletal Anim + IK + Morph GPU", 96, 96, gpu.METAL, &mesh_prog) or >>
+    $skin_pipe := device.skin_pipeline(&skin_prog) or >>
+
+    arm_rest := build_arm_mesh_data() or >>
+    $arm_joints := []int{}
+    $arm_weights := []f64{}
+    for _ in 0:4 {
+        // Bind all 4 arm vertices to joint slot 3 (node 5 = Forearm in [1,2,4,5,6]).
+        arm_joints.push(3)
+        arm_joints.push(0)
+        arm_joints.push(0)
+        arm_joints.push(0)
+        arm_weights.push(1.0)
+        arm_weights.push(0.0)
+        arm_weights.push(0.0)
+        arm_weights.push(0.0)
+    }
+    $bboxes := []fm.Aabb3{}
+    $bused := []bool{}
+    arm_box := fm.aabb3(fm.vec3(1.5, 1.2, -0.5), fm.vec3(3.3, 2.8, 0.5)) or >>
+    for j in 0:5 {
+        bboxes.push(arm_box)
+        bused.push(j == 3)
+    }
+    $arm_skinned := device.upload_skinned_mesh(&arm_rest, &arm_joints, &arm_weights, 5, &bboxes, &bused) or >>
+    $morph_gpu := device.upload(&morphed_data) or >>
+
+    ik_locals := asset.local_matrices_from_trs(&ik_pose) or >>
+    ik_worlds := asset.world_pose(&ik_locals) or >>
+    ik_palette := asset.skin_palette(7, &ik_worlds) or >>
+    arm_ref := arm_skinned.pose(&device, &skin_pipe, &ik_palette) or >>
+
+    eye := fm.vec3(1.0, 1.2, 5.5)
+    view := nexus.look_at_3d(eye, fm.vec3(1.0, 1.2, 0.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+    vp := (nexus.perspective_3d(0.9, 1.0, 0.25, 40.0) or >>).multiply(view)
+    sun_dir := fm.vec3(0.0, 0.2, 1.0).normalized() or >>
+    sun := lights.directional(sun_dir, fm.vec3(2.4, 2.4, 2.4)) or >>
+    env := lights.environment(fm.vec3(0.2, 0.2, 0.25), eye, 1.0, [sun]) or >>
+    mat_arm := ren.material_3d(fm.vec3(0.95, 0.35, 0.2), 0.0, 0.7, fm.vec3(0.0, 0.0, 0.0)) or >>
+    mat_morph := ren.material_3d(fm.vec3(0.2, 0.75, 0.95), 0.0, 0.7, fm.vec3(0.0, 0.0, 0.0)) or >>
+
+    device.begin(255) or >>
+    device.draw_material_reference(arm_ref, fm.identity_3d(), vp, &mat_arm, &env) or >>
+    device.draw_material(&morph_gpu, fm.translation_3d(fm.vec3(-0.3, 1.2, 0.0)), vp, &mat_morph, &env) or >>
+    $arm_hits := 0
+    $morph_hits := 0
+    for y in 10:86 {
+        for x in 10:86 {
+            px := device.read_pixel(x, y) or >>
+            if ch_r(px) > ch_b(px) + 40 { arm_hits += 1 }
+            if ch_b(px) > ch_r(px) + 40 { morph_hits += 1 }
+        }
+    }
+    device.present() or >>
+    assert(arm_hits > 20 && morph_hits > 20)
+
+    morph_gpu.close() or >>
+    arm_skinned.close() or >>
+    skin_pipe.close() or >>
+    device.close() or >>
+
+    err_2b_mm := int(math.round_to_even(err_2b * 1000.0))
+    err_fab_mm := int(math.round_to_even(err_fab * 1000.0))
+    rm_cm := int(math.round_to_even(rm_delta.delta_translation.z * 100.0))
+    println("PASS: ASM + BlendSpace1D/2D + BoneMask/Additive + RootMotion(" + str(rm_cm) +
+        "cm) + TwoBoneIK(err=" + str(err_2b_mm) + "mm) + LookAt + FABRIK(err=" + str(err_fab_mm) +
+        "mm) + MorphSet3D + Metal GPU(arm=" + str(arm_hits) + ", morph=" + str(morph_hits) + ")")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

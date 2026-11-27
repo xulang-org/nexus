@@ -1,0 +1,165 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+resource #"github.com/xulang-org/nexus/resources/scene"
+codec #"github.com/xulang-org/nexus/formats/scene"
+sc_int #"github.com/xulang-org/nexus/integration/scene"
+nexus #"github.com/xulang-org/nexus/scene"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#crypto/sha256
+#errors
+#math
+#os
+#path/filepath
+#strings
+
+fn assert(ok bool, msg string) int {
+    if !ok { >> errors.new("scene_prefab_runtime_checks: " + msg) }
+    << 0
+}
+
+fn clean_dir(path string) int {
+    os.remove_all(path) or (err) {
+        _ := err.msg()
+        << 0
+    }
+    << 0
+}
+
+fn try_instantiate(doc &resource.Document, dir string, tree $&nexus.SceneTree, parent int, name string) string {
+    _ := sc_int.instantiate_with_prefabs(doc, dir, tree, parent, name) or (err) {
+        << err.msg()
+    }
+    << ""
+}
+
+fn write_scene_doc(dir string, rel string, doc &resource.Document) resource.ResourceReference {
+    encoded := codec.encode(doc) or >>
+    full := filepath.join([dir + "", rel + ""])
+    os.mkdir_all(filepath.dir(&full)) or >>
+    snapshot.write_atomic(full + "", &encoded) or >>
+    digest := sha256.sum256(encoded + "")
+    << resource.ResourceReference{
+        uid: digest[0:32],
+        kind: "scene_file",
+        path: rel + "",
+        content_hash: digest
+    }
+}
+
+fn run() int {
+    tmp_dir := "build/prefab-runtime-tmp"
+    clean_dir(tmp_dir + "")
+    os.mkdir_all(tmp_dir + "") or >>
+
+    // Level 2 leaf prefab: barrel.xuscene (Muzzle child with non-identity scale).
+    $b0 := resource.node(-1, "Barrel", resource.NODE_3D)
+    $b1 := resource.node(0, "Muzzle", resource.NODE_3D)
+    b1.local_3d = fm.translation_3d(fm.vec3(0.0, 0.0, -1.0)).multiply(fm.scale_3d(fm.vec3(2.0, 2.0, 2.0)))
+    barrel_doc := resource.make_document([b0, b1]) or >>
+    $barrel_ref := write_scene_doc(tmp_dir + "", "prefabs/barrel.xuscene", &barrel_doc) or >>
+    // Referenced relative to prefabs/turret.xuscene directory:
+    barrel_ref.path = "barrel.xuscene"
+
+    // Level 1 prefab: turret.xuscene referencing barrel.xuscene.
+    $t0 := resource.node(-1, "Turret", resource.NODE_3D)
+    $t1 := resource.node(0, "BarrelMount", resource.NODE_3D)
+    $t2 := resource.node(0, "Shield", resource.NODE_3D)
+    turret_base := resource.make_document([t0, t1, t2]) or >>
+    barrel_pf := resource.prefab_instance_attachment(1, barrel_ref.uid + "", []resource.PrefabOverride{})
+    turret_doc := resource.with_modern_attachments(
+        &turret_base,
+        [barrel_ref],
+        []resource.Surface{}, []resource.AudioBus{}, []resource.AudioEmitter{},
+        []resource.ScriptAttachment{}, []resource.ScriptConnection{}, []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{}, []resource.TileMap2DAttachment{},
+        []resource.EnvironmentAttachment{}, []resource.RigidBody3DAttachment{},
+        []resource.Joint3DAttachment{}, []resource.TerrainAttachment{},
+        []resource.ParticleEmitter3DAttachment{}, [barrel_pf]
+    ) or >>
+    turret_ref := write_scene_doc(tmp_dir + "", "prefabs/turret.xuscene", &turret_doc) or >>
+
+    // Level 0 root world referencing turret.xuscene with overrides.
+    $w0 := resource.node(-1, "World", resource.NODE_3D)
+    $w1 := resource.node(0, "TurretSlot", resource.NODE_3D)
+    world_base := resource.make_document([w0, w1]) or >>
+    ov_shield := resource.PrefabOverride{
+        target_path: "Shield",
+        visible_set: true,
+        visible: false,
+        position_set: false,
+        position: fm.vec3(0.0, 0.0, 0.0)
+    }
+    ov_muzzle := resource.PrefabOverride{
+        target_path: "BarrelMount/Prefab_0_BarrelMount/Muzzle",
+        visible_set: false,
+        visible: true,
+        position_set: true,
+        position: fm.vec3(3.0, 4.0, -5.0)
+    }
+    turret_pf := resource.prefab_instance_attachment(1, turret_ref.uid + "", [ov_shield, ov_muzzle])
+    world_doc := resource.with_modern_attachments(
+        &world_base,
+        [turret_ref],
+        []resource.Surface{}, []resource.AudioBus{}, []resource.AudioEmitter{},
+        []resource.ScriptAttachment{}, []resource.ScriptConnection{}, []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{}, []resource.TileMap2DAttachment{},
+        []resource.EnvironmentAttachment{}, []resource.RigidBody3DAttachment{},
+        []resource.Joint3DAttachment{}, []resource.TerrainAttachment{},
+        []resource.ParticleEmitter3DAttachment{}, [turret_pf]
+    ) or >>
+
+    $tree := nexus.new_scene_tree_3d("PrefabTest", 64) or >>
+    world_root := tree.root()
+    res := sc_int.instantiate_with_prefabs(&world_doc, tmp_dir + "", $&tree, world_root, "Level") or >>
+    assert(res.spawned_prefabs == 2, "spawned 2 nested prefabs") or >>
+    assert(res.applied_overrides == 2, "applied 2 overrides") or >>
+
+    turret_root := sc_int.resolve_node_path(&tree, res.root_id, "TurretSlot/Prefab_0_TurretSlot") or >>
+    shield_id := sc_int.resolve_node_path(&tree, turret_root, "Shield") or >>
+    muzzle_id := sc_int.resolve_node_path(&tree, turret_root, "BarrelMount/Prefab_0_BarrelMount/Muzzle") or >>
+    assert(!(tree.is_visible(shield_id) or >>), "Shield visibility overridden to false") or >>
+    muzzle_n3 := tree.node_3d(muzzle_id) or >>
+    assert(math.abs(muzzle_n3.transform.c3.x - 3.0) < 1e-6 && math.abs(muzzle_n3.transform.c3.y - 4.0) < 1e-6, "Muzzle position overridden") or >>
+    assert(math.abs(muzzle_n3.transform.c0.x - 2.0) < 1e-6, "Muzzle scale preserved during position override") or >>
+
+    // 2. Tampered prefab fails SHA-256 check.
+    bad_bytes := "{\"tampered\":true}"
+    snapshot.write_atomic(filepath.join([tmp_dir + "", "prefabs/barrel.xuscene"]), &bad_bytes) or >>
+    err_hash := try_instantiate(&world_doc, tmp_dir + "", $&tree, world_root, "BadHash")
+    assert(strings.contains(&err_hash, "content_hash"), "tampered prefab rejected: " + err_hash) or >>
+
+    // 3. Cyclic prefab cycle is rejected cleanly without stack overflow.
+    uid_b := "22222222222222222222222222222222"
+    dummy_hash := "0000000000000000000000000000000000000000000000000000000000000000"
+    b_self_ref := resource.ResourceReference{uid: uid_b + "", kind: "scene_file", path: "cyc_b.xuscene", content_hash: dummy_hash + ""}
+    b_base := resource.make_document([resource.node(-1, "B", resource.NODE_3D)]) or >>
+    b_doc := resource.with_modern_attachments(&b_base, [b_self_ref], []resource.Surface{}, []resource.AudioBus{},
+        []resource.AudioEmitter{}, []resource.ScriptAttachment{}, []resource.ScriptConnection{}, []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{}, []resource.TileMap2DAttachment{}, []resource.EnvironmentAttachment{},
+        []resource.RigidBody3DAttachment{}, []resource.Joint3DAttachment{}, []resource.TerrainAttachment{},
+        []resource.ParticleEmitter3DAttachment{}, [resource.prefab_instance_attachment(0, uid_b + "", []resource.PrefabOverride{})]) or >>
+    ref_b := write_scene_doc(tmp_dir + "", "cyc_b.xuscene", &b_doc) or >>
+    ref_b_uid := ref_b.uid + ""
+    a_base := resource.make_document([resource.node(-1, "A", resource.NODE_3D)]) or >>
+    a_doc := resource.with_modern_attachments(&a_base, [ref_b], []resource.Surface{}, []resource.AudioBus{},
+        []resource.AudioEmitter{}, []resource.ScriptAttachment{}, []resource.ScriptConnection{}, []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{}, []resource.TileMap2DAttachment{}, []resource.EnvironmentAttachment{},
+        []resource.RigidBody3DAttachment{}, []resource.Joint3DAttachment{}, []resource.TerrainAttachment{},
+        []resource.ParticleEmitter3DAttachment{}, [resource.prefab_instance_attachment(0, ref_b_uid, []resource.PrefabOverride{})]) or >>
+
+    err_cyc := try_instantiate(&a_doc, tmp_dir + "", $&tree, world_root, "CycleRoot")
+    assert(strings.contains(&err_cyc, "cyclic"), "cyclic prefab rejected: " + err_cyc) or >>
+
+    os.remove_all(tmp_dir + "") or >>
+    println("PASS: scene_prefab_runtime_checks")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

@@ -27,10 +27,17 @@ pub struct Renderer2D {
     copyings []gpu.GraphicsPipeline
     sdf_pipelines []gpu.GraphicsPipeline
     text_pipelines []gpu.GraphicsPipeline
+    lighting_pipelines []gpu.GraphicsPipeline
+    flat_normals []gpu.Texture
+    bloom_pipelines []gpu.GraphicsPipeline
+    bloom_temps []gpu.Texture
     batch_pool GpuVertexPool
     sdf_pool GpuVertexPool
     sdf_enabled bool
     text_enabled bool
+    lighting_enabled bool
+    bloom_enabled bool
+    active_target int
     owner int
     surface_format int
     target_width int
@@ -94,8 +101,10 @@ fn open_2d_session(session present.Session, program &ShaderProgram2D, enable_sdf
             targets: [target], whites: [white], nearests: [nearest], linears: [linear],
             drawings: [draw_pipe], copyings: [copy_pipe], sdf_pipelines: []gpu.GraphicsPipeline{},
             text_pipelines: []gpu.GraphicsPipeline{},
+            lighting_pipelines: []gpu.GraphicsPipeline{}, flat_normals: []gpu.Texture{},
+            bloom_pipelines: []gpu.GraphicsPipeline{}, bloom_temps: []gpu.Texture{},
             batch_pool: new_vertex_pool(), sdf_pool: new_vertex_pool(),
-            sdf_enabled: false, text_enabled: false,
+            sdf_enabled: false, text_enabled: false, lighting_enabled: false, bloom_enabled: false, active_target: 0,
             owner: owner, surface_format: format,
             target_width: state.pixel_width, target_height: state.pixel_height,
             frame_vertices: 0, clip_x: 0, clip_y: 0,
@@ -114,8 +123,11 @@ fn open_2d_session(session present.Session, program &ShaderProgram2D, enable_sdf
         targets: []gpu.Texture{}, whites: []gpu.Texture{}, nearests: []gpu.Sampler{}, linears: []gpu.Sampler{},
         drawings: []gpu.GraphicsPipeline{}, copyings: []gpu.GraphicsPipeline{}, sdf_pipelines: []gpu.GraphicsPipeline{},
         text_pipelines: []gpu.GraphicsPipeline{},
+        lighting_pipelines: []gpu.GraphicsPipeline{}, flat_normals: []gpu.Texture{},
+        bloom_pipelines: []gpu.GraphicsPipeline{}, bloom_temps: []gpu.Texture{},
         batch_pool: new_vertex_pool(), sdf_pool: new_vertex_pool(),
         sdf_enabled: enable_sdf_default, text_enabled: enable_sdf_default,
+        lighting_enabled: false, bloom_enabled: false, active_target: 0,
         owner: owner, surface_format: 0,
         target_width: w, target_height: h,
         frame_vertices: 0, clip_x: 0, clip_y: 0, clip_width: w, clip_height: h,
@@ -231,13 +243,29 @@ pub fn (renderer $&Renderer2D) begin(background int) int {
                 (state.pixel_width != renderer.target_width || state.pixel_height != renderer.target_height) {
                 dev := renderer.session.gpu_device() or >>
                 replacement := target_texture(dev, state.pixel_width, state.pixel_height) or >>
-                old_target := $&renderer.targets[0]
-                old_target.close() or >>
-                renderer.targets = [replacement]
+                $new_targets := [replacement]
+                if renderer.lighting_enabled || renderer.bloom_enabled {
+                    extra := target_texture(dev, state.pixel_width, state.pixel_height) or >>
+                    new_targets.push(extra)
+                }
+                for ti in 0:renderer.targets.len {
+                    old_target := $&renderer.targets[ti]
+                    old_target.close() or >>
+                }
+                renderer.targets = new_targets
+                if renderer.bloom_enabled {
+                    for bi in 0:renderer.bloom_temps.len {
+                        old_bt := $&renderer.bloom_temps[bi]
+                        old_bt.close() or >>
+                    }
+                    bt := target_texture(dev, state.pixel_width, state.pixel_height) or >>
+                    renderer.bloom_temps = [bt]
+                }
                 renderer.target_width = state.pixel_width
                 renderer.target_height = state.pixel_height
             }
         }
+        renderer.active_target = 0
         pool_next_frame($&renderer.batch_pool) or >>
         pool_next_frame($&renderer.sdf_pool) or >>
         dev := renderer.session.gpu_device() or >>
@@ -306,7 +334,8 @@ fn draw_renderer_solid_gpu(renderer $&Renderer2D, batch &canvas.Batch2D) int {
     bytes := vertex_bytes(batch) or >>
     uploaded := upload_renderer_pool(renderer, false, &bytes, count) or >>
     dev := renderer.session.gpu_device() or >>
-    << draw_target_slice(dev, &renderer.batch_pool, uploaded, &renderer.targets[0], &renderer.drawings[0],
+    tidx := renderer.active_target
+    << draw_target_slice(dev, &renderer.batch_pool, uploaded, &renderer.targets[tidx], &renderer.drawings[0],
         true, &renderer.nearests[0], &renderer.whites[0], renderer.target_width, renderer.target_height,
         renderer.clip_x, renderer.clip_y, renderer.clip_width, renderer.clip_height) or >>
 }
@@ -318,12 +347,13 @@ fn draw_renderer_textured_gpu(renderer $&Renderer2D, tex &gpu.Texture,
     bytes := vertex_bytes(batch) or >>
     uploaded := upload_renderer_pool(renderer, false, &bytes, count) or >>
     dev := renderer.session.gpu_device() or >>
+    tidx := renderer.active_target
     if linear {
-        << draw_target_slice(dev, &renderer.batch_pool, uploaded, &renderer.targets[0], &renderer.drawings[0],
+        << draw_target_slice(dev, &renderer.batch_pool, uploaded, &renderer.targets[tidx], &renderer.drawings[0],
             true, &renderer.linears[0], tex, renderer.target_width, renderer.target_height,
             renderer.clip_x, renderer.clip_y, renderer.clip_width, renderer.clip_height) or >>
     }
-    << draw_target_slice(dev, &renderer.batch_pool, uploaded, &renderer.targets[0], &renderer.drawings[0],
+    << draw_target_slice(dev, &renderer.batch_pool, uploaded, &renderer.targets[tidx], &renderer.drawings[0],
         true, &renderer.nearests[0], tex, renderer.target_width, renderer.target_height,
         renderer.clip_x, renderer.clip_y, renderer.clip_width, renderer.clip_height) or >>
 }
@@ -334,7 +364,8 @@ fn draw_renderer_sdf_gpu(renderer $&Renderer2D, batch &canvas.SdfBatch) int {
     if vertex_count <= 0 { << 0 }
     uploaded := upload_renderer_pool(renderer, true, &bytes, vertex_count) or >>
     dev := renderer.session.gpu_device() or >>
-    << draw_target_slice(dev, &renderer.sdf_pool, uploaded, &renderer.targets[0], &renderer.sdf_pipelines[0],
+    tidx := renderer.active_target
+    << draw_target_slice(dev, &renderer.sdf_pool, uploaded, &renderer.targets[tidx], &renderer.sdf_pipelines[0],
         false, &renderer.nearests[0], &renderer.whites[0], renderer.target_width, renderer.target_height,
         renderer.clip_x, renderer.clip_y, renderer.clip_width, renderer.clip_height) or >>
 }
@@ -346,12 +377,13 @@ fn draw_renderer_text_gpu(renderer $&Renderer2D, tex &gpu.Texture,
     bytes := vertex_bytes(batch) or >>
     uploaded := upload_renderer_pool(renderer, false, &bytes, count) or >>
     dev := renderer.session.gpu_device() or >>
+    tidx := renderer.active_target
     if linear {
-        << draw_target_slice(dev, &renderer.batch_pool, uploaded, &renderer.targets[0], &renderer.text_pipelines[0],
+        << draw_target_slice(dev, &renderer.batch_pool, uploaded, &renderer.targets[tidx], &renderer.text_pipelines[0],
             true, &renderer.linears[0], tex, renderer.target_width, renderer.target_height,
             renderer.clip_x, renderer.clip_y, renderer.clip_width, renderer.clip_height) or >>
     }
-    << draw_target_slice(dev, &renderer.batch_pool, uploaded, &renderer.targets[0], &renderer.text_pipelines[0],
+    << draw_target_slice(dev, &renderer.batch_pool, uploaded, &renderer.targets[tidx], &renderer.text_pipelines[0],
         true, &renderer.nearests[0], tex, renderer.target_width, renderer.target_height,
         renderer.clip_x, renderer.clip_y, renderer.clip_width, renderer.clip_height) or >>
 }
@@ -520,18 +552,26 @@ pub fn (renderer $&Renderer2D) close() int {
     err_msg = first_err(err_msg, close_pool_err($&renderer.sdf_pool))
     for i in 0:renderer.sdf_pipelines.len { err_msg = first_err(err_msg, close_pipeline_err($&renderer.sdf_pipelines[i])) }
     for i in 0:renderer.text_pipelines.len { err_msg = first_err(err_msg, close_pipeline_err($&renderer.text_pipelines[i])) }
+    for i in 0:renderer.lighting_pipelines.len { err_msg = first_err(err_msg, close_pipeline_err($&renderer.lighting_pipelines[i])) }
+    for i in 0:renderer.bloom_pipelines.len { err_msg = first_err(err_msg, close_pipeline_err($&renderer.bloom_pipelines[i])) }
     for i in 0:renderer.drawings.len { err_msg = first_err(err_msg, close_pipeline_err($&renderer.drawings[i])) }
     for i in 0:renderer.copyings.len { err_msg = first_err(err_msg, close_pipeline_err($&renderer.copyings[i])) }
     for i in 0:renderer.targets.len { err_msg = first_err(err_msg, close_texture_err($&renderer.targets[i])) }
+    for i in 0:renderer.bloom_temps.len { err_msg = first_err(err_msg, close_texture_err($&renderer.bloom_temps[i])) }
     for i in 0:renderer.whites.len { err_msg = first_err(err_msg, close_texture_err($&renderer.whites[i])) }
+    for i in 0:renderer.flat_normals.len { err_msg = first_err(err_msg, close_texture_err($&renderer.flat_normals[i])) }
     for i in 0:renderer.nearests.len { err_msg = first_err(err_msg, close_sampler_err($&renderer.nearests[i])) }
     for i in 0:renderer.linears.len { err_msg = first_err(err_msg, close_sampler_err($&renderer.linears[i])) }
     renderer.sdf_pipelines = []gpu.GraphicsPipeline{}
     renderer.text_pipelines = []gpu.GraphicsPipeline{}
+    renderer.lighting_pipelines = []gpu.GraphicsPipeline{}
+    renderer.bloom_pipelines = []gpu.GraphicsPipeline{}
     renderer.drawings = []gpu.GraphicsPipeline{}
     renderer.copyings = []gpu.GraphicsPipeline{}
     renderer.targets = []gpu.Texture{}
+    renderer.bloom_temps = []gpu.Texture{}
     renderer.whites = []gpu.Texture{}
+    renderer.flat_normals = []gpu.Texture{}
     renderer.nearests = []gpu.Sampler{}
     renderer.linears = []gpu.Sampler{}
     err_msg = first_err(err_msg, close_session($&renderer.session))

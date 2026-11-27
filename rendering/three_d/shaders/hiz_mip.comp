@@ -1,0 +1,41 @@
+#version 450
+
+layout(set = 0, binding = 0) uniform sampler2D src_hiz;
+layout(set = 1, binding = 0, r32f) uniform writeonly image2D dst_hiz;
+
+layout(set = 2, binding = 0, std140) uniform HizParams {
+    uint sw;
+    uint sh;
+    uint dw;
+    uint dh;
+} params;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= params.dw || gid.y >= params.dh) return;
+
+    float fdx = float(gid.x);
+    float fdy = float(gid.y);
+    float fdw = float(params.dw);
+    float fdh = float(params.dh);
+    float fsw = float(params.sw);
+    float fsh = float(params.sh);
+
+    int sx0 = clamp(int(floor((fdx / fdw) * fsw)), 0, int(params.sw) - 1);
+    int sx1 = clamp(int(floor(((fdx + 1.0) / fdw) * fsw - 1e-5)), sx0, int(params.sw) - 1);
+    int sy0 = clamp(int(floor((fdy / fdh) * fsh)), 0, int(params.sh) - 1);
+    int sy1 = clamp(int(floor(((fdy + 1.0) / fdh) * fsh - 1e-5)), sy0, int(params.sh) - 1);
+
+    float min_d = 1.0;
+    vec2 inv_src = vec2(1.0 / fsw, 1.0 / fsh);
+    for (int y = sy0; y <= sy1; ++y) {
+        for (int x = sx0; x <= sx1; ++x) {
+            vec2 uv = (vec2(float(x), float(y)) + 0.5) * inv_src;
+            float d = textureLod(src_hiz, uv, 0.0).r;
+            min_d = min(min_d, d);
+        }
+    }
+    imageStore(dst_hiz, ivec2(gid), vec4(min_d, 0.0, 0.0, 1.0));
+}

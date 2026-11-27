@@ -1,0 +1,225 @@
+@main
+
+#gpu
+#math
+#time
+fm #"github.com/xulang-org/nexus/foundation/math"
+mesh #"github.com/xulang-org/nexus/resources/mesh"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+nexus #"github.com/xulang-org/nexus/scene"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+
+fn quad_mesh_data(w f64, h f64) mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    n := fm.vec3(0.0, 0.0, 1.0)
+    for xy in [fm.vec2(-w, -h), fm.vec2(w, -h), fm.vec2(w, h), fm.vec2(-w, h)] {
+        d.vertex_lit(fm.vec3(xy.x, xy.y, 0.0), 4294967295, n) or >>
+    }
+    d.triangle(0, 1, 2) or >>
+    d.triangle(0, 2, 3) or >>
+    d.validate() or >>
+    << d
+}
+
+fn prism_mesh_data(r f64) mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    n := fm.vec3(0.0, 0.2, 1.0).normalized() or >>
+    d.vertex_lit(fm.vec3(-r, -r, r), 4294967295, n) or >>
+    d.vertex_lit(fm.vec3(r, -r, r), 4294967295, n) or >>
+    d.vertex_lit(fm.vec3(0.0, r, r), 4294967295, n) or >>
+    d.vertex_lit(fm.vec3(0.0, 0.0, -r), 4294967295, fm.vec3(0.0, 0.0, -1.0)) or >>
+    d.triangle(0, 1, 2) or >>
+    d.triangle(0, 2, 3) or >>
+    d.triangle(1, 3, 2) or >>
+    d.triangle(0, 3, 1) or >>
+    d.validate() or >>
+    << d
+}
+
+fn ch_r(c int) int { << (c >> 24) & 255 }
+fn ch_g(c int) int { << (c >> 16) & 255 }
+fn ch_b(c int) int { << (c >> 8) & 255 }
+
+fn run() int {
+    program := shaders.load_mesh("build/mesh-shaders") or >>
+    cprog := shaders.load_clustered_program("build/mesh-shaders") or >>
+    iprog := shaders.load_indirect_program("build/mesh-shaders") or >>
+
+    $device := ren.open_3d("Indirect Hi-Z checks", 128, 128, gpu.METAL, &program) or >>
+    $clustered := device.clustered_renderer(&cprog) or >>
+    $hiz := device.hiz_pyramid(&iprog) or >>
+    assert(hiz.level_count() == 7) // 64, 32, 16, 8, 4, 2, 1
+
+    $indirect := device.indirect_scene(&iprog) or >>
+
+    // Two distinct mesh prototypes in mega-buffers.
+    m_quad := indirect.add_mesh(&quad_mesh_data(0.35, 0.35) or >>) or >>
+    m_prism := indirect.add_mesh(&prism_mesh_data(0.35) or >>) or >>
+    assert(m_quad == 0 && m_prism == 1)
+
+    // Three distinct PBR materials.
+    mat_red := indirect.add_material(&ren.material_3d(fm.vec3(0.95, 0.12, 0.10), 0.0, 0.7, fm.vec3(0.05, 0.0, 0.0)) or >>) or >>
+    mat_green := indirect.add_material(&ren.material_3d(fm.vec3(0.10, 0.95, 0.15), 0.0, 0.7, fm.vec3(0.0, 0.05, 0.0)) or >>) or >>
+    mat_blue := indirect.add_material(&ren.material_3d(fm.vec3(0.12, 0.20, 0.95), 0.1, 0.5, fm.vec3(0.0, 0.0, 0.05)) or >>) or >>
+
+    // Camera looking from z=+6 toward origin.
+    eye := fm.vec3(0.0, 0.0, 6.0)
+    view := nexus.look_at_3d(eye, fm.vec3(0.0, 0.0, 0.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+    z_near := 0.5
+    z_far := 80.0
+    proj := nexus.perspective_3d(0.9, 1.0, z_near, z_far) or >>
+    vp := proj.multiply(view)
+
+    // Group A (10 visible instances): outside wall coverage on left/right/top flanks at z=0.5..1.5.
+    $vis_ids := []int{}
+    for i in 0:10 {
+        $x := -2.2
+        if i % 2 == 1 { x = 2.2 }
+        y := -1.8 + f64(i / 2) * 0.9
+        $mid := m_quad
+        $mat_id := mat_red
+        if i % 2 == 1 {
+            mid = m_prism
+            mat_id = mat_green
+        }
+        id := indirect.add_instance(mid, mat_id, fm.translation_3d(fm.vec3(x, y, 0.8))) or >>
+        vis_ids.push(id)
+    }
+
+    // Group B (20 frustum-culled instances): far outside left/right/behind-camera/beyond-far.
+    $frustum_ids := []int{}
+    for i in 0:20 {
+        $pos := fm.vec3(400.0 + f64(i) * 5.0, 0.0, 0.0)
+        if i >= 5 && i < 10 { pos = fm.vec3(-400.0 - f64(i) * 5.0, 0.0, 0.0) }
+        if i >= 10 && i < 15 { pos = fm.vec3(0.0, 0.0, 12.0 + f64(i)) } // behind eye (z=+6)
+        if i >= 15 { pos = fm.vec3(0.0, 0.0, -150.0 - f64(i) * 5.0) }     // beyond far (z_far=80)
+        id := indirect.add_instance(m_prism, mat_blue, fm.translation_3d(pos)) or >>
+        frustum_ids.push(id)
+    }
+
+    // Group C (470 Hi-Z occluded instances): packed tightly at z=-3.0..-6.0 directly behind center wall!
+    // Wall spans [-1.6, 1.6] x [-1.6, 1.6] at z=+1.0 (camera at z=+6 -> wall spans ~ [-2.2, 2.2] at z=-3).
+    $occl_ids := []int{}
+    for i in 0:470 {
+        gx := f64(i % 20) * 0.06 - 0.57
+        gy := f64((i / 20) % 24) * 0.05 - 0.57
+        gz := -2.5 - f64(i / 100) * 0.4
+        $mid := m_quad
+        if i % 3 == 0 { mid = m_prism }
+        id := indirect.add_instance(mid, mat_blue, fm.translation_3d(fm.vec3(gx, gy, gz))) or >>
+        occl_ids.push(id)
+    }
+    assert(indirect.instance_count() == 500)
+    indirect.commit(&device) or >>
+
+    // Setup 64 clustered lights illuminating the scene.
+    $ls := []lights.Light3D{}
+    ls.push(lights.directional(fm.vec3(0.1, 0.2, 1.0).normalized() or >>, fm.vec3(1.8, 1.8, 1.8)) or >>)
+    for k in 0:63 {
+        px := -2.8 + f64(k % 9) * 0.7
+        py := -2.8 + f64(k / 9) * 0.8
+        ls.push(lights.point(fm.vec3(px, py, 2.8), fm.vec3(1.2, 1.2, 1.2), 5.0) or >>)
+    }
+    clustered.bin_lights(&device, fm.vec3(0.05, 0.05, 0.06), eye, 1.0, &ls, view, proj, z_near, z_far, 0) or >>
+
+    // Phase 1: Frustum cull only -> Group A and Group C visible, Group B frustum culled!
+    indirect.cull($&device, vp) or >>
+    res1 := indirect.readback_cull_results(&device) or >>
+    assert(res1.len == 500)
+    for id in vis_ids { assert(res1[id] == ren.INDIRECT_RESULT_VISIBLE) }
+    for id in frustum_ids { assert(res1[id] == ren.INDIRECT_RESULT_FRUSTUM_CULLED) }
+    for id in occl_ids { assert(res1[id] == ren.INDIRECT_RESULT_VISIBLE) }
+
+    // Upload standard occluder wall mesh (covers center of viewport at z=+1.0, grayscale matte).
+    wall_data := quad_mesh_data(1.6, 1.6) or >>
+    $wall_mesh := device.upload(&wall_data) or >>
+    wall_mat := ren.material_3d(fm.vec3(0.45, 0.45, 0.48), 0.0, 0.9, fm.vec3(0.0, 0.0, 0.0)) or >>
+    wall_world := fm.translation_3d(fm.vec3(0.0, 0.0, 1.0))
+
+    // Phase 2: Mid-frame Occluder -> Hi-Z -> Indirect Cull -> Single draw_indexed_indirect!
+    device.begin(255) or >>
+    // Draw occluder wall into Device3D depth+color using clustered shader!
+    clustered.draw_material($&device, &wall_mesh, wall_world, view, vp, &wall_mat) or >>
+    // Mid-frame Hi-Z pyramid construction & GPU-driven occlusion culling!
+    hiz.build_from_device($&device) or >>
+    t_cull0 := time.now()
+    indirect.cull_with_hiz($&device, &hiz, vp, 0.0001) or >>
+    t_cull_us := (time.now() - t_cull0) / 1000
+    // ONE GPU Multi-Draw Indirect call draws all surviving visible instances!
+    _ := indirect.draw($&device, &clustered, view, vp, true) or >>
+
+    center_px := device.read_pixel(64, 64) or >>
+    // Wall is neutral gray (~ equal R, G, B); blue occluded quads behind must NOT show!
+    assert(math.abs(f64(ch_r(center_px) - ch_b(center_px))) < 20.0 && ch_r(center_px) > 60)
+
+    // Verify visible Group A instances rasterized via draw_indexed_indirect on BOTH flanks:
+    // left flank has red quads (m_quad), right flank has green prisms (m_prism)!
+    $left_red_hits := 0
+    $right_green_hits := 0
+    for y in 24:104 {
+        for x in 4:24 {
+            px := device.read_pixel(x, y) or >>
+            if ch_r(px) > ch_g(px) + 60 && ch_r(px) > ch_b(px) + 60 { left_red_hits += 1 }
+        }
+        for x in 104:124 {
+            px := device.read_pixel(x, y) or >>
+            if ch_g(px) > ch_r(px) + 60 && ch_g(px) > ch_b(px) + 60 { right_green_hits += 1 }
+        }
+    }
+    assert(left_red_hits > 10 && right_green_hits > 10)
+
+    device.capture("build/indirect-hiz-scene.png") or >>
+    device.present() or >>
+
+    res2 := indirect.readback_cull_results(&device) or >>
+    $v_cnt := 0
+    $f_cnt := 0
+    $o_cnt := 0
+    for id in vis_ids {
+        assert(res2[id] == ren.INDIRECT_RESULT_VISIBLE)
+        v_cnt += 1
+    }
+    for id in frustum_ids {
+        assert(res2[id] == ren.INDIRECT_RESULT_FRUSTUM_CULLED)
+        f_cnt += 1
+    }
+    for id in occl_ids {
+        assert(res2[id] == ren.INDIRECT_RESULT_HIZ_OCCLUDED)
+        o_cnt += 1
+    }
+    assert(v_cnt == 10 && f_cnt == 20 && o_cnt == 470)
+
+    // Phase 3: Inter-frame Hi-Z reuse (build_from_device outside active frame) + reveal 5 moved instances!
+    hiz.build_from_device($&device) or >>
+    for k in 0:5 {
+        indirect.set_instance_transform(occl_ids[k], fm.translation_3d(fm.vec3(-2.3 + f64(k) * 0.2, 2.0, 0.8))) or >>
+    }
+    indirect.sync_instances(&device) or >>
+    indirect.cull_with_hiz($&device, &hiz, vp, 0.0001) or >>
+    res3 := indirect.readback_cull_results(&device) or >>
+    for k in 0:5 { assert(res3[occl_ids[k]] == ren.INDIRECT_RESULT_VISIBLE) }
+    for k in 5:occl_ids.len { assert(res3[occl_ids[k]] == ren.INDIRECT_RESULT_HIZ_OCCLUDED) }
+
+    // Render revealed frame cleanly.
+    device.begin(255) or >>
+    clustered.draw_material($&device, &wall_mesh, wall_world, view, vp, &wall_mat) or >>
+    _ := indirect.draw($&device, &clustered, view, vp, true) or >>
+    device.present() or >>
+
+    wall_mesh.close() or >>
+    indirect.close() or >>
+    hiz.close() or >>
+    clustered.close() or >>
+    device.close() or >>
+    println("PASS: GPU-Driven Indirect + Hi-Z Culling (500 instances, 64 clustered lights, 1 draw_indexed_indirect: visible=" +
+        str(v_cnt) + ", frustum_culled=" + str(f_cnt) + ", hiz_occluded=" + str(o_cnt) + ", midframe_cull=" + str(t_cull_us) + "us)")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

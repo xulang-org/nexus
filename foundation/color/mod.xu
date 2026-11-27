@@ -1,10 +1,261 @@
 @"github.com/xulang-org/nexus/foundation/color"
 
 #errors
+#math
+#strings
+
+pub const WHITE = (255 << 24) | (255 << 16) | (255 << 8) | 255
+pub const BLACK = 255
+pub const TRANSPARENT = 0
+pub const RED = (255 << 24) | 255
+pub const GREEN = (255 << 16) | 255
+pub const BLUE = (255 << 8) | 255
+pub const YELLOW = (255 << 24) | (255 << 16) | 255
+pub const CYAN = (255 << 16) | (255 << 8) | 255
+pub const MAGENTA = (255 << 24) | (255 << 8) | 255
+pub const ORANGE = (255 << 24) | (165 << 16) | 255
+pub const GRAY = (128 << 24) | (128 << 16) | (128 << 8) | 255
+
+pub struct ColorF {
+    pub r f64
+    pub g f64
+    pub b f64
+    pub a f64
+}
+
+pub struct HsvColor {
+    pub h f64
+    pub s f64
+    pub v f64
+    pub a f64
+}
 
 pub fn rgba8(red int, green int, blue int, alpha int) int {
     if red < 0 || red > 255 || green < 0 || green > 255 || blue < 0 || blue > 255 || alpha < 0 || alpha > 255 {
         >> errors.new("color component outside 0...255")
     }
     << (red << 24) | (green << 16) | (blue << 8) | alpha
+}
+
+pub fn rgba_f(r f64, g f64, b f64, a f64) ColorF {
+    << ColorF{r: r, g: g, b: b, a: a}
+}
+
+pub fn rgba8_r(c int) int { << (c >> 24) & 255 }
+pub fn rgba8_g(c int) int { << (c >> 16) & 255 }
+pub fn rgba8_b(c int) int { << (c >> 8) & 255 }
+pub fn rgba8_a(c int) int { << c & 255 }
+
+pub fn with_alpha(c int, alpha int) int {
+    if alpha < 0 || alpha > 255 { >> errors.new("color alpha outside 0...255") }
+    << rgba8(rgba8_r(c), rgba8_g(c), rgba8_b(c), alpha) or >>
+}
+
+fn clamp01(v f64) f64 {
+    if math.is_nan(v) || math.is_inf(v) { << 0.0 }
+    << math.max(0.0, math.min(1.0, v))
+}
+
+fn clamp_byte(v f64) int {
+    iv := int(math.round(clamp01(v) * 255.0))
+    if iv < 0 { << 0 }
+    if iv > 255 { << 255 }
+    << iv
+}
+
+pub fn to_rgba_f(c int) ColorF {
+    << ColorF{
+        r: f64(rgba8_r(c)) / 255.0,
+        g: f64(rgba8_g(c)) / 255.0,
+        b: f64(rgba8_b(c)) / 255.0,
+        a: f64(rgba8_a(c)) / 255.0
+    }
+}
+
+pub fn from_rgba_f(c ColorF) int {
+    << rgba8(clamp_byte(c.r), clamp_byte(c.g), clamp_byte(c.b), clamp_byte(c.a)) or >>
+}
+
+// IEC 61966-2-1 exact sRGB <-> Linear transfer functions.
+pub fn srgb_to_linear(v f64) f64 {
+    c := clamp01(v)
+    if c <= 0.04045 { << c / 12.92 }
+    << math.pow_f64((c + 0.055) / 1.055, 2.4)
+}
+
+pub fn linear_to_srgb(v f64) f64 {
+    c := clamp01(v)
+    if c <= 0.0031308 { << c * 12.92 }
+    << 1.055 * math.pow_f64(c, 1.0 / 2.4) - 0.055
+}
+
+pub fn color_srgb_to_linear(c ColorF) ColorF {
+    << ColorF{r: srgb_to_linear(c.r), g: srgb_to_linear(c.g), b: srgb_to_linear(c.b), a: clamp01(c.a)}
+}
+
+pub fn color_linear_to_srgb(c ColorF) ColorF {
+    << ColorF{r: linear_to_srgb(c.r), g: linear_to_srgb(c.g), b: linear_to_srgb(c.b), a: clamp01(c.a)}
+}
+
+pub fn from_hsv(h f64, s f64, v f64, a f64) ColorF {
+    if math.is_nan(h) || math.is_inf(h) { << ColorF{r: 0.0, g: 0.0, b: 0.0, a: clamp01(a)} }
+    $hue := h - math.floor(h / 360.0) * 360.0
+    if hue < 0.0 { hue = hue + 360.0 }
+    sat := clamp01(s)
+    val := clamp01(v)
+    alpha := clamp01(a)
+    c := val * sat
+    h_sec := hue / 60.0
+    x := c * (1.0 - math.abs((h_sec - math.floor(h_sec / 2.0) * 2.0) - 1.0))
+    m := val - c
+    $r := 0.0
+    $g := 0.0
+    $b := 0.0
+    if h_sec < 1.0 {
+        r = c
+        g = x
+    } else if h_sec < 2.0 {
+        r = x
+        g = c
+    } else if h_sec < 3.0 {
+        g = c
+        b = x
+    } else if h_sec < 4.0 {
+        g = x
+        b = c
+    } else if h_sec < 5.0 {
+        r = x
+        b = c
+    } else {
+        r = c
+        b = x
+    }
+    << ColorF{r: r + m, g: g + m, b: b + m, a: alpha}
+}
+
+pub fn to_hsv(c ColorF) HsvColor {
+    r := clamp01(c.r)
+    g := clamp01(c.g)
+    b := clamp01(c.b)
+    mx := math.max(r, math.max(g, b))
+    mn := math.min(r, math.min(g, b))
+    delta := mx - mn
+    $h := 0.0
+    if delta > 1e-12 {
+        if mx == r {
+            h = 60.0 * ((g - b) / delta)
+            if h < 0.0 { h = h + 360.0 }
+        } else if mx == g {
+            h = 60.0 * (((b - r) / delta) + 2.0)
+        } else {
+            h = 60.0 * (((r - g) / delta) + 4.0)
+        }
+    }
+    $s := 0.0
+    if mx > 1e-12 { s = delta / mx }
+    << HsvColor{h: h, s: s, v: mx, a: clamp01(c.a)}
+}
+
+fn hex_nibble(ch int) int {
+    if ch >= 48 && ch <= 57 { << ch - 48 }
+    if ch >= 65 && ch <= 70 { << ch - 55 }
+    if ch >= 97 && ch <= 102 { << ch - 87 }
+    >> errors.new("nexus color: invalid hex digit")
+}
+
+fn hex_byte(s &string, idx int) int {
+    hi := hex_nibble(s[idx]) or >>
+    lo := hex_nibble(s[idx + 1]) or >>
+    << (hi << 4) | lo
+}
+
+fn slice_str(s &string, lo int, hi int) string {
+    $b := strings.new_byte_builder(hi - lo + 1)
+    for i in lo:hi {
+        b.write_byte(s[i])
+    }
+    << b.to_string()
+}
+
+// Parses #RGB, #RGBA, #RRGGBB, or #RRGGBBAA (with or without leading '#').
+pub fn from_hex(raw string) int {
+    trimmed := strings.trim_space(&raw)
+    $s := trimmed
+    if strings.has_prefix(&s, "#") {
+        s = slice_str(&s, 1, s.len)
+    }
+    if s.len == 3 || s.len == 4 {
+        r0 := hex_nibble(s[0]) or >>
+        g0 := hex_nibble(s[1]) or >>
+        b0 := hex_nibble(s[2]) or >>
+        $a0 := 15
+        if s.len == 4 { a0 = hex_nibble(s[3]) or >> }
+        << rgba8(r0 * 17, g0 * 17, b0 * 17, a0 * 17) or >>
+    }
+    if s.len == 6 || s.len == 8 {
+        r := hex_byte(&s, 0) or >>
+        g := hex_byte(&s, 2) or >>
+        b := hex_byte(&s, 4) or >>
+        $a := 255
+        if s.len == 8 { a = hex_byte(&s, 6) or >> }
+        << rgba8(r, g, b, a) or >>
+    }
+    >> errors.new("nexus color: hex string must have 3, 4, 6, or 8 digits")
+}
+
+fn nibble_char(v int) string {
+    digits := "0123456789ABCDEF"
+    idx := v & 15
+    $b := strings.new_byte_builder(2)
+    b.write_byte(digits[idx])
+    << b.to_string()
+}
+
+fn byte_to_hex(v int) string {
+    << nibble_char((v >> 4) & 15) + nibble_char(v & 15)
+}
+
+pub fn to_hex(rgba int, include_alpha bool) string {
+    $out := "#" + byte_to_hex(rgba8_r(rgba)) + byte_to_hex(rgba8_g(rgba)) + byte_to_hex(rgba8_b(rgba))
+    if include_alpha { out = out + byte_to_hex(rgba8_a(rgba)) }
+    << out
+}
+
+pub fn lerp_rgba8(a int, b int, t f64) int {
+    u := clamp01(t)
+    ca := to_rgba_f(a)
+    cb := to_rgba_f(b)
+    << from_rgba_f(ColorF{
+        r: ca.r + (cb.r - ca.r) * u,
+        g: ca.g + (cb.g - ca.g) * u,
+        b: ca.b + (cb.b - ca.b) * u,
+        a: ca.a + (cb.a - ca.a) * u
+    }) or >>
+}
+
+pub fn lerp_linear_rgba8(a int, b int, t f64) int {
+    u := clamp01(t)
+    la := color_srgb_to_linear(to_rgba_f(a))
+    lb := color_srgb_to_linear(to_rgba_f(b))
+    mixed := ColorF{
+        r: la.r + (lb.r - la.r) * u,
+        g: la.g + (lb.g - la.g) * u,
+        b: la.b + (lb.b - la.b) * u,
+        a: la.a + (lb.a - la.a) * u
+    }
+    << from_rgba_f(color_linear_to_srgb(mixed)) or >>
+}
+
+pub fn multiply_rgba8(a int, b int) int {
+    ca := to_rgba_f(a)
+    cb := to_rgba_f(b)
+    << from_rgba_f(ColorF{r: ca.r * cb.r, g: ca.g * cb.g, b: ca.b * cb.b, a: ca.a * cb.a}) or >>
+}
+
+pub fn premultiply_rgba8(c int) int {
+    a := rgba8_a(c)
+    r := (rgba8_r(c) * a + 127) / 255
+    g := (rgba8_g(c) * a + 127) / 255
+    b := (rgba8_b(c) * a + 127) / 255
+    << rgba8(r, g, b, a) or >>
 }

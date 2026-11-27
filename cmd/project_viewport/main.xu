@@ -1,0 +1,1190 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+data #"github.com/xulang-org/nexus/resources/lighting"
+resource #"github.com/xulang-org/nexus/resources/scene"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+ui_bridge #"github.com/xulang-org/nexus/integration/ui"
+imod #"github.com/xulang-org/nexus/integration/modeling"
+files #"github.com/xulang-org/nexus/integration/scene"
+models3d #"github.com/xulang-org/nexus/integration/scene_render"
+scene_lights #"github.com/xulang-org/nexus/integration/lighting"
+scene_lighting #"github.com/xulang-org/nexus/integration/scene_lighting"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+world3d #"github.com/xulang-org/nexus/integration/rendering/three_d"
+scene #"github.com/xulang-org/nexus/scene"
+mesh_shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+canvas_shaders #"github.com/xulang-org/nexus/assets/shaders/two_d"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+ren2 #"github.com/xulang-org/nexus/rendering/two_d"
+gpu_info #"github.com/xulang-org/nexus/platform/gpu"
+events #window/events
+draw #ui/draw
+layout #ui/layout
+widgets #ui/widgets
+filepath #path/filepath
+#window
+#gpu
+#os
+#errors
+#math
+#strconv
+#strings
+
+const EDITING = 0
+const APPLY = 1
+const CANCEL = 2
+const KEY_KP_ENTER = 88
+
+// Paper palette from assets/design/xu-ui-tokens.json.
+const EDITOR_CANVAS = 0xf6f3efff
+const EDITOR_SURFACE = 0xfffdfbff
+const EDITOR_BORDER = 0xd9d0d9ff
+const EDITOR_TEXT = 0x282329ff
+const EDITOR_MUTED = 0x6d626eff
+const EDITOR_BRAND = 0xbe123cff
+const EDITOR_CHART_1 = 0xb1362aff
+const EDITOR_CHART_2 = 0x1b6baaff
+const EDITOR_CHART_3 = 0x1d7b5eff
+const EDITOR_CHART_4 = 0x90640dff
+const EDITOR_GRID_MINOR = 0xdad2c8ff
+const EDITOR_GRID_MAJOR = 0xbab0a5ff
+
+struct SnapSteps {
+    move f64
+    rotate f64
+    scale f64
+}
+
+fn snap_option(value &string, option string, minimum f64, maximum f64) f64 {
+    step := strconv.parse_float(value) or (err) { >> errors.new(option + " requires a number") }
+    if !fm.finite(step) || step < minimum || step > maximum {
+        >> errors.new(option + " must be between " + (strconv.format_float(minimum, 103, 8) or >>) +
+            " and " + (strconv.format_float(maximum, 103, 8) or >>))
+    }
+    << step
+}
+
+struct Options { path string
+    output string
+    meta_out string
+    select_node int
+    check_node string
+    check_also string
+    check_local bool
+    modern bool
+    capture string
+    live_connect string
+    live_script string
+    whitebox_out string
+    whitebox_shape string
+    snap SnapSteps }
+
+fn options() Options {
+    args := os.args()
+    $config := Options{path: "", output: "", meta_out: "", select_node: -1, check_node: "", check_also: "", check_local: false, modern: false, capture: "",
+        live_connect: "", live_script: "", whitebox_out: "", whitebox_shape: "",
+        snap: SnapSteps{move: 0.25, rotate: 15.0, scale: 10.0}}
+    $i := 1
+    while i < args.len {
+        if args[i] == "--check-local" {
+            config.check_local = true
+            i += 1
+            ->
+        }
+        if args[i] == "--modern" {
+            config.modern = true
+            i += 1
+            ->
+        }
+        if i + 1 >= args.len { >> errors.new("missing option value") }
+        value := args[i + 1] + ""
+        if args[i] == "--scene" { config.path = value }
+        else if args[i] == "--output" { config.output = value }
+        else if args[i] == "--meta-out" { config.meta_out = value }
+        else if args[i] == "--select-node" {
+            config.select_node = strconv.atoi(&value) or (err) { >> errors.new("--select-node requires an integer") }
+        }
+        else if args[i] == "--check-node" { config.check_node = value }
+        else if args[i] == "--check-also" { config.check_also = value }
+        else if args[i] == "--capture" { config.capture = value }
+        else if args[i] == "--live-connect" { config.live_connect = value }
+        else if args[i] == "--live-script" { config.live_script = value }
+        else if args[i] == "--whitebox-out" { config.whitebox_out = value }
+        else if args[i] == "--whitebox" { config.whitebox_shape = value }
+        else if args[i] == "--snap-move" {
+            config.snap.move = snap_option(&value, "--snap-move", 0.0001, 1000000.0) or >>
+        } else if args[i] == "--snap-rotate" {
+            config.snap.rotate = snap_option(&value, "--snap-rotate", 0.01, 180.0) or >>
+        } else if args[i] == "--snap-scale" {
+            config.snap.scale = snap_option(&value, "--snap-scale", 0.01, 100.0) or >>
+        }
+        else { >> errors.new("unknown viewport option: " + args[i]) }
+        i += 2
+    }
+    if config.path.len == 0 || config.output.len == 0 {
+        >> errors.new("viewport requires a scene and a separate output path")
+    }
+    config.path = filepath.abs(&config.path) or >>
+    config.output = filepath.abs(&config.output) or >>
+    if config.meta_out.len > 0 {
+        config.meta_out = filepath.abs(&config.meta_out) or >>
+    }
+    if config.live_script.len > 0 {
+        config.live_script = filepath.abs(&config.live_script) or >>
+    }
+    if config.whitebox_out.len > 0 {
+        config.whitebox_out = filepath.abs(&config.whitebox_out) or >>
+    }
+    if config.path == config.output { >> errors.new("viewport output cannot replace its input scene") }
+    if config.capture.len > 0 && config.check_node.len == 0 && config.live_script.len == 0 && config.live_connect.len == 0 {
+        >> errors.new("viewport capture requires --check-node or --live-*")
+    }
+    if config.check_also.len > 0 && config.check_node.len == 0 { >> errors.new("--check-also requires --check-node") }
+    if config.check_local && config.check_also.len == 0 { >> errors.new("--check-local requires --check-also") }
+    << config
+}
+
+struct UndoNodeState {
+    id int
+    is_3d bool
+    transform fm.Mat4
+    visible bool
+}
+
+struct ViewportSnapshot {
+    nodes []UndoNodeState
+    deleted map[int]bool
+    selection []int
+}
+
+struct SceneNodeMeta {
+    has_surface bool
+    has_light bool
+    has_camera bool
+    has_sprite bool
+    has_v9 bool
+    is_3d bool
+}
+
+struct ViewportModernHost {
+    enabled bool
+    pipelines []world3d.ModernPipeline3D
+    ambient fm.Vec3
+    exposure f64
+    pp_cfg ren.PostProcessConfig3D
+}
+
+struct EditorView {
+    orbit Orbit
+    selection []int
+    mode int
+    local_axes bool
+    snapping bool
+    show_grid bool
+    use_scene_lights bool
+    disable_nonmesh_pick bool
+    snap SnapSteps
+    navigation int
+    last fm.Vec2
+    dragging bool
+    drag GizmoDrag
+    outcome int
+    tree_ids []int
+    doc_by_tree_id map[int]int
+    node_meta []SceneNodeMeta
+    deleted_docs map[int]bool
+    pre_drag_snap ViewportSnapshot
+    undo_stack []ViewportSnapshot
+    redo_stack []ViewportSnapshot
+}
+
+fn empty_snapshot() ViewportSnapshot {
+    << ViewportSnapshot{nodes: []UndoNodeState{}, deleted: map[int]bool{}, selection: []int{}}
+}
+
+fn clone_snapshot(src &ViewportSnapshot) ViewportSnapshot {
+    $nodes := []UndoNodeState{}
+    for i in 0:src.nodes.len { nodes.push(src.nodes[i]) }
+    $del := map[int]bool{}
+    for k, v in src.deleted { del[k] = v }
+    $sel := []int{}
+    for i in 0:src.selection.len { sel.push(src.selection[i]) }
+    << ViewportSnapshot{nodes: nodes, deleted: del, selection: sel}
+}
+
+fn capture_snapshot(editor &EditorView, tree &scene.SceneTree) ViewportSnapshot {
+    $nodes := []UndoNodeState{}
+    for d in 0:editor.tree_ids.len {
+        id := editor.tree_ids[d]
+        info := tree.node_info(id) or (err) {
+            _ := err
+            ->
+        }
+        is3d := info.kind == scene.NODE_3D
+        $tr := fm.identity_3d()
+        if is3d {
+            tr = (tree.node_3d(id) or (err) {
+                _ := err
+                ->
+            }).transform
+        }
+        nodes.push(UndoNodeState{id: id, is_3d: is3d, transform: tr, visible: info.visible})
+    }
+    $del := map[int]bool{}
+    for k, v in editor.deleted_docs { del[k] = v }
+    $sel := []int{}
+    for i in 0:editor.selection.len { sel.push(editor.selection[i]) }
+    << ViewportSnapshot{nodes: nodes, deleted: del, selection: sel}
+}
+
+fn apply_snapshot(editor $&EditorView, tree $&scene.SceneTree, snap &ViewportSnapshot) int {
+    for i in 0:snap.nodes.len {
+        ns := &snap.nodes[i]
+        if ns.is_3d {
+            tree.set_transform_3d(ns.id, ns.transform) or >>
+        }
+        tree.set_visible(ns.id, ns.visible) or >>
+    }
+    $del := map[int]bool{}
+    for k, v in snap.deleted { del[k] = v }
+    editor.deleted_docs = del
+    $sel := []int{}
+    for i in 0:snap.selection.len { sel.push(snap.selection[i]) }
+    editor.selection = sel
+    << 0
+}
+
+fn push_undo_snapshot(editor $&EditorView, snap &ViewportSnapshot) {
+    editor.undo_stack.push(clone_snapshot(snap))
+    editor.redo_stack = []ViewportSnapshot{}
+}
+
+fn perform_undo(editor $&EditorView, tree $&scene.SceneTree) int {
+    if editor.undo_stack.len == 0 { << 0 }
+    cur := capture_snapshot(editor, tree)
+    editor.redo_stack.push(clone_snapshot(&cur))
+    last_idx := editor.undo_stack.len - 1
+    prev := clone_snapshot(&editor.undo_stack[last_idx])
+    $next_stack := []ViewportSnapshot{}
+    for i in 0:last_idx { next_stack.push(clone_snapshot(&editor.undo_stack[i])) }
+    editor.undo_stack = next_stack
+    apply_snapshot(editor, tree, &prev) or >>
+    << 1
+}
+
+fn perform_redo(editor $&EditorView, tree $&scene.SceneTree) int {
+    if editor.redo_stack.len == 0 { << 0 }
+    cur := capture_snapshot(editor, tree)
+    editor.undo_stack.push(clone_snapshot(&cur))
+    last_idx := editor.redo_stack.len - 1
+    nxt := clone_snapshot(&editor.redo_stack[last_idx])
+    $next_stack := []ViewportSnapshot{}
+    for i in 0:last_idx { next_stack.push(clone_snapshot(&editor.redo_stack[i])) }
+    editor.redo_stack = next_stack
+    apply_snapshot(editor, tree, &nxt) or >>
+    << 1
+}
+
+fn editor_snap_step(editor &EditorView) f64 {
+    if !editor.snapping { << 0.0 }
+    if editor.mode == GIZMO_ROTATE { << editor.snap.rotate * 0.017453292519943295 }
+    if editor.mode == GIZMO_SCALE { << editor.snap.scale / 100.0 }
+    << editor.snap.move
+}
+
+fn editor_basis(editor &EditorView, tree &scene.SceneTree) GizmoBasis {
+    if editor.dragging { << editor.drag.basis }
+    if !editor.local_axes || editor.selection.len == 0 { << world_basis() }
+    node := editor.selection[editor.selection.len - 1]
+    world := tree.global_transform_3d(node) or >>
+    << local_basis(world) or >>
+}
+
+fn cancel_drag(editor $&EditorView, tree $&scene.SceneTree) int {
+    if editor.dragging {
+        restore_transform(tree, &editor.drag) or >>
+        editor.dragging = false
+    }
+    editor.navigation = 0
+    << 0
+}
+
+fn select_at(picker &models3d.ScenePicker3D, world $&world3d.Scene3D, tree &scene.SceneTree,
+    frame CameraFrame, point fm.Vec2) int {
+    world.select_lods(tree, frame.position) or >>
+    ray := frame.ray(point) or >>
+    hit := picker.pick(world, tree, ray.origin, ray.direction, ray.near, ray.far) or >>
+    << hit.node
+}
+
+fn pick_nonmesh_node(editor &EditorView, tree &scene.SceneTree, frame CameraFrame, point fm.Vec2) int {
+    if editor.disable_nonmesh_pick { << 0 }
+    $best_id := 0
+    $best_d2 := 14.0 * 14.0
+    for d in 1:editor.tree_ids.len {
+        if d >= editor.node_meta.len { <- }
+        meta := &editor.node_meta[d]
+        if !meta.is_3d || meta.has_surface || editor.deleted_docs.has(d) { -> }
+        tid := editor.tree_ids[d]
+        vis := tree.is_visible(tid) or (err) {
+            _ := err
+            ->
+        }
+        if !vis { -> }
+        wp := (tree.global_transform_3d(tid) or (err) {
+            _ := err
+            ->
+        }).c3.xyz()
+        proj := frame.project(wp)
+        if !proj.visible { -> }
+        delta := proj.position.sub(point)
+        d2 := delta.dot(delta)
+        if d2 <= best_d2 {
+            best_d2 = d2
+            best_id = tid
+        }
+    }
+    << best_id
+}
+
+fn safe_half_extent(b fm.Aabb3) fm.Vec3 {
+    << b.half_extent() or (err) {
+        _ := err
+        << fm.vec3(0.0, 0.0, 0.0)
+    }
+}
+
+fn safe_bounds_for_frame(
+    editor &EditorView,
+    picker &models3d.ScenePicker3D,
+    tree &scene.SceneTree,
+    selection_only bool
+) fm.Aabb3 {
+    $bounds := fm.Aabb3{minimum: fm.vec3(0.0, 0.0, 0.0), maximum: fm.vec3(0.0, 0.0, 0.0)}
+    if selection_only && editor.selection.len > 0 {
+        bounds = picker.visible_selection_bounds(tree, &editor.selection) or >>
+    } else {
+        bounds = picker.visible_bounds(tree, 0) or >>
+    }
+    ext := safe_half_extent(bounds).length()
+    if ext >= 0.0001 { << bounds }
+
+    // Fallback to world transforms of selected or visible 3D nodes (e.g. empty scenes / lights / cameras).
+    $has_pt := false
+    $low := fm.vec3(0.0, 0.0, 0.0)
+    $high := low
+    if selection_only && editor.selection.len > 0 {
+        for sid in editor.selection {
+            info := tree.node_info(sid) or (err) {
+                _ := err
+                ->
+            }
+            if info.kind != scene.NODE_3D { -> }
+            wp := (tree.global_transform_3d(sid) or (err) {
+                _ := err
+                ->
+            }).c3.xyz()
+            if !has_pt {
+                low = wp.sub(fm.vec3(1.2, 1.2, 1.2))
+                high = wp.add(fm.vec3(1.2, 1.2, 1.2))
+                has_pt = true
+            } else {
+                low = fm.vec3(math.min(low.x, wp.x - 1.2), math.min(low.y, wp.y - 1.2), math.min(low.z, wp.z - 1.2))
+                high = fm.vec3(math.max(high.x, wp.x + 1.2), math.max(high.y, wp.y + 1.2), math.max(high.z, wp.z + 1.2))
+            }
+        }
+    } else {
+        for d in 1:editor.tree_ids.len {
+            if d < editor.node_meta.len && editor.node_meta[d].is_3d && !editor.deleted_docs.has(d) {
+                tid := editor.tree_ids[d]
+                wp := (tree.global_transform_3d(tid) or (err) {
+                    _ := err
+                    ->
+                }).c3.xyz()
+                if !has_pt {
+                    low = wp.sub(fm.vec3(1.5, 1.5, 1.5))
+                    high = wp.add(fm.vec3(1.5, 1.5, 1.5))
+                    has_pt = true
+                } else {
+                    low = fm.vec3(math.min(low.x, wp.x - 1.5), math.min(low.y, wp.y - 1.5), math.min(low.z, wp.z - 1.5))
+                    high = fm.vec3(math.max(high.x, wp.x + 1.5), math.max(high.y, wp.y + 1.5), math.max(high.z, wp.z + 1.5))
+                }
+            }
+        }
+    }
+    if !has_pt {
+        << fm.aabb3(fm.vec3(-4.0, -1.0, -4.0), fm.vec3(4.0, 2.0, 4.0)) or >>
+    }
+    << fm.aabb3(low, high) or >>
+}
+
+fn is_apply_key(event &events.Event) bool {
+    << event.physical_key == events.KEY_ENTER ||
+        event.physical_key == KEY_KP_ENTER ||
+        event.logical_key == 13 ||
+        event.logical_key == 10
+}
+
+fn handle_event(editor $&EditorView, tree $&scene.SceneTree, world $&world3d.Scene3D,
+    picker &models3d.ScenePicker3D, event &events.Event, size fm.Vec2, point fm.Vec2) int {
+    $dummy_wb := empty_whitebox_host() or >>
+    dummy_live := empty_live_channel()
+    << handle_event_live(editor, tree, world, picker, $&dummy_wb, &dummy_live, event, size, point) or >>
+}
+
+fn handle_event_live(editor $&EditorView, tree $&scene.SceneTree, world $&world3d.Scene3D,
+    picker &models3d.ScenePicker3D, wb $&WhiteboxHost, live_ch &LiveChannel,
+    event &events.Event, size fm.Vec2, point fm.Vec2) int {
+    if event.kind == events.EVENT_CLOSE_REQUESTED {
+        editor.outcome = CANCEL
+        << 0
+    }
+    if event.kind == events.EVENT_FOCUS_LOST || event.kind == events.EVENT_INPUT_RESET ||
+        event.kind == events.EVENT_RESIZED || event.kind == events.EVENT_PIXEL_SIZE_CHANGED {
+        << cancel_drag(editor, tree) or >>
+    }
+    if event.kind == events.EVENT_KEY_DOWN && !event.repeated {
+        has_mod := (event.modifiers & (events.MOD_META | events.MOD_CTRL)) != 0
+        has_shift := (event.modifiers & events.MOD_SHIFT) != 0
+        if is_apply_key(event) {
+            if !editor.dragging { editor.outcome = APPLY }
+        } else if event.physical_key == events.KEY_ESCAPE {
+            if editor.dragging { cancel_drag(editor, tree) or >> }
+            else { editor.outcome = CANCEL }
+        } else if !editor.dragging {
+            if has_mod && event.physical_key == events.KEY_Z {
+                if wb.active && wb.session.mode != imod.EDIT_MODE_OBJECT {
+                    s := $&wb.session
+                    if has_shift { _ := s.redo() }
+                    else { _ := s.undo() }
+                    emit_whitebox_event(live_ch, wb)
+                } else {
+                    if has_shift { perform_redo(editor, tree) or >> }
+                    else { perform_undo(editor, tree) or >> }
+                }
+            } else if !has_mod {
+                if event.physical_key == events.KEY_TAB && wb.active {
+                    wb.session.mode = (wb.session.mode + 1) % 4
+                }
+                if event.physical_key == events.KEY_B && has_shift && !wb.active {
+                    spawn_whitebox_shape(wb, "box", fm.vec3(2.0, 2.0, 2.0)) or >>
+                    emit_whitebox_event(live_ch, wb)
+                }
+                if wb.active && wb.session.mode != imod.EDIT_MODE_OBJECT {
+                    if event.physical_key == events.KEY_X && wb.session.selected_faces.len > 0 {
+                        try_wb_extrude(wb, 0.5)
+                        emit_whitebox_event(live_ch, wb)
+                    }
+                    if event.physical_key == events.KEY_I && wb.session.selected_faces.len > 0 {
+                        try_wb_inset(wb, 0.25, 0.0)
+                        emit_whitebox_event(live_ch, wb)
+                    }
+                    if event.physical_key == events.KEY_U {
+                        try_wb_box_uv(wb, 1.0)
+                    }
+                }
+                if event.physical_key == events.KEY_1 || event.physical_key == events.KEY_W { editor.mode = GIZMO_MOVE }
+                if event.physical_key == events.KEY_2 || event.physical_key == events.KEY_E { editor.mode = GIZMO_ROTATE }
+                if event.physical_key == events.KEY_3 || event.physical_key == events.KEY_R { editor.mode = GIZMO_SCALE }
+                if event.physical_key == events.KEY_Q { editor.local_axes = !editor.local_axes }
+                if event.physical_key == events.KEY_S { editor.snapping = !editor.snapping }
+                if event.physical_key == events.KEY_G { editor.show_grid = !editor.show_grid }
+                if event.physical_key == events.KEY_L { editor.use_scene_lights = !editor.use_scene_lights }
+                if event.physical_key == events.KEY_H && editor.selection.len > 0 {
+                    snap := capture_snapshot(editor, tree)
+                    push_undo_snapshot(editor, &snap)
+                    $any_vis := false
+                    for sid in editor.selection {
+                        info := tree.node_info(sid) or (err) {
+                            _ := err
+                            ->
+                        }
+                        if info.visible { any_vis = true }
+                    }
+                    next_vis := !any_vis
+                    for sid in editor.selection {
+                        tree.set_visible(sid, next_vis) or >>
+                    }
+                }
+                if (event.physical_key == events.KEY_DELETE || event.physical_key == events.KEY_BACKSPACE) && editor.selection.len > 0 {
+                    snap := capture_snapshot(editor, tree)
+                    push_undo_snapshot(editor, &snap)
+                    root_id := tree.root()
+                    for sid in editor.selection {
+                        if sid == root_id { -> }
+                        sub := tree.subtree(sid) or (err) {
+                            _ := err
+                            ->
+                        }
+                        for sub_id in sub {
+                            if editor.doc_by_tree_id.has(sub_id) {
+                                d_idx := editor.doc_by_tree_id[sub_id]
+                                if d_idx > 0 { editor.deleted_docs[d_idx] = true }
+                            }
+                        }
+                        tree.set_visible(sid, false) or >>
+                    }
+                    editor.selection = []int{}
+                }
+                if event.physical_key == events.KEY_HOME || event.physical_key == events.KEY_F {
+                    $bounds := safe_bounds_for_frame(editor, picker, tree, event.physical_key == events.KEY_F) or >>
+                    $orbit := frame_orbit(bounds) or >>
+                    if size.x > 0.0 && size.y > size.x { orbit.distance *= size.y / size.x }
+                    editor.orbit = orbit
+                }
+            }
+        }
+        << 0
+    }
+    if size.x < 1.0 || size.y < 1.0 { << 0 }
+    if event.kind == events.EVENT_WHEEL && !editor.dragging && editor.navigation == 0 {
+        editor.orbit = editor.orbit.zoomed(event.dy)
+    } else if event.kind == events.EVENT_POINTER_DOWN && !editor.dragging && editor.navigation == 0 {
+        if event.button == events.BUTTON_RIGHT || event.button == events.BUTTON_MIDDLE {
+            editor.navigation = event.button
+            editor.last = point
+        } else if event.button == events.BUTTON_LEFT {
+            frame := camera_frame(editor.orbit, size) or >>
+            toggle := (event.modifiers & events.MOD_SHIFT) != 0
+            if editor.selection.len > 0 && !toggle {
+                roots := selection_roots(tree, &editor.selection) or >>
+                pivot := selection_pivot(tree, &roots) or >>
+                basis := editor_basis(editor, tree) or >>
+                handles := axis_handles(frame, pivot, basis, editor.mode)
+                hit := handle_at(&handles, point, editor.mode)
+                if hit >= 0 {
+                    editor.pre_drag_snap = capture_snapshot(editor, tree)
+                    editor.drag = start_transform(tree, &roots, pivot, basis, editor.mode, editor_snap_step(editor),
+                        editor.local_axes, &handles[hit], frame.ray(point) or >>, point) or (err) {
+                        eprintln(err.msg())
+                        << 0
+                    }
+                    editor.dragging = true
+                    << 0
+                }
+            }
+            if wb.active && wb.session.mode != imod.EDIT_MODE_OBJECT {
+                vr := frame.ray(point) or >>
+                world := wb.world
+                s := $&wb.session
+                _ := s.pick_subobject(world, fm.ray3d(vr.origin, vr.direction) or >>, 0.25, toggle)
+                << 0
+            }
+            $selected := select_at(picker, world, tree, frame, point) or >>
+            if selected == 0 {
+                nm := pick_nonmesh_node(editor, tree, frame, point)
+                if nm > 0 { selected = nm }
+            }
+            editor.selection = selection_after(&editor.selection, selected, toggle)
+            emit_selection_event(live_ch, editor)
+        }
+    } else if event.kind == events.EVENT_POINTER_MOVE {
+        if editor.dragging {
+            frame := camera_frame(editor.orbit, size) or >>
+            update_transform(tree, &editor.drag, frame.ray(point) or >>, point) or >>
+        } else if editor.navigation != 0 {
+            delta := point.sub(editor.last)
+            editor.last = point
+            if editor.navigation == events.BUTTON_RIGHT { editor.orbit = editor.orbit.turned(delta) }
+            else { editor.orbit = editor.orbit.panned(camera_frame(editor.orbit, size) or >>, delta) }
+        }
+    } else if event.kind == events.EVENT_POINTER_UP {
+        if editor.dragging && event.button == events.BUTTON_LEFT {
+            frame := camera_frame(editor.orbit, size) or >>
+            update_transform(tree, &editor.drag, frame.ray(point) or >>, point) or >>
+            editor.dragging = false
+            snap := clone_snapshot(&editor.pre_drag_snap)
+            push_undo_snapshot(editor, &snap)
+            emit_transform_event(live_ch, editor, tree)
+        }
+        if editor.navigation == event.button { editor.navigation = 0 }
+    }
+    << 0
+}
+
+fn frame_size(state window.State) fm.Vec2 {
+    << fm.vec2(f64(state.pixel_width), f64(state.pixel_height))
+}
+
+fn event_point(state window.State, event &events.Event) fm.Vec2 {
+    if state.width <= 0 || state.height <= 0 { << fm.vec2(0.0, 0.0) }
+    << fm.vec2(event.x * f64(state.pixel_width) / f64(state.width), event.y * f64(state.pixel_height) / f64(state.height))
+}
+
+fn editor_color(packed int) draw.Color {
+    << draw.rgb((packed >> 24) & 255, (packed >> 16) & 255, (packed >> 8) & 255)
+}
+
+fn hud_panel(hud $&ui_bridge.UiFrame, label &string, y f64, width f64, ink int) int {
+    size := (hud.measure_text(label, 14.0) or >>).metrics.width
+    span := math.min(width - 32.0, size + 24.0)
+    panel := layout.Rect{x: 16.0, y: y, width: span, height: 40.0}
+    text := layout.Rect{x: 28.0, y: y, width: span - 24.0, height: 40.0}
+    hud.draw_panel(&panel, 8.0, editor_color(EDITOR_SURFACE), editor_color(EDITOR_BORDER), 1.0) or >>
+    hud.push_clip(&panel) or >>
+    hud.draw_label(&text, label, editor_color(ink), 14.0, 0.0, 0.5) or >>
+    hud.pop_clip() or >>
+    << 0
+}
+
+fn record_tools(hud $&ui_bridge.UiFrame, editor &EditorView, wb &WhiteboxHost, size fm.Vec2) int {
+    hud.begin() or >>
+    if size.x < 96.0 || size.y < 72.0 { << 0 }
+    $mode := "[1/W] Move"
+    if editor.mode == GIZMO_ROTATE { mode = "[2/E] Rotate" }
+    else if editor.mode == GIZMO_SCALE { mode = "[3/R] Scale" }
+    if wb.active {
+        if wb.session.mode == imod.EDIT_MODE_VERTEX { mode = "[Tab] WB:Vertex" }
+        else if wb.session.mode == imod.EDIT_MODE_EDGE { mode = "[Tab] WB:Edge" }
+        else if wb.session.mode == imod.EDIT_MODE_FACE { mode = "[Tab] WB:Face" }
+        else { mode = "[Tab] WB:Object" }
+    }
+    $space := "World"
+    if editor.local_axes { space = "Local" }
+    $snap := "Snap off"
+    if editor.snapping {
+        $value := editor.snap.move
+        $unit := " units"
+        if editor.mode == GIZMO_ROTATE {
+            value = editor.snap.rotate
+            unit = " deg"
+        } else if editor.mode == GIZMO_SCALE {
+            value = editor.snap.scale
+            unit = "%"
+        }
+        snap = "Snap " + (strconv.format_float(value, 103, 8) or >>) + unit
+    }
+    $grid_lbl := "Grid off"
+    if editor.show_grid { grid_lbl = "Grid on" }
+    $lgt_lbl := "Sun"
+    if editor.use_scene_lights { lgt_lbl = "Scene Lights" }
+    label := mode + " | [Q] " + space + " | [S] " + snap + " | [G] " + grid_lbl + " | [L] " + lgt_lbl + " | " + str(editor.selection.len) + " sel"
+    hud_panel(hud, &label, 16.0, size.x, EDITOR_TEXT) or >>
+    if size.y >= 128.0 {
+        $guide := "Enter Apply | Esc Cancel | H Hide | Del Delete"
+        if wb.active {
+            guide = "Enter Apply | Tab SubObj | X Extrude | I Inset | U BoxUV | Cmd+Z Undo"
+        } else if size.x >= 720.0 {
+            guide = guide + " | Cmd+Z Undo | F Frame | Right Orbit | Mid Pan"
+        }
+        hud_panel(hud, &guide, size.y - 56.0, size.x, EDITOR_MUTED) or >>
+    }
+    << 0
+}
+
+fn draw_world_segment(batch $&canvas.Batch2D, frame CameraFrame, a fm.Vec3, b fm.Vec3, width f64, color int) int {
+    pa := frame.project(a)
+    pb := frame.project(b)
+    if pa.visible && pb.visible {
+        draw_stroke(batch, pa.position, pb.position, width, color) or >>
+    }
+    << 0
+}
+
+fn draw_xz_grid(batch $&canvas.Batch2D, frame CameraFrame) int {
+    $k := -10
+    while k <= 10 {
+        fk := f64(k)
+        $col_z := EDITOR_GRID_MINOR
+        $w_z := 0.55
+        if k == 0 {
+            col_z = EDITOR_CHART_2
+            w_z = 1.25
+        } else if k % 5 == 0 {
+            col_z = EDITOR_GRID_MAJOR
+            w_z = 0.85
+        }
+        $col_x := EDITOR_GRID_MINOR
+        $w_x := 0.55
+        if k == 0 {
+            col_x = EDITOR_CHART_1
+            w_x = 1.25
+        } else if k % 5 == 0 {
+            col_x = EDITOR_GRID_MAJOR
+            w_x = 0.85
+        }
+        $seg := -10
+        while seg < 10 {
+            f0 := f64(seg)
+            f1 := f64(seg + 2)
+            draw_world_segment(batch, frame, fm.vec3(fk, 0.0, f0), fm.vec3(fk, 0.0, f1), w_z, col_z) or >>
+            draw_world_segment(batch, frame, fm.vec3(f0, 0.0, fk), fm.vec3(f1, 0.0, fk), w_x, col_x) or >>
+            seg += 2
+        }
+        k += 1
+    }
+    << 0
+}
+
+fn draw_diamond_marker(batch $&canvas.Batch2D, at fm.Vec2, size f64, color int) int {
+    top := at.add(fm.vec2(0.0, -size))
+    right := at.add(fm.vec2(size, 0.0))
+    bot := at.add(fm.vec2(0.0, size))
+    left := at.add(fm.vec2(-size, 0.0))
+    batch.triangle(top, right, bot, color) or >>
+    batch.triangle(top, bot, left, color) or >>
+    << 0
+}
+
+fn draw_nonmesh_markers(batch $&canvas.Batch2D, tree &scene.SceneTree, editor &EditorView, frame CameraFrame) int {
+    for d in 1:editor.tree_ids.len {
+        if d >= editor.node_meta.len { <- }
+        meta := &editor.node_meta[d]
+        if !meta.is_3d || meta.has_surface || editor.deleted_docs.has(d) { -> }
+        tid := editor.tree_ids[d]
+        vis := tree.is_visible(tid) or (err) {
+            _ := err
+            ->
+        }
+        if !vis { -> }
+        wp := (tree.global_transform_3d(tid) or (err) {
+            _ := err
+            ->
+        }).c3.xyz()
+        pt := frame.project(wp)
+        if !pt.visible { -> }
+        if meta.has_light {
+            draw_diamond_marker(batch, pt.position, 6.0, EDITOR_CHART_4) or >>
+        } else if meta.has_camera {
+            draw_square(batch, pt.position, 5.0, EDITOR_CHART_2) or >>
+        } else if meta.has_sprite {
+            draw_diamond_marker(batch, pt.position, 5.0, EDITOR_BRAND) or >>
+        } else if meta.has_v9 {
+            draw_diamond_marker(batch, pt.position, 5.0, EDITOR_CHART_3) or >>
+        } else {
+            draw_square(batch, pt.position, 4.0, EDITOR_MUTED) or >>
+        }
+    }
+    << 0
+}
+
+fn gather_view_lights(slights &scene_lights.SceneLights3D, tree &scene.SceneTree, use_scene_lights bool) []data.Light3D {
+    if use_scene_lights && slights.binding_count() > 0 {
+        gathered := slights.gather(tree) or >>
+        if gathered.len > 0 { << gathered }
+    }
+    sun := data.directional(fm.vec3(0.40, 0.72, 0.4), fm.vec3(2.6, 2.6, 2.6)) or >>
+    << [sun]
+}
+
+fn draw_view(device $&ren.Device3D, overlay $&ren2.Overlay2D, hud $&ui_bridge.UiFrame, world $&world3d.Scene3D,
+    modern $&ViewportModernHost, slights &scene_lights.SceneLights3D, scene_mods &imod.SceneModeling3D, tree &scene.SceneTree, editor &EditorView,
+    wb $&WhiteboxHost, frame CameraFrame, capture string) int {
+    world.select_lods(tree, frame.position) or >>
+    if wb.active {
+        wb_mat := wb.material
+        wb_s := $&wb.session
+        _ := wb_s.sync_gpu(device, wb_mat, &[]ren.Material3D{}, true) or >>
+    }
+    if modern.enabled && modern.pipelines.len > 0 {
+        lights_list := gather_view_lights(slights, tree, editor.use_scene_lights) or >>
+        $opaque_refs := []ren.MeshRef3D{}
+        $opaque_worlds := []fm.Mat4{}
+        $opaque_mats := []ren.Material3D{}
+        _ := world.collect_visible_draws(tree, frame.projection, $&opaque_refs, $&opaque_worlds, $&opaque_mats) or >>
+        _ := scene_mods.collect_draws(tree, &editor.tree_ids, $&opaque_refs, $&opaque_worlds, $&opaque_mats) or >>
+        if wb.active {
+            _ := wb.session.collect_draws(wb.world, $&opaque_refs, $&opaque_worlds, $&opaque_mats) or >>
+        }
+        amb := modern.ambient
+        exp := modern.exposure
+        pp := modern.pp_cfg
+        mp := $&modern.pipelines[0]
+        _ := mp.prepare_lights(device, amb, frame.position, exp, &lights_list, frame.view, frame.proj, frame.near, frame.far) or >>
+        _ := mp.render_clustered_hdr_frame(device, &opaque_refs, &opaque_worlds, &opaque_mats, frame.view, frame.proj, frame.near, frame.far, EDITOR_CANVAS, &pp) or >>
+    } else {
+        lighting := data.environment(fm.vec3(0.24, 0.25, 0.27), frame.position, 1.0,
+            gather_view_lights(slights, tree, editor.use_scene_lights) or >>) or >>
+        device.begin(EDITOR_CANVAS) or >>
+        world.draw_lit(device, tree, frame.projection, &lighting) or >>
+        _ := scene_mods.draw_lit(device, tree, &editor.tree_ids, frame.projection, &lighting) or >>
+        if wb.active {
+            _ := wb.session.draw_lit(device, wb.world, frame.projection, &lighting) or >>
+        }
+    }
+    if capture.len > 0 { device.capture(capture) or >> }
+    $batch := canvas.new_batch()
+    if editor.show_grid {
+        draw_xz_grid($&batch, frame) or >>
+    }
+    draw_whitebox_overlay($&batch, wb, frame) or >>
+    draw_nonmesh_markers($&batch, tree, editor, frame) or >>
+    for i in 0:editor.selection.len {
+        node := editor.selection[i]
+        point := frame.project((tree.global_transform_3d(node) or >>).c3.xyz())
+        if point.visible {
+            $color := EDITOR_TEXT
+            if editor.local_axes && i + 1 == editor.selection.len { color = EDITOR_BRAND }
+            draw_square($&batch, point.position, 3.0, color) or >>
+        }
+    }
+    if editor.selection.len > 0 {
+        roots := selection_roots(tree, &editor.selection) or >>
+        pivot := selection_pivot(tree, &roots) or >>
+        basis := editor_basis(editor, tree) or >>
+        handles := axis_handles(frame, pivot, basis, editor.mode)
+        for i in 0:handles.len {
+            handle := &handles[i]
+            draw_handle($&batch, handle, editor.mode, editor.dragging && handle.index == editor.drag.handle_index) or >>
+        }
+    }
+    overlay.clear() or >>
+    overlay.submit(&batch) or >>
+    record_tools(hud, editor, wb, frame.size) or >>
+    hud.flush_overlay(device.present_session() or >>, overlay) or >>
+    $present := device.begin_present_frame() or >>
+    if present.has_image() {
+        width := present.width()
+        height := present.height()
+        overlay.flush_gpu_frame(device.gpu_device() or >>, $&present, width, height, gpu.LOAD, 0) or >>
+    }
+    << device.finish_present_frame($&present) or >>
+}
+
+fn check_click(picker &models3d.ScenePicker3D, world $&world3d.Scene3D, tree &scene.SceneTree,
+    frame CameraFrame, node int) fm.Vec2 {
+    bounds := picker.visible_bounds(tree, node) or >>
+    center := frame.project(bounds.center() or >>)
+    if !center.visible { >> errors.new("viewport check target is offscreen") }
+    if (select_at(picker, world, tree, frame, center.position) or >>) == node { << center.position }
+    for row in -7:8 {
+        for column in -7:8 {
+            point := center.position.add(fm.vec2(f64(column) * 8.0, f64(row) * 8.0))
+            if (select_at(picker, world, tree, frame, point) or >>) == node { << point }
+        }
+    }
+    >> errors.new("viewport check target is occluded")
+}
+
+fn check_edit(editor $&EditorView, tree $&scene.SceneTree, world $&world3d.Scene3D, picker &models3d.ScenePicker3D,
+    root int, size fm.Vec2, name string) int {
+    expected := check_node_named(tree, root, name + "") or >>
+    frame := camera_frame(editor.orbit, size) or >>
+    click := check_click(picker, world, tree, frame, expected) or >>
+    $event := events.empty()
+    event.kind = events.EVENT_POINTER_DOWN
+    event.button = events.BUTTON_LEFT
+    handle_event(editor, tree, world, picker, &event, size, click) or >>
+    if editor.selection.len != 1 || editor.selection[0] != expected { >> errors.new("viewport selected the wrong triangle") }
+    pivot := (tree.global_transform_3d(expected) or >>).c3.xyz()
+    $x_length := 0.0
+    handles := axis_handles(frame, pivot, world_basis(), GIZMO_MOVE)
+    for i in 0:handles.len {
+        handle := &handles[i]
+        if handle.axis.x == 1.0 { x_length = handle.length }
+    }
+    if x_length <= 0.0 { >> errors.new("viewport check X handle is hidden") }
+    start := frame.project(pivot.add(fm.vec3(x_length * 0.82, 0.0, 0.0))).position
+    end := frame.project(pivot.add(fm.vec3(x_length * 0.82 + 0.20, 0.0, 0.0))).position
+    handle_event(editor, tree, world, picker, &event, size, start) or >>
+    event.kind = events.EVENT_POINTER_MOVE
+    handle_event(editor, tree, world, picker, &event, size, end) or >>
+    event.kind = events.EVENT_FOCUS_LOST
+    handle_event(editor, tree, world, picker, &event, size, end) or >>
+    restored := (tree.global_transform_3d(expected) or >>).c3.xyz()
+    if restored.sub(pivot).length() > 0.000001 || editor.dragging { >> errors.new("viewport focus loss left a partial drag") }
+    event.kind = events.EVENT_POINTER_DOWN
+    handle_event(editor, tree, world, picker, &event, size, start) or >>
+    event.kind = events.EVENT_POINTER_UP
+    handle_event(editor, tree, world, picker, &event, size, end) or >>
+    moved := (tree.global_transform_3d(expected) or >>).c3.xyz().sub(pivot)
+    if math.abs(moved.x - 0.20) > 0.000001 || math.abs(moved.y) > 0.000001 || math.abs(moved.z) > 0.000001 {
+        >> errors.new("viewport drag did not preserve the selected world axis")
+    }
+    event.kind = events.EVENT_KEY_DOWN
+    event.physical_key = events.KEY_ENTER
+    handle_event(editor, tree, world, picker, &event, size, end) or >>
+    if editor.outcome != APPLY { >> errors.new("viewport did not accept the checked edit") }
+    println("PASS: picked " + name + ", dragged world X, canceled on focus loss, then applied")
+    << 0
+}
+
+fn write_viewport_meta(config &Options, editor &EditorView) int {
+    if config.meta_out.len == 0 { << 0 }
+    $selected_doc := -1
+    if editor.selection.len > 0 {
+        last_id := editor.selection[editor.selection.len - 1]
+        if editor.doc_by_tree_id.has(last_id) {
+            selected_doc = editor.doc_by_tree_id[last_id]
+        }
+    }
+    $del_parts := []string{}
+    for d in 1:editor.tree_ids.len {
+        if editor.deleted_docs.has(d) {
+            del_parts.push(str(d))
+        }
+    }
+    raw := "{\"selected_node\":" + str(selected_doc) + ",\"deleted_nodes\":[" + strings.join(del_parts, ",") + "]}\n"
+    snapshot.write_atomic(config.meta_out + "", &raw) or >>
+    << 0
+}
+
+fn run() int {
+    config := options() or >>
+    directory := filepath.dir(&config.path)
+    document := files.load(config.path + "") or >>
+    doc_meta := files.load(config.path + "") or >>
+    name := (doc_meta.describe_node(0) or >>).name
+    mesh_program := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    canvas_program := canvas_shaders.load_canvas("build/canvas-shaders") or >>
+    sdf_program := canvas_shaders.load_ui_sdf("build/canvas-shaders") or >>
+    text_program := canvas_shaders.load_ui_text("build/canvas-shaders") or >>
+    opts := window.Options{title: "Nexus 3D View — " + name,
+        width: 1100, height: 700, resizable: true, high_pixel_density: false, hidden: false}
+    $device := ren.open_3d_window(opts, gpu.AUTO, &mesh_program) or >>
+    println("Viewport GPU backend: " + gpu_info.backend_name(device.backend() or >>))
+    $overlay := ren2.open_overlay(device.present_session() or >>, &canvas_program, &sdf_program) or >>
+    overlay.enable_text(device.present_session() or >>, &text_program) or >>
+    styles := widgets.light_styles()
+    $hud := ui_bridge.new_ui_frame(&styles) or >>
+    $models := models3d.prepare_surfaces(&device, document, directory + "") or >>
+    $tree := scene.new_scene_tree_3d("Editor", 4097) or >>
+    parent := tree.root()
+    $world := world3d.new_scene_3d(&device) or >>
+    root := models.instantiate($&world, $&tree, parent, name + "") or >>
+    picker := models.picker(&tree, root) or >>
+    $scene_mods := imod.prepare_scene_modeling(&device, &doc_meta) or >>
+
+    $slights := scene_lights.new_scene_lights_3d()
+    if doc_meta.light_count() > 0 {
+        scene_lighting.bind(&doc_meta, $&slights, &tree, root) or >>
+    }
+
+    tree_ids := tree.subtree(root) or >>
+    $doc_by_tree_id := map[int]int{}
+    for d in 0:tree_ids.len { doc_by_tree_id[tree_ids[d]] = d }
+
+    $has_surf := map[int]bool{}
+    for i in 0:doc_meta.surface_count() {
+        sf := doc_meta.surface(i) or >>
+        has_surf[sf.node] = true
+    }
+    for i in 0:doc_meta.editable_mesh_count() {
+        em := doc_meta.editable_mesh(i) or >>
+        has_surf[em.node] = true
+    }
+    for i in 0:doc_meta.csg_tree_count() {
+        cs := doc_meta.csg_tree(i) or >>
+        has_surf[cs.node] = true
+    }
+    $has_light := map[int]bool{}
+    for i in 0:doc_meta.light_count() {
+        lt := doc_meta.light(i) or >>
+        has_light[lt.node] = true
+    }
+    $has_sprite := map[int]bool{}
+    for i in 0:doc_meta.sprite_3d_count() {
+        sp := doc_meta.sprite_3d(i) or >>
+        has_sprite[sp.node] = true
+    }
+    $has_v9 := map[int]bool{}
+    for i in 0:doc_meta.environment_count() {
+        ev := doc_meta.environment(i) or >>
+        has_v9[ev.node] = true
+    }
+    for i in 0:doc_meta.rigid_body_3d_count() {
+        rb := doc_meta.rigid_body_3d(i) or >>
+        has_v9[rb.node] = true
+    }
+    for i in 0:doc_meta.terrain_count() {
+        trr := doc_meta.terrain(i) or >>
+        has_v9[trr.node] = true
+    }
+    for i in 0:doc_meta.particle_emitter_3d_count() {
+        pt := doc_meta.particle_emitter_3d(i) or >>
+        has_v9[pt.node] = true
+    }
+    for i in 0:doc_meta.prefab_instance_count() {
+        pf := doc_meta.prefab_instance(i) or >>
+        has_v9[pf.node] = true
+    }
+    $node_meta := []SceneNodeMeta{}
+    for d in 0:doc_meta.node_count() {
+        nd := doc_meta.describe_node(d) or >>
+        node_meta.push(SceneNodeMeta{
+            has_surface: has_surf.has(d),
+            has_light: has_light.has(d),
+            has_camera: nd.camera.is_set() || nd.orthographic.is_set(),
+            has_sprite: has_sprite.has(d),
+            has_v9: has_v9.has(d),
+            is_3d: nd.kind == resource.NODE_3D
+        })
+    }
+
+    use_modern := (config.modern || doc_meta.has_modern_attachments()) && device.is_gpu()
+    $pp_cfg := ren.post_process_defaults_3d()
+    $env_ambient := fm.vec3(0.24, 0.25, 0.27)
+    $env_exposure := 1.0
+    if doc_meta.environment_count() > 0 {
+        ev := doc_meta.environment(0) or >>
+        env_ambient = ev.ambient
+        env_exposure = ev.exposure
+        pp_cfg.ao_enabled = ev.gtao_enabled
+        pp_cfg.ssr_enabled = ev.ssr_enabled
+        pp_cfg.bloom_enabled = ev.bloom_enabled
+        pp_cfg.bloom_threshold = ev.bloom_threshold
+        pp_cfg.bloom_intensity = ev.bloom_intensity
+        pp_cfg.taa_enabled = ev.taa_enabled
+        pp_cfg.exposure = ev.exposure
+    }
+    $modern := ViewportModernHost{
+        enabled: use_modern,
+        pipelines: []world3d.ModernPipeline3D{},
+        ambient: env_ambient,
+        exposure: env_exposure,
+        pp_cfg: pp_cfg
+    }
+    if use_modern {
+        cprog := mesh_shaders.load_clustered_program("build/mesh-shaders") or >>
+        iprog := mesh_shaders.load_indirect_program("build/mesh-shaders") or >>
+        pprog := mesh_shaders.load_postprocess_program("build/mesh-shaders") or >>
+        modern.pipelines.push(world3d.new_modern_pipeline_3d(&device, &cprog, &iprog, &pprog) or >>)
+    }
+
+    $init_sel := []int{}
+    if config.select_node > 0 && config.select_node < tree_ids.len && config.select_node < node_meta.len {
+        if node_meta[config.select_node].is_3d {
+            init_sel.push(tree_ids[config.select_node])
+        }
+    }
+
+    init_bounds := picker.visible_bounds(&tree, 0) or >>
+    $orbit := Orbit{center: fm.vec3(0.0, 0.0, 0.0), distance: 6.0, yaw: 0.48, pitch: 0.38}
+    init_ext := safe_half_extent(init_bounds).length()
+    if init_ext >= 0.0001 {
+        orbit = frame_orbit(init_bounds) or >>
+    }
+    zero := fm.vec3(0.0, 0.0, 0.0)
+    empty_drag := GizmoDrag{targets: []DragTarget{}, mode: GIZMO_MOVE, basis: world_basis(), handle_index: 0,
+        snap_step: 0.0, snap_origin: 0.0, pivot: zero, axis: zero, extent: 1.0, start: 0.0, radial: zero}
+    $editor := EditorView{orbit: orbit, selection: init_sel, mode: GIZMO_MOVE, local_axes: false, snapping: false,
+        show_grid: config.check_node.len == 0,
+        use_scene_lights: doc_meta.light_count() > 0 && config.check_node.len == 0,
+        disable_nonmesh_pick: config.check_node.len > 0,
+        snap: config.snap, navigation: 0, last: fm.vec2(0.0, 0.0),
+        dragging: false, drag: empty_drag, outcome: EDITING,
+        tree_ids: tree_ids, doc_by_tree_id: doc_by_tree_id, node_meta: node_meta,
+        deleted_docs: map[int]bool{}, pre_drag_snap: empty_snapshot(),
+        undo_stack: []ViewportSnapshot{}, redo_stack: []ViewportSnapshot{}}
+    $wb := empty_whitebox_host() or >>
+    if config.whitebox_shape.len > 0 {
+        spawn_whitebox_shape($&wb, config.whitebox_shape + "", fm.vec3(2.0, 2.0, 2.0)) or >>
+    }
+    $live_ch := empty_live_channel()
+    if config.live_connect.len > 0 {
+        live_ch = connect_live_host(config.live_connect + "") or >>
+        emit_ready_event(&live_ch, gpu_info.backend_name(device.backend() or >>))
+    }
+    $script_lines := []string{}
+    $script_cursor := 0
+    if config.live_script.len > 0 {
+        sraw := snapshot.read(config.live_script + "", snapshot.MAX_BYTES) or >>
+        for raw_ln in strings.split(&sraw, "\n") {
+            ln := strings.trim_space(&raw_ln)
+            if ln.len > 0 { script_lines.push(ln) }
+        }
+    }
+
+    $redraw := true
+    $wb_emit_pending := false
+    $pending_capture := config.capture + ""
+    while editor.outcome == EDITING {
+        window.pump() or >>
+        state := (device.window() or >>).state() or >>
+        size := frame_size(state)
+        if live_ch.connected {
+            $draining := true
+            while draining {
+                select {
+                    cmd_line := <-live_ch.incoming {
+                        if apply_live_command(&cmd_line, $&editor, $&tree, $&wb, $&pending_capture) {
+                            redraw = true
+                            wb_emit_pending = true
+                            if pending_capture.len > 0 || editor.outcome != EDITING {
+                                draining = false
+                            }
+                        }
+                    }
+                    else { draining = false }
+                }
+            }
+        }
+        if script_cursor < script_lines.len {
+            cmd_line := script_lines[script_cursor] + ""
+            script_cursor += 1
+            if apply_live_command(&cmd_line, $&editor, $&tree, $&wb, $&pending_capture) {
+                redraw = true
+                wb_emit_pending = true
+            }
+        }
+        for i in 0:256 {
+            event := device.poll() or >>
+            if event.kind == events.EVENT_NONE { <- }
+            if config.check_node.len == 0 && config.live_script.len == 0 {
+                handle_event_live($&editor, $&tree, $&world, &picker, $&wb, &live_ch, &event, size, event_point(state, &event)) or >>
+            }
+            if editor.outcome != EDITING { <- }
+            if event.kind != events.EVENT_POINTER_MOVE || editor.dragging || editor.navigation != 0 { redraw = true }
+        }
+        if editor.outcome != EDITING {
+            if (pending_capture.len > 0 || (wb_emit_pending && live_ch.connected && wb.active)) && size.x >= 1.0 && size.y >= 1.0 {
+                frame := camera_frame(editor.orbit, size) or >>
+                draw_view($&device, $&overlay, $&hud, $&world, $&modern, &slights, &scene_mods, &tree, &editor, $&wb, frame, pending_capture + "") or >>
+                if pending_capture.len > 0 {
+                    emit_captured_event(&live_ch, pending_capture + "")
+                    pending_capture = ""
+                }
+                if wb_emit_pending {
+                    emit_whitebox_event(&live_ch, &wb)
+                    wb_emit_pending = false
+                }
+            }
+            <-
+        }
+        if state.minimized || (!redraw && pending_capture.len == 0) || size.x < 1.0 || size.y < 1.0 {
+            sleep_ns(8000000)
+            ->
+        }
+        if config.check_also.len > 0 {
+            check_group($&editor, $&tree, $&world, &picker, root, size, config.check_node + "", config.check_also + "",
+                config.check_local) or >>
+        } else if config.check_node.len > 0 {
+            check_edit($&editor, $&tree, $&world, &picker, root, size, config.check_node + "") or >>
+        }
+        frame := camera_frame(editor.orbit, size) or >>
+        draw_view($&device, $&overlay, $&hud, $&world, $&modern, &slights, &scene_mods, &tree, &editor, $&wb, frame, pending_capture + "") or >>
+        if pending_capture.len > 0 {
+            emit_captured_event(&live_ch, pending_capture + "")
+            pending_capture = ""
+        }
+        if wb_emit_pending {
+            emit_whitebox_event(&live_ch, &wb)
+            wb_emit_pending = false
+        }
+        redraw = false
+    }
+    if editor.outcome == APPLY {
+        captured := models.capture(&tree, root) or >>
+        files.save(config.output + "", &captured) or >>
+        write_viewport_meta(&config, &editor) or >>
+        export_whitebox_glb(&wb, config.whitebox_out + "") or >>
+        emit_live_event(&live_ch, "{\"event\":\"closed\",\"outcome\":\"apply\"}")
+    } else {
+        emit_live_event(&live_ch, "{\"event\":\"closed\",\"outcome\":\"cancel\"}")
+    }
+    live_ch.close_live()
+    wb_sess := $&wb.session
+    _ := wb_sess.close()
+    if modern.enabled && modern.pipelines.len > 0 {
+        ($&modern.pipelines[0]).close()
+    }
+    scene_mods.close() or >>
+    models.close() or >>
+    overlay.close() or >>
+    device.close() or >>
+    << 0
+}
+
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

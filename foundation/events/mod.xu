@@ -1,0 +1,243 @@
+@"github.com/xulang-org/nexus/foundation/events"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#strings
+
+pub struct SubscriptionHandle {
+    pub id int
+    pub generation int
+}
+
+pub struct BusEvent {
+    pub id int
+    pub topic string
+    pub sender_id int
+    pub target_id int
+    pub priority int
+    pub int_val int
+    pub float_val f64
+    pub vec_val fm.Vec3
+    pub str_val string
+    pub tag string
+}
+
+struct SubscriberSlot {
+    alive bool
+    generation int
+    pattern string
+    prefix_match bool
+    tag_filter string
+    min_priority int
+    inbox []BusEvent
+}
+
+pub struct EventBus {
+    subs []SubscriberSlot
+    free_ids []int
+    pending []BusEvent
+    history []BusEvent
+    max_queue int
+    history_cap int
+    next_event_id int
+}
+
+pub fn make_event(topic string, sender_id int, target_id int, priority int, int_val int, float_val f64, vec_val fm.Vec3, str_val string, tag string) BusEvent {
+    << BusEvent{
+        id: 0,
+        topic: topic + "",
+        sender_id: sender_id,
+        target_id: target_id,
+        priority: priority,
+        int_val: int_val,
+        float_val: float_val,
+        vec_val: vec_val,
+        str_val: str_val + "",
+        tag: tag + ""
+    }
+}
+
+pub fn new_event_bus(max_queue int, history_cap int) EventBus {
+    if max_queue < 1 || max_queue > 65536 || history_cap < 0 || history_cap > 4096 {
+        >> errors.new("nexus events: invalid queue or history capacity")
+    }
+    << EventBus{
+        subs: []SubscriberSlot{},
+        free_ids: []int{},
+        pending: []BusEvent{},
+        history: []BusEvent{},
+        max_queue: max_queue,
+        history_cap: history_cap,
+        next_event_id: 1
+    }
+}
+
+fn clone_event(ev &BusEvent) BusEvent {
+    << BusEvent{
+        id: ev.id,
+        topic: ev.topic + "",
+        sender_id: ev.sender_id,
+        target_id: ev.target_id,
+        priority: ev.priority,
+        int_val: ev.int_val,
+        float_val: ev.float_val,
+        vec_val: ev.vec_val,
+        str_val: ev.str_val + "",
+        tag: ev.tag + ""
+    }
+}
+
+fn add_subscription(bus $&EventBus, pattern string, prefix_match bool, tag_filter string, min_priority int) SubscriptionHandle {
+    if pattern.len == 0 {
+        >> errors.new("nexus events: subscription topic/prefix cannot be empty")
+    }
+    $id := 0
+    $gen := 1
+    if bus.free_ids.len > 0 {
+        last := bus.free_ids.len - 1
+        id = bus.free_ids[last]
+        $next_free := []int{}
+        for i in 0:last { next_free.push(bus.free_ids[i]) }
+        bus.free_ids = next_free
+        gen = bus.subs[id].generation
+        bus.subs[id] = SubscriberSlot{
+            alive: true, generation: gen, pattern: pattern + "",
+            prefix_match: prefix_match, tag_filter: tag_filter + "",
+            min_priority: min_priority, inbox: []BusEvent{}
+        }
+    } else {
+        id = bus.subs.len
+        bus.subs.push(SubscriberSlot{
+            alive: true, generation: 1, pattern: pattern + "",
+            prefix_match: prefix_match, tag_filter: tag_filter + "",
+            min_priority: min_priority, inbox: []BusEvent{}
+        })
+    }
+    << SubscriptionHandle{id: id, generation: gen}
+}
+
+pub fn (bus $&EventBus) subscribe(topic string, tag_filter string, min_priority int) SubscriptionHandle {
+    << add_subscription(bus, topic, false, tag_filter, min_priority) or >>
+}
+
+pub fn (bus $&EventBus) subscribe_prefix(prefix string, tag_filter string, min_priority int) SubscriptionHandle {
+    << add_subscription(bus, prefix, true, tag_filter, min_priority) or >>
+}
+
+pub fn (bus &EventBus) is_subscribed(h SubscriptionHandle) bool {
+    if h.id < 0 || h.id >= bus.subs.len { << false }
+    sid := h.id
+    s := &bus.subs[sid]
+    << s.alive && s.generation == h.generation
+}
+
+pub fn (bus $&EventBus) unsubscribe(h SubscriptionHandle) bool {
+    if !bus.is_subscribed(h) { << false }
+    bus.subs[h.id].alive = false
+    bus.subs[h.id].generation = bus.subs[h.id].generation + 1
+    bus.subs[h.id].inbox = []BusEvent{}
+    bus.free_ids.push(h.id)
+    << true
+}
+
+pub fn (bus $&EventBus) enqueue(ev BusEvent) int {
+    if ev.topic.len == 0 {
+        >> errors.new("nexus events: event topic cannot be empty")
+    }
+    if bus.pending.len >= bus.max_queue {
+        >> errors.new("nexus events: pending queue capacity exceeded")
+    }
+    eid := bus.next_event_id
+    $stored := clone_event(&ev)
+    stored.id = eid
+    bus.next_event_id = eid + 1
+    bus.pending.push(stored)
+    << eid
+}
+
+pub fn (bus &EventBus) pending_count() int { << bus.pending.len }
+
+pub fn (bus $&EventBus) clear_pending() {
+    bus.pending = []BusEvent{}
+}
+
+fn slot_matches(sub &SubscriberSlot, ev &BusEvent) bool {
+    if ev.priority < sub.min_priority { << false }
+    if sub.tag_filter.len > 0 && ev.tag != sub.tag_filter { << false }
+    if sub.prefix_match {
+        << strings.has_prefix(&ev.topic, sub.pattern)
+    }
+    << ev.topic == sub.pattern
+}
+
+fn sort_events_desc(list $&[]BusEvent) {
+    if list.len < 2 { << }
+    for i in 0:(list.len - 1) {
+        for j in (i + 1):list.len {
+            swap := list[j].priority > list[i].priority ||
+                   (list[j].priority == list[i].priority && list[j].id < list[i].id)
+            if swap {
+                tmp := list[i]
+                list[i] = list[j]
+                list[j] = tmp
+            }
+        }
+    }
+}
+
+pub fn (bus $&EventBus) flush() int {
+    if bus.pending.len == 0 { << 0 }
+    sort_events_desc($&bus.pending)
+    $delivered := 0
+    for ei in 0:bus.pending.len {
+        ev := &bus.pending[ei]
+        for si in 0:bus.subs.len {
+            if !bus.subs[si].alive { -> }
+            if slot_matches(&bus.subs[si], ev) {
+                bus.subs[si].inbox.push(clone_event(ev))
+                delivered += 1
+            }
+        }
+        if bus.history_cap > 0 {
+            bus.history.push(clone_event(ev))
+            if bus.history.len > bus.history_cap {
+                drop_n := bus.history.len - bus.history_cap
+                $trimmed := []BusEvent{}
+                for k in drop_n:bus.history.len {
+                    trimmed.push(bus.history[k])
+                }
+                bus.history = trimmed
+            }
+        }
+    }
+    bus.pending = []BusEvent{}
+    << delivered
+}
+
+pub fn (bus $&EventBus) poll(h SubscriptionHandle) []BusEvent {
+    if !bus.is_subscribed(h) {
+        >> errors.new("nexus events: stale or invalid subscription handle")
+    }
+    sid := h.id
+    $out := []BusEvent{}
+    sub := &bus.subs[sid]
+    for i in 0:sub.inbox.len {
+        ev := &sub.inbox[i]
+        out.push(clone_event(ev))
+    }
+    bus.subs[sid].inbox = []BusEvent{}
+    << out
+}
+
+pub fn (bus &EventBus) recent_events(limit int) []BusEvent {
+    $out := []BusEvent{}
+    if bus.history.len == 0 || limit == 0 { << out }
+    $start := 0
+    if limit > 0 && limit < bus.history.len {
+        start = bus.history.len - limit
+    }
+    for i in start:bus.history.len {
+        out.push(clone_event(&bus.history[i]))
+    }
+    << out
+}

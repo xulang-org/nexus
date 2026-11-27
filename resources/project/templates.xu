@@ -1,0 +1,323 @@
+@"github.com/xulang-org/nexus/resources/project"
+
+#encoding/json
+#strings
+
+pub fn generate_xu_xun(module_name &string, nexus_dep &string, xu_version &string) string {
+    $ver := xu_version + ""
+    if ver.len == 0 { ver = DEFAULT_XU_VERSION }
+    $dep := nexus_dep + ""
+    if dep.len == 0 { dep = "file:../nexus" }
+    $b := strings.new_byte_builder(256)
+    b.write_str("module: " + *module_name + "\n")
+    b.write_str("version: !ver 0.1.0\n")
+    b.write_str("xu: !ver " + ver + "\n")
+    b.write_str("require:\n")
+    b.write_str("  \"github.com/xulang-org/nexus\": " + dep + "\n")
+    << b.to_string()
+}
+
+pub fn generate_gitignore() string {
+    $b := strings.new_byte_builder(256)
+    b.write_str("# Nexus build & staging outputs\n")
+    b.write_str("build/\n")
+    b.write_str(".nexus/\n")
+    b.write_str("*.xubc\n")
+    b.write_str("\n# OS & editor files\n")
+    b.write_str(".DS_Store\n")
+    b.write_str("Thumbs.db\n")
+    b.write_str("*.tmp\n")
+    b.write_str("*.log\n")
+    << b.to_string()
+}
+
+pub fn generate_game_config_xu(module_name &string, meta &ProjectMeta) string {
+    mod_path := *module_name + "/src/game"
+    name_s := meta.name + ""
+    id_s := meta.id + ""
+    ver_s := meta.version + ""
+    tmpl_s := meta.template + ""
+    rp_s := meta.render_profile + ""
+    es_s := meta.entry_scene + ""
+    dl_s := meta.default_locale + ""
+    $b := strings.new_byte_builder(512)
+    b.write_str("@" + json.quote(&mod_path) + "\n\n")
+    b.write_str("pub const GAME_NAME = " + json.quote(&name_s) + "\n")
+    b.write_str("pub const PROJECT_ID = " + json.quote(&id_s) + "\n")
+    b.write_str("pub const GAME_VERSION = " + json.quote(&ver_s) + "\n")
+    b.write_str("pub const TEMPLATE = " + json.quote(&tmpl_s) + "\n")
+    b.write_str("pub const RENDER_PROFILE = " + json.quote(&rp_s) + "\n")
+    b.write_str("pub const ENTRY_SCENE = " + json.quote(&es_s) + "\n")
+    b.write_str("pub const DEFAULT_LOCALE = " + json.quote(&dl_s) + "\n\n")
+    b.write_str("pub fn boot_banner() string {\n")
+    b.write_str("    << GAME_NAME + \" (\" + PROJECT_ID + \") v\" + GAME_VERSION + \" [\" + RENDER_PROFILE + \"]\"\n")
+    b.write_str("}\n")
+    << b.to_string()
+}
+
+fn write_dollar_decl(b $&strings.ByteBuilder, indent string, rest string) {
+    b.write_str(indent)
+    b.write_byte(36)
+    b.write_str(rest + "\n")
+}
+
+pub fn generate_main_xu(module_name &string, meta &ProjectMeta) string {
+    game_pkg := *module_name + "/src/game"
+    $b := strings.new_byte_builder(2048)
+    b.write_str("@main\n\n")
+    b.write_str("game #" + json.quote(&game_pkg) + "\n")
+    b.write_str("proj #\"github.com/xulang-org/nexus/integration/project\"\n")
+    b.write_str("scene_fmt #\"github.com/xulang-org/nexus/formats/scene\"\n")
+    b.write_str("inp #\"github.com/xulang-org/nexus/input\"\n")
+    b.write_str("loc #\"github.com/xulang-org/nexus/i18n\"\n")
+    b.write_str("timing #\"github.com/xulang-org/nexus/timing\"\n")
+    b.write_str("snapshot #\"github.com/xulang-org/nexus/internal/file_snapshot\"\n")
+    b.write_str("#errors\n")
+    b.write_str("#os\n")
+    b.write_str("#path/filepath\n\n")
+    b.write_str("fn run() int {\n")
+    b.write_str("    args := os.args()\n")
+    write_dollar_decl($&b, "    ", "project_file := \"project.json\"")
+    write_dollar_decl($&b, "    ", "smoke := false")
+    write_dollar_decl($&b, "    ", "i := 1")
+    b.write_str("    while i < args.len {\n")
+    b.write_str("        arg := args[i] + \"\"\n")
+    b.write_str("        if arg == \"--project\" && i + 1 < args.len {\n")
+    b.write_str("            project_file = args[i + 1] + \"\"\n")
+    b.write_str("            i = i + 2\n")
+    b.write_str("        } else if arg == \"--smoke\" {\n")
+    b.write_str("            smoke = true\n")
+    b.write_str("            i = i + 1\n")
+    b.write_str("        } else {\n")
+    b.write_str("            i = i + 1\n")
+    b.write_str("        }\n")
+    b.write_str("    }\n\n")
+    b.write_str("    project := proj.load_project(project_file) or >>\n")
+    b.write_str("    entry_key := project.entry_scene_key()\n")
+    b.write_str("    scene_idx := project.scene_index(&entry_key)\n")
+    b.write_str("    if scene_idx < 0 {\n")
+    b.write_str("        >> errors.new(\"entry scene not found: \" + entry_key)\n")
+    b.write_str("    }\n")
+    b.write_str("    scene_path := project.scene_source(scene_idx) or >>\n")
+    b.write_str("    scene_raw := snapshot.read(scene_path, scene_fmt.MAX_BYTES) or >>\n")
+    b.write_str("    scene_doc := scene_fmt.decode(&scene_raw) or >>\n\n")
+    write_dollar_decl($&b, "    ", "loc_path := filepath.join([project.directory + \"\", \"locales/strings.json\"])")
+    b.write_str("    if project.has_paths && project.paths.locales.len > 0 {\n")
+    b.write_str("        loc_path = filepath.join([project.directory + \"\", project.paths.locales + \"\"])\n")
+    b.write_str("    }\n")
+    write_dollar_decl($&b, "    ", "localizer := loc.load_json_file(loc_path, game.DEFAULT_LOCALE) or >>")
+    b.write_str("\n")
+    write_dollar_decl($&b, "    ", "inp_path := filepath.join([project.directory + \"\", \"config/input_bindings.json\"])")
+    b.write_str("    if project.has_paths && project.paths.input_bindings.len > 0 {\n")
+    b.write_str("        inp_path = filepath.join([project.directory + \"\", project.paths.input_bindings + \"\"])\n")
+    b.write_str("    }\n")
+    b.write_str("    inp_raw := snapshot.read(inp_path, 262144) or >>\n")
+    write_dollar_decl($&b, "    ", "input_map := inp.new_input_map()")
+    b.write_str("    input_map.import_bindings_json(&inp_raw) or >>\n\n")
+    write_dollar_decl($&b, "    ", "clock := timing.new_scaled_clock(60, 4)")
+    b.write_str("    _ := clock.advance(0.0166667)\n")
+    b.write_str("    _ := smoke\n\n")
+    if meta.template == TEMPLATE_2D {
+        b.write_str("    // Mount Renderer2D + AudioMixer + PlatformServices here for interactive 2D loop.\n")
+    } else if meta.template == TEMPLATE_25D {
+        b.write_str("    // Mount HD-2D / Isometric Renderer + AudioMixer + PlatformServices here.\n")
+    } else {
+        b.write_str("    // Mount ModernPipeline3D / Renderer3D + AudioMixer + PlatformServices here.\n")
+    }
+    b.write_str("    title := localizer.tr(\"app.title\")\n")
+    b.write_str("    jump_keys := input_map.action_keys(\"jump\") or >>\n")
+    b.write_str("    println(\"READY \" + game.boot_banner() + \" title=\" + title +\n")
+    b.write_str("        \" scene=\" + entry_key + \" nodes=\" + str(scene_doc.node_count()) +\n")
+    b.write_str("        \" jump_keys=\" + str(jump_keys.len))\n")
+    b.write_str("    << 0\n")
+    b.write_str("}\n\n")
+    b.write_str("fn main() int {\n")
+    b.write_str("    << run() or (err) {\n")
+    b.write_str("        eprintln(err.msg())\n")
+    b.write_str("        << 1\n")
+    b.write_str("    }\n")
+    b.write_str("}\n")
+    << b.to_string()
+}
+
+pub fn generate_default_i18n_catalog_json(meta &ProjectMeta) string {
+    name_s := meta.name + ""
+    def_loc := meta.default_locale + ""
+    $b := strings.new_byte_builder(1024)
+    b.write_str("{\n")
+    b.write_str("  \"format\": \"nexus.i18n\",\n")
+    b.write_str("  \"version\": 1,\n")
+    b.write_str("  \"default_locale\": " + json.quote(&def_loc) + ",\n")
+    b.write_str("  \"locales\": {\n")
+    b.write_str("    \"en-US\": {\n")
+    b.write_str("      \"entries\": {\"app.title\": " + json.quote(&name_s) + ", \"menu.play\": \"Play\", \"menu.settings\": \"Settings\", \"menu.quit\": \"Quit\"},\n")
+    b.write_str("      \"plurals\": {\"hud.items\": {\"zero\": \"No items\", \"one\": \"1 item\", \"other\": \"{count} items\"}}\n")
+    b.write_str("    },\n")
+    b.write_str("    \"zh-CN\": {\n")
+    b.write_str("      \"entries\": {\"app.title\": " + json.quote(&name_s) + ", \"menu.play\": \"开始游戏\", \"menu.settings\": \"设置\", \"menu.quit\": \"退出\"},\n")
+    b.write_str("      \"plurals\": {\"hud.items\": {\"other\": \"{count} 件物品\"}}\n")
+    b.write_str("    }")
+    if def_loc != "en-US" && def_loc != "zh-CN" && def_loc.len > 0 {
+        b.write_str(",\n    " + json.quote(&def_loc) + ": {\n")
+        b.write_str("      \"entries\": {\"app.title\": " + json.quote(&name_s) + ", \"menu.play\": \"Play\", \"menu.settings\": \"Settings\", \"menu.quit\": \"Quit\"},\n")
+        b.write_str("      \"plurals\": {}\n")
+        b.write_str("    }")
+    }
+    b.write_str("\n  }\n")
+    b.write_str("}\n")
+    << b.to_string()
+}
+
+pub fn generate_default_input_bindings_json(template &string) string {
+    _ := template
+    $b := strings.new_byte_builder(768)
+    b.write_str("{\n")
+    b.write_str("  \"format\": \"nexus.input\",\n")
+    b.write_str("  \"version\": 1,\n")
+    b.write_str("  \"actions\": [\n")
+    b.write_str("    {\"name\": \"move_left\", \"keys\": [4], \"sources\": [0]},\n")
+    b.write_str("    {\"name\": \"move_right\", \"keys\": [7], \"sources\": [1]},\n")
+    b.write_str("    {\"name\": \"move_up\", \"keys\": [26], \"sources\": [2]},\n")
+    b.write_str("    {\"name\": \"move_down\", \"keys\": [22], \"sources\": [3]},\n")
+    b.write_str("    {\"name\": \"jump\", \"keys\": [44], \"sources\": [4]},\n")
+    b.write_str("    {\"name\": \"interact\", \"keys\": [8], \"sources\": [5]},\n")
+    b.write_str("    {\"name\": \"pause\", \"keys\": [41], \"sources\": [6]}\n")
+    b.write_str("  ]\n")
+    b.write_str("}\n")
+    << b.to_string()
+}
+
+pub fn generate_default_perf_budgets_json(template &string) string {
+    _ := template
+    $b := strings.new_byte_builder(768)
+    b.write_str("{\n")
+    b.write_str("  \"format\": \"nexus.perf_budgets\",\n")
+    b.write_str("  \"version\": 1,\n")
+    b.write_str("  \"profiles\": {\n")
+    b.write_str("    \"desktop_60fps\": {\"max_avg_ms\": 14.0, \"max_p95_ms\": 16.67, \"max_p99_ms\": 20.0, \"min_samples\": 10, \"max_regression_ratio\": 0.10},\n")
+    b.write_str("    \"console_120fps\": {\"max_avg_ms\": 7.0, \"max_p95_ms\": 8.33, \"max_p99_ms\": 10.5, \"min_samples\": 10, \"max_regression_ratio\": 0.10},\n")
+    b.write_str("    \"switch_handheld_30fps\": {\"max_avg_ms\": 29.0, \"max_p95_ms\": 33.33, \"max_p99_ms\": 38.0, \"min_samples\": 10, \"max_regression_ratio\": 0.12},\n")
+    b.write_str("    \"mobile_60fps\": {\"max_avg_ms\": 14.5, \"max_p95_ms\": 16.67, \"max_p99_ms\": 22.0, \"min_samples\": 10, \"max_regression_ratio\": 0.12}\n")
+    b.write_str("  }\n")
+    b.write_str("}\n")
+    << b.to_string()
+}
+
+pub fn generate_default_platform_mapping_json() string {
+    $b := strings.new_byte_builder(512)
+    b.write_str("{\n")
+    b.write_str("  \"format\": \"nexus.platform_mapping\",\n")
+    b.write_str("  \"version\": 1,\n")
+    b.write_str("  \"achievements\": [\n")
+    b.write_str("    {\n")
+    b.write_str("      \"logical_id\": \"ACH_FIRST_WIN\",\n")
+    b.write_str("      \"steam_id\": \"ACH_FIRST_WIN\",\n")
+    b.write_str("      \"xbox_id\": \"1\",\n")
+    b.write_str("      \"ps_trophy_id\": 0,\n")
+    b.write_str("      \"taptap_id\": \"tap_first_win\"\n")
+    b.write_str("    }\n")
+    b.write_str("  ],\n")
+    b.write_str("  \"dlcs\": [\n")
+    b.write_str("    {\n")
+    b.write_str("      \"logical_id\": \"DLC_EXPANSION_01\",\n")
+    b.write_str("      \"steam_app_id\": 480010,\n")
+    b.write_str("      \"xbox_store_id\": \"9NX0DLC00001\",\n")
+    b.write_str("      \"ps_entitlement\": \"DLC001\",\n")
+    b.write_str("      \"switch_aoc_index\": 1,\n")
+    b.write_str("      \"taptap_dlc_id\": \"tap_dlc_01\"\n")
+    b.write_str("    }\n")
+    b.write_str("  ]\n")
+    b.write_str("}\n")
+    << b.to_string()
+}
+
+pub fn generate_readme(meta &ProjectMeta, module_name &string, plats &ProjectPlatformConfigs) string {
+    $b := strings.new_byte_builder(1536)
+    b.write_str("# " + meta.name + "\n\n")
+    b.write_str("- **Project ID**: `" + meta.id + "`\n")
+    b.write_str("- **Xu Module**: `" + *module_name + "`\n")
+    b.write_str("- **Template / Render Profile**: `" + meta.template + "` / `" + meta.render_profile + "`\n")
+    b.write_str("- **Entry Scene**: `scenes/" + meta.entry_scene + "`\n")
+    b.write_str("- **Default Locale**: `" + meta.default_locale + "`\n\n")
+    b.write_str("## Directory Layout\n\n")
+    b.write_str("```text\n")
+    b.write_str(".\n")
+    b.write_str("├── xu.xun                  # Xu module & Nexus engine dependency\n")
+    b.write_str("├── project.json            # Nexus project manifest (meta, paths, platforms, assets, scenes)\n")
+    b.write_str("├── src/                    # Game Xu source code (@main + game modules)\n")
+    b.write_str("├── scenes/                 # Authored .xuscene levels\n")
+    b.write_str("├── prefabs/                # Reusable .xuscene prefabs\n")
+    b.write_str("├── assets/                 # models/, textures/, audio/, animations/, shaders/\n")
+    b.write_str("├── scripts/                # XuScript (.xus) & schemas\n")
+    b.write_str("├── locales/                # i18n string catalogs (strings.json)\n")
+    b.write_str("├── config/                 # input_bindings.json, perf_budgets.json, platform_mapping.json\n")
+    b.write_str("├── platforms/              # Store/SDK manifests (steam/xbox/ps/switch/taptap/mobile/miniprogram)\n")
+    b.write_str("├── tests/                  # Game tests & performance regression gates\n")
+    b.write_str("└── build/ & .nexus/        # (gitignored) Build artifacts, cooked generations & editor cache\n")
+    b.write_str("```\n\n")
+    b.write_str("## Common Commands\n\n")
+    b.write_str("```sh\n")
+    b.write_str("# Typecheck & build game executable\n")
+    b.write_str("xu check src/main.xu\n")
+    b.write_str("xu build src/main.xu -o build/game && ./build/game --smoke\n\n")
+    b.write_str("# Audit project structure, scenes, locales, input & platform certs\n")
+    b.write_str("nexus-project doctor project.json\n\n")
+    b.write_str("# Cook scenes & assets into immutable generation under build/published\n")
+    b.write_str("nexus-project build project.json --output build/published\n")
+    if plats.steam.len > 0 {
+        b.write_str("nexus-project steam-stage project.json --output build/stage-steam\n")
+    }
+    if plats.xbox.len > 0 {
+        b.write_str("nexus-project xbox-stage project.json --output build/stage-xbox\n")
+    }
+    if plats.playstation.len > 0 {
+        b.write_str("nexus-project ps-stage project.json --output build/stage-ps\n")
+    }
+    if plats.switch_cfg.len > 0 {
+        b.write_str("nexus-project switch-stage project.json --output build/stage-switch\n")
+    }
+    if plats.taptap.len > 0 {
+        b.write_str("nexus-project taptap-stage project.json --output build/stage-taptap\n")
+    }
+    b.write_str("```\n")
+    << b.to_string()
+}
+
+pub fn format_layout_spec() string {
+    $b := strings.new_byte_builder(1536)
+    b.write_str("Nexus Standard User Game Project Layout:\n")
+    b.write_str("<my_game>/\n")
+    b.write_str("├── xu.xun                       Xu module manifest requiring github.com/xulang-org/nexus\n")
+    b.write_str("├── project.json                 nexus.project v1 (meta, paths, platforms, assets UID map, scenes)\n")
+    b.write_str("├── .gitignore                   Ignores build/, .nexus/, *.xubc\n")
+    b.write_str("├── README.md                    Build, doctor, editor, and store staging guide\n")
+    b.write_str("├── src/\n")
+    b.write_str("│   ├── main.xu                  @main game entrypoint\n")
+    b.write_str("│   └── game/config.xu           Compile-time identity & boot config\n")
+    b.write_str("├── scenes/main.xuscene          Entry scene (.xuscene)\n")
+    b.write_str("├── prefabs/                     Reusable .xuscene prefab templates\n")
+    b.write_str("├── assets/\n")
+    b.write_str("│   ├── models/                  .glb / .obj / .stl meshes\n")
+    b.write_str("│   ├── textures/                .png textures & sprite atlases\n")
+    b.write_str("│   ├── audio/                   .wav / ADPCM audio clips\n")
+    b.write_str("│   ├── animations/              Skeletal ASM JSON & clips\n")
+    b.write_str("│   └── shaders/                 Custom MSL / GLSL / HLSL shaders\n")
+    b.write_str("├── scripts/                     XuScript (.xus) + .schema.json\n")
+    b.write_str("├── locales/strings.json         nexus.i18n v1 localization catalog\n")
+    b.write_str("├── config/\n")
+    b.write_str("│   ├── input_bindings.json      nexus.input v1 keyboard/gamepad bindings\n")
+    b.write_str("│   ├── perf_budgets.json        nexus.perf_budgets v1 frame budgets\n")
+    b.write_str("│   └── platform_mapping.json    nexus.platform_mapping v1 achievements & DLCs\n")
+    b.write_str("├── platforms/\n")
+    b.write_str("│   ├── steam.json               Steamworks / SteamPipe config\n")
+    b.write_str("│   ├── xbox.json                Xbox GDK config & XR rules\n")
+    b.write_str("│   ├── playstation.json         PS5/PS4 PSN config & TRC rules\n")
+    b.write_str("│   ├── switch.json              Nintendo Switch / Switch 2 Lotcheck config\n")
+    b.write_str("│   ├── taptap.json              TapTap TapSDK v4 CN/Global config\n")
+    b.write_str("│   ├── mobile/                  Android / iOS store icons & extras\n")
+    b.write_str("│   └── miniprogram/             WeChat / Douyin MiniGame config\n")
+    b.write_str("├── tests/                       Game tests & perf regression checks\n")
+    b.write_str("├── build/                       (gitignored) compiled binaries, published generations, staged pkgs\n")
+    b.write_str("└── .nexus/                      (gitignored) editor drafts, receipts, local mock saves\n")
+    << b.to_string()
+}

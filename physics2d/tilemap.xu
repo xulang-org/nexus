@@ -1,0 +1,110 @@
+@"github.com/xulang-org/nexus/physics2d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+tiles #"github.com/xulang-org/nexus/resources/tilemap"
+#errors
+#math
+
+// A static snapshot of one layer's solid ground footprints in unit cells.
+pub struct TileMapCollider2D {
+    to_world fm.Transform2D
+    to_cells fm.Transform2D
+    stride int
+    solid map[int]bool
+    left int
+    right int
+    top int
+    bottom int
+}
+
+pub fn new_tilemap_collider_2d(grid &tiles.TileMap2D, world fm.Transform2D) TileMapCollider2D {
+    grid.validate() or >>
+    inverse_world := world.inverse() or >>
+    w := grid.tile_width
+    h := grid.tile_height
+    $local := fm.Transform2D{a: w, b: 0.0, c: 0.0, d: h, tx: 0.0, ty: 0.0}
+    $inverse := fm.Transform2D{a: 1.0 / w, b: 0.0, c: 0.0, d: 1.0 / h, tx: 0.0, ty: 0.0}
+    if grid.layout != tiles.LAYOUT_ORTHOGONAL {
+        // Both diamond layouts lie on this lattice. Offset it so that each
+        // cell's footprint spans [col, col+1] and [row, row+1].
+        local = fm.Transform2D{a: w * 0.5, b: h * 0.5, c: -w * 0.5, d: h * 0.5, tx: 0.0, ty: -h * 0.5}
+        inverse = fm.Transform2D{a: 1.0 / w, b: -1.0 / w, c: 1.0 / h, d: 1.0 / h, tx: 0.5, ty: 0.5}
+    }
+    to_world := world.multiply(local)
+    to_cells := inverse.multiply(inverse_world)
+    if !to_world.is_finite() || !to_cells.is_finite() {
+        >> errors.new("nexus tilemap physics: invalid cell transform")
+    }
+    stride := grid.width + grid.height
+    $collider := TileMapCollider2D{to_world: to_world, to_cells: to_cells, stride: stride, solid: map[int]bool{},
+        left: stride, right: -1, top: stride, bottom: -stride}
+    if grid.solid_tile_count() == 0 { << collider }
+    for row in 0:grid.height {
+        for col in 0:grid.width {
+            if !(grid.cell_is_solid(col, row) or >>) { -> }
+            $x := col
+            $y := row
+            if grid.layout == tiles.LAYOUT_STAGGERED {
+                x = col + (row + 1) / 2
+                y = row / 2 - col
+            }
+            solids := $&collider.solid
+            solids[y * stride + x] = true
+            if x < collider.left { collider.left = x }
+            if x > collider.right { collider.right = x }
+            if y < collider.top { collider.top = y }
+            if y > collider.bottom { collider.bottom = y }
+        }
+    }
+    << collider
+}
+
+pub struct TileMotion2D {
+    pub position fm.Vec2
+    pub collisions int
+}
+
+fn transform_vector(transform fm.Transform2D, v fm.Vec2) fm.Vec2 {
+    << fm.vec2(transform.a * v.x + transform.c * v.y, transform.b * v.x + transform.d * v.y)
+}
+
+// Position and motion use world coordinates. Half-size is in cells, aligned
+// with the grid axes. Elevation and atlas dimensions do not move colliders.
+pub fn (collider &TileMapCollider2D) move_and_slide(position fm.Vec2, motion fm.Vec2, half_size fm.Vec2) TileMotion2D {
+    target := position.add(motion)
+    center := collider.to_cells.point(position)
+    delta := transform_vector(collider.to_cells, motion)
+    start := center.sub(half_size)
+    end := start.add(delta)
+    size := half_size.scaled(2.0)
+    body := fm.rect2(start.x, start.y, size.x, size.y)
+    if collider.stride <= 0 || !body.valid() || !fm.rect2(end.x, end.y, size.x, size.y).valid() ||
+        !fm.finite(target.x) || !fm.finite(target.y) {
+        >> errors.new("nexus tilemap physics: invalid motion or footprint")
+    }
+    // Slide passes only remove velocity components. Include their small
+    // contact offsets in the swept bounds when selecting candidate cells.
+    margin := contact_margin() * f64(MAX_SLIDE_PASSES)
+    x0 := math.max(f64(collider.left), math.floor(math.min(start.x, end.x) - margin))
+    x1 := math.min(f64(collider.right), math.floor(math.max(start.x, end.x) + size.x + margin))
+    y0 := math.max(f64(collider.top), math.floor(math.min(start.y, end.y) - margin))
+    y1 := math.min(f64(collider.bottom), math.floor(math.max(start.y, end.y) + size.y + margin))
+    if x0 > x1 || y0 > y1 { << TileMotion2D{position: target, collisions: 0} }
+    $solids := []fm.Rect2{}
+    for y in int(y0):(int(y1) + 1) {
+        for x in int(x0):(int(x1) + 1) {
+            if !collider.solid.has(y * collider.stride + x) { -> }
+            if solids.len == MAX_KINEMATIC_SOLIDS { >> errors.new("nexus tilemap physics: swept cell budget exceeded") }
+            solids.push(fm.rect2(f64(x), f64(y), 1.0, 1.0))
+        }
+    }
+    if solids.len == 0 { << TileMotion2D{position: target, collisions: 0} }
+    result := move_and_slide(body, delta, &solids) or >>
+    if result.travelled.x == 0.0 && result.travelled.y == 0.0 {
+        << TileMotion2D{position: position, collisions: result.collisions}
+    }
+    if result.collisions == 0 { << TileMotion2D{position: target, collisions: 0} }
+    resolved := position.add(transform_vector(collider.to_world, result.travelled))
+    if !fm.finite(resolved.x) || !fm.finite(resolved.y) { >> errors.new("nexus tilemap physics: resolved pose overflow") }
+    << TileMotion2D{position: resolved, collisions: result.collisions}
+}

@@ -1,0 +1,431 @@
+@"github.com/xulang-org/nexus/integration/rendering/three_d"
+
+colors #"github.com/xulang-org/nexus/foundation/color"
+fm #"github.com/xulang-org/nexus/foundation/math"
+light_data #"github.com/xulang-org/nexus/resources/lighting"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+sprite_data #"github.com/xulang-org/nexus/resources/sprite3d"
+nexus #"github.com/xulang-org/nexus/scene"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+#errors
+
+struct SpriteBinding3D {
+    spec sprite_data.Sprite3D
+    material ren.Material3D
+}
+
+// Owns one shared unit quad Mesh3D and weak material/texture bindings for Node3D
+// billboards and HD-2D cutout sprites. Texture3D ownership stays with the caller.
+pub struct SceneSprites3D {
+    owner ren.DeviceRef3D
+    quads []ren.Mesh3D
+    bindings map[int]SpriteBinding3D
+    bound_nodes []int
+    count int
+    closed bool
+}
+
+fn apply_sprite_material(material &ren.Material3D, spec &sprite_data.Sprite3D) ren.Material3D {
+    spec.validate() or >>
+    $next := material.with_alpha_cutoff(spec.effective_alpha_cutoff()) or >>
+    next = next.with_double_sided(spec.double_sided)
+    next = next.with_uv_region(spec.region) or >>
+    next = next.with_uv_flip(spec.flip_x, spec.flip_y) or >>
+    next = next.with_shaded(spec.shaded) or >>
+    next = next.with_alpha(spec.opacity) or >>
+    next = next.with_alpha_blend(spec.is_alpha_blended()) or >>
+    << next
+}
+
+pub fn new_scene_sprites_3d(device &ren.Device3D) SceneSprites3D {
+    device.backend() or >>
+    white := colors.rgba8(255, 255, 255, 255) or >>
+    quad_data := meshes.quad_mesh_3d(1.0, 1.0, fm.vec2(0.0, 0.0), white) or >>
+    quad := device.upload(&quad_data) or >>
+    << SceneSprites3D{
+        owner: device.reference(),
+        quads: [quad],
+        bindings: map[int]SpriteBinding3D{},
+        bound_nodes: []int{},
+        count: 0,
+        closed: false
+    }
+}
+
+fn (sprites &SceneSprites3D) require_open() int {
+    if sprites.closed || sprites.quads.len == 0 {
+        >> errors.new("nexus sprite3d: sprite scene is closed")
+    }
+    << 0
+}
+
+fn (sprites &SceneSprites3D) quad_ref() ren.MeshRef3D {
+    sprites.require_open() or >>
+    << sprites.quads[0].reference()
+}
+
+pub fn (sprites &SceneSprites3D) binding_count() int { << sprites.count }
+pub fn (sprites &SceneSprites3D) remaining_bindings() int { << sprite_data.MAX_SPRITES_3D - sprites.count }
+pub fn (sprites &SceneSprites3D) has_sprite(node int) bool { << !sprites.closed && sprites.bindings.has(node) }
+
+pub fn (sprites &SceneSprites3D) spec(node int) sprite_data.Sprite3D {
+    sprites.require_open() or >>
+    if !sprites.bindings.has(node) { >> errors.new("nexus sprite3d: node has no Sprite3D binding") }
+    << sprites.bindings[node].spec
+}
+
+pub fn (sprites &SceneSprites3D) check_binding(tree &nexus.SceneTree, node int, spec &sprite_data.Sprite3D, material &ren.Material3D) int {
+    sprites.require_open() or >>
+    spec.validate() or >>
+    info := tree.node_info(node) or >>
+    if info.kind != nexus.NODE_3D || info.queued_free {
+        >> errors.new("nexus sprite3d: Sprite3D requires an editable Node3D")
+    }
+    applied := apply_sprite_material(material, spec) or >>
+    sprites.owner.validate_material(sprites.quad_ref() or >>, &applied) or >>
+    if !sprites.bindings.has(node) {
+        if sprites.count >= sprite_data.MAX_SPRITES_3D {
+            >> errors.new("nexus sprite3d: sprite binding limit reached; prune retired nodes")
+        }
+        << 1
+    }
+    << 0
+}
+
+pub fn (sprites $&SceneSprites3D) attach_material(tree &nexus.SceneTree, node int, spec sprite_data.Sprite3D, material ren.Material3D) int {
+    added := sprites.check_binding(tree, node, &spec, &material) or >>
+    applied := apply_sprite_material(&material, &spec) or >>
+    if added == 1 { sprites.bound_nodes.push(node) }
+    sprites.bindings[node] = SpriteBinding3D{spec: spec, material: applied}
+    sprites.count = sprites.count + added
+    << 0
+}
+
+pub fn (sprites $&SceneSprites3D) attach(tree &nexus.SceneTree, node int, spec sprite_data.Sprite3D, texture &ren.Texture3D) int {
+    spec.validate() or >>
+    base := ren.material_3d(spec.tint, 0.0, 0.9, fm.vec3(0.0, 0.0, 0.0)) or >>
+    textured := base.with_base_texture(texture) or >>
+    << sprites.attach_material(tree, node, spec, textured) or >>
+}
+
+pub fn (sprites $&SceneSprites3D) set_spec(tree &nexus.SceneTree, node int, spec sprite_data.Sprite3D) int {
+    sprites.require_open() or >>
+    spec.validate() or >>
+    info := tree.node_info(node) or >>
+    if info.kind != nexus.NODE_3D || info.queued_free {
+        >> errors.new("nexus sprite3d: Sprite3D requires an editable Node3D")
+    }
+    if !sprites.bindings.has(node) { >> errors.new("nexus sprite3d: attach a sprite before updating its spec") }
+    existing := &sprites.bindings[node]
+    applied := apply_sprite_material(&existing.material, &spec) or >>
+    sprites.owner.validate_material(sprites.quad_ref() or >>, &applied) or >>
+    sprites.bindings[node] = SpriteBinding3D{spec: spec, material: applied}
+    << 0
+}
+
+// Lightweight animation/facing update that reuses the shared quad without GPU uploads.
+pub fn (sprites $&SceneSprites3D) set_region(node int, region fm.Rect2, flip_x bool, flip_y bool) int {
+    sprites.require_open() or >>
+    if !sprites.bindings.has(node) { >> errors.new("nexus sprite3d: node has no Sprite3D binding") }
+    existing := &sprites.bindings[node]
+    next_spec := existing.spec.with_region(region) or >>
+    flipped := next_spec.with_flip(flip_x, flip_y) or >>
+    applied := apply_sprite_material(&existing.material, &flipped) or >>
+    sprites.bindings[node] = SpriteBinding3D{spec: flipped, material: applied}
+    << 0
+}
+
+fn (sprites $&SceneSprites3D) compact_bound_nodes() {
+    $kept := []int{}
+    for i in 0:sprites.bound_nodes.len {
+        node := sprites.bound_nodes[i]
+        if sprites.bindings.has(node) { kept.push(node) }
+    }
+    sprites.bound_nodes = kept
+}
+
+pub fn (sprites $&SceneSprites3D) detach(node int) int {
+    if node <= 0 { >> errors.new("nexus sprite3d: invalid sprite node") }
+    if !sprites.bindings.has(node) { << 0 }
+    bindings := $&sprites.bindings
+    bindings.delete(node)
+    sprites.count = sprites.count - 1
+    sprites.compact_bound_nodes()
+    << 1
+}
+
+pub fn (sprites $&SceneSprites3D) prune(tree &nexus.SceneTree) int {
+    $drop := []int{}
+    for i in 0:sprites.bound_nodes.len {
+        node := sprites.bound_nodes[i]
+        if !tree.is_alive(node) {
+            drop.push(node)
+            ->
+        }
+        info := tree.node_info(node) or >>
+        if info.queued_free { drop.push(node) }
+    }
+    if drop.len == 0 { << 0 }
+    bindings := $&sprites.bindings
+    for i in 0:drop.len {
+        bindings.delete(drop[i])
+    }
+    sprites.count = sprites.count - drop.len
+    sprites.compact_bound_nodes()
+    << drop.len
+}
+
+// Convenience world pose for Camera3D look-at rigs (matches CameraNode3D global transform).
+pub fn camera_world_from_look_at(eye fm.Vec3, target fm.Vec3, up fm.Vec3) fm.Mat4 {
+    view := nexus.look_at_3d(eye, target, up) or >>
+    << view.affine_inverse() or >>
+}
+
+// Collect alpha-cutout shadow casters for all visible cast_shadow sprites.
+pub fn (sprites &SceneSprites3D) shadow_casters(tree &nexus.SceneTree, camera_world fm.Mat4) []ren.ShadowCaster3D {
+    sprites.require_open() or >>
+    if !camera_world.is_affine() { >> errors.new("nexus sprite3d: invalid camera world transform") }
+    quad := sprites.quad_ref() or >>
+    order := tree.subtree(tree.root()) or >>
+    $casters := []ren.ShadowCaster3D{}
+    for node in order {
+        if !sprites.bindings.has(node) || !(tree.is_visible(node) or >>) { -> }
+        binding := &sprites.bindings[node]
+        if !binding.spec.cast_shadow || binding.spec.is_alpha_blended() { -> }
+        node_world := tree.global_transform_3d(node) or >>
+        world := binding.spec.quad_world_matrix(node_world, camera_world) or >>
+        casters.push(ren.shadow_caster_material(quad, world, &binding.material) or >>)
+    }
+    << casters
+}
+
+fn sprite_sort_comes_before(ia int, da f64, ib int, db f64) bool {
+    diff := da - db
+    if diff > 1e-6 { << true }
+    if diff < -1e-6 { << false }
+    << ia < ib
+}
+
+fn sort_transparent_sprites(depths &[]f64) []int {
+    n := depths.len
+    $order := []int{}
+    $scratch := []int{}
+    for i in 0:n {
+        order.push(i)
+        scratch.push(i)
+    }
+    $width := 1
+    while width < n {
+        $left := 0
+        while left < n {
+            $mid := left + width
+            if mid > n { mid = n }
+            $right := left + width * 2
+            if right > n { right = n }
+            $li := left
+            $ri := mid
+            $out := left
+            while li < mid && ri < right {
+                ia := order[li]
+                ib := order[ri]
+                if sprite_sort_comes_before(ia, depths[ia], ib, depths[ib]) {
+                    scratch[out] = ia
+                    li += 1
+                } else {
+                    scratch[out] = ib
+                    ri += 1
+                }
+                out += 1
+            }
+            while li < mid {
+                scratch[out] = order[li]
+                li += 1
+                out += 1
+            }
+            while ri < right {
+                scratch[out] = order[ri]
+                ri += 1
+                out += 1
+            }
+            for k in left:right { order[k] = scratch[k] }
+            left += width * 2
+        }
+        width = width * 2
+    }
+    << order
+}
+
+pub fn (sprites &SceneSprites3D) draw_lit(device $&ren.Device3D, tree &nexus.SceneTree,
+    camera_world fm.Mat4, view_projection fm.Mat4, lighting &light_data.Environment3D) SceneDraw3D {
+    empty := ren.no_shadow_binding()
+    << sprites.draw_lit_with_shadow(device, tree, camera_world, view_projection, lighting, &empty) or >>
+}
+
+pub fn (sprites &SceneSprites3D) draw_lit_shadowed(device $&ren.Device3D, tree &nexus.SceneTree,
+    camera_world fm.Mat4, view_projection fm.Mat4, lighting &light_data.Environment3D,
+    shadow &ren.ShadowMap3D, source int) SceneDraw3D {
+    binding := shadow.binding(lighting, source) or >>
+    binding.validate_camera(view_projection) or >>
+    << sprites.draw_lit_with_shadow(device, tree, camera_world, view_projection, lighting, &binding) or >>
+}
+
+fn (sprites &SceneSprites3D) draw_lit_with_shadow(device $&ren.Device3D, tree &nexus.SceneTree,
+    camera_world fm.Mat4, view_projection fm.Mat4, lighting &light_data.Environment3D,
+    shadow &ren.ShadowBinding3D) SceneDraw3D {
+    sprites.require_open() or >>
+    if !sprites.owner.matches(device) { >> errors.new("nexus sprite3d: sprite scene belongs to another device") }
+    device.validate_recording() or >>
+    lighting.validate() or >>
+    if !camera_world.is_affine() || !view_projection.is_finite() {
+        >> errors.new("nexus sprite3d: invalid camera transform or view-projection")
+    }
+    quad := sprites.quad_ref() or >>
+    order := tree.subtree(tree.root()) or >>
+    $instances := 0
+    $triangles := 0
+    $culled_instances := 0
+    $culled_triangles := 0
+    $blend_nodes := []int{}
+    $blend_worlds := []fm.Mat4{}
+    $blend_depths := []f64{}
+    $view := fm.identity_3d()
+    $have_view := false
+    for node in order {
+        if !sprites.bindings.has(node) || !(tree.is_visible(node) or >>) { -> }
+        binding := &sprites.bindings[node]
+        node_world := tree.global_transform_3d(node) or >>
+        world := binding.spec.quad_world_matrix(node_world, camera_world) or >>
+        if !(sprites.owner.material_in_view(quad, world, view_projection, &binding.material) or >>) {
+            culled_instances += 1
+            culled_triangles += quad.triangle_count()
+            ->
+        }
+        if binding.spec.is_alpha_blended() {
+            if !have_view {
+                view = camera_world.affine_inverse() or >>
+                have_view = true
+            }
+            center := world.transform(fm.vec4(0.5, 0.5, 0.0, 1.0)).xyz()
+            vpos := view.transform(fm.vec4(center.x, center.y, center.z, 1.0))
+            blend_nodes.push(node)
+            blend_worlds.push(world)
+            blend_depths.push(-vpos.z)
+            ->
+        }
+        count := device.draw_material_shadowed_reference(quad, world, view_projection, &binding.material, lighting, shadow) or >>
+        instances += 1
+        triangles += count
+    }
+    if blend_nodes.len > 0 {
+        sorted := sort_transparent_sprites(&blend_depths)
+        for sidx in sorted {
+            bnode := blend_nodes[sidx]
+            bbind := &sprites.bindings[bnode]
+            count := device.draw_material_shadowed_reference(quad, blend_worlds[sidx], view_projection, &bbind.material, lighting, shadow) or >>
+            instances += 1
+            triangles += count
+        }
+    }
+    << SceneDraw3D{
+        instances: instances,
+        triangles: triangles,
+        culled_instances: culled_instances,
+        culled_triangles: culled_triangles,
+        lod_instances: 0,
+        lod_triangles_saved: 0
+    }
+}
+
+// Draws visible non-alpha-blended sprites (opaque and cutout) into an active HdrTarget3D.
+pub fn (sprites &SceneSprites3D) draw_opaque_into_hdr(
+    device &ren.Device3D,
+    hdr $&ren.HdrTarget3D,
+    clustered &ren.ClusteredRenderer3D,
+    tree &nexus.SceneTree,
+    camera_world fm.Mat4,
+    view fm.Mat4,
+    view_projection fm.Mat4
+) SceneDraw3D {
+    sprites.require_open() or >>
+    if !sprites.owner.matches(device) { >> errors.new("nexus sprite3d: sprite scene belongs to another device") }
+    if !camera_world.is_affine() || !view.is_affine() || !view_projection.is_finite() {
+        >> errors.new("nexus sprite3d: invalid camera transforms for HDR sprite pass")
+    }
+    quad := sprites.quad_ref() or >>
+    order := tree.subtree(tree.root()) or >>
+    $instances := 0
+    $triangles := 0
+    $culled_instances := 0
+    $culled_triangles := 0
+    for node in order {
+        if !sprites.bindings.has(node) || !(tree.is_visible(node) or >>) { -> }
+        binding := &sprites.bindings[node]
+        if binding.spec.is_alpha_blended() { -> }
+        node_world := tree.global_transform_3d(node) or >>
+        world := binding.spec.quad_world_matrix(node_world, camera_world) or >>
+        if !(sprites.owner.material_in_view(quad, world, view_projection, &binding.material) or >>) {
+            culled_instances += 1
+            culled_triangles += quad.triangle_count()
+            ->
+        }
+        count := hdr.draw_clustered(device, clustered, quad, world, view, view_projection, &binding.material) or >>
+        instances += 1
+        triangles += count
+    }
+    << SceneDraw3D{
+        instances: instances,
+        triangles: triangles,
+        culled_instances: culled_instances,
+        culled_triangles: culled_triangles,
+        lod_instances: 0,
+        lod_triangles_saved: 0
+    }
+}
+
+// Submits visible ALPHA_MODE_BLEND Sprite3D instances into a TransparentQueue3D for back-to-front HDR alpha blending.
+pub fn (sprites &SceneSprites3D) enqueue_transparent(
+    tree &nexus.SceneTree,
+    camera_world fm.Mat4,
+    queue $&ren.TransparentQueue3D,
+    order_bias f64
+) int {
+    sprites.require_open() or >>
+    if !camera_world.is_affine() { >> errors.new("nexus sprite3d: invalid camera transform") }
+    quad := sprites.quad_ref() or >>
+    order := tree.subtree(tree.root()) or >>
+    $added := 0
+    for node in order {
+        if !sprites.bindings.has(node) || !(tree.is_visible(node) or >>) { -> }
+        binding := &sprites.bindings[node]
+        if !binding.spec.is_alpha_blended() { -> }
+        node_world := tree.global_transform_3d(node) or >>
+        world := binding.spec.quad_world_matrix(node_world, camera_world) or >>
+        queue.submit(quad, world, binding.material, order_bias) or >>
+        added += 1
+    }
+    << added
+}
+
+fn close_sprite_quad(quad $&ren.Mesh3D) string {
+    quad.close() or (err) { << err.msg() }
+    << ""
+}
+
+pub fn (sprites $&SceneSprites3D) close() int {
+    if sprites.closed { << 0 }
+    $first := ""
+    for i in 0:sprites.quads.len {
+        quad := $&sprites.quads[i]
+        msg := close_sprite_quad(quad)
+        if first.len == 0 && msg.len > 0 { first = msg }
+    }
+    sprites.quads = []ren.Mesh3D{}
+    sprites.bindings = map[int]SpriteBinding3D{}
+    sprites.bound_nodes = []int{}
+    sprites.count = 0
+    sprites.closed = true
+    if first.len > 0 { >> errors.new(first) }
+    << 0
+}
+
+fn (sprites $&SceneSprites3D) drop() { sprites.close() or (err) { << } }

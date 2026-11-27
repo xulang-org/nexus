@@ -1,0 +1,393 @@
+@"github.com/xulang-org/nexus/audio/mixer"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const QUANTIZE_IMMEDIATE = 0
+pub const QUANTIZE_BEAT = 1
+pub const QUANTIZE_BAR = 2
+
+pub struct StemSpec {
+    pub name string
+    pub voice_id int
+    pub base_volume f64
+}
+
+pub struct MusicStateSpec {
+    pub name string
+    pub weights []f64
+}
+
+pub struct MusicDirector {
+    bpm f64
+    beats_per_bar int
+    beat_phase f64
+    stems []StemSpec
+    states []MusicStateSpec
+    state_index map[string]int
+    current_state string
+    current_weights []f64
+    start_weights []f64
+    target_weights []f64
+    fading bool
+    fade_elapsed f64
+    fade_duration f64
+    has_pending bool
+    pending_state string
+    pending_quantize int
+    pending_fade_sec f64
+    pending_trigger_beat f64
+    transitions_triggered int
+    smooth_ramp_ms f64
+}
+
+pub fn new_music_director(bpm f64, beats_per_bar int) MusicDirector {
+    if !fm.finite(bpm) || bpm < 20.0 || bpm > 360.0 || beats_per_bar < 1 || beats_per_bar > 16 {
+        >> errors.new("nexus audio: MusicDirector requires BPM in 20..360 and beats_per_bar in 1..16")
+    }
+    << MusicDirector{
+        bpm: bpm,
+        beats_per_bar: beats_per_bar,
+        beat_phase: 0.0,
+        stems: []StemSpec{},
+        states: []MusicStateSpec{},
+        state_index: map[string]int{},
+        current_state: "",
+        current_weights: []f64{},
+        start_weights: []f64{},
+        target_weights: []f64{},
+        fading: false,
+        fade_elapsed: 0.0,
+        fade_duration: 0.0,
+        has_pending: false,
+        pending_state: "",
+        pending_quantize: QUANTIZE_IMMEDIATE,
+        pending_fade_sec: 0.0,
+        pending_trigger_beat: 0.0,
+        transitions_triggered: 0,
+        smooth_ramp_ms: 0.0
+    }
+}
+
+pub fn (dir $&MusicDirector) set_bpm(bpm f64) int {
+    if !fm.finite(bpm) || bpm < 20.0 || bpm > 360.0 {
+        >> errors.new("nexus audio: invalid BPM")
+    }
+    dir.bpm = bpm
+    << 0
+}
+
+pub fn (dir $&MusicDirector) set_smooth_ramp_ms(ms f64) int {
+    if !fm.finite(ms) || ms < 0.0 || ms > 5000.0 {
+        >> errors.new("nexus audio: smooth ramp_ms outside 0..5000")
+    }
+    dir.smooth_ramp_ms = ms
+    << 0
+}
+
+pub fn (dir &MusicDirector) beat_position() f64 { << dir.beat_phase }
+pub fn (dir &MusicDirector) bar_position() f64 { << dir.beat_phase / f64(dir.beats_per_bar) }
+pub fn (dir &MusicDirector) active_state() string { << dir.current_state + "" }
+pub fn (dir &MusicDirector) queued_state() string { << dir.pending_state + "" }
+pub fn (dir &MusicDirector) transition_count() int { << dir.transitions_triggered }
+
+pub fn (dir $&MusicDirector) add_stem(name string, voice_id int, base_volume f64) int {
+    if name.len == 0 || !fm.finite(base_volume) || base_volume < 0.0 || base_volume > 2.0 {
+        >> errors.new("nexus audio: invalid music stem spec")
+    }
+    for s in dir.stems {
+        if s.name == name { >> errors.new("nexus audio: duplicate stem name: " + name) }
+    }
+    idx := dir.stems.len
+    dir.stems.push(StemSpec{name: name + "", voice_id: voice_id, base_volume: base_volume})
+    dir.current_weights.push(1.0)
+    dir.start_weights.push(1.0)
+    dir.target_weights.push(1.0)
+    // Expand existing defined states cleanly with default 0.0 weight for new stems.
+    for i in 0:dir.states.len {
+        dir.states[i].weights.push(0.0)
+    }
+    << idx
+}
+
+pub fn (dir $&MusicDirector) define_state(name string, weights &[]f64) int {
+    if name.len == 0 || weights.len != dir.stems.len {
+        >> errors.new("nexus audio: music state weights must match stem count")
+    }
+    $clean := []f64{}
+    for w in weights {
+        if !fm.finite(w) || w < 0.0 || w > 1.0 {
+            >> errors.new("nexus audio: stem weight must be in 0.0..1.0")
+        }
+        clean.push(w)
+    }
+    if dir.state_index.has(name + "") {
+        idx := dir.state_index[name + ""]
+        dir.states[idx].weights = clean
+        << idx
+    }
+    idx := dir.states.len
+    dir.states.push(MusicStateSpec{name: name + "", weights: clean})
+    dir.state_index[name + ""] = idx
+    << idx
+}
+
+pub fn (dir &MusicDirector) stem_volume(name string) f64 {
+    for i in 0:dir.stems.len {
+        if dir.stems[i].name == name {
+            << dir.current_weights[i] * dir.stems[i].base_volume
+        }
+    }
+    >> errors.new("nexus audio: unknown stem name: " + name)
+}
+
+fn (dir $&MusicDirector) apply_mixer_volumes(mixer $&Mixer) int {
+    for i in 0:dir.stems.len {
+        vol := clamp_mix(dir.current_weights[i] * dir.stems[i].base_volume, 0.0, 4.0)
+        if dir.smooth_ramp_ms > 0.000001 {
+            mixer.set_volume_smooth(dir.stems[i].voice_id, vol, dir.smooth_ramp_ms) or >>
+        } else {
+            mixer.set_volume(dir.stems[i].voice_id, vol) or >>
+        }
+    }
+    << 0
+}
+
+fn (dir $&MusicDirector) begin_fade(state_name string, fade_seconds f64) int {
+    if !dir.state_index.has(state_name + "") {
+        >> errors.new("nexus audio: unknown music state: " + state_name)
+    }
+    idx := dir.state_index[state_name + ""]
+    st := &dir.states[idx]
+    for i in 0:dir.stems.len {
+        dir.start_weights[i] = dir.current_weights[i]
+        dir.target_weights[i] = st.weights[i]
+    }
+    dir.current_state = state_name + ""
+    dir.transitions_triggered += 1
+    if fade_seconds <= 0.000001 {
+        for i in 0:dir.stems.len {
+            dir.current_weights[i] = dir.target_weights[i]
+        }
+        dir.fading = false
+        dir.fade_elapsed = 0.0
+        dir.fade_duration = 0.0
+    } else {
+        dir.fading = true
+        dir.fade_elapsed = 0.0
+        dir.fade_duration = fade_seconds
+    }
+    << 0
+}
+
+pub fn (dir $&MusicDirector) set_state_immediate(mixer $&Mixer, name string) int {
+    dir.has_pending = false
+    dir.pending_state = ""
+    dir.begin_fade(name + "", 0.0) or >>
+    dir.apply_mixer_volumes(mixer) or >>
+    << 0
+}
+
+pub fn (dir $&MusicDirector) request_transition(name string, quantize int, fade_seconds f64) int {
+    if !dir.state_index.has(name + "") {
+        >> errors.new("nexus audio: unknown music target state: " + name)
+    }
+    if quantize != QUANTIZE_IMMEDIATE && quantize != QUANTIZE_BEAT && quantize != QUANTIZE_BAR {
+        >> errors.new("nexus audio: invalid music quantize mode")
+    }
+    if !fm.finite(fade_seconds) || fade_seconds < 0.0 || fade_seconds > 60.0 {
+        >> errors.new("nexus audio: invalid crossfade duration")
+    }
+    $trigger := dir.beat_phase
+    if quantize == QUANTIZE_BEAT {
+        trigger = math.floor(dir.beat_phase + 0.000000001) + 1.0
+    } else if quantize == QUANTIZE_BAR {
+        bpb := f64(dir.beats_per_bar)
+        trigger = (math.floor((dir.beat_phase + 0.000000001) / bpb) + 1.0) * bpb
+    }
+    dir.has_pending = true
+    dir.pending_state = name + ""
+    dir.pending_quantize = quantize
+    dir.pending_fade_sec = fade_seconds
+    dir.pending_trigger_beat = trigger
+    << 0
+}
+
+// Advances musical clock, checks quantized state triggers, interpolates crossfades, and updates Mixer voices.
+// Returns 1 if a quantized transition triggered during this update, else 0.
+pub fn (dir $&MusicDirector) update(mixer $&Mixer, dt f64) int {
+    if !fm.finite(dt) || dt < 0.0 || dt > 10.0 {
+        >> errors.new("nexus audio: invalid MusicDirector dt")
+    }
+    dir.beat_phase += dt * (dir.bpm / 60.0)
+    $triggered := 0
+    if dir.has_pending && dir.beat_phase + 0.000000001 >= dir.pending_trigger_beat {
+        target := dir.pending_state + ""
+        fade_sec := dir.pending_fade_sec
+        dir.has_pending = false
+        dir.pending_state = ""
+        dir.begin_fade(target, fade_sec) or >>
+        triggered = 1
+    }
+    if dir.fading {
+        dir.fade_elapsed += dt
+        $t := 1.0
+        if dir.fade_duration > 0.000001 {
+            t = clamp_mix(dir.fade_elapsed / dir.fade_duration, 0.0, 1.0)
+        }
+        // Smoothstep S-curve for natural equal-perception transitions.
+        s := t * t * (3.0 - 2.0 * t)
+        for i in 0:dir.stems.len {
+            dir.current_weights[i] = dir.start_weights[i] + (dir.target_weights[i] - dir.start_weights[i]) * s
+        }
+        if t >= 1.0 { dir.fading = false }
+    }
+    dir.apply_mixer_volumes(mixer) or >>
+    << triggered
+}
+
+pub struct AmbientZone {
+    pub name string
+    pub voice_id int
+    pub center fm.Vec2
+    pub inner_radius f64
+    pub outer_radius f64
+    pub priority int
+    pub base_volume f64
+    pub duck_scale f64
+    pub active bool
+    pub current_volume f64
+}
+
+pub struct AmbientZoneMixer {
+    zones []AmbientZone
+    zone_index map[string]int
+    dominant string
+    smooth_ramp_ms f64
+}
+
+pub fn new_ambient_zone_mixer() AmbientZoneMixer {
+    << AmbientZoneMixer{
+        zones: []AmbientZone{},
+        zone_index: map[string]int{},
+        dominant: "",
+        smooth_ramp_ms: 0.0
+    }
+}
+
+pub fn (amb $&AmbientZoneMixer) set_smooth_ramp_ms(ms f64) int {
+    if !fm.finite(ms) || ms < 0.0 || ms > 5000.0 {
+        >> errors.new("nexus audio: smooth ramp_ms outside 0..5000")
+    }
+    amb.smooth_ramp_ms = ms
+    << 0
+}
+
+pub fn (amb $&AmbientZoneMixer) add_zone(
+    name string,
+    voice_id int,
+    center fm.Vec2,
+    inner_radius f64,
+    outer_radius f64,
+    priority int,
+    base_volume f64,
+    duck_scale f64
+) int {
+    if name.len == 0 || !fm.finite(center.x) || !fm.finite(center.y) || !fm.finite(inner_radius) || !fm.finite(outer_radius) ||
+        inner_radius < 0.0 || outer_radius <= inner_radius ||
+        !fm.finite(base_volume) || base_volume < 0.0 || base_volume > 2.0 ||
+        !fm.finite(duck_scale) || duck_scale < 0.0 || duck_scale > 1.0 {
+        >> errors.new("nexus audio: invalid AmbientZone parameters")
+    }
+    if amb.zone_index.has(name + "") {
+        >> errors.new("nexus audio: duplicate ambient zone: " + name)
+    }
+    idx := amb.zones.len
+    amb.zones.push(AmbientZone{
+        name: name + "",
+        voice_id: voice_id,
+        center: center,
+        inner_radius: inner_radius,
+        outer_radius: outer_radius,
+        priority: priority,
+        base_volume: base_volume,
+        duck_scale: duck_scale,
+        active: true,
+        current_volume: 0.0
+    })
+    amb.zone_index[name + ""] = idx
+    << idx
+}
+
+pub fn (amb $&AmbientZoneMixer) set_zone_active(name string, active bool) int {
+    if !amb.zone_index.has(name + "") {
+        >> errors.new("nexus audio: unknown ambient zone: " + name)
+    }
+    idx := amb.zone_index[name + ""]
+    amb.zones[idx].active = active
+    << 0
+}
+
+pub fn (amb &AmbientZoneMixer) zone_volume(name string) f64 {
+    if !amb.zone_index.has(name + "") {
+        >> errors.new("nexus audio: unknown ambient zone: " + name)
+    }
+    idx := amb.zone_index[name + ""]
+    << amb.zones[idx].current_volume
+}
+
+pub fn (amb &AmbientZoneMixer) dominant_zone() string { << amb.dominant + "" }
+
+pub fn (amb $&AmbientZoneMixer) update(mixer $&Mixer, listener fm.Vec2) int {
+    if !fm.finite(listener.x) || !fm.finite(listener.y) { >> errors.new("nexus audio: invalid listener position") }
+    $raw_weights := []f64{}
+    $top_priority := -2147483647
+    $top_idx := -1
+    $top_weight := 0.0
+
+    for i in 0:amb.zones.len {
+        z := &amb.zones[i]
+        $w := 0.0
+        if z.active {
+            dist := listener.sub(z.center).length()
+            if dist <= z.inner_radius {
+                w = 1.0
+            } else if dist < z.outer_radius {
+                t := (z.outer_radius - dist) / (z.outer_radius - z.inner_radius)
+                w = t * t * (3.0 - 2.0 * t)
+            }
+        }
+        raw_weights.push(w)
+        if w > 0.001 {
+            if top_idx < 0 || z.priority > top_priority || (z.priority == top_priority && w > top_weight) {
+                top_priority = z.priority
+                top_idx = i
+                top_weight = w
+            }
+        }
+    }
+
+    if top_idx >= 0 {
+        amb.dominant = amb.zones[top_idx].name + ""
+    } else {
+        amb.dominant = ""
+    }
+
+    for i in 0:amb.zones.len {
+        $duck := 1.0
+        if top_idx >= 0 && amb.zones[i].priority < top_priority && raw_weights[i] > 0.001 {
+            // Interpolate ducking smoothly with the higher-priority zone's audible weight.
+            target_duck := amb.zones[top_idx].duck_scale
+            duck = 1.0 - (1.0 - target_duck) * top_weight
+        }
+        vol := clamp_mix(amb.zones[i].base_volume * raw_weights[i] * duck, 0.0, 4.0)
+        amb.zones[i].current_volume = vol
+        if amb.smooth_ramp_ms > 0.000001 {
+            mixer.set_volume_smooth(amb.zones[i].voice_id, vol, amb.smooth_ramp_ms) or >>
+        } else {
+            mixer.set_volume(amb.zones[i].voice_id, vol) or >>
+        }
+    }
+    << 0
+}

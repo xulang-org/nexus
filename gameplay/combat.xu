@@ -1,0 +1,559 @@
+@"github.com/xulang-org/nexus/gameplay"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const DMG_PHYSICAL = 0
+pub const DMG_FIRE = 1
+pub const DMG_ICE = 2
+pub const DMG_LIGHTNING = 3
+pub const DMG_POISON = 4
+pub const DMG_TRUE = 5
+
+pub const TEAM_NONE = 0
+pub const TEAM_PLAYER = 1
+pub const TEAM_ENEMY = 2
+pub const TEAM_NEUTRAL = 4
+pub const TEAM_ALL = 7
+
+pub struct HealthComponent {
+    pub hp f64
+    pub max_hp f64
+    pub shield f64
+    pub max_shield f64
+    pub poise f64
+    pub max_poise f64
+    pub invuln_remaining f64
+    pub hit_invuln_duration f64
+    pub shield_regen_delay f64
+    pub shield_regen_rate f64
+    pub poise_regen_delay f64
+    pub poise_regen_rate f64
+    pub combat_timer f64
+    pub poise_timer f64
+    pub alive bool
+    seen_attack_ids []int
+}
+
+pub fn new_health(max_hp f64, max_shield f64, max_poise f64) HealthComponent {
+    if math.is_nan(max_hp) || math.is_inf(max_hp) || max_hp <= 0.0 {
+        >> errors.new("nexus gameplay: max_hp must be finite and positive")
+    }
+    if math.is_nan(max_shield) || math.is_inf(max_shield) || max_shield < 0.0 ||
+        math.is_nan(max_poise) || math.is_inf(max_poise) || max_poise < 0.0 {
+        >> errors.new("nexus gameplay: max_shield and max_poise must be finite and non-negative")
+    }
+    << HealthComponent{
+        hp: max_hp,
+        max_hp: max_hp,
+        shield: max_shield,
+        max_shield: max_shield,
+        poise: max_poise,
+        max_poise: max_poise,
+        invuln_remaining: 0.0,
+        hit_invuln_duration: 0.0,
+        shield_regen_delay: 3.0,
+        shield_regen_rate: 0.0,
+        poise_regen_delay: 2.0,
+        poise_regen_rate: 0.0,
+        combat_timer: 0.0,
+        poise_timer: 0.0,
+        alive: true,
+        seen_attack_ids: []int{}
+    }
+}
+
+pub fn (h $&HealthComponent) configure_regen(
+    hit_invuln f64,
+    shield_delay f64,
+    shield_rate f64,
+    poise_delay f64,
+    poise_rate f64
+) int {
+    if hit_invuln < 0.0 || shield_delay < 0.0 || shield_rate < 0.0 || poise_delay < 0.0 || poise_rate < 0.0 {
+        >> errors.new("nexus gameplay: health regen parameters must be non-negative")
+    }
+    h.hit_invuln_duration = hit_invuln
+    h.shield_regen_delay = shield_delay
+    h.shield_regen_rate = shield_rate
+    h.poise_regen_delay = poise_delay
+    h.poise_regen_rate = poise_rate
+    << 0
+}
+
+pub fn (h $&HealthComponent) step(dt f64) {
+    if dt < 0.0 || math.is_nan(dt) || math.is_inf(dt) { << }
+    if h.invuln_remaining > 0.0 {
+        h.invuln_remaining = math.max(0.0, h.invuln_remaining - dt)
+    }
+    if !h.alive { << }
+    h.combat_timer += dt
+    h.poise_timer += dt
+    if h.shield_regen_rate > 0.0 && h.shield < h.max_shield && h.combat_timer >= h.shield_regen_delay {
+        h.shield = math.min(h.max_shield, h.shield + h.shield_regen_rate * dt)
+    }
+    if h.poise_regen_rate > 0.0 && h.poise < h.max_poise && h.poise_timer >= h.poise_regen_delay {
+        h.poise = math.min(h.max_poise, h.poise + h.poise_regen_rate * dt)
+    }
+}
+
+pub fn (h $&HealthComponent) heal(amount f64) f64 {
+    if !h.alive || amount <= 0.0 || math.is_nan(amount) || math.is_inf(amount) {
+        << 0.0
+    }
+    before := h.hp
+    h.hp = math.min(h.max_hp, h.hp + amount)
+    << h.hp - before
+}
+
+pub fn (h $&HealthComponent) revive(hp_ratio f64) int {
+    r := gp_clamp(hp_ratio, 0.05, 1.0)
+    h.alive = true
+    h.hp = h.max_hp * r
+    h.shield = h.max_shield
+    h.poise = h.max_poise
+    h.invuln_remaining = 0.0
+    h.combat_timer = 0.0
+    h.poise_timer = 0.0
+    << 0
+}
+
+pub fn (h &HealthComponent) hp_ratio() f64 {
+    if h.max_hp <= 0.0 { << 0.0 }
+    << gp_clamp(h.hp / h.max_hp, 0.0, 1.0)
+}
+
+pub struct DamageSpec {
+    pub attack_id int
+    pub source_id int
+    pub source_team int
+    pub base_damage f64
+    pub element int
+    pub poise_damage f64
+    pub crit_rate f64
+    pub crit_mult f64
+    pub knockback fm.Vec3
+    pub can_friendly_fire bool
+    pub ignore_invuln bool
+    pub hit_multiplier f64
+}
+
+pub fn default_damage_spec(source_id int, source_team int, base_damage f64) DamageSpec {
+    << DamageSpec{
+        attack_id: 0,
+        source_id: source_id,
+        source_team: source_team,
+        base_damage: base_damage,
+        element: DMG_PHYSICAL,
+        poise_damage: 10.0,
+        crit_rate: 0.0,
+        crit_mult: 1.5,
+        knockback: fm.vec3(0.0, 0.0, 0.0),
+        can_friendly_fire: false,
+        ignore_invuln: false,
+        hit_multiplier: 1.0
+    }
+}
+
+pub struct DamageResult {
+    pub applied bool
+    pub blocked_reason string
+    pub raw_damage f64
+    pub mitigated_damage f64
+    pub shield_absorbed f64
+    pub hp_damage f64
+    pub is_crit bool
+    pub staggered bool
+    pub killed bool
+    pub knockback fm.Vec3
+}
+
+fn empty_dmg_result(reason string) DamageResult {
+    << DamageResult{
+        applied: false,
+        blocked_reason: reason,
+        raw_damage: 0.0,
+        mitigated_damage: 0.0,
+        shield_absorbed: 0.0,
+        hp_damage: 0.0,
+        is_crit: false,
+        staggered: false,
+        killed: false,
+        knockback: fm.vec3(0.0, 0.0, 0.0)
+    }
+}
+
+fn seen_attack_id(h &HealthComponent, attack_id int) bool {
+    if attack_id <= 0 { << false }
+    for id in h.seen_attack_ids {
+        if id == attack_id { << true }
+    }
+    << false
+}
+
+fn record_attack_id(h $&HealthComponent, attack_id int) {
+    if attack_id <= 0 { << }
+    if h.seen_attack_ids.len >= 16 {
+        $next := []int{}
+        for i in 1:h.seen_attack_ids.len {
+            next.push(h.seen_attack_ids[i])
+        }
+        h.seen_attack_ids = next
+    }
+    h.seen_attack_ids.push(attack_id)
+}
+
+fn element_res_stat(element int) string {
+    if element == DMG_FIRE { << "fire_res" }
+    if element == DMG_ICE { << "ice_res" }
+    if element == DMG_LIGHTNING { << "lightning_res" }
+    if element == DMG_POISON { << "poison_res" }
+    << ""
+}
+
+pub fn apply_damage(
+    health $&HealthComponent,
+    target_team int,
+    target_stats &StatSheet,
+    target_statuses &StatusManager,
+    spec &DamageSpec,
+    rng $&GameplayRng
+) DamageResult {
+    if !health.alive { << empty_dmg_result("dead") }
+    if seen_attack_id(health, spec.attack_id) {
+        << empty_dmg_result("duplicate_hit")
+    }
+    if spec.source_team != TEAM_NONE && spec.source_team == target_team && !spec.can_friendly_fire {
+        << empty_dmg_result("friendly_fire")
+    }
+    is_tag_inv := target_statuses.has_tag(TAG_INVULNERABLE)
+    if !spec.ignore_invuln && (health.invuln_remaining > 0.0 || is_tag_inv) {
+        << empty_dmg_result("invulnerable")
+    }
+    if spec.base_damage < 0.0 || math.is_nan(spec.base_damage) || math.is_inf(spec.base_damage) {
+        >> errors.new("nexus gameplay: damage must be finite and non-negative")
+    }
+
+    mult := math.max(0.0, spec.hit_multiplier)
+    $raw := spec.base_damage * mult
+    $crit := false
+    if spec.crit_rate > 0.0 && raw > 0.0 {
+        roll := rng.next_f64()
+        if roll < gp_clamp(spec.crit_rate, 0.0, 1.0) {
+            crit = true
+            raw *= math.max(1.0, spec.crit_mult)
+        }
+    }
+
+    $mitigated := raw
+    if spec.element != DMG_TRUE {
+        if spec.element == DMG_PHYSICAL {
+            def := math.max(0.0, target_stats.get_or("defense", 0.0))
+            mitigated = raw * (100.0 / (100.0 + def))
+        } else {
+            rname := element_res_stat(spec.element)
+            res := gp_clamp(target_stats.get_or(rname, 0.0), -1.0, 0.90)
+            mitigated = raw * (1.0 - res)
+        }
+    }
+
+    record_attack_id(health, spec.attack_id)
+    $shield_abs := 0.0
+    $rem := mitigated
+    if health.shield > 0.0 && spec.element != DMG_TRUE {
+        shield_abs = math.min(health.shield, rem)
+        health.shield -= shield_abs
+        rem -= shield_abs
+    }
+    hp_before := health.hp
+    health.hp = math.max(0.0, health.hp - rem)
+    hp_dmg := hp_before - health.hp
+
+    $staggered := false
+    if health.max_poise > 0.0 && spec.poise_damage > 0.0 {
+        health.poise -= spec.poise_damage
+        health.poise_timer = 0.0
+        if health.poise <= 0.0 {
+            staggered = true
+            health.poise = health.max_poise
+        }
+    }
+
+    health.combat_timer = 0.0
+    if health.hit_invuln_duration > 0.0 {
+        health.invuln_remaining = health.hit_invuln_duration
+    }
+    $killed := false
+    if health.hp <= 0.0 {
+        health.alive = false
+        killed = true
+    }
+
+    << DamageResult{
+        applied: true,
+        blocked_reason: "",
+        raw_damage: raw,
+        mitigated_damage: mitigated,
+        shield_absorbed: shield_abs,
+        hp_damage: hp_dmg,
+        is_crit: crit,
+        staggered: staggered,
+        killed: killed,
+        knockback: spec.knockback
+    }
+}
+
+// =========================================================================
+// Hitbox / Hurtbox 3D Overlap Resolver
+// =========================================================================
+
+pub struct Hitbox3D {
+    pub id int
+    pub owner_id int
+    pub team int
+    pub attack_id int
+    pub center fm.Vec3
+    pub radius f64
+    pub active bool
+    pub spec DamageSpec
+}
+
+pub struct Hurtbox3D {
+    pub id int
+    pub owner_id int
+    pub team int
+    pub center fm.Vec3
+    pub radius f64
+    pub damage_multiplier f64
+    pub active bool
+    pub tag string
+}
+
+pub struct CombatOverlap3D {
+    pub hitbox_index int
+    pub hurtbox_index int
+    pub attacker_id int
+    pub target_id int
+    pub hit_point fm.Vec3
+    pub multiplier f64
+}
+
+pub fn resolve_combat_overlaps_3d(
+    hitboxes &[]Hitbox3D,
+    hurtboxes &[]Hurtbox3D
+) []CombatOverlap3D {
+    $out := []CombatOverlap3D{}
+    for i in 0:hitboxes.len {
+        hb := &hitboxes[i]
+        if !hb.active || hb.radius <= 0.0 { -> }
+        for j in 0:hurtboxes.len {
+            hurt := &hurtboxes[j]
+            if !hurt.active || hurt.radius <= 0.0 { -> }
+            if hb.owner_id == hurt.owner_id { -> }
+            if hb.team != TEAM_NONE && hb.team == hurt.team && !hb.spec.can_friendly_fire { -> }
+            delta := hurt.center.sub(hb.center)
+            dist_sq := delta.dot(delta)
+            r_sum := hb.radius + hurt.radius
+            if dist_sq <= r_sum * r_sum {
+                mid := hb.center.add(delta.scaled(0.5))
+                out.push(CombatOverlap3D{
+                    hitbox_index: i,
+                    hurtbox_index: j,
+                    attacker_id: hb.owner_id,
+                    target_id: hurt.owner_id,
+                    hit_point: mid,
+                    multiplier: math.max(0.0, hurt.damage_multiplier)
+                })
+            }
+        }
+    }
+    << out
+}
+
+// =========================================================================
+// Ability Set (Cooldowns, Charges, GCD, Cast Time, Combo Windows)
+// =========================================================================
+
+pub struct AbilityDef {
+    pub id string
+    pub cooldown f64
+    pub max_charges int
+    pub cost f64
+    pub cast_time f64
+    pub gcd f64
+    pub combo_steps int
+    pub combo_window f64
+}
+
+pub struct AbilityCastResult {
+    pub started bool
+    pub reason string
+    pub combo_step int
+    pub cost_paid f64
+}
+
+struct AbilityRuntime {
+    def AbilityDef
+    charges int
+    recharge_left f64
+    combo_step int
+    combo_timer f64
+}
+
+pub struct AbilitySet {
+    slots []AbilityRuntime
+    gcd_left f64
+    casting_id string
+    cast_left f64
+}
+
+pub fn new_ability_set() AbilitySet {
+    << AbilitySet{
+        slots: []AbilityRuntime{},
+        gcd_left: 0.0,
+        casting_id: "",
+        cast_left: 0.0
+    }
+}
+
+pub fn (a $&AbilitySet) register(def AbilityDef) int {
+    if def.id.len == 0 || def.max_charges < 1 || def.cooldown < 0.0 || def.cost < 0.0 ||
+        def.cast_time < 0.0 || def.gcd < 0.0 || def.combo_steps < 1 || def.combo_window < 0.0 {
+        >> errors.new("nexus gameplay: invalid AbilityDef fields")
+    }
+    max_c := def.max_charges
+    for i in 0:a.slots.len {
+        if a.slots[i].def.id == def.id {
+            a.slots[i].def = def
+            a.slots[i].charges = max_c
+            a.slots[i].recharge_left = 0.0
+            a.slots[i].combo_step = 0
+            a.slots[i].combo_timer = 0.0
+            << i
+        }
+    }
+    a.slots.push(AbilityRuntime{
+        def: def,
+        charges: max_c,
+        recharge_left: 0.0,
+        combo_step: 0,
+        combo_timer: 0.0
+    })
+    << a.slots.len - 1
+}
+
+fn ability_index(a &AbilitySet, id &string) int {
+    for i in 0:a.slots.len {
+        if a.slots[i].def.id == *id { << i }
+    }
+    << -1
+}
+
+pub fn (a $&AbilitySet) try_cast(id string, current_resource f64, silenced bool) AbilityCastResult {
+    idx := ability_index(a, &id)
+    if idx < 0 {
+        << AbilityCastResult{started: false, reason: "unknown", combo_step: 0, cost_paid: 0.0}
+    }
+    if silenced {
+        << AbilityCastResult{started: false, reason: "silenced", combo_step: 0, cost_paid: 0.0}
+    }
+    if a.cast_left > 0.0 {
+        << AbilityCastResult{started: false, reason: "casting", combo_step: 0, cost_paid: 0.0}
+    }
+    if a.gcd_left > 0.0 {
+        << AbilityCastResult{started: false, reason: "gcd", combo_step: 0, cost_paid: 0.0}
+    }
+    slot := $&a.slots[idx]
+    if slot.charges < 1 {
+        << AbilityCastResult{started: false, reason: "cooldown", combo_step: 0, cost_paid: 0.0}
+    }
+    if current_resource + 1e-9 < slot.def.cost {
+        << AbilityCastResult{started: false, reason: "resource", combo_step: 0, cost_paid: 0.0}
+    }
+
+    was_full := slot.charges == slot.def.max_charges
+    slot.charges -= 1
+    if was_full && slot.def.cooldown > 0.0 {
+        slot.recharge_left = slot.def.cooldown
+    }
+    $csteps := slot.def.combo_steps
+    if csteps > 1 {
+        if slot.combo_timer > 0.0 {
+            if csteps < 2 { csteps = 2 }
+            slot.combo_step = (slot.combo_step % csteps) + 1
+        } else {
+            slot.combo_step = 1
+        }
+        slot.combo_timer = slot.def.combo_window
+    } else {
+        slot.combo_step = 1
+        slot.combo_timer = 0.0
+    }
+    if slot.def.gcd > 0.0 {
+        a.gcd_left = slot.def.gcd
+    }
+    if slot.def.cast_time > 0.0 {
+        a.casting_id = slot.def.id + ""
+        a.cast_left = slot.def.cast_time
+    }
+    << AbilityCastResult{
+        started: true,
+        reason: "",
+        combo_step: slot.combo_step,
+        cost_paid: slot.def.cost
+    }
+}
+
+pub fn (a $&AbilitySet) step(dt f64) {
+    if dt <= 0.0 || math.is_nan(dt) || math.is_inf(dt) { << }
+    if a.gcd_left > 0.0 {
+        a.gcd_left = math.max(0.0, a.gcd_left - dt)
+    }
+    if a.cast_left > 0.0 {
+        a.cast_left = math.max(0.0, a.cast_left - dt)
+        if a.cast_left <= 0.0 {
+            a.casting_id = ""
+        }
+    }
+    for i in 0:a.slots.len {
+        slot := $&a.slots[i]
+        if slot.combo_timer > 0.0 {
+            slot.combo_timer = math.max(0.0, slot.combo_timer - dt)
+            if slot.combo_timer <= 0.0 { slot.combo_step = 0 }
+        }
+        if slot.charges < slot.def.max_charges && slot.def.cooldown > 0.0 {
+            $rem_dt := dt
+            while rem_dt > 0.0 && slot.charges < slot.def.max_charges {
+                if rem_dt >= slot.recharge_left {
+                    rem_dt -= slot.recharge_left
+                    slot.charges += 1
+                    if slot.charges < slot.def.max_charges {
+                        slot.recharge_left = slot.def.cooldown
+                    } else {
+                        slot.recharge_left = 0.0
+                    }
+                } else {
+                    slot.recharge_left -= rem_dt
+                    rem_dt = 0.0
+                }
+            }
+        }
+    }
+}
+
+pub fn (a &AbilitySet) charges(id string) int {
+    idx := ability_index(a, &id)
+    if idx < 0 { << 0 }
+    << a.slots[idx].charges
+}
+
+pub fn (a &AbilitySet) cooldown_remaining(id string) f64 {
+    idx := ability_index(a, &id)
+    if idx < 0 { << 0.0 }
+    << a.slots[idx].recharge_left
+}
+
+pub fn (a &AbilitySet) is_casting() bool {
+    << a.cast_left > 0.0
+}

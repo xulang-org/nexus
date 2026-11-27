@@ -1,17 +1,20 @@
 @main
 
+diag #"github.com/xulang-org/nexus/foundation/diagnostics"
 fm #"github.com/xulang-org/nexus/foundation/math"
 scene #"github.com/xulang-org/nexus/scene"
 controls #"github.com/xulang-org/nexus/input"
+timing #"github.com/xulang-org/nexus/timing"
 xacp #"github.com/xulang-org/nexus/xacp"
+#encoding/xun
 #os
 #strings
 #strconv
 #time
 #errors
 
-fn send_request(fd int, body string) int {
-    frame := "XACP/1\n" + str(body.len) + "\n" + body
+fn send_request(fd int, body &string) int {
+    frame := "XACP/1\n" + str(body.len) + "\n" + *body
     $offset := 0
     while offset < frame.len {
         $end := offset + 512
@@ -28,6 +31,15 @@ struct TestReader {
     remainder string
 }
 
+fn (r $&TestReader) wait_readable() int {
+    for _ in 0:2000 {
+        ready := os.socket_poll(r.fd, 1) or >>
+        if ready != 0 { << 0 }
+        time.sleep(1000000)
+    }
+    >> errors.new("xacp test: timed out waiting for socket response")
+}
+
 fn (r $&TestReader) read_line() string {
     while true {
         idx := strings.index_byte(&r.remainder, 10)
@@ -39,6 +51,7 @@ fn (r $&TestReader) read_line() string {
             }
             << line
         }
+        r.wait_readable() or >>
         chunk := os.socket_read(r.fd, 4096) or >>
         if chunk.len == 0 { >> errors.new("EOF") }
         r.remainder = r.remainder + chunk
@@ -47,6 +60,7 @@ fn (r $&TestReader) read_line() string {
 
 fn (r $&TestReader) read_bytes(count int) string {
     while r.remainder.len < count {
+        r.wait_readable() or >>
         chunk := os.socket_read(r.fd, 4096) or >>
         if chunk.len == 0 { >> errors.new("EOF") }
         r.remainder = r.remainder + chunk
@@ -65,6 +79,27 @@ fn (r $&TestReader) read_frame() string {
     << body
 }
 
+fn wait_poll(ctrl $&xacp.GameControl, tree $&scene.SceneTree, input $&controls.InputMap) int {
+    for _ in 0:200 {
+        if ctrl.poll(tree, input) {
+            << 0
+        }
+        time.sleep(1000000)
+    }
+    >> errors.new("xacp test: timed out waiting for ctrl.poll")
+}
+
+fn wait_poll_full(ctrl $&xacp.GameControl, tree $&scene.SceneTree, input $&controls.InputMap,
+                  logger $&diag.Logger, cvars $&diag.CVarRegistry, profiler $&timing.FrameProfiler) int {
+    for _ in 0:200 {
+        if ctrl.poll_full(tree, input, logger, cvars, profiler) {
+            << 0
+        }
+        time.sleep(1000000)
+    }
+    >> errors.new("xacp test: timed out waiting for ctrl.poll_full")
+}
+
 fn run_tests() int {
     println("=== Nexus Engine XACP Integration Test Suite ===")
 
@@ -78,10 +113,13 @@ fn run_tests() int {
     $input := controls.new_input_map()
     input.bind("up", xacp.KEY_W) or >>
     input.bind("left", xacp.KEY_A) or >>
+    input.bind_mouse("fire", controls.MOUSE_BUTTON_LEFT) or >>
 
     port := 19876
     $ctrl := xacp.attach_tcp(port)
-    time.sleep(50000000) // 50ms wait for listener
+    assert(ctrl.is_open())
+    ctrl.set_canvas_size(1280, 720)
+    ctrl.set_frame(42)
 
     client := os.socket(2, 1, 0) or >>
     os.connect4(client, 127, 0, 0, 1, port) or >>
@@ -89,7 +127,7 @@ fn run_tests() int {
 
     // Test 1: xacp.hello
     hello_req := "id: !i 1\nop: xacp.hello\nargs:\n  ver: !ver 1.0.0\n  nonce: \"test-nexus-nonce\"\n"
-    send_request(client, hello_req) or >>
+    send_request(client, &hello_req) or >>
     hello_res := reader.read_frame() or >>
     assert(strings.contains(&hello_res, "ok: !b true"))
     assert(strings.contains(&hello_res, "test-nexus-nonce"))
@@ -98,7 +136,7 @@ fn run_tests() int {
 
     // Test 2: proc.status
     status_req := "id: !i 2\nop: proc.status\nargs: {}\n"
-    send_request(client, status_req) or >>
+    send_request(client, &status_req) or >>
     status_res := reader.read_frame() or >>
     assert(strings.contains(&status_res, "ok: !b true"))
     assert(strings.contains(&status_res, "state: \"OPEN\""))
@@ -106,120 +144,352 @@ fn run_tests() int {
 
     // Test 3: ui.tree
     tree_req := "id: !i 3\nop: ui.tree\nargs:\n  win: !i 1\n"
-    send_request(client, tree_req) or >>
-    $polled := false
-    for i in 0:100 {
-        if ctrl.poll($&tree, $&input) {
-            polled = true
-            <-
-        }
-        time.sleep(1000000)
-    }
-    assert(polled)
+    send_request(client, &tree_req) or >>
+    wait_poll($&ctrl, $&tree, $&input) or >>
     tree_res := reader.read_frame() or >>
     assert(strings.contains(&tree_res, "ok: !b true"))
+    assert(strings.contains(&tree_res, "revision: !i "))
     assert(strings.contains(&tree_res, "World"))
     assert(strings.contains(&tree_res, "Player"))
     assert(strings.contains(&tree_res, "Gem0"))
     assert(strings.contains(&tree_res, "total: !i 4"))
     println("  [OK] ui.tree scene hierarchy inspection and serialization")
 
-    // Test 4: ui.input
+    // Test 4: ui.input (keyboard)
     is_up := input.pressed("up") or >>
     assert(!is_up)
     input_req := "id: !i 4\nop: ui.input\nargs:\n  win: !i 1\n  steps: [{ev: key_down, key: !i 119}]\n"
-    send_request(client, input_req) or >>
-    polled = false
-    for i in 0:100 {
-        if ctrl.poll($&tree, $&input) {
-            polled = true
-            <-
-        }
-        time.sleep(1000000)
-    }
-    assert(polled)
+    send_request(client, &input_req) or >>
+    wait_poll($&ctrl, $&tree, $&input) or >>
     input_res := reader.read_frame() or >>
     assert(strings.contains(&input_res, "ok: !b true"))
+    assert(strings.contains(&input_res, "applied: !i 1"))
     is_up_now := input.pressed("up") or >>
     assert(is_up_now)
     println("  [OK] ui.input virtual keyboard injection into nexus input map")
 
-    // Test 5: ui.act (pause)
+    // Test 5: ui.act (pause & unpause with structured action feedback)
     assert(!tree.paused)
     act_req := "id: !i 5\nop: ui.act\nargs:\n  win: !i 1\n  node: !i 1\n  act: pause\n"
-    send_request(client, act_req) or >>
-    polled = false
-    for i in 0:100 {
-        if ctrl.poll($&tree, $&input) {
-            polled = true
-            <-
-        }
-        time.sleep(1000000)
-    }
-    assert(polled)
+    send_request(client, &act_req) or >>
+    wait_poll($&ctrl, $&tree, $&input) or >>
     act_res := reader.read_frame() or >>
     assert(strings.contains(&act_res, "ok: !b true"))
+    assert(strings.contains(&act_res, "paused: !b true"))
     assert(tree.paused)
-    println("  [OK] ui.act pause control action")
+
+    unpause_req := "id: !i 6\nop: ui.act\nargs:\n  win: !i 1\n  node: !i 1\n  act: unpause\n"
+    send_request(client, &unpause_req) or >>
+    wait_poll($&ctrl, $&tree, $&input) or >>
+    unpause_res := reader.read_frame() or >>
+    assert(strings.contains(&unpause_res, "ok: !b true"))
+    assert(strings.contains(&unpause_res, "paused: !b false"))
+    assert(!tree.paused)
+
+    re_pause_req := "id: !i 7\nop: ui.act\nargs:\n  win: !i 1\n  node: !i 1\n  act: pause\n"
+    send_request(client, &re_pause_req) or >>
+    wait_poll($&ctrl, $&tree, $&input) or >>
+    _ := reader.read_frame() or >>
+    assert(tree.paused)
+    println("  [OK] ui.act pause and unpause control actions")
 
     // Test 6: nexus.step
-    step_req := "id: !i 6\nop: nexus.step\nargs:\n  frames: !i 5\n"
-    send_request(client, step_req) or >>
-    polled = false
-    for i in 0:100 {
-        if ctrl.poll($&tree, $&input) {
-            polled = true
-            <-
-        }
-        time.sleep(1000000)
-    }
-    assert(polled)
+    step_req := "id: !i 8\nop: nexus.step\nargs:\n  frames: !i 5\n"
+    send_request(client, &step_req) or >>
+    wait_poll($&ctrl, $&tree, $&input) or >>
     step_res := reader.read_frame() or >>
     assert(strings.contains(&step_res, "ok: !b true"))
+    assert(strings.contains(&step_res, "frame_number: !i 42"))
     assert(ctrl.steps_remaining == 5)
     assert(ctrl.consume_step())
     assert(ctrl.steps_remaining == 4)
     println("  [OK] nexus.step frame-by-frame advance control")
 
-    // Test 7: nexus.state
-    state_req := "id: !i 7\nop: nexus.state\nargs: {}\n"
-    send_request(client, state_req) or >>
-    polled = false
-    for i in 0:100 {
-        if ctrl.poll($&tree, $&input) {
-            polled = true
-            <-
-        }
-        time.sleep(1000000)
-    }
-    assert(polled)
+    // Test 7: nexus.state (reflects configured canvas dimensions and frame)
+    state_req := "id: !i 9\nop: nexus.state\nargs: {}\n"
+    send_request(client, &state_req) or >>
+    wait_poll($&ctrl, $&tree, $&input) or >>
     state_res := reader.read_frame() or >>
     assert(strings.contains(&state_res, "node_count: !i 4"))
     assert(strings.contains(&state_res, "paused: !b true"))
+    assert(strings.contains(&state_res, "frame_number: !i 42"))
+    assert(strings.contains(&state_res, "canvas_width: !i 1280"))
+    assert(strings.contains(&state_res, "canvas_height: !i 720"))
     println("  [OK] nexus.state internal metrics query")
 
     // Test 8: ui.screenshot
-    shot_req := "id: !i 8\nop: ui.screenshot\nargs:\n  win: !i 1\n  mode: file\n"
-    send_request(client, shot_req) or >>
-    polled = false
-    for i in 0:100 {
-        if ctrl.poll($&tree, $&input) {
-            polled = true
-            <-
-        }
-        time.sleep(1000000)
-    }
-    assert(polled)
+    shot_req := "id: !i 10\nop: ui.screenshot\nargs:\n  win: !i 1\n  mode: file\n"
+    send_request(client, &shot_req) or >>
+    wait_poll($&ctrl, $&tree, $&input) or >>
     assert(ctrl.screenshot_requested())
-    // Fulfill screenshot with test file
-    ctrl.fulfill_screenshot(960, 640, "tests/xu.xun")
+    ctrl.fulfill_screenshot(1280, 720, "tests/xu.xun")
     shot_res := reader.read_frame() or >>
+    assert(xun.parse(&shot_res).ok())
     assert(strings.contains(&shot_res, "ok: !b true"))
-    assert(strings.contains(&shot_res, "pixel_width: !i 960"))
+    assert(strings.contains(&shot_res, "pixel_width: !i 1280"))
     println("  [OK] ui.screenshot rendering lifecycle synchronization")
 
+    // Test 9: invalid_request_id recovery (0, -1, duplicate, skipped)
+    bad_zero := "id: !i 0\nop: proc.status\nargs: {}\n"
+    send_request(client, &bad_zero) or >>
+    assert(strings.contains(&reader.read_frame() or >>, "code: invalid_request_id"))
+    bad_dup := "id: !i 10\nop: proc.status\nargs: {}\n"
+    send_request(client, &bad_dup) or >>
+    assert(strings.contains(&reader.read_frame() or >>, "code: invalid_request_id"))
+    bad_skip := "id: !i 12\nop: proc.status\nargs: {}\n"
+    send_request(client, &bad_skip) or >>
+    assert(strings.contains(&reader.read_frame() or >>, "code: invalid_request_id"))
+    ok_next := "id: !i 11\nop: proc.status\nargs: {}\n"
+    send_request(client, &ok_next) or >>
+    assert(strings.contains(&reader.read_frame() or >>, "id: !i 11\nok: !b true"))
+    println("  [OK] strict monotonic request_id enforcement and recovery")
+
     os.socket_close(client) or >>
+
+    // Test 10: Cross-connection nonce replay rejection on same listener
+    c_replay := os.socket(2, 1, 0) or >>
+    os.connect4(c_replay, 127, 0, 0, 1, port) or >>
+    $r_replay := TestReader{fd: c_replay, remainder: ""}
+    send_request(c_replay, &hello_req) or >>
+    replay_res := r_replay.read_frame() or >>
+    assert(strings.contains(&replay_res, "code: nonce_replay"))
+    os.socket_close(c_replay) or >>
     ctrl.close()
+    println("  [OK] cross-connection nonce replay rejection")
+
+    // Test 11: close() unbinds listener & mixed 3D/Group nodes + XUN escaping
+    $tree3d := scene.new_scene_tree_3d("Stage3D", 64) or >>
+    grp := tree3d.add_group(tree3d.root(), "Entities") or >>
+    hero3d := tree3d.add_child_3d(grp, "Hero \"Alpha\" \\v1") or >>
+    tree3d.set_position_3d(hero3d, fm.vec3(1.5, 2.5, 3.5)) or >>
+    sub2d := tree3d.add_child(grp, "HudItem") or >>
+    tree3d.set_position(sub2d, fm.vec2(42.0, 84.0)) or >>
+
+    $ctrl2 := xacp.attach_tcp(port)
+    assert(ctrl2.is_open())
+    c2 := os.socket(2, 1, 0) or >>
+    os.connect4(c2, 127, 0, 0, 1, port) or >>
+    $r2 := TestReader{fd: c2, remainder: ""}
+    hello_req2 := "id: !i 1\nop: xacp.hello\nargs:\n  ver: !ver 1.0.0\n  nonce: \"test-3d-nonce\"\n"
+    send_request(c2, &hello_req2) or >>
+    _ := r2.read_frame() or >>
+    tree_req2 := "id: !i 2\nop: ui.tree\nargs:\n  win: !i 1\n"
+    send_request(c2, &tree_req2) or >>
+    wait_poll($&ctrl2, $&tree3d, $&input) or >>
+    tree3d_res := r2.read_frame() or >>
+    assert(strings.contains(&tree3d_res, "ok: !b true"))
+    assert(strings.contains(&tree3d_res, "node_kind: \"Group\""))
+    assert(strings.contains(&tree3d_res, "node_kind: \"Node3D\""))
+    assert(strings.contains(&tree3d_res, "dim: !i 3"))
+    assert(strings.contains(&tree3d_res, "z: !f 3.5"))
+    assert(strings.contains(&tree3d_res, "node_kind: \"Node2D\""))
+    assert(strings.contains(&tree3d_res, "Hero \\\"Alpha\\\" \\\\v1"))
+    os.socket_close(c2) or >>
+    ctrl2.close()
+    println("  [OK] close() port reuse, 3D/Group scene tree and XUN string escaping")
+
+    // Test 12: Token auth enforcement before handshake and bad token rejection
+    $ctrl_auth := xacp.attach_tcp_with_token(0, "nexus-secret-token")
+    assert(ctrl_auth.is_open())
+    assert(ctrl_auth.port > 0)
+    c_bad := os.socket(2, 1, 0) or >>
+    os.connect4(c_bad, 127, 0, 0, 1, ctrl_auth.port) or >>
+    $r_bad := TestReader{fd: c_bad, remainder: ""}
+
+    unauth_s_req := "id: !i 1\nop: proc.status\nargs: {}\n"
+    send_request(c_bad, &unauth_s_req) or >>
+    unauth_status := r_bad.read_frame() or >>
+    assert(strings.contains(&unauth_status, "code: auth_required"))
+
+    bad_hello := "id: !i 1\nop: xacp.hello\nargs:\n  ver: !ver 1.0.0\n  nonce: \"n1\"\n  token: \"wrong\"\n"
+    send_request(c_bad, &bad_hello) or >>
+    bad_hello_res := r_bad.read_frame() or >>
+    assert(strings.contains(&bad_hello_res, "code: auth_failed"))
+    os.socket_close(c_bad) or >>
+
+    c_ok := os.socket(2, 1, 0) or >>
+    os.connect4(c_ok, 127, 0, 0, 1, ctrl_auth.port) or >>
+    $r_ok := TestReader{fd: c_ok, remainder: ""}
+    good_hello := "id: !i 1\nop: xacp.hello\nargs:\n  ver: !ver 1.0.0\n  nonce: \"n2\"\n  token: \"nexus-secret-token\"\n"
+    send_request(c_ok, &good_hello) or >>
+    good_hello_res := r_ok.read_frame() or >>
+    assert(strings.contains(&good_hello_res, "ok: !b true"))
+
+    send_request(c_ok, &tree_req2) or >>
+    wait_poll($&ctrl_auth, $&tree3d, $&input) or >>
+    auth_tree_res := r_ok.read_frame() or >>
+    assert(strings.contains(&auth_tree_res, "ok: !b true"))
+    assert(strings.contains(&auth_tree_res, "Stage3D"))
+    os.socket_close(c_ok) or >>
+    ctrl_auth.close()
+    println("  [OK] token authentication enforcement and rejection before handshake")
+
+    // Test 13: request_timeout when poll() is not called, then recovery
+    short_limits := xacp.ServerLimits{
+        request_timeout_ms: 150,
+        write_timeout_ms: 2000,
+        hello_timeout_ms: 2000,
+        idle_timeout_ms: 5000,
+        nonce_cache: 128,
+        nonce_replay: true
+    }
+    $ctrl_to := xacp.attach_tcp_with_limits(0, "", short_limits)
+    assert(ctrl_to.is_open())
+    c_to := os.socket(2, 1, 0) or >>
+    os.connect4(c_to, 127, 0, 0, 1, ctrl_to.port) or >>
+    $r_to := TestReader{fd: c_to, remainder: ""}
+    send_request(c_to, &hello_req) or >>
+    assert(strings.contains(&r_to.read_frame() or >>, "ok: !b true"))
+    to_tree_req := "id: !i 2\nop: ui.tree\nargs: {}\n"
+    send_request(c_to, &to_tree_req) or >>
+    to_res := r_to.read_frame() or >>
+    assert(strings.contains(&to_res, "code: request_timeout"))
+    // Session remains open and next id works when polled
+    to_state_req := "id: !i 3\nop: nexus.state\nargs: {}\n"
+    send_request(c_to, &to_state_req) or >>
+    wait_poll($&ctrl_to, $&tree, $&input) or >>
+    assert(strings.contains(&r_to.read_frame() or >>, "ok: !b true"))
+    os.socket_close(c_to) or >>
+    ctrl_to.close()
+    println("  [OK] request_timeout delivery and post-timeout session recovery")
+
+    // Test 14: Pointer/scroll/modifiers ui.input + UI node mirror + ui.tree filters + ui.act
+    $ctrl_ui := xacp.attach_tcp(0)
+    assert(ctrl_ui.is_open())
+    ctrl_ui.register_ui_node(xacp.UiNodeSnapshot{
+        id: 100, parent: -1, kind: "UiPanel", label: "HUD",
+        x: 0.0, y: 0.0, width: 400.0, height: 300.0,
+        visible: true, enabled: true, focusable: false, focused: false, checked: false, value: 0.0
+    })
+    ctrl_ui.register_ui_node(xacp.UiNodeSnapshot{
+        id: 101, parent: 100, kind: "UiButton", label: "Play",
+        x: 20.0, y: 20.0, width: 120.0, height: 40.0,
+        visible: true, enabled: true, focusable: true, focused: false, checked: false, value: 0.0
+    })
+    ctrl_ui.register_ui_node(xacp.UiNodeSnapshot{
+        id: 102, parent: 100, kind: "UiToggle", label: "Audio",
+        x: 20.0, y: 80.0, width: 120.0, height: 32.0,
+        visible: true, enabled: true, focusable: true, focused: false, checked: false, value: 0.0
+    })
+
+    c_ui := os.socket(2, 1, 0) or >>
+    os.connect4(c_ui, 127, 0, 0, 1, ctrl_ui.port) or >>
+    $r_ui := TestReader{fd: c_ui, remainder: ""}
+    send_request(c_ui, &hello_req) or >>
+    _ := r_ui.read_frame() or >>
+
+    ptr_req := "id: !i 2\nop: ui.input\nargs:\n  win: !i 1\n  steps: [{ev: pointer_move, x: !f 150.0, y: !f 220.0, dx: !f 5.0, dy: !f -3.0}, {ev: pointer_down, button: !i 1, x: !f 150.0, y: !f 220.0, modifiers: !i 3}, {ev: scroll, dx: !f 0.0, dy: !f 1.5}]\n"
+    send_request(c_ui, &ptr_req) or >>
+    wait_poll($&ctrl_ui, $&tree, $&input) or >>
+    ptr_res := r_ui.read_frame() or >>
+    assert(strings.contains(&ptr_res, "applied: !i 3"))
+    assert(strings.contains(&ptr_res, "mouse_x: !f 150"))
+    assert(input.pressed("fire") or >>)
+    assert(input.has_modifier(controls.MOD_SHIFT))
+
+    act_focus := "id: !i 3\nop: ui.act\nargs:\n  win: !i 1\n  node: !i 101\n  act: focus\n"
+    send_request(c_ui, &act_focus) or >>
+    wait_poll($&ctrl_ui, $&tree, $&input) or >>
+    assert(strings.contains(&r_ui.read_frame() or >>, "consumed: !b true"))
+
+    act_toggle := "id: !i 4\nop: ui.act\nargs:\n  win: !i 1\n  node: !i 102\n  act: click\n"
+    send_request(c_ui, &act_toggle) or >>
+    wait_poll($&ctrl_ui, $&tree, $&input) or >>
+    toggle_res := r_ui.read_frame() or >>
+    assert(strings.contains(&toggle_res, "checked: !b true"))
+
+    act_text := "id: !i 5\nop: ui.act\nargs:\n  win: !i 1\n  node: !i 101\n  act: set_text\n  text: \"Resume\"\n"
+    send_request(c_ui, &act_text) or >>
+    wait_poll($&ctrl_ui, $&tree, $&input) or >>
+    _ := r_ui.read_frame() or >>
+
+    ui_tree_req := "id: !i 6\nop: ui.tree\nargs:\n  scope: \"ui\"\n  focused_only: !b true\n"
+    send_request(c_ui, &ui_tree_req) or >>
+    wait_poll($&ctrl_ui, $&tree, $&input) or >>
+    ui_tree_res := r_ui.read_frame() or >>
+    assert(strings.contains(&ui_tree_res, "total: !i 1"))
+    assert(strings.contains(&ui_tree_res, "id: !i 102"))
+
+    all_tree_req := "id: !i 7\nop: ui.tree\nargs:\n  scope: \"all\"\n"
+    send_request(c_ui, &all_tree_req) or >>
+    wait_poll($&ctrl_ui, $&tree, $&input) or >>
+    all_tree_res := r_ui.read_frame() or >>
+    assert(strings.contains(&all_tree_res, "total: !i 7"))
+    assert(strings.contains(&all_tree_res, "text: \"Resume\""))
+
+    drained := ctrl_ui.drain_ui_actions()
+    assert(drained.len == 3)
+    assert(drained[0].act == "focus" && drained[1].act == "click" && drained[2].text == "Resume")
+    os.socket_close(c_ui) or >>
+    ctrl_ui.close()
+    println("  [OK] pointer/scroll ui.input, UI mirror ui.tree, and widget ui.act feedback")
+
+    // Test 15: poll_full (Logger -> proc.output, CVarRegistry -> nexus.cvar, FrameProfiler -> nexus.state, deferred step)
+    $logger := diag.new_logger(64) or >>
+    _ := logger.info("boot", "nexus xacp ready", 10) or >>
+    _ := logger.warn("render", "frame spike", 20) or >>
+    $cvars := diag.new_cvar_registry()
+    _ := cvars.register_int("r.fov", 75, diag.CVAR_NONE, "camera fov") or >>
+    $profiler := timing.new_frame_profiler()
+    profiler.record_frame_ms(16.0)
+    profiler.record_frame_ms(16.0)
+
+    $ctrl_full := xacp.attach_tcp(0)
+    assert(ctrl_full.is_open())
+    ctrl_full.set_frame(100)
+    c_full := os.socket(2, 1, 0) or >>
+    os.connect4(c_full, 127, 0, 0, 1, ctrl_full.port) or >>
+    $r_full := TestReader{fd: c_full, remainder: ""}
+    send_request(c_full, &hello_req) or >>
+    _ := r_full.read_frame() or >>
+
+    out_req := "id: !i 2\nop: proc.output\nargs:\n  stream: \"log\"\n  since: !i 0\n  max_bytes: !i 4096\n"
+    send_request(c_full, &out_req) or >>
+    wait_poll_full($&ctrl_full, $&tree, $&input, $&logger, $&cvars, $&profiler) or >>
+    out_res := r_full.read_frame() or >>
+    assert(strings.contains(&out_res, "nexus xacp ready"))
+    assert(strings.contains(&out_res, "frame spike"))
+
+    cvar_req := "id: !i 3\nop: nexus.cvar\nargs:\n  cmd: \"r.fov 90\"\n"
+    send_request(c_full, &cvar_req) or >>
+    wait_poll_full($&ctrl_full, $&tree, $&input, $&logger, $&cvars, $&profiler) or >>
+    cvar_res := r_full.read_frame() or >>
+    assert(strings.contains(&cvar_res, "exec_ok: !b true"))
+    assert(strings.contains(&cvar_res, "r.fov = 90"))
+
+    full_state_req := "id: !i 4\nop: nexus.state\nargs: {}\n"
+    send_request(c_full, &full_state_req) or >>
+    wait_poll_full($&ctrl_full, $&tree, $&input, $&logger, $&cvars, $&profiler) or >>
+    full_state_res := r_full.read_frame() or >>
+    assert(strings.contains(&full_state_res, "profiler_frames: !i 2"))
+    assert(strings.contains(&full_state_res, "log_count: !i 2"))
+
+    wait_step_req := "id: !i 5\nop: nexus.step\nargs:\n  frames: !i 2\n  wait: !b true\n"
+    send_request(c_full, &wait_step_req) or >>
+    wait_poll_full($&ctrl_full, $&tree, $&input, $&logger, $&cvars, $&profiler) or >>
+    assert(ctrl_full.consume_step())
+    assert(!ctrl_full.complete_step_if_done(tree.paused))
+    assert(ctrl_full.consume_step())
+    ctrl_full.set_frame(102)
+    assert(ctrl_full.complete_step_if_done(tree.paused))
+    wait_step_res := r_full.read_frame() or >>
+    assert(strings.contains(&wait_step_res, "completed: !b true"))
+    assert(strings.contains(&wait_step_res, "frame_number: !i 102"))
+
+    // Test 16: reject_screenshot path redaction
+    shot_fail_req := "id: !i 6\nop: ui.screenshot\nargs:\n  win: !i 1\n"
+    send_request(c_full, &shot_fail_req) or >>
+    wait_poll_full($&ctrl_full, $&tree, $&input, $&logger, $&cvars, $&profiler) or >>
+    assert(ctrl_full.screenshot_requested())
+    ctrl_full.reject_screenshot("failed writing /Users/secret/dump.png")
+    shot_fail_res := r_full.read_frame() or >>
+    assert(strings.contains(&shot_fail_res, "code: adapter_error"))
+    assert(!strings.contains(&shot_fail_res, "/Users/secret"))
+    assert(strings.contains(&shot_fail_res, "<path>"))
+
+    os.socket_close(c_full) or >>
+    ctrl_full.close()
+    println("  [OK] poll_full (proc.output, nexus.cvar, profiler, deferred nexus.step, error redaction)")
 
     println("=== ALL XACP NEXUS TESTS PASSED! ===")
     << 0

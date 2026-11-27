@@ -1,0 +1,183 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+tiles #"github.com/xulang-org/nexus/resources/tilemap"
+#math
+#path/filepath
+#ui/draw
+
+fn panel_color() draw.Color { << draw.rgb(245, 244, 239) }
+fn ink() draw.Color { << draw.rgb(29, 34, 42) }
+fn muted() draw.Color { << draw.rgb(82, 93, 102) }
+fn accent() draw.Color { << draw.rgb(33, 93, 79) }
+
+fn control(frame $&draw.Frame, bounds fm.Rect2, label string, selected bool, enabled bool) int {
+    $bg := draw.rgb(230, 232, 226)
+    $fg := ink()
+    if selected { bg = accent()
+        fg = draw.rgb(255, 255, 255) }
+    if !enabled { bg = draw.rgb(237, 236, 231)
+        fg = draw.rgb(113, 120, 123) }
+    frame.fill_round_rect(bounds.position.x, bounds.position.y, bounds.size.x, bounds.size.y, 6.0, bg) or >>
+    inset := (bounds.size.x - f64(label.len) * 6.8) * 0.5
+    frame.text(bounds.position.x + math.max(5.0, inset), bounds.position.y + 7.0, 13.0, fg, &label) or >>
+    << 0
+}
+
+fn (editor &TileEditor) image_tile(frame $&draw.Frame, tile int, dst fm.Rect2, nearest bool) int {
+    uv := editor.layer.grid.tileset.tile_uv(tile) or >>
+    width := f64(editor.atlas.width)
+    height := f64(editor.atlas.height)
+    x := uv.position.x * width
+    y := uv.position.y * height
+    source := draw.ImageRect{x: x, y: y, width: math.min(width - x, uv.size.x * width),
+        height: math.min(height - y, uv.size.y * height)}
+    destination := draw.ImageRect{x: dst.position.x, y: dst.position.y, width: dst.size.x, height: dst.size.y}
+    $sampler := draw.SAMPLER_LINEAR
+    if nearest { sampler = draw.SAMPLER_NEAREST }
+    << frame.image_region(&editor.atlas, &source, &destination, 1.0, sampler) or >>
+}
+
+fn guide(frame $&draw.Frame, center fm.Vec2, half fm.Vec2, square bool, color draw.Color, width f64) int {
+    x := center.x
+    y := center.y
+    if square { << frame.stroke_rect(x - half.x, y - half.y, half.x * 2.0, half.y * 2.0, color, width) or >> }
+    frame.line(x, y - half.y, x + half.x, y, color, width) or >>
+    frame.line(x + half.x, y, x, y + half.y, color, width) or >>
+    frame.line(x, y + half.y, x - half.x, y, color, width) or >>
+    frame.line(x - half.x, y, x, y - half.y, color, width) or >>
+    << 0
+}
+
+fn (editor &TileEditor) paint_canvas(frame $&draw.Frame) int {
+    panel := editor.canvas()
+    grid := &editor.layer.grid
+    frame.push() or >>
+    frame.clip_rect(panel.position.x, panel.position.y, panel.size.x, panel.size.y) or >>
+    frame.fill_rect(panel.position.x, panel.position.y, panel.size.x, panel.size.y, draw.rgb(26, 35, 44)) or >>
+    quad := grid.tileset.local_quad_bounds() or >>
+    half := fm.vec2(grid.tile_width, grid.tile_height).scaled(editor.zoom * 0.5)
+    square := grid.layout == tiles.LAYOUT_ORTHOGONAL
+    for cell in editor.order {
+        center := editor.screen(grid.cell_center(cell.col, cell.row))
+        ground := fm.rect2(center.x - half.x, center.y - half.y, half.x * 2.0, half.y * 2.0)
+        if ground.overlaps(panel) {
+            guide(frame, center, half, square, draw.rgb(68, 83, 94), 0.65) or >>
+        }
+    }
+    for cell in editor.order {
+        tile := grid.cell(cell.col, cell.row) or >>
+        if tile == tiles.EMPTY_TILE { -> }
+        top_left := editor.screen((grid.cell_visual_center(cell.col, cell.row) or >>).add(quad.position))
+        dst := fm.rect2(top_left.x, top_left.y, quad.size.x * editor.zoom, quad.size.y * editor.zoom)
+        if dst.overlaps(panel) {
+            editor.image_tile(frame, tile, dst, editor.layer.pixel_art) or >>
+        }
+    }
+    if panel.contains(editor.pointer) {
+        cell := grid.point_to_cell(editor.local(editor.pointer)) or >>
+        if grid.in_bounds(cell.col, cell.row) {
+            center := editor.screen(grid.cell_center(cell.col, cell.row))
+            $color := draw.rgb(244, 211, 135)
+            if editor.erasing { color = draw.rgb(255, 145, 122) }
+            guide(frame, center, half, square, color, 2.0) or >>
+        }
+    }
+    if editor.exit_index >= 0 {
+        gate := editor.screen(editor.exit_local)
+        guide(frame, gate, fm.vec2(10.0, 7.0), false, draw.rgb(100, 233, 217), 2.5) or >>
+    }
+    frame.pop() or >>
+    << 0
+}
+
+fn (editor &TileEditor) paint_layers(frame $&draw.Frame) int {
+    frame.text(17.0, f64(TOP) + 13.0, 14.0, ink(), &"Layers") or >>
+    for row in 0:editor.layer_rows() {
+        index := editor.layer_scroll + row
+        if index >= editor.layer_names.len { <- }
+        bounds := editor.layer_row(row)
+        $color := muted()
+        if index == editor.index {
+            frame.fill_round_rect(bounds.position.x, bounds.position.y, bounds.size.x, bounds.size.y, 6.0, draw.rgb(219, 233, 223)) or >>
+            color = accent()
+        }
+        frame.push() or >>
+        frame.clip_rect(bounds.position.x, bounds.position.y, bounds.size.x - 4.0, bounds.size.y) or >>
+        name := editor.layer_names[index] + ""
+        frame.text(bounds.position.x + 9.0, bounds.position.y + 5.0, 13.0, color, &name) or >>
+        frame.pop() or >>
+    }
+    << 0
+}
+
+fn (editor &TileEditor) paint_palette(frame $&draw.Frame) int {
+    x := editor.size.x - f64(RIGHT) + 17.0
+    frame.text(x, f64(TOP) + 13.0, 14.0, ink(), &"Tileset") or >>
+    control(frame, editor.palette_control(0), "Brush", !editor.erasing, true) or >>
+    control(frame, editor.palette_control(1), "Erase", editor.erasing, true) or >>
+    capacity := editor.palette_capacity()
+    for slot in 0:capacity {
+        tile := editor.page * capacity + slot
+        if tile >= editor.layer.grid.tileset.tile_count() { <- }
+        bounds := editor.swatch(slot)
+        bx := bounds.position.x
+        by := bounds.position.y
+        frame.fill_round_rect(bx, by, bounds.size.x, bounds.size.y, 4.0, draw.rgb(222, 224, 218)) or >>
+        aspect := editor.layer.grid.tileset.draw_width / editor.layer.grid.tileset.draw_height
+        w := math.min(32.0, 32.0 * aspect)
+        h := math.min(32.0, 32.0 / aspect)
+        icon := fm.rect2(bx + (bounds.size.x - w) * 0.5, by + (bounds.size.y - h) * 0.5, w, h)
+        editor.image_tile(frame, tile, icon, true) or >>
+        if tile == editor.tile && !editor.erasing { frame.stroke_rect(bx, by, bounds.size.x, bounds.size.y, accent(), 2.0) or >> }
+    }
+    $label := "Tile " + str(editor.tile)
+    if editor.layer.grid.tile_is_solid(editor.tile) { label = label + "   ·   Solid" }
+    frame.text(x, editor.size.y - f64(BOTTOM) - 67.0, 12.0, muted(), &label) or >>
+    prev := editor.palette_control(2)
+    control(frame, prev, "‹", false, editor.page > 0) or >>
+    control(frame, editor.palette_control(3), "›", false, editor.page + 1 < editor.palette_pages()) or >>
+    page_label := str(editor.page + 1) + " / " + str(editor.palette_pages())
+    frame.text(prev.position.x + 65.0, prev.position.y + 6.0, 12.0, muted(), &page_label) or >>
+    << 0
+}
+
+fn (editor &TileEditor) record(frame $&draw.Frame) int {
+    frame.begin() or >>
+    frame.set_bg(panel_color()) or >>
+    editor.paint_canvas(frame) or >>
+    editor.paint_layers(frame) or >>
+    editor.paint_palette(frame) or >>
+    frame.line(0.0, f64(TOP) - 0.5, editor.size.x, f64(TOP) - 0.5, draw.rgb(211, 215, 208), 1.0) or >>
+    frame.text(17.0, 16.0, 17.0, ink(), &"TileMap Editor") or >>
+    frame.push() or >>
+    $header_width := editor.size.x - 430.0
+    if editor.exit_index >= 0 { header_width = header_width - 88.0 }
+    frame.clip_rect(151.0, 10.0, header_width, 30.0) or >>
+    $file := filepath.base(&editor.draft.path)
+    if editor.draft.dirty() || editor.changed { file = file + "  •" }
+    frame.text(157.0, 18.0, 13.0, muted(), &file) or >>
+    frame.pop() or >>
+
+    control(frame, toolbar_button(editor.size.x, 0), "Undo", false, editor.draft.undo.len > 0) or >>
+    control(frame, toolbar_button(editor.size.x, 1), "Redo", false, editor.draft.redo.len > 0) or >>
+    control(frame, toolbar_button(editor.size.x, 2), "Fit", false, true) or >>
+    control(frame, toolbar_button(editor.size.x, 3), "Save", true, editor.draft.dirty() || editor.changed) or >>
+    if editor.exit_index >= 0 {
+        control(frame, toolbar_button(editor.size.x, 4), "Move Exit", editor.placing_exit, true) or >>
+    }
+
+    grid := &editor.layer.grid
+    $status := editor.status + ""
+    if editor.placing_exit { status = "Click the map to move its exit" }
+    if status.len == 0 {
+        status = str(grid.width) + " × " + str(grid.height) + " cells"
+        if editor.canvas().contains(editor.pointer) {
+            cell := grid.point_to_cell(editor.local(editor.pointer)) or >>
+            if grid.in_bounds(cell.col, cell.row) { status = status + "   ·   Column " + str(cell.col) + ", row " + str(cell.row) }
+        }
+    }
+    frame.text(16.0, editor.size.y - 24.0, 12.0, muted(), &status) or >>
+    frame.text(editor.size.x - 278.0, editor.size.y - 24.0, 12.0, muted(), &"Scroll to zoom · Right-drag to pan") or >>
+    << 0
+}

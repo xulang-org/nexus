@@ -71,13 +71,55 @@ XU_VEC2 cascade_gradient(XU_VEC3 p) {
     if (abs(n.z) <= 0.00001) return XU_VEC2(0.0,0.0);
     return XU_VEC2(-2.0*n.x,2.0*n.y)/n.z;
 }
+float xu_shadow_fract(float x) { return x - floor(x); }
+float pcss_contact_hardened_sample(XU_VEC2 uv, float receiver_z, XU_VEC2 gradient, float bias,
+    float texel, XU_VEC2 atlas_offset, XU_VEC2 atlas_size, float pcss_radius, XU_SHADOW_RESOURCES) {
+    XU_VEC2 cell = floor(uv / texel);
+    float ign = xu_shadow_fract(52.9829189 * xu_shadow_fract(dot(cell, XU_VEC2(0.06711056, 0.00583715))));
+    float ang = 6.2831853 * ign;
+    float search_r = pcss_radius * texel;
+    float blocker_sum = 0.0;
+    float blocker_count = 0.0;
+    for (int k = 0; k < 16; ++k) {
+        float r = sqrt((float(k) + 0.5) / 16.0);
+        float theta = float(k) * 2.39996323 + ang;
+        XU_VEC2 offset = XU_VEC2(cos(theta), sin(theta)) * (r * search_r);
+        XU_VEC2 at = clamp(uv + offset, XU_VEC2(0.5 * texel, 0.5 * texel), XU_VEC2(1.0 - 0.5 * texel, 1.0 - 0.5 * texel));
+        XU_VEC2 atlas = (at + atlas_offset) / atlas_size;
+        float sample_d = XU_SHADOW_READ(atlas);
+        float ref_z = receiver_z + dot(gradient, at - uv) + bias;
+        if (sample_d > ref_z) {
+            blocker_sum += sample_d;
+            blocker_count += 1.0;
+        }
+    }
+    if (blocker_count < 0.5) return 1.0;
+    float avg_blocker = blocker_sum / blocker_count;
+    float blocker_gap = max(0.0, avg_blocker - receiver_z);
+    float penumbra_texels = clamp(0.75 + blocker_gap * pcss_radius * 18.0, 0.75, pcss_radius * 2.5);
+    float filter_r = penumbra_texels * texel;
+    float vis = 0.0;
+    for (int k = 0; k < 16; ++k) {
+        float r = sqrt((float(k) + 0.5) / 16.0);
+        float theta = float(k) * 2.39996323 + ang;
+        XU_VEC2 offset = XU_VEC2(cos(theta), sin(theta)) * (r * filter_r);
+        XU_VEC2 at = uv + offset;
+        if (at.x < 0.0 || at.x > 1.0 || at.y < 0.0 || at.y > 1.0) { vis += 1.0; continue; }
+        XU_VEC2 atlas = (at + atlas_offset) / atlas_size;
+        vis += (receiver_z + dot(gradient, at - uv) + bias >= XU_SHADOW_READ(atlas)) ? 1.0 : 0.0;
+    }
+    return vis / 16.0;
+}
 float cascade_sample(XU_VEC3 p, XU_VEC2 gradient, int layer, float bias,
-    float texel, XU_VEC2 atlas_size, float raster_bias, XU_SHADOW_RESOURCES) {
+    float texel, XU_VEC2 atlas_size, float raster_bias, float pcss_radius, XU_SHADOW_RESOURCES) {
     if (p.x < -1.0 || p.x > 1.0 || p.y < -1.0 || p.y > 1.0 || p.z < 0.0 || p.z > 1.0) return 1.0;
     // Sub-texel raster precision needs a geometric slope bias as well as
     // the caller's normal/depth bias. Author normals can be smoothed.
     bias += max(abs(gradient.x),abs(gradient.y))*texel*raster_bias;
     XU_VEC2 uv = XU_VEC2(p.x*0.5+0.5,0.5-p.y*0.5);
+    if (pcss_radius > 0.0001) {
+        return pcss_contact_hardened_sample(uv, p.z, gradient, bias, texel, XU_VEC2(float(layer%2),float(layer/2)), atlas_size, pcss_radius, XU_SHADOW_ARGS);
+    }
     float visible = 0.0, total = 0.0;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
@@ -112,11 +154,12 @@ float cascade_shadow_visibility(XU_VEC3 world, XU_VEC3 normal,
     if (layer==1) { p=p1.xyz;g=g1;range=r1;next_p=p2.xyz;next_g=g2;next_range=r2; }
     if (layer==2) { p=p2.xyz;g=g2;range=r2;next_p=p3.xyz;next_g=g3;next_range=r3; }
     if (layer==3) { p=p3.xyz;g=g3;range=r3; }
+    float pcss_radius=max(0.0,-gradient_scales.x);
     float bias=light_bias.w+shadow_filter.y*(1.0-max(0.0,dot(unit_safe(normal),light_bias.xyz)));
-    float current=cascade_sample(p,g,layer,bias*range.w,shadow_filter.x,atlas.zw,limits.w,XU_SHADOW_ARGS);
+    float current=cascade_sample(p,g,layer,bias*range.w,shadow_filter.x,atlas.zw,limits.w,pcss_radius,XU_SHADOW_ARGS);
     if (range.y > range.z && distance > range.z) {
         float next=1.0;
-        if (float(layer+1) < limits.z) next=cascade_sample(next_p,next_g,layer+1,bias*next_range.w,shadow_filter.x,atlas.zw,limits.w,XU_SHADOW_ARGS);
+        if (float(layer+1) < limits.z) next=cascade_sample(next_p,next_g,layer+1,bias*next_range.w,shadow_filter.x,atlas.zw,limits.w,pcss_radius,XU_SHADOW_ARGS);
         float alpha=clamp((distance-range.z)/(range.y-range.z),0.0,1.0);
         alpha=alpha*alpha*(3.0-2.0*alpha);
         current=XU_MIX(current,next,alpha);
@@ -125,7 +168,7 @@ float cascade_shadow_visibility(XU_VEC3 world, XU_VEC3 normal,
 }
 // Manual nearest-depth 3x3 PCF, independent of comparison-sampler support.
 float shadow_visibility(XU_VEC3 world, XU_VEC3 normal, XU_MAT4 mvp,
-    XU_VEC4 direction_bias, XU_VEC4 shadow_filter, XU_VEC4 depth, XU_SHADOW_RESOURCES) {
+    XU_VEC4 direction_bias, XU_VEC4 shadow_filter, XU_VEC4 depth, float pcss_param, XU_SHADOW_RESOURCES) {
     if (shadow_filter.w > 2.5) return point_shadow_visibility(world,normal,direction_bias,shadow_filter,depth,XU_SHADOW_ARGS);
     XU_VEC4 projected = XU_MUL(mvp, XU_VEC4(world, 1.0));
     XU_VEC3 p = projected.xyz / max(projected.w,0.000001);
@@ -141,6 +184,10 @@ float shadow_visibility(XU_VEC3 world, XU_VEC3 normal, XU_MAT4 mvp,
     XU_VEC3 toward_light = direction_bias.xyz;
     if (shadow_filter.w > 1.5) toward_light = unit_safe(direction_bias.xyz-world);
     float bias = direction_bias.w + shadow_filter.y * (1.0 - max(0.0, dot(unit_safe(normal), toward_light)));
+    float pcss_radius = max(0.0, -pcss_param);
+    if (pcss_radius > 0.0001) {
+        return pcss_contact_hardened_sample(uv, p.z, gradient, bias, shadow_filter.x, XU_VEC2(0.0, 0.0), XU_VEC2(1.0, 1.0), pcss_radius, XU_SHADOW_ARGS);
+    }
     // Compare at the receiver plane's depth at each actual texel center.
     // A constant reference across PCF taps self-shadows sloped surfaces.
     float visibility = 0.0;

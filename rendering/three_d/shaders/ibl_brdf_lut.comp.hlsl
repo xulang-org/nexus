@@ -1,0 +1,70 @@
+cbuffer LutParams : register(b0, space2) {
+    float4 size_samples;
+};
+
+RWTexture2D<float4> out_lut : register(u0, space1);
+
+float radical_inverse_vdc(uint bits) {
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+
+float2 hammersley(uint i, uint n) {
+    return float2(float(i) / float(n), radical_inverse_vdc(i));
+}
+
+float3 importance_sample_ggx(float2 xi, float3 n, float roughness) {
+    float a = roughness * roughness;
+    float phi = 2.0 * 3.14159265359 * xi.x;
+    float cos_theta = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));
+    float sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
+    float3 h = float3(cos(phi) * sin_theta, sin(phi) * sin_theta, cos_theta);
+    float3 up = abs(n.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+    float3 tangent = normalize(cross(up, n));
+    float3 bitangent = cross(n, tangent);
+    return normalize(tangent * h.x + bitangent * h.y + n * h.z);
+}
+
+float g_schlick_ggx_ibl(float nv, float roughness) {
+    float r = roughness;
+    float k = (r * r) * 0.5;
+    return nv / (nv * (1.0 - k) + k);
+}
+
+float g_smith_ibl(float nv, float nl, float roughness) {
+    return g_schlick_ggx_ibl(nv, roughness) * g_schlick_ggx_ibl(nl, roughness);
+}
+
+[numthreads(8, 8, 1)]
+void main(uint3 dispatch_id : SV_DispatchThreadID) {
+    uint2 gid = dispatch_id.xy;
+    uint w = uint(size_samples.x), h = uint(size_samples.y);
+    if (gid.x >= w || gid.y >= h) return;
+
+    float nv = max((float(gid.x) + 0.5) / float(w), 0.001);
+    float roughness = clamp((float(gid.y) + 0.5) / float(h), 0.045, 1.0);
+    float3 v = float3(sqrt(max(0.0, 1.0 - nv * nv)), 0.0, nv);
+    float3 n = float3(0.0, 0.0, 1.0);
+
+    float a_acc = 0.0, b_acc = 0.0;
+    uint samples = max(uint(size_samples.z), 1u);
+    for (uint i = 0u; i < samples; ++i) {
+        float2 xi = hammersley(i, samples);
+        float3 hvec = importance_sample_ggx(xi, n, roughness);
+        float3 l = normalize(2.0 * dot(v, hvec) * hvec - v);
+        float nl = max(l.z, 0.0), nh = max(hvec.z, 0.0), vh = max(dot(v, hvec), 0.0);
+        if (nl > 0.0) {
+            float g = g_smith_ibl(nv, nl, roughness);
+            float g_vis = (g * vh) / max(nh * nv, 1e-5);
+            float fc = pow(1.0 - vh, 5.0);
+            a_acc += (1.0 - fc) * g_vis;
+            b_acc += fc * g_vis;
+        }
+    }
+    float inv_n = 1.0 / float(samples);
+    out_lut[gid] = float4(a_acc * inv_n, b_acc * inv_n, 0.0, 1.0);
+}

@@ -1,0 +1,559 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+gltf #"github.com/xulang-org/nexus/formats/gltf"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+mod #"github.com/xulang-org/nexus/modeling"
+imod #"github.com/xulang-org/nexus/integration/modeling"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+scene #"github.com/xulang-org/nexus/scene"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#encoding/json
+#errors
+#math
+#net
+#os
+#strconv
+#strings
+#time
+
+struct WhiteboxHost {
+    active bool
+    session imod.EditableModelSession
+    world fm.Mat4
+    mat_asset rm.MaterialAsset
+    material ren.Material3D
+}
+
+struct LiveChannel {
+    connected bool
+    conn net.Conn
+    incoming chan string
+    stop chan int
+    done chan int
+}
+
+fn empty_whitebox_host() WhiteboxHost {
+    m := mod.box_editable(fm.vec3(2.0, 2.0, 2.0), 4294967295, 0) or >>
+    sess := imod.new_editable_session(m) or >>
+    ma := rm.default_material_asset("Whitebox")
+    mat := imod.material_asset_to_3d(&ma) or >>
+    << WhiteboxHost{
+        active: false,
+        session: sess,
+        world: fm.identity_3d(),
+        mat_asset: ma,
+        material: mat
+    }
+}
+
+fn build_whitebox_mesh(shape string, size fm.Vec3) rm.EditableMesh {
+    if shape == "wedge" {
+        << mod.wedge_editable(size, 4294967295, 0) or >>
+    } else if shape == "stair" {
+        << mod.stair_editable(size, 6, 4294967295, 0) or >>
+    } else if shape == "cylinder" {
+        r := math.min(size.x, size.z) * 0.5
+        << mod.cylinder_editable(r, r, size.y, 16, 4294967295, 0) or >>
+    } else if shape == "arch" {
+        thick := math.min(size.x * 0.25, 0.4)
+        << mod.arch_editable(size, thick, 12, 4294967295, 0) or >>
+    }
+    << mod.box_editable(size, 4294967295, 0) or >>
+}
+
+fn spawn_whitebox_shape(wb $&WhiteboxHost, shape string, size fm.Vec3) int {
+    em := build_whitebox_mesh(shape, size) or >>
+    old_sess := $&wb.session
+    _ := old_sess.close()
+    next := imod.new_editable_session(em) or >>
+    wb.session = next
+    wb.active = true
+    wb.world = fm.identity_3d()
+    << 0
+}
+
+fn empty_live_channel() LiveChannel {
+    << LiveChannel{
+        connected: false,
+        conn: net.closed_conn(),
+        incoming: chan string{cap: 64},
+        stop: chan int{cap: 1},
+        done: chan int{cap: 1}
+    }
+}
+
+fn signal_done(done chan int) {
+    select {
+        done <- 1 {}
+        else {}
+    }
+}
+
+fn live_reader_worker(fd int, out chan string, stop chan int, done chan int) {
+    $rem := ""
+    while true {
+        select {
+            _ := <-stop {
+                signal_done(done)
+                <<
+            }
+            else {}
+        }
+        ready := os.socket_poll(fd, 1) or (err) {
+            _ := err
+            signal_done(done)
+            <<
+        }
+        if ready == 0 {
+            time.sleep(4000000)
+            ->
+        }
+        chunk := net.conn_read(fd, 8192) or (err) {
+            _ := err
+            signal_done(done)
+            <<
+        }
+        if chunk.len == 0 {
+            signal_done(done)
+            <<
+        }
+        rem = rem + chunk
+        while true {
+            idx := strings.index_byte(&rem, 10)
+            if idx < 0 { <- }
+            line := strings.trim_space(&(rem[0:idx] + ""))
+            rem = rem[idx + 1:rem.len] + ""
+            if line.len > 0 {
+                select {
+                    out <- line {}
+                    _ := <-stop {
+                        signal_done(done)
+                        <<
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn close_conn_quiet(c $&net.Conn) {
+    _ := c.close() or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn connect_live_host(addr string) LiveChannel {
+    if addr.len == 0 { << empty_live_channel() }
+    $conn := net.dial_to("tcp", addr) or >>
+    _ := conn.set_nodelay(true) or (err) {
+        close_conn_quiet($&conn)
+        >> err
+    }
+    fd := conn.descriptor() or (err) {
+        close_conn_quiet($&conn)
+        >> err
+    }
+    incoming := chan string{cap: 128}
+    stop := chan int{cap: 1}
+    done := chan int{cap: 1}
+    xu live_reader_worker(fd, incoming, stop, done)
+    << LiveChannel{
+        connected: true,
+        conn: conn,
+        incoming: incoming,
+        stop: stop,
+        done: done
+    }
+}
+
+fn (ch $&LiveChannel) close_live() {
+    if !ch.connected { << }
+    select {
+        ch.stop <- 1 {}
+        else {}
+    }
+    _ := <-ch.done
+    close_conn_quiet($&ch.conn)
+    ch.connected = false
+}
+
+fn emit_live_event(ch &LiveChannel, payload string) {
+    if !ch.connected { << }
+    line := payload + "\n"
+    _ := ch.conn.write(&line) or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn emit_ready_event(ch &LiveChannel, backend string) {
+    emit_live_event(ch, "{\"event\":\"ready\",\"backend\":" + json.quote(&backend) + "}")
+}
+
+fn emit_captured_event(ch &LiveChannel, path string) {
+    emit_live_event(ch, "{\"event\":\"captured\",\"path\":" + json.quote(&path) + "}")
+}
+
+fn fmt_f64_live(v f64) string {
+    << strconv.format_float(v, 103, -1) or (err) {
+        _ := err
+        << "0"
+    }
+}
+
+fn emit_selection_event(ch &LiveChannel, editor &EditorView) {
+    if !ch.connected { << }
+    $doc_idx := -1
+    if editor.selection.len > 0 {
+        last := editor.selection[editor.selection.len - 1]
+        if editor.doc_by_tree_id.has(last) {
+            doc_idx = editor.doc_by_tree_id[last]
+        }
+    }
+    emit_live_event(ch, "{\"event\":\"selection\",\"node\":" + str(doc_idx) + "}")
+}
+
+fn emit_transform_event(ch &LiveChannel, editor &EditorView, tree &scene.SceneTree) {
+    if !ch.connected || editor.selection.len == 0 { << }
+    last := editor.selection[editor.selection.len - 1]
+    if !editor.doc_by_tree_id.has(last) { << }
+    doc_idx := editor.doc_by_tree_id[last]
+    n3d := tree.node_3d(last) or (err) {
+        _ := err
+        <<
+    }
+    m := n3d.transform
+    vals := [m.c0.x, m.c0.y, m.c0.z, m.c0.w,
+        m.c1.x, m.c1.y, m.c1.z, m.c1.w,
+        m.c2.x, m.c2.y, m.c2.z, m.c2.w,
+        m.c3.x, m.c3.y, m.c3.z, m.c3.w]
+    $parts := []string{}
+    for v in vals {
+        parts.push(fmt_f64_live(v))
+    }
+    emit_live_event(ch, "{\"event\":\"transform\",\"node\":" + str(doc_idx) + ",\"transform\":[" + strings.join(parts, ",") + "]}")
+}
+
+fn emit_whitebox_event(ch &LiveChannel, wb &WhiteboxHost) {
+    if !ch.connected || !wb.active { << }
+    $tris := 0
+    for i in 0:wb.session.compiled.len {
+        tris += wb.session.compiled[i].mesh.triangle_count()
+    }
+    emit_live_event(ch, "{\"event\":\"whitebox\",\"vertices\":" + str(wb.session.mesh.vertices.len) +
+        ",\"faces\":" + str(wb.session.mesh.faces.len) + ",\"triangles\":" + str(tris) + "}")
+}
+
+fn try_set_visible(tree $&scene.SceneTree, nid int, vis bool) {
+    _ := tree.set_visible(nid, vis) or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn try_set_transform(tree $&scene.SceneTree, nid int, mat fm.Mat4) {
+    _ := tree.set_transform_3d(nid, mat) or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn json_str_or(doc &json.Doc, obj int, key string, fallback string) string {
+    if !doc.has(obj, key + "") { << fallback }
+    << doc.as_string(doc.get(obj, key + "")) or (err) {
+        _ := err
+        << fallback
+    }
+}
+
+fn json_f64_or(doc &json.Doc, obj int, key string, fallback f64) f64 {
+    if !doc.has(obj, key + "") { << fallback }
+    << doc.as_f64(doc.get(obj, key + "")) or (err) {
+        _ := err
+        << fallback
+    }
+}
+
+fn try_spawn_wb(wb $&WhiteboxHost, shape string, sz fm.Vec3) {
+    _ := spawn_whitebox_shape(wb, shape, sz) or (err) {
+        eprintln(err.msg())
+        <<
+    }
+}
+
+fn try_wb_extrude(wb $&WhiteboxHost, dist f64) {
+    s := $&wb.session
+    _ := s.apply_extrude(dist) or (err) {
+        eprintln(err.msg())
+        <<
+    }
+}
+
+fn try_wb_inset(wb $&WhiteboxHost, amt f64, dep f64) {
+    s := $&wb.session
+    _ := s.apply_inset(amt, dep) or (err) {
+        eprintln(err.msg())
+        <<
+    }
+}
+
+fn try_wb_bevel(wb $&WhiteboxHost, w f64) {
+    s := $&wb.session
+    _ := s.apply_bevel(w) or (err) {
+        eprintln(err.msg())
+        <<
+    }
+}
+
+fn try_wb_box_uv(wb $&WhiteboxHost, sc f64) {
+    s := $&wb.session
+    _ := s.apply_box_uv(sc) or (err) {
+        eprintln(err.msg())
+        <<
+    }
+}
+
+fn try_wb_flip(wb $&WhiteboxHost) {
+    s := $&wb.session
+    _ := s.apply_flip_normals() or (err) {
+        eprintln(err.msg())
+        <<
+    }
+}
+
+fn apply_live_command(
+    line &string,
+    editor $&EditorView,
+    tree $&scene.SceneTree,
+    wb $&WhiteboxHost,
+    pending_capture $&string
+) bool {
+    doc := json.parse_max(line, 1048576)
+    if !doc.ok() { << false }
+    root := doc.root()
+    if !doc.is_dict(root) { << false }
+    cmd := doc.as_string(doc.get(root, "cmd")) or (err) {
+        _ := err
+        << false
+    }
+    if cmd == "select" {
+        node_idx := doc.as_int(doc.get(root, "node")) or (err) {
+            _ := err
+            << false
+        }
+        if node_idx <= 0 || node_idx >= editor.tree_ids.len {
+            editor.selection = []int{}
+        } else {
+            editor.selection = [editor.tree_ids[node_idx]]
+        }
+        << true
+    }
+    if cmd == "set_visible" {
+        node_idx := doc.as_int(doc.get(root, "node")) or (err) {
+            _ := err
+            << false
+        }
+        vis := doc.as_bool(doc.get(root, "visible")) or (err) {
+            _ := err
+            << false
+        }
+        if node_idx > 0 && node_idx < editor.tree_ids.len {
+            try_set_visible(tree, editor.tree_ids[node_idx], vis)
+        }
+        << true
+    }
+    if cmd == "set_transform" {
+        node_idx := doc.as_int(doc.get(root, "node")) or (err) {
+            _ := err
+            << false
+        }
+        tr_node := doc.get(root, "transform")
+        if node_idx > 0 && node_idx < editor.tree_ids.len && tr_node >= 0 && doc.is_list(tr_node) && doc.count(tr_node) == 16 {
+            $vals := []f64{}
+            for i in 0:16 {
+                vals.push(doc.as_f64(doc.at(tr_node, i)) or (err) {
+                    _ := err
+                    << false
+                })
+            }
+            mat := fm.Mat4{
+                c0: fm.vec4(vals[0], vals[1], vals[2], vals[3]),
+                c1: fm.vec4(vals[4], vals[5], vals[6], vals[7]),
+                c2: fm.vec4(vals[8], vals[9], vals[10], vals[11]),
+                c3: fm.vec4(vals[12], vals[13], vals[14], vals[15])
+            }
+            if mat.is_affine() {
+                try_set_transform(tree, editor.tree_ids[node_idx], mat)
+            }
+        }
+        << true
+    }
+    if cmd == "set_mode" {
+        mstr := doc.as_string(doc.get(root, "mode")) or (err) {
+            _ := err
+            << false
+        }
+        if mstr == "move" { editor.mode = GIZMO_MOVE }
+        else if mstr == "rotate" { editor.mode = GIZMO_ROTATE }
+        else if mstr == "scale" { editor.mode = GIZMO_SCALE }
+        else if mstr == "face" { wb.session.mode = imod.EDIT_MODE_FACE }
+        else if mstr == "edge" { wb.session.mode = imod.EDIT_MODE_EDGE }
+        else if mstr == "vertex" { wb.session.mode = imod.EDIT_MODE_VERTEX }
+        else if mstr == "object" { wb.session.mode = imod.EDIT_MODE_OBJECT }
+        << true
+    }
+    if cmd == "spawn_whitebox" {
+        shape := json_str_or(&doc, root, "shape", "box")
+        $sz := fm.vec3(2.0, 2.0, 2.0)
+        if doc.has(root, "size") {
+            snode := doc.get(root, "size")
+            if snode >= 0 && doc.is_list(snode) && doc.count(snode) == 3 {
+                sx := doc.as_f64(doc.at(snode, 0)) or (err) {
+                    _ := err
+                    << false
+                }
+                sy := doc.as_f64(doc.at(snode, 1)) or (err) {
+                    _ := err
+                    << false
+                }
+                szv := doc.as_f64(doc.at(snode, 2)) or (err) {
+                    _ := err
+                    << false
+                }
+                sz = fm.vec3(sx, sy, szv)
+            }
+        }
+        try_spawn_wb(wb, shape, sz)
+        << true
+    }
+    if cmd == "select_subobject" {
+        if !wb.active { << false }
+        arr := doc.get(root, "indices")
+        if arr < 0 || !doc.is_list(arr) { << false }
+        $idxs := []int{}
+        for i in 0:doc.count(arr) {
+            idxs.push(doc.as_int(doc.at(arr, i)) or (err) {
+                _ := err
+                << false
+            })
+        }
+        if wb.session.mode == imod.EDIT_MODE_VERTEX {
+            $clean := []int{}
+            for v in idxs {
+                if v < 0 || v >= wb.session.mesh.vertices.len { << false }
+                clean.push(v)
+            }
+            wb.session.selected_verts = clean
+        } else if wb.session.mode == imod.EDIT_MODE_EDGE {
+            if (idxs.len % 2) != 0 { << false }
+            $clean := []int{}
+            $ei := 0
+            while ei + 1 < idxs.len {
+                $a := idxs[ei]
+                $b := idxs[ei + 1]
+                if a < 0 || a >= wb.session.mesh.vertices.len || b < 0 || b >= wb.session.mesh.vertices.len || a == b {
+                    << false
+                }
+                if b < a {
+                    tmp := a
+                    a = b
+                    b = tmp
+                }
+                clean.push(a)
+                clean.push(b)
+                ei += 2
+            }
+            wb.session.selected_edges = clean
+        } else {
+            $clean := []int{}
+            for fi in idxs {
+                if fi < 0 || fi >= wb.session.mesh.faces.len { << false }
+                clean.push(fi)
+            }
+            wb.session.selected_faces = clean
+        }
+        << true
+    }
+    if cmd == "model_op" {
+        if !wb.active { << false }
+        op := doc.as_string(doc.get(root, "op")) or (err) {
+            _ := err
+            << false
+        }
+        if op == "extrude" {
+            try_wb_extrude(wb, json_f64_or(&doc, root, "value", 0.5))
+        } else if op == "inset" {
+            try_wb_inset(wb, json_f64_or(&doc, root, "amount", 0.25), json_f64_or(&doc, root, "value", 0.0))
+        } else if op == "bevel" {
+            try_wb_bevel(wb, json_f64_or(&doc, root, "value", 0.12))
+        } else if op == "box_uv" {
+            try_wb_box_uv(wb, json_f64_or(&doc, root, "value", 1.0))
+        } else if op == "flip" {
+            try_wb_flip(wb)
+        } else if op == "undo" {
+            s := $&wb.session
+            _ := s.undo()
+        } else if op == "redo" {
+            s := $&wb.session
+            _ := s.redo()
+        }
+        << true
+    }
+    if cmd == "capture" {
+        p := doc.as_string(doc.get(root, "path")) or (err) {
+            _ := err
+            << false
+        }
+        *pending_capture = p
+        << true
+    }
+    if cmd == "apply" {
+        editor.outcome = APPLY
+        << true
+    }
+    if cmd == "cancel" {
+        editor.outcome = CANCEL
+        << true
+    }
+    << false
+}
+
+fn draw_whitebox_overlay(batch $&canvas.Batch2D, wb &WhiteboxHost, frame CameraFrame) int {
+    if !wb.active { << 0 }
+    $dbg := meshes.new_debug_draw_3d(0.01) or >>
+    wb.session.build_debug_wireframe($&dbg, wb.world, EDITOR_TEXT, EDITOR_BRAND, EDITOR_CHART_2) or >>
+    count := dbg.segment_count()
+    for i in 0:count {
+        pa := frame.project(dbg.segment_a(i))
+        pb := frame.project(dbg.segment_b(i))
+        if pa.visible && pb.visible {
+            $w := 1.1
+            col := dbg.segment_color(i)
+            if col == EDITOR_BRAND { w = 2.0 }
+            draw_stroke(batch, pa.position, pb.position, w, col) or >>
+        }
+    }
+    << 0
+}
+
+fn export_whitebox_glb(wb &WhiteboxHost, out_path string) int {
+    if !wb.active || out_path.len == 0 { << 0 }
+    prims := mod.compile_to_primitives(&wb.session.mesh, true) or >>
+    $g_prims := []gltf.GlbExportPrimitive{}
+    $mats := []gltf.MaterialDescription{}
+    for i in 0:prims.len {
+        $mat := gltf.default_material()
+        mat.base = wb.mat_asset.base_color
+        mat.metallic = wb.mat_asset.metallic
+        mat.roughness = wb.mat_asset.roughness
+        mats.push(mat)
+        g_prims.push(gltf.GlbExportPrimitive{mesh: ~prims[i].mesh, material: i})
+    }
+    glb_raw := gltf.encode_primitives_glb("Whitebox", &g_prims, &mats) or >>
+    snapshot.write_atomic(out_path + "", &glb_raw) or >>
+    << 0
+}

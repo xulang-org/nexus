@@ -1,0 +1,509 @@
+@"github.com/xulang-org/nexus/rendering/three_d"
+
+#gpu
+layout #gpu/layout
+#errors
+#math
+fm #"github.com/xulang-org/nexus/foundation/math"
+
+pub const FROXEL_X = 32
+pub const FROXEL_Y = 18
+pub const FROXEL_Z = 32
+pub const FROXEL_TOTAL = 18432
+
+pub struct AtmosphereProgram3D {
+    pub format int
+    pub entrypoint string
+    pub froxel_scatter []u8
+    pub froxel_accum []u8
+    pub apply_vertex []u8
+    pub apply_fragment []u8
+}
+
+pub fn empty_atmosphere_program_3d() AtmosphereProgram3D {
+    << AtmosphereProgram3D{
+        format: 0,
+        entrypoint: "",
+        froxel_scatter: []u8{},
+        froxel_accum: []u8{},
+        apply_vertex: []u8{},
+        apply_fragment: []u8{}
+    }
+}
+
+pub struct AtmosphereConfig3D {
+    pub sky_enabled bool
+    pub sun_direction fm.Vec3
+    pub sun_radiance fm.Vec3
+    pub sun_disc_intensity f64
+    pub sun_disc_angular_radius f64
+    pub rayleigh_scale f64
+    pub mie_scale f64
+    pub mie_g f64
+    pub ground_albedo fm.Vec3
+
+    pub fog_enabled bool
+    pub fog_near f64
+    pub fog_far f64
+    pub fog_density f64
+    pub fog_height_falloff f64
+    pub fog_base_height f64
+    pub fog_anisotropy f64
+    pub fog_extinction_scale f64
+    pub fog_scattering_strength f64
+    pub fog_albedo fm.Vec3
+    pub fog_ambient fm.Vec3
+    pub sun_shaft_boost f64
+    pub local_light_boost f64
+    pub noise_strength f64
+    pub noise_scale f64
+    pub wind_velocity fm.Vec3
+    pub time f64
+}
+
+fn atm_safe_norm(v fm.Vec3, fallback fm.Vec3) fm.Vec3 {
+    << v.normalized() or (err) { << fallback }
+}
+
+pub fn default_atmosphere_config_3d() AtmosphereConfig3D {
+    sun_dir := atm_safe_norm(fm.vec3(0.35, 0.65, -0.67), fm.vec3(0.0, 1.0, 0.0))
+    << AtmosphereConfig3D{
+        sky_enabled: true,
+        sun_direction: sun_dir,
+        sun_radiance: fm.vec3(1.0, 0.96, 0.90),
+        sun_disc_intensity: 28.0,
+        sun_disc_angular_radius: 0.022,
+        rayleigh_scale: 1.0,
+        mie_scale: 1.0,
+        mie_g: 0.76,
+        ground_albedo: fm.vec3(0.18, 0.20, 0.22),
+
+        fog_enabled: true,
+        fog_near: 0.5,
+        fog_far: 90.0,
+        fog_density: 0.025,
+        fog_height_falloff: 0.12,
+        fog_base_height: 0.0,
+        fog_anisotropy: 0.55,
+        fog_extinction_scale: 1.0,
+        fog_scattering_strength: 1.0,
+        fog_albedo: fm.vec3(0.72, 0.80, 0.90),
+        fog_ambient: fm.vec3(0.22, 0.28, 0.38),
+        sun_shaft_boost: 1.6,
+        local_light_boost: 1.8,
+        noise_strength: 0.0,
+        noise_scale: 0.18,
+        wind_velocity: fm.vec3(0.4, 0.05, 0.2),
+        time: 0.0
+    }
+}
+
+pub fn (cfg &AtmosphereConfig3D) validate() int {
+    if !cfg.sun_direction.is_finite() || cfg.sun_direction.dot(cfg.sun_direction) <= 1e-12 ||
+        !cfg.sun_radiance.is_finite() || cfg.sun_radiance.x < 0.0 || cfg.sun_radiance.y < 0.0 || cfg.sun_radiance.z < 0.0 ||
+        !cfg.ground_albedo.is_finite() || cfg.ground_albedo.x < 0.0 || cfg.ground_albedo.y < 0.0 || cfg.ground_albedo.z < 0.0 {
+        >> errors.new("nexus atmosphere 3D: invalid sky vector or color")
+    }
+    if !fm.finite(cfg.sun_disc_intensity) || cfg.sun_disc_intensity < 0.0 || cfg.sun_disc_intensity > 1000.0 ||
+        !fm.finite(cfg.sun_disc_angular_radius) || cfg.sun_disc_angular_radius <= 0.0005 || cfg.sun_disc_angular_radius > 0.5 ||
+        !fm.finite(cfg.rayleigh_scale) || cfg.rayleigh_scale < 0.0 || cfg.rayleigh_scale > 10.0 ||
+        !fm.finite(cfg.mie_scale) || cfg.mie_scale < 0.0 || cfg.mie_scale > 10.0 ||
+        !fm.finite(cfg.mie_g) || cfg.mie_g <= -0.98 || cfg.mie_g >= 0.98 {
+        >> errors.new("nexus atmosphere 3D: invalid sky scattering scalars")
+    }
+    if !fm.finite(cfg.fog_near) || !fm.finite(cfg.fog_far) || cfg.fog_near <= 0.01 || cfg.fog_far <= cfg.fog_near ||
+        !fm.finite(cfg.fog_density) || cfg.fog_density < 0.0 || cfg.fog_density > 10.0 ||
+        !fm.finite(cfg.fog_height_falloff) || cfg.fog_height_falloff < 0.0 || cfg.fog_height_falloff > 10.0 ||
+        !fm.finite(cfg.fog_base_height) || !fm.finite(cfg.fog_anisotropy) || cfg.fog_anisotropy <= -0.98 || cfg.fog_anisotropy >= 0.98 ||
+        !fm.finite(cfg.fog_extinction_scale) || cfg.fog_extinction_scale < 0.0 ||
+        !fm.finite(cfg.fog_scattering_strength) || cfg.fog_scattering_strength < 0.0 {
+        >> errors.new("nexus atmosphere 3D: invalid fog bounds, density or anisotropy")
+    }
+    if !cfg.fog_albedo.is_finite() || cfg.fog_albedo.x < 0.0 || cfg.fog_albedo.y < 0.0 || cfg.fog_albedo.z < 0.0 ||
+        !cfg.fog_ambient.is_finite() || cfg.fog_ambient.x < 0.0 || cfg.fog_ambient.y < 0.0 || cfg.fog_ambient.z < 0.0 ||
+        !fm.finite(cfg.sun_shaft_boost) || cfg.sun_shaft_boost < 0.0 ||
+        !fm.finite(cfg.local_light_boost) || cfg.local_light_boost < 0.0 ||
+        !fm.finite(cfg.noise_strength) || cfg.noise_strength < 0.0 || cfg.noise_strength > 1.0 ||
+        !fm.finite(cfg.noise_scale) || cfg.noise_scale < 0.0 ||
+        !cfg.wind_velocity.is_finite() || !fm.finite(cfg.time) {
+        >> errors.new("nexus atmosphere 3D: invalid fog scattering, ambient or noise parameters")
+    }
+    << 0
+}
+
+pub struct AtmosphereRenderer3D {
+    owner DeviceRef3D
+    compute []gpu.ComputePipeline // [0]=froxel_scatter, [1]=froxel_accum
+    pipelines []gpu.GraphicsPipeline // [0]=atmosphere_apply (HDR RGBA16F BLEND_PREMULTIPLIED)
+    samplers []gpu.Sampler           // [0]=nearest depth sampler
+    buffers []gpu.Buffer             // [0]=froxel_scatter (294,912B), [1]=froxel_accum (294,912B)
+    closed bool
+}
+
+fn push_atm_word(dst $&[]int, val f64) int {
+    w := scalar_word(val) or >>
+    dst.push(w)
+    << 0
+}
+
+pub fn (device &Device3D) atmosphere_renderer(program &AtmosphereProgram3D) AtmosphereRenderer3D {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus atmosphere 3D: create AtmosphereRenderer3D outside a frame") }
+    if !device.is_gpu() { >> errors.new("nexus atmosphere 3D: requires GPU backend") }
+    dev := device.gpu_device() or >>
+    if (dev.shader_formats() & program.format) == 0 || program.entrypoint.len == 0 ||
+        program.froxel_scatter.len == 0 || program.froxel_accum.len == 0 ||
+        program.apply_vertex.len == 0 || program.apply_fragment.len == 0 {
+        >> errors.new("nexus atmosphere 3D: invalid or incomplete atmosphere shader program")
+    }
+
+    froxel_bytes := FROXEL_TOTAL * 16
+    stats := dev.stats() or >>
+    if stats.buffer_count + 2 > 1024 || froxel_bytes * 2 > 67108864 - stats.buffer_bytes {
+        >> errors.new("nexus atmosphere 3D: exceeds buffer count or 64 MiB VRAM budget")
+    }
+
+    c_scat_desc := gpu.ComputeResourcesDesc{
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 0,
+        read_textures: 0,
+        read_buffers: 1,
+        write_textures: 0,
+        write_buffers: 1,
+        uniform_sizes: [240],
+        threads_x: 64,
+        threads_y: 1,
+        threads_z: 1
+    }
+    $c_scat := dev.compute_pipeline_with_resources(&c_scat_desc, &program.froxel_scatter) or >>
+
+    c_acc_desc := gpu.ComputeResourcesDesc{
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 0,
+        read_textures: 0,
+        read_buffers: 1,
+        write_textures: 0,
+        write_buffers: 1,
+        uniform_sizes: [112],
+        threads_x: 64,
+        threads_y: 1,
+        threads_z: 1
+    }
+    $c_acc := dev.compute_pipeline_with_resources(&c_acc_desc, &program.froxel_accum) or >>
+
+    vs_desc := gpu.ShaderResourcesDesc{
+        stage: gpu.VERTEX,
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 0,
+        storage_textures: 0,
+        storage_buffers: 0,
+        uniform_sizes: []int{}
+    }
+    fs_desc := gpu.ShaderResourcesDesc{
+        stage: gpu.FRAGMENT,
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 1,
+        storage_textures: 0,
+        storage_buffers: 1,
+        uniform_sizes: [240]
+    }
+    $vs := dev.shader_with_resources(&vs_desc, &program.apply_vertex) or >>
+    $fs := dev.shader_with_resources(&fs_desc, &program.apply_fragment) or >>
+
+    $pdesc := gpu.pipeline_defaults(layout.RGBA16_FLOAT)
+    pdesc.primitive = gpu.TRIANGLES
+    pdesc.cull = gpu.CULL_NONE
+    pdesc.depth_format = 0
+    pdesc.depth_compare = gpu.DEPTH_DISABLED
+    pdesc.depth_write = false
+    pdesc.blend = gpu.BLEND_PREMULTIPLIED
+    $p_apply := dev.graphics_pipeline(&vs, &fs, &pdesc) or >>
+    vs.close() or >>
+    fs.close() or >>
+
+    $sdesc := gpu.sampler_defaults()
+    sdesc.min_filter = gpu.NEAREST
+    sdesc.mag_filter = gpu.NEAREST
+    sdesc.mip_filter = gpu.NEAREST
+    $near_samp := dev.sampler(sdesc) or >>
+
+    $b_scat := dev.buffer(froxel_bytes, gpu.BUFFER_COMPUTE_STORAGE_READ | gpu.BUFFER_COMPUTE_STORAGE_WRITE) or >>
+    $b_acc := dev.buffer(froxel_bytes, gpu.BUFFER_COMPUTE_STORAGE_WRITE | gpu.BUFFER_GRAPHICS_STORAGE_READ) or >>
+    zeros := zero_bytes(froxel_bytes)
+    $u0 := dev.upload(&b_scat, 0, &zeros) or >>
+    u0.close() or >>
+    $u1 := dev.upload(&b_acc, 0, &zeros) or >>
+    u1.close() or >>
+
+    << AtmosphereRenderer3D{
+        owner: device.reference(),
+        compute: [c_scat, c_acc],
+        pipelines: [p_apply],
+        samplers: [near_samp],
+        buffers: [b_scat, b_acc],
+        closed: false
+    }
+}
+
+fn build_scatter_params_bytes(
+    inv_vp fm.Mat4,
+    eye fm.Vec3,
+    cam_fwd fm.Vec3,
+    light_count int,
+    sun_dir fm.Vec3,
+    cfg &AtmosphereConfig3D
+) []u8 {
+    $w := []int{}
+    ivp_w := matrix_words(inv_vp) or >>
+    for v in ivp_w { w.push(v) }
+
+    push_atm_word($&w, eye.x) or >>
+    push_atm_word($&w, eye.y) or >>
+    push_atm_word($&w, eye.z) or >>
+    push_atm_word($&w, cfg.time) or >>
+
+    push_atm_word($&w, cam_fwd.x) or >>
+    push_atm_word($&w, cam_fwd.y) or >>
+    push_atm_word($&w, cam_fwd.z) or >>
+    push_atm_word($&w, f64(light_count)) or >>
+
+    push_atm_word($&w, f64(FROXEL_X)) or >>
+    push_atm_word($&w, f64(FROXEL_Y)) or >>
+    push_atm_word($&w, f64(FROXEL_Z)) or >>
+    push_atm_word($&w, cfg.fog_near) or >>
+
+    push_atm_word($&w, cfg.fog_far) or >>
+    push_atm_word($&w, cfg.fog_density) or >>
+    push_atm_word($&w, cfg.fog_height_falloff) or >>
+    push_atm_word($&w, cfg.fog_base_height) or >>
+
+    push_atm_word($&w, cfg.fog_anisotropy) or >>
+    push_atm_word($&w, cfg.fog_extinction_scale) or >>
+    push_atm_word($&w, cfg.noise_strength) or >>
+    push_atm_word($&w, cfg.noise_scale) or >>
+
+    push_atm_word($&w, cfg.fog_albedo.x) or >>
+    push_atm_word($&w, cfg.fog_albedo.y) or >>
+    push_atm_word($&w, cfg.fog_albedo.z) or >>
+    push_atm_word($&w, cfg.fog_scattering_strength) or >>
+
+    push_atm_word($&w, cfg.fog_ambient.x) or >>
+    push_atm_word($&w, cfg.fog_ambient.y) or >>
+    push_atm_word($&w, cfg.fog_ambient.z) or >>
+    push_atm_word($&w, cfg.local_light_boost) or >>
+
+    $fog_f := 0.0
+    if cfg.fog_enabled { fog_f = 1.0 }
+    push_atm_word($&w, sun_dir.x) or >>
+    push_atm_word($&w, sun_dir.y) or >>
+    push_atm_word($&w, sun_dir.z) or >>
+    push_atm_word($&w, fog_f) or >>
+
+    push_atm_word($&w, cfg.sun_radiance.x) or >>
+    push_atm_word($&w, cfg.sun_radiance.y) or >>
+    push_atm_word($&w, cfg.sun_radiance.z) or >>
+    push_atm_word($&w, cfg.sun_shaft_boost) or >>
+
+    push_atm_word($&w, cfg.wind_velocity.x) or >>
+    push_atm_word($&w, cfg.wind_velocity.y) or >>
+    push_atm_word($&w, cfg.wind_velocity.z) or >>
+    push_atm_word($&w, 0.0) or >>
+
+    for _ in 0:4 { push_atm_word($&w, 0.0) or >> }
+    << word_bytes(&w) or >>
+}
+
+fn build_accum_params_bytes(
+    inv_vp fm.Mat4,
+    eye fm.Vec3,
+    cam_fwd fm.Vec3,
+    cfg &AtmosphereConfig3D
+) []u8 {
+    $w := []int{}
+    ivp_w := matrix_words(inv_vp) or >>
+    for v in ivp_w { w.push(v) }
+
+    push_atm_word($&w, eye.x) or >>
+    push_atm_word($&w, eye.y) or >>
+    push_atm_word($&w, eye.z) or >>
+    push_atm_word($&w, cfg.fog_near) or >>
+
+    push_atm_word($&w, cam_fwd.x) or >>
+    push_atm_word($&w, cam_fwd.y) or >>
+    push_atm_word($&w, cam_fwd.z) or >>
+    push_atm_word($&w, cfg.fog_far) or >>
+
+    push_atm_word($&w, f64(FROXEL_X)) or >>
+    push_atm_word($&w, f64(FROXEL_Y)) or >>
+    push_atm_word($&w, f64(FROXEL_Z)) or >>
+    push_atm_word($&w, 0.0) or >>
+    << word_bytes(&w) or >>
+}
+
+fn build_apply_uniform_bytes(
+    inv_vp fm.Mat4,
+    view fm.Mat4,
+    eye fm.Vec3,
+    sun_dir fm.Vec3,
+    cfg &AtmosphereConfig3D
+) []u8 {
+    $w := []int{}
+    ivp_w := matrix_words(inv_vp) or >>
+    for v in ivp_w { w.push(v) }
+    v_w := matrix_words(view) or >>
+    for v in v_w { w.push(v) }
+
+    $sky_f := 0.0
+    if cfg.sky_enabled { sky_f = 1.0 }
+    push_atm_word($&w, eye.x) or >>
+    push_atm_word($&w, eye.y) or >>
+    push_atm_word($&w, eye.z) or >>
+    push_atm_word($&w, sky_f) or >>
+
+    $fog_f := 0.0
+    if cfg.fog_enabled { fog_f = 1.0 }
+    push_atm_word($&w, sun_dir.x) or >>
+    push_atm_word($&w, sun_dir.y) or >>
+    push_atm_word($&w, sun_dir.z) or >>
+    push_atm_word($&w, fog_f) or >>
+
+    push_atm_word($&w, cfg.sun_radiance.x) or >>
+    push_atm_word($&w, cfg.sun_radiance.y) or >>
+    push_atm_word($&w, cfg.sun_radiance.z) or >>
+    push_atm_word($&w, cfg.sun_disc_intensity) or >>
+
+    push_atm_word($&w, 0.0000058 * cfg.rayleigh_scale) or >>
+    push_atm_word($&w, 0.0000135 * cfg.rayleigh_scale) or >>
+    push_atm_word($&w, 0.0000331 * cfg.rayleigh_scale) or >>
+    push_atm_word($&w, 8000.0) or >>
+
+    disc_cos := math.cos(cfg.sun_disc_angular_radius)
+    push_atm_word($&w, 0.000021 * cfg.mie_scale) or >>
+    push_atm_word($&w, cfg.mie_g) or >>
+    push_atm_word($&w, 1200.0) or >>
+    push_atm_word($&w, disc_cos) or >>
+
+    push_atm_word($&w, cfg.ground_albedo.x) or >>
+    push_atm_word($&w, cfg.ground_albedo.y) or >>
+    push_atm_word($&w, cfg.ground_albedo.z) or >>
+    push_atm_word($&w, cfg.fog_near) or >>
+
+    push_atm_word($&w, f64(FROXEL_X)) or >>
+    push_atm_word($&w, f64(FROXEL_Y)) or >>
+    push_atm_word($&w, f64(FROXEL_Z)) or >>
+    push_atm_word($&w, cfg.fog_far) or >>
+    << word_bytes(&w) or >>
+}
+
+pub fn (atm &AtmosphereRenderer3D) apply_into_hdr(
+    device &Device3D,
+    hdr $&HdrTarget3D,
+    clustered &ClusteredRenderer3D,
+    eye fm.Vec3,
+    view fm.Mat4,
+    proj fm.Mat4,
+    cfg &AtmosphereConfig3D
+) int {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus atmosphere 3D: end Device3D frame before apply_into_hdr") }
+    if atm.closed || !atm.owner.matches(device) {
+        >> errors.new("nexus atmosphere 3D: closed or foreign AtmosphereRenderer3D")
+    }
+    if hdr.closed || hdr.active || !hdr.owner.matches(device) || hdr.textures.len < 3 {
+        >> errors.new("nexus atmosphere 3D: invalid, closed or active HdrTarget3D")
+    }
+    if clustered.closed || !clustered.owner.matches(device) || !clustered.ready {
+        >> errors.new("nexus atmosphere 3D: requires binned ClusteredRenderer3D")
+    }
+    if !eye.is_finite() || !view.is_affine() || !proj.is_finite() {
+        >> errors.new("nexus atmosphere 3D: invalid camera matrices")
+    }
+    cfg.validate() or >>
+    if !cfg.sky_enabled && !cfg.fog_enabled { << 0 }
+
+    vp := proj.multiply(view)
+    inv_vp := mat4_inverse(vp) or >>
+    cam_fwd_raw := fm.vec3(-view.c0.z, -view.c1.z, -view.c2.z)
+    cam_fwd := atm_safe_norm(cam_fwd_raw, fm.vec3(0.0, 0.0, -1.0))
+    sun_dir := cfg.sun_direction.normalized() or >>
+
+    dev := device.gpu_device() or >>
+    $enc := dev.command_encoder() or >>
+
+    if cfg.fog_enabled {
+        scat_bytes := build_scatter_params_bytes(inv_vp, eye, cam_fwd, clustered.light_count, sun_dir, cfg) or >>
+        acc_bytes := build_accum_params_bytes(inv_vp, eye, cam_fwd, cfg) or >>
+        tw_empty := []gpu.StorageTextureWrite{}
+
+        bw_s := [gpu.write_buffer(&atm.buffers[0], false)]
+        $ps := enc.begin_compute_with_resources(&tw_empty, &bw_s) or >>
+        ps.pipeline(&atm.compute[0]) or >>
+        ps.read_buffer(0, &clustered.buffers[0]) or >>
+        ps.uniform(0, &scat_bytes) or >>
+        ps.dispatch((FROXEL_TOTAL + 63) / 64, 1, 1) or >>
+        ps.end() or >>
+
+        bw_a := [gpu.write_buffer(&atm.buffers[1], false)]
+        $pa := enc.begin_compute_with_resources(&tw_empty, &bw_a) or >>
+        pa.pipeline(&atm.compute[1]) or >>
+        pa.read_buffer(0, &atm.buffers[0]) or >>
+        pa.uniform(0, &acc_bytes) or >>
+        pa.dispatch((FROXEL_X * FROXEL_Y + 63) / 64, 1, 1) or >>
+        pa.end() or >>
+    }
+
+    apply_bytes := build_apply_uniform_bytes(inv_vp, view, eye, sun_dir, cfg) or >>
+    c0 := gpu.ColorAttachment{
+        view: hdr.textures[0].view(0) or >>,
+        load: gpu.LOAD,
+        store: gpu.STORE,
+        clear: gpu.Color{r: 0.0, g: 0.0, b: 0.0, a: 0.0}
+    }
+    $rpass := enc.begin_render(c0, gpu.no_depth()) or >>
+    rpass.pipeline(&atm.pipelines[0]) or >>
+    rpass.sampler(gpu.FRAGMENT, 0, &hdr.textures[2], &atm.samplers[0]) or >>
+    rpass.uniform(gpu.FRAGMENT, 0, &apply_bytes) or >>
+    rpass.storage_buffer(gpu.FRAGMENT, 0, &atm.buffers[1]) or >>
+    rpass.draw(3, 0, 1, 0) or >>
+    rpass.end() or >>
+
+    $fence := enc.submit() or >>
+    fence.wait() or >>
+    fence.close() or >>
+    hdr.ready = true
+    << 1
+}
+
+pub fn (atm $&AtmosphereRenderer3D) close() int {
+    if atm.closed { << 0 }
+    for i in 0:atm.compute.len {
+        c := $&atm.compute[i]
+        c.close() or >>
+    }
+    for i in 0:atm.pipelines.len {
+        p := $&atm.pipelines[i]
+        p.close() or >>
+    }
+    for i in 0:atm.samplers.len {
+        s := $&atm.samplers[i]
+        s.close() or >>
+    }
+    for i in 0:atm.buffers.len {
+        b := $&atm.buffers[i]
+        b.close() or >>
+    }
+    atm.compute = []gpu.ComputePipeline{}
+    atm.pipelines = []gpu.GraphicsPipeline{}
+    atm.samplers = []gpu.Sampler{}
+    atm.buffers = []gpu.Buffer{}
+    atm.closed = true
+    << 0
+}
+
+fn (atm $&AtmosphereRenderer3D) drop() {
+    atm.close() or (err) { << }
+}

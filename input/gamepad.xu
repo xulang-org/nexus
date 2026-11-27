@@ -1,0 +1,407 @@
+@"github.com/xulang-org/nexus/input"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const MAX_GAMEPADS = 4
+pub const GAMEPAD_BUTTON_COUNT = 16
+pub const GAMEPAD_AXIS_COUNT = 6
+
+pub const BTN_SOUTH = 0
+pub const BTN_EAST = 1
+pub const BTN_WEST = 2
+pub const BTN_NORTH = 3
+pub const BTN_L1 = 4
+pub const BTN_R1 = 5
+pub const BTN_L2 = 6
+pub const BTN_R2 = 7
+pub const BTN_SELECT = 8
+pub const BTN_START = 9
+pub const BTN_L3 = 10
+pub const BTN_R3 = 11
+pub const BTN_DPAD_UP = 12
+pub const BTN_DPAD_DOWN = 13
+pub const BTN_DPAD_LEFT = 14
+pub const BTN_DPAD_RIGHT = 15
+pub const BTN_SHARE = 16
+
+pub const AXIS_LX = 0
+pub const AXIS_LY = 1
+pub const AXIS_RX = 2
+pub const AXIS_RY = 3
+pub const AXIS_LT = 4
+pub const AXIS_RT = 5
+
+pub const LAYOUT_XBOX = 0
+pub const LAYOUT_PLAYSTATION_CROSS = 1
+pub const LAYOUT_PLAYSTATION_CIRCLE = 2
+pub const LAYOUT_SWITCH = 3
+pub const LAYOUT_STEAM_DECK = 4
+
+pub const GP_EVENT_CONNECTED = 1
+pub const GP_EVENT_DISCONNECTED = 2
+
+pub struct GamepadEvent {
+    pub kind int
+    pub slot int
+    pub layout int
+    pub name string
+}
+
+pub struct GamepadBindingTemplate {
+    pub layout int
+    pub confirm int
+    pub cancel int
+    pub jump int
+    pub attack int
+    pub pause int
+}
+
+pub fn template_for_layout(layout int) GamepadBindingTemplate {
+    if layout < LAYOUT_XBOX || layout > LAYOUT_STEAM_DECK {
+        >> errors.new("nexus gamepad: unknown controller layout")
+    }
+    if layout == LAYOUT_SWITCH || layout == LAYOUT_PLAYSTATION_CIRCLE {
+        << GamepadBindingTemplate{
+            layout: layout,
+            confirm: BTN_EAST,
+            cancel: BTN_SOUTH,
+            jump: BTN_EAST,
+            attack: BTN_NORTH,
+            pause: BTN_START
+        }
+    }
+    << GamepadBindingTemplate{
+        layout: layout,
+        confirm: BTN_SOUTH,
+        cancel: BTN_EAST,
+        jump: BTN_SOUTH,
+        attack: BTN_WEST,
+        pause: BTN_START
+    }
+}
+
+fn clamp_gp(v f64, lo f64, hi f64) f64 {
+    << math.max(lo, math.min(hi, v))
+}
+
+pub fn shape_stick_radial(x f64, y f64, inner_dz f64, outer_dz f64, exponent f64) fm.Vec2 {
+    if !fm.finite(x) || !fm.finite(y) || !fm.finite(inner_dz) || !fm.finite(outer_dz) || !fm.finite(exponent) ||
+        inner_dz < 0.0 || outer_dz < 0.0 || inner_dz + outer_dz >= 0.99 || exponent <= 0.0 {
+        >> errors.new("nexus gamepad: invalid stick shaping parameters")
+    }
+    cx := clamp_gp(x, -1.0, 1.0)
+    cy := clamp_gp(y, -1.0, 1.0)
+    mag := math.sqrt(cx * cx + cy * cy)
+    if mag <= inner_dz || mag <= 1e-9 {
+        << fm.vec2(0.0, 0.0)
+    }
+    hi := 1.0 - outer_dz
+    lin := clamp_gp((mag - inner_dz) / (hi - inner_dz), 0.0, 1.0)
+    $shaped := lin
+    if math.abs(exponent - 1.0) > 1e-6 && lin > 0.0 {
+        shaped = clamp_gp(math.exp(exponent * math.log(lin)), 0.0, 1.0)
+    }
+    scale := shaped / mag
+    << fm.vec2(cx * scale, cy * scale)
+}
+
+pub fn shape_trigger(raw f64, deadzone f64) f64 {
+    if !fm.finite(raw) || !fm.finite(deadzone) || deadzone < 0.0 || deadzone >= 0.99 {
+        >> errors.new("nexus gamepad: invalid trigger parameters")
+    }
+    clamped := clamp_gp(raw, 0.0, 1.0)
+    if clamped <= deadzone { << 0.0 }
+    << clamp_gp((clamped - deadzone) / (1.0 - deadzone), 0.0, 1.0)
+}
+
+struct GamepadSlot {
+    connected bool
+    layout int
+    name string
+    buttons []bool
+    prev_buttons []bool
+    axes []f64
+}
+
+fn empty_gamepad_slot() GamepadSlot {
+    $btns := []bool{}
+    $prev := []bool{}
+    for _ in 0:GAMEPAD_BUTTON_COUNT {
+        btns.push(false)
+        prev.push(false)
+    }
+    $axes := []f64{}
+    for _ in 0:GAMEPAD_AXIS_COUNT { axes.push(0.0) }
+    << GamepadSlot{
+        connected: false,
+        layout: LAYOUT_XBOX,
+        name: "",
+        buttons: btns,
+        prev_buttons: prev,
+        axes: axes
+    }
+}
+
+pub struct GamepadManager {
+    slots []GamepadSlot
+    events []GamepadEvent
+}
+
+pub fn new_gamepad_manager() GamepadManager {
+    $slots := []GamepadSlot{}
+    for _ in 0:MAX_GAMEPADS { slots.push(empty_gamepad_slot()) }
+    << GamepadManager{slots: slots, events: []GamepadEvent{}}
+}
+
+fn check_slot(slot int) int {
+    if slot < 0 || slot >= MAX_GAMEPADS {
+        >> errors.new("nexus gamepad: slot out of range 0..3")
+    }
+    << slot
+}
+
+pub fn (gm $&GamepadManager) begin_frame() {
+    for s in 0:gm.slots.len {
+        sl := $&gm.slots[s]
+        for b in 0:GAMEPAD_BUTTON_COUNT {
+            sl.prev_buttons[b] = sl.buttons[b]
+        }
+    }
+}
+
+pub fn (gm $&GamepadManager) connect(slot int, layout int, name string) int {
+    check_slot(slot) or >>
+    _ := template_for_layout(layout) or >>
+    $sl := empty_gamepad_slot()
+    sl.connected = true
+    sl.layout = layout
+    sl.name = name + ""
+    gm.slots[slot] = sl
+    gm.events.push(GamepadEvent{kind: GP_EVENT_CONNECTED, slot: slot, layout: layout, name: name + ""})
+    << 0
+}
+
+pub fn (gm $&GamepadManager) disconnect(slot int) int {
+    check_slot(slot) or >>
+    old_layout := gm.slots[slot].layout
+    old_name := gm.slots[slot].name + ""
+    was_conn := gm.slots[slot].connected
+    gm.slots[slot] = empty_gamepad_slot()
+    if was_conn {
+        gm.events.push(GamepadEvent{kind: GP_EVENT_DISCONNECTED, slot: slot, layout: old_layout, name: old_name})
+    }
+    << 0
+}
+
+pub fn (gm &GamepadManager) is_connected(slot int) bool {
+    if slot < 0 || slot >= MAX_GAMEPADS { << false }
+    << gm.slots[slot].connected
+}
+
+pub fn (gm &GamepadManager) connected_count() int {
+    $n := 0
+    for i in 0:gm.slots.len {
+        if gm.slots[i].connected { n += 1 }
+    }
+    << n
+}
+
+pub fn (gm $&GamepadManager) drain_events() []GamepadEvent {
+    $out := []GamepadEvent{}
+    for i in 0:gm.events.len {
+        ev := &gm.events[i]
+        out.push(GamepadEvent{kind: ev.kind, slot: ev.slot, layout: ev.layout, name: ev.name + ""})
+    }
+    gm.events = []GamepadEvent{}
+    << out
+}
+
+pub fn (gm $&GamepadManager) set_button(slot int, button int, down bool) int {
+    check_slot(slot) or >>
+    if button < 0 || button >= GAMEPAD_BUTTON_COUNT {
+        >> errors.new("nexus gamepad: button index out of range")
+    }
+    if !gm.slots[slot].connected {
+        >> errors.new("nexus gamepad: cannot set button on disconnected slot")
+    }
+    gm.slots[slot].buttons[button] = down
+    << 0
+}
+
+pub fn (gm $&GamepadManager) set_axis(slot int, axis int, value f64) int {
+    check_slot(slot) or >>
+    if axis < 0 || axis >= GAMEPAD_AXIS_COUNT || !fm.finite(value) {
+        >> errors.new("nexus gamepad: invalid axis index or value")
+    }
+    if !gm.slots[slot].connected {
+        >> errors.new("nexus gamepad: cannot set axis on disconnected slot")
+    }
+    $clamped := value
+    if axis == AXIS_LT || axis == AXIS_RT {
+        clamped = clamp_gp(value, 0.0, 1.0)
+    } else {
+        clamped = clamp_gp(value, -1.0, 1.0)
+    }
+    gm.slots[slot].axes[axis] = clamped
+    << 0
+}
+
+pub fn (gm &GamepadManager) button_pressed(slot int, button int) bool {
+    if slot < 0 || slot >= MAX_GAMEPADS || button < 0 || button >= GAMEPAD_BUTTON_COUNT { << false }
+    if !gm.slots[slot].connected { << false }
+    << gm.slots[slot].buttons[button]
+}
+
+pub fn (gm &GamepadManager) button_just_pressed(slot int, button int) bool {
+    if slot < 0 || slot >= MAX_GAMEPADS || button < 0 || button >= GAMEPAD_BUTTON_COUNT { << false }
+    sl := &gm.slots[slot]
+    << sl.connected && sl.buttons[button] && !sl.prev_buttons[button]
+}
+
+pub fn (gm &GamepadManager) button_just_released(slot int, button int) bool {
+    if slot < 0 || slot >= MAX_GAMEPADS || button < 0 || button >= GAMEPAD_BUTTON_COUNT { << false }
+    sl := &gm.slots[slot]
+    << sl.connected && !sl.buttons[button] && sl.prev_buttons[button]
+}
+
+pub fn (gm &GamepadManager) left_stick(slot int, inner_dz f64, outer_dz f64, exponent f64) fm.Vec2 {
+    check_slot(slot) or >>
+    sl := &gm.slots[slot]
+    if !sl.connected { << fm.vec2(0.0, 0.0) }
+    << shape_stick_radial(sl.axes[AXIS_LX], sl.axes[AXIS_LY], inner_dz, outer_dz, exponent) or >>
+}
+
+pub fn (gm &GamepadManager) right_stick(slot int, inner_dz f64, outer_dz f64, exponent f64) fm.Vec2 {
+    check_slot(slot) or >>
+    sl := &gm.slots[slot]
+    if !sl.connected { << fm.vec2(0.0, 0.0) }
+    << shape_stick_radial(sl.axes[AXIS_RX], sl.axes[AXIS_RY], inner_dz, outer_dz, exponent) or >>
+}
+
+pub fn (gm &GamepadManager) trigger(slot int, is_right bool, deadzone f64) f64 {
+    check_slot(slot) or >>
+    sl := &gm.slots[slot]
+    if !sl.connected { << 0.0 }
+    $ax := AXIS_LT
+    if is_right { ax = AXIS_RT }
+    << shape_trigger(sl.axes[ax], deadzone) or >>
+}
+
+pub fn (gm &GamepadManager) bind_template_to_input_map(slot int, input_map $&InputMap, source_base int) int {
+    check_slot(slot) or >>
+    if source_base < 0 || source_base + 9 >= MAX_SOURCES {
+        >> errors.new("nexus gamepad: source_base out of range")
+    }
+    input_map.bind_source("confirm", source_base + 0) or >>
+    input_map.bind_source("cancel", source_base + 1) or >>
+    input_map.bind_source("jump", source_base + 2) or >>
+    input_map.bind_source("attack", source_base + 3) or >>
+    input_map.bind_source("pause", source_base + 4) or >>
+    input_map.bind_source("move_left", source_base + 5) or >>
+    input_map.bind_source("move_right", source_base + 6) or >>
+    input_map.bind_source("move_up", source_base + 7) or >>
+    input_map.bind_source("move_down", source_base + 8) or >>
+    input_map.bind_source("fire", source_base + 9) or >>
+    << 0
+}
+
+fn bval(down bool) f64 {
+    if down { << 1.0 }
+    << 0.0
+}
+
+pub fn (gm &GamepadManager) sync_slot_to_input_map(slot int, input_map $&InputMap, source_base int) int {
+    check_slot(slot) or >>
+    if source_base < 0 || source_base + 9 >= MAX_SOURCES {
+        >> errors.new("nexus gamepad: source_base out of range")
+    }
+    sl := &gm.slots[slot]
+    if !sl.connected {
+        for off in 0:10 {
+            input_map.feed_source(source_base + off, 0.0) or >>
+        }
+        << 0
+    }
+    tmpl := template_for_layout(sl.layout) or >>
+    ls := shape_stick_radial(sl.axes[AXIS_LX], sl.axes[AXIS_LY], 0.15, 0.05, 1.0) or >>
+    rt_v := shape_trigger(sl.axes[AXIS_RT], 0.08) or >>
+
+    input_map.feed_source(source_base + 0, bval(sl.buttons[tmpl.confirm])) or >>
+    input_map.feed_source(source_base + 1, bval(sl.buttons[tmpl.cancel])) or >>
+    input_map.feed_source(source_base + 2, bval(sl.buttons[tmpl.jump])) or >>
+    input_map.feed_source(source_base + 3, bval(sl.buttons[tmpl.attack])) or >>
+    input_map.feed_source(source_base + 4, bval(sl.buttons[tmpl.pause])) or >>
+    input_map.feed_source(source_base + 5, math.max(0.0, -ls.x)) or >>
+    input_map.feed_source(source_base + 6, math.max(0.0, ls.x)) or >>
+    input_map.feed_source(source_base + 7, math.max(0.0, ls.y)) or >>
+    input_map.feed_source(source_base + 8, math.max(0.0, -ls.y)) or >>
+    input_map.feed_source(source_base + 9, rt_v) or >>
+    << 0
+}
+
+struct BufferedActionEntry {
+    frame int
+    action string
+    consumed bool
+}
+
+pub struct InputBuffer {
+    window_frames int
+    entries []BufferedActionEntry
+}
+
+pub fn new_input_buffer(window_frames int) InputBuffer {
+    if window_frames < 1 || window_frames > 120 {
+        >> errors.new("nexus input buffer: window_frames must be 1..120")
+    }
+    << InputBuffer{window_frames: window_frames, entries: []BufferedActionEntry{}}
+}
+
+pub fn (ib $&InputBuffer) push_frame(frame int, actions &[]string) {
+    cutoff := frame - ib.window_frames
+    $kept := []BufferedActionEntry{}
+    for i in 0:ib.entries.len {
+        e := &ib.entries[i]
+        if e.frame >= cutoff {
+            kept.push(BufferedActionEntry{frame: e.frame, action: e.action + "", consumed: e.consumed})
+        }
+    }
+    for i in 0:actions.len {
+        kept.push(BufferedActionEntry{frame: frame, action: actions[i] + "", consumed: false})
+    }
+    ib.entries = kept
+}
+
+pub fn (ib $&InputBuffer) consume_buffered(action string, current_frame int) bool {
+    cutoff := current_frame - ib.window_frames
+    for i in 0:ib.entries.len {
+        e := $&ib.entries[i]
+        if !e.consumed && e.frame >= cutoff && e.frame <= current_frame && e.action == action {
+            e.consumed = true
+            << true
+        }
+    }
+    << false
+}
+
+pub fn (ib &InputBuffer) match_sequence(sequence &[]string, current_frame int, max_gap_frames int) bool {
+    if sequence.len == 0 || max_gap_frames < 0 { << false }
+    cutoff := current_frame - ib.window_frames
+    $seq_idx := sequence.len - 1
+    $prev_frame := current_frame + max_gap_frames
+    $i := ib.entries.len - 1
+    while i >= 0 && seq_idx >= 0 {
+        e := &ib.entries[i]
+        if e.frame >= cutoff && e.frame <= current_frame && e.action == sequence[seq_idx] {
+            if seq_idx == sequence.len - 1 || (prev_frame - e.frame) <= max_gap_frames {
+                prev_frame = e.frame
+                seq_idx -= 1
+                if seq_idx < 0 { << true }
+            }
+        }
+        i -= 1
+    }
+    << false
+}

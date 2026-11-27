@@ -1,0 +1,641 @@
+@"github.com/xulang-org/nexus/foundation/spatial"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub struct SpatialMatch2D {
+    pub id int
+    pub dist_sq f64
+}
+
+pub struct SpatialMatch3D {
+    pub id int
+    pub dist_sq f64
+}
+
+struct SpatialItem2D {
+    alive bool
+    id int
+    bounds fm.Rect2
+    min_cx int
+    min_cy int
+    max_cx int
+    max_cy int
+    stamp int
+}
+
+struct SpatialBucket2D {
+    alive bool
+    cx int
+    cy int
+    next_bucket int
+    slots []int
+}
+
+pub struct SpatialHash2D {
+    cell_size f64
+    inv_cell_size f64
+    items []SpatialItem2D
+    free_slots []int
+    id_to_slot map[int]int
+    buckets []SpatialBucket2D
+    free_buckets []int
+    cell_heads map[int]int
+    live_count int
+    query_stamp int
+}
+
+fn cell_hash_2d(cx int, cy int) int {
+    << ((cx * 73856093) ^ (cy * 19349663)) & 0x7FFFFFFF
+}
+
+fn cell_hash_3d(cx int, cy int, cz int) int {
+    << ((cx * 73856093) ^ (cy * 19349663) ^ (cz * 83492791)) & 0x7FFFFFFF
+}
+
+pub fn new_spatial_hash_2d(cell_size f64) SpatialHash2D {
+    if !fm.finite(cell_size) || cell_size <= 1e-6 || cell_size > 1000000.0 {
+        >> errors.new("nexus spatial: invalid 2D cell size")
+    }
+    << SpatialHash2D{
+        cell_size: cell_size,
+        inv_cell_size: 1.0 / cell_size,
+        items: []SpatialItem2D{},
+        free_slots: []int{},
+        id_to_slot: map[int]int{},
+        buckets: []SpatialBucket2D{},
+        free_buckets: []int{},
+        cell_heads: map[int]int{},
+        live_count: 0,
+        query_stamp: 1
+    }
+}
+
+fn (h &SpatialHash2D) cell_range(bounds fm.Rect2) []int {
+    min_x := bounds.position.x
+    min_y := bounds.position.y
+    max_x := bounds.position.x + bounds.size.x
+    max_y := bounds.position.y + bounds.size.y
+    cxmin := int(math.floor(min_x * h.inv_cell_size))
+    cymin := int(math.floor(min_y * h.inv_cell_size))
+    cxmax := int(math.floor((max_x - 1e-9) * h.inv_cell_size))
+    cymax := int(math.floor((max_y - 1e-9) * h.inv_cell_size))
+    $cx1 := cxmax
+    $cy1 := cymax
+    if cx1 < cxmin { cx1 = cxmin }
+    if cy1 < cymin { cy1 = cymin }
+    << [cxmin, cymin, cx1, cy1]
+}
+
+fn (h $&SpatialHash2D) bucket_add_slot(cx int, cy int, slot int) {
+    key := cell_hash_2d(cx, cy)
+    $prev := -1
+    $bi := -1
+    if h.cell_heads.has(key) { bi = h.cell_heads[key] }
+    while bi >= 0 {
+        if h.buckets[bi].cx == cx && h.buckets[bi].cy == cy {
+            h.buckets[bi].slots.push(slot)
+            <<
+        }
+        prev = bi
+        bi = h.buckets[bi].next_bucket
+    }
+    _ := prev
+    $old_head := -1
+    if h.cell_heads.has(key) { old_head = h.cell_heads[key] }
+    $nb := 0
+    if h.free_buckets.len > 0 {
+        last := h.free_buckets.len - 1
+        nb = h.free_buckets[last]
+        $nf := []int{}
+        for i in 0:last { nf.push(h.free_buckets[i]) }
+        h.free_buckets = nf
+        h.buckets[nb] = SpatialBucket2D{alive: true, cx: cx, cy: cy, next_bucket: old_head, slots: [slot]}
+    } else {
+        nb = h.buckets.len
+        h.buckets.push(SpatialBucket2D{alive: true, cx: cx, cy: cy, next_bucket: old_head, slots: [slot]})
+    }
+    h.cell_heads[key] = nb
+}
+
+fn (h $&SpatialHash2D) bucket_remove_slot(cx int, cy int, slot int) {
+    key := cell_hash_2d(cx, cy)
+    if !h.cell_heads.has(key) { << }
+    $prev := -1
+    $bi := h.cell_heads[key]
+    while bi >= 0 {
+        if h.buckets[bi].cx == cx && h.buckets[bi].cy == cy {
+            $next_slots := []int{}
+            for s in h.buckets[bi].slots {
+                if s != slot { next_slots.push(s) }
+            }
+            is_empty := next_slots.len == 0
+            h.buckets[bi].slots = next_slots
+            if is_empty {
+                nxt := h.buckets[bi].next_bucket
+                if prev < 0 { h.cell_heads[key] = nxt } else { h.buckets[prev].next_bucket = nxt }
+                h.buckets[bi].alive = false
+                h.buckets[bi].next_bucket = -1
+                h.free_buckets.push(bi)
+            }
+            <<
+        }
+        prev = bi
+        bi = h.buckets[bi].next_bucket
+    }
+}
+
+pub fn (h &SpatialHash2D) contains(id int) bool {
+    << h.id_to_slot.has(id) && h.items[h.id_to_slot[id]].alive
+}
+
+pub fn (h &SpatialHash2D) count() int { << h.live_count }
+
+pub fn (h $&SpatialHash2D) clear() {
+    h.items = []SpatialItem2D{}
+    h.free_slots = []int{}
+    h.id_to_slot = map[int]int{}
+    h.buckets = []SpatialBucket2D{}
+    h.free_buckets = []int{}
+    h.cell_heads = map[int]int{}
+    h.live_count = 0
+}
+
+pub fn (h $&SpatialHash2D) insert(id int, bounds fm.Rect2) int {
+    if !bounds.valid() { >> errors.new("nexus spatial: 2D bounds must be valid") }
+    if h.contains(id) { << h.update(id, bounds) or >> }
+    cr := h.cell_range(bounds)
+    $slot := 0
+    if h.free_slots.len > 0 {
+        last := h.free_slots.len - 1
+        slot = h.free_slots[last]
+        $nf := []int{}
+        for i in 0:last { nf.push(h.free_slots[i]) }
+        h.free_slots = nf
+        h.items[slot] = SpatialItem2D{
+            alive: true, id: id, bounds: bounds,
+            min_cx: cr[0], min_cy: cr[1], max_cx: cr[2], max_cy: cr[3], stamp: 0
+        }
+    } else {
+        slot = h.items.len
+        h.items.push(SpatialItem2D{
+            alive: true, id: id, bounds: bounds,
+            min_cx: cr[0], min_cy: cr[1], max_cx: cr[2], max_cy: cr[3], stamp: 0
+        })
+    }
+    h.id_to_slot[id] = slot
+    h.live_count += 1
+    for cy in cr[1]:(cr[3] + 1) {
+        for cx in cr[0]:(cr[2] + 1) {
+            h.bucket_add_slot(cx, cy, slot)
+        }
+    }
+    << slot
+}
+
+pub fn (h $&SpatialHash2D) insert_circle(id int, center fm.Vec2, radius f64) int {
+    if !center.is_finite() || !fm.finite(radius) || radius <= 0.0 {
+        >> errors.new("nexus spatial: invalid 2D circle bounds")
+    }
+    box := fm.rect2(center.x - radius, center.y - radius, radius * 2.0, radius * 2.0)
+    << h.insert(id, box) or >>
+}
+
+pub fn (h $&SpatialHash2D) update(id int, bounds fm.Rect2) int {
+    if !bounds.valid() { >> errors.new("nexus spatial: 2D bounds must be valid") }
+    if !h.contains(id) { << h.insert(id, bounds) or >> }
+    slot := h.id_to_slot[id]
+    old := h.items[slot]
+    cr := h.cell_range(bounds)
+    same_cells := old.min_cx == cr[0] && old.min_cy == cr[1] && old.max_cx == cr[2] && old.max_cy == cr[3]
+    if same_cells {
+        h.items[slot].bounds = bounds
+        << slot
+    }
+    for cy in old.min_cy:(old.max_cy + 1) {
+        for cx in old.min_cx:(old.max_cx + 1) {
+            h.bucket_remove_slot(cx, cy, slot)
+        }
+    }
+    h.items[slot].bounds = bounds
+    h.items[slot].min_cx = cr[0]
+    h.items[slot].min_cy = cr[1]
+    h.items[slot].max_cx = cr[2]
+    h.items[slot].max_cy = cr[3]
+    for cy in cr[1]:(cr[3] + 1) {
+        for cx in cr[0]:(cr[2] + 1) {
+            h.bucket_add_slot(cx, cy, slot)
+        }
+    }
+    << slot
+}
+
+pub fn (h $&SpatialHash2D) remove(id int) bool {
+    if !h.contains(id) { << false }
+    slot := h.id_to_slot[id]
+    old := h.items[slot]
+    for cy in old.min_cy:(old.max_cy + 1) {
+        for cx in old.min_cx:(old.max_cx + 1) {
+            h.bucket_remove_slot(cx, cy, slot)
+        }
+    }
+    h.items[slot].alive = false
+    h.free_slots.push(slot)
+    h.live_count -= 1
+    << true
+}
+
+pub fn (h $&SpatialHash2D) query_rect(bounds fm.Rect2) []int {
+    if !bounds.valid() { >> errors.new("nexus spatial: invalid 2D query rect") }
+    h.query_stamp = h.query_stamp + 1
+    stamp := h.query_stamp
+    cr := h.cell_range(bounds)
+    $out := []int{}
+    for cy in cr[1]:(cr[3] + 1) {
+        for cx in cr[0]:(cr[2] + 1) {
+            key := cell_hash_2d(cx, cy)
+            if !h.cell_heads.has(key) { -> }
+            $bi := h.cell_heads[key]
+            while bi >= 0 {
+                if h.buckets[bi].cx == cx && h.buckets[bi].cy == cy {
+                    for slot in h.buckets[bi].slots {
+                        if h.items[slot].alive && h.items[slot].stamp != stamp {
+                            h.items[slot].stamp = stamp
+                            if bounds.overlaps(h.items[slot].bounds) {
+                                out.push(h.items[slot].id)
+                            }
+                        }
+                    }
+                    <-
+                }
+                bi = h.buckets[bi].next_bucket
+            }
+        }
+    }
+    << out
+}
+
+pub fn (h $&SpatialHash2D) query_radius(center fm.Vec2, radius f64) []int {
+    if !center.is_finite() || !fm.finite(radius) || radius < 0.0 {
+        >> errors.new("nexus spatial: invalid 2D query radius")
+    }
+    r := math.max(radius, 1e-6)
+    query := fm.rect2(center.x - r, center.y - r, r * 2.0, r * 2.0)
+    cand := h.query_rect(query) or >>
+    rsq := radius * radius
+    $out := []int{}
+    for id in cand {
+        slot := h.id_to_slot[id]
+        closest := h.items[slot].bounds.clamp_point(center)
+        if closest.distance_sq(center) <= rsq {
+            out.push(id)
+        }
+    }
+    << out
+}
+
+pub fn (h $&SpatialHash2D) nearest(point fm.Vec2, max_radius f64, max_results int) []SpatialMatch2D {
+    if !point.is_finite() || !fm.finite(max_radius) || max_radius <= 0.0 || max_results < 1 {
+        >> errors.new("nexus spatial: invalid nearest 2D query")
+    }
+    ids := h.query_radius(point, max_radius) or >>
+    $matches := []SpatialMatch2D{}
+    for id in ids {
+        slot := h.id_to_slot[id]
+        c := h.items[slot].bounds.center()
+        matches.push(SpatialMatch2D{id: id, dist_sq: c.distance_sq(point)})
+    }
+    if matches.len > 1 {
+        for i in 0:(matches.len - 1) {
+            for j in (i + 1):matches.len {
+                if matches[j].dist_sq < matches[i].dist_sq {
+                    tmp := matches[i]
+                    matches[i] = matches[j]
+                    matches[j] = tmp
+                }
+            }
+        }
+    }
+    if matches.len <= max_results { << matches }
+    $capped := []SpatialMatch2D{}
+    for i in 0:max_results { capped.push(matches[i]) }
+    << capped
+}
+
+struct SpatialItem3D {
+    alive bool
+    id int
+    bounds fm.Aabb3
+    min_cx int
+    min_cy int
+    min_cz int
+    max_cx int
+    max_cy int
+    max_cz int
+    stamp int
+}
+
+struct SpatialBucket3D {
+    alive bool
+    cx int
+    cy int
+    cz int
+    next_bucket int
+    slots []int
+}
+
+pub struct SpatialHash3D {
+    cell_size f64
+    inv_cell_size f64
+    items []SpatialItem3D
+    free_slots []int
+    id_to_slot map[int]int
+    buckets []SpatialBucket3D
+    free_buckets []int
+    cell_heads map[int]int
+    live_count int
+    query_stamp int
+}
+
+pub fn new_spatial_hash_3d(cell_size f64) SpatialHash3D {
+    if !fm.finite(cell_size) || cell_size <= 1e-6 || cell_size > 1000000.0 {
+        >> errors.new("nexus spatial: invalid 3D cell size")
+    }
+    << SpatialHash3D{
+        cell_size: cell_size,
+        inv_cell_size: 1.0 / cell_size,
+        items: []SpatialItem3D{},
+        free_slots: []int{},
+        id_to_slot: map[int]int{},
+        buckets: []SpatialBucket3D{},
+        free_buckets: []int{},
+        cell_heads: map[int]int{},
+        live_count: 0,
+        query_stamp: 1
+    }
+}
+
+fn (h &SpatialHash3D) cell_range(bounds fm.Aabb3) []int {
+    cxmin := int(math.floor(bounds.minimum.x * h.inv_cell_size))
+    cymin := int(math.floor(bounds.minimum.y * h.inv_cell_size))
+    czmin := int(math.floor(bounds.minimum.z * h.inv_cell_size))
+    cxmax := int(math.floor((bounds.maximum.x - 1e-9) * h.inv_cell_size))
+    cymax := int(math.floor((bounds.maximum.y - 1e-9) * h.inv_cell_size))
+    czmax := int(math.floor((bounds.maximum.z - 1e-9) * h.inv_cell_size))
+    $cx1 := cxmax
+    $cy1 := cymax
+    $cz1 := czmax
+    if cx1 < cxmin { cx1 = cxmin }
+    if cy1 < cymin { cy1 = cymin }
+    if cz1 < czmin { cz1 = czmin }
+    << [cxmin, cymin, czmin, cx1, cy1, cz1]
+}
+
+fn (h $&SpatialHash3D) bucket_add_slot(cx int, cy int, cz int, slot int) {
+    key := cell_hash_3d(cx, cy, cz)
+    $bi := -1
+    if h.cell_heads.has(key) { bi = h.cell_heads[key] }
+    while bi >= 0 {
+        if h.buckets[bi].cx == cx && h.buckets[bi].cy == cy && h.buckets[bi].cz == cz {
+            h.buckets[bi].slots.push(slot)
+            <<
+        }
+        bi = h.buckets[bi].next_bucket
+    }
+    $old_head := -1
+    if h.cell_heads.has(key) { old_head = h.cell_heads[key] }
+    $nb := 0
+    if h.free_buckets.len > 0 {
+        last := h.free_buckets.len - 1
+        nb = h.free_buckets[last]
+        $nf := []int{}
+        for i in 0:last { nf.push(h.free_buckets[i]) }
+        h.free_buckets = nf
+        h.buckets[nb] = SpatialBucket3D{alive: true, cx: cx, cy: cy, cz: cz, next_bucket: old_head, slots: [slot]}
+    } else {
+        nb = h.buckets.len
+        h.buckets.push(SpatialBucket3D{alive: true, cx: cx, cy: cy, cz: cz, next_bucket: old_head, slots: [slot]})
+    }
+    h.cell_heads[key] = nb
+}
+
+fn (h $&SpatialHash3D) bucket_remove_slot(cx int, cy int, cz int, slot int) {
+    key := cell_hash_3d(cx, cy, cz)
+    if !h.cell_heads.has(key) { << }
+    $prev := -1
+    $bi := h.cell_heads[key]
+    while bi >= 0 {
+        if h.buckets[bi].cx == cx && h.buckets[bi].cy == cy && h.buckets[bi].cz == cz {
+            $next_slots := []int{}
+            for s in h.buckets[bi].slots {
+                if s != slot { next_slots.push(s) }
+            }
+            is_empty := next_slots.len == 0
+            h.buckets[bi].slots = next_slots
+            if is_empty {
+                nxt := h.buckets[bi].next_bucket
+                if prev < 0 { h.cell_heads[key] = nxt } else { h.buckets[prev].next_bucket = nxt }
+                h.buckets[bi].alive = false
+                h.buckets[bi].next_bucket = -1
+                h.free_buckets.push(bi)
+            }
+            <<
+        }
+        prev = bi
+        bi = h.buckets[bi].next_bucket
+    }
+}
+
+pub fn (h &SpatialHash3D) contains(id int) bool {
+    << h.id_to_slot.has(id) && h.items[h.id_to_slot[id]].alive
+}
+
+pub fn (h &SpatialHash3D) count() int { << h.live_count }
+
+pub fn (h $&SpatialHash3D) clear() {
+    h.items = []SpatialItem3D{}
+    h.free_slots = []int{}
+    h.id_to_slot = map[int]int{}
+    h.buckets = []SpatialBucket3D{}
+    h.free_buckets = []int{}
+    h.cell_heads = map[int]int{}
+    h.live_count = 0
+}
+
+pub fn (h $&SpatialHash3D) insert(id int, bounds fm.Aabb3) int {
+    bounds.validate() or >>
+    if h.contains(id) { << h.update(id, bounds) or >> }
+    cr := h.cell_range(bounds)
+    $slot := 0
+    if h.free_slots.len > 0 {
+        last := h.free_slots.len - 1
+        slot = h.free_slots[last]
+        $nf := []int{}
+        for i in 0:last { nf.push(h.free_slots[i]) }
+        h.free_slots = nf
+        h.items[slot] = SpatialItem3D{
+            alive: true, id: id, bounds: bounds,
+            min_cx: cr[0], min_cy: cr[1], min_cz: cr[2],
+            max_cx: cr[3], max_cy: cr[4], max_cz: cr[5], stamp: 0
+        }
+    } else {
+        slot = h.items.len
+        h.items.push(SpatialItem3D{
+            alive: true, id: id, bounds: bounds,
+            min_cx: cr[0], min_cy: cr[1], min_cz: cr[2],
+            max_cx: cr[3], max_cy: cr[4], max_cz: cr[5], stamp: 0
+        })
+    }
+    h.id_to_slot[id] = slot
+    h.live_count += 1
+    for cz in cr[2]:(cr[5] + 1) {
+        for cy in cr[1]:(cr[4] + 1) {
+            for cx in cr[0]:(cr[3] + 1) {
+                h.bucket_add_slot(cx, cy, cz, slot)
+            }
+        }
+    }
+    << slot
+}
+
+pub fn (h $&SpatialHash3D) insert_sphere(id int, center fm.Vec3, radius f64) int {
+    if !center.is_finite() || !fm.finite(radius) || radius < 0.0 {
+        >> errors.new("nexus spatial: invalid 3D sphere bounds")
+    }
+    d := fm.vec3(radius, radius, radius)
+    box := fm.aabb3(center.sub(d), center.add(d)) or >>
+    << h.insert(id, box) or >>
+}
+
+pub fn (h $&SpatialHash3D) update(id int, bounds fm.Aabb3) int {
+    bounds.validate() or >>
+    if !h.contains(id) { << h.insert(id, bounds) or >> }
+    slot := h.id_to_slot[id]
+    old := h.items[slot]
+    cr := h.cell_range(bounds)
+    same_cells := old.min_cx == cr[0] && old.min_cy == cr[1] && old.min_cz == cr[2] &&
+                  old.max_cx == cr[3] && old.max_cy == cr[4] && old.max_cz == cr[5]
+    if same_cells {
+        h.items[slot].bounds = bounds
+        << slot
+    }
+    for cz in old.min_cz:(old.max_cz + 1) {
+        for cy in old.min_cy:(old.max_cy + 1) {
+            for cx in old.min_cx:(old.max_cx + 1) {
+                h.bucket_remove_slot(cx, cy, cz, slot)
+            }
+        }
+    }
+    h.items[slot].bounds = bounds
+    h.items[slot].min_cx = cr[0]
+    h.items[slot].min_cy = cr[1]
+    h.items[slot].min_cz = cr[2]
+    h.items[slot].max_cx = cr[3]
+    h.items[slot].max_cy = cr[4]
+    h.items[slot].max_cz = cr[5]
+    for cz in cr[2]:(cr[5] + 1) {
+        for cy in cr[1]:(cr[4] + 1) {
+            for cx in cr[0]:(cr[3] + 1) {
+                h.bucket_add_slot(cx, cy, cz, slot)
+            }
+        }
+    }
+    << slot
+}
+
+pub fn (h $&SpatialHash3D) remove(id int) bool {
+    if !h.contains(id) { << false }
+    slot := h.id_to_slot[id]
+    old := h.items[slot]
+    for cz in old.min_cz:(old.max_cz + 1) {
+        for cy in old.min_cy:(old.max_cy + 1) {
+            for cx in old.min_cx:(old.max_cx + 1) {
+                h.bucket_remove_slot(cx, cy, cz, slot)
+            }
+        }
+    }
+    h.items[slot].alive = false
+    h.free_slots.push(slot)
+    h.live_count -= 1
+    << true
+}
+
+pub fn (h $&SpatialHash3D) query_aabb(box fm.Aabb3) []int {
+    box.validate() or >>
+    h.query_stamp = h.query_stamp + 1
+    stamp := h.query_stamp
+    cr := h.cell_range(box)
+    $out := []int{}
+    for cz in cr[2]:(cr[5] + 1) {
+        for cy in cr[1]:(cr[4] + 1) {
+            for cx in cr[0]:(cr[3] + 1) {
+                key := cell_hash_3d(cx, cy, cz)
+                if !h.cell_heads.has(key) { -> }
+                $bi := h.cell_heads[key]
+                while bi >= 0 {
+                    if h.buckets[bi].cx == cx && h.buckets[bi].cy == cy && h.buckets[bi].cz == cz {
+                        for slot in h.buckets[bi].slots {
+                            if h.items[slot].alive && h.items[slot].stamp != stamp {
+                                h.items[slot].stamp = stamp
+                                if box.overlaps(h.items[slot].bounds) {
+                                    out.push(h.items[slot].id)
+                                }
+                            }
+                        }
+                        <-
+                    }
+                    bi = h.buckets[bi].next_bucket
+                }
+            }
+        }
+    }
+    << out
+}
+
+pub fn (h $&SpatialHash3D) query_sphere(center fm.Vec3, radius f64) []int {
+    if !center.is_finite() || !fm.finite(radius) || radius < 0.0 {
+        >> errors.new("nexus spatial: invalid 3D query sphere")
+    }
+    d := fm.vec3(radius, radius, radius)
+    box := fm.aabb3(center.sub(d), center.add(d)) or >>
+    cand := h.query_aabb(box) or >>
+    rsq := radius * radius
+    $out := []int{}
+    for id in cand {
+        slot := h.id_to_slot[id]
+        dsq := h.items[slot].bounds.distance_squared(center) or >>
+        if dsq <= rsq {
+            out.push(id)
+        }
+    }
+    << out
+}
+
+pub fn (h $&SpatialHash3D) nearest(point fm.Vec3, max_radius f64, max_results int) []SpatialMatch3D {
+    if !point.is_finite() || !fm.finite(max_radius) || max_radius <= 0.0 || max_results < 1 {
+        >> errors.new("nexus spatial: invalid nearest 3D query")
+    }
+    ids := h.query_sphere(point, max_radius) or >>
+    $matches := []SpatialMatch3D{}
+    for id in ids {
+        slot := h.id_to_slot[id]
+        c := h.items[slot].bounds.center() or >>
+        matches.push(SpatialMatch3D{id: id, dist_sq: c.distance_sq(point)})
+    }
+    if matches.len > 1 {
+        for i in 0:(matches.len - 1) {
+            for j in (i + 1):matches.len {
+                if matches[j].dist_sq < matches[i].dist_sq {
+                    tmp := matches[i]
+                    matches[i] = matches[j]
+                    matches[j] = tmp
+                }
+            }
+        }
+    }
+    if matches.len <= max_results { << matches }
+    $capped := []SpatialMatch3D{}
+    for i in 0:max_results { capped.push(matches[i]) }
+    << capped
+}

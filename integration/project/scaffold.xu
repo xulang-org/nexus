@@ -1,0 +1,258 @@
+@"github.com/xulang-org/nexus/integration/project"
+
+rp #"github.com/xulang-org/nexus/resources/project"
+rs #"github.com/xulang-org/nexus/resources/steam"
+rc #"github.com/xulang-org/nexus/resources/console"
+rt #"github.com/xulang-org/nexus/resources/taptap"
+resource #"github.com/xulang-org/nexus/resources/scene"
+scene_fmt #"github.com/xulang-org/nexus/formats/scene"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#errors
+#os
+#path/filepath
+#strings
+
+pub struct InitOptions {
+    pub dir string
+    pub name string
+    pub id string
+    pub module_name string
+    pub template string
+    pub default_locale string
+    pub nexus_path string
+    pub platforms []string
+    pub force bool
+}
+
+pub struct InitResult {
+    pub project_dir string
+    pub project_json string
+    pub dirs_created int
+    pub files_created []string
+}
+
+fn write_project_file(root_dir &string, rel_path string, content &string, created $&[]string) int {
+    rel := relative_file(&rel_path) or >>
+    dest := filepath.join([*root_dir, rel + ""])
+    ensure_parent_dir(&dest) or >>
+    snapshot.write_atomic(dest + "", content) or >>
+    created.push(rel)
+    << 0
+}
+
+fn build_starter_scene_raw(template &string) string {
+    $nodes := []resource.NodeData{}
+    if *template == rp.TEMPLATE_2D {
+        nodes.push(resource.node(-1, "World", resource.NODE_2D))
+        nodes.push(resource.node(0, "MainCamera", resource.NODE_2D))
+        nodes.push(resource.node(0, "PlayerSpawn", resource.NODE_2D))
+        nodes.push(resource.node(0, "WorldTiles", resource.NODE_2D))
+    } else if *template == rp.TEMPLATE_25D {
+        nodes.push(resource.node(-1, "World", resource.NODE_3D))
+        nodes.push(resource.node(0, "MainCamera", resource.NODE_3D))
+        nodes.push(resource.node(0, "Stage", resource.NODE_3D))
+        nodes.push(resource.node(0, "PlayerSpawn", resource.NODE_3D))
+    } else if *template == rp.TEMPLATE_BLANK {
+        nodes.push(resource.node(-1, "World", resource.NODE_3D))
+    } else {
+        nodes.push(resource.node(-1, "World", resource.NODE_3D))
+        nodes.push(resource.node(0, "MainCamera", resource.NODE_3D))
+        nodes.push(resource.node(0, "PlayerSpawn", resource.NODE_3D))
+        nodes.push(resource.node(0, "SunLight", resource.NODE_3D))
+    }
+    doc := resource.make_document(nodes) or >>
+    << scene_fmt.encode(&doc) or >>
+}
+
+fn resolve_nexus_dep(project_abs_dir &string, nexus_path &string) string {
+    raw := strings.trim_space(nexus_path)
+    if raw.len == 0 {
+        << "file:../nexus"
+    }
+    abs_nx := filepath.abs(&raw) or >>
+    abs_slashed := filepath.to_slash(&abs_nx)
+    if filepath.is_abs(&raw) {
+        << "file:" + abs_slashed
+    }
+    rel := filepath.rel(project_abs_dir, &abs_nx) or (err) {
+        _ := err.msg()
+        << "file:" + abs_slashed
+    }
+    slashed := filepath.to_slash(&rel)
+    if strings.has_prefix(&slashed, "../../..") {
+        << "file:" + abs_slashed
+    }
+    << "file:" + slashed
+}
+
+pub fn init_project(opts &InitOptions) InitResult {
+    raw_dir := strings.trim_space(&opts.dir)
+    if raw_dir.len == 0 {
+        >> errors.new("nexus project: target directory is required")
+    }
+    os.mkdir_all(raw_dir + "") or >>
+    abs_dir := filepath.abs(&raw_dir) or >>
+    clean_dir := filepath.clean(&abs_dir)
+
+    name := rp.validate_project_name(&opts.name) or >>
+    $tmpl_in := opts.template + ""
+    if strings.trim_space(&tmpl_in).len == 0 { tmpl_in = rp.TEMPLATE_3D }
+    tmpl := rp.validate_template(&tmpl_in) or >>
+    $loc_in := strings.trim_space(&opts.default_locale)
+    if loc_in.len == 0 { loc_in = "en-US" }
+    $id_in := strings.trim_space(&opts.id)
+    if id_in.len == 0 { id_in = rp.default_project_id(&name) }
+    _ := rp.validate_project_id(&id_in) or >>
+
+    slug := rp.slugify_identifier(&name)
+    $mod_name := strings.trim_space(&opts.module_name)
+    if mod_name.len == 0 {
+        mod_name = "game/" + slug
+    }
+
+    proj_json_path := filepath.join([clean_dir + "", "project.json"])
+    if path_exists(proj_json_path + "") && !opts.force {
+        >> errors.new("nexus project: project.json already exists in " + clean_dir + " (pass --force to overwrite)")
+    }
+
+    $plats_list := []string{}
+    for i in 0:opts.platforms.len {
+        plats_list.push(opts.platforms[i] + "")
+    }
+    plat_cfgs := rp.platform_configs_for_list(&plats_list)
+    meta := rp.default_meta(name + "", id_in + "", tmpl + "", loc_in + "")
+    paths := rp.default_paths()
+    rp.validate_meta(&meta) or >>
+    rp.validate_paths(&paths) or >>
+    rp.validate_platform_configs(&plat_cfgs) or >>
+
+    std_dirs := rp.standard_directories()
+    for i in 0:std_dirs.len {
+        d := filepath.join([clean_dir + "", std_dirs[i] + ""])
+        os.mkdir_all(d + "") or >>
+    }
+
+    $created := []string{}
+    keep_dirs := [
+        "prefabs",
+        "assets/models",
+        "assets/textures",
+        "assets/audio",
+        "assets/animations",
+        "assets/shaders",
+        "scripts",
+        "platforms/mobile",
+        "platforms/miniprogram",
+        "tests"
+    ]
+    keep_content := ""
+    for i in 0:keep_dirs.len {
+        write_project_file(&clean_dir, keep_dirs[i] + "/.gitkeep", &keep_content, $&created) or >>
+    }
+
+    // Scene manifest & starter scene
+    scene_raw := build_starter_scene_raw(&tmpl) or >>
+    write_project_file(&clean_dir, "scenes/main.xuscene", &scene_raw, $&created) or >>
+
+    // Localization & config files
+    i18n_raw := rp.generate_default_i18n_catalog_json(&meta)
+    write_project_file(&clean_dir, "locales/strings.json", &i18n_raw, $&created) or >>
+    input_raw := rp.generate_default_input_bindings_json(&tmpl)
+    write_project_file(&clean_dir, "config/input_bindings.json", &input_raw, $&created) or >>
+    budget_raw := rp.generate_default_perf_budgets_json(&tmpl)
+    write_project_file(&clean_dir, "config/perf_budgets.json", &budget_raw, $&created) or >>
+    mapping_raw := rp.generate_default_platform_mapping_json()
+    write_project_file(&clean_dir, "config/platform_mapping.json", &mapping_raw, $&created) or >>
+
+    // Optional platform store configs
+    if plat_cfgs.steam.len > 0 {
+        $sc := rs.default_config(480, 481)
+        sc.achievement_ids = ["ACH_FIRST_WIN"]
+        sc.dlc_ids = [480010]
+        s_raw := rs.encode_config_json(&sc) or >>
+        write_project_file(&clean_dir, plat_cfgs.steam + "", &s_raw, $&created) or >>
+    }
+    if plat_cfgs.xbox.len > 0 {
+        $xc := rc.default_xbox_config()
+        xc.display_name = name + ""
+        xc.executable = slug + ".exe"
+        xc.achievement_ids = ["1"]
+        xc.dlc_store_ids = ["9NX0DLC00001"]
+        x_raw := rc.encode_xbox_config_json(&xc) or >>
+        write_project_file(&clean_dir, plat_cfgs.xbox + "", &x_raw, $&created) or >>
+    }
+    if plat_cfgs.playstation.len > 0 {
+        $pc := rc.default_ps_config()
+        pc.display_name = name + ""
+        pc.trophies = [
+            rc.PsTrophyDef{
+                trophy_id: 0,
+                grade: rc.TROPHY_BRONZE,
+                name: "First Win",
+                is_progress: false,
+                target_value: 0,
+                hidden: false
+            }
+        ]
+        pc.entitlement_labels = ["DLC001"]
+        p_raw := rc.encode_ps_config_json(&pc) or >>
+        write_project_file(&clean_dir, plat_cfgs.playstation + "", &p_raw, $&created) or >>
+    }
+    if plat_cfgs.switch_cfg.len > 0 {
+        $nc := rc.default_switch_config()
+        nc.display_name = name + ""
+        nc.aoc_indices = [1]
+        n_raw := rc.encode_switch_config_json(&nc) or >>
+        write_project_file(&clean_dir, plat_cfgs.switch_cfg + "", &n_raw, $&created) or >>
+    }
+    if plat_cfgs.taptap.len > 0 {
+        $tc := rt.default_config("demo_client_id", "demo_client_token", rt.REGION_CN)
+        tc.package_name = id_in + ""
+        tc.app_name = name + ""
+        tc.achievement_ids = ["tap_first_win"]
+        tc.dlc_ids = ["tap_dlc_01"]
+        t_raw := rt.encode_config_json(&tc) or >>
+        write_project_file(&clean_dir, plat_cfgs.taptap + "", &t_raw, $&created) or >>
+    }
+
+    // Module manifest, source entrypoint, gitignore & readme
+    nx_dep := resolve_nexus_dep(&clean_dir, &opts.nexus_path) or >>
+    xun_raw := rp.generate_xu_xun(&mod_name, &nx_dep, &rp.DEFAULT_XU_VERSION)
+    write_project_file(&clean_dir, "xu.xun", &xun_raw, $&created) or >>
+    gi_raw := rp.generate_gitignore()
+    write_project_file(&clean_dir, ".gitignore", &gi_raw, $&created) or >>
+    rm_raw := rp.generate_readme(&meta, &mod_name, &plat_cfgs)
+    write_project_file(&clean_dir, "README.md", &rm_raw, $&created) or >>
+    cfg_xu := rp.generate_game_config_xu(&mod_name, &meta)
+    write_project_file(&clean_dir, "src/game/config.xu", &cfg_xu, $&created) or >>
+    main_xu := rp.generate_main_xu(&mod_name, &meta)
+    write_project_file(&clean_dir, "src/main.xu", &main_xu, $&created) or >>
+
+    // Project manifest
+    entry_resolved := filepath.join([clean_dir + "", "scenes", "main.xuscene"])
+    $proj := Project{
+        path: proj_json_path + "",
+        directory: clean_dir + "",
+        scenes: [Entry{key: "main.xuscene", path: "scenes/main.xuscene", resolved: entry_resolved}],
+        assets: []Entry{},
+        has_meta: true,
+        meta: meta,
+        has_paths: true,
+        paths: paths,
+        has_platforms: plat_cfgs.steam.len > 0 || plat_cfgs.xbox.len > 0 || plat_cfgs.playstation.len > 0 ||
+            plat_cfgs.switch_cfg.len > 0 || plat_cfgs.taptap.len > 0,
+        platforms: plat_cfgs
+    }
+    save_project_manifest(&proj) or >>
+    created.push("project.json")
+
+    // Verify self-consistency via standard loader.
+    _ := load_project(proj_json_path + "") or >>
+
+    << InitResult{
+        project_dir: clean_dir,
+        project_json: proj_json_path,
+        dirs_created: std_dirs.len,
+        files_created: created
+    }
+}

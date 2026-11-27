@@ -1,0 +1,538 @@
+@"github.com/xulang-org/nexus/ecs"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const SYS_INTEGRATE_VELOCITY = 1
+pub const SYS_UPDATE_MATRICES_BOUNDS = 2
+pub const SYS_STEP_PARTICLES = 3
+pub const SYS_AUDIO_ATTENUATION = 4
+pub const SYS_HEALTH_REGEN = 5
+
+pub struct SystemSpec {
+    pub name string
+    pub kind int
+    pub required_mask int
+    pub read_mask int
+    pub write_mask int
+}
+
+pub struct ScheduleStage {
+    pub system_indices []int
+    pub shared_read_mask int
+}
+
+pub struct EcsSchedule {
+    pub systems []SystemSpec
+    pub stages []ScheduleStage
+}
+
+pub struct FrameContext {
+    pub dt f64
+    pub listener fm.Vec3
+    pub workers int
+}
+
+pub fn sys_integrate_velocity() SystemSpec {
+    << SystemSpec{
+        name: "IntegrateVelocity",
+        kind: SYS_INTEGRATE_VELOCITY,
+        required_mask: COMP_TRANSFORM | COMP_VELOCITY,
+        read_mask: COMP_VELOCITY,
+        write_mask: COMP_TRANSFORM
+    }
+}
+
+pub fn sys_update_bounds() SystemSpec {
+    << SystemSpec{
+        name: "UpdateBounds",
+        kind: SYS_UPDATE_MATRICES_BOUNDS,
+        required_mask: COMP_TRANSFORM | COMP_BOUNDS,
+        read_mask: COMP_TRANSFORM,
+        write_mask: COMP_BOUNDS
+    }
+}
+
+pub fn sys_step_particles() SystemSpec {
+    << SystemSpec{
+        name: "StepParticles",
+        kind: SYS_STEP_PARTICLES,
+        required_mask: COMP_PARTICLE,
+        read_mask: 0,
+        write_mask: COMP_PARTICLE
+    }
+}
+
+pub fn sys_audio_attenuation() SystemSpec {
+    << SystemSpec{
+        name: "AudioAttenuation",
+        kind: SYS_AUDIO_ATTENUATION,
+        required_mask: COMP_TRANSFORM | COMP_AUDIO,
+        read_mask: COMP_TRANSFORM,
+        write_mask: COMP_AUDIO
+    }
+}
+
+pub fn sys_health_regen() SystemSpec {
+    << SystemSpec{
+        name: "HealthRegen",
+        kind: SYS_HEALTH_REGEN,
+        required_mask: COMP_HEALTH,
+        read_mask: 0,
+        write_mask: COMP_HEALTH
+    }
+}
+
+pub fn systems_conflict(a &SystemSpec, b &SystemSpec) bool {
+    aw_conflict := (a.write_mask & (b.read_mask | b.write_mask)) != 0
+    bw_conflict := (b.write_mask & (a.read_mask | a.write_mask)) != 0
+    << aw_conflict || bw_conflict
+}
+
+// Compiles declared systems into conflict-free parallel stages via greedy wave grouping
+// preserving program order across any conflicting read/write dependencies.
+pub fn compile_schedule(systems &[]SystemSpec) EcsSchedule {
+    if systems.len == 0 {
+        << EcsSchedule{systems: []SystemSpec{}, stages: []ScheduleStage{}}
+    }
+    $copied := []SystemSpec{}
+    for i in 0:systems.len {
+        s := &systems[i]
+        if s.kind < SYS_INTEGRATE_VELOCITY || s.kind > SYS_HEALTH_REGEN {
+            >> errors.new("nexus ecs: unknown system kind")
+        }
+        copied.push(SystemSpec{
+            name: s.name + "",
+            kind: s.kind,
+            required_mask: s.required_mask,
+            read_mask: s.read_mask,
+            write_mask: s.write_mask
+        })
+    }
+
+    $assigned := []bool{}
+    for _ in 0:copied.len { assigned.push(false) }
+    $stages := []ScheduleStage{}
+    $remaining := copied.len
+    while remaining > 0 {
+        $stage_sys := []int{}
+        $blocked_read := 0
+        $blocked_write := 0
+        $shared_r := 0
+        $seen_r := 0
+        for i in 0:copied.len {
+            if assigned[i] { -> }
+            sys := &copied[i]
+            // Earlier unassigned system i blocks later systems that conflict with i.
+            can_place := (sys.write_mask & (blocked_read | blocked_write)) == 0 &&
+                         (sys.read_mask & blocked_write) == 0
+            if can_place {
+                $ok_with_stage := true
+                for si in stage_sys {
+                    other := &copied[si]
+                    if systems_conflict(sys, other) { ok_with_stage = false }
+                }
+                if ok_with_stage {
+                    stage_sys.push(i)
+                    assigned[i] = true
+                    remaining -= 1
+                    overlap := seen_r & sys.read_mask
+                    shared_r = shared_r | overlap
+                    seen_r = seen_r | sys.read_mask
+                }
+            }
+            if !assigned[i] {
+                blocked_read = blocked_read | sys.read_mask
+                blocked_write = blocked_write | sys.write_mask
+            }
+        }
+        stages.push(ScheduleStage{system_indices: stage_sys, shared_read_mask: shared_r})
+    }
+    << EcsSchedule{systems: copied, stages: stages}
+}
+
+fn kernel_integrate_velocity(positions $&[]fm.Vec3, scales &[]fm.Vec3, world_mats $&[]fm.Mat4, lin &[]fm.Vec3, dt f64) {
+    for r in 0:positions.len {
+        np := positions[r].add(lin[r].scaled(dt))
+        positions[r] = np
+        sc := scales[r]
+        world_mats[r] = fm.Mat4{
+            c0: fm.vec4(sc.x, 0.0, 0.0, 0.0),
+            c1: fm.vec4(0.0, sc.y, 0.0, 0.0),
+            c2: fm.vec4(0.0, 0.0, sc.z, 0.0),
+            c3: fm.vec4(np.x, np.y, np.z, 1.0)
+        }
+    }
+}
+
+fn kernel_update_bounds(positions &[]fm.Vec3, scales &[]fm.Vec3, local &[]fm.Aabb3, world $&[]fm.Aabb3) {
+    for r in 0:local.len {
+        p := positions[r]
+        sc := scales[r]
+        lb := local[r]
+        hx := (lb.maximum.x - lb.minimum.x) * 0.5 * math.abs(sc.x)
+        hy := (lb.maximum.y - lb.minimum.y) * 0.5 * math.abs(sc.y)
+        hz := (lb.maximum.z - lb.minimum.z) * 0.5 * math.abs(sc.z)
+        cx := p.x + (lb.maximum.x + lb.minimum.x) * 0.5 * sc.x
+        cy := p.y + (lb.maximum.y + lb.minimum.y) * 0.5 * sc.y
+        cz := p.z + (lb.maximum.z + lb.minimum.z) * 0.5 * sc.z
+        world[r] = fm.Aabb3{
+            minimum: fm.vec3(cx - hx, cy - hy, cz - hz),
+            maximum: fm.vec3(cx + hx, cy + hy, cz + hz)
+        }
+    }
+}
+
+fn kernel_step_particles(pc $&ParticleCol, dt f64) {
+    for r in 0:pc.age.len {
+        if !pc.alive[r] { -> }
+        na := pc.age[r] + dt
+        pc.age[r] = na
+        if na >= pc.lifetime[r] {
+            pc.alive[r] = false
+        }
+    }
+}
+
+fn kernel_audio_attenuation(positions &[]fm.Vec3, ac $&AudioCol, listener fm.Vec3) {
+    for r in 0:ac.gain.len {
+        dist := positions[r].sub(listener).length()
+        md := ac.max_dist[r]
+        if dist >= md {
+            ac.attenuated[r] = 0.0
+        } else {
+            f := 1.0 - dist / md
+            ac.attenuated[r] = ac.gain[r] * f * f
+        }
+    }
+}
+
+fn kernel_health_regen(hc $&HealthCol, dt f64) {
+    for r in 0:hc.hp.len {
+        if !hc.alive[r] { -> }
+        nh := math.min(hc.max_hp[r], hc.hp[r] + hc.regen[r] * dt)
+        hc.hp[r] = nh
+    }
+}
+
+// Executes an ordered slice of systems for a single chunk with zero Vec3 cloning.
+// Fetches each touched component channel at most once across all systems in the batch.
+fn run_chunk_stage_systems(
+    chunk_mask int,
+    kinds &[]int,
+    req_masks &[]int,
+    chk &EcsChunk,
+    dt f64,
+    listener fm.Vec3
+) int {
+    $run_vel := false
+    $run_bounds := false
+    $run_particles := false
+    $run_audio := false
+    $run_health := false
+    for i in 0:kinds.len {
+        if (chunk_mask & req_masks[i]) != req_masks[i] { -> }
+        k := kinds[i]
+        if k == SYS_INTEGRATE_VELOCITY { run_vel = true
+        } else if k == SYS_UPDATE_MATRICES_BOUNDS { run_bounds = true
+        } else if k == SYS_STEP_PARTICLES { run_particles = true
+        } else if k == SYS_AUDIO_ATTENUATION { run_audio = true
+        } else if k == SYS_HEALTH_REGEN { run_health = true }
+    }
+    $did_any := false
+    if run_vel || run_bounds || run_audio {
+        $tc := <-chk.transforms
+        if run_vel {
+            vc := <-chk.velocities
+            kernel_integrate_velocity($&tc.positions, &tc.scales, $&tc.world_mats, &vc.lin, dt)
+            chk.velocities <- vc
+            did_any = true
+        }
+        if run_bounds {
+            $bc := <-chk.bounds
+            kernel_update_bounds(&tc.positions, &tc.scales, &bc.local, $&bc.world)
+            chk.bounds <- bc
+            did_any = true
+        }
+        if run_audio {
+            $ac := <-chk.audios
+            kernel_audio_attenuation(&tc.positions, $&ac, listener)
+            chk.audios <- ac
+            did_any = true
+        }
+        chk.transforms <- tc
+    }
+    if run_particles {
+        $pc := <-chk.particles
+        kernel_step_particles($&pc, dt)
+        chk.particles <- pc
+        did_any = true
+    }
+    if run_health {
+        $hc := <-chk.healths
+        kernel_health_regen($&hc, dt)
+        chk.healths <- hc
+        did_any = true
+    }
+    if did_any { << 1 }
+    << 0
+}
+
+struct WorkerJob {
+    quit bool
+    kinds []int
+    req_masks []int
+    chunk_masks []int
+    chunks []EcsChunk
+    dt f64
+    listener fm.Vec3
+}
+
+struct WorkerSlot {
+    jobs chan WorkerJob
+    done chan int
+}
+
+// Persistent Xu coroutine worker pool for zero-spawn, zero-clone chunk-level ECS execution.
+pub struct EcsWorkerPool {
+    slots []WorkerSlot
+    workers int
+    closed bool
+}
+
+fn persistent_worker_loop(jobs chan WorkerJob, done chan int) {
+    while true {
+        job := <-jobs
+        if job.quit {
+            done <- 0
+            <<
+        }
+        $n := 0
+        for i in 0:job.chunks.len {
+            chk := &job.chunks[i]
+            _ := run_chunk_stage_systems(job.chunk_masks[i], &job.kinds, &job.req_masks, chk, job.dt, job.listener)
+            meta := <-chk.meta
+            n += meta.count
+            chk.meta <- meta
+        }
+        done <- n
+    }
+}
+
+pub fn new_worker_pool(workers int) EcsWorkerPool {
+    if workers < 1 || workers > 16 {
+        >> errors.new("nexus ecs: invalid worker pool size (1..16)")
+    }
+    $slots := []WorkerSlot{}
+    for _ in 0:workers {
+        jch := chan WorkerJob{cap: 4}
+        dch := chan int{cap: 4}
+        xu persistent_worker_loop(jch, dch)
+        slots.push(WorkerSlot{jobs: jch, done: dch})
+    }
+    << EcsWorkerPool{slots: slots, workers: workers, closed: false}
+}
+
+pub fn (pool $&EcsWorkerPool) close() int {
+    if pool.closed { << 0 }
+    for i in 0:pool.slots.len {
+        sl := &pool.slots[i]
+        sl.jobs <- WorkerJob{
+            quit: true,
+            kinds: []int{},
+            req_masks: []int{},
+            chunk_masks: []int{},
+            chunks: []EcsChunk{},
+            dt: 0.0,
+            listener: fm.vec3(0.0, 0.0, 0.0)
+        }
+    }
+    for i in 0:pool.slots.len {
+        sl := &pool.slots[i]
+        _ := <-sl.done
+    }
+    pool.slots = []WorkerSlot{}
+    pool.closed = true
+    << 0
+}
+
+fn (pool $&EcsWorkerPool) drop() {
+    pool.close() or (err) { << }
+}
+
+fn clone_ints(src &[]int) []int {
+    $out := []int{}
+    for v in src { out.push(v) }
+    << out
+}
+
+pub fn execute_sequential(world &EcsWorld, schedule &EcsSchedule, ctx FrameContext) int {
+    if !fm.finite(ctx.dt) || ctx.dt < 0.0 || !ctx.listener.is_finite() {
+        >> errors.new("nexus ecs: invalid FrameContext")
+    }
+    $processed := 0
+    for st_i in 0:schedule.stages.len {
+        st := &schedule.stages[st_i]
+        $kinds := []int{}
+        $req_masks := []int{}
+        for s_i in st.system_indices {
+            sys := &schedule.systems[s_i]
+            kinds.push(sys.kind)
+            req_masks.push(sys.required_mask)
+        }
+        for ai in 0:world.archetypes.len {
+            arch := &world.archetypes[ai]
+            for ci in 0:arch.chunks.len {
+                chk := &arch.chunks[ci]
+                ran := run_chunk_stage_systems(arch.mask, &kinds, &req_masks, chk, ctx.dt, ctx.listener)
+                if ran > 0 {
+                    meta := <-chk.meta
+                    processed += meta.count
+                    chk.meta <- meta
+                }
+            }
+        }
+    }
+    << processed
+}
+
+// Persistent-pool chunk-fused parallel execution across disjoint-ownership Xu coroutines.
+pub fn execute_with_pool(
+    pool &EcsWorkerPool,
+    world &EcsWorld,
+    schedule &EcsSchedule,
+    ctx FrameContext
+) int {
+    if pool.closed { >> errors.new("nexus ecs: worker pool is closed") }
+    if !fm.finite(ctx.dt) || ctx.dt < 0.0 || !ctx.listener.is_finite() {
+        >> errors.new("nexus ecs: invalid FrameContext")
+    }
+    $processed := 0
+    $all_chunks := []EcsChunk{}
+    $all_masks := []int{}
+    for ai in 0:world.archetypes.len {
+        arch := &world.archetypes[ai]
+        for ci in 0:arch.chunks.len {
+            all_chunks.push(arch.chunks[ci])
+            all_masks.push(arch.mask)
+        }
+    }
+    if all_chunks.len == 0 { << 0 }
+
+    // Single flattened ordered pipeline across stages: per-chunk execution guarantees
+    // strict stage-0 -> stage-1 order inside every independent chunk while keeping
+    // transformed columns hot in L1/L2 cache with zero intermediate barriers or Vec3 copies!
+    $all_kinds := []int{}
+    $all_req := []int{}
+    for st_i in 0:schedule.stages.len {
+        st := &schedule.stages[st_i]
+        for s_i in st.system_indices {
+            sys := &schedule.systems[s_i]
+            all_kinds.push(sys.kind)
+            all_req.push(sys.required_mask)
+        }
+    }
+    if all_kinds.len == 0 { << 0 }
+
+    $n_shards := pool.workers
+    if all_chunks.len < n_shards { n_shards = all_chunks.len }
+    if n_shards <= 0 { << 0 }
+    for sh in 0:n_shards {
+        start := (all_chunks.len * sh) / n_shards
+        end := (all_chunks.len * (sh + 1)) / n_shards
+        $sub_chunks := []EcsChunk{}
+        $sub_masks := []int{}
+        for idx in start:end {
+            sub_chunks.push(all_chunks[idx])
+            sub_masks.push(all_masks[idx])
+        }
+        sl := &pool.slots[sh]
+        sl.jobs <- WorkerJob{
+            quit: false,
+            kinds: clone_ints(&all_kinds),
+            req_masks: clone_ints(&all_req),
+            chunk_masks: sub_masks,
+            chunks: sub_chunks,
+            dt: ctx.dt,
+            listener: ctx.listener
+        }
+    }
+    for sh in 0:n_shards {
+        sl := &pool.slots[sh]
+        processed += <-sl.done
+    }
+    << processed
+}
+
+fn ad_hoc_worker(job WorkerJob, done chan int) {
+    $n := 0
+    for i in 0:job.chunks.len {
+        chk := &job.chunks[i]
+        ran := run_chunk_stage_systems(job.chunk_masks[i], &job.kinds, &job.req_masks, chk, job.dt, job.listener)
+        if ran > 0 {
+            meta := <-chk.meta
+            n += meta.count
+            chk.meta <- meta
+        }
+    }
+    done <- n
+}
+
+// One-shot parallel execution across up to ctx.workers concurrent Xu coroutines.
+pub fn execute_parallel(world &EcsWorld, schedule &EcsSchedule, ctx FrameContext) int {
+    if !fm.finite(ctx.dt) || ctx.dt < 0.0 || !ctx.listener.is_finite() || ctx.workers < 1 || ctx.workers > 16 {
+        >> errors.new("nexus ecs: invalid FrameContext or workers count (1..16)")
+    }
+    $all_chunks := []EcsChunk{}
+    $all_masks := []int{}
+    for ai in 0:world.archetypes.len {
+        arch := &world.archetypes[ai]
+        for ci in 0:arch.chunks.len {
+            all_chunks.push(arch.chunks[ci])
+            all_masks.push(arch.mask)
+        }
+    }
+    if all_chunks.len == 0 { << 0 }
+
+    $all_kinds := []int{}
+    $all_req := []int{}
+    for st_i in 0:schedule.stages.len {
+        st := &schedule.stages[st_i]
+        for s_i in st.system_indices {
+            sys := &schedule.systems[s_i]
+            all_kinds.push(sys.kind)
+            all_req.push(sys.required_mask)
+        }
+    }
+    if all_kinds.len == 0 { << 0 }
+
+    $done := chan int{cap: 16}
+    $n_shards := ctx.workers
+    if all_chunks.len < n_shards { n_shards = all_chunks.len }
+    if n_shards <= 0 { << 0 }
+    for sh in 0:n_shards {
+        start := (all_chunks.len * sh) / n_shards
+        end := (all_chunks.len * (sh + 1)) / n_shards
+        $sub_chunks := []EcsChunk{}
+        $sub_masks := []int{}
+        for idx in start:end {
+            sub_chunks.push(all_chunks[idx])
+            sub_masks.push(all_masks[idx])
+        }
+        xu ad_hoc_worker(WorkerJob{
+            quit: false,
+            kinds: clone_ints(&all_kinds),
+            req_masks: clone_ints(&all_req),
+            chunk_masks: sub_masks,
+            chunks: sub_chunks,
+            dt: ctx.dt,
+            listener: ctx.listener
+        }, done)
+    }
+    $processed := 0
+    for _ in 0:n_shards {
+        processed += <-done
+    }
+    << processed
+}

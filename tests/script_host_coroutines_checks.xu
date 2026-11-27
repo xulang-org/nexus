@@ -1,0 +1,282 @@
+@main
+
+#errors
+#math
+fm #"github.com/xulang-org/nexus/foundation/math"
+nexus #"github.com/xulang-org/nexus/scene"
+inp #"github.com/xulang-org/nexus/input"
+phys #"github.com/xulang-org/nexus/physics3d"
+pcm #"github.com/xulang-org/nexus/resources/audio"
+mixer #"github.com/xulang-org/nexus/audio/mixer"
+nav #"github.com/xulang-org/nexus/navigation"
+vfx #"github.com/xulang-org/nexus/vfx"
+bc #"github.com/xulang-org/nexus/script/bytecode"
+sc #"github.com/xulang-org/nexus/script/compiler"
+vm #"github.com/xulang-org/nexus/script/vm"
+host #"github.com/xulang-org/nexus/script/host"
+rt #"github.com/xulang-org/nexus/integration/script_runtime"
+
+fn near(a f64, b f64) bool { << math.abs(a - b) < 1e-5 }
+
+fn compile_must_fail(src string, schema string) bool {
+    _ := sc.compile(src, schema, "bad.xus") or (err) { << true }
+    << false
+}
+
+fn eval_exec_must_fail(m $&vm.Instance) bool {
+    _ := m.execute(0.016, 0.0, vm.DEFAULT_BUDGET, 1024.0) or (err) { << true }
+    << false
+}
+
+fn test_math_and_rollback() int {
+    src := "@math_probe\nstruct MathProbe {\n    acc f64\n}\npub fn (self \$&MathProbe) physics_process(delta f64, axis f64) f64 {\n    a := abs(-3.5)\n    b := sqrt(16.0)\n    c := sin(0.0) + cos(0.0)\n    d := floor(2.9) + ceil(2.1)\n    e := min(5.0, max(2.0, clamp(axis * 10.0, 1.0, 4.0)))\n    self.acc = a + b + c + d + e + delta * 0.0\n    << self.acc\n}\n"
+    schema := "{\"profile\":\"xu-scalar-v1\",\"module\":\"math_probe\",\"class\":\"MathProbe\",\"fields\":[{\"id\":1,\"name\":\"acc\",\"type\":\"f64\",\"default\":42.0}]}"
+    mod := sc.compile(src, schema, "math_probe.xus") or >>
+    raw := mod.encode() or >>
+    decoded := bc.decode(&raw) or >>
+
+    $m := vm.instantiate(decoded) or >>
+    res := m.execute(0.016, 0.3, vm.DEFAULT_BUDGET, 1024.0) or >>
+    // a=3.5, b=4, c=1, d=5, clamp(3,1,4)=3 => e=3 => sum=16.5
+    if !near(res, 16.5) || !near(m.state(1) or >>, 16.5) {
+        >> errors.new("math intrinsics returned unexpected value")
+    }
+
+    // Check sqrt(-1) rolls back self.acc cleanly.
+    bad_math_src := "@math_err\nstruct MathErr {\n    acc f64\n}\npub fn (self \$&MathErr) physics_process(delta f64, axis f64) f64 {\n    self.acc = 999.0 + delta * 0.0 + axis * 0.0\n    << sqrt(-1.0)\n}\n"
+    bad_schema := "{\"profile\":\"xu-scalar-v1\",\"module\":\"math_err\",\"class\":\"MathErr\",\"fields\":[{\"id\":1,\"name\":\"acc\",\"type\":\"f64\",\"default\":7.0}]}"
+    bad_mod := sc.compile(bad_math_src, bad_schema, "math_err.xus") or >>
+    $bm := vm.instantiate(bad_mod) or >>
+    if !eval_exec_must_fail($&bm) || !near(bm.state(1) or >>, 7.0) {
+        >> errors.new("sqrt(-1) failed to roll back VM state")
+    }
+
+    // Check yield_frame inside physics_process is rejected by compiler.
+    bad_yield := "@bad_y\nstruct BadY {\n    acc f64\n}\npub fn (self \$&BadY) physics_process(delta f64, axis f64) f64 {\n    yield_frame()\n    << delta + axis\n}\n"
+    if !compile_must_fail(bad_yield, "{\"profile\":\"xu-scalar-v1\",\"module\":\"bad_y\",\"class\":\"BadY\",\"fields\":[{\"id\":1,\"name\":\"acc\",\"type\":\"f64\",\"default\":0.0}]}") {
+        >> errors.new("compiler allowed yield_frame inside physics_process")
+    }
+    << 0
+}
+
+fn agent_schema_v1() string {
+    << "{\"profile\":\"xu-scalar-v1\",\"module\":\"agent_ctrl\",\"class\":\"AgentCtrl\"," +
+       "\"fields\":[{\"id\":1,\"name\":\"stage\",\"type\":\"f64\",\"default\":0.0},{\"id\":2,\"name\":\"voice\",\"type\":\"f64\",\"default\":0.0},{\"id\":3,\"name\":\"hit\",\"type\":\"f64\",\"default\":0.0}]," +
+       "\"signals\":[{\"id\":10,\"name\":\"done\"}]," +
+       "\"coroutines\":[{\"id\":100,\"name\":\"patrol\"}]}"
+}
+
+fn agent_source_v1() string {
+    << "@agent_ctrl\n" +
+       "struct AgentCtrl {\n    stage f64\n    voice f64\n    hit f64\n}\n" +
+       "pub fn (self \$&AgentCtrl) physics_process(delta f64, axis f64) f64 {\n" +
+       "    ax := input_axis(1.0, 2.0)\n" +
+       "    node_translate(ax * delta * 10.0, 0.0, 0.0)\n" +
+       "    if input_just_pressed(3.0) > 0.5 {\n" +
+       "        node_set_visible(0.0)\n" +
+       "        phys_apply_impulse(0.0, 0.0, 12.0, 0.0)\n" +
+       "        v := audio_play(0.0, 0.8, 0.0)\n" +
+       "        self.voice = v\n" +
+       "        audio_set_bus_volume(0.0, 0.9)\n" +
+       "        vfx_burst(0.0, 16.0)\n" +
+       "        vfx_set_pos(0.0, node_pos_x(), 1.0, 0.0)\n" +
+       "    }\n" +
+       "    self.hit = phys_raycast(0.0, 1.0, 0.0, 10.0, 0.0, 0.0)\n" +
+       "    bb_set(5.0, self.hit + axis * 0.0)\n" +
+       "    << nav_path_length(0.0, 0.0, 0.0, 5.0, 0.0, 0.0) + node_is_visible()\n" +
+       "}\n" +
+       "pub fn (self \$&AgentCtrl) patrol(speed f64) f64 {\n" +
+       "    local_acc := speed * 2.0\n" +
+       "    self.stage = 1.0\n" +
+       "    yield_frame()\n" +
+       "    nx := nav_next_x(0.0, 0.0, 0.0, 5.0, 0.0, 0.0)\n" +
+       "    self.stage = 2.0\n" +
+       "    yield_seconds(0.2)\n" +
+       "    self.stage = 3.0\n" +
+       "    payload := yield_signal(99.0)\n" +
+       "    self.stage = 4.0\n" +
+       "    bb := host_call(701, 5.0)\n" +
+       "    t := time_elapsed()\n" +
+       "    out := local_acc + nx + payload + bb + t * 0.0\n" +
+       "    emit_signal(\"done\", out)\n" +
+       "    << out\n" +
+       "}\n"
+}
+
+fn agent_source_v2() string {
+    << "@agent_ctrl\n" +
+       "struct AgentCtrl {\n    stage f64\n    voice f64\n    hit f64\n}\n" +
+       "pub fn (self \$&AgentCtrl) physics_process(delta f64, axis f64) f64 {\n" +
+       "    << delta + axis\n" +
+       "}\n" +
+       "pub fn (self \$&AgentCtrl) patrol(speed f64) f64 {\n" +
+       "    yield_frame()\n" +
+       "    << speed + 50.0\n" +
+       "}\n"
+}
+
+fn run() int {
+    test_math_and_rollback() or >>
+
+    // Compile + bytecode round-trip.
+    mod_v1 := sc.compile(agent_source_v1(), agent_schema_v1(), "agent_v1.xus") or >>
+    raw_v1 := mod_v1.encode() or >>
+    prog_v1 := bc.decode(&raw_v1) or >>
+    mod_v2 := sc.compile(agent_source_v2(), agent_schema_v1(), "agent_v2.xus") or >>
+
+    // Build SceneTree3D, InputMap, RigidWorld3D, Audio Mixer, NavMesh3D, ParticleSystem2D.
+    $tree := nexus.new_scene_tree_3d("World", 16) or >>
+    player := tree.add_child_3d(tree.root(), "Player") or >>
+    tree.set_position_3d(player, fm.vec3(1.0, 0.0, 0.0)) or >>
+    $scripts := host.new_scene_scripts(8) or >>
+    sid := scripts.attach(&tree, player, prog_v1) or >>
+
+    $imap := inp.new_input_map()
+    imap.bind("left", 10) or >>
+    imap.bind("right", 11) or >>
+    imap.bind("fire", 12) or >>
+    imap.begin_frame()
+    imap.feed_key(11, true) or >>
+    imap.feed_key(12, true) or >>
+
+    wall_box := fm.aabb3(fm.vec3(4.0, -2.0, -2.0), fm.vec3(6.0, 2.0, 2.0)) or >>
+    static_boxes := [phys.StaticBox3D{bounds: wall_box, layer: 1, trigger: false}]
+    $phys_world := phys.new_rigid_world(fm.vec3(0.0, -9.8, 0.0), static_boxes, []phys.StaticRamp3D{}, []phys.StaticTriangle3D{}) or >>
+    sph := phys.dynamic_sphere_3d(fm.vec3(0.0, 3.0, 0.0), 0.5, 2.0, 0.4, 0.3) or >>
+    phys_world.add_body(sph) or >>
+
+    $samples := []int{}
+    for i in 0:2048 {
+        samples.push(int(math.sin(f64(i) * 0.1) * 12000.0))
+    }
+    clip := pcm.pcm16(48000, 1, samples) or >>
+    $aud := mixer.new_mixer(48000, 8) or >>
+    _ := aud.add_clip(clip) or >>
+
+    verts := [fm.vec3(-1.0, 0.0, -2.0), fm.vec3(6.0, 0.0, -2.0), fm.vec3(6.0, 0.0, 2.0), fm.vec3(-1.0, 0.0, 2.0)]
+    inds := [0, 2, 1, 0, 3, 2]
+    areas := [0, 0]
+    flags := [1, 1]
+    nav_mesh := nav.build_navmesh(&verts, &inds, 0.78, &areas, &flags) or >>
+
+    $e2 := vfx.default_emitter_2d(fm.vec2(0.0, 0.0))
+    e2.emitting = false
+    $vfx2 := vfx.new_particle_system_2d(64, 17, e2) or >>
+
+    $ctx := rt.new_script_host_context()
+    ctx.register_input_action(1, "left") or >>
+    ctx.register_input_action(2, "right") or >>
+    ctx.register_input_action(3, "fire") or >>
+
+    // 1. Run physics_process via ScriptHostContext trampoline across all 7 subsystems.
+    phys_ret := ctx.run_physics_process(
+        $&scripts, $&tree, sid, 0.1, 0.0, &imap,
+        true, $&phys_world, true, $&aud, true, &nav_mesh, true, $&vfx2
+    ) or >>
+    // nav_path_length ~ 5.0 + node_is_visible(0.0) = 5.0
+    if !near(phys_ret, 5.0) { >> errors.new("host nav_path_length + visibility mismatch") }
+    n3 := tree.node_3d(player) or >>
+    // Started at x=1.0, translated by ax(1.0) * 0.1 * 10.0 = +1.0 => x=2.0, hidden
+    if !near(n3.transform.c3.x, 2.0) || (tree.is_visible(player) or >>) {
+        >> errors.new("host scene translate/visibility mismatch")
+    }
+    if !near(scripts.state(sid, 3) or >>, 4.0) {
+        >> errors.new("host phys_raycast distance expected 4.0")
+    }
+    _ := phys_world.step(0.05, 1, 4) or >>
+    if phys_world.body(0).velocity.y <= 1.0 {
+        >> errors.new("host phys_apply_impulse did not accelerate dynamic body")
+    }
+    voice_id := int(math.round(scripts.state(sid, 2) or >>))
+    if !aud.is_playing(voice_id) { >> errors.new("host audio_play failed to start mixer voice") }
+    pcm_mix := aud.render(128) or >>
+    $nonzero_pcm := 0
+    for s in pcm_mix { if s != 0 { nonzero_pcm += 1 } }
+    if nonzero_pcm == 0 { >> errors.new("audio mixer produced silent buffer after audio_play") }
+
+    vfx2.step(0.016) or >>
+    if vfx2.alive_count() != 16 { >> errors.new("host vfx_burst failed to spawn 16 particles") }
+    vevs := ctx.drain_vfx_events()
+    if vevs.len != 2 || vevs[0].count != 16 || !vevs[1].is_pos_update || !near(vevs[1].pos.x, 2.0) {
+        >> errors.new("host VFX event stream mismatch")
+    }
+
+    // 2. Cooperative Coroutines: yield_frame -> yield_seconds -> yield_signal -> emit_signal -> complete.
+    $sched := host.new_coroutine_scheduler()
+    cid := sched.spawn($&scripts, &tree, sid, "patrol", 5.0) or >>
+
+    // Tick 1: reaches yield_frame() with stage == 1.0.
+    ctx.tick_coroutines($&sched, $&scripts, $&tree, 0.016, &imap, true, $&phys_world, true, $&aud, true, &nav_mesh, true, $&vfx2) or >>
+    if sched.status(cid) != host.CORO_WAIT_FRAME || !near(scripts.state(sid, 1) or >>, 1.0) {
+        >> errors.new("coroutine failed at yield_frame stage")
+    }
+
+    // Tick 2: wakes, computes nav_next_x, reaches yield_seconds(0.2) with stage == 2.0.
+    ctx.tick_coroutines($&sched, $&scripts, $&tree, 0.016, &imap, true, $&phys_world, true, $&aud, true, &nav_mesh, true, $&vfx2) or >>
+    if sched.status(cid) != host.CORO_WAIT_SECONDS || !near(scripts.state(sid, 1) or >>, 2.0) {
+        >> errors.new("coroutine failed at yield_seconds stage")
+    }
+
+    // Tick 3 (0.10s): still waiting (0.10s left).
+    ctx.tick_coroutines($&sched, $&scripts, $&tree, 0.10, &imap, true, $&phys_world, true, $&aud, true, &nav_mesh, true, $&vfx2) or >>
+    if sched.status(cid) != host.CORO_WAIT_SECONDS || !near(scripts.state(sid, 1) or >>, 2.0) {
+        >> errors.new("coroutine woke too early during yield_seconds")
+    }
+
+    // Tick 4 (0.15s): wakes, enters yield_signal(99.0) with stage == 3.0.
+    ctx.tick_coroutines($&sched, $&scripts, $&tree, 0.15, &imap, true, $&phys_world, true, $&aud, true, &nav_mesh, true, $&vfx2) or >>
+    if sched.status(cid) != host.CORO_WAIT_SIGNAL || !near(scripts.state(sid, 1) or >>, 3.0) {
+        >> errors.new("coroutine failed to pause on yield_signal")
+    }
+
+    // Deliver signal 99 with payload 25.0 -> Tick 5 resumes and completes!
+    woken := sched.notify_signal(99, 25.0) or >>
+    if woken != 1 || sched.status(cid) != host.CORO_READY {
+        >> errors.new("coroutine scheduler failed to wake task on notify_signal")
+    }
+    ctx.tick_coroutines($&sched, $&scripts, $&tree, 0.016, &imap, true, $&phys_world, true, $&aud, true, &nav_mesh, true, $&vfx2) or >>
+    // out = local_acc(10) + nx(5) + payload(25) + bb(4) = 44.0
+    st_c := sched.status(cid)
+    res_c := sched.result(cid) or >>
+    stg_c := scripts.state(sid, 1) or >>
+    if st_c != host.CORO_COMPLETED || !near(res_c, 44.0) || !near(stg_c, 4.0) {
+        >> errors.new("coroutine completion result/state mismatch: status=" + str(st_c) + ", res=" + str(int(math.round(res_c * 100.0))) + "/100, stage=" + str(int(stg_c)))
+    }
+    if scripts.pending_signals() != 1 { >> errors.new("coroutine did not emit signal") }
+
+    // 3. Hot-reload safety + cancel + queue_free cancellation.
+    cid_old := sched.spawn($&scripts, &tree, sid, "patrol", 1.0) or >>
+    ctx.tick_coroutines($&sched, $&scripts, $&tree, 0.016, &imap, true, $&phys_world, true, $&aud, true, &nav_mesh, true, $&vfx2) or >>
+    if sched.status(cid_old) != host.CORO_WAIT_FRAME { >> errors.new("pre-reload coroutine not suspended") }
+    scripts.reload(&tree, sid, mod_v2) or >>
+    ctx.tick_coroutines($&sched, $&scripts, $&tree, 0.016, &imap, true, $&phys_world, true, $&aud, true, &nav_mesh, true, $&vfx2) or >>
+    if sched.status(cid_old) != host.CORO_CANCELLED {
+        >> errors.new("coroutine was not auto-cancelled on module hot-reload")
+    }
+
+    cid_v2 := sched.spawn($&scripts, &tree, sid, "patrol", 7.0) or >>
+    ctx.tick_coroutines($&sched, $&scripts, $&tree, 0.016, &imap, true, $&phys_world, true, $&aud, true, &nav_mesh, true, $&vfx2) or >>
+    ctx.tick_coroutines($&sched, $&scripts, $&tree, 0.016, &imap, true, $&phys_world, true, $&aud, true, &nav_mesh, true, $&vfx2) or >>
+    if sched.status(cid_v2) != host.CORO_COMPLETED || !near(sched.result(cid_v2) or >>, 57.0) {
+        >> errors.new("post-reload v2 coroutine failed to complete")
+    }
+
+    cid_free := sched.spawn($&scripts, &tree, sid, "patrol", 2.0) or >>
+    ctx.tick_coroutines($&sched, $&scripts, $&tree, 0.016, &imap, true, $&phys_world, true, $&aud, true, &nav_mesh, true, $&vfx2) or >>
+    tree.queue_free(player) or >>
+    ctx.tick_coroutines($&sched, $&scripts, $&tree, 0.016, &imap, true, $&phys_world, true, $&aud, true, &nav_mesh, true, $&vfx2) or >>
+    if sched.status(cid_free) != host.CORO_CANCELLED || sched.active_count() != 0 {
+        >> errors.new("queue_free failed to cancel active coroutine")
+    }
+
+    println("PASS: Unified Script Host Bindings (Scene/Input/Physics3D/Audio/Nav/VFX/BB) + Cooperative Coroutines + Hot-Reload Safety (host_calls=" + str(ctx.host_call_count()) + ", coro_res=" + str(int(math.round(sched.result(cid) or >>))) + ", v2_res=" + str(int(math.round(sched.result(cid_v2) or >>))) + ")")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        eprintln("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

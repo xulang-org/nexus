@@ -1,0 +1,437 @@
+@"github.com/xulang-org/nexus/foundation/spatial"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub struct QuadtreeRayHit {
+    pub id int
+    pub t f64
+}
+
+struct QtItem2D {
+    id int
+    min_x f64
+    min_y f64
+    max_x f64
+    max_y f64
+    node_idx int
+}
+
+struct QtNode2D {
+    cx f64
+    cy f64
+    half_w f64
+    half_h f64
+    depth int
+    children []int
+    items []int
+}
+
+pub struct Quadtree2D {
+    min_x f64
+    min_y f64
+    max_x f64
+    max_y f64
+    max_depth int
+    leaf_capacity int
+    nodes []QtNode2D
+    items []QtItem2D
+    free_items []int
+    id_to_slot map[int]int
+    live_count int
+}
+
+fn sort_unique_ids(ids $&[]int) []int {
+    if ids.len == 0 { << []int{} }
+    for i in 1:ids.len {
+        cur := ids[i]
+        $j := i - 1
+        while j >= 0 && ids[j] > cur {
+            ids[j + 1] = ids[j]
+            j -= 1
+        }
+        ids[j + 1] = cur
+    }
+    $out := []int{}
+    for v in ids {
+        if out.len == 0 || v != out[out.len - 1] {
+            out.push(v)
+        }
+    }
+    << out
+}
+
+pub fn new_quadtree_2d(
+    min_x f64,
+    min_y f64,
+    max_x f64,
+    max_y f64,
+    max_depth int,
+    leaf_capacity int
+) Quadtree2D {
+    if !fm.finite(min_x) || !fm.finite(min_y) || !fm.finite(max_x) || !fm.finite(max_y) ||
+        max_x <= min_x || max_y <= min_y {
+        >> errors.new("nexus spatial: quadtree requires finite bounds with min < max")
+    }
+    if max_depth < 1 || max_depth > 10 || leaf_capacity < 1 || leaf_capacity > 64 {
+        >> errors.new("nexus spatial: invalid quadtree max_depth or leaf_capacity")
+    }
+    root := QtNode2D{
+        cx: (min_x + max_x) * 0.5,
+        cy: (min_y + max_y) * 0.5,
+        half_w: (max_x - min_x) * 0.5,
+        half_h: (max_y - min_y) * 0.5,
+        depth: 0,
+        children: []int{},
+        items: []int{}
+    }
+    << Quadtree2D{
+        min_x: min_x,
+        min_y: min_y,
+        max_x: max_x,
+        max_y: max_y,
+        max_depth: max_depth,
+        leaf_capacity: leaf_capacity,
+        nodes: [root],
+        items: []QtItem2D{},
+        free_items: []int{},
+        id_to_slot: map[int]int{},
+        live_count: 0
+    }
+}
+
+fn (qt &Quadtree2D) child_for_box(node_idx int, bx0 f64, by0 f64, bx1 f64, by1 f64) int {
+    n := &qt.nodes[node_idx]
+    if n.children.len != 4 { << -1 }
+    $right := false
+    $left := false
+    if bx0 >= n.cx { right = true }
+    if bx1 <= n.cx { left = true }
+    $top := false
+    $bot := false
+    if by0 >= n.cy { top = true }
+    if by1 <= n.cy { bot = true }
+
+    if left && bot { << n.children[0] }
+    if right && bot { << n.children[1] }
+    if left && top { << n.children[2] }
+    if right && top { << n.children[3] }
+    << -1
+}
+
+fn (qt $&Quadtree2D) split_node(node_idx int) {
+    if qt.nodes[node_idx].children.len == 4 { << }
+    cx := qt.nodes[node_idx].cx
+    cy := qt.nodes[node_idx].cy
+    qh := qt.nodes[node_idx].half_w * 0.5
+    qv := qt.nodes[node_idx].half_h * 0.5
+    cd := qt.nodes[node_idx].depth + 1
+    c0 := qt.nodes.len
+    qt.nodes.push(QtNode2D{cx: cx - qh, cy: cy - qv, half_w: qh, half_h: qv, depth: cd, children: []int{}, items: []int{}})
+    qt.nodes.push(QtNode2D{cx: cx + qh, cy: cy - qv, half_w: qh, half_h: qv, depth: cd, children: []int{}, items: []int{}})
+    qt.nodes.push(QtNode2D{cx: cx - qh, cy: cy + qv, half_w: qh, half_h: qv, depth: cd, children: []int{}, items: []int{}})
+    qt.nodes.push(QtNode2D{cx: cx + qh, cy: cy + qv, half_w: qh, half_h: qv, depth: cd, children: []int{}, items: []int{}})
+    qt.nodes[node_idx].children = [c0, c0 + 1, c0 + 2, c0 + 3]
+
+    // Migrate existing leaf items cleanly into child quadrants where possible.
+    $old_items := []int{}
+    for slot in qt.nodes[node_idx].items { old_items.push(slot) }
+    $kept := []int{}
+    for slot in old_items {
+        it := qt.items[slot]
+        ch := qt.child_for_box(node_idx, it.min_x, it.min_y, it.max_x, it.max_y)
+        if ch >= 0 {
+            qt.nodes[ch].items.push(slot)
+            qt.items[slot].node_idx = ch
+        } else {
+            kept.push(slot)
+        }
+    }
+    qt.nodes[node_idx].items = kept
+}
+
+pub fn (qt $&Quadtree2D) remove(id int) bool {
+    if !qt.id_to_slot.has(id) { << false }
+    slot := qt.id_to_slot[id]
+    nidx := qt.items[slot].node_idx
+    if nidx >= 0 && nidx < qt.nodes.len {
+        $kept := []int{}
+        for s in qt.nodes[nidx].items {
+            if s != slot { kept.push(s) }
+        }
+        qt.nodes[nidx].items = kept
+    }
+    qt.items[slot].node_idx = -1
+    im := $&qt.id_to_slot
+    im.delete(id)
+    qt.free_items.push(slot)
+    qt.live_count -= 1
+    << true
+}
+
+pub fn (qt $&Quadtree2D) insert(id int, min_x f64, min_y f64, max_x f64, max_y f64) int {
+    if !fm.finite(min_x) || !fm.finite(min_y) || !fm.finite(max_x) || !fm.finite(max_y) ||
+        max_x < min_x || max_y < min_y {
+        >> errors.new("nexus spatial: quadtree insert requires finite min <= max")
+    }
+    if qt.id_to_slot.has(id) {
+        _ := qt.remove(id)
+    }
+
+    $slot := -1
+    item := QtItem2D{id: id, min_x: min_x, min_y: min_y, max_x: max_x, max_y: max_y, node_idx: 0}
+    if qt.free_items.len > 0 {
+        top_idx := qt.free_items.len - 1
+        slot = qt.free_items[top_idx]
+        $next_f := []int{}
+        for i in 0:top_idx { next_f.push(qt.free_items[i]) }
+        qt.free_items = next_f
+        qt.items[slot] = item
+    } else {
+        slot = qt.items.len
+        qt.items.push(item)
+    }
+
+    $cur := 0
+    while true {
+        n := &qt.nodes[cur]
+        if n.children.len == 0 {
+            if n.items.len >= qt.leaf_capacity && n.depth < qt.max_depth {
+                qt.split_node(cur)
+            } else {
+                <-
+            }
+        }
+        ch := qt.child_for_box(cur, min_x, min_y, max_x, max_y)
+        if ch < 0 { <- }
+        cur = ch
+    }
+    qt.nodes[cur].items.push(slot)
+    qt.items[slot].node_idx = cur
+    qt.id_to_slot[id] = slot
+    qt.live_count += 1
+    << 0
+}
+
+pub fn (qt $&Quadtree2D) update(id int, min_x f64, min_y f64, max_x f64, max_y f64) int {
+    << qt.insert(id, min_x, min_y, max_x, max_y) or >>
+}
+
+fn box_overlaps(ax0 f64, ay0 f64, ax1 f64, ay1 f64, bx0 f64, by0 f64, bx1 f64, by1 f64) bool {
+    << !(ax1 < bx0 || ax0 > bx1 || ay1 < by0 || ay0 > by1)
+}
+
+pub fn (qt &Quadtree2D) query_rect(min_x f64, min_y f64, max_x f64, max_y f64) []int {
+    if !fm.finite(min_x) || !fm.finite(min_y) || !fm.finite(max_x) || !fm.finite(max_y) ||
+        max_x < min_x || max_y < min_y {
+        >> errors.new("nexus spatial: query_rect requires finite min <= max")
+    }
+    $out := []int{}
+    $stack := [0]
+    while stack.len > 0 {
+        top_i := stack.len - 1
+        nidx := stack[top_i]
+        $next_s := []int{}
+        for i in 0:top_i { next_s.push(stack[i]) }
+        stack = next_s
+
+        n := &qt.nodes[nidx]
+        // Loose quadtree allows items belonging to this node or descendants inside 2x half extent;
+        // at split, children hold items cleanly inside quadrant, and items crossing center stay in node.
+        // Using 2x extent guarantees all nested boxes overlap if queried rect hits loose cell.
+        lx0 := n.cx - n.half_w * 2.0
+        ly0 := n.cy - n.half_h * 2.0
+        lx1 := n.cx + n.half_w * 2.0
+        ly1 := n.cy + n.half_h * 2.0
+        if !box_overlaps(min_x, min_y, max_x, max_y, lx0, ly0, lx1, ly1) { -> }
+
+        for slot in n.items {
+            it := &qt.items[slot]
+            if box_overlaps(min_x, min_y, max_x, max_y, it.min_x, it.min_y, it.max_x, it.max_y) {
+                out.push(it.id)
+            }
+        }
+        for ch in n.children {
+            stack.push(ch)
+        }
+    }
+    << sort_unique_ids($&out)
+}
+
+fn circle_overlaps_box(cx f64, cy f64, r2 f64, bx0 f64, by0 f64, bx1 f64, by1 f64) bool {
+    px := math.max(bx0, math.min(cx, bx1))
+    py := math.max(by0, math.min(cy, by1))
+    dx := cx - px
+    dy := cy - py
+    << dx * dx + dy * dy <= r2
+}
+
+pub fn (qt &Quadtree2D) query_circle(cx f64, cy f64, radius f64) []int {
+    if !fm.finite(cx) || !fm.finite(cy) || !fm.finite(radius) || radius < 0.0 {
+        >> errors.new("nexus spatial: query_circle requires finite coords and radius >= 0")
+    }
+    r2 := radius * radius
+    $out := []int{}
+    $stack := [0]
+    while stack.len > 0 {
+        top_i := stack.len - 1
+        nidx := stack[top_i]
+        $next_s := []int{}
+        for i in 0:top_i { next_s.push(stack[i]) }
+        stack = next_s
+
+        n := &qt.nodes[nidx]
+        lx0 := n.cx - n.half_w * 2.0
+        ly0 := n.cy - n.half_h * 2.0
+        lx1 := n.cx + n.half_w * 2.0
+        ly1 := n.cy + n.half_h * 2.0
+        if !circle_overlaps_box(cx, cy, r2, lx0, ly0, lx1, ly1) { -> }
+
+        for slot in n.items {
+            it := &qt.items[slot]
+            if circle_overlaps_box(cx, cy, r2, it.min_x, it.min_y, it.max_x, it.max_y) {
+                out.push(it.id)
+            }
+        }
+        for ch in n.children {
+            stack.push(ch)
+        }
+    }
+    << sort_unique_ids($&out)
+}
+
+struct QtRayTest {
+    hit bool
+    t f64
+}
+
+fn ray_aabb_2d(
+    ox f64,
+    oy f64,
+    ux f64,
+    uy f64,
+    max_dist f64,
+    bx0 f64,
+    by0 f64,
+    bx1 f64,
+    by1 f64
+) QtRayTest {
+    $tmin := 0.0
+    $tmax := max_dist
+    if math.abs(ux) < 1e-12 {
+        if ox < bx0 || ox > bx1 { << QtRayTest{hit: false, t: 0.0} }
+    } else {
+        inv_x := 1.0 / ux
+        $t1 := (bx0 - ox) * inv_x
+        $t2 := (bx1 - ox) * inv_x
+        if t1 > t2 {
+            tmp := t1
+            t1 = t2
+            t2 = tmp
+        }
+        if t1 > tmin { tmin = t1 }
+        if t2 < tmax { tmax = t2 }
+        if tmin > tmax { << QtRayTest{hit: false, t: 0.0} }
+    }
+    if math.abs(uy) < 1e-12 {
+        if oy < by0 || oy > by1 { << QtRayTest{hit: false, t: 0.0} }
+    } else {
+        inv_y := 1.0 / uy
+        $t1 := (by0 - oy) * inv_y
+        $t2 := (by1 - oy) * inv_y
+        if t1 > t2 {
+            tmp := t1
+            t1 = t2
+            t2 = tmp
+        }
+        if t1 > tmin { tmin = t1 }
+        if t2 < tmax { tmax = t2 }
+        if tmin > tmax { << QtRayTest{hit: false, t: 0.0} }
+    }
+    << QtRayTest{hit: true, t: tmin}
+}
+
+pub fn (qt &Quadtree2D) raycast_2d(
+    ox f64,
+    oy f64,
+    dx f64,
+    dy f64,
+    max_dist f64
+) []QuadtreeRayHit {
+    if !fm.finite(ox) || !fm.finite(oy) || !fm.finite(dx) || !fm.finite(dy) ||
+        !fm.finite(max_dist) || max_dist <= 0.0 {
+        >> errors.new("nexus spatial: raycast_2d requires finite inputs and max_dist > 0")
+    }
+    len := math.sqrt(dx * dx + dy * dy)
+    if len <= 1e-12 {
+        >> errors.new("nexus spatial: raycast_2d direction must be non-zero")
+    }
+    ux := dx / len
+    uy := dy / len
+
+    $hits := []QuadtreeRayHit{}
+    $stack := [0]
+    while stack.len > 0 {
+        top_i := stack.len - 1
+        nidx := stack[top_i]
+        $next_s := []int{}
+        for i in 0:top_i { next_s.push(stack[i]) }
+        stack = next_s
+
+        n := &qt.nodes[nidx]
+        lx0 := n.cx - n.half_w * 2.0
+        ly0 := n.cy - n.half_h * 2.0
+        lx1 := n.cx + n.half_w * 2.0
+        ly1 := n.cy + n.half_h * 2.0
+        n_res := ray_aabb_2d(ox, oy, ux, uy, max_dist, lx0, ly0, lx1, ly1)
+        if !n_res.hit { -> }
+
+        for slot in n.items {
+            it := &qt.items[slot]
+            res := ray_aabb_2d(ox, oy, ux, uy, max_dist, it.min_x, it.min_y, it.max_x, it.max_y)
+            if res.hit {
+                hits.push(QuadtreeRayHit{id: it.id, t: res.t})
+            }
+        }
+        for ch in n.children {
+            stack.push(ch)
+        }
+    }
+
+    for i in 1:hits.len {
+        cur := hits[i]
+        $j := i - 1
+        while j >= 0 {
+            prev := hits[j]
+            if prev.t > cur.t + 1e-12 || (math.abs(prev.t - cur.t) <= 1e-12 && prev.id > cur.id) {
+                hits[j + 1] = prev
+                j -= 1
+            } else {
+                <-
+            }
+        }
+        hits[j + 1] = cur
+    }
+    << hits
+}
+
+pub fn (qt &Quadtree2D) count() int { << qt.live_count }
+pub fn (qt &Quadtree2D) node_count() int { << qt.nodes.len }
+
+pub fn (qt $&Quadtree2D) clear() {
+    root := QtNode2D{
+        cx: (qt.min_x + qt.max_x) * 0.5,
+        cy: (qt.min_y + qt.max_y) * 0.5,
+        half_w: (qt.max_x - qt.min_x) * 0.5,
+        half_h: (qt.max_y - qt.min_y) * 0.5,
+        depth: 0,
+        children: []int{},
+        items: []int{}
+    }
+    qt.nodes = [root]
+    qt.items = []QtItem2D{}
+    qt.free_items = []int{}
+    qt.id_to_slot = map[int]int{}
+    qt.live_count = 0
+}

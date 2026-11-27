@@ -1,0 +1,89 @@
+struct ProbeShGpu { float4 dc; float4 px; float4 py; float4 pz; };
+
+cbuffer DdgiUpdateUniform : register(b0, space2) {
+    float4 dims_rays; float4 depth_params; float4 rot_row0; float4 rot_row1; float4 rot_row2;
+    float4 pad0; float4 pad1; float4 pad2;
+};
+
+StructuredBuffer<float4> ray_results : register(t0, space0);
+StructuredBuffer<ProbeShGpu> prev_probes : register(t1, space0);
+StructuredBuffer<float2> prev_vis : register(t2, space0);
+RWStructuredBuffer<ProbeShGpu> out_probes : register(u0, space1);
+RWStructuredBuffer<float2> out_vis : register(u1, space1);
+
+float3 fibonacci_dir(uint ray_idx, uint ray_count, float3 r0, float3 r1, float3 r2) {
+    float n = max(float(ray_count), 1.0), fi = float(ray_idx) + 0.5, phi = 2.399963229728653 * float(ray_idx);
+    float cos_theta = 1.0 - 2.0 * fi / n, sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
+    float3 d = float3(cos(phi) * sin_theta, cos_theta, sin(phi) * sin_theta);
+    return normalize(float3(dot(r0, d), dot(r1, d), dot(r2, d)));
+}
+
+float3 oct_decode(float2 uv01) {
+    float2 f = uv01 * 2.0 - 1.0;
+    float3 n = float3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = clamp(-n.z, 0.0, 1.0);
+    n.x += (n.x >= 0.0) ? -t : t;
+    n.y += (n.y >= 0.0) ? -t : t;
+    return normalize(n);
+}
+
+[numthreads(64, 1, 1)]
+void main(uint3 dispatch_id : SV_DispatchThreadID) {
+    uint gid = dispatch_id.x;
+    uint probe_count = uint(dims_rays.x);
+    if (gid >= probe_count) return;
+
+    uint rays_per_probe = uint(dims_rays.y), ray_base = gid * rays_per_probe;
+    float3 sum_dc = float3(0.0, 0.0, 0.0), sum_px = float3(0.0, 0.0, 0.0), sum_py = float3(0.0, 0.0, 0.0), sum_pz = float3(0.0, 0.0, 0.0);
+    uint valid_rays = 0u, backface_rays = 0u;
+
+    for (uint r = 0u; r < rays_per_probe; ++r) {
+        float4 rr = ray_results[ray_base + r];
+        if (rr.w < 0.0) { backface_rays += 1u; continue; }
+        float3 d = fibonacci_dir(r, rays_per_probe, rot_row0.xyz, rot_row1.xyz, rot_row2.xyz);
+        float3 rad = max(rr.xyz, float3(0.0, 0.0, 0.0));
+        sum_dc += rad; sum_px += rad * d.x; sum_py += rad * d.y; sum_pz += rad * d.z;
+        valid_rays += 1u;
+    }
+
+    float bf_ratio = float(backface_rays) / max(float(rays_per_probe), 1.0);
+    float validity = (bf_ratio > depth_params.y || valid_rays == 0u) ? 0.0 : 1.0;
+    float3 new_dc = float3(0.0, 0.0, 0.0), new_px = float3(0.0, 0.0, 0.0), new_py = float3(0.0, 0.0, 0.0), new_pz = float3(0.0, 0.0, 0.0);
+    if (valid_rays > 0u && validity > 0.5) {
+        float inv_n = 1.0 / float(valid_rays);
+        new_dc = sum_dc * inv_n;
+        new_px = sum_px * (2.0 * inv_n);
+        new_py = sum_py * (2.0 * inv_n);
+        new_pz = sum_pz * (2.0 * inv_n);
+    }
+
+    float h = (depth_params.w > 0.5) ? 0.0 : clamp(dims_rays.z, 0.0, 0.98);
+    ProbeShGpu prev = prev_probes[gid];
+    ProbeShGpu next_sh;
+    next_sh.dc = float4(lerp(new_dc, prev.dc.xyz, h), validity);
+    next_sh.px = float4(lerp(new_px, prev.px.xyz, h), 0.0);
+    next_sh.py = float4(lerp(new_py, prev.py.xyz, h), 0.0);
+    next_sh.pz = float4(lerp(new_pz, prev.pz.xyz, h), 0.0);
+    out_probes[gid] = next_sh;
+
+    uint vis_res = max(uint(depth_params.z), 1u), vis_texels = vis_res * vis_res, vis_base = gid * vis_texels;
+    float max_pdist = max(dims_rays.w, 0.5), sharp = max(depth_params.x, 1.0);
+    for (uint ty = 0u; ty < vis_res; ++ty) {
+        for (uint tx = 0u; tx < vis_res; ++tx) {
+            float2 oct_uv = float2((float(tx) + 0.5) / float(vis_res), (float(ty) + 0.5) / float(vis_res));
+            float3 tex_dir = oct_decode(oct_uv);
+            float sum_d = 0.0, sum_d2 = 0.0, sum_w = 0.0;
+            for (uint r = 0u; r < rays_per_probe; ++r) {
+                float4 rr = ray_results[ray_base + r];
+                float3 d = fibonacci_dir(r, rays_per_probe, rot_row0.xyz, rot_row1.xyz, rot_row2.xyz);
+                float c = max(dot(tex_dir, d), 0.0);
+                if (c <= 1e-4) continue;
+                float w = pow(c, sharp), dist = (rr.w < 0.0) ? 0.0 : min(rr.w, max_pdist);
+                sum_d += w * dist; sum_d2 += w * dist * dist; sum_w += w;
+            }
+            float2 cur_m = (sum_w > 1e-6) ? float2(sum_d / sum_w, sum_d2 / sum_w) : float2(max_pdist, max_pdist * max_pdist);
+            float2 pm = prev_vis[vis_base + ty * vis_res + tx];
+            out_vis[vis_base + ty * vis_res + tx] = lerp(cur_m, pm, h);
+        }
+    }
+}

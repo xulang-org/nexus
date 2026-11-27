@@ -1,0 +1,58 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct ViewUniform {
+    float4x4 view_proj;
+    float4x4 view;
+};
+
+struct InstanceGpu {
+    float4x4 model;
+    float4x4 normals;
+    float4 bounds_min;
+    float4 bounds_max;
+    uint4 draw_info;
+};
+
+struct VertexIn {
+    float3 position [[attribute(0)]];
+    float4 color [[attribute(1)]];
+    float3 normal [[attribute(2)]];
+    float2 uv [[attribute(3)]];
+    float4 tangent [[attribute(4)]];
+};
+
+struct VertexOut {
+    float4 position [[position]];
+    float4 vertex_color;
+    float3 world;
+    float3 world_normal;
+    float2 texture_uv;
+    float3 world_tangent;
+    float3 world_bitangent;
+    float view_depth;
+    uint material_id [[flat]];
+    float orientation [[flat]];
+};
+
+vertex VertexOut main0(
+    VertexIn in [[stage_in]],
+    constant ViewUniform& u [[buffer(0)]],
+    device const InstanceGpu* instances [[buffer(1)]],
+    uint iid [[instance_id]]
+) {
+    InstanceGpu inst = instances[iid];
+    VertexOut out;
+    out.texture_uv = in.uv;
+    float4 world4 = inst.model * float4(in.position, 1.0);
+    out.position = u.view_proj * world4;
+    out.vertex_color = in.color;
+    out.world = world4.xyz;
+    out.world_tangent = (inst.model * float4(in.tangent.xyz, 0.0)).xyz;
+    out.world_bitangent = (inst.model * float4(cross(in.normal, in.tangent.xyz) * in.tangent.w, 0.0)).xyz;
+    out.world_normal = (inst.normals * float4(in.normal, 0.0)).xyz;
+    out.view_depth = -(u.view * float4(world4.xyz, 1.0)).z;
+    out.material_id = inst.draw_info.w;
+    out.orientation = inst.bounds_min.w;
+    return out;
+}

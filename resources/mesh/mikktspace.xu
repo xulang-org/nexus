@@ -1,0 +1,360 @@
+@"github.com/xulang-org/nexus/resources/mesh"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub struct MikkTSpaceOptions {
+    pub weld_angle_deg f64
+    pub weld_coincident_corners bool
+    pub position_epsilon f64
+}
+
+pub fn default_mikktspace_options() MikkTSpaceOptions {
+    << MikkTSpaceOptions{
+        weld_angle_deg: 60.0,
+        weld_coincident_corners: true,
+        position_epsilon: 0.00001
+    }
+}
+
+pub struct MikkTSpaceStats {
+    pub original_vertices int
+    pub final_vertices int
+    pub split_vertices int
+    pub mirrored_seams int
+    pub degenerate_corners int
+    pub triangles int
+}
+
+fn fallback_tangent_for_normal(normal fm.Vec3) fm.Vec3 {
+    $axis := fm.vec3(1.0, 0.0, 0.0)
+    if math.abs(normal.x) > 0.9 { axis = fm.vec3(0.0, 1.0, 0.0) }
+    candidate := axis.sub(normal.scaled(normal.dot(axis)))
+    if candidate.length() <= 0.000001 {
+        alt := fm.vec3(0.0, 0.0, 1.0).sub(normal.scaled(normal.dot(fm.vec3(0.0, 0.0, 1.0))))
+        if alt.length() <= 0.000001 { << fm.vec3(1.0, 0.0, 0.0) }
+        << alt.normalized() or (e) { << fm.vec3(1.0, 0.0, 0.0) }
+    }
+    << candidate.normalized() or (e) { << fm.vec3(1.0, 0.0, 0.0) }
+}
+
+fn safe_norm(v fm.Vec3, fb fm.Vec3) fm.Vec3 {
+    << v.normalized() or (e) { << fb }
+}
+
+fn orthogonalize_tangent(normal fm.Vec3, raw fm.Vec3) fm.Vec3 {
+    projected := raw.sub(normal.scaled(normal.dot(raw)))
+    if projected.length() <= 0.000000001 {
+        << fallback_tangent_for_normal(normal)
+    }
+    << projected.normalized() or (e) { << fallback_tangent_for_normal(normal) }
+}
+
+fn corner_angle_safe(a fm.Vec3, b fm.Vec3, c fm.Vec3) f64 {
+    ab := b.sub(a)
+    ac := c.sub(a)
+    if ab.length() <= 0.000000000001 || ac.length() <= 0.000000000001 { << 0.001 }
+    first := ab.normalized() or (e) { << 0.001 }
+    second := ac.normalized() or (e) { << 0.001 }
+    angle := math.atan2(first.cross(second).length(), first.dot(second))
+    if !fm.finite(angle) || angle <= 0.000001 { << 0.001 }
+    << angle
+}
+
+pub fn (mesh $&MeshData3D) generate_mikktspace_tangents() MikkTSpaceStats {
+    opts := default_mikktspace_options()
+    << mesh.generate_mikktspace_tangents_with(&opts) or >>
+}
+
+// Generates corner-angle-weighted MikkTSpace-style tangents, automatically
+// splitting vertices across mirrored UV handedness or sharp tangent seams.
+pub fn (mesh $&MeshData3D) generate_mikktspace_tangents_with(opts &MikkTSpaceOptions) MikkTSpaceStats {
+    if !fm.finite(opts.weld_angle_deg) || opts.weld_angle_deg < 0.0 || opts.weld_angle_deg > 180.0 ||
+        !fm.finite(opts.position_epsilon) || opts.position_epsilon <= 0.0 || opts.position_epsilon > 0.1 {
+        >> errors.new("nexus mesh: MikkTSpace weld_angle_deg must be in 0..180 and position_epsilon in (0, 0.1]")
+    }
+    mesh.validate() or >>
+    for vertex in mesh.vertices {
+        if !vertex.has_uv || vertex.normal.dot(vertex.normal) == 0.0 {
+            >> errors.new("nexus mesh: MikkTSpace tangent generation requires normals and UVs on every vertex")
+        }
+    }
+
+    cos_threshold := math.cos(opts.weld_angle_deg * 0.017453292519943295)
+    orig_count := mesh.vertices.len
+    tri_count := mesh.triangle_count()
+
+    $corner_t := []fm.Vec3{}
+    $corner_side := []int{}
+    $corner_angle := []f64{}
+    $corner_vertex := []int{}
+    $degenerate_corners := 0
+
+    for t in 0:tri_count {
+        ia := mesh.indices[t * 3]
+        ib := mesh.indices[t * 3 + 1]
+        ic := mesh.indices[t * 3 + 2]
+        va := &mesh.vertices[ia]
+        vb := &mesh.vertices[ib]
+        vc := &mesh.vertices[ic]
+
+        e1 := vb.position.sub(va.position)
+        e2 := vc.position.sub(va.position)
+        u1 := vb.uv.x - va.uv.x
+        v1 := vb.uv.y - va.uv.y
+        u2 := vc.uv.x - va.uv.x
+        v2 := vc.uv.y - va.uv.y
+        det := u1 * v2 - v1 * u2
+
+        $face_valid := false
+        $face_t := fm.vec3(1.0, 0.0, 0.0)
+        $face_b := fm.vec3(0.0, 1.0, 0.0)
+        if math.abs(det) > 0.000000000001 {
+            $det_sign := 1.0
+            if det < 0.0 { det_sign = -1.0 }
+            raw_t := e1.scaled(v2).sub(e2.scaled(v1)).scaled(det_sign)
+            raw_b := e2.scaled(u1).sub(e1.scaled(u2)).scaled(det_sign)
+            if raw_t.length() > 0.000000000001 && raw_b.length() > 0.000000000001 {
+                face_t = safe_norm(raw_t, fm.vec3(1.0, 0.0, 0.0))
+                face_b = safe_norm(raw_b, fm.vec3(0.0, 1.0, 0.0))
+                face_valid = true
+            }
+        }
+
+        ids := [ia, ib, ic]
+        $tri_tangents := []fm.Vec3{}
+        $tri_sides := []int{}
+        $tri_angles := []f64{}
+        $pos_votes := 0
+        $neg_votes := 0
+
+        for c in 0:3 {
+            id := ids[c]
+            nb := mesh.vertices[ids[(c + 1) % 3]].position
+            nc := mesh.vertices[ids[(c + 2) % 3]].position
+            vtx := &mesh.vertices[id]
+            ang := corner_angle_safe(vtx.position, nb, nc)
+            tri_angles.push(ang)
+
+            if !face_valid {
+                degenerate_corners += 1
+                tri_tangents.push(fallback_tangent_for_normal(vtx.normal))
+                tri_sides.push(0)
+                pos_votes += 1
+                ->
+            }
+
+            proj := face_t.sub(vtx.normal.scaled(vtx.normal.dot(face_t)))
+            if proj.length() <= 0.0000000001 {
+                degenerate_corners += 1
+                tri_tangents.push(fallback_tangent_for_normal(vtx.normal))
+                tri_sides.push(0)
+                pos_votes += 1
+                ->
+            }
+
+            tan := safe_norm(proj, fallback_tangent_for_normal(vtx.normal))
+            dir := vtx.normal.cross(tan).dot(face_b)
+            $side := 0
+            if dir < 0.0 {
+                side = 1
+                neg_votes += 1
+            } else {
+                pos_votes += 1
+            }
+            if math.abs(dir) <= 0.0000000001 { degenerate_corners += 1 }
+            tri_tangents.push(tan)
+            tri_sides.push(side)
+        }
+
+        $canonical_side := 0
+        if neg_votes > pos_votes { canonical_side = 1 }
+        for c in 0:3 {
+            corner_vertex.push(ids[c])
+            corner_t.push(tri_tangents[c])
+            corner_side.push(canonical_side)
+            corner_angle.push(tri_angles[c])
+        }
+    }
+
+    // Build topological smoothing buckets (optional coincident-corner welding across triangle soups).
+    $vert_bucket := []int{}
+    $bucket_count := 0
+    if !opts.weld_coincident_corners {
+        for i in 0:orig_count { vert_bucket.push(i) }
+        bucket_count = orig_count
+    } else {
+        inv_p := 1.0 / opts.position_epsilon
+        $bucket_map := map[string]int{}
+        for i in 0:orig_count {
+            v := &mesh.vertices[i]
+            key := str(int(math.round_to_even(v.position.x * inv_p))) + "," +
+                str(int(math.round_to_even(v.position.y * inv_p))) + "," +
+                str(int(math.round_to_even(v.position.z * inv_p))) + "|" +
+                str(int(math.round_to_even(v.normal.x * 10000.0))) + "," +
+                str(int(math.round_to_even(v.normal.y * 10000.0))) + "," +
+                str(int(math.round_to_even(v.normal.z * 10000.0))) + "|" +
+                str(int(math.round_to_even(v.uv.x * 10000.0))) + "," +
+                str(int(math.round_to_even(v.uv.y * 10000.0)))
+            if bucket_map.has(key + "") {
+                vert_bucket.push(bucket_map[key + ""])
+            } else {
+                bid := bucket_count
+                bucket_map[key + ""] = bid
+                vert_bucket.push(bid)
+                bucket_count += 1
+            }
+        }
+    }
+
+    // Group corners per smoothing bucket using linked chains by (handedness side, weld angle).
+    $bucket_head := []int{}
+    for _b in 0:bucket_count { bucket_head.push(-1) }
+    $vert_has_pos := []bool{}
+    $vert_has_neg := []bool{}
+    $vert_referenced := []bool{}
+    for _i in 0:orig_count {
+        vert_has_pos.push(false)
+        vert_has_neg.push(false)
+        vert_referenced.push(false)
+    }
+
+    $group_orig := []int{}
+    $group_side := []int{}
+    $group_seed := []fm.Vec3{}
+    $group_sum := []fm.Vec3{}
+    $group_next := []int{}
+    $corner_group := []int{}
+
+    for c in 0:corner_vertex.len {
+        ov := corner_vertex[c]
+        bk := vert_bucket[ov]
+        side := corner_side[c]
+        tan := corner_t[c]
+        ang := corner_angle[c]
+        vert_referenced[ov] = true
+        if side == 0 { vert_has_pos[ov] = true } else { vert_has_neg[ov] = true }
+
+        $matched := -1
+        $g := bucket_head[bk]
+        while g >= 0 {
+            if group_side[g] == side && group_seed[g].dot(tan) >= cos_threshold {
+                candidate_sum := group_sum[g].add(tan.scaled(ang))
+                if candidate_sum.length() > 0.000001 {
+                    group_sum[g] = candidate_sum
+                    matched = g
+                    <-
+                }
+            }
+            g = group_next[g]
+        }
+
+        if matched < 0 {
+            matched = group_orig.len
+            group_orig.push(ov)
+            group_side.push(side)
+            group_seed.push(tan)
+            group_sum.push(tan.scaled(ang))
+            group_next.push(bucket_head[bk])
+            bucket_head[bk] = matched
+        }
+        corner_group.push(matched)
+    }
+
+    $mirrored_seams := 0
+    for ov in 0:orig_count {
+        if vert_has_pos[ov] && vert_has_neg[ov] { mirrored_seams += 1 }
+    }
+
+    // Materialize output vertices per (original_vertex, smoothing_group) pair so welded
+    // coincident corners share exact averaged tangents while keeping topology valid.
+    $out_vertices := []Vertex3D{}
+    for i in 0:orig_count {
+        src := &mesh.vertices[i]
+        fb := fallback_tangent_for_normal(src.normal)
+        out_vertices.push(Vertex3D{
+            position: src.position,
+            color: src.color,
+            normal: src.normal,
+            uv: src.uv,
+            tangent: fm.vec4(fb.x, fb.y, fb.z, 1.0),
+            has_uv: true,
+            has_tangent: true
+        })
+    }
+
+    $primary_assigned := []bool{}
+    for _i in 0:orig_count { primary_assigned.push(false) }
+    $pair_map := map[string]int{}
+    $out_indices := []int{}
+
+    for c in 0:corner_group.len {
+        ov := corner_vertex[c]
+        g := corner_group[c]
+        pk := str(ov) + ":" + str(g)
+        if pair_map.has(pk + "") {
+            out_indices.push(pair_map[pk + ""])
+            ->
+        }
+        src := &mesh.vertices[ov]
+        $raw_avg := group_sum[g]
+        if raw_avg.length() <= 0.000000001 { raw_avg = group_seed[g] }
+        ortho := orthogonalize_tangent(src.normal, raw_avg)
+        $w := 1.0
+        if group_side[g] == 1 { w = -1.0 }
+        new_v := Vertex3D{
+            position: src.position,
+            color: src.color,
+            normal: src.normal,
+            uv: src.uv,
+            tangent: fm.vec4(ortho.x, ortho.y, ortho.z, w),
+            has_uv: true,
+            has_tangent: true
+        }
+        $out_idx := ov
+        if !primary_assigned[ov] {
+            primary_assigned[ov] = true
+            out_vertices[ov] = new_v
+        } else {
+            if out_vertices.len >= MAX_VERTICES {
+                >> errors.new("nexus mesh: MikkTSpace seam split exceeds vertex limit")
+            }
+            out_idx = out_vertices.len
+            out_vertices.push(new_v)
+        }
+        pair_map[pk + ""] = out_idx
+        out_indices.push(out_idx)
+    }
+
+    $candidate := MeshData3D{vertices: out_vertices, indices: out_indices}
+    candidate.validate() or >>
+    $next_verts := []Vertex3D{}
+    $next_idx := []int{}
+    for i in 0:candidate.vertices.len {
+        v := &candidate.vertices[i]
+        next_verts.push(Vertex3D{
+            position: v.position,
+            color: v.color,
+            normal: v.normal,
+            uv: v.uv,
+            tangent: v.tangent,
+            has_uv: v.has_uv,
+            has_tangent: v.has_tangent
+        })
+    }
+    for idx in candidate.indices {
+        next_idx.push(idx)
+    }
+    mesh.vertices = next_verts
+    mesh.indices = next_idx
+
+    << MikkTSpaceStats{
+        original_vertices: orig_count,
+        final_vertices: mesh.vertices.len,
+        split_vertices: mesh.vertices.len - orig_count,
+        mirrored_seams: mirrored_seams,
+        degenerate_corners: degenerate_corners,
+        triangles: tri_count
+    }
+}

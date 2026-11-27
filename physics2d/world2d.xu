@@ -1,0 +1,878 @@
+@"github.com/xulang-org/nexus/physics2d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+// +Y points downward (matching 2D screen coordinates and move_and_slide floor normals).
+pub const COLLIDER_SOLID = 0
+pub const COLLIDER_ONE_WAY = 1
+pub const COLLIDER_TRIGGER = 2
+
+pub const TRIGGER_ENTER = 1
+pub const TRIGGER_STAY = 2
+pub const TRIGGER_EXIT = 3
+
+pub struct Collider2D {
+    pub id int
+    pub bounds fm.Rect2
+    pub prev_bounds fm.Rect2
+    pub frame_delta fm.Vec2
+    pub velocity fm.Vec2
+    pub kind int
+    pub layer int
+    pub mask int
+    pub enabled bool
+}
+
+pub struct RaycastHit2D {
+    pub hit bool
+    pub collider_id int
+    pub distance f64
+    pub fraction f64
+    pub point fm.Vec2
+    pub normal fm.Vec2
+}
+
+pub struct TriggerEvent2D {
+    pub actor_id int
+    pub trigger_id int
+    pub kind int
+}
+
+pub struct WorldMotionResult2D {
+    pub bounds fm.Rect2
+    pub remaining fm.Vec2
+    pub collided bool
+    pub floor bool
+    pub ceiling bool
+    pub wall_left bool
+    pub wall_right bool
+    pub floor_collider_id int
+    pub one_way_landed bool
+}
+
+struct TriggerPair {
+    actor_id int
+    trigger_id int
+}
+
+pub struct PhysicsWorld2D {
+    colliders []Collider2D
+    active_overlaps []TriggerPair
+}
+
+pub fn new_physics_world_2d() PhysicsWorld2D {
+    << PhysicsWorld2D{
+        colliders: []Collider2D{},
+        active_overlaps: []TriggerPair{}
+    }
+}
+
+fn check_rect(r fm.Rect2) int {
+    if !r.valid() {
+        >> errors.new("nexus physics2d: collider bounds must have finite positive width and height")
+    }
+    << 0
+}
+
+pub fn (w $&PhysicsWorld2D) add_collider(bounds fm.Rect2, kind int, layer int, mask int) int {
+    check_rect(bounds) or >>
+    if kind != COLLIDER_SOLID && kind != COLLIDER_ONE_WAY && kind != COLLIDER_TRIGGER {
+        >> errors.new("nexus physics2d: invalid 2D collider kind")
+    }
+    if w.colliders.len >= MAX_KINEMATIC_SOLIDS {
+        >> errors.new("nexus physics2d: collider limit exceeded")
+    }
+    id := w.colliders.len
+    w.colliders.push(Collider2D{
+        id: id,
+        bounds: bounds,
+        prev_bounds: bounds,
+        frame_delta: fm.vec2(0.0, 0.0),
+        velocity: fm.vec2(0.0, 0.0),
+        kind: kind,
+        layer: layer,
+        mask: mask,
+        enabled: true
+    })
+    << id
+}
+
+pub fn (w $&PhysicsWorld2D) add_solid(bounds fm.Rect2, layer int, mask int) int {
+    << w.add_collider(bounds, COLLIDER_SOLID, layer, mask) or >>
+}
+
+pub fn (w $&PhysicsWorld2D) add_one_way_platform(bounds fm.Rect2, layer int, mask int) int {
+    << w.add_collider(bounds, COLLIDER_ONE_WAY, layer, mask) or >>
+}
+
+pub fn (w $&PhysicsWorld2D) add_trigger(bounds fm.Rect2, layer int, mask int) int {
+    << w.add_collider(bounds, COLLIDER_TRIGGER, layer, mask) or >>
+}
+
+pub fn (w $&PhysicsWorld2D) set_collider_bounds(id int, bounds fm.Rect2) int {
+    check_rect(bounds) or >>
+    if id < 0 || id >= w.colliders.len { >> errors.new("nexus physics2d: invalid collider id") }
+    w.colliders[id].prev_bounds = bounds
+    w.colliders[id].bounds = bounds
+    w.colliders[id].frame_delta = fm.vec2(0.0, 0.0)
+    w.colliders[id].velocity = fm.vec2(0.0, 0.0)
+    << 0
+}
+
+pub fn (w $&PhysicsWorld2D) move_collider(id int, next_bounds fm.Rect2, dt f64) fm.Vec2 {
+    check_rect(next_bounds) or >>
+    if !fm.finite(dt) || dt <= 0.0 || dt > 1.0 {
+        >> errors.new("nexus physics2d: invalid dt for move_collider")
+    }
+    if id < 0 || id >= w.colliders.len { >> errors.new("nexus physics2d: invalid collider id") }
+    c := $&w.colliders[id]
+    delta := fm.vec2(next_bounds.position.x - c.bounds.position.x, next_bounds.position.y - c.bounds.position.y)
+    c.prev_bounds = c.bounds
+    c.bounds = next_bounds
+    c.frame_delta = delta
+    c.velocity = delta.scaled(1.0 / dt)
+    << delta
+}
+
+pub fn (w $&PhysicsWorld2D) clear_frame_deltas() {
+    for i in 0:w.colliders.len {
+        w.colliders[i].prev_bounds = w.colliders[i].bounds
+        w.colliders[i].frame_delta = fm.vec2(0.0, 0.0)
+        w.colliders[i].velocity = fm.vec2(0.0, 0.0)
+    }
+}
+
+pub fn (w $&PhysicsWorld2D) set_collider_enabled(id int, enabled bool) int {
+    if id < 0 || id >= w.colliders.len { >> errors.new("nexus physics2d: invalid collider id") }
+    w.colliders[id].enabled = enabled
+    << 0
+}
+
+pub fn (w &PhysicsWorld2D) collider(id int) Collider2D {
+    if id < 0 || id >= w.colliders.len { >> errors.new("nexus physics2d: invalid collider id") }
+    c := &w.colliders[id]
+    << Collider2D{
+        id: c.id,
+        bounds: c.bounds,
+        prev_bounds: c.prev_bounds,
+        frame_delta: c.frame_delta,
+        velocity: c.velocity,
+        kind: c.kind,
+        layer: c.layer,
+        mask: c.mask,
+        enabled: c.enabled
+    }
+}
+
+fn rects_overlap_strict(a fm.Rect2, b fm.Rect2) bool {
+    << a.overlaps(b)
+}
+
+fn layer_matches(collider &Collider2D, query_mask int) bool {
+    << (collider.layer & query_mask) != 0
+}
+
+pub fn (w &PhysicsWorld2D) overlap_rect(query fm.Rect2, mask int, include_triggers bool) []int {
+    check_rect(query) or >>
+    $ids := []int{}
+    for c in w.colliders {
+        if !c.enabled || !layer_matches(&c, mask) { -> }
+        if !include_triggers && c.kind == COLLIDER_TRIGGER { -> }
+        if rects_overlap_strict(query, c.bounds) { ids.push(c.id) }
+    }
+    << ids
+}
+
+pub fn (w &PhysicsWorld2D) overlap_point(point fm.Vec2, mask int, include_triggers bool) []int {
+    if !point.is_finite() { >> errors.new("nexus physics2d: overlap_point requires finite point") }
+    $ids := []int{}
+    for c in w.colliders {
+        if !c.enabled || !layer_matches(&c, mask) { -> }
+        if !include_triggers && c.kind == COLLIDER_TRIGGER { -> }
+        if c.bounds.contains(point) { ids.push(c.id) }
+    }
+    << ids
+}
+
+pub fn (w &PhysicsWorld2D) overlap_circle(center fm.Vec2, radius f64, mask int, include_triggers bool) []int {
+    if !center.is_finite() || !fm.finite(radius) || radius < 0.0 {
+        >> errors.new("nexus physics2d: invalid overlap_circle center or radius")
+    }
+    rsq := radius * radius
+    $ids := []int{}
+    for c in w.colliders {
+        if !c.enabled || !layer_matches(&c, mask) { -> }
+        if !include_triggers && c.kind == COLLIDER_TRIGGER { -> }
+        closest := c.bounds.clamp_point(center)
+        if closest.distance_sq(center) <= rsq { ids.push(c.id) }
+    }
+    << ids
+}
+
+pub fn (w &PhysicsWorld2D) raycast_all(origin fm.Vec2, dir fm.Vec2, max_dist f64, mask int, include_one_way bool, include_triggers bool) []RaycastHit2D {
+    if !fm.finite(origin.x) || !fm.finite(origin.y) || !fm.finite(dir.x) || !fm.finite(dir.y) ||
+        !fm.finite(max_dist) || max_dist <= 0.0 || dir.length_sq() <= 1e-18 {
+        >> errors.new("nexus physics2d: invalid raycast_all parameters")
+    }
+    unit_dir := dir.normalized()
+    dx := unit_dir.x * max_dist
+    dy := unit_dir.y * max_dist
+    $hits := []RaycastHit2D{}
+    for c in w.colliders {
+        if !c.enabled || !layer_matches(&c, mask) { -> }
+        if !include_triggers && c.kind == COLLIDER_TRIGGER { -> }
+        if c.kind == COLLIDER_ONE_WAY && !include_one_way { -> }
+        $tmin := 0.0
+        $tmax := 1.0
+        $nx := 0.0
+        $ny := 0.0
+        $miss := false
+        if math.abs(dx) <= 1e-12 {
+            if origin.x < c.bounds.position.x || origin.x > c.bounds.position.x + c.bounds.size.x { miss = true }
+        } else {
+            tx1 := (c.bounds.position.x - origin.x) / dx
+            tx2 := (c.bounds.position.x + c.bounds.size.x - origin.x) / dx
+            $tenter := tx1
+            $texit := tx2
+            $cand_nx := -1.0
+            if tx1 > tx2 {
+                tenter = tx2
+                texit = tx1
+                cand_nx = 1.0
+            }
+            if tenter > tmin {
+                tmin = tenter
+                nx = cand_nx
+                ny = 0.0
+            }
+            if texit < tmax { tmax = texit }
+            if tmin > tmax { miss = true }
+        }
+        if !miss {
+            if math.abs(dy) <= 1e-12 {
+                if origin.y < c.bounds.position.y || origin.y > c.bounds.position.y + c.bounds.size.y { miss = true }
+            } else {
+                ty1 := (c.bounds.position.y - origin.y) / dy
+                ty2 := (c.bounds.position.y + c.bounds.size.y - origin.y) / dy
+                $tenter := ty1
+                $texit := ty2
+                $cand_ny := -1.0
+                if ty1 > ty2 {
+                    tenter = ty2
+                    texit = ty1
+                    cand_ny = 1.0
+                }
+                if tenter > tmin {
+                    tmin = tenter
+                    nx = 0.0
+                    ny = cand_ny
+                }
+                if texit < tmax { tmax = texit }
+                if tmin > tmax { miss = true }
+            }
+        }
+        if !miss && tmin >= 0.0 && tmin <= 1.0 {
+            dist := tmin * max_dist
+            hits.push(RaycastHit2D{
+                hit: true,
+                collider_id: c.id,
+                distance: dist,
+                fraction: tmin,
+                point: origin.add(unit_dir.scaled(dist)),
+                normal: fm.vec2(nx, ny)
+            })
+        }
+    }
+    if hits.len > 1 {
+        for i in 0:(hits.len - 1) {
+            for j in (i + 1):hits.len {
+                if hits[j].distance < hits[i].distance {
+                    tmp := hits[i]
+                    hits[i] = hits[j]
+                    hits[j] = tmp
+                }
+            }
+        }
+    }
+    << hits
+}
+
+pub fn (w &PhysicsWorld2D) raycast(origin fm.Vec2, dir fm.Vec2, max_dist f64, mask int, include_one_way bool) RaycastHit2D {
+    if !fm.finite(origin.x) || !fm.finite(origin.y) || !fm.finite(dir.x) || !fm.finite(dir.y) ||
+        !fm.finite(max_dist) || max_dist <= 0.0 || dir.length_sq() <= 1e-18 {
+        >> errors.new("nexus physics2d: invalid raycast parameters")
+    }
+    unit_dir := dir.normalized() or >>
+    $best := RaycastHit2D{
+        hit: false,
+        collider_id: -1,
+        distance: max_dist,
+        fraction: 1.0,
+        point: origin.add(unit_dir.scaled(max_dist)),
+        normal: fm.vec2(0.0, 0.0)
+    }
+
+    for c in w.colliders {
+        if !c.enabled || c.kind == COLLIDER_TRIGGER || !layer_matches(&c, mask) { -> }
+        if c.kind == COLLIDER_ONE_WAY && !include_one_way { -> }
+        // Ray-AABB slab intersection normalized against unit_dir * max_dist.
+        dx := unit_dir.x * max_dist
+        dy := unit_dir.y * max_dist
+        $tmin := 0.0
+        $tmax := 1.0
+        $nx := 0.0
+        $ny := 0.0
+        $miss := false
+
+        if math.abs(dx) <= 0.000000000001 {
+            if origin.x < c.bounds.position.x || origin.x > c.bounds.position.x + c.bounds.size.x { miss = true }
+        } else {
+            tx1 := (c.bounds.position.x - origin.x) / dx
+            tx2 := (c.bounds.position.x + c.bounds.size.x - origin.x) / dx
+            $tenter := tx1
+            $texit := tx2
+            $cand_nx := -1.0
+            if tx1 > tx2 {
+                tenter = tx2
+                texit = tx1
+                cand_nx = 1.0
+            }
+            if tenter > tmin {
+                tmin = tenter
+                nx = cand_nx
+                ny = 0.0
+            }
+            if texit < tmax { tmax = texit }
+            if tmin > tmax { miss = true }
+        }
+
+        if !miss {
+            if math.abs(dy) <= 0.000000000001 {
+                if origin.y < c.bounds.position.y || origin.y > c.bounds.position.y + c.bounds.size.y { miss = true }
+            } else {
+                ty1 := (c.bounds.position.y - origin.y) / dy
+                ty2 := (c.bounds.position.y + c.bounds.size.y - origin.y) / dy
+                $tenter := ty1
+                $texit := ty2
+                $cand_ny := -1.0
+                if ty1 > ty2 {
+                    tenter = ty2
+                    texit = ty1
+                    cand_ny = 1.0
+                }
+                if tenter > tmin {
+                    tmin = tenter
+                    nx = 0.0
+                    ny = cand_ny
+                }
+                if texit < tmax { tmax = texit }
+                if tmin > tmax { miss = true }
+            }
+        }
+
+        if !miss && tmin >= 0.0 && tmin <= best.fraction {
+            dist := tmin * max_dist
+            best = RaycastHit2D{
+                hit: true,
+                collider_id: c.id,
+                distance: dist,
+                fraction: tmin,
+                point: origin.add(unit_dir.scaled(dist)),
+                normal: fm.vec2(nx, ny)
+            }
+        }
+    }
+    << best
+}
+
+pub fn (w &PhysicsWorld2D) move_and_slide_world(body fm.Rect2, motion fm.Vec2, mask int) WorldMotionResult2D {
+    << w.move_and_slide_world_opts(body, motion, mask, false) or >>
+}
+
+pub fn (w &PhysicsWorld2D) move_and_slide_world_opts(body fm.Rect2, motion fm.Vec2, mask int, drop_through_one_way bool) WorldMotionResult2D {
+    check_rect(body) or >>
+    if !fm.finite(motion.x) || !fm.finite(motion.y) { >> errors.new("nexus physics2d: invalid 2D motion") }
+
+    $current := body
+    $remaining := motion
+    $collided := false
+    $floor := false
+    $ceiling := false
+    $wall_left := false
+    $wall_right := false
+    $floor_id := -1
+    $one_way_landed := false
+
+    for _pass in 0:MAX_SLIDE_PASSES {
+        if remaining.length() <= 0.000000001 { <- }
+        $nearest := SweepHit{hit: false, time: 1.0, normal: fm.vec2(0.0, 0.0), started_overlapping: false}
+        $nearest_id := -1
+        $nearest_kind := COLLIDER_SOLID
+
+        for c in w.colliders {
+            if !c.enabled || c.kind == COLLIDER_TRIGGER || !layer_matches(&c, mask) { -> }
+            if c.kind == COLLIDER_ONE_WAY {
+                if drop_through_one_way || remaining.y <= 0.0 { -> }
+                // Only catch the top surface when body bottom is at or above the ledge.
+                if current.position.y + current.size.y > c.bounds.position.y + 0.0001 { -> }
+            }
+            candidate := sweep_rect(current, remaining, c.bounds) or >>
+            if c.kind == COLLIDER_ONE_WAY && (!candidate.hit || candidate.normal.y >= 0.0) { -> }
+            if candidate.hit && (!nearest.hit || candidate.time < nearest.time) {
+                nearest = candidate
+                nearest_id = c.id
+                nearest_kind = c.kind
+            }
+        }
+
+        if !nearest.hit {
+            current = fm.rect2(current.position.x + remaining.x, current.position.y + remaining.y, current.size.x, current.size.y)
+            remaining = fm.vec2(0.0, 0.0)
+            <-
+        }
+
+        collided = true
+        travel := remaining.scaled(nearest.time)
+        current = fm.rect2(current.position.x + travel.x, current.position.y + travel.y, current.size.x, current.size.y)
+        if nearest.normal.y < 0.0 {
+            floor = true
+            floor_id = nearest_id
+            if nearest_kind == COLLIDER_ONE_WAY { one_way_landed = true }
+        }
+        if nearest.normal.y > 0.0 { ceiling = true }
+        if nearest.normal.x > 0.0 { wall_left = true }
+        if nearest.normal.x < 0.0 { wall_right = true }
+        leftover := remaining.scaled(1.0 - nearest.time)
+        remaining = leftover.sub(nearest.normal.scaled(leftover.dot(nearest.normal)))
+    }
+
+    // Also probe micro-gap (0.01 px) beneath feet when stationary/falling for stable grounding.
+    if !floor && remaining.y >= 0.0 {
+        probe := fm.rect2(current.position.x, current.position.y + 0.01, current.size.x, current.size.y)
+        for c in w.colliders {
+            if !c.enabled || c.kind == COLLIDER_TRIGGER || !layer_matches(&c, mask) { -> }
+            if c.kind == COLLIDER_ONE_WAY {
+                if drop_through_one_way || current.position.y + current.size.y > c.bounds.position.y + 0.0001 { -> }
+            }
+            if rects_overlap_strict(probe, c.bounds) && current.position.y + current.size.y <= c.bounds.position.y + 0.02 {
+                floor = true
+                floor_id = c.id
+                if c.kind == COLLIDER_ONE_WAY { one_way_landed = true }
+                <-
+            }
+        }
+    }
+
+    << WorldMotionResult2D{
+        bounds: current,
+        remaining: remaining,
+        collided: collided,
+        floor: floor,
+        ceiling: ceiling,
+        wall_left: wall_left,
+        wall_right: wall_right,
+        floor_collider_id: floor_id,
+        one_way_landed: one_way_landed
+    }
+}
+
+fn has_trigger_pair(pairs &[]TriggerPair, actor_id int, trigger_id int) bool {
+    for p in pairs {
+        if p.actor_id == actor_id && p.trigger_id == trigger_id { << true }
+    }
+    << false
+}
+
+pub fn (w $&PhysicsWorld2D) step_triggers(actor_id int, body fm.Rect2, mask int) []TriggerEvent2D {
+    check_rect(body) or >>
+    $events := []TriggerEvent2D{}
+    $current_triggers := []int{}
+
+    for c in w.colliders {
+        if !c.enabled || c.kind != COLLIDER_TRIGGER || !layer_matches(&c, mask) { -> }
+        if rects_overlap_strict(body, c.bounds) {
+            current_triggers.push(c.id)
+            if has_trigger_pair(&w.active_overlaps, actor_id, c.id) {
+                events.push(TriggerEvent2D{actor_id: actor_id, trigger_id: c.id, kind: TRIGGER_STAY})
+            } else {
+                events.push(TriggerEvent2D{actor_id: actor_id, trigger_id: c.id, kind: TRIGGER_ENTER})
+            }
+        }
+    }
+
+    $next_active := []TriggerPair{}
+    for p in w.active_overlaps {
+        if p.actor_id != actor_id {
+            next_active.push(TriggerPair{actor_id: p.actor_id, trigger_id: p.trigger_id})
+            ->
+        }
+        $still_inside := false
+        for tid in current_triggers {
+            if tid == p.trigger_id {
+                still_inside = true
+                <-
+            }
+        }
+        if !still_inside {
+            events.push(TriggerEvent2D{actor_id: actor_id, trigger_id: p.trigger_id, kind: TRIGGER_EXIT})
+        }
+    }
+    for tid in current_triggers {
+        next_active.push(TriggerPair{actor_id: actor_id, trigger_id: tid})
+    }
+    w.active_overlaps = next_active
+    << events
+}
+
+pub struct OverlapResolution2D {
+    pub bounds fm.Rect2
+    pub push fm.Vec2
+    pub resolved bool
+    pub iterations int
+}
+
+fn (w &PhysicsWorld2D) has_solid_overlap(query fm.Rect2, mask int) bool {
+    for c in w.colliders {
+        if !c.enabled || c.kind != COLLIDER_SOLID || !layer_matches(&c, mask) { -> }
+        if query.overlaps(c.bounds) { << true }
+    }
+    << false
+}
+
+pub fn (w &PhysicsWorld2D) resolve_overlaps(body fm.Rect2, mask int) OverlapResolution2D {
+    check_rect(body) or >>
+    $cur := body
+    $total_push := fm.vec2(0.0, 0.0)
+    $iters := 0
+    for _it in 0:4 {
+        $moved := false
+        for c in w.colliders {
+            if !c.enabled || c.kind != COLLIDER_SOLID || !layer_matches(&c, mask) { -> }
+            if !cur.overlaps(c.bounds) { -> }
+            b := c.bounds
+            ov_x := math.min(cur.position.x + cur.size.x, b.position.x + b.size.x) - math.max(cur.position.x, b.position.x)
+            ov_y := math.min(cur.position.y + cur.size.y, b.position.y + b.size.y) - math.max(cur.position.y, b.position.y)
+            if ov_x <= 0.0 || ov_y <= 0.0 { -> }
+            $dx := 0.0
+            $dy := 0.0
+            if ov_x <= ov_y {
+                cx := cur.position.x + cur.size.x * 0.5
+                bcx := b.position.x + b.size.x * 0.5
+                if cx < bcx { dx = -ov_x } else { dx = ov_x }
+            } else {
+                cy := cur.position.y + cur.size.y * 0.5
+                bcy := b.position.y + b.size.y * 0.5
+                if cy < bcy { dy = -ov_y } else { dy = ov_y }
+            }
+            cur = fm.rect2(cur.position.x + dx, cur.position.y + dy, cur.size.x, cur.size.y)
+            total_push = fm.vec2(total_push.x + dx, total_push.y + dy)
+            moved = true
+            iters += 1
+        }
+        if !moved { <- }
+    }
+    resolved := !w.has_solid_overlap(cur, mask)
+    << OverlapResolution2D{
+        bounds: cur,
+        push: total_push,
+        resolved: resolved,
+        iterations: iters
+    }
+}
+
+pub struct PlatformerConfig2D {
+    pub move_speed f64
+    pub ground_accel f64
+    pub air_accel f64
+    pub gravity f64
+    pub max_fall_speed f64
+    pub jump_velocity f64
+    pub jump_cut_multiplier f64
+    pub coyote_time f64
+    pub jump_buffer_time f64
+    pub wall_slide_speed f64
+    pub wall_jump_vx f64
+    pub wall_jump_vy f64
+    pub wall_jump_lock_time f64
+    pub one_way_drop_time f64
+    pub corner_correction_px f64
+    pub step_up_px f64
+    pub platform_momentum_factor f64
+}
+
+pub fn default_platformer_config_2d() PlatformerConfig2D {
+    << PlatformerConfig2D{
+        move_speed: 220.0,
+        ground_accel: 2200.0,
+        air_accel: 1200.0,
+        gravity: 980.0,
+        max_fall_speed: 640.0,
+        jump_velocity: 420.0,
+        jump_cut_multiplier: 0.45,
+        coyote_time: 0.12,
+        jump_buffer_time: 0.12,
+        wall_slide_speed: 90.0,
+        wall_jump_vx: 240.0,
+        wall_jump_vy: 400.0,
+        wall_jump_lock_time: 0.14,
+        one_way_drop_time: 0.16,
+        corner_correction_px: 5.0,
+        step_up_px: 4.0,
+        platform_momentum_factor: 0.5
+    }
+}
+
+pub struct PlatformerInput2D {
+    pub move_x f64
+    pub jump_pressed bool
+    pub jump_held bool
+    pub drop_down bool
+}
+
+pub struct PlatformerController2D {
+    pub config PlatformerConfig2D
+    pub bounds fm.Rect2
+    pub velocity fm.Vec2
+    pub on_floor bool
+    pub on_wall_left bool
+    pub on_wall_right bool
+    pub wall_sliding bool
+    pub coyote_timer f64
+    pub jump_buffer_timer f64
+    pub wall_lock_timer f64
+    pub drop_timer f64
+    pub jump_cut_done bool
+    pub jumped_from_coyote bool
+    pub wall_jumps int
+    pub floor_collider_id int
+    pub corner_corrections int
+    pub step_ups int
+}
+
+pub fn new_platformer_controller_2d(bounds fm.Rect2, cfg PlatformerConfig2D) PlatformerController2D {
+    check_rect(bounds) or >>
+    << PlatformerController2D{
+        config: cfg,
+        bounds: bounds,
+        velocity: fm.vec2(0.0, 0.0),
+        on_floor: false,
+        on_wall_left: false,
+        on_wall_right: false,
+        wall_sliding: false,
+        coyote_timer: 0.0,
+        jump_buffer_timer: 0.0,
+        wall_lock_timer: 0.0,
+        drop_timer: 0.0,
+        jump_cut_done: false,
+        jumped_from_coyote: false,
+        wall_jumps: 0,
+        floor_collider_id: -1,
+        corner_corrections: 0,
+        step_ups: 0
+    }
+}
+
+fn approach_f64(current f64, target f64, max_delta f64) f64 {
+    if current < target {
+        next := current + max_delta
+        if next > target { << target }
+        << next
+    }
+    next := current - max_delta
+    if next < target { << target }
+    << next
+}
+
+pub fn (ctrl $&PlatformerController2D) step(world &PhysicsWorld2D, mask int, input &PlatformerInput2D, dt f64) WorldMotionResult2D {
+    if !fm.finite(dt) || dt <= 0.0 || dt > 0.25 || !fm.finite(input.move_x) {
+        >> errors.new("nexus physics2d: invalid platformer step dt or move_x")
+    }
+    $move_x := input.move_x
+    if move_x < -1.0 { move_x = -1.0 }
+    if move_x > 1.0 { move_x = 1.0 }
+
+    was_on_floor := ctrl.on_floor
+    $floor_vel := fm.vec2(0.0, 0.0)
+    if was_on_floor && ctrl.floor_collider_id >= 0 && ctrl.floor_collider_id < world.colliders.len {
+        fc := world.collider(ctrl.floor_collider_id) or >>
+        floor_vel = fc.velocity
+        if fc.enabled && (math.abs(fc.frame_delta.x) > 0.0 || math.abs(fc.frame_delta.y) > 0.0) {
+            // If vertical platform rises into the rider, depenetrate vertically first, then carry horizontally.
+            if world.has_solid_overlap(ctrl.bounds, mask) {
+                mtv := world.resolve_overlaps(ctrl.bounds, mask) or >>
+                ctrl.bounds = mtv.bounds
+                if math.abs(fc.frame_delta.x) > 0.0 {
+                    carry_x := world.move_and_slide_world_opts(ctrl.bounds, fm.vec2(fc.frame_delta.x, 0.0), mask, false) or >>
+                    ctrl.bounds = carry_x.bounds
+                }
+            } else {
+                carry := world.move_and_slide_world_opts(ctrl.bounds, fc.frame_delta, mask, false) or >>
+                ctrl.bounds = carry.bounds
+            }
+        }
+    }
+
+    if ctrl.on_floor {
+        ctrl.coyote_timer = ctrl.config.coyote_time
+        ctrl.jump_cut_done = false
+        ctrl.jumped_from_coyote = false
+    } else if ctrl.coyote_timer > 0.0 {
+        ctrl.coyote_timer = math.max(0.0, ctrl.coyote_timer - dt)
+    }
+
+    if input.jump_pressed {
+        ctrl.jump_buffer_timer = ctrl.config.jump_buffer_time
+    } else if ctrl.jump_buffer_timer > 0.0 {
+        ctrl.jump_buffer_timer = math.max(0.0, ctrl.jump_buffer_timer - dt)
+    }
+
+    if ctrl.wall_lock_timer > 0.0 {
+        ctrl.wall_lock_timer = math.max(0.0, ctrl.wall_lock_timer - dt)
+    }
+    if input.drop_down && ctrl.on_floor {
+        ctrl.drop_timer = ctrl.config.one_way_drop_time
+    } else if ctrl.drop_timer > 0.0 {
+        ctrl.drop_timer = math.max(0.0, ctrl.drop_timer - dt)
+    }
+
+    // Horizontal acceleration (suppressed briefly right after a wall jump).
+    if ctrl.wall_lock_timer <= 0.0 {
+        $accel := ctrl.config.air_accel
+        if ctrl.on_floor { accel = ctrl.config.ground_accel }
+        ctrl.velocity.x = approach_f64(ctrl.velocity.x, move_x * ctrl.config.move_speed, accel * dt)
+    }
+
+    // Gravity + variable jump cut when player releases jump while ascending.
+    ctrl.velocity.y += ctrl.config.gravity * dt
+    if !input.jump_held && ctrl.velocity.y < 0.0 && !ctrl.jump_cut_done {
+        ctrl.velocity.y *= ctrl.config.jump_cut_multiplier
+        ctrl.jump_cut_done = true
+    }
+
+    // Consume buffered jump against ground/coyote first, otherwise wall jump.
+    if ctrl.jump_buffer_timer > 0.0 {
+        if ctrl.on_floor || ctrl.coyote_timer > 0.0 {
+            if !ctrl.on_floor && ctrl.coyote_timer > 0.0 { ctrl.jumped_from_coyote = true }
+            ctrl.velocity.y = -ctrl.config.jump_velocity + math.min(0.0, floor_vel.y * ctrl.config.platform_momentum_factor)
+            ctrl.velocity.x += floor_vel.x * ctrl.config.platform_momentum_factor
+            ctrl.on_floor = false
+            ctrl.coyote_timer = 0.0
+            ctrl.jump_buffer_timer = 0.0
+            ctrl.jump_cut_done = false
+        } else if ctrl.on_wall_left || ctrl.on_wall_right {
+            if ctrl.on_wall_left {
+                ctrl.velocity.x = ctrl.config.wall_jump_vx
+            } else {
+                ctrl.velocity.x = -ctrl.config.wall_jump_vx
+            }
+            ctrl.velocity.y = -ctrl.config.wall_jump_vy
+            ctrl.wall_lock_timer = ctrl.config.wall_jump_lock_time
+            ctrl.jump_buffer_timer = 0.0
+            ctrl.jump_cut_done = false
+            ctrl.wall_jumps += 1
+        }
+    }
+
+    // Wall slide clamp when falling against a vertical surface while steering into it.
+    touching_wall_in_air := !ctrl.on_floor && ((ctrl.on_wall_left && move_x < -0.1) || (ctrl.on_wall_right && move_x > 0.1))
+    ctrl.wall_sliding = touching_wall_in_air && ctrl.velocity.y > 0.0
+    if ctrl.wall_sliding && ctrl.velocity.y > ctrl.config.wall_slide_speed {
+        ctrl.velocity.y = ctrl.config.wall_slide_speed
+    }
+    if ctrl.velocity.y > ctrl.config.max_fall_speed {
+        ctrl.velocity.y = ctrl.config.max_fall_speed
+    }
+
+    pre_step_bounds := ctrl.bounds
+    pre_move_vx := ctrl.velocity.x
+    pre_move_vy := ctrl.velocity.y
+    intended_motion := ctrl.velocity.scaled(dt)
+    $res := world.move_and_slide_world_opts(ctrl.bounds, intended_motion, mask, ctrl.drop_timer > 0.0) or >>
+
+    // Ascending corner squeeze: nudge past small ceiling overlaps and preserve upward velocity.
+    if !was_on_floor && res.ceiling && pre_move_vy < 0.0 && ctrl.config.corner_correction_px >= 1.0 {
+        max_nudge := int(math.floor(ctrl.config.corner_correction_px))
+        $corrected := false
+        $step := 1
+        while step <= max_nudge && !corrected {
+            for sign_dir in [-1.0, 1.0] {
+                dx := f64(step) * sign_dir
+                shifted := fm.rect2(pre_step_bounds.position.x + dx, pre_step_bounds.position.y, pre_step_bounds.size.x, pre_step_bounds.size.y)
+                if !world.has_solid_overlap(shifted, mask) {
+                    cand := world.move_and_slide_world_opts(shifted, fm.vec2(0.0, intended_motion.y), mask, ctrl.drop_timer > 0.0) or >>
+                    if !cand.ceiling {
+                        res = cand
+                        corrected = true
+                        ctrl.corner_corrections += 1
+                        <-
+                    }
+                }
+            }
+            step += 1
+        }
+        if corrected {
+            ctrl.velocity.y = pre_move_vy
+        }
+    }
+
+    // Grounded micro step-up over small curbs/stairs when walking into a low wall.
+    if was_on_floor && (res.wall_left || res.wall_right) && math.abs(move_x) > 0.1 && ctrl.config.step_up_px >= 1.0 {
+        max_step := int(math.floor(ctrl.config.step_up_px))
+        $step := 1
+        while step <= max_step {
+            lifted := fm.rect2(pre_step_bounds.position.x, pre_step_bounds.position.y - f64(step), pre_step_bounds.size.x, pre_step_bounds.size.y)
+            if !world.has_solid_overlap(lifted, mask) {
+                fwd := world.move_and_slide_world_opts(lifted, fm.vec2(intended_motion.x, 0.0), mask, false) or >>
+                if !fwd.wall_left && !fwd.wall_right {
+                    down := world.move_and_slide_world_opts(fwd.bounds, fm.vec2(0.0, f64(step) + 0.5), mask, false) or >>
+                    if down.floor {
+                        res = down
+                        ctrl.velocity.x = pre_move_vx
+                        ctrl.step_ups += 1
+                        <-
+                    }
+                }
+            }
+            step += 1
+        }
+    }
+
+    ctrl.bounds = res.bounds
+    ctrl.on_floor = res.floor
+    ctrl.on_wall_left = res.wall_left
+    ctrl.on_wall_right = res.wall_right
+    ctrl.floor_collider_id = res.floor_collider_id
+
+    if res.floor && ctrl.velocity.y > 0.0 { ctrl.velocity.y = 0.0 }
+    if res.ceiling && ctrl.velocity.y < 0.0 { ctrl.velocity.y = 0.0 }
+    if res.wall_left && ctrl.velocity.x < 0.0 { ctrl.velocity.x = 0.0 }
+    if res.wall_right && ctrl.velocity.x > 0.0 { ctrl.velocity.x = 0.0 }
+
+    // Probe 1px horizontally so pushing against a wall keeps wall_left/right armed on consecutive ticks.
+    if !ctrl.on_floor && !ctrl.on_wall_left && move_x < -0.1 {
+        left_probe := fm.rect2(ctrl.bounds.position.x - 1.0, ctrl.bounds.position.y + 1.0, 1.0, math.max(1.0, ctrl.bounds.size.y - 2.0))
+        hits := world.overlap_rect(left_probe, mask, false) or >>
+        for hid in hits {
+            c := world.collider(hid) or >>
+            if c.kind == COLLIDER_SOLID {
+                ctrl.on_wall_left = true
+                <-
+            }
+        }
+    }
+    if !ctrl.on_floor && !ctrl.on_wall_right && move_x > 0.1 {
+        right_probe := fm.rect2(ctrl.bounds.position.x + ctrl.bounds.size.x, ctrl.bounds.position.y + 1.0, 1.0, math.max(1.0, ctrl.bounds.size.y - 2.0))
+        hits := world.overlap_rect(right_probe, mask, false) or >>
+        for hid in hits {
+            c := world.collider(hid) or >>
+            if c.kind == COLLIDER_SOLID {
+                ctrl.on_wall_right = true
+                <-
+            }
+        }
+    }
+
+    << res
+}

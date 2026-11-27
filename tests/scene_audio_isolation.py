@@ -9,12 +9,14 @@ import tempfile
 root=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='xu-scene-audio-') as temporary:
  target=Path(temporary);shutil.copyfile(root/'xu.xun',target/'xu.xun')
- for package in ['scene','foundation/math','resources/scene','resources/lighting','resources/audio','formats/scene','formats/wav','internal/file_snapshot','integration/scene','integration/scene_audio','integration/audio','audio','platform/sdl_audio']:
+ for package in ['scene','foundation/math', 'resources/camera','resources/scene','resources/lod','resources/lighting','resources/shadow',
+                 'resources/modeling','resources/persistence','resources/sprite3d','resources/tilemap','resources/audio','formats/scene','formats/wav','internal/file_snapshot','integration/scene','integration/scene_audio','integration/audio','audio','platform/sdl_audio']:
   shutil.copytree(root/package,target/package)
  (target/'native').mkdir()
  shutil.copyfile(root/'native/nexus_audio.xulib',target/'native/nexus_audio.xulib')
  checks=target/'checks';checks.mkdir();shutil.copyfile(root/'tests/scene_audio_process_cli.xu',checks/'main.xu')
- (checks/'xu.xun').write_text('module: example/audio_scene_isolation\nversion: !ver 0.1.0\nxu: !ver 0.12.3\nrequire:\n  "github.com/xulang-org/nexus": file:..\n')
+ sdk=next(line for line in (root/'xu.xun').read_text().splitlines() if line.startswith('xu:'))
+ (checks/'xu.xun').write_text('module: example/audio_scene_isolation\nversion: !ver 0.1.0\n'+sdk+'\nrequire:\n  "github.com/xulang-org/nexus": file:..\n')
  scenes=target/'scenes';scenes.mkdir()
  for source,destination in [('base.xuscene','world.xuscene'),('tone.wav','tone.wav')]:shutil.copyfile(root/'build/scene-audio-fixtures'/source,scenes/destination)
  binary=target/'audio-scene-cli'

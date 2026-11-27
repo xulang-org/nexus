@@ -1,0 +1,302 @@
+@main
+
+pcm #"github.com/xulang-org/nexus/resources/audio"
+wav #"github.com/xulang-org/nexus/formats/wav"
+mix #"github.com/xulang-org/nexus/audio/mixer"
+gltf #"github.com/xulang-org/nexus/formats/gltf"
+fm #"github.com/xulang-org/nexus/foundation/math"
+#math
+#errors
+
+fn push_u16_b(buf $&[]int, v int) {
+    buf.push(v & 255)
+    buf.push((v >> 8) & 255)
+}
+
+fn push_u32_b(buf $&[]int, v int) {
+    buf.push(v & 255)
+    buf.push((v >> 8) & 255)
+    buf.push((v >> 16) & 255)
+    buf.push((v >> 24) & 255)
+}
+
+fn push_f32_b(buf $&[]int, v f64) {
+    push_u32_b(buf, math.float32_bits(v))
+}
+
+fn push_ascii_b(buf $&[]int, s string) {
+    for i in 0:s.len { buf.push(s[i] & 255) }
+}
+
+fn pad4_zeros(buf $&[]int) {
+    while buf.len % 4 != 0 { buf.push(0) }
+}
+
+fn make_sine_mono(rate int, frames int, freq_hz f64, amp f64) pcm.Clip {
+    tau := 6.283185307179586
+    $samples := []int{}
+    for i in 0:frames {
+        t := f64(i) / f64(rate)
+        v := int(math.round_to_even(math.sin(tau * freq_hz * t) * amp))
+        samples.push(v)
+    }
+    << pcm.pcm16(rate, 1, samples) or >>
+}
+
+fn make_sine_stereo(rate int, frames int, f_left f64, f_right f64, amp f64) pcm.Clip {
+    tau := 6.283185307179586
+    $samples := []int{}
+    for i in 0:frames {
+        t := f64(i) / f64(rate)
+        l := int(math.round_to_even(math.sin(tau * f_left * t) * amp))
+        r := int(math.round_to_even(math.sin(tau * f_right * t) * amp))
+        samples.push(l)
+        samples.push(r)
+    }
+    << pcm.pcm16(rate, 2, samples) or >>
+}
+
+fn channel_rms(samples &[]int, ch int) f64 {
+    frames := samples.len / 2
+    if frames <= 0 { << 0.0 }
+    $sum2 := 0.0
+    for f in 0:frames {
+        v := f64(samples[f * 2 + ch])
+        sum2 += v * v
+    }
+    << math.sqrt(sum2 / f64(frames))
+}
+
+fn build_two_clip_glb() string {
+    $bin := []int{}
+    // 0: POSITION (3 verts = 36 bytes), off=0
+    pts := [-0.4, -0.4, 0.0, 0.4, -0.4, 0.0, 0.0, 0.4, 0.0]
+    for v in pts { push_f32_b($&bin, v) }
+    // 1: NORMAL (36 bytes), off=36
+    for _ in 0:3 {
+        push_f32_b($&bin, 0.0)
+        push_f32_b($&bin, 0.0)
+        push_f32_b($&bin, 1.0)
+    }
+    // 2: TEXCOORD_0 (24 bytes), off=72
+    uvs := [0.0, 0.0, 1.0, 0.0, 0.5, 1.0]
+    for v in uvs { push_f32_b($&bin, v) }
+    // 3: JOINTS_0 u8 vec4 (12 bytes), off=96
+    for _ in 0:12 { bin.push(0) }
+    // 4: WEIGHTS_0 (48 bytes), off=108
+    for _ in 0:3 {
+        push_f32_b($&bin, 1.0)
+        push_f32_b($&bin, 0.0)
+        push_f32_b($&bin, 0.0)
+        push_f32_b($&bin, 0.0)
+    }
+    // 5: IBM (64 bytes), off=156
+    ibm := [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    for v in ibm { push_f32_b($&bin, v) }
+    // 6: times [0.0, 1.0] (8 bytes), off=220
+    push_f32_b($&bin, 0.0)
+    push_f32_b($&bin, 1.0)
+    // 7: clip 0 translation (0->4,0,0) (24 bytes), off=228
+    t0 := [0.0, 0.0, 0.0, 4.0, 0.0, 0.0]
+    for v in t0 { push_f32_b($&bin, v) }
+    // 8: clip 1 translation (0->0,2,0) (24 bytes), off=252
+    t1 := [0.0, 0.0, 0.0, 0.0, 2.0, 0.0]
+    for v in t1 { push_f32_b($&bin, v) }
+    // 9: clip 1 rotation Y (0 -> +90 deg) (32 bytes), off=276
+    s45 := math.sin(0.7853981633974483)
+    c45 := math.cos(0.7853981633974483)
+    rot := [0.0, 0.0, 0.0, 1.0, 0.0, s45, 0.0, c45]
+    for v in rot { push_f32_b($&bin, v) }
+    // 10: clip 1 scale (1 -> 3) (24 bytes), off=308
+    sc := [1.0, 1.0, 1.0, 3.0, 3.0, 3.0]
+    for v in sc { push_f32_b($&bin, v) }
+    pad4_zeros($&bin)
+
+    js := "{\"asset\":{\"version\":\"2.0\"}," +
+        "\"buffers\":[{\"byteLength\":" + str(bin.len) + "}]," +
+        "\"bufferViews\":[" +
+        "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":36,\"target\":34962}," +
+        "{\"buffer\":0,\"byteOffset\":36,\"byteLength\":36,\"target\":34962}," +
+        "{\"buffer\":0,\"byteOffset\":72,\"byteLength\":24,\"target\":34962}," +
+        "{\"buffer\":0,\"byteOffset\":96,\"byteLength\":12,\"target\":34962}," +
+        "{\"buffer\":0,\"byteOffset\":108,\"byteLength\":48,\"target\":34962}," +
+        "{\"buffer\":0,\"byteOffset\":156,\"byteLength\":64}," +
+        "{\"buffer\":0,\"byteOffset\":220,\"byteLength\":8}," +
+        "{\"buffer\":0,\"byteOffset\":228,\"byteLength\":24}," +
+        "{\"buffer\":0,\"byteOffset\":252,\"byteLength\":24}," +
+        "{\"buffer\":0,\"byteOffset\":276,\"byteLength\":32}," +
+        "{\"buffer\":0,\"byteOffset\":308,\"byteLength\":24}]," +
+        "\"accessors\":[" +
+        "{\"bufferView\":0,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\",\"min\":[-0.4,-0.4,0],\"max\":[0.4,0.4,0]}," +
+        "{\"bufferView\":1,\"componentType\":5126,\"count\":3,\"type\":\"VEC3\"}," +
+        "{\"bufferView\":2,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"}," +
+        "{\"bufferView\":3,\"componentType\":5121,\"count\":3,\"type\":\"VEC4\"}," +
+        "{\"bufferView\":4,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"}," +
+        "{\"bufferView\":5,\"componentType\":5126,\"count\":1,\"type\":\"MAT4\"}," +
+        "{\"bufferView\":6,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\",\"min\":[0],\"max\":[1]}," +
+        "{\"bufferView\":7,\"componentType\":5126,\"count\":2,\"type\":\"VEC3\"}," +
+        "{\"bufferView\":8,\"componentType\":5126,\"count\":2,\"type\":\"VEC3\"}," +
+        "{\"bufferView\":9,\"componentType\":5126,\"count\":2,\"type\":\"VEC4\"}," +
+        "{\"bufferView\":10,\"componentType\":5126,\"count\":2,\"type\":\"VEC3\"}]," +
+        "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2,\"JOINTS_0\":3,\"WEIGHTS_0\":4}}]}]," +
+        "\"nodes\":[{\"children\":[1,2]},{\"name\":\"joint\"},{\"mesh\":0,\"skin\":0}]," +
+        "\"scenes\":[{\"nodes\":[0]}],\"scene\":0," +
+        "\"skins\":[{\"joints\":[1],\"inverseBindMatrices\":5}]," +
+        "\"animations\":[" +
+        "{\"name\":\"walk_x\",\"samplers\":[{\"input\":6,\"output\":7,\"interpolation\":\"LINEAR\"}],\"channels\":[{\"sampler\":0,\"target\":{\"node\":1,\"path\":\"translation\"}}]}," +
+        "{\"name\":\"turn_scale\",\"samplers\":[{\"input\":6,\"output\":8,\"interpolation\":\"LINEAR\"},{\"input\":6,\"output\":9,\"interpolation\":\"LINEAR\"},{\"input\":6,\"output\":10,\"interpolation\":\"LINEAR\"}],\"channels\":[{\"sampler\":0,\"target\":{\"node\":1,\"path\":\"translation\"}},{\"sampler\":1,\"target\":{\"node\":1,\"path\":\"rotation\"}},{\"sampler\":2,\"target\":{\"node\":1,\"path\":\"scale\"}}]}" +
+        "]}"
+
+    $js_bytes := []int{}
+    push_ascii_b($&js_bytes, js)
+    while js_bytes.len % 4 != 0 { js_bytes.push(32) }
+
+    total := 12 + 8 + js_bytes.len + 8 + bin.len
+    $glb := []int{}
+    push_u32_b($&glb, 1179937895) // "glTF"
+    push_u32_b($&glb, 2)
+    push_u32_b($&glb, total)
+    push_u32_b($&glb, js_bytes.len)
+    push_u32_b($&glb, 1313821514) // "JSON"
+    for b in js_bytes { glb.push(b) }
+    push_u32_b($&glb, bin.len)
+    push_u32_b($&glb, 5130562) // "BIN\0"
+    for b in bin { glb.push(b) }
+    << string_from_bytes(glb)
+}
+
+fn check_adpcm_corrupt(raw &string) bool {
+    _ := wav.decode(raw) or (err) { << true }
+    << false
+}
+
+fn run() int {
+    // 1. IMA ADPCM (0x0011) 4:1 compression + mono/stereo SNR & malformed rejection.
+    stereo_src := make_sine_stereo(44100, 8080, 440.0, 660.0, 18000.0) or >>
+    adpcm_stereo_bytes := wav.encode_ima_adpcm_wav(&stereo_src) or >>
+    raw_pcm_bytes := stereo_src.sample_count() * 2
+    ratio := f64(raw_pcm_bytes) / f64(adpcm_stereo_bytes.len)
+    assert(ratio > 3.85)
+    dec_stereo := wav.decode(&adpcm_stereo_bytes) or >>
+    assert(dec_stereo.sample_rate() == 44100 && dec_stereo.channel_count() == 2)
+    assert(dec_stereo.frame_count() == stereo_src.frame_count())
+
+    $sig_pow := 0.0
+    $err_pow := 0.0
+    for f in 0:stereo_src.frame_count() {
+        for c in 0:2 {
+            s0 := f64(stereo_src.sample(f, c) or >>)
+            s1 := f64(dec_stereo.sample(f, c) or >>)
+            d := s0 - s1
+            sig_pow += s0 * s0
+            err_pow += d * d
+        }
+    }
+    snr_db := 10.0 * math.log10(sig_pow / math.max(err_pow, 1.0))
+    assert(snr_db > 32.0)
+
+    mono_src := make_sine_mono(24000, 4040, 520.0, 16000.0) or >>
+    adpcm_mono_bytes := wav.encode_ima_adpcm_wav(&mono_src) or >>
+    dec_mono := wav.decode(&adpcm_mono_bytes) or >>
+    assert(dec_mono.sample_rate() == 24000 && dec_mono.channel_count() == 1)
+    assert(dec_mono.frame_count() == mono_src.frame_count())
+    assert(f64(mono_src.sample_count() * 2) / f64(adpcm_mono_bytes.len) > 3.7)
+
+    // Corrupt IMA ADPCM fmt block_align (byte 32 -> 7) must fail cleanly.
+    $bad_align := []int{}
+    for i in 0:adpcm_mono_bytes.len { bad_align.push(adpcm_mono_bytes[i] & 255) }
+    bad_align[32] = 7
+    bad_str := string_from_bytes(bad_align)
+    assert(check_adpcm_corrupt(&bad_str))
+
+    // 2. Per-Bus Audio DSP: Biquad Lowpass / Highpass / Bandpass + Delay + Stereo Reverb + Preview Snapshot Purity.
+    bass := make_sine_mono(24000, 2400, 200.0, 14000.0) or >>
+    treble := make_sine_mono(24000, 2400, 6500.0, 14000.0) or >>
+    burst := make_sine_mono(24000, 240, 1200.0, 16000.0) or >>
+
+    $mx := mix.new_mixer(24000, 16) or >>
+    c_bass := mx.add_clip(bass) or >>
+    c_treble := mx.add_clip(treble) or >>
+    c_burst := mx.add_clip(burst) or >>
+
+    b_lp := mx.add_bus(0, "LP", 1.0) or >>
+    mx.enable_bus_lowpass(b_lp, 700.0, 0.707) or >>
+    b_hp := mx.add_bus(0, "HP", 1.0) or >>
+    mx.enable_bus_highpass(b_hp, 3000.0, 0.707) or >>
+    b_fx := mx.add_bus(0, "FX", 1.0) or >>
+    mx.enable_bus_delay(b_fx, 0.03, 0.55, 0.65) or >>
+    mx.enable_bus_reverb(b_fx, 0.85, 0.25, 0.60) or >>
+
+    // Lowpass must pass 200Hz cleanly and crush 6500Hz.
+    vlp_b := mx.play(c_bass, b_lp, 1.0, 0.0, false) or >>
+    s_lp_bass := mx.render(2400) or >>
+    mx.stop(vlp_b) or >>
+    mx.clear_bus_dsp(b_lp) or >>
+    mx.enable_bus_lowpass(b_lp, 700.0, 0.707) or >>
+    vlp_t := mx.play(c_treble, b_lp, 1.0, 0.0, false) or >>
+    s_lp_treb := mx.render(2400) or >>
+    mx.stop(vlp_t) or >>
+    rms_lp_bass := channel_rms(&s_lp_bass, 0)
+    rms_lp_treb := channel_rms(&s_lp_treb, 0)
+    assert(rms_lp_bass > 7000.0 && rms_lp_treb < rms_lp_bass / 12.0)
+
+    // Highpass must pass 6500Hz cleanly and crush 200Hz.
+    vhp_t := mx.play(c_treble, b_hp, 1.0, 0.0, false) or >>
+    s_hp_treb := mx.render(2400) or >>
+    mx.stop(vhp_t) or >>
+    mx.clear_bus_dsp(b_hp) or >>
+    mx.enable_bus_highpass(b_hp, 3000.0, 0.707) or >>
+    vhp_b := mx.play(c_bass, b_hp, 1.0, 0.0, false) or >>
+    s_hp_bass := mx.render(2400) or >>
+    mx.stop(vhp_b) or >>
+    rms_hp_treb := channel_rms(&s_hp_treb, 0)
+    rms_hp_bass := channel_rms(&s_hp_bass, 0)
+    assert(rms_hp_treb > 7000.0 && rms_hp_bass < rms_hp_treb / 10.0)
+
+    // Delay + Reverb preview immutability and ringing stereo tail after dry voice ends.
+    v_fx := mx.play(c_burst, b_fx, 1.0, 0.0, false) or >>
+    p_a := mx.prepare(480) or >>
+    p_b := mx.prepare(480) or >>
+    for k in 0:p_a.samples.len { assert(p_a.samples[k] == p_b.samples[k]) }
+    mx.commit(&p_a) or >>
+    assert(!mx.is_playing(v_fx)) // 240-frame burst finished within 480-frame commit
+    tail := mx.render(2400) or >> // Zero playing voices -> pure delay/reverb tail!
+    tail_rms_l := channel_rms(&tail, 0)
+    tail_rms_r := channel_rms(&tail, 1)
+    assert(tail_rms_l > 450.0 && tail_rms_r > 450.0)
+    $lr_diff := 0
+    for f in 0:2400 {
+        if tail[f * 2] != tail[f * 2 + 1] { lr_diff += 1 }
+    }
+    assert(lr_diff > 100) // Stereo decorrelated reverb taps produce non-identical L/R tail!
+
+    // 3. glTF TRS Pose Cross-Fade Blending (formats/gltf.sample_blended_pose).
+    glb_str := build_two_clip_glb()
+    asset := gltf.decode_glb_geometry(&glb_str) or >>
+    assert(asset.animation_count() == 2)
+    blended := asset.sample_blended_pose(0, 1.0, 1, 1.0, 0.5) or >>
+    assert(blended.len >= 3)
+    m_joint := blended[1]
+    // Translation blends linearly: 0.5 * (4,0,0) + 0.5 * (0,2,0) = (2, 1, 0).
+    assert(math.abs(m_joint.c3.x - 2.0) < 0.001 && math.abs(m_joint.c3.y - 1.0) < 0.001)
+    // Scale (1 -> 3 at t=0.5 = 2.0) + SLERP Y rotation (0 -> 90deg at t=0.5 = 45deg) -> c0.x = 2*cos(45)=1.4142, c0.z = -1.4142!
+    assert(math.abs(m_joint.c0.x - math.sqrt(2.0)) < 0.002)
+    assert(math.abs(m_joint.c0.z + math.sqrt(2.0)) < 0.002)
+    assert(math.abs(m_joint.c1.y - 2.0) < 0.002)
+
+    ratio_x100 := int(math.round_to_even(ratio * 100.0))
+    snr_x10 := int(math.round_to_even(snr_db * 10.0))
+    println("PASS: IMA ADPCM 0x0011 (ratio=" + str(ratio_x100 / 100) + "." + str(ratio_x100 % 100) +
+        ", snr=" + str(snr_x10 / 10) + "." + str(snr_x10 % 10) +
+        "dB) + Bus DSP (LP=" + str(int(rms_lp_bass)) + "/" + str(int(rms_lp_treb)) +
+        ", HP=" + str(int(rms_hp_treb)) + "/" + str(int(rms_hp_bass)) +
+        ", tail_rms=" + str(int(tail_rms_l)) + ") + glTF Pose Blend (SLERP 45deg, s=2.0)")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

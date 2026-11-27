@@ -1,0 +1,387 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct LightGpu {
+    float4 position_kind;
+    float4 direction_range;
+    float4 radiance_inner;
+    float4 cone;
+};
+
+struct ProbeShGpu {
+    float4 dc; // xyz=dc, w=validity
+    float4 px;
+    float4 py;
+    float4 pz;
+};
+
+struct BvhNodeGpu {
+    float4 bmin_left;  // xyz=aabb_min, w=(leaf ? float(first_tri) : float(left_child))
+    float4 bmax_right; // xyz=aabb_max, w=(leaf ? float(tri_count) : -float(right_child))
+};
+
+struct RtTriGpu {
+    float4 v0_mat; // xyz=v0, w=float(mat_id)
+    float4 e1_pad; // xyz=v1 - v0
+    float4 e2_pad; // xyz=v2 - v0
+    float4 n_ds;   // xyz=unit_normal, w=(double_sided >= 0.5)
+};
+
+struct RtMatGpu {
+    float4 albedo_rough;   // rgb=albedo, w=roughness
+    float4 emission_metal; // rgb=emission, w=metallic
+};
+
+struct DdgiTraceUniform {
+    float4 origin_nx;       // xyz=origin, w=nx
+    float4 spacing_ny;      // xyz=spacing, w=ny
+    float4 dims_rays;       // x=nz, y=rays_per_probe, z=frame_index, w=max_ray_distance
+    float4 counts;          // x=bvh_node_count, y=tri_count, z=light_count, w=bounce_scale
+    float4 sky_color_dir;   // rgb=sky_radiance, w=direct_scale
+    float4 ground_color_emi;// rgb=ground_radiance, w=emissive_scale
+    float4 rot_row0;        // xyz=row0, w=has_prev_probes
+    float4 rot_row1;        // xyz=row1, w=shadow_bias
+    float4 rot_row2;        // xyz=row2, w=0
+    float4 ambient_pad;     // rgb=ambient_radiance, w=0
+    float4 pad0;
+    float4 pad1;
+};
+
+static inline float3 fibonacci_dir(
+    uint ray_idx,
+    uint ray_count,
+    float3 r0,
+    float3 r1,
+    float3 r2
+) {
+    float n = max(float(ray_count), 1.0);
+    float fi = float(ray_idx) + 0.5;
+    float phi = 2.399963229728653 * float(ray_idx); // 2*PI / golden_ratio^2
+    float cos_theta = 1.0 - 2.0 * fi / n;
+    float sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
+    float3 d = float3(cos(phi) * sin_theta, cos_theta, sin(phi) * sin_theta);
+    float3 rot = float3(dot(r0, d), dot(r1, d), dot(r2, d));
+    return normalize(rot);
+}
+
+static inline bool intersect_aabb(
+    float3 ro,
+    float3 inv_rd,
+    float3 bmin,
+    float3 bmax,
+    float t_max,
+    thread float& out_tmin
+) {
+    float3 t0 = (bmin - ro) * inv_rd;
+    float3 t1 = (bmax - ro) * inv_rd;
+    float3 tsmaller = min(t0, t1);
+    float3 tbigger = max(t0, t1);
+    float tmin = max(0.0, max(tsmaller.x, max(tsmaller.y, tsmaller.z)));
+    float tmax = min(t_max, min(tbigger.x, min(tbigger.y, tbigger.z)));
+    out_tmin = tmin;
+    return tmin <= tmax;
+}
+
+static inline bool intersect_tri(
+    float3 ro,
+    float3 rd,
+    RtTriGpu tri,
+    float t_min,
+    float t_max,
+    thread float& out_t
+) {
+    float3 v0 = tri.v0_mat.xyz;
+    float3 e1 = tri.e1_pad.xyz;
+    float3 e2 = tri.e2_pad.xyz;
+    float3 pvec = cross(rd, e2);
+    float det = dot(e1, pvec);
+    if (abs(det) < 1e-7) return false;
+    float inv_det = 1.0 / det;
+    float3 tvec = ro - v0;
+    float u = dot(tvec, pvec) * inv_det;
+    if (u < -1e-5 || u > 1.00001) return false;
+    float3 qvec = cross(tvec, e1);
+    float v = dot(rd, qvec) * inv_det;
+    if (v < -1e-5 || (u + v) > 1.00002) return false;
+    float t = dot(e2, qvec) * inv_det;
+    if (t <= t_min || t >= t_max) return false;
+    out_t = t;
+    return true;
+}
+
+static inline float3 make_inv_dir(float3 rd) {
+    return float3(
+        abs(rd.x) > 1e-8 ? (1.0 / rd.x) : (rd.x >= 0.0 ? 1e8 : -1e8),
+        abs(rd.y) > 1e-8 ? (1.0 / rd.y) : (rd.y >= 0.0 ? 1e8 : -1e8),
+        abs(rd.z) > 1e-8 ? (1.0 / rd.z) : (rd.z >= 0.0 ? 1e8 : -1e8)
+    );
+}
+
+static inline int trace_closest(
+    float3 ro,
+    float3 rd,
+    float max_dist,
+    device const BvhNodeGpu* nodes,
+    uint node_count,
+    device const RtTriGpu* tris,
+    uint tri_count,
+    thread float& out_t
+) {
+    out_t = max_dist;
+    int best_tri = -1;
+    if (node_count == 0u || tri_count == 0u) return -1;
+
+    float3 inv_rd = make_inv_dir(rd);
+    uint stack[32];
+    int sp = 0;
+    stack[sp++] = 0u;
+
+    while (sp > 0) {
+        uint ni = stack[--sp];
+        if (ni >= node_count) continue;
+        BvhNodeGpu node = nodes[ni];
+        float box_t = 0.0;
+        if (!intersect_aabb(ro, inv_rd, node.bmin_left.xyz, node.bmax_right.xyz, out_t, box_t)) {
+            continue;
+        }
+        if (node.bmax_right.w > 0.5) {
+            uint first = uint(max(0.0, node.bmin_left.w));
+            uint cnt = uint(node.bmax_right.w);
+            uint end = min(first + cnt, tri_count);
+            for (uint ti = first; ti < end; ++ti) {
+                float hit_t = 0.0;
+                if (intersect_tri(ro, rd, tris[ti], 1e-4, out_t, hit_t)) {
+                    out_t = hit_t;
+                    best_tri = int(ti);
+                }
+            }
+        } else {
+            uint left = uint(max(0.0, node.bmin_left.w));
+            uint right = uint(max(0.0, -node.bmax_right.w));
+            float tl = 0.0;
+            float tr = 0.0;
+            bool hl = (left < node_count) && intersect_aabb(ro, inv_rd, nodes[left].bmin_left.xyz, nodes[left].bmax_right.xyz, out_t, tl);
+            bool hr = (right < node_count) && intersect_aabb(ro, inv_rd, nodes[right].bmin_left.xyz, nodes[right].bmax_right.xyz, out_t, tr);
+            if (hl && hr) {
+                if (tl < tr) {
+                    if (sp < 31) stack[sp++] = right;
+                    if (sp < 31) stack[sp++] = left;
+                } else {
+                    if (sp < 31) stack[sp++] = left;
+                    if (sp < 31) stack[sp++] = right;
+                }
+            } else if (hl) {
+                if (sp < 31) stack[sp++] = left;
+            } else if (hr) {
+                if (sp < 31) stack[sp++] = right;
+            }
+        }
+    }
+    return best_tri;
+}
+
+static inline bool trace_any_hit(
+    float3 ro,
+    float3 rd,
+    float t_min,
+    float t_max,
+    device const BvhNodeGpu* nodes,
+    uint node_count,
+    device const RtTriGpu* tris,
+    uint tri_count
+) {
+    if (node_count == 0u || tri_count == 0u || t_max <= t_min) return false;
+    float3 inv_rd = make_inv_dir(rd);
+    uint stack[32];
+    int sp = 0;
+    stack[sp++] = 0u;
+
+    while (sp > 0) {
+        uint ni = stack[--sp];
+        if (ni >= node_count) continue;
+        BvhNodeGpu node = nodes[ni];
+        float box_t = 0.0;
+        if (!intersect_aabb(ro, inv_rd, node.bmin_left.xyz, node.bmax_right.xyz, t_max, box_t)) {
+            continue;
+        }
+        if (node.bmax_right.w > 0.5) {
+            uint first = uint(max(0.0, node.bmin_left.w));
+            uint cnt = uint(node.bmax_right.w);
+            uint end = min(first + cnt, tri_count);
+            for (uint ti = first; ti < end; ++ti) {
+                float hit_t = 0.0;
+                if (intersect_tri(ro, rd, tris[ti], t_min, t_max, hit_t)) {
+                    return true;
+                }
+            }
+        } else {
+            uint left = uint(max(0.0, node.bmin_left.w));
+            uint right = uint(max(0.0, -node.bmax_right.w));
+            if (left < node_count && sp < 31) stack[sp++] = left;
+            if (right < node_count && sp < 31) stack[sp++] = right;
+        }
+    }
+    return false;
+}
+
+static inline float3 sample_prev_sh_valid(
+    device const ProbeShGpu* probes,
+    constant DdgiTraceUniform& u,
+    float3 world,
+    float3 n
+) {
+    int nx = int(u.origin_nx.w);
+    int ny = int(u.spacing_ny.w);
+    int nz = int(u.dims_rays.x);
+    if (nx <= 0 || ny <= 0 || nz <= 0) return float3(0.0);
+
+    float3 rel = (world - u.origin_nx.xyz) / max(u.spacing_ny.xyz, float3(1e-4));
+    float fx = clamp(rel.x, 0.0, float(max(nx - 1, 0)));
+    float fy = clamp(rel.y, 0.0, float(max(ny - 1, 0)));
+    float fz = clamp(rel.z, 0.0, float(max(nz - 1, 0)));
+
+    int x0 = min(int(floor(fx)), max(nx - 1, 0));
+    int y0 = min(int(floor(fy)), max(ny - 1, 0));
+    int z0 = min(int(floor(fz)), max(nz - 1, 0));
+    int x1 = min(x0 + 1, max(nx - 1, 0));
+    int y1 = min(y0 + 1, max(ny - 1, 0));
+    int z1 = min(z0 + 1, max(nz - 1, 0));
+
+    float tx = fx - float(x0);
+    float ty = fy - float(y0);
+    float tz = fz - float(z0);
+
+    float3 sum_irr = float3(0.0);
+    float sum_w = 0.0;
+    for (int dz = 0; dz < 2; ++dz) {
+        int iz = (dz == 0) ? z0 : z1;
+        float wz = (dz == 0) ? (1.0 - tz) : tz;
+        for (int dy = 0; dy < 2; ++dy) {
+            int iy = (dy == 0) ? y0 : y1;
+            float wy = (dy == 0) ? (1.0 - ty) : ty;
+            for (int dx = 0; dx < 2; ++dx) {
+                int ix = (dx == 0) ? x0 : x1;
+                float wx = (dx == 0) ? (1.0 - tx) : tx;
+                uint pid = uint((iz * ny + iy) * nx + ix);
+                ProbeShGpu sh = probes[pid];
+                if (sh.dc.w < 0.5) continue;
+                float w = wx * wy * wz;
+                float3 e = max(sh.dc.xyz + sh.px.xyz * n.x + sh.py.xyz * n.y + sh.pz.xyz * n.z, float3(0.0));
+                sum_irr += e * w;
+                sum_w += w;
+            }
+        }
+    }
+    return sum_w > 1e-5 ? (sum_irr / sum_w) : float3(0.0);
+}
+
+kernel void main0(
+    constant DdgiTraceUniform& u [[buffer(0)]],
+    device const BvhNodeGpu* bvh_nodes [[buffer(1)]],
+    device const RtTriGpu* rt_tris [[buffer(2)]],
+    device const RtMatGpu* rt_mats [[buffer(3)]],
+    device const LightGpu* lights [[buffer(4)]],
+    device const ProbeShGpu* prev_probes [[buffer(5)]],
+    device float4* ray_results [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint nx = uint(u.origin_nx.w);
+    uint ny = uint(u.spacing_ny.w);
+    uint nz = uint(u.dims_rays.x);
+    uint rays_per_probe = uint(u.dims_rays.y);
+    uint probe_count = nx * ny * nz;
+    uint total_rays = probe_count * rays_per_probe;
+    if (gid >= total_rays) return;
+
+    uint probe_idx = gid / rays_per_probe;
+    uint ray_idx = gid - probe_idx * rays_per_probe;
+
+    uint slice_xy = nx * ny;
+    uint iz = probe_idx / slice_xy;
+    uint rem = probe_idx - iz * slice_xy;
+    uint iy = rem / nx;
+    uint ix = rem - iy * nx;
+
+    float3 probe_pos = u.origin_nx.xyz + float3(float(ix), float(iy), float(iz)) * u.spacing_ny.xyz;
+    float3 rd = fibonacci_dir(ray_idx, rays_per_probe, u.rot_row0.xyz, u.rot_row1.xyz, u.rot_row2.xyz);
+
+    uint node_count = uint(u.counts.x);
+    uint tri_count = uint(u.counts.y);
+    float max_dist = u.dims_rays.w;
+    float hit_t = max_dist;
+    int hit_tri = trace_closest(probe_pos, rd, max_dist, bvh_nodes, node_count, rt_tris, tri_count, hit_t);
+
+    if (hit_tri < 0) {
+        float t_sky = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
+        float3 sky = mix(u.ground_color_emi.rgb, u.sky_color_dir.rgb, t_sky);
+        ray_results[gid] = float4(max(sky, float3(0.0)), max_dist);
+        return;
+    }
+
+    RtTriGpu tri = rt_tris[uint(hit_tri)];
+    float3 n = tri.n_ds.xyz;
+    float facing = dot(rd, n);
+    if (facing > 0.0) {
+        if (tri.n_ds.w < 0.5) {
+            // Backface hit indicates probe may be inside enclosed geometry.
+            ray_results[gid] = float4(0.0, 0.0, 0.0, -hit_t);
+            return;
+        }
+        n = -n;
+    }
+
+    uint mat_idx = uint(max(0.0, tri.v0_mat.w));
+    RtMatGpu mat = rt_mats[mat_idx];
+    float3 diffuse_albedo = max(mat.albedo_rough.rgb, float3(0.0)) * (1.0 - clamp(mat.emission_metal.w, 0.0, 1.0));
+    float3 rad = max(mat.emission_metal.rgb, float3(0.0)) * u.ground_color_emi.w +
+        u.ambient_pad.rgb * diffuse_albedo;
+
+    float3 hit_p = probe_pos + rd * hit_t;
+    float bias = max(u.rot_row1.w, 0.002);
+    float3 shadow_ro = hit_p + n * bias;
+
+    uint lcount = min(uint(u.counts.z), 64u);
+    float dir_scale = u.sky_color_dir.w;
+    if (dir_scale > 0.0) {
+        for (uint li = 0u; li < lcount; ++li) {
+            LightGpu src = lights[li];
+            float3 ldir = src.direction_range.xyz;
+            float atten = 1.0;
+            float shadow_max = max_dist;
+            if (src.position_kind.w > 0.5) {
+                float3 delta = src.position_kind.xyz - hit_p;
+                float d2 = dot(delta, delta);
+                float r2 = src.direction_range.w * src.direction_range.w;
+                if (d2 < 1e-10 || d2 >= r2) continue;
+                float d = sqrt(d2);
+                ldir = delta / d;
+                float rel2 = d2 / r2;
+                float edge = max(0.0, 1.0 - rel2 * rel2);
+                atten = edge * edge / max(d2, 0.0001);
+                if (src.position_kind.w > 1.5) {
+                    float cos_a = dot(src.direction_range.xyz, -ldir);
+                    float sp = clamp((cos_a - src.cone.x) / max(src.radiance_inner.w - src.cone.x, 1e-6), 0.0, 1.0);
+                    atten *= sp * sp * (3.0 - 2.0 * sp);
+                }
+                shadow_max = max(d - bias * 2.0, 0.002);
+            } else {
+                ldir = normalize(ldir);
+            }
+            float nl = max(dot(n, ldir), 0.0);
+            if (nl <= 0.0) continue;
+            if (trace_any_hit(shadow_ro, ldir, 0.001, shadow_max, bvh_nodes, node_count, rt_tris, tri_count)) {
+                continue;
+            }
+            rad += (diffuse_albedo / 3.14159265359) * src.radiance_inner.xyz * atten * nl * dir_scale;
+        }
+    }
+
+    // Multi-bounce indirect illumination from previous temporal DDGI irradiance probes.
+    if (u.rot_row0.w > 0.5 && u.counts.w > 0.0) {
+        float3 prev_irr = sample_prev_sh_valid(prev_probes, u, hit_p + n * 0.05, n);
+        rad += diffuse_albedo * prev_irr * u.counts.w;
+    }
+
+    rad = clamp(rad, float3(0.0), float3(32.0));
+    ray_results[gid] = float4(rad, hit_t);
+}

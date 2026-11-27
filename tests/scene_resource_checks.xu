@@ -7,6 +7,13 @@ resource #"github.com/xulang-org/nexus/resources/scene"
 
 fn rejected(raw &string) bool { codec.decode(raw) or (err) { << true }
     << false }
+fn exceeds_json_budget(document &resource.Document) bool {
+    codec.encode(document) or (err) {
+        message := err.msg()
+        << strings.contains(&message, "JSON node budget")
+    }
+    << false
+}
 fn run() int {
     raw := os.read("build/scene-asset-fixtures/base.xuscene") or >>
     document := codec.decode(&raw) or >>
@@ -21,6 +28,20 @@ fn run() int {
     original := os.read("examples/scene_assets/assets/world.xuscene") or >>
     gallery := codec.decode(&original) or >>
     assert(gallery.node_count() == 10 && gallery.surface_count() == 8 && gallery.resource_count() == 1)
+    lod_raw := os.read("build/scene-asset-fixtures/lod-authored.xuscene") or >>
+    lod_document := codec.decode(&lod_raw) or >>
+    assert(lod_document.surface_count() == 1 && lod_document.resource_count() == 2)
+    $lod_surface := lod_document.surface(0) or >>
+    assert(lod_surface.levels.len == 1 && lod_surface.levels[0].resource_uid == (lod_document.resource(1) or >>).uid)
+    policy := lod_surface.distance_policy() or >>
+    assert((policy.threshold(0) or >>) == 2.123456789012345 && policy.hysteresis() == 0.125)
+    edited := $&lod_surface.levels[0]
+    edited.distance = 3.0
+    assert((lod_document.surface(0) or >>).levels[0].distance == 2.123456789012345)
+    lod_canonical := codec.encode(&lod_document) or >>
+    assert(strings.contains(&lod_canonical, "\"version\":6"))
+    lod_restored := codec.decode(&lod_canonical) or >>
+    assert(lod_canonical == (codec.encode(&lod_restored) or >>))
     // A maximum-size document shares one source model across all surface nodes.
     $nodes := []resource.NodeData{}
     $surfaces := []resource.Surface{}
@@ -28,13 +49,24 @@ fn run() int {
         $parent := 0
         if i == 0 { parent = -1 }
         nodes.push(resource.node(parent, "n" + str(i), resource.NODE_3D))
-        surfaces.push(resource.Surface{node: i, resource_uid: reference.uid + "", primitive: 0})
+        surfaces.push(resource.surface(i, reference.uid + "", 0))
     }
     plain := resource.make_document(nodes) or >>
     largest := resource.with_attachments(&plain, [reference], surfaces, []resource.AudioBus{}, []resource.AudioEmitter{}, []resource.ScriptAttachment{}, []resource.ScriptConnection{}, []resource.LightAttachment{}) or >>
     largest_raw := codec.encode(&largest) or >>
     largest_loaded := codec.decode(&largest_raw) or >>
     assert(largest_loaded.surface_count() == 4096 && largest_loaded.node_count() == 4096)
+    dense_reference := largest_loaded.resource(0) or >>
+    $dense_lods := []resource.Surface{}
+    for i in 0:plain.node_count() {
+        uid := dense_reference.uid + ""
+        $surface := resource.surface(i, uid + "", 0)
+        surface.levels.push(resource.SurfaceLevel{distance: 2.0, resource_uid: uid, primitive: 0})
+        dense_lods.push(surface)
+    }
+    dense := resource.with_attachments(&plain, [dense_reference], dense_lods, []resource.AudioBus{}, []resource.AudioEmitter{},
+        []resource.ScriptAttachment{}, []resource.ScriptConnection{}, []resource.LightAttachment{}) or >>
+    assert(exceeds_json_budget(&dense))
     failures := os.read("build/scene-asset-fixtures/reject-list.txt") or >>
     rows := strings.split(&failures, "\n")
     $count := 0
@@ -45,7 +77,7 @@ fn run() int {
             assert(false) }
         count = count + 1
     }
-    println("PASS: pinned resource/surface descriptors, canonical roundtrip, original PBR gallery, 4096 shared surfaces and " + str(count) + " strict rejection cases")
+    println("PASS: pinned resource/surface and LOD descriptors, canonical roundtrip, original PBR gallery, 4096 shared surfaces and " + str(count) + " strict rejection cases")
     << 0
 }
 fn main() int { << run() or (err) { eprintln(err.msg())

@@ -1,0 +1,150 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+project #"github.com/xulang-org/nexus/integration/project"
+#errors
+#math
+#os
+#ui
+#ui/draw
+
+const START_WIDTH = 1120
+const START_HEIGHT = 700
+const MIN_WIDTH = 820
+const MIN_HEIGHT = 520
+
+fn wait_canvas(events chan ui.Event) ui.Event {
+    while true {
+        event := <- events
+        if event.kind == ui.EV_CANVAS_READY { << event }
+        if event.kind == ui.EV_WINDOW_FAILED || event.kind == ui.EV_EXIT {
+            >> errors.new("could not open the tile editor window")
+        }
+    }
+}
+
+fn route_input(context &draw.Context, editor $&TileEditor, packet &ui.InputEvent) bool {
+    << editor.input(context, packet.kind, packet.button, fm.vec2(packet.x, packet.y), packet.dy, packet.key,
+        packet.modifiers) or (err) {
+        editor.status = err.msg()
+        << true
+    }
+}
+
+fn work(events chan ui.Event, window ui.Window, draft TileDraft, check_output string) int {
+    ready := wait_canvas(events) or >>
+    context := draw.context_of(&ready) or >>
+    identity := ui.canvas_of(&ready) or >>
+    window.content_command("input_enabled\t1") or >>
+    window.content_command("pan_enabled\t0") or >>
+    ui.native_set_min_size(MIN_WIDTH, MIN_HEIGHT) or >>
+    $editor := open_editor(&context, draft, f64(START_WIDTH), f64(START_HEIGHT)) or >>
+    $frame := context.new_frame(16384)
+    if check_output.len > 0 {
+        << run_editor_check(&context, $&editor, $&frame, check_output) or >>
+    }
+    editor.record($&frame) or >>
+    frame.present() or >>
+    $guarded := false
+    $confirming := false
+    while true {
+        event := <- events
+        if event.kind == ui.EV_EXIT || (event.window_id == identity.window_id && event.kind == ui.EV_CANVAS_CLOSED) { <- }
+        if event.kind == ui.EV_CONFIRM && confirming {
+            confirming = false
+            if event.menu_id == "1" {
+                ui.native_accept_close() or >>
+                <-
+            }
+            ui.native_reject_close() or >>
+        }
+        if event.window_id != identity.window_id { -> }
+        $repaint := false
+        if event.kind == ui.EV_CLOSE_REQUESTED {
+            dirty := editor.draft.dirty() || editor.changed
+            if !dirty {
+                ui.native_accept_close() or >>
+                <-
+            }
+            if !confirming {
+                ui.native_confirm("Discard tile edits?", "Changes since the last save will be lost.") or >>
+                confirming = true
+            }
+        } else if event.kind == ui.EV_CANVAS_METRICS {
+            editor.resize(fm.vec2(math.max(f64(MIN_WIDTH), f64(event.width)), math.max(f64(MIN_HEIGHT), f64(event.height))))
+            repaint = true
+        } else if event.kind == ui.EV_BLURRED {
+            editor.cancel_stroke() or >>
+            repaint = true
+        } else if ui.is_input_event(event.kind) {
+            packet := ui.input_of(&event) or >>
+            if packet.generation != identity.generation { -> }
+            repaint = route_input(&context, $&editor, &packet)
+        }
+        next_guard := editor.draft.dirty() || editor.changed
+        if guarded != next_guard {
+            $mode := 0
+            if next_guard { mode = 1 }
+            ui.native_set_close_guard(mode) or >>
+            guarded = next_guard
+        }
+        if repaint {
+            editor.record($&frame) or >>
+            frame.present() or >>
+        }
+    }
+    frame.dispose()
+    << 0
+}
+
+fn work_message(events chan ui.Event, window ui.Window, draft TileDraft, check_output string) string {
+    work(events, window, draft, check_output) or (err) { << err.msg() }
+    << ""
+}
+
+fn worker(events chan ui.Event, window ui.Window, draft TileDraft, check_output string, result chan string) {
+    message := work_message(events, window, draft, check_output)
+    result <- message
+    ui.append_shell_cmd("quit_app") or (err) { eprintln(err.msg())
+        << }
+}
+
+fn run() int {
+    args := os.args()
+    $check_output := ""
+    $path := ""
+    if args.len == 4 && args[1] == "--project" {
+        pkg := project.load_project(args[2] + "") or >>
+        key := args[3] + ""
+        index := pkg.scene_index(&key)
+        if index < 0 { >> errors.new("scene is not listed in the project") }
+        path = pkg.scene_source(index) or >>
+    } else if args.len == 4 && args[2] == "--check" {
+        path = args[1] + ""
+        check_output = args[3] + ""
+    }
+    else if args.len != 2 || args[1] == "--help" {
+        println("Usage: nexus-tilemap-editor <scene.xuscene>")
+        println("       nexus-tilemap-editor --project <project.json> <published scene name>")
+        if args.len == 2 { << 0 }
+        << 1
+    }
+    if path.len == 0 { path = args[1] + "" }
+    draft := open_draft(path) or >>
+    $app := ui.new_app()
+    $window := app.open_window(ui.WindowOpts{title: "Nexus TileMap Editor", width: START_WIDTH, height: START_HEIGHT}) or >>
+    draw.attach($&window) or >>
+    result := chan string{cap: 1}
+    xu worker(app.event_ch, window, draft, check_output, result)
+    app.run() or >>
+    error := <- result
+    if error.len > 0 { >> errors.new(error) }
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

@@ -1,0 +1,127 @@
+@main
+
+plat #"github.com/xulang-org/nexus/platform/console"
+cs #"github.com/xulang-org/nexus/console"
+rc #"github.com/xulang-org/nexus/resources/console"
+#os
+
+fn to_bytes(s string) []u8 {
+    << plat.str_to_u8(&s)
+}
+
+fn from_bytes(buf &[]u8) string {
+    << plat.u8_to_str(buf, buf.len)
+}
+
+fn run() int {
+    mode := os.getenv("NEXUS_CONSOLE_TEST_MODE")
+    $xcfg := rc.default_xbox_config()
+    xcfg.achievement_ids = ["XB_NATIVE_WIN"]
+    $pcfg := rc.default_ps_config()
+    pcfg.trophies = [
+        rc.PsTrophyDef{trophy_id: 7, grade: rc.TROPHY_GOLD, name: "PS Native Gold", is_progress: false, target_value: 0, hidden: false}
+    ]
+    pcfg.activities = [rc.PsActivityDef{activity_id: "raid_01", name: "Raid 01", category: "competitive"}]
+    $swcfg := rc.default_switch_config()
+    swcfg.aoc_indices = [3]
+
+    if mode == "missing" {
+        assert(plat.raw_is_available(rc.PLATFORM_XBOX_SERIES_X) == 0)
+        assert(plat.raw_is_available(rc.PLATFORM_PS5) == 0)
+        assert(plat.raw_is_available(rc.PLATFORM_SWITCH) == 0)
+        $xb := cs.init_xbox_auto(xcfg, rc.PLATFORM_XBOX_SERIES_X, "") or >>
+        assert(!xb.is_native() && xb.backend_name() == "console_mock")
+        xb.shutdown() or >>
+        $ps := cs.init_ps_auto(pcfg, rc.PLATFORM_PS5, "") or >>
+        assert(!ps.is_native() && ps.backend_name() == "console_mock")
+        ps.shutdown() or >>
+        $sw := cs.init_switch_auto(swcfg, rc.PLATFORM_SWITCH, "") or >>
+        assert(!sw.is_native() && sw.backend_name() == "console_mock")
+        sw.shutdown() or >>
+        println("PASS: console_native_checks missing-driver fallback")
+        << 0
+    }
+
+    if mode == "xbox" {
+        assert(plat.raw_is_available(rc.PLATFORM_XBOX_SERIES_X) == 1)
+        $xb := cs.init_xbox_native(xcfg, rc.PLATFORM_XBOX_SERIES_X) or >>
+        assert(xb.is_native() && xb.is_xbox() && xb.safe_area_percent() == 90)
+        u := xb.primary_user()
+        assert(u.signed_in && u.display_name == "XboxFakeTag" && u.has_multiplayer_privilege && u.crossplay_allowed)
+        xb.unlock_achievement("XB_NATIVE_WIN", 0) or >>
+        assert(xb.has_achievement("XB_NATIVE_WIN", 0))
+        payload := to_bytes("xbox-xgamesave-blob")
+        xb.save_write("saves", "slot0.bin", &payload) or >>
+        assert(xb.save_exists("saves", "slot0.bin"))
+        got := xb.save_read("saves", "slot0.bin") or >>
+        assert(from_bytes(&got) == "xbox-xgamesave-blob")
+        assert(xb.has_entitlement("9NX0DLC00001"))
+        $h := rc.default_haptic_command()
+        h.left_trigger_rumble = 0.8
+        xb.apply_haptics(0, h) or >>
+        assert(xb.create_session(4, true) == 8801)
+        xb.poll() or >>
+        xb.shutdown() or >>
+        println("PASS: console_native_checks xbox dlopen C ABI")
+        << 0
+    }
+
+    if mode == "switch" {
+        assert(plat.raw_is_available(rc.PLATFORM_SWITCH) == 1)
+        $sw := cs.init_switch_native(swcfg, rc.PLATFORM_SWITCH) or >>
+        assert(sw.is_native() && sw.is_switch() && sw.operation_mode() == rc.OPERATION_MODE_DOCKED)
+        assert(sw.npad_style() == rc.NPAD_PRO_CONTROLLER && sw.safe_area_percent() == 90)
+        assert(sw.confirm_button_layout() == rc.CONFIRM_SWITCH_A_EAST)
+        su := sw.primary_user()
+        assert(su.signed_in && su.display_name == "SwitchFakeUser")
+        assert(sw.has_aoc(3))
+        $sh := rc.default_haptic_command()
+        sh.low_freq_motor = 0.7
+        sh.hd_rumble_freq_low = 160.0
+        sh.hd_rumble_freq_high = 320.0
+        sw.apply_haptics(0, sh) or >>
+        sp := to_bytes("switch-savedata-blob")
+        sw.save_write("save", "slot0.bin", &sp) or >>
+        sgot := sw.save_read("save", "slot0.bin") or >>
+        assert(from_bytes(&sgot) == "switch-savedata-blob")
+        sw.poll() or >>
+        sw.shutdown() or >>
+        println("PASS: console_native_checks switch dlopen C ABI")
+        << 0
+    }
+
+    assert(plat.raw_is_available(rc.PLATFORM_PS5) == 1)
+    $ps := cs.init_ps_native(pcfg, rc.PLATFORM_PS5) or >>
+    assert(ps.is_native() && ps.is_playstation() && ps.safe_area_percent() == 90)
+    assert(ps.confirm_button_layout() == rc.CONFIRM_CIRCLE_B)
+    pu := ps.primary_user()
+    assert(pu.signed_in && pu.display_name == "PSNFakeOnlineId")
+    ps.unlock_achievement("", 7) or >>
+    assert(ps.has_achievement("", 7))
+    ps.start_activity("raid_01") or >>
+    ps.set_presence("In Raid", "raid_01") or >>
+    $ph := rc.default_haptic_command()
+    ph.right_adaptive = rc.AdaptiveTriggerEffect{mode: rc.TRIGGER_WEAPON, start_position: 2, end_position: 6, strength: 7, frequency: 0}
+    ph.lightbar_r = 200
+    ph.lightbar_g = 30
+    ph.lightbar_b = 40
+    ps.apply_haptics(0, ph) or >>
+    pp := to_bytes("ps-savedata-payload")
+    ps.save_write("SAVEDATA", "slot0.bin", &pp) or >>
+    pgot := ps.save_read("SAVEDATA", "slot0.bin") or >>
+    assert(from_bytes(&pgot) == "ps-savedata-payload")
+    assert(ps.has_entitlement("SEASONPASS000001"))
+    ps.end_activity("raid_01", rc.ACTIVITY_COMPLETED) or >>
+    ps.poll() or >>
+    ps.shutdown() or >>
+    println("PASS: console_native_checks playstation dlopen C ABI")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

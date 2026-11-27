@@ -2,6 +2,8 @@
 
 fm #"github.com/xulang-org/nexus/foundation/math"
 canvas #"github.com/xulang-org/nexus/resources/canvas"
+l2d #"github.com/xulang-org/nexus/resources/lighting2d"
+#errors
 #math
 
 fn clamp_i(value int, lo int, hi int) int {
@@ -331,4 +333,150 @@ fn soft_draw_sdf_batch(pixels $&[]u8, width int, height int,
         rect := batch.rect_at(i) or (err) { << }
         soft_draw_sdf_rect(pixels, width, height, min_x, min_y, max_x, max_y, rect)
     }
+}
+
+fn soft_apply_lighting_2d(
+    pixels $&[]u8,
+    width int,
+    height int,
+    env &l2d.LightEnvironment2D,
+    view_origin fm.Vec2,
+    view_size fm.Vec2,
+    layer_mask int,
+    has_normal_map bool,
+    normal_tex &[]u8,
+    normal_w int,
+    normal_h int,
+    normal_linear bool
+) int {
+    if width <= 0 || height <= 0 || pixels.len != width * height * 4 {
+        >> errors.new("nexus canvas: software lighting buffer length mismatch")
+    }
+    view_bounds := fm.rect2(view_origin.x, view_origin.y, view_size.x, view_size.y)
+    lights := env.visible_lights(view_bounds, layer_mask, l2d.MAX_GPU_LIGHTS_2D) or >>
+    occs := env.visible_occluders(view_bounds, layer_mask, l2d.MAX_GPU_OCCLUDERS_2D) or >>
+    $filtered := l2d.new_environment_2d(env.ambient) or >>
+    filtered.set_exposure(env.exposure) or >>
+    filtered.set_shadow_bias(env.shadow_bias) or >>
+    filtered.set_soft_tonemap(env.soft_tonemap)
+    filtered.set_specular_strength(env.specular_strength) or >>
+    for i in 0:lights.len { filtered.add_light(lights[i]) or >> }
+    for i in 0:occs.len { filtered.add_occluder(occs[i]) or >> }
+
+    inv_w := 1.0 / f64(width)
+    inv_h := 1.0 / f64(height)
+    default_n := fm.vec3(0.0, 0.0, 1.0)
+    has_valid_norm := has_normal_map && normal_w > 0 && normal_h > 0 && normal_tex.len == normal_w * normal_h * 4
+
+    for py in 0:height {
+        v := (f64(py) + 0.5) * inv_h
+        wy := view_origin.y + v * view_size.y
+        for px in 0:width {
+            u := (f64(px) + 0.5) * inv_w
+            wx := view_origin.x + u * view_size.x
+            $n := default_n
+            if has_valid_norm {
+                nt := sample_texture_f(normal_tex, normal_w, normal_h, normal_linear, u, v)
+                raw := fm.vec3(nt[0] * 2.0 - 1.0, nt[1] * 2.0 - 1.0, nt[2] * 2.0 - 1.0)
+                if raw.length() > 1e-5 {
+                    n = raw.normalized() or >>
+                }
+            }
+            lit := l2d.evaluate_point_2d(&filtered, fm.vec2(wx, wy), n, layer_mask) or >>
+            idx := (py * width + px) * 4
+            r := u8_to_norm(pixels[idx]) * lit.x
+            g := u8_to_norm(pixels[idx + 1]) * lit.y
+            b := u8_to_norm(pixels[idx + 2]) * lit.z
+            pixels[idx] = byte_u8(r)
+            pixels[idx + 1] = byte_u8(g)
+            pixels[idx + 2] = byte_u8(b)
+        }
+    }
+    << 0
+}
+
+fn bloom_bright_extract(r f64, g f64, b f64, threshold f64, soft_knee f64) []f64 {
+    luma := max_f(r, max_f(g, b))
+    knee := max_f(soft_knee, 0.0001)
+    soft := clamp_f(luma - threshold + knee, 0.0, 2.0 * knee)
+    soft_term := (soft * soft) / (4.0 * knee)
+    denom := max_f(luma, 0.00001)
+    contrib := max_f(soft_term, luma - threshold) / denom
+    scale := max_f(contrib, 0.0)
+    << [r * scale, g * scale, b * scale]
+}
+
+fn soft_apply_bloom_2d(
+    pixels $&[]u8,
+    width int,
+    height int,
+    threshold f64,
+    soft_knee f64,
+    intensity f64,
+    radius f64
+) int {
+    if width <= 0 || height <= 0 || pixels.len != width * height * 4 {
+        >> errors.new("nexus canvas: software bloom buffer length mismatch")
+    }
+    inv_w := 1.0 / f64(width)
+    inv_h := 1.0 / f64(height)
+    offsets := [-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0]
+    weights := [0.016216, 0.054054, 0.121622, 0.194595, 0.227027, 0.194595, 0.121622, 0.054054, 0.016216]
+
+    // Snapshot source RGBA for bilinear taps.
+    $src := []u8{}
+    for i in 0:pixels.len { src.push(pixels[i]) }
+
+    // Pass 1: horizontal bright-pass blur (float RGB buffer).
+    $h_r := []f64{}
+    $h_g := []f64{}
+    $h_b := []f64{}
+    for py in 0:height {
+        v := (f64(py) + 0.5) * inv_h
+        for px in 0:width {
+            u := (f64(px) + 0.5) * inv_w
+            $sr := 0.0
+            $sg := 0.0
+            $sb := 0.0
+            for k in 0:9 {
+                su := clamp_f(u + offsets[k] * radius * inv_w, 0.0, 1.0)
+                t := sample_texture_f(&src, width, height, true, su, v)
+                br := bloom_bright_extract(t[0], t[1], t[2], threshold, soft_knee)
+                w := weights[k]
+                sr += br[0] * w
+                sg += br[1] * w
+                sb += br[2] * w
+            }
+            h_r.push(sr)
+            h_g.push(sg)
+            h_b.push(sb)
+        }
+    }
+
+    // Pass 2: vertical blur + additive composite onto pixels.
+    for py in 0:height {
+        for px in 0:width {
+            $vr := 0.0
+            $vg := 0.0
+            $vb := 0.0
+            for k in 0:9 {
+                fy := (f64(py) + 0.5) + offsets[k] * radius - 0.5
+                cy := clamp_f(fy, 0.0, f64(height - 1))
+                y0 := clamp_i(int(math.floor(cy)), 0, height - 1)
+                y1 := clamp_i(y0 + 1, 0, height - 1)
+                ty := cy - f64(y0)
+                i0 := y0 * width + px
+                i1 := y1 * width + px
+                w := weights[k]
+                vr += (h_r[i0] * (1.0 - ty) + h_r[i1] * ty) * w
+                vg += (h_g[i0] * (1.0 - ty) + h_g[i1] * ty) * w
+                vb += (h_b[i0] * (1.0 - ty) + h_b[i1] * ty) * w
+            }
+            idx := (py * width + px) * 4
+            pixels[idx] = byte_u8(u8_to_norm(src[idx]) + vr * intensity)
+            pixels[idx + 1] = byte_u8(u8_to_norm(src[idx + 1]) + vg * intensity)
+            pixels[idx + 2] = byte_u8(u8_to_norm(src[idx + 2]) + vb * intensity)
+        }
+    }
+    << 0
 }

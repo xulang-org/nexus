@@ -1,0 +1,187 @@
+@main
+
+#errors
+#math
+#os
+#strings
+persist #"github.com/xulang-org/nexus/resources/persistence"
+scene_io #"github.com/xulang-org/nexus/integration/scene"
+nexus #"github.com/xulang-org/nexus/scene"
+
+fn rejects_guid(raw string) bool {
+    _ := persist.parse_guid(raw) or (err) { << true }
+    << false
+}
+
+fn rejects_migrate(chain &persist.SaveMigrationChain, env &persist.SaveEnvelope, target int) bool {
+    _ := chain.migrate(env, target) or (err) { << true }
+    << false
+}
+
+fn rejects_decode_env(raw string) bool {
+    _ := persist.decode_envelope(&raw) or (err) { << true }
+    << false
+}
+
+fn rejects_assign(reg $&scene_io.PersistentEntityRegistry, world string, tree &nexus.SceneTree, node int, g persist.EntityGuid) bool {
+    _ := reg.assign_guid(world, tree, node, g, "bad", false) or (err) { << true }
+    << false
+}
+
+fn run() int {
+    // 1. GUID normalization, determinism & validation.
+    g1 := persist.deterministic_guid("world:item", "magic_key_01") or >>
+    g1_dup := persist.deterministic_guid("world:item", "magic_key_01") or >>
+    g2 := persist.deterministic_guid("world:item", "magic_key_02") or >>
+    assert(g1.equals(&g1_dup) && !g1.equals(&g2))
+
+    upper := persist.parse_guid(strings.to_upper(&g1.value)) or >>
+    assert(upper.equals(&g1))
+    assert(rejects_guid("not-a-guid"))
+    assert(rejects_guid("12345678_1234_1234_1234_1234567890ab"))
+
+    // 2. Multi-world registry with Overworld & Dungeon.
+    $overworld := nexus.new_scene_tree_3d("Overworld", 32) or >>
+    npc := overworld.add_child_3d(overworld.root(), "QuestGiver") or >>
+    player := overworld.add_child_3d(overworld.root(), "Player") or >>
+    sword := overworld.add_child_3d(player, "EquippedSword") or >>
+    temp_crate := overworld.add_child_3d(overworld.root(), "TempCrate") or >>
+
+    $dungeon := nexus.new_scene_tree_3d("Dungeon01", 32) or >>
+    chest := dungeon.add_child_3d(dungeon.root(), "DungeonChest") or >>
+    boss_door := dungeon.add_child_3d(dungeon.root(), "BossDoor") or >>
+
+    $reg := scene_io.new_persistent_registry()
+    reg.register_world("overworld") or >>
+    reg.register_world("dungeon_01") or >>
+
+    npc_ref := reg.assign_new_guid("overworld", &overworld, npc, "npc", false) or >>
+    player_ref := reg.assign_new_guid("overworld", &overworld, player, "player", true) or >>
+    sword_ref := reg.assign_new_guid("overworld", &overworld, sword, "weapon", true) or >>
+    crate_ref := reg.assign_new_guid("overworld", &overworld, temp_crate, "prop", false) or >>
+    chest_ref := reg.assign_new_guid("dungeon_01", &dungeon, chest, "loot", false) or >>
+    door_ref := reg.assign_new_guid("dungeon_01", &dungeon, boss_door, "door", false) or >>
+
+    reg.set_entity_state(&chest_ref.guid, "{\"opened\":false,\"gold\":250}") or >>
+    reg.set_entity_state(&door_ref.guid, "{\"locked\":true}") or >>
+
+    // Cross-world link from Overworld NPC -> Dungeon Chest + Overworld NPC -> Player.
+    reg.add_link(&npc_ref.guid, &chest_ref, "quest_target") or >>
+    reg.add_link(&npc_ref.guid, &player_ref, "quest_owner") or >>
+    links := reg.links_from(&npc_ref.guid) or >>
+    assert(links.len == 2)
+
+    // Resolution when Overworld is active.
+    r_npc := reg.resolve(&npc_ref, "overworld", &overworld)
+    assert(r_npc.status == scene_io.RESOLVE_LIVE && r_npc.node_id == npc)
+    r_chest_away := reg.resolve(&chest_ref, "overworld", &overworld)
+    assert(r_chest_away.status == scene_io.RESOLVE_UNLOADED_WORLD && r_chest_away.world_id == "dungeon_01")
+    fake_ref := persist.new_entity_ref(g2, "overworld", "/Missing", "none") or >>
+    r_missing := reg.resolve(&fake_ref, "overworld", &overworld)
+    assert(r_missing.status == scene_io.RESOLVE_MISSING)
+
+    // 3. Freeing node + slot reuse must never alias old GUID!
+    overworld.queue_free(temp_crate) or >>
+    _ := overworld.flush_free() or >>
+    new_barrel := overworld.add_child_3d(overworld.root(), "FreshBarrel") or >>
+    cleared := reg.sync_world("overworld", &overworld)
+    assert(cleared == 1)
+    r_crate := reg.resolve(&crate_ref, "overworld", &overworld)
+    assert(r_crate.status == scene_io.RESOLVE_MISSING)
+    assert(overworld.is_alive(new_barrel))
+
+    // 4. Transfer Player + EquippedSword child from Overworld into Dungeon01.
+    dun_root := dungeon.root()
+    moved_player := reg.transfer_entity_world(&player_ref.guid, "overworld", $&overworld,
+        "dungeon_01", $&dungeon, dun_root) or >>
+    assert(overworld.find_child(overworld.root(), "Player") == 0)
+    moved_sword := dungeon.find_child(moved_player, "EquippedSword") or >>
+    assert(moved_sword > 0)
+    g_p_now := reg.guid_for_node("dungeon_01", moved_player) or >>
+    g_s_now := reg.guid_for_node("dungeon_01", moved_sword) or >>
+    assert(g_p_now.equals(&player_ref.guid) && g_s_now.equals(&sword_ref.guid))
+
+    // Active world is now dungeon_01: player resolves LIVE, npc resolves UNLOADED_WORLD!
+    r_p_dun := reg.resolve(&player_ref, "dungeon_01", &dungeon)
+    assert(r_p_dun.status == scene_io.RESOLVE_LIVE && r_p_dun.world_id == "dungeon_01" && r_p_dun.node_id == moved_player)
+    r_npc_dun := reg.resolve(&npc_ref, "dungeon_01", &dungeon)
+    assert(r_npc_dun.status == scene_io.RESOLVE_UNLOADED_WORLD && r_npc_dun.world_id == "overworld")
+
+    // 5. Retire chest and save manifest with SHA-256 SaveEnvelope + reload Dungeon from scratch.
+    reg.set_entity_state(&chest_ref.guid, "{\"opened\":true,\"gold\":0}") or >>
+    reg.retire_entity(&chest_ref.guid) or >>
+    r_chest_ret := reg.resolve(&chest_ref, "dungeon_01", &dungeon)
+    assert(r_chest_ret.status == scene_io.RESOLVE_RETIRED)
+    assert(rejects_assign($&reg, "dungeon_01", &dungeon, new_barrel, persist.EntityGuid{value: chest_ref.guid.value + ""}))
+
+    save_dir := "build/persistent-entities-test"
+    os.mkdir_all(save_dir + "") or >>
+    save_path := save_dir + "/world_save_v1.json"
+    reg.save_to_file(save_path + "", "dungeon_01", 1) or >>
+
+    // Tampered file fails SHA-256 check!
+    raw_saved := os.read(save_path + "") or >>
+    tampered := strings.replace(&raw_saved, "BossDoor", "HackDoor", 1)
+    assert(rejects_decode_env(tampered))
+
+    // Reload registry in fresh state & rebind onto freshly instantiated Dungeon01 tree (simulating scene reload).
+    $fresh_dun := nexus.new_scene_tree_3d("Dungeon01", 32) or >>
+    _ := fresh_dun.add_child_3d(fresh_dun.root(), "DungeonChest") or >>
+    fresh_door := fresh_dun.add_child_3d(fresh_dun.root(), "BossDoor") or >>
+
+    empty_chain := persist.new_migration_chain()
+    $reg2 := scene_io.new_persistent_registry()
+    rep0 := reg2.load_from_file(save_path, &empty_chain, 1) or >>
+    assert(rep0.from_version == 1 && rep0.to_version == 1)
+
+    rebind := reg2.rebind_world("dungeon_01", $&fresh_dun, true) or >>
+    assert(rebind.rebound == 1 && rebind.retired_pruned == 1)
+    assert(fresh_dun.find_child(fresh_dun.root(), "DungeonChest") == 0)
+    assert(fresh_dun.find_child(fresh_dun.root(), "BossDoor") == fresh_door)
+    assert((reg2.guid_for_node("dungeon_01", fresh_door) or >>).equals(&door_ref.guid))
+    assert(reg2.entity_state(&door_ref.guid) == "{\"locked\":true}")
+
+    // 6. Multi-hop SaveMigrationChain v1 -> v2 -> v3 + tamper/downgrade rejection.
+    $chain := persist.new_migration_chain()
+    chain.add_step(persist.MigrationStep{
+        from_version: 1,
+        to_version: 2,
+        description: "v1->v2 rename active_world and add difficulty",
+        rename_keys: [persist.KeyRename{old_key: "active_world", new_key: "current_region"}],
+        inject_defaults: [persist.KeyDefault{key: "difficulty", raw_json_value: "\"normal\""}],
+        remove_keys: []string{}
+    }) or >>
+    chain.add_step(persist.MigrationStep{
+        from_version: 2,
+        to_version: 3,
+        description: "v2->v3 add hardcore flag and remove legacy links",
+        rename_keys: []persist.KeyRename{},
+        inject_defaults: [persist.KeyDefault{key: "hardcore", raw_json_value: "false"}],
+        remove_keys: ["links"]
+    }) or >>
+
+    v1_env := persist.decode_envelope(&raw_saved) or >>
+    same_rep := chain.migrate(&v1_env, 1) or >>
+    assert(same_rep.steps_applied.len == 0)
+    assert(rejects_migrate(&chain, &v1_env, 0))
+    mig_rep := chain.migrate(&v1_env, 3) or >>
+    assert(mig_rep.from_version == 1 && mig_rep.to_version == 3 && mig_rep.steps_applied.len == 2)
+    mig_rep.envelope.verify() or >>
+    assert(strings.contains(&mig_rep.envelope.payload, "\"current_region\":\"dungeon_01\""))
+    assert(strings.contains(&mig_rep.envelope.payload, "\"difficulty\":\"normal\""))
+    assert(strings.contains(&mig_rep.envelope.payload, "\"hardcore\":false"))
+    assert(!strings.contains(&mig_rep.envelope.payload, "\"links\""))
+    assert(strings.contains(&mig_rep.envelope.payload, "\"schema_version\":3"))
+    assert(rejects_migrate(&chain, &mig_rep.envelope, 2))
+    assert(rejects_migrate(&chain, &mig_rep.envelope, 4))
+
+    println("PASS: persistent_entities_checks (EntityGuid + CrossWorld resolve/transfer + Reload rebind/prune + SHA-256 v1->v3 SaveMigrationChain)")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln("FAIL: " + err.msg())
+        << 1
+    }
+}

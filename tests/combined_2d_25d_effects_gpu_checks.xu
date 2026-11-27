@@ -1,0 +1,304 @@
+@main
+
+#errors
+#gpu
+#math
+#ui/draw
+#ui/layout
+widgets #ui/widgets
+#window
+colors #"github.com/xulang-org/nexus/foundation/color"
+fm #"github.com/xulang-org/nexus/foundation/math"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+tiles #"github.com/xulang-org/nexus/resources/tilemap"
+nexus #"github.com/xulang-org/nexus/scene"
+ren2 #"github.com/xulang-org/nexus/rendering/two_d"
+ren3 #"github.com/xulang-org/nexus/rendering/three_d"
+sc2 #"github.com/xulang-org/nexus/integration/rendering/two_d"
+ui_bridge #"github.com/xulang-org/nexus/integration/ui"
+shd2 #"github.com/xulang-org/nexus/assets/shaders/two_d"
+shd3 #"github.com/xulang-org/nexus/assets/shaders/three_d"
+vfx #"github.com/xulang-org/nexus/vfx"
+
+fn px_r(c int) int { << (c >> 24) & 255 }
+fn px_g(c int) int { << (c >> 16) & 255 }
+fn px_b(c int) int { << (c >> 8) & 255 }
+fn abs_i(v int) int { if v < 0 { << -v } << v }
+
+fn test_combined_2d_gpu_effects(
+    canvas_prog &ren2.ShaderProgram2D,
+    sdf_prog &ren2.SdfProgram2D,
+    text_prog &ren2.TextProgram2D
+) int {
+    w := 256
+    h := 192
+    $r2 := ren2.open_2d("Combined 2D GPU Effects", w, h, gpu.METAL, canvas_prog) or >>
+
+    // 4x4 white-ish texture for textured TileMapLayer2D verification
+    $tex_px := []int{}
+    for _ in 0:16 { tex_px.push(0x909090FF) }
+    $tile_tex := r2.texture_rgba(4, 4, &tex_px, false) or >>
+
+    atlas := tiles.tileset_2d(2, 2, 16.0, 16.0, fm.vec2(0.0, 0.0)) or >>
+    $grid := tiles.new_tilemap_2d(tiles.LAYOUT_ORTHOGONAL, 4, 4, 16.0, 16.0, 0.0, atlas) or >>
+    grid.set_cell(0, 0, 1) or >>
+    grid.set_cell(1, 0, 1) or >>
+    grid.set_cell(0, 1, 1) or >>
+    grid.set_cell(1, 1, 1) or >>
+
+    $tree := nexus.new_scene_tree("World2D", 16) or >>
+    map_node := tree.add_child(tree.root(), "Tiles") or >>
+    back_node := tree.add_child(tree.root(), "Back") or >>
+    mid_node := tree.add_child(tree.root(), "Mid") or >>
+    front_node := tree.add_child(tree.root(), "Front") or >>
+    para_node := tree.add_child(tree.root(), "ParallaxProp") or >>
+    tree.set_position(map_node, fm.vec2(160.0, 100.0)) or >>
+    tree.set_position(para_node, fm.vec2(0.0, -56.0)) or >>
+
+    // Overlapping vertical Y-Sort strip: back_red (y=48), mid_green (y=64), front_blue (y=80)
+    $ys := sc2.new_ysort_queue_2d()
+    c_red := colors.rgba8(240, 30, 30, 255) or >>
+    c_green := colors.rgba8(30, 230, 40, 255) or >>
+    c_blue := colors.rgba8(30, 60, 245, 255) or >>
+    c_gold := colors.rgba8(250, 210, 40, 255) or >>
+    c_alpha_blue := colors.rgba8(20, 40, 240, 128) or >>
+    c_bg := colors.rgba8(20, 24, 34, 255) or >>
+
+    ys.push_rect(&tree, back_node, fm.rect2(24.0, 28.0, 52.0, 44.0), c_red, -1, 0, 48.0) or >>
+    ys.push_rect(&tree, front_node, fm.rect2(24.0, 62.0, 52.0, 44.0), c_blue, -1, 0, 80.0) or >>
+    ys.push_rect(&tree, mid_node, fm.rect2(34.0, 44.0, 32.0, 40.0), c_green, -1, 0, 64.0) or >>
+
+    // Ortho TileMap layer recorded onto separate textured batch
+    tlayer := sc2.new_tilemap_layer_2d(map_node, grid, 0, false, 0.0) or >>
+
+    // Parallax layer (0.25x scroll)
+    para := sc2.new_parallax_layer_2d(0.25, 0.25, 0.0, 0.0) or >>
+    $cam := nexus.new_camera_2d(f64(w), f64(h)) or >>
+    cam.position = fm.vec2(f64(w) * 0.5, f64(h) * 0.5)
+
+    // 2D Particle System + 2D Trail
+    $e2 := vfx.default_emitter_2d(fm.vec2(190.0, 70.0))
+    e2.emitting = false
+    e2.life_min = 0.45
+    e2.life_max = 0.55
+    e2.speed_min = 25.0
+    e2.speed_max = 45.0
+    e2.gravity = fm.vec2(0.0, 240.0)
+    e2.floor_enabled = true
+    e2.floor_y = 110.0
+    e2.floor_restitution = 0.7
+    e2.size_start_min = 14.0
+    e2.size_start_max = 16.0
+    $ps2 := vfx.new_particle_system_2d(64, 99, e2) or >>
+    ps2.burst(32) or >>
+    ps2.step(0.016) or >>
+
+    $t2 := vfx.new_trail_2d(vfx.TrailConfig{
+        lifetime: 0.5,
+        min_vertex_distance: 2.0,
+        start_width: 12.0,
+        end_width: 8.0,
+        uv_tile_length: 16.0,
+        max_points: 16
+    }) or >>
+    for k in 0:6 {
+        t2.push_point(fm.vec2(130.0 + f64(k) * 14.0, 148.0)) or >>
+    }
+
+    // Scissor-clipped UI Frame (draws crisp red panel clipped strictly to x in [16..80], y in [120..168])
+    r2.enable_sdf(sdf_prog) or >>
+    r2.enable_text(text_prog) or >>
+    styles := widgets.dark_styles()
+    $uf := ui_bridge.new_ui_frame(&styles) or >>
+    $mask := uf.create_mask_2d(&r2) or >>
+    uf.begin() or >>
+    uf.push_clip(&layout.Rect{x: 16.0, y: 120.0, width: 64.0, height: 48.0}) or >>
+    uf.draw_panel(&layout.Rect{x: 16.0, y: 120.0, width: 110.0, height: 48.0}, 0.0,
+        draw.rgb(235, 30, 30), draw.rgb(235, 30, 30), 0.0) or >>
+    uf.pop_clip() or >>
+
+    // Record camera 0 combined frame
+    view_world := cam.view_transform(f64(w), f64(h)) or >>
+    view_para := para.view_transform(&cam, f64(w), f64(h)) or >>
+
+    $b_para := canvas.new_batch()
+    para_world := tree.global_transform(para_node) or >>
+    b_para.quad(fm.rect2(0.0, 0.0, 24.0, 18.0), view_para.multiply(para_world), c_gold) or >>
+
+    $b_tile := canvas.new_batch()
+    tlayer.record(&tree, view_world, $&b_tile) or >>
+
+    $b_fg := canvas.new_batch()
+    ys.record_single(view_world, $&b_fg) or >>
+    // Alpha-blended tint overlay onto solid red patch at (110..150, 16..52)
+    b_fg.quad(fm.rect2(110.0, 16.0, 40.0, 36.0), fm.identity(), c_red) or >>
+    b_fg.quad(fm.rect2(110.0, 16.0, 40.0, 36.0), fm.identity(), c_alpha_blue) or >>
+    _ := ps2.emit_batch($&b_fg) or >>
+    _ := t2.emit_batch($&b_fg) or >>
+
+    r2.begin(c_bg) or >>
+    r2.submit(&b_para) or >>
+    r2.submit_texture(&b_tile, &tile_tex) or >>
+    r2.submit(&b_fg) or >>
+    uf.flush_2d($&r2, $&mask) or >>
+
+    // Check 1: Y-Sort overlap pixels
+    px_mid_over_back := r2.read_pixel(46, 54) or >> // red [28..72] vs green [44..84] -> green wins
+    px_front_over_mid := r2.read_pixel(46, 74) or >> // green [44..84] vs blue [62..106] -> blue wins
+    assert(px_g(px_mid_over_back) > px_r(px_mid_over_back) + 80)
+    assert(px_b(px_front_over_mid) > px_g(px_front_over_mid) + 80)
+
+    // Check 2: TileMap textured batch rendered
+    px_tile := r2.read_pixel(172, 112) or >>
+    assert(px_r(px_tile) > 100 && px_g(px_tile) > 100 && abs_i(px_r(px_tile) - px_b(px_tile)) <= 8)
+
+    // Check 3: Semi-transparent alpha blend (128 blue over 255 red -> purple with both R>80 and B>80)
+    px_blend := r2.read_pixel(130, 34) or >>
+    assert(px_r(px_blend) > 85 && px_b(px_blend) > 85 && px_g(px_blend) < 60)
+
+    // Check 4: Scissor clip on UI HUD (x=40 inside [16..80] is red; x=94 outside is background!)
+    px_clip_in := r2.read_pixel(40, 140) or >>
+    px_clip_out := r2.read_pixel(94, 140) or >>
+    assert(px_r(px_clip_in) > 180 && px_b(px_clip_in) < 60)
+    assert(px_r(px_clip_out) < 60)
+
+    // Check 5: Parallax prop (world y=-56, x=0) maps to screen [96..120, 16..34] at cam=(128,96)
+    px_para_0 := r2.read_pixel(108, 25) or >>
+    assert(px_r(px_para_0) > 180 && px_g(px_para_0) > 160 && px_b(px_para_0) < 80)
+
+    // Check 6: Trail visible on frame 0 at (165, 148)
+    px_trail_on := r2.read_pixel(165, 148) or >>
+    assert(px_r(px_trail_on) > 120 || px_g(px_trail_on) > 120 || px_b(px_trail_on) > 120)
+    r2.present() or >>
+
+    // Frame 2: pan camera right by +48 -> parallax shifts only -12px (to [84..108, 16..34]),
+    // while world Y-Sort moves left -48px, AND expire particles + trail past lifetime -> trail pixel returns to bg!
+    cam.position.x += 48.0
+    for _ in 0:35 { ps2.step(0.025) or >> }
+    t2.update(0.8) or >>
+    assert(ps2.alive_count() == 0 && t2.point_count() == 0)
+
+    view_world2 := cam.view_transform(f64(w), f64(h)) or >>
+    view_para2 := para.view_transform(&cam, f64(w), f64(h)) or >>
+    $b_para2 := canvas.new_batch()
+    b_para2.quad(fm.rect2(0.0, 0.0, 24.0, 18.0), view_para2.multiply(para_world), c_gold) or >>
+    $b_fg2 := canvas.new_batch()
+    ys.record_single(view_world2, $&b_fg2) or >>
+    _ := ps2.emit_batch($&b_fg2) or >>
+    _ := t2.emit_batch($&b_fg2) or >>
+
+    r2.begin(c_bg) or >>
+    r2.submit(&b_para2) or >>
+    r2.submit(&b_fg2) or >>
+    // Parallax shifted only 12px left (covering [84..108, 16..34]) -> (90, 25) gold, old right (114, 25) bg!
+    px_para_moved := r2.read_pixel(90, 25) or >>
+    px_para_old_edge := r2.read_pixel(114, 25) or >>
+    assert(px_r(px_para_moved) > 180 && px_g(px_para_moved) > 160)
+    assert(px_r(px_para_old_edge) < 50 && px_g(px_para_old_edge) < 50)
+    // World Y-Sort back edge shifted left -48px: old right edge (68, 54) is now empty bg!
+    px_world_panned := r2.read_pixel(68, 54) or >>
+    assert(px_g(px_world_panned) < 50 && px_r(px_world_panned) < 50)
+    // Expired trail cleared completely
+    px_trail_off := r2.read_pixel(165, 148) or >>
+    assert(px_r(px_trail_off) < 50 && px_g(px_trail_off) < 50 && px_b(px_trail_off) < 50)
+    r2.present() or >>
+
+    mask.close() or >>
+    tile_tex.close() or >>
+    r2.close() or >>
+    << 0
+}
+
+fn make_box(hx f64, hy f64, hz f64, color int) meshes.MeshData3D {
+    $d := meshes.new_mesh_data_3d()
+    p0 := fm.vec3(-hx, -hy, hz)
+    p1 := fm.vec3(hx, -hy, hz)
+    p2 := fm.vec3(hx, hy, hz)
+    p3 := fm.vec3(-hx, hy, hz)
+    p4 := fm.vec3(-hx, -hy, -hz)
+    p5 := fm.vec3(hx, -hy, -hz)
+    p6 := fm.vec3(hx, hy, -hz)
+    p7 := fm.vec3(-hx, hy, -hz)
+    nf := fm.vec3(0.0, 0.0, 1.0)
+    nb := fm.vec3(0.0, 0.0, -1.0)
+    nr := fm.vec3(1.0, 0.0, 0.0)
+    nl := fm.vec3(-1.0, 0.0, 0.0)
+    nu := fm.vec3(0.0, 1.0, 0.0)
+    nd := fm.vec3(0.0, -1.0, 0.0)
+    faces := [p0, p1, p2, p3, nf, p5, p4, p7, p6, nb, p1, p5, p6, p2, nr, p4, p0, p3, p7, nl, p3, p2, p6, p7, nu, p4, p5, p1, p0, nd]
+    for f in 0:6 {
+        base := d.vertices.len
+        fi := f * 5
+        n := faces[fi + 4]
+        for k in 0:4 {
+            d.vertex_lit(faces[fi + k], color, n) or >>
+        }
+        d.triangle(base, base + 1, base + 2) or >>
+        d.triangle(base, base + 2, base + 3) or >>
+    }
+    d.validate() or >>
+    << d
+}
+
+fn test_hd25d_gpu_depth_interleave(mesh_prog &ren3.ShaderProgram3D) int {
+    w := 160
+    h := 120
+    wopts := window.Options{title: "2.5D Depth Interleave", width: w, height: h, resizable: false, high_pixel_density: false, hidden: true}
+    $dev := ren3.open_3d_window(wopts, gpu.METAL, mesh_prog) or >>
+    pillar_cpu := make_box(0.6, 1.4, 0.6, 4294967295) or >>
+    sprite_cpu := make_box(0.55, 0.55, 0.05, 4294967295) or >>
+    $pillar_m := dev.upload(&pillar_cpu) or >>
+    $sprite_m := dev.upload(&sprite_cpu) or >>
+
+    green_mat := ren3.material_3d(fm.vec3(0.10, 0.88, 0.18), 0.0, 0.8, fm.vec3(0.0, 0.4, 0.0)) or >>
+    mag_mat := ren3.material_3d(fm.vec3(0.95, 0.12, 0.92), 0.0, 0.8, fm.vec3(0.5, 0.0, 0.5)) or >>
+
+    eye := fm.vec3(0.0, 0.6, 4.5)
+    view := nexus.look_at_3d(eye, fm.vec3(0.0, 0.0, 0.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+    proj := nexus.perspective_3d(0.85, f64(w) / f64(h), 0.2, 50.0) or >>
+    vp := proj.multiply(view)
+    sun := lights.directional(fm.vec3(0.2, 0.5, 0.85).normalized() or >>, fm.vec3(1.6, 1.6, 1.6)) or >>
+    env := lights.environment(fm.vec3(0.4, 0.4, 0.4), eye, 1.0, [sun]) or >>
+
+    // 1. Sprite in FRONT of pillar (z=+1.0) -> magenta wins center pixel
+    dev.begin(255) or >>
+    dev.draw_material(&pillar_m, fm.identity_3d(), vp, &green_mat, &env) or >>
+    dev.draw_material(&sprite_m, fm.translation_3d(fm.vec3(0.0, 0.0, 1.0)), vp, &mag_mat, &env) or >>
+    px_front := dev.read_pixel(w / 2, h / 2) or >>
+    dev.present() or >>
+    assert(px_r(px_front) > px_g(px_front) + 40 && px_b(px_front) > px_g(px_front) + 40)
+
+    // 2. Sprite BEHIND pillar (z=-1.0) -> depth test rejects sprite, green pillar stays visible!
+    dev.begin(255) or >>
+    dev.draw_material(&pillar_m, fm.identity_3d(), vp, &green_mat, &env) or >>
+    dev.draw_material(&sprite_m, fm.translation_3d(fm.vec3(0.0, 0.0, -1.0)), vp, &mag_mat, &env) or >>
+    px_behind := dev.read_pixel(w / 2, h / 2) or >>
+    dev.present() or >>
+    assert(px_g(px_behind) > px_r(px_behind) + 40 && px_g(px_behind) > px_b(px_behind) + 40)
+
+    pillar_m.close() or >>
+    sprite_m.close() or >>
+    dev.close() or >>
+    << 0
+}
+
+fn run() int {
+    cprog := shd2.load_canvas("build/canvas-shaders") or >>
+    sprog := shd2.load_ui_sdf("build/canvas-shaders") or >>
+    tprog := shd2.load_ui_text("build/canvas-shaders") or >>
+    mprog := shd3.load_mesh("build/mesh-shaders") or >>
+
+    test_combined_2d_gpu_effects(&cprog, &sprog, &tprog) or >>
+    test_hd25d_gpu_depth_interleave(&mprog) or >>
+    println("PASS: combined_2d_25d_effects_gpu_checks (Parallax+TileMap+YSort+2DParticles+Trail+Alpha+ScissorHUD + 2.5D Metal depth)")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+}

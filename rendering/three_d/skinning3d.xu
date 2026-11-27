@@ -1,0 +1,323 @@
+@"github.com/xulang-org/nexus/rendering/three_d"
+
+#gpu
+#encoding/binary
+#errors
+#math
+fm #"github.com/xulang-org/nexus/foundation/math"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+
+pub struct SkinProgram3D {
+    pub format int
+    pub entrypoint string
+    pub compute []u8
+}
+
+pub struct SkinPipeline3D {
+    owner DeviceRef3D
+    pipeline gpu.ComputePipeline
+    closed bool
+}
+
+pub struct SkinnedMesh3D {
+    owner DeviceRef3D
+    buffers []gpu.Buffer
+    soft_mesh []Mesh3D
+    vertex_count int
+    index_count int
+    max_bones int
+    normals bool
+    uvs bool
+    tangents bool
+    bone_boxes []fm.Aabb3
+    bone_used []bool
+    rest_bounds fm.Aabb3
+    bounds fm.Aabb3
+    closed bool
+}
+
+pub fn empty_skin_program_3d() SkinProgram3D {
+    << SkinProgram3D{format: 0, entrypoint: "", compute: []u8{}}
+}
+
+pub fn (device &Device3D) skin_pipeline(program &SkinProgram3D) SkinPipeline3D {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: create skin pipeline outside a frame") }
+    if !device.is_gpu() { >> errors.new("nexus 3D: GPU skin pipeline requires GPU backend") }
+    dev := device.gpu_device() or >>
+    if (dev.shader_formats() & program.format) == 0 || program.compute.len == 0 || program.entrypoint.len == 0 {
+        >> errors.new("nexus 3D: incompatible or empty GPU skinning compute shader")
+    }
+    desc := gpu.ComputePipelineDesc{
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        read_buffers: 3,
+        write_buffers: 1,
+        uniform_sizes: [16],
+        threads_x: 64,
+        threads_y: 1,
+        threads_z: 1
+    }
+    pipeline := dev.compute_pipeline(&desc, &program.compute) or >>
+    << SkinPipeline3D{owner: device.reference(), pipeline: pipeline, closed: false}
+}
+
+pub fn (pipeline $&SkinPipeline3D) close() int {
+    if pipeline.closed { << 0 }
+    p := $&pipeline.pipeline
+    p.close() or >>
+    pipeline.closed = true
+    << 0
+}
+
+fn (pipeline $&SkinPipeline3D) drop() {
+    pipeline.close() or (err) { << }
+}
+
+struct PackedVertexFlags {
+    normals bool
+    uvs bool
+    tangents bool
+}
+
+fn pack_rest_vertex_bytes(mesh &meshes.MeshData3D, dst $&[]u8) PackedVertexFlags {
+    $normals := true
+    $uvs := true
+    $tangents := true
+    for i in 0:mesh.vertices.len {
+        vertex := &mesh.vertices[i]
+        if vertex.normal.dot(vertex.normal) == 0.0 { normals = false }
+        if !vertex.has_uv { uvs = false }
+        if !vertex.has_tangent { tangents = false }
+        values := [vertex.position.x, vertex.position.y, vertex.position.z,
+            f64((vertex.color >> 24) & 255) / 255.0, f64((vertex.color >> 16) & 255) / 255.0,
+            f64((vertex.color >> 8) & 255) / 255.0, f64(vertex.color & 255) / 255.0,
+            vertex.normal.x, vertex.normal.y, vertex.normal.z, vertex.uv.x, vertex.uv.y,
+            vertex.tangent.x, vertex.tangent.y, vertex.tangent.z, vertex.tangent.w]
+        for j in 0:16 { put_scalar(dst, i * 64 + j * 4, values[j]) or >> }
+    }
+    << PackedVertexFlags{normals: normals, uvs: uvs, tangents: tangents}
+}
+
+fn clone_boxes(src &[]fm.Aabb3) []fm.Aabb3 {
+    $out := []fm.Aabb3{}
+    for i in 0:src.len { out.push(src[i]) }
+    << out
+}
+
+fn clone_used(src &[]bool) []bool {
+    $out := []bool{}
+    for i in 0:src.len { out.push(src[i]) }
+    << out
+}
+
+pub fn (device &Device3D) upload_skinned_mesh(
+    mesh &meshes.MeshData3D,
+    joint_indices &[]int,
+    joint_weights &[]f64,
+    max_bones int,
+    bone_boxes &[]fm.Aabb3,
+    bone_used &[]bool
+) SkinnedMesh3D {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: upload skinned meshes outside a frame") }
+    if max_bones < 1 || max_bones > 256 || bone_boxes.len != max_bones || bone_used.len != max_bones {
+        >> errors.new("nexus 3D: invalid skinned mesh bone palette bounds")
+    }
+    if mesh.vertices.len < 1 || mesh.indices.len < 3 || joint_indices.len != mesh.vertices.len * 4 || joint_weights.len != mesh.vertices.len * 4 {
+        >> errors.new("nexus 3D: skinned mesh vertices, indices or joint influences mismatch")
+    }
+    authored_bounds := mesh.bounds() or >>
+    rest_bounds := quantized_bounds(authored_bounds) or >>
+    for i in 0:joint_indices.len {
+        ji := joint_indices[i]
+        w := joint_weights[i]
+        if ji < 0 || ji >= max_bones || !fm.finite(w) || w < 0.0 || w > 1.0 {
+            >> errors.new("nexus 3D: skinning joint index or weight out of range")
+        }
+    }
+    if !device.is_gpu() {
+        rest_cpu := device.upload(mesh) or >>
+        soft_n := rest_cpu.normals
+        soft_u := rest_cpu.uvs
+        soft_t := rest_cpu.tangents
+        << SkinnedMesh3D{
+            owner: device.reference(),
+            buffers: []gpu.Buffer{},
+            soft_mesh: [rest_cpu], vertex_count: mesh.vertices.len, index_count: mesh.indices.len,
+            max_bones: max_bones, normals: soft_n, uvs: soft_u, tangents: soft_t,
+            bone_boxes: clone_boxes(bone_boxes), bone_used: clone_used(bone_used), rest_bounds: rest_bounds, bounds: rest_bounds, closed: false
+        }
+    }
+    dev := device.gpu_device() or >>
+    $packed := zero_bytes(mesh.vertices.len * 64)
+    rest_flags := pack_rest_vertex_bytes(mesh, $&packed) or >>
+    normals := rest_flags.normals
+    uvs := rest_flags.uvs
+    tangents := rest_flags.tangents
+    $indices := zero_bytes(mesh.indices.len * 4)
+    for i in 0:mesh.indices.len { binary.little_endian().put_u32_bytes($&indices, i * 4, mesh.indices[i]) or >> }
+    $inf_bytes := zero_bytes(mesh.vertices.len * 32)
+    order := binary.little_endian()
+    for v in 0:mesh.vertices.len {
+        base := v * 32
+        for k in 0:4 {
+            order.put_u32_bytes($&inf_bytes, base + k * 4, joint_indices[v * 4 + k]) or >>
+            put_scalar($&inf_bytes, base + 16 + k * 4, joint_weights[v * 4 + k]) or >>
+        }
+    }
+    joint_bytes_len := max_bones * 48
+    stats := dev.stats() or >>
+    total_size := packed.len * 2 + inf_bytes.len + joint_bytes_len + indices.len
+    if stats.buffer_count + 5 > 1024 || total_size > 67108864 - stats.buffer_bytes {
+        >> errors.new("nexus 3D: skinned mesh exceeds GPU 1024-buffer or 64 MiB budget")
+    }
+    $rest_vb := dev.buffer(packed.len, gpu.BUFFER_COMPUTE_STORAGE_READ) or >>
+    $inf_buf := dev.buffer(inf_bytes.len, gpu.BUFFER_COMPUTE_STORAGE_READ) or >>
+    $joint_buf := dev.buffer(joint_bytes_len, gpu.BUFFER_COMPUTE_STORAGE_READ) or >>
+    $posed_vb := dev.buffer(packed.len, gpu.BUFFER_VERTEX | gpu.BUFFER_GRAPHICS_STORAGE_READ | gpu.BUFFER_COMPUTE_STORAGE_READ | gpu.BUFFER_COMPUTE_STORAGE_WRITE) or >>
+    $ib := dev.buffer(indices.len, gpu.BUFFER_INDEX) or >>
+    $u0 := dev.upload(&rest_vb, 0, &packed) or >>
+    u0.close() or >>
+    $u1 := dev.upload(&inf_buf, 0, &inf_bytes) or >>
+    u1.close() or >>
+    $u2 := dev.upload(&posed_vb, 0, &packed) or >>
+    u2.close() or >>
+    $u3 := dev.upload(&ib, 0, &indices) or >>
+    u3.close() or >>
+    << SkinnedMesh3D{
+        owner: device.reference(),
+        buffers: [rest_vb, inf_buf, joint_buf, posed_vb, ib],
+        soft_mesh: []Mesh3D{}, vertex_count: mesh.vertices.len, index_count: mesh.indices.len,
+        max_bones: max_bones, normals: normals, uvs: uvs, tangents: tangents,
+        bone_boxes: clone_boxes(bone_boxes), bone_used: clone_used(bone_used), rest_bounds: rest_bounds, bounds: rest_bounds, closed: false
+    }
+}
+
+fn conservative_skinned_bounds(rest fm.Aabb3, bone_boxes &[]fm.Aabb3, bone_used &[]bool, palette &[]fm.Mat4) fm.Aabb3 {
+    $has_any := false
+    $lo := fm.vec3(0.0, 0.0, 0.0)
+    $hi := fm.vec3(0.0, 0.0, 0.0)
+    for j in 0:palette.len {
+        if !bone_used[j] { -> }
+        transformed := world_bounds(bone_boxes[j], palette[j]) or >>
+        if !has_any {
+            lo = transformed.minimum
+            hi = transformed.maximum
+            has_any = true
+        } else {
+            lo = fm.vec3(math.min(lo.x, transformed.minimum.x), math.min(lo.y, transformed.minimum.y), math.min(lo.z, transformed.minimum.z))
+            hi = fm.vec3(math.max(hi.x, transformed.maximum.x), math.max(hi.y, transformed.maximum.y), math.max(hi.z, transformed.maximum.z))
+        }
+    }
+    if !has_any { << rest }
+    raw := fm.aabb3(lo, hi) or >>
+    << quantized_bounds(raw) or >>
+}
+
+pub fn (mesh &SkinnedMesh3D) current_bounds() fm.Aabb3 {
+    << mesh.bounds
+}
+
+pub fn (mesh &SkinnedMesh3D) reference() MeshRef3D {
+    if !mesh.owner.has_gpu {
+        if mesh.closed || mesh.soft_mesh.len == 0 {
+            << MeshRef3D{vertices: gpu.BufferRef{}, indices: gpu.BufferRef{},
+                soft_vertices: gpu.empty_soft_blob_ref(), soft_indices: gpu.empty_soft_blob_ref(),
+                count: mesh.index_count, normals: mesh.normals, uvs: mesh.uvs, tangents: mesh.tangents,
+                bounds: mesh.bounds, has_gpu: false, device_id: mesh.owner.device_id}
+        }
+        ref := mesh.soft_mesh[0].reference()
+        << MeshRef3D{vertices: ref.vertices, indices: ref.indices,
+            soft_vertices: ref.soft_vertices, soft_indices: ref.soft_indices,
+            count: ref.count, normals: ref.normals, uvs: ref.uvs, tangents: ref.tangents,
+            bounds: mesh.bounds, has_gpu: false, device_id: ref.device_id}
+    }
+    if mesh.closed || mesh.buffers.len < 5 {
+        << MeshRef3D{vertices: gpu.BufferRef{}, indices: gpu.BufferRef{},
+            soft_vertices: gpu.empty_soft_blob_ref(), soft_indices: gpu.empty_soft_blob_ref(),
+            count: mesh.index_count, normals: mesh.normals, uvs: mesh.uvs, tangents: mesh.tangents,
+            bounds: mesh.bounds, has_gpu: true, device_id: 0}
+    }
+    << MeshRef3D{vertices: mesh.buffers[3].reference(), indices: mesh.buffers[4].reference(),
+        soft_vertices: gpu.empty_soft_blob_ref(), soft_indices: gpu.empty_soft_blob_ref(),
+        count: mesh.index_count, normals: mesh.normals, uvs: mesh.uvs, tangents: mesh.tangents,
+        bounds: mesh.bounds, has_gpu: true, device_id: 0}
+}
+
+pub fn (mesh $&SkinnedMesh3D) pose(device &Device3D, pipeline &SkinPipeline3D, palette &[]fm.Mat4) MeshRef3D {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: skinning pose dispatch must run before device.begin") }
+    if mesh.closed || pipeline.closed || !mesh.owner.matches(device) || !pipeline.owner.matches(device) {
+        >> errors.new("nexus 3D: closed or foreign skinned mesh or pipeline")
+    }
+    if palette.len < 1 || palette.len > mesh.max_bones {
+        >> errors.new("nexus 3D: joint palette count outside skinned mesh capacity")
+    }
+    for i in 0:palette.len {
+        if !palette[i].is_affine() { >> errors.new("nexus 3D: skinning palette contains non-affine transform") }
+    }
+    new_bounds := conservative_skinned_bounds(mesh.rest_bounds, &mesh.bone_boxes, &mesh.bone_used, palette) or >>
+    if !device.is_gpu() {
+        >> errors.new("nexus 3D: GPU skinning dispatch requires GPU device")
+    }
+    dev := device.gpu_device() or >>
+    // Pack compact 3x4 affine rows (48 bytes per bone: 25% smaller than full 4x4 matrices).
+    $joint_bytes := zero_bytes(palette.len * 48)
+    for b in 0:palette.len {
+        m := palette[b]
+        base := b * 48
+        rows := [m.c0.x, m.c1.x, m.c2.x, m.c3.x,
+                 m.c0.y, m.c1.y, m.c2.y, m.c3.y,
+                 m.c0.z, m.c1.z, m.c2.z, m.c3.z]
+        for k in 0:12 { put_scalar($&joint_bytes, base + k * 4, rows[k]) or >> }
+    }
+    $up := dev.upload(&mesh.buffers[2], 0, &joint_bytes) or >>
+    up.close() or >>
+    order := binary.little_endian()
+    $unif := zero_bytes(16)
+    order.put_u32_bytes($&unif, 0, mesh.vertex_count) or >>
+    order.put_u32_bytes($&unif, 4, palette.len) or >>
+    $hn := 0
+    if mesh.normals { hn = 1 }
+    $ht := 0
+    if mesh.tangents { ht = 1 }
+    order.put_u32_bytes($&unif, 8, hn) or >>
+    order.put_u32_bytes($&unif, 12, ht) or >>
+    $enc := dev.command_encoder() or >>
+    writes := [gpu.write_buffer(&mesh.buffers[3], false)]
+    $pass := enc.begin_compute(&writes) or >>
+    pass.pipeline(&pipeline.pipeline) or >>
+    pass.read_buffer(0, &mesh.buffers[0]) or >>
+    pass.read_buffer(1, &mesh.buffers[1]) or >>
+    pass.read_buffer(2, &mesh.buffers[2]) or >>
+    pass.uniform(0, &unif) or >>
+    groups := (mesh.vertex_count + 63) / 64
+    pass.dispatch(groups, 1, 1) or >>
+    pass.end() or >>
+    $fence := enc.submit() or >>
+    fence.wait() or >>
+    fence.close() or >>
+    mesh.bounds = new_bounds
+    << mesh.reference()
+}
+
+pub fn (mesh $&SkinnedMesh3D) close() int {
+    if mesh.closed { << 0 }
+    for i in 0:mesh.buffers.len {
+        b := $&mesh.buffers[i]
+        b.close() or >>
+    }
+    if mesh.soft_mesh.len > 0 {
+        sm := $&mesh.soft_mesh[0]
+        sm.close() or >>
+    }
+    mesh.buffers = []gpu.Buffer{}
+    mesh.soft_mesh = []Mesh3D{}
+    mesh.closed = true
+    << 0
+}
+
+fn (mesh $&SkinnedMesh3D) drop() {
+    mesh.close() or (err) { << }
+}

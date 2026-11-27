@@ -1,0 +1,474 @@
+@"github.com/xulang-org/nexus/integration/project"
+
+rp #"github.com/xulang-org/nexus/resources/project"
+ri #"github.com/xulang-org/nexus/resources/i18n"
+rs #"github.com/xulang-org/nexus/resources/steam"
+rc #"github.com/xulang-org/nexus/resources/console"
+rt #"github.com/xulang-org/nexus/resources/taptap"
+inp #"github.com/xulang-org/nexus/input"
+scene_fmt #"github.com/xulang-org/nexus/formats/scene"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#encoding/json
+#errors
+#os
+#path/filepath
+#strings
+
+pub struct DoctorIssue {
+    pub code string
+    pub severity string
+    pub path string
+    pub message string
+}
+
+pub struct DoctorReport {
+    pub project_path string
+    pub passed bool
+    pub checks_run int
+    pub error_count int
+    pub warning_count int
+    pub issues []DoctorIssue
+}
+
+fn push_issue(issues $&[]DoctorIssue, errors $&int, warnings $&int, code string, severity string, path string, message string) {
+    if severity == "error" {
+        *errors = *errors + 1
+    } else if severity == "warning" {
+        *warnings = *warnings + 1
+    }
+    issues.push(DoctorIssue{
+        code: code + "",
+        severity: severity + "",
+        path: path + "",
+        message: message + ""
+    })
+}
+
+fn try_check_scene(proj &Project, s &Entry) string {
+    raw := snapshot.read(s.resolved + "", scene_fmt.MAX_BYTES) or (err) {
+        << "cannot read scene: " + err.msg()
+    }
+    doc := scene_fmt.decode(&raw) or (err) {
+        << "invalid scene format: " + err.msg()
+    }
+    for i in 0:doc.resource_count() {
+        r := doc.resource(i) or (err) { << err.msg() }
+        _ := proj.asset_source(&r.uid) or (err) {
+            << "scene '" + s.key + "' references missing/unregistered asset UID '" + r.uid + "': " + err.msg()
+        }
+    }
+    << ""
+}
+
+fn try_resolve_rel(dir &string, rel &string) string {
+    << resolve_project_path(dir, rel, true) or (err) {
+        _ := err.msg()
+        << ""
+    }
+}
+
+fn try_dir_exists(dir &string, rel &string) bool {
+    trimmed := strings.trim_space(rel)
+    if trimmed.len == 0 { << false }
+    full := filepath.join([*dir, trimmed])
+    info := os.stat(full + "") or (err) {
+        _ := err.msg()
+        << false
+    }
+    << info.is_dir
+}
+
+fn try_check_i18n(resolved &string, default_locale &string, warn_msg $&string) string {
+    raw := snapshot.read(*resolved + "", 4194304) or (err) { << err.msg() }
+    lower := strings.to_lower(resolved)
+    $cat := ri.new_catalog("en-US") or (err) { << err.msg() }
+    if strings.ends_with(&lower, ".csv") {
+        $def_l := "en-US"
+        if default_locale.len > 0 { def_l = *default_locale + "" }
+        cat = ri.decode_catalog_csv(&raw, def_l) or (err) { << err.msg() }
+    } else {
+        cat = ri.decode_catalog_json(&raw) or (err) { << err.msg() }
+    }
+    if default_locale.len > 0 {
+        norm := ri.normalize_locale(default_locale) or (err) { << err.msg() }
+        locs := cat.locales()
+        $found := false
+        for i in 0:locs.len {
+            if locs[i] == norm { found = true }
+        }
+        if !found {
+            *warn_msg = "i18n catalog has no entries for default_locale '" + norm + "'"
+        }
+    }
+    << ""
+}
+
+fn try_check_input(resolved &string) string {
+    raw := snapshot.read(*resolved + "", 262144) or (err) { << err.msg() }
+    $im := inp.new_input_map()
+    _ := im.import_bindings_json(&raw) or (err) { << err.msg() }
+    << ""
+}
+
+fn try_check_perf_budgets(resolved &string) string {
+    raw := snapshot.read(*resolved + "", 1048576) or (err) { << err.msg() }
+    _ := rp.validate_perf_budgets_json(&raw) or (err) { << err.msg() }
+    << ""
+}
+
+fn try_check_platform_mapping(resolved &string) string {
+    raw := snapshot.read(*resolved + "", 1048576) or (err) { << err.msg() }
+    _ := rp.validate_platform_mapping_json(&raw) or (err) { << err.msg() }
+    << ""
+}
+
+fn try_check_steam(resolved &string) string {
+    raw := snapshot.read(*resolved + "", 1048576) or (err) { << err.msg() }
+    _ := rs.decode_config_json(&raw) or (err) { << err.msg() }
+    << ""
+}
+
+struct ConsoleCertCheck {
+    err string
+    report rc.CertificationReport
+}
+
+fn try_check_xbox(resolved &string) ConsoleCertCheck {
+    raw := snapshot.read(*resolved + "", 1048576) or (err) {
+        << ConsoleCertCheck{err: err.msg(), report: rc.CertificationReport{platform: 0, passed: false, issues: []rc.CertificationIssue{}}}
+    }
+    cfg := rc.decode_xbox_config_json(&raw) or (err) {
+        << ConsoleCertCheck{err: err.msg(), report: rc.CertificationReport{platform: 0, passed: false, issues: []rc.CertificationIssue{}}}
+    }
+    rep := rc.audit_xbox_certification(&cfg, 90)
+    << ConsoleCertCheck{err: "", report: rep}
+}
+
+fn try_check_ps(resolved &string) ConsoleCertCheck {
+    raw := snapshot.read(*resolved + "", 1048576) or (err) {
+        << ConsoleCertCheck{err: err.msg(), report: rc.CertificationReport{platform: 0, passed: false, issues: []rc.CertificationIssue{}}}
+    }
+    cfg := rc.decode_ps_config_json(&raw) or (err) {
+        << ConsoleCertCheck{err: err.msg(), report: rc.CertificationReport{platform: 0, passed: false, issues: []rc.CertificationIssue{}}}
+    }
+    rep := rc.audit_ps_certification(&cfg, 90)
+    << ConsoleCertCheck{err: "", report: rep}
+}
+
+fn try_check_switch(resolved &string) ConsoleCertCheck {
+    raw := snapshot.read(*resolved + "", 1048576) or (err) {
+        << ConsoleCertCheck{err: err.msg(), report: rc.CertificationReport{platform: 0, passed: false, issues: []rc.CertificationIssue{}}}
+    }
+    cfg := rc.decode_switch_config_json(&raw) or (err) {
+        << ConsoleCertCheck{err: err.msg(), report: rc.CertificationReport{platform: 0, passed: false, issues: []rc.CertificationIssue{}}}
+    }
+    rep := rc.audit_switch_certification(&cfg, 90, 100)
+    << ConsoleCertCheck{err: "", report: rep}
+}
+
+struct TapTapCertCheck {
+    err string
+    report rt.TapTapAuditReport
+}
+
+fn try_check_taptap(resolved &string) TapTapCertCheck {
+    raw := snapshot.read(*resolved + "", 1048576) or (err) {
+        << TapTapCertCheck{err: err.msg(), report: rt.TapTapAuditReport{passed: false, issues: []rt.TapTapAuditIssue{}}}
+    }
+    cfg := rt.decode_config_json(&raw) or (err) {
+        << TapTapCertCheck{err: err.msg(), report: rt.TapTapAuditReport{passed: false, issues: []rt.TapTapAuditIssue{}}}
+    }
+    rep := rt.audit_taptap_submission(&cfg)
+    << TapTapCertCheck{err: "", report: rep}
+}
+
+fn try_read_xun(path &string) string {
+    << snapshot.read(*path + "", 65536) or (err) {
+        _ := err.msg()
+        << ""
+    }
+}
+
+pub fn diagnose_project(project_path string) DoctorReport {
+    $issues := []DoctorIssue{}
+    $errors := 0
+    $warnings := 0
+    $checks := 1
+
+    p := load_project(project_path + "") or (err) {
+        push_issue($&issues, $&errors, $&warnings, "PROJ-001", "error", project_path + "", err.msg())
+        << DoctorReport{
+            project_path: project_path + "",
+            passed: false,
+            checks_run: checks,
+            error_count: errors,
+            warning_count: warnings,
+            issues: issues
+        }
+    }
+
+    // 1. Validate all declared scenes decode & reference registered UIDs.
+    checks += 1
+    for i in 0:p.scenes.len {
+        s := &p.scenes[i]
+        serr := try_check_scene(&p, s)
+        if serr.len > 0 {
+            push_issue($&issues, $&errors, $&warnings, "PROJ-002", "error", s.path + "", serr)
+        }
+    }
+
+    // 2. Entry scene consistency.
+    if p.has_meta && p.meta.entry_scene.len > 0 {
+        checks += 1
+        ek := p.meta.entry_scene + ""
+        if p.scene_index(&ek) < 0 {
+            push_issue($&issues, $&errors, $&warnings, "PROJ-003", "error", "project.json", "entry_scene '" + ek + "' not in scenes")
+        }
+    }
+
+    // 3. Check xu.xun presence & nexus dependency.
+    checks += 1
+    xun_res := try_resolve_rel(&p.directory, &"xu.xun")
+    if xun_res.len == 0 {
+        $sev := "warning"
+        if p.has_meta { sev = "error" }
+        push_issue($&issues, $&errors, $&warnings, "PROJ-004", sev, "xu.xun", "missing xu.xun module manifest in project root")
+    } else {
+        xun_raw := try_read_xun(&xun_res)
+        if !strings.contains(&xun_raw, "github.com/xulang-org/nexus") {
+            push_issue($&issues, $&errors, $&warnings, "PROJ-004", "warning", "xu.xun", "xu.xun does not declare github.com/xulang-org/nexus dependency")
+        }
+    }
+
+    // 4. Standard source/asset/gitignore directories when structured paths are configured.
+    if p.has_paths {
+        checks += 1
+        if p.paths.src.len > 0 {
+            if !try_dir_exists(&p.directory, &p.paths.src) {
+                push_issue($&issues, $&errors, $&warnings, "PROJ-005", "warning", p.paths.src + "", "configured src directory does not exist")
+            } else {
+                main_rel := p.paths.src + "/main.xu"
+                if try_resolve_rel(&p.directory, &main_rel).len == 0 {
+                    push_issue($&issues, $&errors, $&warnings, "PROJ-005", "warning", main_rel, "missing entrypoint main.xu in src directory")
+                }
+            }
+        }
+        if p.paths.scenes.len > 0 && !try_dir_exists(&p.directory, &p.paths.scenes) {
+            push_issue($&issues, $&errors, $&warnings, "PROJ-005", "warning", p.paths.scenes + "", "configured scenes directory does not exist")
+        }
+        if p.paths.assets.len > 0 && !try_dir_exists(&p.directory, &p.paths.assets) {
+            push_issue($&issues, $&errors, $&warnings, "PROJ-005", "warning", p.paths.assets + "", "configured assets directory does not exist")
+        }
+
+        // 5. Localization catalog.
+        if p.paths.locales.len > 0 {
+            checks += 1
+            loc_res := try_resolve_rel(&p.directory, &p.paths.locales)
+            if loc_res.len == 0 {
+                push_issue($&issues, $&errors, $&warnings, "PROJ-006", "error", p.paths.locales + "", "configured localization catalog file not found")
+            } else {
+                $def_l := ""
+                if p.has_meta { def_l = p.meta.default_locale + "" }
+                $loc_warn := ""
+                lerr := try_check_i18n(&loc_res, &def_l, $&loc_warn)
+                if lerr.len > 0 {
+                    push_issue($&issues, $&errors, $&warnings, "PROJ-006", "error", p.paths.locales + "", lerr)
+                } else if loc_warn.len > 0 {
+                    push_issue($&issues, $&errors, $&warnings, "PROJ-006W", "warning", p.paths.locales + "", loc_warn)
+                }
+            }
+        }
+
+        // 6. Input bindings.
+        if p.paths.input_bindings.len > 0 {
+            checks += 1
+            inp_res := try_resolve_rel(&p.directory, &p.paths.input_bindings)
+            if inp_res.len == 0 {
+                push_issue($&issues, $&errors, $&warnings, "PROJ-007", "error", p.paths.input_bindings + "", "configured input_bindings file not found")
+            } else {
+                ierr := try_check_input(&inp_res)
+                if ierr.len > 0 {
+                    push_issue($&issues, $&errors, $&warnings, "PROJ-007", "error", p.paths.input_bindings + "", ierr)
+                }
+            }
+        }
+
+        // 7. Perf budgets.
+        if p.paths.perf_budgets.len > 0 {
+            checks += 1
+            pb_res := try_resolve_rel(&p.directory, &p.paths.perf_budgets)
+            if pb_res.len == 0 {
+                push_issue($&issues, $&errors, $&warnings, "PROJ-008", "error", p.paths.perf_budgets + "", "configured perf_budgets file not found")
+            } else {
+                perr := try_check_perf_budgets(&pb_res)
+                if perr.len > 0 {
+                    push_issue($&issues, $&errors, $&warnings, "PROJ-008", "error", p.paths.perf_budgets + "", perr)
+                }
+            }
+        }
+
+        // 8. Platform ID mapping.
+        if p.paths.platform_mapping.len > 0 {
+            checks += 1
+            pm_res := try_resolve_rel(&p.directory, &p.paths.platform_mapping)
+            if pm_res.len == 0 {
+                push_issue($&issues, $&errors, $&warnings, "PROJ-009", "error", p.paths.platform_mapping + "", "configured platform_mapping file not found")
+            } else {
+                merr := try_check_platform_mapping(&pm_res)
+                if merr.len > 0 {
+                    push_issue($&issues, $&errors, $&warnings, "PROJ-009", "error", p.paths.platform_mapping + "", merr)
+                }
+            }
+        }
+    }
+
+    // 9. Configured store/platform manifests.
+    if p.has_platforms {
+        if p.platforms.steam.len > 0 {
+            checks += 1
+            s_res := try_resolve_rel(&p.directory, &p.platforms.steam)
+            if s_res.len == 0 {
+                push_issue($&issues, $&errors, $&warnings, "PROJ-010", "error", p.platforms.steam + "", "Steam config file not found")
+            } else {
+                serr := try_check_steam(&s_res)
+                if serr.len > 0 {
+                    push_issue($&issues, $&errors, $&warnings, "PROJ-010", "error", p.platforms.steam + "", serr)
+                }
+            }
+        }
+        if p.platforms.xbox.len > 0 {
+            checks += 1
+            x_res := try_resolve_rel(&p.directory, &p.platforms.xbox)
+            if x_res.len == 0 {
+                push_issue($&issues, $&errors, $&warnings, "PROJ-011", "error", p.platforms.xbox + "", "Xbox config file not found")
+            } else {
+                xchk := try_check_xbox(&x_res)
+                if xchk.err.len > 0 {
+                    push_issue($&issues, $&errors, $&warnings, "PROJ-011", "error", p.platforms.xbox + "", xchk.err)
+                } else {
+                    for ii in 0:xchk.report.issues.len {
+                        iss := &xchk.report.issues[ii]
+                        push_issue($&issues, $&errors, $&warnings, iss.code + "", iss.severity + "", p.platforms.xbox + "", iss.message + "")
+                    }
+                }
+            }
+        }
+        if p.platforms.playstation.len > 0 {
+            checks += 1
+            p_res := try_resolve_rel(&p.directory, &p.platforms.playstation)
+            if p_res.len == 0 {
+                push_issue($&issues, $&errors, $&warnings, "PROJ-012", "error", p.platforms.playstation + "", "PlayStation config file not found")
+            } else {
+                pchk := try_check_ps(&p_res)
+                if pchk.err.len > 0 {
+                    push_issue($&issues, $&errors, $&warnings, "PROJ-012", "error", p.platforms.playstation + "", pchk.err)
+                } else {
+                    for ii in 0:pchk.report.issues.len {
+                        iss := &pchk.report.issues[ii]
+                        push_issue($&issues, $&errors, $&warnings, iss.code + "", iss.severity + "", p.platforms.playstation + "", iss.message + "")
+                    }
+                }
+            }
+        }
+        if p.platforms.switch_cfg.len > 0 {
+            checks += 1
+            n_res := try_resolve_rel(&p.directory, &p.platforms.switch_cfg)
+            if n_res.len == 0 {
+                push_issue($&issues, $&errors, $&warnings, "PROJ-013", "error", p.platforms.switch_cfg + "", "Switch config file not found")
+            } else {
+                nchk := try_check_switch(&n_res)
+                if nchk.err.len > 0 {
+                    push_issue($&issues, $&errors, $&warnings, "PROJ-013", "error", p.platforms.switch_cfg + "", nchk.err)
+                } else {
+                    for ii in 0:nchk.report.issues.len {
+                        iss := &nchk.report.issues[ii]
+                        push_issue($&issues, $&errors, $&warnings, iss.code + "", iss.severity + "", p.platforms.switch_cfg + "", iss.message + "")
+                    }
+                }
+            }
+        }
+        if p.platforms.taptap.len > 0 {
+            checks += 1
+            t_res := try_resolve_rel(&p.directory, &p.platforms.taptap)
+            if t_res.len == 0 {
+                push_issue($&issues, $&errors, $&warnings, "PROJ-014", "error", p.platforms.taptap + "", "TapTap config file not found")
+            } else {
+                tchk := try_check_taptap(&t_res)
+                if tchk.err.len > 0 {
+                    push_issue($&issues, $&errors, $&warnings, "PROJ-014", "error", p.platforms.taptap + "", tchk.err)
+                } else {
+                    for ii in 0:tchk.report.issues.len {
+                        iss := &tchk.report.issues[ii]
+                        push_issue($&issues, $&errors, $&warnings, iss.code + "", iss.severity + "", p.platforms.taptap + "", iss.message + "")
+                    }
+                }
+            }
+        }
+    }
+
+    // 10. .gitignore advisory for structured projects.
+    if p.has_meta {
+        checks += 1
+        gi_res := try_resolve_rel(&p.directory, &".gitignore")
+        if gi_res.len == 0 {
+            push_issue($&issues, $&errors, $&warnings, "PROJ-015", "warning", ".gitignore", "missing .gitignore (recommended to ignore build/ and .nexus/)")
+        }
+    }
+
+    << DoctorReport{
+        project_path: p.path + "",
+        passed: errors == 0,
+        checks_run: checks,
+        error_count: errors,
+        warning_count: warnings,
+        issues: issues
+    }
+}
+
+pub fn format_doctor_report(rep &DoctorReport) string {
+    $b := strings.new_byte_builder(512)
+    $status := "PASS"
+    if !rep.passed { status = "FAIL" }
+    b.write_str("DOCTOR " + status +
+        " checks=" + str(rep.checks_run) +
+        " errors=" + str(rep.error_count) +
+        " warnings=" + str(rep.warning_count) + "\n")
+    for i in 0:rep.issues.len {
+        iss := &rep.issues[i]
+        b.write_str("  [" + iss.severity + "] " + iss.code + " (" + iss.path + "): " + iss.message + "\n")
+    }
+    b.write_str("  project=" + rep.project_path + "\n")
+    << b.to_string()
+}
+
+fn json_bool(v bool) string {
+    if v { << "true" }
+    << "false"
+}
+
+pub fn encode_doctor_report_json(rep &DoctorReport) string {
+    $b := strings.new_byte_builder(512)
+    pp := rep.project_path + ""
+    b.write_str("{\n")
+    b.write_str("  \"project_path\": " + json.quote(&pp) + ",\n")
+    b.write_str("  \"passed\": " + json_bool(rep.passed) + ",\n")
+    b.write_str("  \"checks_run\": " + str(rep.checks_run) + ",\n")
+    b.write_str("  \"error_count\": " + str(rep.error_count) + ",\n")
+    b.write_str("  \"warning_count\": " + str(rep.warning_count) + ",\n")
+    b.write_str("  \"issues\": [")
+    for i in 0:rep.issues.len {
+        if i > 0 { b.write_str(",") }
+        iss := &rep.issues[i]
+        c_s := iss.code + ""
+        s_s := iss.severity + ""
+        p_s := iss.path + ""
+        m_s := iss.message + ""
+        b.write_str("\n    {\"code\": " + json.quote(&c_s) +
+            ", \"severity\": " + json.quote(&s_s) +
+            ", \"path\": " + json.quote(&p_s) +
+            ", \"message\": " + json.quote(&m_s) + "}")
+    }
+    if rep.issues.len > 0 { b.write_str("\n  ") }
+    b.write_str("]\n}\n")
+    << b.to_string()
+}

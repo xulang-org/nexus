@@ -18,6 +18,13 @@ pub fn cascade_node_camera(camera &nexus.CameraNode3D,tree &nexus.SceneTree,aspe
     << policy.cascade_camera(view,projection) or >>
 }
 
+// Resolve either projection from a Node3D's current lens and world pose.
+pub fn cascade_scene_camera(tree &nexus.SceneTree, node int, aspect f64) policy.CascadeCamera3D {
+    projection := tree.camera_projection_3d(node, aspect) or >>
+    view := (tree.global_transform_3d(node) or >>).affine_inverse() or >>
+    << policy.cascade_camera(view, projection) or >>
+}
+
 // Shadow coverage is independent of the main camera's frustum. Hidden, queued
 // or removed nodes do not cast; selected LOD and weak resource checks are shared.
 pub fn (scene &Scene3D) shadow_casters(tree &nexus.SceneTree) []ren.ShadowCaster3D {
@@ -28,7 +35,12 @@ pub fn (scene &Scene3D) shadow_casters(tree &nexus.SceneTree) []ren.ShadowCaster
         mesh := scene.selected_mesh(node) or >>
         scene.owner.validate_mesh(mesh,false) or >>
         world := tree.global_transform_3d(node) or >>
-        casters.push(ren.ShadowCaster3D{mesh: mesh,world: world})
+        if scene.materials.has(node) {
+            material := &scene.materials[node]
+            casters.push(ren.shadow_caster_material(mesh, world, material) or >>)
+        } else {
+            casters.push(ren.shadow_caster(mesh, world))
+        }
     }
     << casters
 }

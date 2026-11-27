@@ -1,6 +1,7 @@
 @"github.com/xulang-org/nexus/resources/scene"
 
 fm #"github.com/xulang-org/nexus/foundation/math"
+camera_data #"github.com/xulang-org/nexus/resources/camera"
 #unicode/utf8
 #errors
 
@@ -25,6 +26,9 @@ pub struct NodeData {
     pub process_mode int
     pub local fm.Transform2D
     pub local_3d fm.Mat4
+    pub camera camera_data.Perspective
+    pub orthographic camera_data.Orthographic
+    pub camera_2d camera_data.View2D
 }
 pub struct Document { nodes []NodeData
     references []ResourceReference
@@ -33,10 +37,23 @@ pub struct Document { nodes []NodeData
     emitters []AudioEmitter
     scripts []ScriptAttachment
     connections []ScriptConnection
-    lights []LightAttachment }
+    lights []LightAttachment
+    sprites_3d []Sprite3DAttachment
+    tilemaps_2d []TileMap2DAttachment
+    environments []EnvironmentAttachment
+    rigid_bodies_3d []RigidBody3DAttachment
+    joints_3d []Joint3DAttachment
+    terrains []TerrainAttachment
+    particles_3d []ParticleEmitter3DAttachment
+    prefab_instances []PrefabInstanceAttachment
+    editable_meshes []EditableMeshAttachment
+    csg_trees []CsgTreeAttachment
+    material_overrides []MaterialOverrideAttachment }
 pub fn node(parent int, name string, kind int) NodeData {
     << NodeData{parent: parent, name: name, kind: kind, visible: true,
-        process_mode: PROCESS_INHERIT, local: fm.identity(), local_3d: fm.identity_3d()}
+        process_mode: PROCESS_INHERIT, local: fm.identity(), local_3d: fm.identity_3d(),
+        camera: camera_data.Perspective{}, orthographic: camera_data.Orthographic{},
+        camera_2d: camera_data.View2D{}}
 }
 fn valid_name(name &string) bool {
     if name.len < 1 || name.len > 255 || *name == "." || *name == ".." || !utf8.valid(name) { << false }
@@ -64,6 +81,13 @@ pub fn make_document(nodes []NodeData) Document {
         name := current.name + ""
         if !valid_name(&name) { >> errors.new("nexus scene: invalid UTF-8 node name") }
         if current.kind != NODE_GROUP && current.kind != NODE_2D && current.kind != NODE_3D { >> errors.new("nexus scene: unsupported node kind") }
+        if (current.camera.is_set() || current.orthographic.is_set()) && current.kind != NODE_3D {
+            >> errors.new("nexus scene: 3D camera requires a Node3D")
+        }
+        if current.camera.is_set() && current.orthographic.is_set() {
+            >> errors.new("nexus scene: Node3D has two camera projections")
+        }
+        if current.camera_2d.is_set() && current.kind != NODE_2D { >> errors.new("nexus scene: 2D camera requires a Node2D") }
         if current.process_mode < PROCESS_INHERIT || current.process_mode > PROCESS_DISABLED { >> errors.new("nexus scene: invalid process mode") }
         if !current.local.is_finite() || !current.local_3d.is_affine() { >> errors.new("nexus scene: transform must be finite and affine") }
         if (current.kind != NODE_2D && !identity_2d(current.local)) || (current.kind != NODE_3D && !identity_3d(current.local_3d)) {
@@ -86,7 +110,12 @@ pub fn make_document(nodes []NodeData) Document {
         depths.push(depth)
         previous_depth = depth
     }
-    << Document{nodes: nodes, references: []ResourceReference{}, surfaces: []Surface{}, buses: []AudioBus{}, emitters: []AudioEmitter{}, scripts: []ScriptAttachment{}, connections: []ScriptConnection{}, lights: []LightAttachment{}}
+    << Document{nodes: nodes, references: []ResourceReference{}, surfaces: []Surface{}, buses: []AudioBus{}, emitters: []AudioEmitter{}, scripts: []ScriptAttachment{}, connections: []ScriptConnection{}, lights: []LightAttachment{}, sprites_3d: []Sprite3DAttachment{}, tilemaps_2d: []TileMap2DAttachment{}, environments: []EnvironmentAttachment{}, rigid_bodies_3d: []RigidBody3DAttachment{}, joints_3d: []Joint3DAttachment{}, terrains: []TerrainAttachment{}, particles_3d: []ParticleEmitter3DAttachment{}, prefab_instances: []PrefabInstanceAttachment{}, editable_meshes: []EditableMeshAttachment{}, csg_trees: []CsgTreeAttachment{}, material_overrides: []MaterialOverrideAttachment{}}
+}
+pub fn (document &Document) has_modern_attachments() bool {
+    << document.environments.len > 0 || document.rigid_bodies_3d.len > 0 ||
+        document.joints_3d.len > 0 || document.terrains.len > 0 ||
+        document.particles_3d.len > 0 || document.prefab_instances.len > 0
 }
 pub fn (document &Document) node_count() int { << document.nodes.len }
 pub fn (document &Document) describe_node(index int) NodeData {

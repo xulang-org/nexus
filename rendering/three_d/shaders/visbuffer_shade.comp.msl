@@ -1,0 +1,455 @@
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint MAX_LIGHTS_PER_CLUSTER = 64u;
+
+struct ShadowData {
+    float4x4 mvp[4];
+    float4 direction_bias;
+    float4 shadow_filter;
+    float4 depth;
+    float4 camera_depth;
+    float4 ranges[4];
+    float4 limits;
+    float4 gradient_scales;
+};
+
+struct VisShadeUniform {
+    float4x4 view_proj;
+    float4x4 view;
+    float4 ambient_count;      // xyz=ambient, w=light_count
+    float4 eye_exposure;       // xyz=eye, w=exposure
+    float4 screen_depth;       // x=width, y=height, z=z_near, w=z_far
+    float4 grid_mode;          // x=gx, y=gy, z=gz, w=slice_mode
+    float4 log_info;           // x=log_ratio, y=gi_enabled, z=gi_strength, w=ibl_intensity
+    float4 sky_color;          // rgb=linear background color
+    float4 irr_origin_nx;      // xyz=origin, w=nx
+    float4 irr_spacing_ny;     // xyz=spacing, w=ny
+    float4 irr_dims;           // x=nz, y=ibl_enabled, z=shadow_light_slot, w=0
+    ShadowData s;              // 416 bytes exact shadow uniform parity with mesh.frag.msl
+};
+
+struct MeshletGpu {
+    float4 bound_sphere;
+    float4 cone;
+    uint4 info; // x=instance_id, y=first_index, z=index_count, w=pad
+};
+
+struct MeshletInstanceGpu {
+    float4x4 model;
+    float4x4 normals;
+    float4 scale_info; // x=max_scale, y=albedo_tex_slot (0=none,1..4), z=0, w=orient
+    float4 base_metallic;
+    float4 emission_roughness;
+    float4 maps_normal;
+    float4 surface;
+    float4 uv_rect;
+};
+
+struct LightGpu {
+    float4 position_kind;
+    float4 direction_range;
+    float4 radiance_inner;
+    float4 cone;
+};
+
+struct ProbeShGpu {
+    float4 dc;
+    float4 px;
+    float4 py;
+    float4 pz;
+};
+
+static inline float cross2(float2 a, float2 b) {
+    return a.x * b.y - a.y * b.x;
+}
+
+static inline float3 unit_safe(float3 value) {
+    float largest = max(abs(value.x), max(abs(value.y), abs(value.z)));
+    if (!isfinite(largest) || largest == 0.0) return float3(0.0, 0.0, 0.0);
+    float3 scaled = value / largest;
+    return scaled / sqrt(dot(scaled, scaled));
+}
+
+static inline float3 compute_bary(
+    float4 c0, float4 c1, float4 c2,
+    float2 ndc0, float2 ndc1, float2 ndc2,
+    float area, float2 px_ndc
+) {
+    if (abs(area) <= 1e-12) return float3(1.0 / 3.0);
+    float l0 = cross2(ndc1 - px_ndc, ndc2 - px_ndc) / area;
+    float l1 = cross2(ndc2 - px_ndc, ndc0 - px_ndc) / area;
+    float l2 = 1.0 - l0 - l1;
+    float pw0 = l0 / max(c0.w, 1e-5);
+    float pw1 = l1 / max(c1.w, 1e-5);
+    float pw2 = l2 / max(c2.w, 1e-5);
+    float psum = pw0 + pw1 + pw2;
+    if (abs(psum) <= 1e-12) return float3(1.0 / 3.0);
+    return clamp(float3(pw0, pw1, pw2) / psum, -0.5, 1.5);
+}
+
+static inline float3 material_direct(float3 base, float metallic, float roughness,
+    float3 normal, float3 position, float3 eye, float3 light, float3 radiance) {
+    float3 n = unit_safe(normal), v = unit_safe(eye - position), l = unit_safe(light), h = unit_safe(v + l);
+    float nv = max(dot(n, v), 0.0001), nl = max(dot(n, l), 0.0);
+    float nh = max(dot(n, h), 0.0), vh = clamp(dot(v, h), 0.0, 1.0);
+    float alpha = roughness * roughness, a2 = alpha * alpha;
+    float denominator = (nh * a2 - nh) * nh + 1.0;
+    float distribution = a2 / (3.14159265359 * max(denominator * denominator, 1e-12));
+    float visibility = 0.5 / max(nl * sqrt(nv * nv * (1.0 - a2) + a2) +
+        nv * sqrt(nl * nl * (1.0 - a2) + a2), 0.000001);
+    float3 f0 = mix(float3(0.04, 0.04, 0.04), base, metallic);
+    float factor = pow(1.0 - vh, 5.0);
+    float3 fresnel = f0 + (float3(1.0, 1.0, 1.0) - f0) * factor;
+    float3 diffuse = (float3(1.0, 1.0, 1.0) - fresnel) * (1.0 - metallic) * base / 3.14159265359;
+    return (diffuse + distribution * visibility * fresnel) * radiance * nl;
+}
+
+static inline float3 source_direct(float3 base, float metallic, float roughness,
+    float3 normal, float3 position, float3 eye, LightGpu src) {
+    float3 light = src.direction_range.xyz;
+    float attenuation = 1.0;
+    if (src.position_kind.w > 0.5) {
+        float3 delta = src.position_kind.xyz - position;
+        float distance2 = dot(delta, delta), radius2 = src.direction_range.w * src.direction_range.w;
+        if (distance2 < 1e-12 || distance2 >= radius2) return float3(0.0, 0.0, 0.0);
+        light = delta / sqrt(distance2);
+        float relative2 = distance2 / radius2;
+        float edge = max(0.0, 1.0 - relative2 * relative2);
+        attenuation = edge * edge / max(distance2, 0.0001);
+        if (src.position_kind.w > 1.5) {
+            float cosine = dot(src.direction_range.xyz, -light);
+            float transition = clamp((cosine - src.cone.x) / max(src.radiance_inner.w - src.cone.x, 0.000001), 0.0, 1.0);
+            attenuation *= transition * transition * (3.0 - 2.0 * transition);
+        }
+    }
+    return material_direct(base, metallic, roughness, normal, position, eye, light, src.radiance_inner.xyz * attenuation);
+}
+
+static inline float3 eval_probe(device const ProbeShGpu* probes, uint idx, float3 n) {
+    ProbeShGpu sh = probes[idx];
+    return max(sh.dc.xyz + sh.px.xyz * n.x + sh.py.xyz * n.y + sh.pz.xyz * n.z, float3(0.0));
+}
+
+static inline float3 sample_irradiance(
+    device const ProbeShGpu* probes,
+    constant VisShadeUniform& u,
+    float3 world,
+    float3 n
+) {
+    int nx = int(u.irr_origin_nx.w);
+    int ny = int(u.irr_spacing_ny.w);
+    int nz = int(u.irr_dims.x);
+    float3 f = (world - u.irr_origin_nx.xyz) / u.irr_spacing_ny.xyz;
+    int x0 = clamp(int(floor(f.x)), 0, nx - 1);
+    int y0 = clamp(int(floor(f.y)), 0, ny - 1);
+    int z0 = clamp(int(floor(f.z)), 0, nz - 1);
+    int x1 = min(x0 + 1, nx - 1);
+    int y1 = min(y0 + 1, ny - 1);
+    int z1 = min(z0 + 1, nz - 1);
+    float tx = clamp(f.x - float(x0), 0.0, 1.0);
+    float ty = clamp(f.y - float(y0), 0.0, 1.0);
+    float tz = clamp(f.z - float(z0), 0.0, 1.0);
+
+    float3 c000 = eval_probe(probes, uint((z0 * ny + y0) * nx + x0), n);
+    float3 c100 = eval_probe(probes, uint((z0 * ny + y0) * nx + x1), n);
+    float3 c010 = eval_probe(probes, uint((z0 * ny + y1) * nx + x0), n);
+    float3 c110 = eval_probe(probes, uint((z0 * ny + y1) * nx + x1), n);
+    float3 c001 = eval_probe(probes, uint((z1 * ny + y0) * nx + x0), n);
+    float3 c101 = eval_probe(probes, uint((z1 * ny + y0) * nx + x1), n);
+    float3 c011 = eval_probe(probes, uint((z1 * ny + y1) * nx + x0), n);
+    float3 c111 = eval_probe(probes, uint((z1 * ny + y1) * nx + x1), n);
+
+    float3 c00 = mix(c000, c100, tx);
+    float3 c10 = mix(c010, c110, tx);
+    float3 c01 = mix(c001, c101, tx);
+    float3 c11 = mix(c011, c111, tx);
+    return mix(mix(c00, c10, ty), mix(c01, c11, ty), tz);
+}
+
+static inline float2 shadow_slope_grad(float3 p, float3 px, float3 py) {
+    float3 n = unit_safe(cross(px - p, py - p));
+    if (abs(n.z) <= 0.00001) return float2(0.0, 0.0);
+    return float2(-2.0 * n.x, 2.0 * n.y) / n.z;
+}
+
+static inline float cascade_layer_pcf(
+    float3 p, float2 gradient, int layer, float bias, float texel,
+    float2 atlas_size, float raster_bias, texture2d<float> smap, sampler ssamp
+) {
+    if (p.x < -1.0 || p.x > 1.0 || p.y < -1.0 || p.y > 1.0 || p.z < 0.0 || p.z > 1.0) return 1.0;
+    float adj_bias = bias + max(abs(gradient.x), abs(gradient.y)) * texel * raster_bias;
+    float2 uv = float2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+    float visible = 0.0;
+    float total = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            float2 at = (floor(uv / texel) + float2(float(x), float(y)) + float2(0.5)) * texel;
+            float2 weights = max(float2(1.5) - abs((at - uv) / texel), float2(0.0));
+            float weight = weights.x * weights.y;
+            total += weight;
+            if (weight <= 0.0) continue;
+            if (at.x < 0.0 || at.x > 1.0 || at.y < 0.0 || at.y > 1.0) { visible += weight; continue; }
+            float2 atlas = (at + float2(float(layer % 2), float(layer / 2))) / atlas_size;
+            float ref_d = smap.sample(ssamp, atlas, level(0.0)).r;
+            visible += (p.z + dot(gradient, at - uv) + adj_bias >= ref_d ? 1.0 : 0.0) * weight;
+        }
+    }
+    return visible / max(total, 1e-6);
+}
+
+static inline float eval_vis_shadow(
+    float3 world, float3 world_x, float3 world_y, float3 normal,
+    constant ShadowData& s, texture2d<float> smap, sampler ssamp
+) {
+    if (s.shadow_filter.w < 0.5) return 1.0;
+    if (s.shadow_filter.w > 3.5) {
+        float4 c0 = s.mvp[0] * float4(world, 1.0);
+        float4 c0x = s.mvp[0] * float4(world_x, 1.0);
+        float4 c0y = s.mvp[0] * float4(world_y, 1.0);
+        float2 g0 = shadow_slope_grad(c0.xyz, c0x.xyz, c0y.xyz);
+        float distance = dot(s.camera_depth, float4(world, 1.0));
+        if (distance < s.limits.x || distance > s.limits.y) return 1.0;
+        int layer = 0;
+        if (distance > s.ranges[0].y && s.limits.z > 1.5) layer = 1;
+        if (distance > s.ranges[1].y && s.limits.z > 2.5) layer = 2;
+        if (distance > s.ranges[2].y && s.limits.z > 3.5) layer = 3;
+        float4 p_cur = s.mvp[layer] * float4(world, 1.0);
+        float scale = (layer == 0) ? 1.0 : ((layer == 1) ? s.gradient_scales.y : ((layer == 2) ? s.gradient_scales.z : s.gradient_scales.w));
+        float bias = s.direction_bias.w + s.shadow_filter.y * (1.0 - max(0.0, dot(unit_safe(normal), s.direction_bias.xyz)));
+        return cascade_layer_pcf(p_cur.xyz, g0 * scale, layer, bias * s.ranges[layer].w, s.shadow_filter.x, s.depth.zw, s.limits.w, smap, ssamp);
+    }
+
+    float4 proj = s.mvp[0] * float4(world, 1.0);
+    float4 proj_x = s.mvp[0] * float4(world_x, 1.0);
+    float4 proj_y = s.mvp[0] * float4(world_y, 1.0);
+    float3 p = proj.xyz / max(proj.w, 0.000001);
+    float3 px = proj_x.xyz / max(proj_x.w, 0.000001);
+    float3 py = proj_y.xyz / max(proj_y.w, 0.000001);
+    if (proj.w <= 0.000001 || p.x < -1.0 || p.x > 1.0 || p.y < -1.0 || p.y > 1.0 || p.z < 0.0 || p.z > 1.0) return 1.0;
+    float2 grad = shadow_slope_grad(p, px, py);
+    float2 uv = float2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+    float3 to_l = s.shadow_filter.w > 1.5 ? unit_safe(s.direction_bias.xyz - world) : s.direction_bias.xyz;
+    float bias = s.direction_bias.w + s.shadow_filter.y * (1.0 - max(0.0, dot(unit_safe(normal), to_l)));
+    float vis = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            float2 at = (floor(uv / s.shadow_filter.x) + float2(float(x), float(y)) + float2(0.5)) * s.shadow_filter.x;
+            if (at.x < 0.0 || at.x > 1.0 || at.y < 0.0 || at.y > 1.0) vis += 1.0;
+            else vis += (p.z + dot(grad, at - uv) + bias >= smap.sample(ssamp, at, level(0.0)).r ? 1.0 : 0.0);
+        }
+    }
+    return vis / 9.0;
+}
+
+static inline float4 sample_albedo_grad(
+    int slot,
+    float2 uv,
+    float2 grad_x,
+    float2 grad_y,
+    texture2d<float> t0, sampler s0,
+    texture2d<float> t1, sampler s1,
+    texture2d<float> t2, sampler s2,
+    texture2d<float> t3, sampler s3
+) {
+    if (slot == 1) return t0.sample(s0, uv, gradient2d(grad_x, grad_y));
+    if (slot == 2) return t1.sample(s1, uv, gradient2d(grad_x, grad_y));
+    if (slot == 3) return t2.sample(s2, uv, gradient2d(grad_x, grad_y));
+    if (slot == 4) return t3.sample(s3, uv, gradient2d(grad_x, grad_y));
+    return float4(1.0);
+}
+
+kernel void main0(
+    texture2d<float> ibl_brdf [[texture(0)]],
+    texture2d<float> ibl_env [[texture(1)]],
+    texture2d<float> shadow_map [[texture(2)]],
+    texture2d<float> albedo0 [[texture(3)]],
+    texture2d<float> albedo1 [[texture(4)]],
+    texture2d<float> albedo2 [[texture(5)]],
+    texture2d<float> albedo3 [[texture(6)]],
+    texture2d<uint, access::read> vis_tex [[texture(7)]],
+    texture2d<float, access::write> out_hdr [[texture(8)]],
+    texture2d<float, access::write> out_norm_rough [[texture(9)]],
+    sampler ibl_brdf_samp [[sampler(0)]],
+    sampler ibl_env_samp [[sampler(1)]],
+    sampler shadow_samp [[sampler(2)]],
+    sampler albedo_samp0 [[sampler(3)]],
+    sampler albedo_samp1 [[sampler(4)]],
+    sampler albedo_samp2 [[sampler(5)]],
+    sampler albedo_samp3 [[sampler(6)]],
+    constant VisShadeUniform& u [[buffer(0)]],
+    device const MeshletGpu* meshlets [[buffer(1)]],
+    device const MeshletInstanceGpu* instances [[buffer(2)]],
+    device const float* verts [[buffer(3)]],
+    device const uint* indices [[buffer(4)]],
+    device const LightGpu* lights [[buffer(5)]],
+    device const uint* cluster_counts [[buffer(6)]],
+    device const uint* cluster_indices [[buffer(7)]],
+    device const ProbeShGpu* probes [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint sw = uint(u.screen_depth.x);
+    uint sh = uint(u.screen_depth.y);
+    if (gid.x >= sw || gid.y >= sh) return;
+
+    uint vis_id = vis_tex.read(gid).r;
+    if (vis_id == 0u) {
+        out_hdr.write(float4(u.sky_color.rgb, 1.0), gid);
+        out_norm_rough.write(float4(0.0, 0.0, 0.0, 1.0), gid);
+        return;
+    }
+
+    uint raw = vis_id - 1u;
+    uint mid = raw >> 8u;
+    uint prim = raw & 0xFFu;
+
+    MeshletGpu m = meshlets[mid];
+    MeshletInstanceGpu inst = instances[m.info.x];
+    uint base_idx = m.info.y + prim * 3u;
+    uint i0 = indices[base_idx + 0u];
+    uint i1 = indices[base_idx + 1u];
+    uint i2 = indices[base_idx + 2u];
+
+    uint v0b = i0 * 16u;
+    uint v1b = i1 * 16u;
+    uint v2b = i2 * 16u;
+
+    float3 lp0 = float3(verts[v0b + 0u], verts[v0b + 1u], verts[v0b + 2u]);
+    float3 lp1 = float3(verts[v1b + 0u], verts[v1b + 1u], verts[v1b + 2u]);
+    float3 lp2 = float3(verts[v2b + 0u], verts[v2b + 1u], verts[v2b + 2u]);
+
+    float4 w0_4 = inst.model * float4(lp0, 1.0);
+    float4 w1_4 = inst.model * float4(lp1, 1.0);
+    float4 w2_4 = inst.model * float4(lp2, 1.0);
+
+    float4 c0 = u.view_proj * w0_4;
+    float4 c1 = u.view_proj * w1_4;
+    float4 c2 = u.view_proj * w2_4;
+
+    float2 ndc0 = c0.xy / max(abs(c0.w), 1e-6) * (c0.w < 0.0 ? -1.0 : 1.0);
+    float2 ndc1 = c1.xy / max(abs(c1.w), 1e-6) * (c1.w < 0.0 ? -1.0 : 1.0);
+    float2 ndc2 = c2.xy / max(abs(c2.w), 1e-6) * (c2.w < 0.0 ? -1.0 : 1.0);
+
+    float2 inv_wh = float2(1.0 / u.screen_depth.x, 1.0 / u.screen_depth.y);
+    float2 px_ndc = float2((float(gid.x) + 0.5) * inv_wh.x * 2.0 - 1.0, 1.0 - (float(gid.y) + 0.5) * inv_wh.y * 2.0);
+    float2 dx_ndc = float2(2.0 * inv_wh.x, 0.0);
+    float2 dy_ndc = float2(0.0, -2.0 * inv_wh.y);
+
+    float area = cross2(ndc1 - ndc0, ndc2 - ndc0);
+    float3 bary = compute_bary(c0, c1, c2, ndc0, ndc1, ndc2, area, px_ndc);
+    float3 bary_dx = compute_bary(c0, c1, c2, ndc0, ndc1, ndc2, area, px_ndc + dx_ndc);
+    float3 bary_dy = compute_bary(c0, c1, c2, ndc0, ndc1, ndc2, area, px_ndc + dy_ndc);
+
+    float3 world_pos = w0_4.xyz * bary.x + w1_4.xyz * bary.y + w2_4.xyz * bary.z;
+    float3 world_x = w0_4.xyz * bary_dx.x + w1_4.xyz * bary_dx.y + w2_4.xyz * bary_dx.z;
+    float3 world_y = w0_4.xyz * bary_dy.x + w1_4.xyz * bary_dy.y + w2_4.xyz * bary_dy.z;
+
+    float4 col0 = float4(verts[v0b + 3u], verts[v0b + 4u], verts[v0b + 5u], verts[v0b + 6u]);
+    float4 col1 = float4(verts[v1b + 3u], verts[v1b + 4u], verts[v1b + 5u], verts[v1b + 6u]);
+    float4 col2 = float4(verts[v2b + 3u], verts[v2b + 4u], verts[v2b + 5u], verts[v2b + 6u]);
+    float4 vcol = col0 * bary.x + col1 * bary.y + col2 * bary.z;
+
+    float3 ln0 = float3(verts[v0b + 7u], verts[v0b + 8u], verts[v0b + 9u]);
+    float3 ln1 = float3(verts[v1b + 7u], verts[v1b + 8u], verts[v1b + 9u]);
+    float3 ln2 = float3(verts[v2b + 7u], verts[v2b + 8u], verts[v2b + 9u]);
+    float3 local_n = unit_safe(ln0 * bary.x + ln1 * bary.y + ln2 * bary.z);
+    if (dot(local_n, local_n) == 0.0) {
+        local_n = unit_safe(cross(lp1 - lp0, lp2 - lp0));
+    }
+    float3 wn = unit_safe((inst.normals * float4(local_n, 0.0)).xyz);
+    float3 to_eye = unit_safe(u.eye_exposure.xyz - world_pos);
+    if (dot(wn, to_eye) < 0.0) wn = -wn;
+
+    // Analytic UV interpolation and screen-space gradient differentials.
+    float2 uv0 = float2(verts[v0b + 10u], verts[v0b + 11u]);
+    float2 uv1 = float2(verts[v1b + 10u], verts[v1b + 11u]);
+    float2 uv2 = float2(verts[v2b + 10u], verts[v2b + 11u]);
+    float2 uv_c = uv0 * bary.x + uv1 * bary.y + uv2 * bary.z;
+    float2 uv_x = uv0 * bary_dx.x + uv1 * bary_dx.y + uv2 * bary_dx.z;
+    float2 uv_y = uv0 * bary_dy.x + uv1 * bary_dy.y + uv2 * bary_dy.z;
+    float2 sample_uv = inst.uv_rect.xy + uv_c * inst.uv_rect.zw;
+    float2 grad_x = (uv_x - uv_c) * inst.uv_rect.zw;
+    float2 grad_y = (uv_y - uv_c) * inst.uv_rect.zw;
+
+    float3 base = clamp(inst.base_metallic.rgb * vcol.rgb, 0.0, 1.0);
+    int tex_slot = int(inst.scale_info.y + 0.5);
+    if (tex_slot >= 1 && tex_slot <= 4) {
+        base *= sample_albedo_grad(
+            tex_slot, sample_uv, grad_x, grad_y,
+            albedo0, albedo_samp0, albedo1, albedo_samp1, albedo2, albedo_samp2, albedo3, albedo_samp3
+        ).rgb;
+    }
+
+    float metallic = clamp(inst.base_metallic.w, 0.0, 1.0);
+    float roughness = clamp(inst.emission_roughness.w, 0.045, 1.0);
+    float3 emission = max(inst.emission_roughness.rgb, 0.0);
+
+    // Shadow visibility factor (for the shadow-casting light slot).
+    float shadow_vis = eval_vis_shadow(world_pos, world_x, world_y, wn, u.s, shadow_map, shadow_samp);
+    uint shadow_lid = uint(u.s.shadow_filter.z + 0.5);
+
+    // 1. Global directional lights (stored at cluster_counts[total_clusters]).
+    uint gx = max(uint(u.grid_mode.x), 1u);
+    uint gy = max(uint(u.grid_mode.y), 1u);
+    uint gz = max(uint(u.grid_mode.z), 1u);
+    uint total_clusters = gx * gy * gz;
+    float3 direct = float3(0.0);
+
+    if (u.ambient_count.w > 0.5) {
+        uint dir_count = min(cluster_counts[total_clusters], MAX_LIGHTS_PER_CLUSTER);
+        for (uint di = 0u; di < dir_count; ++di) {
+            uint lid = cluster_indices[total_clusters * MAX_LIGHTS_PER_CLUSTER + di];
+            float vis = (u.s.shadow_filter.w > 0.5 && lid == shadow_lid) ? shadow_vis : 1.0;
+            direct += source_direct(base, metallic, roughness, wn, world_pos, u.eye_exposure.xyz, lights[lid]) * vis;
+        }
+
+        // 2. Local clustered point/spot lights.
+        float view_depth = -(u.view * float4(world_pos, 1.0)).z;
+        uint cx = min(uint((float(gid.x) + 0.5) * inv_wh.x * float(gx)), gx - 1u);
+        uint cy = min(uint((float(gid.y) + 0.5) * inv_wh.y * float(gy)), gy - 1u);
+        float zn = u.screen_depth.z;
+        float zf = u.screen_depth.w;
+        float z_clamped = clamp(view_depth, zn, zf);
+        float z_norm = (u.grid_mode.w < 0.5)
+            ? clamp(log(max(z_clamped, zn) / zn) / max(u.log_info.x, 1e-6), 0.0, 0.999999)
+            : clamp((z_clamped - zn) / max(zf - zn, 1e-6), 0.0, 0.999999);
+        uint cz = min(uint(z_norm * float(gz)), gz - 1u);
+        uint cid = (cz * gy + cy) * gx + cx;
+
+        uint lcount = min(cluster_counts[cid], MAX_LIGHTS_PER_CLUSTER);
+        uint list_base = cid * MAX_LIGHTS_PER_CLUSTER;
+        for (uint i = 0u; i < lcount; ++i) {
+            uint lid = cluster_indices[list_base + i];
+            float vis = (u.s.shadow_filter.w > 0.5 && lid == shadow_lid) ? shadow_vis : 1.0;
+            direct += source_direct(base, metallic, roughness, wn, world_pos, u.eye_exposure.xyz, lights[lid]) * vis;
+        }
+    }
+
+    // 3. Diffuse GI + Specular Split-Sum Environment IBL.
+    float3 irr = u.ambient_count.xyz;
+    if (u.log_info.y > 0.5) {
+        irr += sample_irradiance(probes, u, world_pos, wn) * u.log_info.z;
+    }
+
+    float nv = clamp(dot(wn, to_eye), 0.001, 0.999);
+    float3 f0 = mix(float3(0.04, 0.04, 0.04), base, metallic);
+    float3 ks_ibl = f0 + (max(float3(1.0 - roughness), f0) - f0) * pow(1.0 - nv, 5.0);
+    float m4 = metallic * metallic;
+    float3 kd_ibl = (u.irr_dims.y > 0.5)
+        ? ((float3(1.0) - ks_ibl) * (1.0 - metallic))
+        : float3(1.0 - m4 * m4);
+    float3 specular_ibl = float3(0.0);
+    if (u.irr_dims.y > 0.5) {
+        float3 r_vec = unit_safe(reflect(-to_eye, wn));
+        float u_eq = atan2(r_vec.z, r_vec.x) * (0.5 / 3.14159265359) + 0.5;
+        float v_eq = acos(clamp(r_vec.y, -1.0, 1.0)) / 3.14159265359;
+        float lod = clamp(roughness * 4.0, 0.0, 4.0);
+        float3 prefiltered = ibl_env.sample(ibl_env_samp, float2(u_eq, v_eq), level(lod)).rgb;
+        float2 env_brdf = ibl_brdf.sample(ibl_brdf_samp, float2(nv, roughness), level(0.0)).rg;
+        specular_ibl = prefiltered * (f0 * env_brdf.x + env_brdf.y) * u.log_info.w;
+    }
+
+    float3 hdr_rgb = max(direct + irr * base * kd_ibl + specular_ibl + emission, 0.0);
+    out_hdr.write(float4(hdr_rgb, 1.0), gid);
+    out_norm_rough.write(float4(wn, roughness), gid);
+}

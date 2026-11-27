@@ -1,0 +1,521 @@
+@"github.com/xulang-org/nexus/integration/audio_stream"
+
+assets #"github.com/xulang-org/nexus/assets/audio"
+mix #"github.com/xulang-org/nexus/audio/mixer"
+#errors
+#math
+
+pub const MAX_POOL_WORKERS = 8
+pub const MAX_CHUNK_FRAMES = 4096
+
+pub struct AsyncAudioConfig {
+    pub worker_count int
+    pub chunk_frames int
+    pub max_inflight_chunks int
+}
+
+pub fn default_async_audio_config() AsyncAudioConfig {
+    << AsyncAudioConfig{
+        worker_count: 2,
+        chunk_frames: 1024,
+        max_inflight_chunks: 4
+    }
+}
+
+pub struct AsyncAudioStats {
+    pub worker_count int
+    pub active_streams int
+    pub inflight_jobs int
+    pub completed_chunks int
+    pub discarded_stale_chunks int
+    pub fed_frames int
+}
+
+struct DecodeJob {
+    stream_id int
+    generation int
+    seq int
+    path string
+    start_frame int
+    frames int
+    total_frames int
+    channels int
+    looping bool
+    finished bool
+}
+
+struct DecodeResult {
+    stream_id int
+    generation int
+    seq int
+    frames int
+    worker_id int
+    finished bool
+    samples []int
+    error_text string
+}
+
+struct PendingChunk {
+    seq int
+    frames int
+    finished bool
+    samples []int
+}
+
+struct AsyncStreamSlot {
+    id int
+    path string
+    source int
+    sample_rate int
+    channels int
+    total_frames int
+    looping bool
+    generation int
+    issue_cursor int
+    commit_cursor int
+    next_seq int
+    next_commit_seq int
+    inflight int
+    eof_submitted bool
+    eof_fed bool
+    closed bool
+    pending []PendingChunk
+}
+
+pub struct AsyncAudioPool {
+    config AsyncAudioConfig
+    jobs chan DecodeJob
+    results chan DecodeResult
+    stop chan int
+    worker_done chan int
+    streams []AsyncStreamSlot
+    completed_chunks int
+    discarded_stale_chunks int
+    fed_frames int
+    closed bool
+}
+
+fn validate_config(cfg &AsyncAudioConfig) int {
+    if cfg.worker_count < 1 || cfg.worker_count > MAX_POOL_WORKERS ||
+        cfg.chunk_frames < 64 || cfg.chunk_frames > assets.MAX_READ_FRAMES ||
+        cfg.max_inflight_chunks < 1 || cfg.max_inflight_chunks > 32 {
+        >> errors.new("nexus async_audio: invalid pool worker, chunk, or inflight budget")
+    }
+    << 0
+}
+
+fn close_reader_quiet(r $&assets.WavReader) {
+    r.close() or (e) { << }
+}
+
+fn decode_chunk_job(worker_id int, job &DecodeJob) DecodeResult {
+    $reader := assets.open_wav_reader(job.path + "") or (err) {
+        << DecodeResult{
+            stream_id: job.stream_id, generation: job.generation, seq: job.seq,
+            frames: 0, worker_id: worker_id, finished: false, samples: []int{},
+            error_text: err.msg()
+        }
+    }
+    if job.total_frames <= 0 || job.frames <= 0 || job.channels <= 0 {
+        reader_ref := $&reader
+        reader_ref.close() or (e) { << DecodeResult{
+            stream_id: job.stream_id, generation: job.generation, seq: job.seq,
+            frames: 0, worker_id: worker_id, finished: false, samples: []int{},
+            error_text: e.msg()
+        } }
+        << DecodeResult{
+            stream_id: job.stream_id, generation: job.generation, seq: job.seq,
+            frames: 0, worker_id: worker_id, finished: job.finished, samples: []int{},
+            error_text: "nexus async_audio: empty WAV stream"
+        }
+    }
+
+    $samples := []int{}
+    $remaining := job.frames
+    $pos := job.start_frame % job.total_frames
+    while remaining > 0 {
+        $take := remaining
+        avail := job.total_frames - pos
+        if take > avail { take = avail }
+        part := reader.read_frames(pos, take) or (err) {
+            close_reader_quiet($&reader)
+            << DecodeResult{
+                stream_id: job.stream_id, generation: job.generation, seq: job.seq,
+                frames: 0, worker_id: worker_id, finished: false, samples: []int{},
+                error_text: err.msg()
+            }
+        }
+        for s in part { samples.push(s) }
+        remaining -= take
+        pos = (pos + take) % job.total_frames
+        if !job.looping && remaining > 0 && pos == 0 { <- }
+    }
+    reader_ref := $&reader
+    reader_ref.close() or (err) {
+        << DecodeResult{
+            stream_id: job.stream_id, generation: job.generation, seq: job.seq,
+            frames: 0, worker_id: worker_id, finished: false, samples: []int{},
+            error_text: err.msg()
+        }
+    }
+    decoded_frames := samples.len / job.channels
+    << DecodeResult{
+        stream_id: job.stream_id,
+        generation: job.generation,
+        seq: job.seq,
+        frames: decoded_frames,
+        worker_id: worker_id,
+        finished: job.finished,
+        samples: samples,
+        error_text: ""
+    }
+}
+
+fn audio_decode_worker(worker_id int, jobs chan DecodeJob, results chan DecodeResult, stop chan int, done chan int) {
+    $running := true
+    while running {
+        select {
+            _ := <-stop {
+                running = false
+            }
+            job := <-jobs {
+                res := decode_chunk_job(worker_id, &job)
+                results <- res
+            }
+        }
+    }
+    done <- worker_id
+}
+
+pub fn open_pool(cfg AsyncAudioConfig) AsyncAudioPool {
+    validate_config(&cfg) or >>
+    jobs := chan DecodeJob{cap: 256}
+    results := chan DecodeResult{cap: 256}
+    stop := chan int{cap: 16}
+    worker_done := chan int{cap: 16}
+
+    for wid in 0:cfg.worker_count {
+        xu audio_decode_worker(wid, jobs, results, stop, worker_done)
+    }
+
+    << AsyncAudioPool{
+        config: cfg,
+        jobs: jobs,
+        results: results,
+        stop: stop,
+        worker_done: worker_done,
+        streams: []AsyncStreamSlot{},
+        completed_chunks: 0,
+        discarded_stale_chunks: 0,
+        fed_frames: 0,
+        closed: false
+    }
+}
+
+pub fn (pool $&AsyncAudioPool) open_stream(mixer $&mix.Mixer, path string, capacity_frames int, looping bool) int {
+    if pool.closed { >> errors.new("nexus async_audio: pool is closed") }
+    $reader := assets.open_wav_reader(path + "") or >>
+    rate := reader.sample_rate()
+    channels := reader.channel_count()
+    total := reader.frame_count()
+    rref := $&reader
+    rref.close() or >>
+    if total <= 0 { >> errors.new("nexus async_audio: WAV file contains zero frames") }
+    source := mixer.open_stream(rate, channels, capacity_frames) or >>
+    id := pool.streams.len
+    pool.streams.push(AsyncStreamSlot{
+        id: id,
+        path: path + "",
+        source: source,
+        sample_rate: rate,
+        channels: channels,
+        total_frames: total,
+        looping: looping,
+        generation: 1,
+        issue_cursor: 0,
+        commit_cursor: 0,
+        next_seq: 0,
+        next_commit_seq: 0,
+        inflight: 0,
+        eof_submitted: false,
+        eof_fed: false,
+        closed: false,
+        pending: []PendingChunk{}
+    })
+    pool.schedule_stream(mixer, id) or >>
+    << id
+}
+
+fn (pool &AsyncAudioPool) check_handle(handle int) int {
+    if pool.closed || handle < 0 || handle >= pool.streams.len || pool.streams[handle].closed {
+        >> errors.new("nexus async_audio: stale, closed, or invalid stream handle")
+    }
+    << handle
+}
+
+pub fn (pool &AsyncAudioPool) source_id(handle int) int {
+    pool.check_handle(handle) or >>
+    << pool.streams[handle].source
+}
+
+pub fn (pool &AsyncAudioPool) generation(handle int) int {
+    pool.check_handle(handle) or >>
+    << pool.streams[handle].generation
+}
+
+pub fn (pool &AsyncAudioPool) commit_cursor(handle int) int {
+    pool.check_handle(handle) or >>
+    << pool.streams[handle].commit_cursor
+}
+
+pub fn (pool &AsyncAudioPool) stats() AsyncAudioStats {
+    $active := 0
+    $inflight := 0
+    for i in 0:pool.streams.len {
+        if !pool.streams[i].closed {
+            active += 1
+            inflight += pool.streams[i].inflight
+        }
+    }
+    << AsyncAudioStats{
+        worker_count: pool.config.worker_count,
+        active_streams: active,
+        inflight_jobs: inflight,
+        completed_chunks: pool.completed_chunks,
+        discarded_stale_chunks: pool.discarded_stale_chunks,
+        fed_frames: pool.fed_frames
+    }
+}
+
+fn (pool $&AsyncAudioPool) ingest_result(msg DecodeResult) int {
+    sid := msg.stream_id
+    if sid < 0 || sid >= pool.streams.len {
+        pool.discarded_stale_chunks += 1
+        << 0
+    }
+    slot := $&pool.streams[sid]
+    if slot.closed || msg.generation != slot.generation {
+        pool.discarded_stale_chunks += 1
+        << 0
+    }
+    if slot.inflight > 0 { slot.inflight -= 1 }
+    if msg.error_text.len > 0 {
+        >> errors.new(msg.error_text)
+    }
+    pool.completed_chunks += 1
+    $samples_copy := []int{}
+    for s in msg.samples { samples_copy.push(s) }
+    slot.pending.push(PendingChunk{
+        seq: msg.seq,
+        frames: msg.frames,
+        finished: msg.finished,
+        samples: samples_copy
+    })
+    << 0
+}
+
+fn drop_pending_at(src &[]PendingChunk, remove_idx int) []PendingChunk {
+    $out := []PendingChunk{}
+    for i in 0:src.len {
+        if i != remove_idx {
+            c := &src[i]
+            $s := []int{}
+            for x in c.samples { s.push(x) }
+            out.push(PendingChunk{seq: c.seq, frames: c.frames, finished: c.finished, samples: s})
+        }
+    }
+    << out
+}
+
+fn (pool $&AsyncAudioPool) schedule_stream(mixer &mix.Mixer, handle int) int {
+    slot := $&pool.streams[handle]
+    if slot.closed || slot.eof_submitted { << 0 }
+    info := mixer.stream_info(slot.source) or >>
+    $pending_frames := 0
+    for c in slot.pending { pending_frames += c.frames }
+    queued_approx := info.buffered_frames + pending_frames + slot.inflight * pool.config.chunk_frames
+    $room := info.capacity_frames - queued_approx
+    while slot.inflight < pool.config.max_inflight_chunks && !slot.eof_submitted && room >= 1 {
+        $take := pool.config.chunk_frames
+        if take > room { take = room }
+        if !slot.looping {
+            rem := slot.total_frames - slot.issue_cursor
+            if rem <= 0 {
+                slot.eof_submitted = true
+                <-
+            }
+            if take > rem { take = rem }
+        }
+        finished := !slot.looping && slot.issue_cursor + take >= slot.total_frames
+        job := DecodeJob{
+            stream_id: slot.id,
+            generation: slot.generation,
+            seq: slot.next_seq,
+            path: slot.path + "",
+            start_frame: slot.issue_cursor,
+            frames: take,
+            total_frames: slot.total_frames,
+            channels: slot.channels,
+            looping: slot.looping,
+            finished: finished
+        }
+        pool.jobs <- job
+        slot.next_seq += 1
+        slot.inflight += 1
+        total_f := slot.total_frames
+        if slot.looping && total_f > 0 {
+            slot.issue_cursor = (slot.issue_cursor + take) % total_f
+        } else {
+            slot.issue_cursor = slot.issue_cursor + take
+            if slot.issue_cursor >= slot.total_frames { slot.eof_submitted = true }
+        }
+        room -= take
+    }
+    << 0
+}
+
+// Non-blocking drain + ordered reassembly + feed + refill scheduling. Returns newly fed frames.
+pub fn (pool $&AsyncAudioPool) pump(mixer $&mix.Mixer) int {
+    if pool.closed { >> errors.new("nexus async_audio: pool is closed") }
+    $draining := true
+    while draining {
+        select {
+            msg := <-pool.results {
+                pool.ingest_result(msg) or >>
+            }
+            else {
+                draining = false
+            }
+        }
+    }
+
+    $newly_fed := 0
+    for i in 0:pool.streams.len {
+        if pool.streams[i].closed { -> }
+        // Feed contiguous chunks matching next_commit_seq while mixer ring has room.
+        $progressed := true
+        while progressed {
+            progressed = false
+            info := mixer.stream_info(pool.streams[i].source) or >>
+            if info.eof { <- }
+            $found := -1
+            for j in 0:pool.streams[i].pending.len {
+                if pool.streams[i].pending[j].seq == pool.streams[i].next_commit_seq {
+                    found = j
+                    <-
+                }
+            }
+            if found < 0 { <- }
+            chunk := &pool.streams[i].pending[found]
+            chunk_frames := chunk.frames
+            if chunk_frames > info.room_frames { <- }
+            chunk_finished := chunk.finished
+            mixer.feed_stream(pool.streams[i].source, &chunk.samples, chunk_finished) or >>
+            slot := $&pool.streams[i]
+            slot.pending = drop_pending_at(&slot.pending, found)
+            slot.next_commit_seq += 1
+            total_f := slot.total_frames
+            if slot.looping && total_f > 0 {
+                slot.commit_cursor = (slot.commit_cursor + chunk_frames) % total_f
+            } else {
+                slot.commit_cursor = slot.commit_cursor + chunk_frames
+            }
+            if chunk_finished { slot.eof_fed = true }
+            pool.fed_frames += chunk_frames
+            newly_fed += chunk_frames
+            progressed = true
+        }
+        pool.schedule_stream(mixer, i) or >>
+    }
+    << newly_fed
+}
+
+// Blocks up to one decoded chunk per cycle until at least min_new_frames have been fed
+// or all active streams have exhausted inflight work. Returns total newly fed frames.
+pub fn (pool $&AsyncAudioPool) wait_and_pump(mixer $&mix.Mixer, min_new_frames int, max_waits int) int {
+    if pool.closed { >> errors.new("nexus async_audio: pool is closed") }
+    $fed_total := pool.pump(mixer) or >>
+    $waits := 0
+    while fed_total < min_new_frames && waits < max_waits {
+        $has_inflight := false
+        for i in 0:pool.streams.len {
+            if !pool.streams[i].closed && pool.streams[i].inflight > 0 {
+                has_inflight = true
+                <-
+            }
+        }
+        if !has_inflight { <- }
+        msg := <-pool.results
+        pool.ingest_result(msg) or >>
+        fed_total += pool.pump(mixer) or >>
+        waits += 1
+    }
+    << fed_total
+}
+
+// Issues a generation barrier on seek so stale in-flight chunks from before the seek are discarded cleanly.
+pub fn (pool $&AsyncAudioPool) seek_frames(mixer $&mix.Mixer, handle int, frame int) int {
+    pool.check_handle(handle) or >>
+    slot := $&pool.streams[handle]
+    if frame < 0 || frame > slot.total_frames {
+        >> errors.new("nexus async_audio: seek frame outside audio duration")
+    }
+    $target := frame
+    if slot.looping && target == slot.total_frames { target = 0 }
+    mixer.reset_stream(slot.source, &[]int{}, false, false) or >>
+    slot.generation += 1
+    slot.issue_cursor = target
+    slot.commit_cursor = target
+    slot.next_seq = 0
+    slot.next_commit_seq = 0
+    slot.inflight = 0
+    slot.eof_submitted = false
+    slot.eof_fed = false
+    slot.pending = []PendingChunk{}
+    pool.schedule_stream(mixer, handle) or >>
+    << target
+}
+
+pub fn (pool $&AsyncAudioPool) seek_seconds(mixer $&mix.Mixer, handle int, seconds f64) int {
+    pool.check_handle(handle) or >>
+    rate := pool.streams[handle].sample_rate
+    total := pool.streams[handle].total_frames
+    if rate <= 0 { >> errors.new("nexus async_audio: invalid sample rate") }
+    dur := f64(total) / f64(rate)
+    if math.is_nan(seconds) || math.is_inf(seconds) || seconds < 0.0 || seconds > dur {
+        >> errors.new("nexus async_audio: seek time outside duration")
+    }
+    target := int(math.round_to_even(seconds * f64(rate)))
+    << pool.seek_frames(mixer, handle, target) or >>
+}
+
+pub fn (pool $&AsyncAudioPool) close_stream(mixer $&mix.Mixer, handle int) int {
+    if pool.closed || handle < 0 || handle >= pool.streams.len {
+        >> errors.new("nexus async_audio: invalid stream handle")
+    }
+    if pool.streams[handle].closed { << 0 }
+    source := pool.streams[handle].source
+    if mixer.is_stream(source) { mixer.close_stream(source) or >> }
+    slot := $&pool.streams[handle]
+    slot.closed = true
+    slot.inflight = 0
+    slot.pending = []PendingChunk{}
+    << 0
+}
+
+pub fn (pool $&AsyncAudioPool) close(mixer $&mix.Mixer) int {
+    if pool.closed { << 0 }
+    for _ in 0:pool.config.worker_count {
+        pool.stop <- 1
+    }
+    for _ in 0:pool.config.worker_count {
+        _ := <-pool.worker_done
+    }
+    for i in 0:pool.streams.len {
+        if !pool.streams[i].closed {
+            pool.close_stream(mixer, i) or >>
+        }
+    }
+    pool.closed = true
+    << 0
+}

@@ -1,0 +1,501 @@
+@"github.com/xulang-org/nexus/integration/modeling"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+mod #"github.com/xulang-org/nexus/modeling"
+physics3d #"github.com/xulang-org/nexus/physics3d"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+light_data #"github.com/xulang-org/nexus/resources/lighting"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+#errors
+#math
+
+pub const EDIT_MODE_OBJECT = 0
+pub const EDIT_MODE_VERTEX = 1
+pub const EDIT_MODE_EDGE = 2
+pub const EDIT_MODE_FACE = 3
+pub const MAX_MODEL_HISTORY = 32
+
+pub struct EditableModelSession {
+    pub mesh rm.EditableMesh
+    pub undo_stack []rm.EditableMesh
+    pub redo_stack []rm.EditableMesh
+    pub mode int
+    pub selected_verts []int
+    pub selected_edges []int
+    pub selected_faces []int
+    pub compiled []mod.CompiledPrimitive
+    pub gpu_meshes []ren.Mesh3D
+    pub gpu_materials []ren.Material3D
+    pub dirty_gpu bool
+    pub closed bool
+}
+
+pub fn new_editable_session(mesh rm.EditableMesh) EditableModelSession {
+    mesh.validate() or >>
+    << EditableModelSession{
+        mesh: mesh,
+        undo_stack: []rm.EditableMesh{},
+        redo_stack: []rm.EditableMesh{},
+        mode: EDIT_MODE_FACE,
+        selected_verts: []int{},
+        selected_edges: []int{},
+        selected_faces: []int{},
+        compiled: []mod.CompiledPrimitive{},
+        gpu_meshes: []ren.Mesh3D{},
+        gpu_materials: []ren.Material3D{},
+        dirty_gpu: true,
+        closed: false
+    }
+}
+
+pub fn material_asset_to_3d(asset &rm.MaterialAsset) ren.Material3D {
+    asset.validate() or >>
+    $mat := ren.material_3d(asset.base_color, asset.metallic, asset.roughness, asset.emission) or >>
+    mat = mat.with_double_sided(asset.double_sided)
+    mat = mat.with_alpha(asset.alpha) or >>
+    if asset.alpha_mode == rm.ALPHA_MASK {
+        mat = mat.with_alpha_cutoff(asset.alpha_cutoff) or >>
+    } else if asset.alpha_mode == rm.ALPHA_BLEND {
+        mat = mat.with_alpha_blend(true) or >>
+    }
+    if asset.clearcoat > 0.0 {
+        mat = mat.with_clearcoat(asset.clearcoat, asset.clearcoat_roughness) or >>
+    }
+    if asset.sheen_color.x > 0.0 || asset.sheen_color.y > 0.0 || asset.sheen_color.z > 0.0 {
+        mat = mat.with_sheen(asset.sheen_color, asset.sheen_roughness) or >>
+    }
+    mat = mat.with_ior(asset.ior) or >>
+    mat = mat.with_uv_flip(asset.flip_u, asset.flip_v) or >>
+    << mat
+}
+
+fn (s $&EditableModelSession) push_undo_snapshot(prev rm.EditableMesh) {
+    s.undo_stack.push(prev)
+    if s.undo_stack.len > MAX_MODEL_HISTORY {
+        $trimmed := []rm.EditableMesh{}
+        start := s.undo_stack.len - MAX_MODEL_HISTORY
+        for i in start:s.undo_stack.len {
+            trimmed.push(s.undo_stack[i].clone())
+        }
+        s.undo_stack = trimmed
+    }
+    s.redo_stack = []rm.EditableMesh{}
+}
+
+pub fn (s $&EditableModelSession) undo() bool {
+    if s.undo_stack.len == 0 { << false }
+    s.redo_stack.push(s.mesh.clone())
+    last := s.undo_stack.len - 1
+    s.mesh = s.undo_stack[last].clone()
+    $next_undo := []rm.EditableMesh{}
+    for i in 0:last { next_undo.push(s.undo_stack[i].clone()) }
+    s.undo_stack = next_undo
+    s.selected_verts = []int{}
+    s.selected_edges = []int{}
+    s.selected_faces = []int{}
+    s.dirty_gpu = true
+    << true
+}
+
+pub fn (s $&EditableModelSession) redo() bool {
+    if s.redo_stack.len == 0 { << false }
+    s.undo_stack.push(s.mesh.clone())
+    last := s.redo_stack.len - 1
+    s.mesh = s.redo_stack[last].clone()
+    $next_redo := []rm.EditableMesh{}
+    for i in 0:last { next_redo.push(s.redo_stack[i].clone()) }
+    s.redo_stack = next_redo
+    s.selected_verts = []int{}
+    s.selected_edges = []int{}
+    s.selected_faces = []int{}
+    s.dirty_gpu = true
+    << true
+}
+
+pub fn (s $&EditableModelSession) clear_selection() {
+    s.selected_verts = []int{}
+    s.selected_edges = []int{}
+    s.selected_faces = []int{}
+}
+
+fn toggled_int(list &[]int, item int, multi bool) []int {
+    if !multi {
+        << [item]
+    }
+    $next := []int{}
+    $found := false
+    for i in 0:list.len {
+        x := list[i]
+        if x == item {
+            found = true
+        } else {
+            next.push(x)
+        }
+    }
+    if !found { next.push(item) }
+    << next
+}
+
+pub fn (s $&EditableModelSession) pick_subobject(
+    world fm.Mat4,
+    ray fm.Ray3D,
+    max_world_dist f64,
+    multi bool
+) bool {
+    if s.mode == EDIT_MODE_FACE {
+        hit := mod.pick_face(&s.mesh, world, ray)
+        if !hit.hit {
+            if !multi { s.selected_faces = []int{} }
+            << false
+        }
+        s.selected_faces = toggled_int(&s.selected_faces, hit.face_id, multi)
+        << true
+    }
+    if s.mode == EDIT_MODE_VERTEX {
+        hit := mod.pick_vertex(&s.mesh, world, ray, max_world_dist)
+        if !hit.hit {
+            if !multi { s.selected_verts = []int{} }
+            << false
+        }
+        s.selected_verts = toggled_int(&s.selected_verts, hit.vertex_id, multi)
+        << true
+    }
+    if s.mode == EDIT_MODE_EDGE {
+        hit := mod.pick_edge(&s.mesh, world, ray, max_world_dist)
+        if !hit.hit {
+            if !multi { s.selected_edges = []int{} }
+            << false
+        }
+        $a := hit.v0
+        $b := hit.v1
+        if b < a {
+            a = hit.v1
+            b = hit.v0
+        }
+        if !multi {
+            s.selected_edges = [a, b]
+            << true
+        }
+        $next := []int{}
+        $found := false
+        $i := 0
+        while i + 1 < s.selected_edges.len {
+            ea := s.selected_edges[i]
+            eb := s.selected_edges[i + 1]
+            if ea == a && eb == b {
+                found = true
+            } else {
+                next.push(ea)
+                next.push(eb)
+            }
+            i += 2
+        }
+        if !found {
+            next.push(a)
+            next.push(b)
+        }
+        s.selected_edges = next
+        << true
+    }
+    << false
+}
+
+pub fn (s $&EditableModelSession) apply_extrude(distance f64) []int {
+    prev := s.mesh.clone()
+    $cand := s.mesh.clone()
+    faces := mod.extrude_faces($&cand, &s.selected_faces, distance) or >>
+    s.push_undo_snapshot(prev)
+    s.mesh = cand
+    s.selected_faces = ~faces
+    s.dirty_gpu = true
+    << faces
+}
+
+pub fn (s $&EditableModelSession) apply_inset(amount f64, depth f64) []int {
+    prev := s.mesh.clone()
+    $cand := s.mesh.clone()
+    faces := mod.inset_faces($&cand, &s.selected_faces, amount, depth) or >>
+    s.push_undo_snapshot(prev)
+    s.mesh = cand
+    s.selected_faces = ~faces
+    s.dirty_gpu = true
+    << faces
+}
+
+pub fn (s $&EditableModelSession) apply_bevel(width f64) []int {
+    if s.selected_edges.len < 2 {
+        >> errors.new("nexus modeling: select at least one edge to bevel")
+    }
+    $e0 := []int{}
+    $e1 := []int{}
+    $i := 0
+    while i + 1 < s.selected_edges.len {
+        e0.push(s.selected_edges[i])
+        e1.push(s.selected_edges[i + 1])
+        i += 2
+    }
+    prev := s.mesh.clone()
+    $cand := s.mesh.clone()
+    faces := mod.bevel_edges($&cand, &e0, &e1, width) or >>
+    s.push_undo_snapshot(prev)
+    s.mesh = cand
+    s.selected_edges = []int{}
+    s.selected_faces = ~faces
+    s.dirty_gpu = true
+    << faces
+}
+
+pub fn (s $&EditableModelSession) apply_translate(delta fm.Vec3) int {
+    prev := s.mesh.clone()
+    $cand := s.mesh.clone()
+    if s.mode == EDIT_MODE_VERTEX && s.selected_verts.len > 0 {
+        mod.translate_vertices($&cand, &s.selected_verts, delta) or >>
+    } else if s.mode == EDIT_MODE_EDGE && s.selected_edges.len > 0 {
+        $verts := []int{}
+        for v in s.selected_edges { verts.push(v) }
+        mod.translate_vertices($&cand, &verts, delta) or >>
+    } else if s.selected_faces.len > 0 {
+        mod.translate_faces($&cand, &s.selected_faces, delta) or >>
+    } else {
+        >> errors.new("nexus modeling: no active sub-object selection to translate")
+    }
+    s.push_undo_snapshot(prev)
+    s.mesh = cand
+    s.dirty_gpu = true
+    << 0
+}
+
+pub fn (s $&EditableModelSession) apply_box_uv(scale f64) int {
+    prev := s.mesh.clone()
+    $cand := s.mesh.clone()
+    if s.selected_faces.len > 0 {
+        mod.project_uv_box($&cand, &s.selected_faces, scale) or >>
+    } else {
+        mod.project_uv_box_all($&cand, scale) or >>
+    }
+    s.push_undo_snapshot(prev)
+    s.mesh = cand
+    s.dirty_gpu = true
+    << 0
+}
+
+pub fn (s $&EditableModelSession) apply_material_slot(slot int) int {
+    if s.selected_faces.len == 0 {
+        >> errors.new("nexus modeling: select faces before assigning material slot")
+    }
+    prev := s.mesh.clone()
+    $cand := s.mesh.clone()
+    mod.set_face_material_slot($&cand, &s.selected_faces, slot) or >>
+    s.push_undo_snapshot(prev)
+    s.mesh = cand
+    s.dirty_gpu = true
+    << 0
+}
+
+pub fn (s $&EditableModelSession) apply_flip_normals() int {
+    if s.selected_faces.len == 0 {
+        >> errors.new("nexus modeling: select faces to flip normals")
+    }
+    prev := s.mesh.clone()
+    $cand := s.mesh.clone()
+    mod.flip_face_normals($&cand, &s.selected_faces) or >>
+    s.push_undo_snapshot(prev)
+    s.mesh = cand
+    s.dirty_gpu = true
+    << 0
+}
+
+pub fn (s $&EditableModelSession) apply_merge_vertices(threshold f64) int {
+    if s.selected_verts.len < 2 {
+        >> errors.new("nexus modeling: select at least two vertices to merge")
+    }
+    $cand := s.mesh.clone()
+    merged := mod.merge_vertices($&cand, &s.selected_verts, threshold) or >>
+    if merged <= 0 { << 0 }
+    s.push_undo_snapshot(s.mesh.clone())
+    s.mesh = cand
+    s.selected_verts = []int{}
+    s.dirty_gpu = true
+    << merged
+}
+
+fn try_close_mesh(m $&ren.Mesh3D) {
+    _ := m.close() or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn close_mesh_list(items $&[]ren.Mesh3D) {
+    for i in 0:items.len {
+        m := $&items[i]
+        try_close_mesh(m)
+    }
+}
+
+// Recompiles EditableMesh and swaps GPU buffers atomically (preserves previous
+// GPU meshes if compilation or upload fails).
+pub fn (s $&EditableModelSession) sync_gpu(
+    device &ren.Device3D,
+    default_mat ren.Material3D,
+    slot_mats &[]ren.Material3D,
+    generate_tangents bool
+) int {
+    if s.closed { >> errors.new("nexus modeling: session is closed") }
+    if !s.dirty_gpu && s.gpu_meshes.len > 0 { << s.gpu_meshes.len }
+    compiled := mod.compile_to_primitives(&s.mesh, generate_tangents) or >>
+    $next_gpu := []ren.Mesh3D{}
+    $next_mats := []ren.Material3D{}
+    for i in 0:compiled.len {
+        pr := &compiled[i]
+        gm := device.upload(&pr.mesh) or (err) {
+            close_mesh_list($&next_gpu)
+            >> err
+        }
+        next_gpu.push(gm)
+        $mat := default_mat
+        if pr.material_slot >= 0 && pr.material_slot < slot_mats.len {
+            mat = slot_mats[pr.material_slot]
+        }
+        next_mats.push(mat)
+    }
+    close_mesh_list($&s.gpu_meshes)
+    s.compiled = compiled
+    s.gpu_meshes = next_gpu
+    s.gpu_materials = next_mats
+    s.dirty_gpu = false
+    << s.gpu_meshes.len
+}
+
+pub fn (s &EditableModelSession) collect_draws(
+    world fm.Mat4,
+    out_refs $&[]ren.MeshRef3D,
+    out_worlds $&[]fm.Mat4,
+    out_mats $&[]ren.Material3D
+) int {
+    if s.closed { >> errors.new("nexus modeling: closed session") }
+    for i in 0:s.gpu_meshes.len {
+        out_refs.push(s.gpu_meshes[i].reference())
+        out_worlds.push(world)
+        out_mats.push(s.gpu_materials[i])
+    }
+    << s.gpu_meshes.len
+}
+
+pub fn (s &EditableModelSession) draw_lit(
+    device $&ren.Device3D,
+    world fm.Mat4,
+    view_proj fm.Mat4,
+    lighting &light_data.Environment3D
+) int {
+    if s.closed { >> errors.new("nexus modeling: closed session") }
+    $tris := 0
+    for i in 0:s.gpu_meshes.len {
+        tris += device.draw_material(&s.gpu_meshes[i], world, view_proj, &s.gpu_materials[i], lighting) or >>
+    }
+    << tris
+}
+
+pub fn (s &EditableModelSession) build_debug_wireframe(
+    dbg $&meshes.DebugDraw3D,
+    world fm.Mat4,
+    edge_color int,
+    sel_color int,
+    vert_color int
+) int {
+    $sel_edges_map := map[string]bool{}
+    $ei := 0
+    while ei + 1 < s.selected_edges.len {
+        a := s.selected_edges[ei]
+        b := s.selected_edges[ei + 1]
+        if a < b { sel_edges_map[str(a) + ":" + str(b)] = true }
+        else { sel_edges_map[str(b) + ":" + str(a)] = true }
+        ei += 2
+    }
+    $sel_faces_map := map[int]bool{}
+    for fi in s.selected_faces { sel_faces_map[fi] = true }
+
+    edges := s.mesh.build_edges()
+    for e in edges {
+        p0 := world.transform_point(s.mesh.vertices[e.v0].position)
+        p1 := world.transform_point(s.mesh.vertices[e.v1].position)
+        $is_sel := sel_edges_map.has(str(e.v0) + ":" + str(e.v1))
+        if !is_sel {
+            for fi in e.faces {
+                if sel_faces_map.has(fi) { is_sel = true }
+            }
+        }
+        $col := edge_color
+        if is_sel { col = sel_color }
+        dbg.line(p0, p1, col, 0.0) or >>
+    }
+
+    if s.mode == EDIT_MODE_VERTEX {
+        $sel_v_map := map[int]bool{}
+        for vid in s.selected_verts { sel_v_map[vid] = true }
+        for vi in 0:s.mesh.vertices.len {
+            p := world.transform_point(s.mesh.vertices[vi].position)
+            $col := vert_color
+            $sz := 0.03
+            if sel_v_map.has(vi) {
+                col = sel_color
+                sz = 0.06
+            }
+            dbg.cross(p, sz, col, 0.0) or >>
+        }
+    }
+    if s.mode == EDIT_MODE_FACE {
+        for fi in s.selected_faces {
+            if fi < 0 || fi >= s.mesh.faces.len { -> }
+            c := world.transform_point(s.mesh.face_centroid(fi) or (err) {
+                _ := err
+                ->
+            })
+            n := s.mesh.face_normal(fi) or (err) {
+                _ := err
+                ->
+            }
+            wn := world.transform_direction(n).normalized_or_zero()
+            if wn.length_sq() > 0.5 {
+                dbg.arrow(c, c.add(wn.scaled(0.35)), sel_color, 0.0) or >>
+            }
+        }
+    }
+    << 0
+}
+
+// Builds world-space Physics3D static triangle colliders directly from the
+// compiled EditableMesh geometry.
+pub fn (s &EditableModelSession) build_collision_triangles(world fm.Mat4, layer int) []physics3d.StaticTriangle3D {
+    prims := mod.compile_to_primitives(&s.mesh, false) or >>
+    $tris := []physics3d.StaticTriangle3D{}
+    for pi in 0:prims.len {
+        pr := &prims[pi]
+        for ti in 0:pr.mesh.triangle_count() {
+            ia := pr.mesh.indices[ti * 3]
+            ib := pr.mesh.indices[ti * 3 + 1]
+            ic := pr.mesh.indices[ti * 3 + 2]
+            t := physics3d.transform_triangle_3d(
+                pr.mesh.vertices[ia].position,
+                pr.mesh.vertices[ib].position,
+                pr.mesh.vertices[ic].position,
+                world,
+                layer
+            ) or (err) {
+                _ := err
+                ->
+            }
+            tris.push(t)
+        }
+    }
+    << tris
+}
+
+pub fn (s $&EditableModelSession) close() int {
+    if s.closed { << 0 }
+    close_mesh_list($&s.gpu_meshes)
+    s.gpu_meshes = []ren.Mesh3D{}
+    s.closed = true
+    << 0
+}

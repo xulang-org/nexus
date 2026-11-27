@@ -1,0 +1,224 @@
+@"github.com/xulang-org/nexus/integration/gltf_render"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+phys #"github.com/xulang-org/nexus/physics3d"
+#errors
+#math
+
+// Bidirectional adapter coupling skeletal hierarchies (glTF joints + inverse bind matrices)
+// to XPBD articulated rigid bodies with ball-socket/cone-swing constraints.
+pub struct SkeletonRagdoll3D {
+    world phys.JointedWorld3D
+    parents []int
+    body_ids []int         // -1 if leaf joint without a physical segment, else index in world
+    joint_world_offsets []fm.Vec3 // offset from body center to joint pivot in body-local space
+    inverse_binds []fm.Mat4
+    bind_lengths []f64
+}
+
+pub fn create_ragdoll_from_skeleton(
+    parents &[]int,
+    bind_worlds &[]fm.Mat4,
+    inverse_binds &[]fm.Mat4,
+    bone_radius f64,
+    swing_limit_rad f64,
+    ground_solids &[]fm.Aabb3,
+    ground_layers &[]int
+) SkeletonRagdoll3D {
+    n := parents.len
+    if n < 1 || bind_worlds.len != n || inverse_binds.len != n ||
+        !fm.finite(bone_radius) || bone_radius <= 0.0 ||
+        !fm.finite(swing_limit_rad) || swing_limit_rad <= 0.0 {
+        >> errors.new("nexus ragdoll: invalid skeleton hierarchy or joint limits")
+    }
+    $empty_tris := []phys.StaticTriangle3D{}
+    $world := phys.new_jointed_world_3d(
+        fm.vec3(0.0, -9.81, 0.0), 0.1, 0.25,
+        ground_solids, ground_layers, &empty_tris
+    ) or >>
+
+    $body_ids := []int{}
+    $offsets := []fm.Vec3{}
+    $lengths := []f64{}
+
+    // Determine one representative child or rest bone extent per joint to form physical segments.
+    for j in 0:n {
+        p_j := bind_worlds[j].c3.xyz()
+        q_j := phys.quaternion_from_mat4(bind_worlds[j]) or >>
+        $sum_child := fm.vec3(0.0, 0.0, 0.0)
+        $child_cnt := 0
+        for c in 0:n {
+            if parents[c] == j {
+                sum_child = sum_child.add(bind_worlds[c].c3.xyz())
+                child_cnt += 1
+            }
+        }
+        $seg_vec := fm.vec3(0.0, bone_radius * 2.0, 0.0)
+        if child_cnt > 0 {
+            avg_child := sum_child.scaled(1.0 / f64(child_cnt))
+            diff := avg_child.sub(p_j)
+            if diff.length() > 1e-4 { seg_vec = diff }
+        } else if parents[j] >= 0 {
+            par_pos := bind_worlds[parents[j]].c3.xyz()
+            ext := p_j.sub(par_pos)
+            if ext.length() > 1e-4 { seg_vec = ext.scaled(0.5) }
+        }
+        seg_len := math.max(bone_radius * 2.0, seg_vec.length())
+        lengths.push(seg_len)
+
+        // Place rigid body center at bone midpoint p_j + seg_vec * 0.5 with orientation q_j.
+        center := p_j.add(seg_vec.scaled(0.5))
+        half_ext := fm.vec3(bone_radius, math.max(bone_radius, seg_len * 0.45), bone_radius)
+        bid := world.add_body(center, q_j, half_ext, 1.0, 0.1, 0.6, 1, 1) or >>
+        body_ids.push(bid)
+
+        // Local offset from center -> joint pivot p_j in q_j local coordinates.
+        inv_rot := fm.quaternion(-q_j.x, -q_j.y, -q_j.z, q_j.w).rotation_matrix() or >>
+        world_off := p_j.sub(center)
+        offsets.push(inv_rot.transform(fm.vec4(world_off.x, world_off.y, world_off.z, 0.0)).xyz())
+    }
+
+    // Link every child bone to its parent bone at the child's joint pivot!
+    for j in 0:n {
+        p := parents[j]
+        if p < 0 { -> }
+        if p >= n { >> errors.new("nexus ragdoll: invalid parent index") }
+        pivot := bind_worlds[j].c3.xyz()
+        parent_pos := bind_worlds[p].c3.xyz()
+        $swing_dir := pivot.sub(parent_pos)
+        if swing_dir.length() <= 1e-6 { swing_dir = fm.vec3(0.0, -1.0, 0.0) }
+        _ := world.add_ball_socket_joint(body_ids[p], body_ids[j], pivot, swing_dir, swing_limit_rad, 0.0001) or >>
+    }
+
+    $cp_parents := []int{}
+    for p in parents { cp_parents.push(p) }
+    $cp_inv := []fm.Mat4{}
+    for m in inverse_binds { cp_inv.push(m) }
+
+    << SkeletonRagdoll3D{
+        world: world,
+        parents: cp_parents,
+        body_ids: body_ids,
+        joint_world_offsets: offsets,
+        inverse_binds: cp_inv,
+        bind_lengths: lengths
+    }
+}
+
+pub fn (rag $&SkeletonRagdoll3D) sync_from_world_pose(worlds &[]fm.Mat4) int {
+    if worlds.len != rag.body_ids.len {
+        >> errors.new("nexus ragdoll: pose matrix count differs from skeleton")
+    }
+    wref := $&rag.world
+    for j in 0:worlds.len {
+        bid := rag.body_ids[j]
+        if bid < 0 { -> }
+        q := phys.quaternion_from_mat4(worlds[j]) or >>
+        rm := q.rotation_matrix() or >>
+        off := rm.transform(fm.vec4(rag.joint_world_offsets[j].x, rag.joint_world_offsets[j].y, rag.joint_world_offsets[j].z, 0.0)).xyz()
+        joint_pos := worlds[j].c3.xyz()
+        body_center := joint_pos.sub(off)
+        wref.set_body_pose(bid, body_center, q) or >>
+    }
+    << 0
+}
+
+pub fn (rag $&SkeletonRagdoll3D) step(dt f64, substeps int, iters int) int {
+    wref := $&rag.world
+    << wref.step(dt, substeps, iters) or >>
+}
+
+pub fn (rag &SkeletonRagdoll3D) world_transforms() []fm.Mat4 {
+    $out := []fm.Mat4{}
+    for j in 0:rag.body_ids.len {
+        bid := rag.body_ids[j]
+        bm := rag.world.transform_matrix(bid) or >>
+        joint_pivot := bm.transform(fm.vec4(rag.joint_world_offsets[j].x, rag.joint_world_offsets[j].y, rag.joint_world_offsets[j].z, 1.0)).xyz()
+        out.push(fm.Mat4{c0: bm.c0, c1: bm.c1, c2: bm.c2, c3: fm.vec4(joint_pivot.x, joint_pivot.y, joint_pivot.z, 1.0)})
+    }
+    << out
+}
+
+// Reconstructs GPU Compute LBS joint palette directly from active ragdoll physics transforms!
+pub fn (rag &SkeletonRagdoll3D) build_skin_palette(root_world fm.Mat4) []fm.Mat4 {
+    inv_root := root_world.affine_inverse() or >>
+    joint_worlds := rag.world_transforms() or >>
+    $palette := []fm.Mat4{}
+    for j in 0:joint_worlds.len {
+        palette.push(inv_root.multiply(joint_worlds[j]).multiply(rag.inverse_binds[j]))
+    }
+    << palette
+}
+
+fn q_slerp_mat(ma fm.Mat4, mb fm.Mat4, t f64) fm.Mat4 {
+    if t <= 0.0 { << ma }
+    if t >= 1.0 { << mb }
+    qa := phys.quaternion_from_mat4(ma) or >>
+    qb_raw := phys.quaternion_from_mat4(mb) or >>
+    $qb := qb_raw
+    $dot := qa.x * qb.x + qa.y * qb.y + qa.z * qb.z + qa.w * qb.w
+    if dot < 0.0 {
+        qb = fm.quaternion(-qb.x, -qb.y, -qb.z, -qb.w)
+        dot = -dot
+    }
+    dot = math.min(1.0, dot)
+    $q := fm.quaternion(0.0, 0.0, 0.0, 1.0)
+    if dot > 0.9995 {
+        inv_t := 1.0 - t
+        q = fm.quaternion(
+            qa.x * inv_t + qb.x * t,
+            qa.y * inv_t + qb.y * t,
+            qa.z * inv_t + qb.z * t,
+            qa.w * inv_t + qb.w * t
+        ).normalized() or >>
+    } else {
+        theta := math.acos(dot)
+        sin_t := math.sin(theta)
+        wa := math.sin((1.0 - t) * theta) / sin_t
+        wb := math.sin(t * theta) / sin_t
+        q = fm.quaternion(
+            qa.x * wa + qb.x * wb,
+            qa.y * wa + qb.y * wb,
+            qa.z * wa + qb.z * wb,
+            qa.w * wa + qb.w * wb
+        ).normalized() or >>
+    }
+    r := q.rotation_matrix() or >>
+    pa := ma.c3.xyz()
+    pb := mb.c3.xyz()
+    p := pa.add(pb.sub(pa).scaled(t))
+    << fm.Mat4{c0: r.c0, c1: r.c1, c2: r.c2, c3: fm.vec4(p.x, p.y, p.z, 1.0)}
+}
+
+pub fn (rag $&SkeletonRagdoll3D) apply_impulse(bone_idx int, impulse fm.Vec3, world_point fm.Vec3) int {
+    if bone_idx < 0 || bone_idx >= rag.body_ids.len { >> errors.new("nexus ragdoll: bone index out of range") }
+    wref := $&rag.world
+    << wref.apply_impulse_at_point(rag.body_ids[bone_idx], impulse, world_point) or >>
+}
+
+// Smoothly blends an animated joint world pose with live ragdoll simulation (weight in 0..1)
+// and outputs a GPU skinning palette.
+pub fn (rag &SkeletonRagdoll3D) blend_skin_palette(
+    anim_worlds &[]fm.Mat4,
+    ragdoll_weight f64,
+    root_world fm.Mat4
+) []fm.Mat4 {
+    if anim_worlds.len != rag.body_ids.len || !fm.finite(ragdoll_weight) {
+        >> errors.new("nexus ragdoll: invalid animated pose count or blend weight")
+    }
+    w := math.max(0.0, math.min(1.0, ragdoll_weight))
+    inv_root := root_world.affine_inverse() or >>
+    rag_worlds := rag.world_transforms() or >>
+    $palette := []fm.Mat4{}
+    for j in 0:rag_worlds.len {
+        blended := q_slerp_mat(anim_worlds[j], rag_worlds[j], w) or >>
+        palette.push(inv_root.multiply(blended).multiply(rag.inverse_binds[j]))
+    }
+    << palette
+}
+
+pub fn (rag &SkeletonRagdoll3D) joint_position(bone_idx int) fm.Vec3 {
+    if bone_idx < 0 || bone_idx >= rag.body_ids.len { >> errors.new("nexus ragdoll: bone index out of range") }
+    ws := rag.world_transforms() or >>
+    << ws[bone_idx].c3.xyz()
+}

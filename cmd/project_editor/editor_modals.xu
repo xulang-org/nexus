@@ -1,0 +1,755 @@
+@main
+
+resource #"github.com/xulang-org/nexus/resources/scene"
+#ui
+#ui/draw
+#ui/layout
+widgets #ui/widgets
+#math
+#strings
+#time
+
+pub const MODAL_NONE = 0
+pub const MODAL_SNAP = 1
+pub const MODAL_NEW_SCENE = 2
+pub const MODAL_UNSAVED = 3
+pub const MODAL_GLOBALS = 4
+pub const MODAL_SCENE_MANAGE = 5
+pub const MODAL_EXPORT = 6
+
+pub const ID_MODAL_MOVE = 9001
+pub const ID_MODAL_ROTATE = 9002
+pub const ID_MODAL_SCALE = 9003
+pub const ID_MODAL_SNAP_CANCEL = 9004
+pub const ID_MODAL_SNAP_SAVE = 9005
+
+pub const ID_MODAL_SCENE_NAME = 9011
+pub const ID_MODAL_SCENE_ROOT = 9012
+pub const ID_MODAL_SCENE_CANCEL = 9013
+pub const ID_MODAL_SCENE_CREATE = 9014
+
+pub const ID_MODAL_UNSAVED_CANCEL = 9021
+pub const ID_MODAL_UNSAVED_DISCARD = 9022
+pub const ID_MODAL_UNSAVED_SAVE = 9023
+
+pub const ID_MODAL_BUS_NAME = 9031
+pub const ID_MODAL_BUS_VOL = 9032
+pub const ID_MODAL_BUS_ADD = 9033
+pub const ID_MODAL_BUS_MUTE = 9034
+pub const ID_MODAL_BUS_DEL = 9035
+pub const ID_MODAL_CONN_SRC = 9036
+pub const ID_MODAL_CONN_SIG = 9037
+pub const ID_MODAL_CONN_DST = 9038
+pub const ID_MODAL_CONN_HND = 9039
+pub const ID_MODAL_CONN_ADD = 9040
+pub const ID_MODAL_CONN_DEL = 9041
+pub const ID_MODAL_GLOBALS_CLOSE = 9042
+
+pub const ID_MODAL_MGR_NAME = 9051
+pub const ID_MODAL_MGR_RENAME = 9052
+pub const ID_MODAL_MGR_DUP = 9053
+pub const ID_MODAL_MGR_DEL = 9054
+pub const ID_MODAL_MGR_CLOSE = 9055
+
+pub const ID_MODAL_EXPORT_DIR = 9061
+pub const ID_MODAL_EXPORT_CANCEL = 9062
+pub const ID_MODAL_EXPORT_RUN = 9063
+
+// Heap-backed widget indices
+pub const MF_SNAP_MOVE = 0
+pub const MF_SNAP_ROTATE = 1
+pub const MF_SNAP_SCALE = 2
+pub const MF_SCENE_NAME = 3
+pub const MF_SCENE_ROOT = 4
+pub const MF_BUS_NAME = 5
+pub const MF_BUS_VOL = 6
+pub const MF_CONN_SRC = 7
+pub const MF_CONN_SIG = 8
+pub const MF_CONN_DST = 9
+pub const MF_CONN_HND = 10
+pub const MF_MGR_NAME = 11
+pub const MF_EXPORT_DIR = 12
+
+pub const MB_SNAP_CANCEL = 0
+pub const MB_SNAP_SAVE = 1
+pub const MB_SCENE_CANCEL = 2
+pub const MB_SCENE_CREATE = 3
+pub const MB_UNSAVED_CANCEL = 4
+pub const MB_UNSAVED_DISCARD = 5
+pub const MB_UNSAVED_SAVE = 6
+pub const MB_BUS_ADD = 7
+pub const MB_BUS_MUTE = 8
+pub const MB_BUS_DEL = 9
+pub const MB_CONN_ADD = 10
+pub const MB_CONN_DEL = 11
+pub const MB_GLOBALS_CLOSE = 12
+pub const MB_MGR_RENAME = 13
+pub const MB_MGR_DUP = 14
+pub const MB_MGR_DEL = 15
+pub const MB_MGR_CLOSE = 16
+pub const MB_EXPORT_CANCEL = 17
+pub const MB_EXPORT_RUN = 18
+
+pub struct ModalState {
+    pub kind int
+    pub card layout.Rect
+
+    pub fields []widgets.Field
+    pub field_ids []int
+    pub buttons []widgets.Button
+    pub button_ids []int
+    pub btn_labels []widgets.StyledLabel
+
+    pub snap_move_err string
+    pub snap_rotate_err string
+    pub snap_scale_err string
+    pub scene_err string
+    pub unsaved_target_scene int
+    pub unsaved_close_after bool
+    pub unsaved_open_project_after bool
+    pub bus_summary string
+    pub conn_summary string
+    pub globals_err string
+    pub mgr_cur_scene string
+    pub mgr_scene_count int
+    pub mgr_err string
+    pub export_err string
+
+    pub focused_id int
+    pub lang int
+}
+
+fn empty_rect() layout.Rect {
+    << layout.Rect{x: 0.0, y: 0.0, width: 120.0, height: 32.0}
+}
+
+fn make_unit_field(
+    context &draw.Context,
+    identity &ui.CanvasEvent,
+    id int,
+    label string,
+    suffix string,
+    helper string,
+    val string
+) widgets.Field {
+    $dec := widgets.field_decoration(&label)
+    dec.suffix = suffix
+    dec.helper = helper
+    dec.clearable = true
+    << widgets.field(context, identity, id, &empty_rect(), &val, &dec) or >>
+}
+
+fn push_modal_unit_field(
+    m $&ModalState,
+    ctx &draw.Context,
+    id_ev &ui.CanvasEvent,
+    id int,
+    label string,
+    suffix string,
+    helper string,
+    val string
+) int {
+    m.field_ids.push(id)
+    f := make_unit_field(ctx, id_ev, id, label, suffix, helper, val) or >>
+    m.fields.push(f)
+    << 0
+}
+
+fn push_modal_btn(
+    m $&ModalState,
+    ctx &draw.Context,
+    id_ev &ui.CanvasEvent,
+    id int,
+    title string
+) int {
+    m.button_ids.push(id)
+    btn := widgets.button(id_ev, id, &empty_rect()) or >>
+    m.buttons.push(btn)
+    m.btn_labels.push(widgets.styled_label(ctx, &title))
+    << 0
+}
+
+pub fn create_modals(context &draw.Context, identity &ui.CanvasEvent, snap &SnapSettings) ModalState {
+    mv := fmt_coord(snap.move_step)
+    rt := fmt_coord(snap.rotate_deg)
+    sc := fmt_coord(snap.scale_pct)
+
+    $m := ModalState{
+        kind: MODAL_NONE,
+        card: empty_rect(),
+        fields: []widgets.Field{},
+        field_ids: []int{},
+        buttons: []widgets.Button{},
+        button_ids: []int{},
+        btn_labels: []widgets.StyledLabel{},
+        snap_move_err: "",
+        snap_rotate_err: "",
+        snap_scale_err: "",
+        scene_err: "",
+        unsaved_target_scene: -1,
+        unsaved_close_after: false,
+        unsaved_open_project_after: false,
+        bus_summary: "Audio Buses: none",
+        conn_summary: "Script Connections: none",
+        globals_err: "",
+        mgr_cur_scene: "",
+        mgr_scene_count: 1,
+        mgr_err: "",
+        export_err: "",
+        focused_id: 0,
+        lang: LANG_EN
+    }
+
+    push_modal_unit_field($&m, context, identity, ID_MODAL_MOVE, "Move snap", "units", "0.0001 .. 1000000", mv) or >>
+    push_modal_unit_field($&m, context, identity, ID_MODAL_ROTATE, "Rotate snap", "deg", "0.01 .. 180", rt) or >>
+    push_modal_unit_field($&m, context, identity, ID_MODAL_SCALE, "Scale snap", "%", "1 .. 10000", sc) or >>
+    push_modal_unit_field($&m, context, identity, ID_MODAL_SCENE_NAME, "Scene file *", "", "Saved under assets/<name>.xuscene", "level_2.xuscene") or >>
+    push_modal_unit_field($&m, context, identity, ID_MODAL_SCENE_ROOT, "Root node name", "", "Default: World", "World") or >>
+    push_modal_unit_field($&m, context, identity, ID_MODAL_BUS_NAME, "Bus Name", "", "Parent 0 (Master)", "SFX") or >>
+    push_modal_unit_field($&m, context, identity, ID_MODAL_BUS_VOL, "Volume", "", "0 .. 4", "1") or >>
+    push_modal_unit_field($&m, context, identity, ID_MODAL_CONN_SRC, "SrcIdx", "", "", "1") or >>
+    push_modal_unit_field($&m, context, identity, ID_MODAL_CONN_SIG, "Signal", "", "", "1") or >>
+    push_modal_unit_field($&m, context, identity, ID_MODAL_CONN_DST, "DstIdx", "", "", "1") or >>
+    push_modal_unit_field($&m, context, identity, ID_MODAL_CONN_HND, "Handler", "", "", "1") or >>
+    push_modal_unit_field($&m, context, identity, ID_MODAL_MGR_NAME, "Scene name *", "", "Target .xuscene file for Rename / Duplicate", "world.xuscene") or >>
+    push_modal_unit_field($&m, context, identity, ID_MODAL_EXPORT_DIR, "Output directory *", "", "Target directory for published build", "build/project-gallery") or >>
+
+    push_modal_btn($&m, context, identity, ID_MODAL_SNAP_CANCEL, "Cancel") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_SNAP_SAVE, "Save Snap") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_SCENE_CANCEL, "Cancel") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_SCENE_CREATE, "Create Scene") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_UNSAVED_CANCEL, "Cancel") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_UNSAVED_DISCARD, "Discard") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_UNSAVED_SAVE, "Save") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_BUS_ADD, "+ Bus") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_BUS_MUTE, "Mute Last") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_BUS_DEL, "- Bus") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_CONN_ADD, "+ Route") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_CONN_DEL, "- Route") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_GLOBALS_CLOSE, "Close") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_MGR_RENAME, "Rename") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_MGR_DUP, "Duplicate") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_MGR_DEL, "Delete") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_MGR_CLOSE, "Close") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_EXPORT_CANCEL, "Cancel") or >>
+    push_modal_btn($&m, context, identity, ID_MODAL_EXPORT_RUN, "Publish Build") or >>
+    << m
+}
+
+pub fn (m $&ModalState) dispose() {
+    for i in 0:m.fields.len { dispose_field($&m.fields[i]) }
+    for i in 0:m.btn_labels.len { dispose_label($&m.btn_labels[i]) }
+}
+
+pub fn (m $&ModalState) open_snap(snap &SnapSettings) {
+    m.kind = MODAL_SNAP
+    mv := fmt_coord(snap.move_step)
+    rt := fmt_coord(snap.rotate_deg)
+    sc := fmt_coord(snap.scale_pct)
+    set_field_val($&m.fields[MF_SNAP_MOVE], &mv)
+    set_field_val($&m.fields[MF_SNAP_ROTATE], &rt)
+    set_field_val($&m.fields[MF_SNAP_SCALE], &sc)
+    m.snap_move_err = ""
+    m.snap_rotate_err = ""
+    m.snap_scale_err = ""
+    m.sync_snap_decorations()
+    m.set_focus(ID_MODAL_MOVE)
+}
+
+pub fn (m $&ModalState) open_new_scene() {
+    m.kind = MODAL_NEW_SCENE
+    set_field_val($&m.fields[MF_SCENE_NAME], &"new_scene.xuscene")
+    set_field_val($&m.fields[MF_SCENE_ROOT], &"World")
+    m.scene_err = ""
+    m.sync_scene_decoration()
+    m.set_focus(ID_MODAL_SCENE_NAME)
+}
+
+pub fn (m $&ModalState) open_unsaved(target_scene int, close_after bool) {
+    m.kind = MODAL_UNSAVED
+    m.unsaved_target_scene = target_scene
+    m.unsaved_close_after = close_after
+    m.unsaved_open_project_after = false
+    m.set_focus(ID_MODAL_UNSAVED_SAVE)
+}
+
+pub fn (m $&ModalState) open_unsaved_open_project() {
+    m.kind = MODAL_UNSAVED
+    m.unsaved_target_scene = -1
+    m.unsaved_close_after = false
+    m.unsaved_open_project_after = true
+    m.set_focus(ID_MODAL_UNSAVED_SAVE)
+}
+
+pub fn (m $&ModalState) open_scene_manage(cur_key &string, scene_count int) {
+    m.kind = MODAL_SCENE_MANAGE
+    m.mgr_cur_scene = *cur_key + ""
+    m.mgr_scene_count = scene_count
+    m.mgr_err = ""
+    val := *cur_key + ""
+    set_field_val($&m.fields[MF_MGR_NAME], &val)
+    m.sync_mgr_decoration()
+    m.set_focus(ID_MODAL_MGR_NAME)
+}
+
+pub fn (m $&ModalState) open_export(cur_out_dir &string) {
+    m.kind = MODAL_EXPORT
+    m.export_err = ""
+    val := *cur_out_dir + ""
+    set_field_val($&m.fields[MF_EXPORT_DIR], &val)
+    m.sync_export_decoration()
+    m.set_focus(ID_MODAL_EXPORT_DIR)
+}
+
+pub fn (m $&ModalState) sync_globals(doc &resource.Document) {
+    if doc.audio_bus_count() == 0 {
+        m.bus_summary = tr(m.lang, "Audio Buses: (auto-created when an AudioEmitter is bound)", "音频总线：（绑定 AudioEmitter 时自动创建）")
+    } else {
+        $bp := []string{}
+        for i in 0:doc.audio_bus_count() {
+            b := doc.audio_bus(i) or (err) { <- }
+            $mt := ""
+            if b.muted { mt = tr(m.lang, " MUTED", " 静音") }
+            bp.push(str(i) + ":" + b.name + "(" + fmt_coord(b.volume) + mt + ")")
+        }
+        m.bus_summary = tr(m.lang, "Buses: ", "总线: ") + strings.join(bp, " | ")
+    }
+    if doc.script_connection_count() == 0 {
+        m.conn_summary = tr(m.lang, "Script Routes: none", "脚本路由：无")
+    } else {
+        $cp := []string{}
+        for i in 0:doc.script_connection_count() {
+            cn := doc.script_connection(i) or (err) { <- }
+            cp.push("n" + str(cn.source) + "." + str(cn.signal) + " -> n" + str(cn.target) + "." + str(cn.handler))
+        }
+        m.conn_summary = tr(m.lang, "Routes: ", "路由: ") + strings.join(cp, " | ")
+    }
+}
+
+pub fn (m $&ModalState) open_globals(doc &resource.Document) {
+    m.kind = MODAL_GLOBALS
+    m.globals_err = ""
+    m.sync_globals(doc)
+    m.set_focus(ID_MODAL_BUS_NAME)
+}
+
+pub fn (m $&ModalState) close() {
+    m.kind = MODAL_NONE
+    m.set_focus(0)
+}
+
+fn set_modal_field_dec(f $&widgets.Field, label string, suffix string, helper string, err_txt &string) {
+    $d := widgets.field_decoration(&label)
+    d.suffix = suffix + ""
+    d.helper = helper + ""
+    d.clearable = true
+    d.error = *err_txt + ""
+    inv := err_txt.len > 0
+    set_field_dec(f, &d)
+    set_field_inv(f, inv)
+}
+
+pub fn (m $&ModalState) apply_lang(lang int) {
+    m.lang = lang
+    set_lbl_text($&m.btn_labels[MB_SNAP_CANCEL], &tr(lang, "Cancel", "取消"))
+    set_lbl_text($&m.btn_labels[MB_SNAP_SAVE], &tr(lang, "Save Snap", "保存设置"))
+    set_lbl_text($&m.btn_labels[MB_SCENE_CANCEL], &tr(lang, "Cancel", "取消"))
+    set_lbl_text($&m.btn_labels[MB_SCENE_CREATE], &tr(lang, "Create Scene", "创建场景"))
+    set_lbl_text($&m.btn_labels[MB_UNSAVED_CANCEL], &tr(lang, "Cancel", "取消"))
+    set_lbl_text($&m.btn_labels[MB_UNSAVED_DISCARD], &tr(lang, "Discard", "放弃"))
+    set_lbl_text($&m.btn_labels[MB_UNSAVED_SAVE], &tr(lang, "Save", "保存"))
+    set_lbl_text($&m.btn_labels[MB_BUS_ADD], &tr(lang, "+ Bus", "+ 总线"))
+    set_lbl_text($&m.btn_labels[MB_BUS_MUTE], &tr(lang, "Mute Last", "静音末项"))
+    set_lbl_text($&m.btn_labels[MB_BUS_DEL], &tr(lang, "- Bus", "- 总线"))
+    set_lbl_text($&m.btn_labels[MB_CONN_ADD], &tr(lang, "+ Route", "+ 路由"))
+    set_lbl_text($&m.btn_labels[MB_CONN_DEL], &tr(lang, "- Route", "- 路由"))
+    set_lbl_text($&m.btn_labels[MB_GLOBALS_CLOSE], &tr(lang, "Close", "关闭"))
+    set_lbl_text($&m.btn_labels[MB_MGR_RENAME], &tr(lang, "Rename", "重命名"))
+    set_lbl_text($&m.btn_labels[MB_MGR_DUP], &tr(lang, "Duplicate", "复制"))
+    set_lbl_text($&m.btn_labels[MB_MGR_DEL], &tr(lang, "Delete", "删除"))
+    set_lbl_text($&m.btn_labels[MB_MGR_CLOSE], &tr(lang, "Close", "关闭"))
+    set_lbl_text($&m.btn_labels[MB_EXPORT_CANCEL], &tr(lang, "Cancel", "取消"))
+    set_lbl_text($&m.btn_labels[MB_EXPORT_RUN], &tr(lang, "Publish Build", "发布构建"))
+
+    m.sync_snap_decorations()
+    m.sync_scene_decoration()
+    empty := ""
+    set_modal_field_dec($&m.fields[MF_SCENE_ROOT], tr(lang, "Root node name", "根节点名称"), "", tr(lang, "Default: World", "默认: World"), &empty)
+    set_modal_field_dec($&m.fields[MF_BUS_NAME], tr(lang, "Bus Name", "总线名称"), "", tr(lang, "Parent 0 (Master)", "父级 0 (Master)"), &empty)
+    set_modal_field_dec($&m.fields[MF_BUS_VOL], tr(lang, "Volume", "音量"), "", "0 .. 4", &empty)
+    set_modal_field_dec($&m.fields[MF_CONN_SRC], tr(lang, "SrcIdx", "源节点"), "", "", &empty)
+    set_modal_field_dec($&m.fields[MF_CONN_SIG], tr(lang, "Signal", "信号"), "", "", &empty)
+    set_modal_field_dec($&m.fields[MF_CONN_DST], tr(lang, "DstIdx", "目标节点"), "", "", &empty)
+    set_modal_field_dec($&m.fields[MF_CONN_HND], tr(lang, "Handler", "处理槽"), "", "", &empty)
+    m.sync_mgr_decoration()
+    m.sync_export_decoration()
+}
+
+pub fn (m $&ModalState) sync_snap_decorations() {
+    sm := m.snap_move_err + ""
+    sr := m.snap_rotate_err + ""
+    ss := m.snap_scale_err + ""
+    lang := m.lang
+    set_modal_field_dec($&m.fields[MF_SNAP_MOVE], tr(lang, "Move snap", "移动步长"), tr(lang, "units", "单位"), "0.0001 .. 1000000", &sm)
+    set_modal_field_dec($&m.fields[MF_SNAP_ROTATE], tr(lang, "Rotate snap", "旋转步长"), tr(lang, "deg", "度"), "0.01 .. 180", &sr)
+    set_modal_field_dec($&m.fields[MF_SNAP_SCALE], tr(lang, "Scale snap", "缩放步长"), "%", "1 .. 10000", &ss)
+}
+
+pub fn (m $&ModalState) sync_scene_decoration() {
+    se := m.scene_err + ""
+    lang := m.lang
+    set_modal_field_dec($&m.fields[MF_SCENE_NAME], tr(lang, "Scene file *", "场景文件名 *"), "", tr(lang, "Saved under assets/<name>.xuscene", "保存在 assets/<name>.xuscene"), &se)
+}
+
+pub fn (m $&ModalState) sync_mgr_decoration() {
+    me := m.mgr_err + ""
+    lang := m.lang
+    set_modal_field_dec($&m.fields[MF_MGR_NAME], tr(lang, "Scene name *", "场景文件名 *"), "", tr(lang, "Target .xuscene file for Rename / Duplicate", "用于重命名 / 复制的目标 .xuscene 文件"), &me)
+}
+
+pub fn (m $&ModalState) sync_export_decoration() {
+    ee := m.export_err + ""
+    lang := m.lang
+    set_modal_field_dec($&m.fields[MF_EXPORT_DIR], tr(lang, "Output directory *", "输出目录 *"), "", tr(lang, "Target directory for published build", "发布构建输出目录"), &ee)
+}
+
+pub fn (m $&ModalState) set_focus(id int) {
+    m.focused_id = id
+    for i in 0:m.fields.len {
+        on := m.field_ids[i] == id
+        focus_field($&m.fields[i], on)
+    }
+    for i in 0:m.buttons.len {
+        on := m.button_ids[i] == id
+        set_btn_focus($&m.buttons[i], on)
+    }
+}
+
+fn variant_or_default(styles &widgets.Styles, variant int) widgets.ControlStyle {
+    << styles.button_variant(variant) or (err) {
+        _ := err
+        << styles.button.clone()
+    }
+}
+
+fn active_field_start(kind int) int {
+    if kind == MODAL_SNAP { << MF_SNAP_MOVE }
+    if kind == MODAL_NEW_SCENE { << MF_SCENE_NAME }
+    if kind == MODAL_GLOBALS { << MF_BUS_NAME }
+    if kind == MODAL_SCENE_MANAGE { << MF_MGR_NAME }
+    if kind == MODAL_EXPORT { << MF_EXPORT_DIR }
+    << 0
+}
+
+fn active_field_end(kind int) int {
+    if kind == MODAL_SNAP { << MF_SNAP_SCALE + 1 }
+    if kind == MODAL_NEW_SCENE { << MF_SCENE_ROOT + 1 }
+    if kind == MODAL_GLOBALS { << MF_CONN_HND + 1 }
+    if kind == MODAL_SCENE_MANAGE { << MF_MGR_NAME + 1 }
+    if kind == MODAL_EXPORT { << MF_EXPORT_DIR + 1 }
+    << 0
+}
+
+fn active_btn_start(kind int) int {
+    if kind == MODAL_SNAP { << MB_SNAP_CANCEL }
+    if kind == MODAL_NEW_SCENE { << MB_SCENE_CANCEL }
+    if kind == MODAL_UNSAVED { << MB_UNSAVED_CANCEL }
+    if kind == MODAL_GLOBALS { << MB_BUS_ADD }
+    if kind == MODAL_SCENE_MANAGE { << MB_MGR_RENAME }
+    if kind == MODAL_EXPORT { << MB_EXPORT_CANCEL }
+    << 0
+}
+
+fn active_btn_end(kind int) int {
+    if kind == MODAL_SNAP { << MB_SNAP_SAVE + 1 }
+    if kind == MODAL_NEW_SCENE { << MB_SCENE_CREATE + 1 }
+    if kind == MODAL_UNSAVED { << MB_UNSAVED_SAVE + 1 }
+    if kind == MODAL_GLOBALS { << MB_GLOBALS_CLOSE + 1 }
+    if kind == MODAL_SCENE_MANAGE { << MB_MGR_CLOSE + 1 }
+    if kind == MODAL_EXPORT { << MB_EXPORT_RUN + 1 }
+    << 0
+}
+
+pub fn (m $&ModalState) layout(viewport_w f64, viewport_h f64, styles &widgets.Styles) {
+    if m.kind == MODAL_NONE { << }
+    vp := layout.Rect{x: 0.0, y: 0.0, width: viewport_w, height: viewport_h}
+    for i in 0:m.fields.len {
+        set_field_viewport($&m.fields[i], &vp)
+    }
+    pri := variant_or_default(styles, widgets.BUTTON_PRIMARY)
+    dng := variant_or_default(styles, widgets.BUTTON_DANGER)
+    sec := variant_or_default(styles, widgets.BUTTON_SECONDARY)
+    set_btn_style($&m.buttons[MB_SNAP_SAVE], &pri)
+    set_btn_style($&m.buttons[MB_SCENE_CREATE], &pri)
+    set_btn_style($&m.buttons[MB_UNSAVED_DISCARD], &dng)
+    set_btn_style($&m.buttons[MB_UNSAVED_SAVE], &pri)
+    set_btn_style($&m.buttons[MB_BUS_ADD], &sec)
+    set_btn_style($&m.buttons[MB_BUS_MUTE], &sec)
+    set_btn_style($&m.buttons[MB_BUS_DEL], &dng)
+    set_btn_style($&m.buttons[MB_CONN_ADD], &sec)
+    set_btn_style($&m.buttons[MB_CONN_DEL], &dng)
+    set_btn_style($&m.buttons[MB_GLOBALS_CLOSE], &pri)
+    set_btn_style($&m.buttons[MB_MGR_RENAME], &pri)
+    set_btn_style($&m.buttons[MB_MGR_DUP], &sec)
+    set_btn_style($&m.buttons[MB_MGR_DEL], &dng)
+    set_btn_style($&m.buttons[MB_MGR_CLOSE], &sec)
+    set_btn_style($&m.buttons[MB_EXPORT_CANCEL], &sec)
+    set_btn_style($&m.buttons[MB_EXPORT_RUN], &pri)
+
+    if m.kind == MODAL_SNAP {
+        cw := math.min(390.0, viewport_w - 32.0)
+        ch := 342.0
+        cx := (viewport_w - cw) * 0.5
+        cy := (viewport_h - ch) * 0.5
+        m.card = layout.Rect{x: cx, y: cy, width: cw, height: ch}
+        fw := cw - 40.0
+        place_rect_field($&m.fields[MF_SNAP_MOVE], &layout.Rect{x: cx + 20.0, y: cy + 62.0, width: fw, height: 64.0}, styles)
+        place_rect_field($&m.fields[MF_SNAP_ROTATE], &layout.Rect{x: cx + 20.0, y: cy + 136.0, width: fw, height: 64.0}, styles)
+        place_rect_field($&m.fields[MF_SNAP_SCALE], &layout.Rect{x: cx + 20.0, y: cy + 210.0, width: fw, height: 64.0}, styles)
+        set_btn_bounds($&m.buttons[MB_SNAP_CANCEL], &layout.Rect{x: cx + cw - 208.0, y: cy + ch - 48.0, width: 88.0, height: 32.0})
+        set_btn_bounds($&m.buttons[MB_SNAP_SAVE], &layout.Rect{x: cx + cw - 110.0, y: cy + ch - 48.0, width: 90.0, height: 32.0})
+    } else if m.kind == MODAL_NEW_SCENE {
+        cw := math.min(390.0, viewport_w - 32.0)
+        ch := 268.0
+        cx := (viewport_w - cw) * 0.5
+        cy := (viewport_h - ch) * 0.5
+        m.card = layout.Rect{x: cx, y: cy, width: cw, height: ch}
+        fw := cw - 40.0
+        place_rect_field($&m.fields[MF_SCENE_NAME], &layout.Rect{x: cx + 20.0, y: cy + 62.0, width: fw, height: 64.0}, styles)
+        place_rect_field($&m.fields[MF_SCENE_ROOT], &layout.Rect{x: cx + 20.0, y: cy + 136.0, width: fw, height: 64.0}, styles)
+        set_btn_bounds($&m.buttons[MB_SCENE_CANCEL], &layout.Rect{x: cx + cw - 228.0, y: cy + ch - 48.0, width: 88.0, height: 32.0})
+        set_btn_bounds($&m.buttons[MB_SCENE_CREATE], &layout.Rect{x: cx + cw - 130.0, y: cy + ch - 48.0, width: 110.0, height: 32.0})
+    } else if m.kind == MODAL_UNSAVED {
+        cw := math.min(400.0, viewport_w - 32.0)
+        ch := 162.0
+        cx := (viewport_w - cw) * 0.5
+        cy := (viewport_h - ch) * 0.5
+        m.card = layout.Rect{x: cx, y: cy, width: cw, height: ch}
+        set_btn_bounds($&m.buttons[MB_UNSAVED_CANCEL], &layout.Rect{x: cx + cw - 300.0, y: cy + ch - 48.0, width: 86.0, height: 32.0})
+        set_btn_bounds($&m.buttons[MB_UNSAVED_DISCARD], &layout.Rect{x: cx + cw - 204.0, y: cy + ch - 48.0, width: 92.0, height: 32.0})
+        set_btn_bounds($&m.buttons[MB_UNSAVED_SAVE], &layout.Rect{x: cx + cw - 102.0, y: cy + ch - 48.0, width: 82.0, height: 32.0})
+    } else if m.kind == MODAL_GLOBALS {
+        cw := math.min(540.0, viewport_w - 32.0)
+        ch := 396.0
+        cx := (viewport_w - cw) * 0.5
+        cy := (viewport_h - ch) * 0.5
+        m.card = layout.Rect{x: cx, y: cy, width: cw, height: ch}
+        fw := (cw - 48.0) * 0.5
+        place_rect_field($&m.fields[MF_BUS_NAME], &layout.Rect{x: cx + 20.0, y: cy + 84.0, width: fw, height: 60.0}, styles)
+        place_rect_field($&m.fields[MF_BUS_VOL], &layout.Rect{x: cx + 28.0 + fw, y: cy + 84.0, width: fw, height: 60.0}, styles)
+        set_btn_bounds($&m.buttons[MB_BUS_ADD], &layout.Rect{x: cx + 20.0, y: cy + 150.0, width: 84.0, height: 28.0})
+        set_btn_bounds($&m.buttons[MB_BUS_MUTE], &layout.Rect{x: cx + 110.0, y: cy + 150.0, width: 96.0, height: 28.0})
+        set_btn_bounds($&m.buttons[MB_BUS_DEL], &layout.Rect{x: cx + 212.0, y: cy + 150.0, width: 84.0, height: 28.0})
+
+        qw := (cw - 64.0) * 0.25
+        place_rect_field($&m.fields[MF_CONN_SRC], &layout.Rect{x: cx + 20.0, y: cy + 224.0, width: qw, height: 52.0}, styles)
+        place_rect_field($&m.fields[MF_CONN_SIG], &layout.Rect{x: cx + 28.0 + qw, y: cy + 224.0, width: qw, height: 52.0}, styles)
+        place_rect_field($&m.fields[MF_CONN_DST], &layout.Rect{x: cx + 36.0 + qw * 2.0, y: cy + 224.0, width: qw, height: 52.0}, styles)
+        place_rect_field($&m.fields[MF_CONN_HND], &layout.Rect{x: cx + 44.0 + qw * 3.0, y: cy + 224.0, width: qw, height: 52.0}, styles)
+        set_btn_bounds($&m.buttons[MB_CONN_ADD], &layout.Rect{x: cx + 20.0, y: cy + 284.0, width: 92.0, height: 28.0})
+        set_btn_bounds($&m.buttons[MB_CONN_DEL], &layout.Rect{x: cx + 118.0, y: cy + 284.0, width: 92.0, height: 28.0})
+        set_btn_bounds($&m.buttons[MB_GLOBALS_CLOSE], &layout.Rect{x: cx + cw - 110.0, y: cy + ch - 46.0, width: 90.0, height: 30.0})
+    } else if m.kind == MODAL_SCENE_MANAGE {
+        cw := math.min(440.0, viewport_w - 32.0)
+        ch := 228.0
+        cx := (viewport_w - cw) * 0.5
+        cy := (viewport_h - ch) * 0.5
+        m.card = layout.Rect{x: cx, y: cy, width: cw, height: ch}
+        fw := cw - 40.0
+        place_rect_field($&m.fields[MF_MGR_NAME], &layout.Rect{x: cx + 20.0, y: cy + 68.0, width: fw, height: 64.0}, styles)
+        by := cy + ch - 48.0
+        set_btn_bounds($&m.buttons[MB_MGR_RENAME], &layout.Rect{x: cx + 20.0, y: by, width: 88.0, height: 32.0})
+        set_btn_bounds($&m.buttons[MB_MGR_DUP], &layout.Rect{x: cx + 116.0, y: by, width: 94.0, height: 32.0})
+        set_btn_bounds($&m.buttons[MB_MGR_DEL], &layout.Rect{x: cx + 218.0, y: by, width: 82.0, height: 32.0})
+        set_btn_bounds($&m.buttons[MB_MGR_CLOSE], &layout.Rect{x: cx + cw - 98.0, y: by, width: 78.0, height: 32.0})
+        del_en := m.mgr_scene_count > 1
+        set_btn_enabled($&m.buttons[MB_MGR_DEL], del_en)
+    } else if m.kind == MODAL_EXPORT {
+        cw := math.min(440.0, viewport_w - 32.0)
+        ch := 214.0
+        cx := (viewport_w - cw) * 0.5
+        cy := (viewport_h - ch) * 0.5
+        m.card = layout.Rect{x: cx, y: cy, width: cw, height: ch}
+        fw := cw - 40.0
+        place_rect_field($&m.fields[MF_EXPORT_DIR], &layout.Rect{x: cx + 20.0, y: cy + 68.0, width: fw, height: 64.0}, styles)
+        by := cy + ch - 48.0
+        set_btn_bounds($&m.buttons[MB_EXPORT_CANCEL], &layout.Rect{x: cx + cw - 240.0, y: by, width: 88.0, height: 32.0})
+        set_btn_bounds($&m.buttons[MB_EXPORT_RUN], &layout.Rect{x: cx + cw - 144.0, y: by, width: 124.0, height: 32.0})
+    }
+}
+
+fn paint_modal_field(f $&widgets.Field, frame $&draw.Frame, styles &widgets.Styles) int {
+    b := f.bounds()
+    frame.push() or >>
+    frame.translate(b.x, b.y) or >>
+    res := f.paint_styled(frame, styles)
+    frame.pop() or >>
+    << res
+}
+
+pub fn (m $&ModalState) paint(frame $&draw.Frame, bounds &layout.Rect, styles &widgets.Styles, pal &PaperPalette) int {
+    if m.kind == MODAL_NONE { << 0 }
+    frame.fill_rect(bounds.x, bounds.y, bounds.width, bounds.height, draw.rgba(40, 35, 41, 108)) or >>
+    c := m.card
+    frame.box_shadow(c.x, c.y, c.width, c.height, 12.0, 0.0, 8.0, 20.0, 0.0, draw.rgba(40, 35, 41, 64)) or >>
+    frame.fill_round_rect(c.x, c.y, c.width, c.height, 12.0, pal.surface) or >>
+    frame.stroke_round_rect(c.x, c.y, c.width, c.height, 12.0, pal.border, 1.0) or >>
+
+    if m.kind == MODAL_SNAP {
+        t_snap := tr(m.lang, "Snap Settings", "吸附设置")
+        s_snap := tr(m.lang, "Used by 3D View gizmos and transforms", "用于 3D 视口坐标轴操作与变换")
+        frame.text(c.x + 20.0, c.y + 16.0, 17.0, pal.text, &t_snap) or >>
+        frame.text(c.x + 20.0, c.y + 39.0, 12.0, pal.muted, &s_snap) or >>
+    } else if m.kind == MODAL_NEW_SCENE {
+        t_ns := tr(m.lang, "New Scene", "新建场景")
+        s_ns := tr(m.lang, "Create and register a new .xuscene file", "创建并注册新的 .xuscene 场景文件")
+        frame.text(c.x + 20.0, c.y + 16.0, 17.0, pal.text, &t_ns) or >>
+        frame.text(c.x + 20.0, c.y + 39.0, 12.0, pal.muted, &s_ns) or >>
+    } else if m.kind == MODAL_UNSAVED {
+        t_us := tr(m.lang, "Unsaved Changes", "未保存的更改")
+        frame.text(c.x + 20.0, c.y + 18.0, 17.0, pal.text, &t_us) or >>
+        $sub := tr(m.lang, "Save changes to the current scene before switching?", "切换场景前是否保存当前场景的更改？")
+        if m.unsaved_open_project_after {
+            sub = tr(m.lang, "Save changes before opening another project?", "打开其他工程前是否保存更改？")
+        } else if m.unsaved_close_after {
+            sub = tr(m.lang, "Save changes before closing the editor?", "关闭编辑器前是否保存更改？")
+        }
+        frame.text(c.x + 20.0, c.y + 48.0, 13.0, pal.muted, &sub) or >>
+    } else if m.kind == MODAL_GLOBALS {
+        t_gl := tr(m.lang, "Scene Globals (Audio Buses & Script Routes)", "场景全局设置（音频总线与脚本路由）")
+        frame.text(c.x + 20.0, c.y + 16.0, 17.0, pal.text, &t_gl) or >>
+        frame.text(c.x + 20.0, c.y + 52.0, 11.5, pal.muted, &m.bus_summary) or >>
+        frame.text(c.x + 20.0, c.y + 196.0, 11.5, pal.muted, &m.conn_summary) or >>
+        if m.globals_err.len > 0 {
+            frame.text(c.x + 20.0, c.y + c.height - 40.0, 12.0, pal.danger, &m.globals_err) or >>
+        }
+    } else if m.kind == MODAL_SCENE_MANAGE {
+        t_mg := tr(m.lang, "Manage Scene", "管理场景")
+        frame.text(c.x + 20.0, c.y + 16.0, 17.0, pal.text, &t_mg) or >>
+        sub := tr(m.lang, "Current: ", "当前: ") + m.mgr_cur_scene + " (" + str(m.mgr_scene_count) + tr(m.lang, " scene(s))", " 个场景)")
+        frame.text(c.x + 20.0, c.y + 39.0, 12.0, pal.muted, &sub) or >>
+    } else if m.kind == MODAL_EXPORT {
+        t_ex := tr(m.lang, "Export / Publish Build", "导出 / 发布构建")
+        s_ex := tr(m.lang, "Cook project assets and scenes into current generation", "打包当前工程资源与场景")
+        frame.text(c.x + 20.0, c.y + 16.0, 17.0, pal.text, &t_ex) or >>
+        frame.text(c.x + 20.0, c.y + 39.0, 12.0, pal.muted, &s_ex) or >>
+    }
+
+    fs := active_field_start(m.kind)
+    fe := active_field_end(m.kind)
+    for i in fs:fe {
+        paint_modal_field($&m.fields[i], frame, styles) or >>
+    }
+    bs := active_btn_start(m.kind)
+    be := active_btn_end(m.kind)
+    for i in bs:be {
+        b := m.buttons[i].clone()
+        _ := b.paint_styled(frame, $&m.btn_labels[i], styles) or >>
+    }
+    for i in fs:fe {
+        field_popup_paint($&m.fields[i], frame, styles) or >>
+    }
+    << 0
+}
+
+fn tick_field(f $&widgets.Field, now time.Instant, reduced bool) bool {
+    << f.tick(now, reduced) or (err) { << false }
+}
+
+fn field_next_tick(f &widgets.Field, now time.Instant, reduced bool) time.Instant {
+    << f.next_caret_tick(now, reduced) or (err) { << time.zero_instant() }
+}
+
+pub fn (m $&ModalState) tick(now time.Instant, reduced bool) bool {
+    fs := active_field_start(m.kind)
+    fe := active_field_end(m.kind)
+    $changed := false
+    for i in fs:fe {
+        if tick_field($&m.fields[i], now, reduced) { changed = true }
+    }
+    << changed
+}
+
+pub fn (m &ModalState) next_tick(now time.Instant, reduced bool) time.Instant {
+    $deadline := time.zero_instant()
+    fs := active_field_start(m.kind)
+    fe := active_field_end(m.kind)
+    for i in fs:fe {
+        next := field_next_tick(&m.fields[i], now, reduced)
+        if !next.is_zero() && (deadline.is_zero() || next.before(deadline)) {
+            deadline = next
+        }
+    }
+    << deadline
+}
+
+pub fn modal_close(m $&ModalState) { m.close() }
+pub fn modal_set_focus(m $&ModalState, id int) { m.set_focus(id) }
+
+pub fn (m &ModalState) has_popup_open() bool {
+    fs := active_field_start(m.kind)
+    fe := active_field_end(m.kind)
+    for i in fs:fe {
+        if m.fields[i].has_popup_open() { << true }
+    }
+    << false
+}
+
+pub fn (m &ModalState) cursor_at(x f64, y f64) int {
+    fs := active_field_start(m.kind)
+    fe := active_field_end(m.kind)
+    for i in fs:fe {
+        if m.fields[i].has_popup_open() { << m.fields[i].cursor_at(x, y) }
+    }
+    for i in fs:fe {
+        if m.fields[i].bounds().contains(x, y) { << m.fields[i].cursor_at(x, y) }
+    }
+    bs := active_btn_start(m.kind)
+    be := active_btn_end(m.kind)
+    for i in bs:be {
+        if m.buttons[i].bounds().contains(x, y) { << m.buttons[i].cursor() }
+    }
+    << ui.CURSOR_DEFAULT
+}
+
+pub fn (m $&ModalState) handle_text_or_request(event &ui.Event) bool {
+    if m.kind == MODAL_NONE { << false }
+    $dirty := false
+    fs := active_field_start(m.kind)
+    fe := active_field_end(m.kind)
+    for i in fs:fe {
+        act := field_event($&m.fields[i], event)
+        if act.needs_paint { dirty = true }
+        if act.kind == widgets.ACTION_CHANGE {
+            if i == MF_SNAP_MOVE && m.snap_move_err.len > 0 {
+                m.snap_move_err = ""
+                m.sync_snap_decorations()
+                dirty = true
+            } else if i == MF_SNAP_ROTATE && m.snap_rotate_err.len > 0 {
+                m.snap_rotate_err = ""
+                m.sync_snap_decorations()
+                dirty = true
+            } else if i == MF_SNAP_SCALE && m.snap_scale_err.len > 0 {
+                m.snap_scale_err = ""
+                m.sync_snap_decorations()
+                dirty = true
+            } else if i == MF_SCENE_NAME && m.scene_err.len > 0 {
+                m.scene_err = ""
+                m.sync_scene_decoration()
+                dirty = true
+            } else if i == MF_MGR_NAME && m.mgr_err.len > 0 {
+                m.mgr_err = ""
+                m.sync_mgr_decoration()
+                dirty = true
+            } else if i == MF_EXPORT_DIR && m.export_err.len > 0 {
+                m.export_err = ""
+                m.sync_export_decoration()
+                dirty = true
+            } else if m.kind == MODAL_GLOBALS && m.globals_err.len > 0 {
+                m.globals_err = ""
+                dirty = true
+            }
+        }
+    }
+    << dirty
+}

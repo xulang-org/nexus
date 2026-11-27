@@ -1,0 +1,139 @@
+@main
+
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#encoding/json
+#path/filepath
+#strconv
+#strings
+#math
+#os
+#errors
+
+pub struct SnapSettings {
+    pub move_step f64
+    pub rotate_deg f64
+    pub scale_pct f64
+}
+
+pub struct SnapValidation {
+    pub valid bool
+    pub settings SnapSettings
+    pub move_err string
+    pub rotate_err string
+    pub scale_err string
+}
+
+pub fn default_snap_settings() SnapSettings {
+    << SnapSettings{move_step: 0.5, rotate_deg: 15.0, scale_pct: 10.0}
+}
+
+pub fn snap_settings_path(output_dir &string) string {
+    << filepath.join([output_dir + "", "editor-snap.json"])
+}
+
+fn read_snap_number(doc &json.Doc, root int, key string, fallback f64) f64 {
+    if !doc.has(root, key + "") {
+        << fallback
+    }
+    node := doc.get(root, key + "")
+    if !doc.is_number(node) {
+        << fallback
+    }
+    v := doc.as_f64(node) or (err) { << fallback }
+    if math.is_nan(v) || math.is_inf(v) || v <= 0.0 {
+        << fallback
+    }
+    << v
+}
+
+pub fn load_snap_settings(output_dir &string) SnapSettings {
+    $s := default_snap_settings()
+    if output_dir.len == 0 {
+        << s
+    }
+    path := snap_settings_path(output_dir)
+    raw := try_read_file(path + "")
+    if raw.len == 0 {
+        << s
+    }
+    doc := json.parse_max(&raw, 65536)
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << s
+    }
+    root := doc.root()
+    $mv := read_snap_number(&doc, root, "move", s.move_step)
+    $rt := read_snap_number(&doc, root, "rotate", s.rotate_deg)
+    $sc := read_snap_number(&doc, root, "scale", s.scale_pct)
+    if mv < 0.0001 || mv > 1000000.0 { mv = s.move_step }
+    if rt < 0.01 || rt > 180.0 { rt = s.rotate_deg }
+    if sc < 1.0 || sc > 10000.0 { sc = s.scale_pct }
+    << SnapSettings{move_step: mv, rotate_deg: rt, scale_pct: sc}
+}
+
+pub fn snap_scale_factor(s &SnapSettings) f64 {
+    << s.scale_pct / 100.0
+}
+
+pub fn save_snap_settings(output_dir &string, s &SnapSettings) int {
+    if output_dir.len == 0 {
+        << 0
+    }
+    os.mkdir_all(output_dir + "") or >>
+    mv := strconv.format_float(s.move_step, 103, -1) or >>
+    rt := strconv.format_float(s.rotate_deg, 103, -1) or >>
+    sc := strconv.format_float(s.scale_pct, 103, -1) or >>
+    raw := "{\n  \"format\": \"nexus.editor_snap\",\n  \"version\": 1,\n  \"move\": " + mv +
+        ",\n  \"rotate\": " + rt + ",\n  \"scale\": " + sc + "\n}\n"
+    path := snap_settings_path(output_dir)
+    snapshot.write_atomic(path, &raw) or >>
+    << 0
+}
+
+fn parse_step_in_range(raw &string, min_val f64, max_val f64, label string) f64 {
+    t := strings.trim_space(raw)
+    if t.len == 0 {
+        >> errors.new(label + " is required")
+    }
+    v := strconv.parse_float(&t) or (err) {
+        >> errors.new("Enter a finite number")
+    }
+    if math.is_nan(v) || math.is_inf(v) {
+        >> errors.new("Enter a finite number")
+    }
+    if v < min_val || v > max_val {
+        >> errors.new("Must be between " + fmt_coord(min_val) + " and " + fmt_coord(max_val))
+    }
+    << v
+}
+
+fn capture_step_error(raw &string, min_val f64, max_val f64, label string) string {
+    _ := parse_step_in_range(raw, min_val, max_val, label) or (err) {
+        << err.msg()
+    }
+    << ""
+}
+
+pub fn validate_snap_inputs(move_raw &string, rotate_raw &string, scale_raw &string) SnapValidation {
+    me := capture_step_error(move_raw, 0.0001, 1000000.0, "Move step")
+    re := capture_step_error(rotate_raw, 0.01, 180.0, "Rotate step")
+    se := capture_step_error(scale_raw, 1.0, 10000.0, "Scale step")
+    if me.len > 0 || re.len > 0 || se.len > 0 {
+        << SnapValidation{
+            valid: false,
+            settings: default_snap_settings(),
+            move_err: me,
+            rotate_err: re,
+            scale_err: se
+        }
+    }
+    mv := parse_step_in_range(move_raw, 0.0001, 1000000.0, "Move step") or (err) { << SnapValidation{valid: false, settings: default_snap_settings(), move_err: err.msg(), rotate_err: "", scale_err: ""} }
+    rt := parse_step_in_range(rotate_raw, 0.01, 180.0, "Rotate step") or (err) { << SnapValidation{valid: false, settings: default_snap_settings(), move_err: "", rotate_err: err.msg(), scale_err: ""} }
+    sc := parse_step_in_range(scale_raw, 1.0, 10000.0, "Scale step") or (err) { << SnapValidation{valid: false, settings: default_snap_settings(), move_err: "", rotate_err: "", scale_err: err.msg()} }
+    << SnapValidation{
+        valid: true,
+        settings: SnapSettings{move_step: mv, rotate_deg: rt, scale_pct: sc},
+        move_err: "",
+        rotate_err: "",
+        scale_err: ""
+    }
+}

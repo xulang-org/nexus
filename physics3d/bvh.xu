@@ -1,0 +1,255 @@
+@"github.com/xulang-org/nexus/physics3d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#math
+
+struct BvhNode3D {
+    minimum fm.Vec3
+    maximum fm.Vec3
+    first_or_left int
+    count int
+    right_child int
+}
+
+struct StaticBvh3D {
+    nodes []BvhNode3D
+    indices []int
+}
+
+fn empty_bvh_3d() StaticBvh3D {
+    << StaticBvh3D{nodes: []BvhNode3D{}, indices: []int{}}
+}
+
+fn node_box_overlap(minimum fm.Vec3, maximum fm.Vec3, box fm.Aabb3) bool {
+    << maximum.x >= box.minimum.x && minimum.x <= box.maximum.x &&
+        maximum.y >= box.minimum.y && minimum.y <= box.maximum.y &&
+        maximum.z >= box.minimum.z && minimum.z <= box.maximum.z
+}
+
+fn ray_segment_hits_box(origin fm.Vec3, motion fm.Vec3, minimum fm.Vec3, maximum fm.Vec3) bool {
+    $tmin := 0.0
+    $tmax := 1.0
+    origins := [origin.x, origin.y, origin.z]
+    dirs := [motion.x, motion.y, motion.z]
+    mins := [minimum.x, minimum.y, minimum.z]
+    maxs := [maximum.x, maximum.y, maximum.z]
+    for axis in 0:3 {
+        d := dirs[axis]
+        o := origins[axis]
+        lo := mins[axis]
+        hi := maxs[axis]
+        if math.abs(d) <= 1e-18 {
+            if o < lo || o > hi { << false }
+        } else {
+            inv := 1.0 / d
+            $t0 := (lo - o) * inv
+            $t1 := (hi - o) * inv
+            if t0 > t1 {
+                tmp := t0
+                t0 = t1
+                t1 = tmp
+            }
+            if t0 > tmin { tmin = t0 }
+            if t1 < tmax { tmax = t1 }
+            if tmin > tmax { << false }
+        }
+    }
+    << true
+}
+
+fn build_static_bvh(bounds &[]fm.Aabb3) StaticBvh3D {
+    n := bounds.len
+    if n == 0 { << empty_bvh_3d() }
+    $indices := []int{}
+    $centers := []fm.Vec3{}
+    for i in 0:n {
+        indices.push(i)
+        centers.push(bounds[i].minimum.add(bounds[i].maximum).scaled(0.5))
+    }
+    $nodes := []BvhNode3D{}
+    nodes.push(BvhNode3D{minimum: zero(), maximum: zero(), first_or_left: 0, count: 0, right_child: -1})
+    $work_node := [0]
+    $work_start := [0]
+    $work_end := [n]
+    $sp := 1
+    while sp > 0 {
+        sp -= 1
+        ni := work_node[sp]
+        start := work_start[sp]
+        end := work_end[sp]
+        first_idx := indices[start]
+        $bmin := bounds[first_idx].minimum
+        $bmax := bounds[first_idx].maximum
+        $cmin := centers[first_idx]
+        $cmax := centers[first_idx]
+        for k in start + 1:end {
+            idx := indices[k]
+            bb := bounds[idx]
+            bmin = fm.vec3(math.min(bmin.x, bb.minimum.x), math.min(bmin.y, bb.minimum.y), math.min(bmin.z, bb.minimum.z))
+            bmax = fm.vec3(math.max(bmax.x, bb.maximum.x), math.max(bmax.y, bb.maximum.y), math.max(bmax.z, bb.maximum.z))
+            cc := centers[idx]
+            cmin = fm.vec3(math.min(cmin.x, cc.x), math.min(cmin.y, cc.y), math.min(cmin.z, cc.z))
+            cmax = fm.vec3(math.max(cmax.x, cc.x), math.max(cmax.y, cc.y), math.max(cmax.z, cc.z))
+        }
+        count := end - start
+        if count <= 4 {
+            nodes[ni] = BvhNode3D{minimum: bmin, maximum: bmax, first_or_left: start, count: count, right_child: -1}
+            ->
+        }
+        cext := cmax.sub(cmin)
+        $axis := 0
+        if cext.y > cext.x && cext.y >= cext.z { axis = 1 }
+        else if cext.z > cext.x && cext.z > cext.y { axis = 2 }
+        $pivot := 0.5 * (cmin.x + cmax.x)
+        if axis == 1 { pivot = 0.5 * (cmin.y + cmax.y) }
+        else if axis == 2 { pivot = 0.5 * (cmin.z + cmax.z) }
+        $left := start
+        $right := end - 1
+        while left <= right {
+            c := centers[indices[left]]
+            $val := c.x
+            if axis == 1 { val = c.y }
+            else if axis == 2 { val = c.z }
+            if val < pivot {
+                left += 1
+            } else {
+                tmp := indices[left]
+                indices[left] = indices[right]
+                indices[right] = tmp
+                right -= 1
+            }
+        }
+        $split := left
+        if split <= start || split >= end { split = start + count / 2 }
+        left_child := nodes.len
+        nodes.push(BvhNode3D{minimum: zero(), maximum: zero(), first_or_left: 0, count: 0, right_child: -1})
+        right_child := nodes.len
+        nodes.push(BvhNode3D{minimum: zero(), maximum: zero(), first_or_left: 0, count: 0, right_child: -1})
+        nodes[ni] = BvhNode3D{minimum: bmin, maximum: bmax, first_or_left: left_child, count: 0, right_child: right_child}
+        if sp >= work_node.len {
+            work_node.push(right_child)
+            work_start.push(split)
+            work_end.push(end)
+        } else {
+            work_node[sp] = right_child
+            work_start[sp] = split
+            work_end[sp] = end
+        }
+        sp += 1
+        if sp >= work_node.len {
+            work_node.push(left_child)
+            work_start.push(start)
+            work_end.push(split)
+        } else {
+            work_node[sp] = left_child
+            work_start[sp] = start
+            work_end[sp] = split
+        }
+        sp += 1
+    }
+    << StaticBvh3D{nodes: nodes, indices: indices}
+}
+
+fn sort_hits(hits $&[]int) {
+    for i in 1:hits.len {
+        key := hits[i]
+        $j := i - 1
+        while j >= 0 && hits[j] > key {
+            hits[j + 1] = hits[j]
+            j -= 1
+        }
+        hits[j + 1] = key
+    }
+}
+
+fn (bvh &StaticBvh3D) query_aabb(box fm.Aabb3, bounds &[]fm.Aabb3) []int {
+    $hits := []int{}
+    if bvh.nodes.len == 0 { << hits }
+    $stack := [0]
+    $sp := 1
+    while sp > 0 {
+        sp -= 1
+        ni := stack[sp]
+        node := bvh.nodes[ni]
+        if !node_box_overlap(node.minimum, node.maximum, box) { -> }
+        if node.count > 0 {
+            for k in node.first_or_left:node.first_or_left + node.count {
+                idx := bvh.indices[k]
+                if aabb_overlap(box, bounds[idx]) { hits.push(idx) }
+            }
+        } else {
+            if sp >= stack.len { stack.push(node.right_child) } else { stack[sp] = node.right_child }
+            sp += 1
+            if sp >= stack.len { stack.push(node.first_or_left) } else { stack[sp] = node.first_or_left }
+            sp += 1
+        }
+    }
+    sort_hits($&hits)
+    << hits
+}
+
+fn (bvh &StaticBvh3D) query_ray(origin fm.Vec3, motion fm.Vec3) []int {
+    $hits := []int{}
+    if bvh.nodes.len == 0 { << hits }
+    $stack := [0]
+    $sp := 1
+    while sp > 0 {
+        sp -= 1
+        ni := stack[sp]
+        node := bvh.nodes[ni]
+        if !ray_segment_hits_box(origin, motion, node.minimum, node.maximum) { -> }
+        if node.count > 0 {
+            for k in node.first_or_left:node.first_or_left + node.count {
+                hits.push(bvh.indices[k])
+            }
+        } else {
+            if sp >= stack.len { stack.push(node.right_child) } else { stack[sp] = node.right_child }
+            sp += 1
+            if sp >= stack.len { stack.push(node.first_or_left) } else { stack[sp] = node.first_or_left }
+            sp += 1
+        }
+    }
+    sort_hits($&hits)
+    << hits
+}
+
+// 1D X-axis insertion-sorted Sweep and Prune returning canonical (lo, hi) pairs.
+fn sap_broadphase_pairs(bounds &[]fm.Aabb3) []int {
+    n := bounds.len
+    $pairs := []int{}
+    if n < 2 { << pairs }
+    $order := []int{}
+    for i in 0:n { order.push(i) }
+    for i in 1:n {
+        key := order[i]
+        key_x := bounds[key].minimum.x
+        $j := i - 1
+        while j >= 0 {
+            other := order[j]
+            ox := bounds[other].minimum.x
+            if ox < key_x || (ox == key_x && other < key) { <- }
+            order[j + 1] = other
+            j -= 1
+        }
+        order[j + 1] = key
+    }
+    for i in 0:n {
+        ia := order[i]
+        ba := bounds[ia]
+        for j in i + 1:n {
+            ib := order[j]
+            bb := bounds[ib]
+            if bb.minimum.x > ba.maximum.x { <- }
+            if ba.maximum.y < bb.minimum.y || ba.minimum.y > bb.maximum.y ||
+                ba.maximum.z < bb.minimum.z || ba.minimum.z > bb.maximum.z { -> }
+            if ia < ib {
+                pairs.push(ia)
+                pairs.push(ib)
+            } else {
+                pairs.push(ib)
+                pairs.push(ia)
+            }
+        }
+    }
+    << pairs
+}

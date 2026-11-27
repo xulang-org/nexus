@@ -1,0 +1,90 @@
+@main
+
+inp #"github.com/xulang-org/nexus/input"
+timing #"github.com/xulang-org/nexus/timing"
+#errors
+#math
+
+fn assert(ok bool, msg string) int {
+    if !ok { >> errors.new("input_replay_timing_checks: " + msg) }
+    << 0
+}
+
+fn run() int {
+    // 1. Input rebinding + JSON roundtrip + gamepad deadzone shaping.
+    $src_map := inp.new_input_map()
+    src_map.bind("jump", 32) or >>
+    src_map.bind("fire", 70) or >>
+    src_map.bind_source("move_left", 1) or >>
+    src_map.bind_source("move_right", 2) or >>
+    src_map.rebind_key("jump", 32, 87) or >>
+
+    keys := src_map.action_keys("jump") or >>
+    assert(keys.len == 1 && keys[0] == 87, "rebind_key moved jump from 32 to 87") or >>
+
+    exported := src_map.export_bindings_json()
+    $live := inp.new_input_map()
+    live.import_bindings_json(&exported) or >>
+    live_keys := live.action_keys("jump") or >>
+    assert(live_keys.len == 1 && live_keys[0] == 87, "JSON bindings imported") or >>
+
+    assert(math.abs(inp.apply_deadzone(0.10, 0.15) or >>) < 1e-9, "deadzone zeros inner stick") or >>
+    dz_edge := inp.apply_deadzone(1.0, 0.2) or >>
+    assert(math.abs(dz_edge - 1.0) < 1e-9, "deadzone scales full deflection to 1.0") or >>
+    live.feed_axis_pair(1, 2, 0.6, 0.2) or >>
+    assert(math.abs((live.axis("move_left", "move_right") or >>) - 0.5) < 1e-6, "axis pair deadzone 0.5") or >>
+
+    // 2. Deterministic InputRecorder -> JSON -> InputReplayer replay.
+    $rec := inp.new_recorder()
+    rec.record_key(0, 87, true) or >>
+    rec.record_source(1, 2, 0.75) or >>
+    rec.record_key(2, 87, false) or >>
+    tape_json := rec.encode_json() or >>
+
+    $replayer := inp.decode_tape_json(&tape_json) or >>
+    $play_map := inp.new_input_map()
+    play_map.import_bindings_json(&exported) or >>
+
+    play_map.begin_frame()
+    assert((replayer.apply_frame(0, $&play_map) or >>) == 1, "frame 0 applies 1 event") or >>
+    assert((play_map.just_pressed("jump") or >>) && (play_map.pressed("jump") or >>), "frame 0 jump just_pressed") or >>
+
+    play_map.begin_frame()
+    assert((replayer.apply_frame(1, $&play_map) or >>) == 1, "frame 1 applies source event") or >>
+    assert(!(play_map.just_pressed("jump") or >>) && math.abs((play_map.value("move_right") or >>) - 0.75) < 1e-6, "frame 1 move_right=0.75") or >>
+
+    play_map.begin_frame()
+    _ := replayer.apply_frame(2, $&play_map) or >>
+    assert((play_map.just_released("jump") or >>) && replayer.is_finished(), "frame 2 jump released and tape finished") or >>
+
+    // 3. ScaledClock: slow-mo, fast-forward, pause, hitstop.
+    $clk := timing.new_scaled_clock(60, 8) or >>
+    clk.set_time_scale(0.5) or >>
+    st1 := clk.advance(1.0 / 30.0) or >> // 0.5 * 1/30 = 1/60 -> exactly 1 step!
+    assert(st1.steps == 1 && math.abs(clk.unscaled_elapsed() - (1.0 / 30.0)) < 1e-6, "0.5x slow-mo produces 1 fixed step from 1/30s") or >>
+
+    clk.set_time_scale(2.0) or >>
+    st2 := clk.advance(1.0 / 60.0) or >> // 2.0 * 1/60 = 1/30 -> 2 steps!
+    assert(st2.steps == 2, "2.0x scale produces 2 fixed steps per 60Hz frame") or >>
+
+    clk.trigger_hitstop(0.05) or >>
+    st_hit := clk.advance(0.03) or >>
+    assert(st_hit.steps == 0 && st_hit.in_hitstop && clk.in_hitstop(), "hitstop freezes scaled steps") or >>
+    _ := clk.advance(0.03) or >> // drains remaining 0.02s hitstop
+    assert(!clk.in_hitstop(), "hitstop expired after unscaled time elapsed") or >>
+
+    clk.set_paused(true)
+    st_pause := clk.advance(0.05) or >>
+    assert(st_pause.steps == 0 && st_pause.paused, "pause freezes scaled steps") or >>
+
+    println("PASS: input_replay_timing_checks")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

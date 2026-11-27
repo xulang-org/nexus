@@ -1,6 +1,7 @@
 @"github.com/xulang-org/nexus/scene"
 
 fm #"github.com/xulang-org/nexus/foundation/math"
+camera_data #"github.com/xulang-org/nexus/resources/camera"
 #errors
 #math
 
@@ -13,26 +14,44 @@ pub struct Camera2D {
     pub zoom f64
 }
 pub fn new_camera_2d(width f64, height f64) Camera2D {
-    if !fm.finite(width) || !fm.finite(height) || width < 1.0 || height < 1.0 || width > 16384.0 || height > 16384.0 {
+    if !camera_data.valid_dimensions_2d(width, height) {
         >> errors.new("nexus: camera design size must be in 1...16384")
     }
     << Camera2D{design_size: fm.vec2(width, height), position: fm.vec2(width * 0.5, height * 0.5),
         rotation: 0.0, zoom: 1.0}
 }
+// The world origin and X direction define the pose. Only lens zoom scales
+// the viewport, even when the node inherits scale or shear.
+pub fn new_camera_node_2d(tree &SceneTree, node int) Camera2D {
+    index := tree.editable(node) or >>
+    component := tree.require_spatial(index, NODE_2D) or >>
+    lens := tree.spatial_2d[component].camera
+    if !lens.is_set() { >> errors.new("nexus: Node2D has no camera attachment") }
+    world := tree.inherited_2d(index) or >>
+    if world.a == 0.0 && world.b == 0.0 { >> errors.new("nexus: 2D camera world X axis is degenerate") }
+    camera := Camera2D{design_size: fm.vec2(lens.width(), lens.height()),
+        position: fm.vec2(world.tx, world.ty), rotation: math.atan2(world.b, world.a), zoom: lens.zoom()}
+    camera.validate(lens.width(), lens.height()) or >>
+    << camera
+}
+pub fn (tree $&SceneTree) set_camera_2d(node int, lens camera_data.View2D) int {
+    index := tree.editable(node) or >>
+    component := tree.require_spatial(index, NODE_2D) or >>
+    tree.spatial_2d[component].camera = lens
+    << 0
+}
 fn (camera &Camera2D) validate(output_width f64, output_height f64) int {
-    if !fm.finite(output_width) || !fm.finite(output_height) || output_width < 1.0 || output_height < 1.0 ||
-        output_width > 16384.0 || output_height > 16384.0 ||
-        !fm.finite(camera.design_size.x) || !fm.finite(camera.design_size.y) ||
-        camera.design_size.x < 1.0 || camera.design_size.y < 1.0 ||
-        camera.design_size.x > 16384.0 || camera.design_size.y > 16384.0 ||
+    if !camera_data.valid_dimensions_2d(output_width, output_height) ||
+        !camera_data.valid_dimensions_2d(camera.design_size.x, camera.design_size.y) ||
         !fm.finite(camera.position.x) || !fm.finite(camera.position.y) ||
         math.abs(camera.position.x) > 1000000000.0 || math.abs(camera.position.y) > 1000000000.0 ||
-        !fm.finite(camera.zoom) || camera.zoom < 0.001 || camera.zoom > 1000.0 ||
+        !camera_data.valid_zoom_2d(camera.zoom) ||
         !fm.finite(camera.rotation) || math.abs(camera.rotation) > 1000000.0 {
         >> errors.new("nexus: invalid camera, zoom or output size")
     }
     << 0
 }
+pub fn (camera &Camera2D) design_size() fm.Vec2 { << camera.design_size }
 // Output coordinates use the same units as the renderer, normally pixels.
 pub fn (camera &Camera2D) viewport(output_width f64, output_height f64) fm.Rect2 {
     camera.validate(output_width, output_height) or >>

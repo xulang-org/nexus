@@ -1,0 +1,677 @@
+@"github.com/xulang-org/nexus/ecs"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub fn (world &EcsWorld) entity_mask(h EntityHandle) int {
+    s := world.resolve_slot(h) or >>
+    << world.archetypes[s.archetype_idx].mask
+}
+
+// Returns all live EntityHandles whose archetype includes every bit in required_mask
+// and zero bits in excluded_mask.
+pub fn (world &EcsWorld) query(required_mask int, excluded_mask int) []EntityHandle {
+    $out := []EntityHandle{}
+    for ai in 0:world.archetypes.len {
+        mask := world.archetypes[ai].mask
+        if (mask & required_mask) != required_mask { -> }
+        if (mask & excluded_mask) != 0 { -> }
+        arch := &world.archetypes[ai]
+        for ci in 0:arch.chunks.len {
+            chk := &arch.chunks[ci]
+            meta := <-chk.meta
+            for r in 0:meta.count {
+                eid := meta.entity_ids[r]
+                out.push(EntityHandle{id: eid, generation: world.slots[eid].generation})
+            }
+            chk.meta <- meta
+        }
+    }
+    << out
+}
+
+fn valid_single_component_bit(bit int) bool {
+    << bit == COMP_TRANSFORM || bit == COMP_VELOCITY || bit == COMP_BOUNDS ||
+       bit == COMP_HEALTH || bit == COMP_PARTICLE || bit == COMP_AUDIO
+}
+
+struct RowSnapshot {
+    pos fm.Vec3
+    scale fm.Vec3
+    wmat fm.Mat4
+    vlin fm.Vec3
+    vang fm.Vec3
+    blocal fm.Aabb3
+    bworld fm.Aabb3
+    hp f64
+    max_hp f64
+    regen f64
+    halive bool
+    page f64
+    plife f64
+    pdamp f64
+    palive bool
+    amax_dist f64
+    again f64
+    aatten f64
+}
+
+fn read_row_snapshot(chk &EcsChunk, mask int, row int) RowSnapshot {
+    $snap := RowSnapshot{
+        pos: fm.vec3(0.0, 0.0, 0.0), scale: fm.vec3(1.0, 1.0, 1.0), wmat: fm.identity_3d(),
+        vlin: fm.vec3(0.0, 0.0, 0.0), vang: fm.vec3(0.0, 0.0, 0.0),
+        blocal: unit_box(), bworld: unit_box(),
+        hp: 100.0, max_hp: 100.0, regen: 0.0, halive: true,
+        page: 0.0, plife: 1.0, pdamp: 0.0, palive: true,
+        amax_dist: 10.0, again: 1.0, aatten: 1.0
+    }
+    if (mask & COMP_TRANSFORM) != 0 {
+        tc := <-chk.transforms
+        snap.pos = tc.positions[row]
+        snap.scale = tc.scales[row]
+        snap.wmat = tc.world_mats[row]
+        chk.transforms <- tc
+    }
+    if (mask & COMP_VELOCITY) != 0 {
+        vc := <-chk.velocities
+        snap.vlin = vc.lin[row]
+        snap.vang = vc.ang[row]
+        chk.velocities <- vc
+    }
+    if (mask & COMP_BOUNDS) != 0 {
+        bc := <-chk.bounds
+        snap.blocal = bc.local[row]
+        snap.bworld = bc.world[row]
+        chk.bounds <- bc
+    }
+    if (mask & COMP_HEALTH) != 0 {
+        hc := <-chk.healths
+        snap.hp = hc.hp[row]
+        snap.max_hp = hc.max_hp[row]
+        snap.regen = hc.regen[row]
+        snap.halive = hc.alive[row]
+        chk.healths <- hc
+    }
+    if (mask & COMP_PARTICLE) != 0 {
+        pc := <-chk.particles
+        snap.page = pc.age[row]
+        snap.plife = pc.lifetime[row]
+        snap.pdamp = pc.damping[row]
+        snap.palive = pc.alive[row]
+        chk.particles <- pc
+    }
+    if (mask & COMP_AUDIO) != 0 {
+        ac := <-chk.audios
+        snap.amax_dist = ac.max_dist[row]
+        snap.again = ac.gain[row]
+        snap.aatten = ac.attenuated[row]
+        chk.audios <- ac
+    }
+    << snap
+}
+
+fn write_row_snapshot(chk &EcsChunk, dst_mask int, src_mask int, row int, snap &RowSnapshot) {
+    keep := dst_mask & src_mask
+    if (keep & COMP_TRANSFORM) != 0 {
+        $tc := <-chk.transforms
+        tc.positions[row] = snap.pos
+        tc.scales[row] = snap.scale
+        tc.world_mats[row] = snap.wmat
+        chk.transforms <- tc
+    }
+    if (keep & COMP_VELOCITY) != 0 {
+        $vc := <-chk.velocities
+        vc.lin[row] = snap.vlin
+        vc.ang[row] = snap.vang
+        chk.velocities <- vc
+    }
+    if (keep & COMP_BOUNDS) != 0 {
+        $bc := <-chk.bounds
+        bc.local[row] = snap.blocal
+        bc.world[row] = snap.bworld
+        chk.bounds <- bc
+    }
+    if (keep & COMP_HEALTH) != 0 {
+        $hc := <-chk.healths
+        hc.hp[row] = snap.hp
+        hc.max_hp[row] = snap.max_hp
+        hc.regen[row] = snap.regen
+        hc.alive[row] = snap.halive
+        chk.healths <- hc
+    }
+    if (keep & COMP_PARTICLE) != 0 {
+        $pc := <-chk.particles
+        pc.age[row] = snap.page
+        pc.lifetime[row] = snap.plife
+        pc.damping[row] = snap.pdamp
+        pc.alive[row] = snap.palive
+        chk.particles <- pc
+    }
+    if (keep & COMP_AUDIO) != 0 {
+        $ac := <-chk.audios
+        ac.max_dist[row] = snap.amax_dist
+        ac.gain[row] = snap.again
+        ac.attenuated[row] = snap.aatten
+        chk.audios <- ac
+    }
+}
+
+fn migrate_entity(world $&EcsWorld, h EntityHandle, new_mask int) int {
+    s := world.resolve_slot(h) or >>
+    old_ai := s.archetype_idx
+    old_ci := s.chunk_idx
+    old_row := s.row
+    old_mask := world.archetypes[old_ai].mask
+    if old_mask == new_mask { << 0 }
+
+    old_arch := &world.archetypes[old_ai]
+    old_chk := &old_arch.chunks[old_ci]
+    snap := read_row_snapshot(old_chk, old_mask, old_row)
+
+    new_ai := world.ensure_archetype(new_mask) or >>
+    dst_arch := $&world.archetypes[new_ai]
+    $dst_ci := dst_arch.chunks.len - 1
+    $need_new := dst_ci < 0
+    if !need_new {
+        dchk := &dst_arch.chunks[dst_ci]
+        dmeta := <-dchk.meta
+        if dmeta.count >= CHUNK_CAPACITY { need_new = true }
+        dchk.meta <- dmeta
+    }
+    if need_new {
+        dst_arch.chunks.push(new_chunk(new_mask))
+        dst_ci = dst_arch.chunks.len - 1
+    }
+    dst_chk := &dst_arch.chunks[dst_ci]
+    dst_row := append_default_row(dst_chk, new_mask, h.id)
+    write_row_snapshot(dst_chk, new_mask, old_mask, dst_row, &snap)
+    dst_arch.entity_count += 1
+
+    // Remove old row via swap-pop without altering live_count or generation.
+    src_arch := $&world.archetypes[old_ai]
+    src_chk := &src_arch.chunks[old_ci]
+    $smeta := <-src_chk.meta
+    last := smeta.count - 1
+    $moved_eid := -1
+    if old_row < last {
+        moved_eid = smeta.entity_ids[last]
+        smeta.entity_ids[old_row] = moved_eid
+    }
+    smeta.entity_ids = truncate_ints(&smeta.entity_ids, last)
+    smeta.count = last
+    src_chk.meta <- smeta
+
+    if (old_mask & COMP_TRANSFORM) != 0 {
+        $tc := <-src_chk.transforms
+        tc.positions = swap_pop_vec3(&tc.positions, old_row, last)
+        tc.scales = swap_pop_vec3(&tc.scales, old_row, last)
+        tc.world_mats = swap_pop_mat4(&tc.world_mats, old_row, last)
+        src_chk.transforms <- tc
+    }
+    if (old_mask & COMP_VELOCITY) != 0 {
+        $vc := <-src_chk.velocities
+        vc.lin = swap_pop_vec3(&vc.lin, old_row, last)
+        vc.ang = swap_pop_vec3(&vc.ang, old_row, last)
+        src_chk.velocities <- vc
+    }
+    if (old_mask & COMP_BOUNDS) != 0 {
+        $bc := <-src_chk.bounds
+        bc.local = swap_pop_aabb(&bc.local, old_row, last)
+        bc.world = swap_pop_aabb(&bc.world, old_row, last)
+        src_chk.bounds <- bc
+    }
+    if (old_mask & COMP_HEALTH) != 0 {
+        $hc := <-src_chk.healths
+        hc.hp = swap_pop_f64(&hc.hp, old_row, last)
+        hc.max_hp = swap_pop_f64(&hc.max_hp, old_row, last)
+        hc.regen = swap_pop_f64(&hc.regen, old_row, last)
+        hc.alive = swap_pop_bool(&hc.alive, old_row, last)
+        src_chk.healths <- hc
+    }
+    if (old_mask & COMP_PARTICLE) != 0 {
+        $pc := <-src_chk.particles
+        pc.age = swap_pop_f64(&pc.age, old_row, last)
+        pc.lifetime = swap_pop_f64(&pc.lifetime, old_row, last)
+        pc.damping = swap_pop_f64(&pc.damping, old_row, last)
+        pc.alive = swap_pop_bool(&pc.alive, old_row, last)
+        src_chk.particles <- pc
+    }
+    if (old_mask & COMP_AUDIO) != 0 {
+        $ac := <-src_chk.audios
+        ac.max_dist = swap_pop_f64(&ac.max_dist, old_row, last)
+        ac.gain = swap_pop_f64(&ac.gain, old_row, last)
+        ac.attenuated = swap_pop_f64(&ac.attenuated, old_row, last)
+        src_chk.audios <- ac
+    }
+    src_arch.entity_count -= 1
+    if moved_eid >= 0 {
+        world.slots[moved_eid].row = old_row
+    }
+    world.slots[h.id].archetype_idx = new_ai
+    world.slots[h.id].chunk_idx = dst_ci
+    world.slots[h.id].row = dst_row
+    << 0
+}
+
+pub fn (world $&EcsWorld) add_component(h EntityHandle, comp_bit int) int {
+    if !valid_single_component_bit(comp_bit) {
+        >> errors.new("nexus ecs: add_component requires a single valid component bit")
+    }
+    s := world.resolve_slot(h) or >>
+    old_mask := world.archetypes[s.archetype_idx].mask
+    << migrate_entity(world, h, old_mask | comp_bit) or >>
+}
+
+pub fn (world $&EcsWorld) remove_component(h EntityHandle, comp_bit int) int {
+    if !valid_single_component_bit(comp_bit) {
+        >> errors.new("nexus ecs: remove_component requires a single valid component bit")
+    }
+    s := world.resolve_slot(h) or >>
+    old_mask := world.archetypes[s.archetype_idx].mask
+    if (old_mask & comp_bit) == 0 { << 0 }
+    new_mask := old_mask - comp_bit
+    if new_mask == 0 {
+        >> errors.new("nexus ecs: entity must retain at least one component")
+    }
+    << migrate_entity(world, h, new_mask) or >>
+}
+
+struct EntityTagEntry {
+    handle EntityHandle
+    tags []string
+}
+
+pub struct EcsTagSet {
+    entries []EntityTagEntry
+    id_to_idx map[int]int
+}
+
+pub fn new_tag_set() EcsTagSet {
+    << EcsTagSet{entries: []EntityTagEntry{}, id_to_idx: map[int]int{}}
+}
+
+pub fn (ts $&EcsTagSet) add(h EntityHandle, tag string) int {
+    if tag.len == 0 { >> errors.new("nexus ecs: tag cannot be empty") }
+    if ts.id_to_idx.has(h.id) {
+        idx := ts.id_to_idx[h.id]
+        if ts.entries[idx].handle.generation != h.generation {
+            ts.entries[idx].handle = h
+            ts.entries[idx].tags = [tag + ""]
+            << 0
+        }
+        for t in ts.entries[idx].tags { if t == tag { << 0 } }
+        ts.entries[idx].tags.push(tag + "")
+        << 0
+    }
+    idx := ts.entries.len
+    ts.entries.push(EntityTagEntry{handle: h, tags: [tag + ""]})
+    ts.id_to_idx[h.id] = idx
+    << 0
+}
+
+pub fn (ts &EcsTagSet) has(h EntityHandle, tag string) bool {
+    if !ts.id_to_idx.has(h.id) { << false }
+    ti := ts.id_to_idx[h.id]
+    e := &ts.entries[ti]
+    if e.handle.generation != h.generation { << false }
+    for t in e.tags { if t == tag { << true } }
+    << false
+}
+
+pub fn (ts $&EcsTagSet) remove(h EntityHandle, tag string) bool {
+    if !ts.id_to_idx.has(h.id) { << false }
+    idx := ts.id_to_idx[h.id]
+    if ts.entries[idx].handle.generation != h.generation { << false }
+    $next := []string{}
+    $removed := false
+    for t in ts.entries[idx].tags {
+        if t == tag { removed = true } else { next.push(t) }
+    }
+    if !removed { << false }
+    ts.entries[idx].tags = next
+    << true
+}
+
+pub fn (ts &EcsTagSet) tags_of(h EntityHandle) []string {
+    if !ts.id_to_idx.has(h.id) { << []string{} }
+    ti := ts.id_to_idx[h.id]
+    e := &ts.entries[ti]
+    if e.handle.generation != h.generation { << []string{} }
+    $out := []string{}
+    for t in e.tags { out.push(t + "") }
+    << out
+}
+
+pub fn (ts &EcsTagSet) entities_with(tag string) []EntityHandle {
+    $out := []EntityHandle{}
+    for e in ts.entries {
+        for t in e.tags {
+            if t == tag {
+                out.push(e.handle)
+                <-
+            }
+        }
+    }
+    << out
+}
+
+pub fn (ts $&EcsTagSet) remove_entity(h EntityHandle) bool {
+    if !ts.id_to_idx.has(h.id) { << false }
+    idx := ts.id_to_idx[h.id]
+    if ts.entries[idx].handle.generation != h.generation { << false }
+    ts.entries[idx].tags = []string{}
+    << true
+}
+
+pub fn (ts $&EcsTagSet) prune_dead(world &EcsWorld) int {
+    $kept := []EntityTagEntry{}
+    $next_map := map[int]int{}
+    $pruned := 0
+    for e in ts.entries {
+        if e.tags.len > 0 && world.is_alive(e.handle) {
+            idx := kept.len
+            $copied_tags := []string{}
+            for t in e.tags { copied_tags.push(t + "") }
+            kept.push(EntityTagEntry{handle: e.handle, tags: copied_tags})
+            next_map[e.handle.id] = idx
+        } else if e.tags.len > 0 {
+            pruned += 1
+        }
+    }
+    ts.entries = kept
+    ts.id_to_idx = next_map
+    << pruned
+}
+
+pub struct EcsIntStore {
+    handles []EntityHandle
+    values []int
+    id_to_idx map[int]int
+}
+
+pub fn new_int_store() EcsIntStore {
+    << EcsIntStore{handles: []EntityHandle{}, values: []int{}, id_to_idx: map[int]int{}}
+}
+
+pub fn (s $&EcsIntStore) set(h EntityHandle, value int) {
+    if s.id_to_idx.has(h.id) {
+        idx := s.id_to_idx[h.id]
+        s.handles[idx] = h
+        s.values[idx] = value
+        <<
+    }
+    idx := s.handles.len
+    s.handles.push(h)
+    s.values.push(value)
+    s.id_to_idx[h.id] = idx
+}
+
+pub fn (s &EcsIntStore) has(h EntityHandle) bool {
+    if !s.id_to_idx.has(h.id) { << false }
+    << s.handles[s.id_to_idx[h.id]].generation == h.generation
+}
+
+pub fn (s &EcsIntStore) get(h EntityHandle) int {
+    if !s.has(h) { >> errors.new("nexus ecs: int store missing or stale handle") }
+    << s.values[s.id_to_idx[h.id]]
+}
+
+pub fn (s $&EcsIntStore) remove(h EntityHandle) bool {
+    if !s.has(h) { << false }
+    s.handles[s.id_to_idx[h.id]] = EntityHandle{id: -1, generation: -1}
+    << true
+}
+
+pub fn (s $&EcsIntStore) prune_dead(world &EcsWorld) int {
+    $nh := []EntityHandle{}
+    $nv := []int{}
+    $nm := map[int]int{}
+    $pruned := 0
+    for i in 0:s.handles.len {
+        h := s.handles[i]
+        if h.id >= 0 && world.is_alive(h) {
+            idx := nh.len
+            nh.push(h)
+            nv.push(s.values[i])
+            nm[h.id] = idx
+        } else if h.id >= 0 {
+            pruned += 1
+        }
+    }
+    s.handles = nh
+    s.values = nv
+    s.id_to_idx = nm
+    << pruned
+}
+
+pub fn (s &EcsIntStore) len() int {
+    $n := 0
+    for h in s.handles { if h.id >= 0 { n += 1 } }
+    << n
+}
+
+pub fn (s &EcsIntStore) entries() []EntityHandle {
+    $out := []EntityHandle{}
+    for h in s.handles { if h.id >= 0 { out.push(h) } }
+    << out
+}
+
+pub struct EcsFloatStore {
+    handles []EntityHandle
+    values []f64
+    id_to_idx map[int]int
+}
+
+pub fn new_float_store() EcsFloatStore {
+    << EcsFloatStore{handles: []EntityHandle{}, values: []f64{}, id_to_idx: map[int]int{}}
+}
+
+pub fn (s $&EcsFloatStore) set(h EntityHandle, value f64) {
+    if s.id_to_idx.has(h.id) {
+        idx := s.id_to_idx[h.id]
+        s.handles[idx] = h
+        s.values[idx] = value
+        <<
+    }
+    idx := s.handles.len
+    s.handles.push(h)
+    s.values.push(value)
+    s.id_to_idx[h.id] = idx
+}
+
+pub fn (s &EcsFloatStore) has(h EntityHandle) bool {
+    if !s.id_to_idx.has(h.id) { << false }
+    << s.handles[s.id_to_idx[h.id]].generation == h.generation
+}
+
+pub fn (s &EcsFloatStore) get(h EntityHandle) f64 {
+    if !s.has(h) { >> errors.new("nexus ecs: float store missing or stale handle") }
+    << s.values[s.id_to_idx[h.id]]
+}
+
+pub fn (s $&EcsFloatStore) remove(h EntityHandle) bool {
+    if !s.has(h) { << false }
+    s.handles[s.id_to_idx[h.id]] = EntityHandle{id: -1, generation: -1}
+    << true
+}
+
+pub fn (s $&EcsFloatStore) prune_dead(world &EcsWorld) int {
+    $nh := []EntityHandle{}
+    $nv := []f64{}
+    $nm := map[int]int{}
+    $pruned := 0
+    for i in 0:s.handles.len {
+        h := s.handles[i]
+        if h.id >= 0 && world.is_alive(h) {
+            idx := nh.len
+            nh.push(h)
+            nv.push(s.values[i])
+            nm[h.id] = idx
+        } else if h.id >= 0 {
+            pruned += 1
+        }
+    }
+    s.handles = nh
+    s.values = nv
+    s.id_to_idx = nm
+    << pruned
+}
+
+pub fn (s &EcsFloatStore) len() int {
+    $n := 0
+    for h in s.handles { if h.id >= 0 { n += 1 } }
+    << n
+}
+
+pub fn (s &EcsFloatStore) entries() []EntityHandle {
+    $out := []EntityHandle{}
+    for h in s.handles { if h.id >= 0 { out.push(h) } }
+    << out
+}
+
+pub struct EcsStringStore {
+    handles []EntityHandle
+    values []string
+    id_to_idx map[int]int
+}
+
+pub fn new_string_store() EcsStringStore {
+    << EcsStringStore{handles: []EntityHandle{}, values: []string{}, id_to_idx: map[int]int{}}
+}
+
+pub fn (s $&EcsStringStore) set(h EntityHandle, value string) {
+    if s.id_to_idx.has(h.id) {
+        idx := s.id_to_idx[h.id]
+        s.handles[idx] = h
+        s.values[idx] = value + ""
+        <<
+    }
+    idx := s.handles.len
+    s.handles.push(h)
+    s.values.push(value + "")
+    s.id_to_idx[h.id] = idx
+}
+
+pub fn (s &EcsStringStore) has(h EntityHandle) bool {
+    if !s.id_to_idx.has(h.id) { << false }
+    << s.handles[s.id_to_idx[h.id]].generation == h.generation
+}
+
+pub fn (s &EcsStringStore) get(h EntityHandle) string {
+    if !s.has(h) { >> errors.new("nexus ecs: string store missing or stale handle") }
+    << s.values[s.id_to_idx[h.id]] + ""
+}
+
+pub fn (s $&EcsStringStore) remove(h EntityHandle) bool {
+    if !s.has(h) { << false }
+    s.handles[s.id_to_idx[h.id]] = EntityHandle{id: -1, generation: -1}
+    << true
+}
+
+pub fn (s $&EcsStringStore) prune_dead(world &EcsWorld) int {
+    $nh := []EntityHandle{}
+    $nv := []string{}
+    $nm := map[int]int{}
+    $pruned := 0
+    for i in 0:s.handles.len {
+        h := s.handles[i]
+        if h.id >= 0 && world.is_alive(h) {
+            idx := nh.len
+            nh.push(h)
+            nv.push(s.values[i] + "")
+            nm[h.id] = idx
+        } else if h.id >= 0 {
+            pruned += 1
+        }
+    }
+    s.handles = nh
+    s.values = nv
+    s.id_to_idx = nm
+    << pruned
+}
+
+pub fn (s &EcsStringStore) len() int {
+    $n := 0
+    for h in s.handles { if h.id >= 0 { n += 1 } }
+    << n
+}
+
+pub fn (s &EcsStringStore) entries() []EntityHandle {
+    $out := []EntityHandle{}
+    for h in s.handles { if h.id >= 0 { out.push(h) } }
+    << out
+}
+
+pub struct EcsVec3Store {
+    handles []EntityHandle
+    values []fm.Vec3
+    id_to_idx map[int]int
+}
+
+pub fn new_vec3_store() EcsVec3Store {
+    << EcsVec3Store{handles: []EntityHandle{}, values: []fm.Vec3{}, id_to_idx: map[int]int{}}
+}
+
+pub fn (s $&EcsVec3Store) set(h EntityHandle, value fm.Vec3) {
+    if s.id_to_idx.has(h.id) {
+        idx := s.id_to_idx[h.id]
+        s.handles[idx] = h
+        s.values[idx] = value
+        <<
+    }
+    idx := s.handles.len
+    s.handles.push(h)
+    s.values.push(value)
+    s.id_to_idx[h.id] = idx
+}
+
+pub fn (s &EcsVec3Store) has(h EntityHandle) bool {
+    if !s.id_to_idx.has(h.id) { << false }
+    << s.handles[s.id_to_idx[h.id]].generation == h.generation
+}
+
+pub fn (s &EcsVec3Store) get(h EntityHandle) fm.Vec3 {
+    if !s.has(h) { >> errors.new("nexus ecs: vec3 store missing or stale handle") }
+    << s.values[s.id_to_idx[h.id]]
+}
+
+pub fn (s $&EcsVec3Store) remove(h EntityHandle) bool {
+    if !s.has(h) { << false }
+    s.handles[s.id_to_idx[h.id]] = EntityHandle{id: -1, generation: -1}
+    << true
+}
+
+pub fn (s $&EcsVec3Store) prune_dead(world &EcsWorld) int {
+    $nh := []EntityHandle{}
+    $nv := []fm.Vec3{}
+    $nm := map[int]int{}
+    $pruned := 0
+    for i in 0:s.handles.len {
+        h := s.handles[i]
+        if h.id >= 0 && world.is_alive(h) {
+            idx := nh.len
+            nh.push(h)
+            nv.push(s.values[i])
+            nm[h.id] = idx
+        } else if h.id >= 0 {
+            pruned += 1
+        }
+    }
+    s.handles = nh
+    s.values = nv
+    s.id_to_idx = nm
+    << pruned
+}
+
+pub fn (s &EcsVec3Store) len() int {
+    $n := 0
+    for h in s.handles { if h.id >= 0 { n += 1 } }
+    << n
+}
+
+pub fn (s &EcsVec3Store) entries() []EntityHandle {
+    $out := []EntityHandle{}
+    for h in s.handles { if h.id >= 0 { out.push(h) } }
+    << out
+}

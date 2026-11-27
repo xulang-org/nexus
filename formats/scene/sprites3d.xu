@@ -1,0 +1,126 @@
+@"github.com/xulang-org/nexus/formats/scene"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+resource #"github.com/xulang-org/nexus/resources/scene"
+sprite3d #"github.com/xulang-org/nexus/resources/sprite3d"
+#encoding/json
+#strconv
+#strings
+#errors
+
+fn billboard_name(mode int) string {
+    if mode == sprite3d.BILLBOARD_DISABLED { << "disabled" }
+    if mode == sprite3d.BILLBOARD_ENABLED { << "enabled" }
+    << "y_axis"
+}
+
+fn billboard_mode(name string) int {
+    if name == "disabled" { << sprite3d.BILLBOARD_DISABLED }
+    if name == "enabled" { << sprite3d.BILLBOARD_ENABLED }
+    if name == "y_axis" { << sprite3d.BILLBOARD_Y_AXIS }
+    >> errors.new("nexus scene: unsupported Sprite3D billboard mode")
+}
+
+fn alpha_mode_name(mode int) string {
+    if mode == sprite3d.ALPHA_MODE_OPAQUE { << "opaque" }
+    if mode == sprite3d.ALPHA_MODE_BLEND { << "blend" }
+    << "cutout"
+}
+
+fn alpha_mode_value(name string) int {
+    if name == "opaque" { << sprite3d.ALPHA_MODE_OPAQUE }
+    if name == "cutout" { << sprite3d.ALPHA_MODE_CUTOUT }
+    if name == "blend" { << sprite3d.ALPHA_MODE_BLEND }
+    >> errors.new("nexus scene: unsupported Sprite3D alpha mode")
+}
+
+fn decode_sprites_3d(doc &json.Doc, root int, version int) []resource.Sprite3DAttachment {
+    if version < SPRITE_TILEMAP_VERSION { << []resource.Sprite3DAttachment{} }
+    rows := rows_min(doc, doc.get(root, "sprites_3d"), 0, resource.MAX_SCENE_SPRITES_3D) or >>
+    $out := []resource.Sprite3DAttachment{}
+    for at in rows {
+        $expected := ["node", "resource", "size", "pivot", "region", "billboard", "alpha_mode",
+            "alpha_cutoff", "double_sided", "cast_shadow", "shaded", "flip_x", "flip_y", "tint", "pixel_art"]
+        has_opacity := doc.has(at, "opacity")
+        if has_opacity { expected.push("opacity") }
+        fields(doc, at, &expected) or >>
+        node := doc.as_int(doc.get(at, "node")) or >>
+        uid := doc.as_string(doc.get(at, "resource")) or >>
+        size_v := vector(doc, doc.get(at, "size"), 2) or >>
+        pivot_v := vector(doc, doc.get(at, "pivot"), 2) or >>
+        region_v := vector(doc, doc.get(at, "region"), 4) or >>
+        billboard := billboard_mode(doc.as_string(doc.get(at, "billboard")) or >>) or >>
+        alpha_mode := alpha_mode_value(doc.as_string(doc.get(at, "alpha_mode")) or >>) or >>
+        alpha_cutoff := doc.as_f64(doc.get(at, "alpha_cutoff")) or >>
+        $opacity := 1.0
+        if has_opacity { opacity = doc.as_f64(doc.get(at, "opacity")) or >> }
+        double_sided := doc.as_bool(doc.get(at, "double_sided")) or >>
+        cast_shadow := doc.as_bool(doc.get(at, "cast_shadow")) or >>
+        shaded := doc.as_bool(doc.get(at, "shaded")) or >>
+        flip_x := doc.as_bool(doc.get(at, "flip_x")) or >>
+        flip_y := doc.as_bool(doc.get(at, "flip_y")) or >>
+        tint_v := vector(doc, doc.get(at, "tint"), 3) or >>
+        pixel_art := doc.as_bool(doc.get(at, "pixel_art")) or >>
+        spec := sprite3d.Sprite3D{
+            size: fm.vec2(size_v[0], size_v[1]),
+            pivot: fm.vec2(pivot_v[0], pivot_v[1]),
+            region: fm.rect2(region_v[0], region_v[1], region_v[2], region_v[3]),
+            billboard: billboard,
+            alpha_mode: alpha_mode,
+            alpha_cutoff: alpha_cutoff,
+            opacity: opacity,
+            double_sided: double_sided,
+            cast_shadow: cast_shadow,
+            shaded: shaded,
+            flip_x: flip_x,
+            flip_y: flip_y,
+            tint: fm.vec3(tint_v[0], tint_v[1], tint_v[2]),
+            pixel_art: pixel_art
+        }
+        spec.validate() or >>
+        out.push(resource.Sprite3DAttachment{node: node, resource_uid: uid, sprite: spec})
+    }
+    << out
+}
+
+fn fmt_f64_list(values &[]f64) string {
+    $out := strings.new_byte_builder(64)
+    out.write_str("[")
+    for i in 0:values.len {
+        if i > 0 { out.write_str(",") }
+        dec := strconv.format_float(values[i], 103, -1) or >>
+        out.write_str(dec)
+    }
+    out.write_str("]")
+    << out.to_string()
+}
+
+fn encode_sprites_3d(document &resource.Document) string {
+    $out := strings.new_byte_builder(1024)
+    out.write_str(",\"sprites_3d\":[\n")
+    for i in 0:document.sprite_3d_count() {
+        if i > 0 { out.write_str(",\n") }
+        item := document.sprite_3d(i) or >>
+        uid := item.resource_uid + ""
+        s := &item.sprite
+        cutoff := strconv.format_float(s.alpha_cutoff, 103, -1) or >>
+        size_s := fmt_f64_list(&[s.size.x, s.size.y]) or >>
+        pivot_s := fmt_f64_list(&[s.pivot.x, s.pivot.y]) or >>
+        region_s := fmt_f64_list(&[s.region.position.x, s.region.position.y, s.region.size.x, s.region.size.y]) or >>
+        tint_s := fmt_f64_list(&[s.tint.x, s.tint.y, s.tint.z]) or >>
+        out.write_str("{\"node\":" + str(item.node) + ",\"resource\":" + json.quote(&uid) +
+            ",\"size\":" + size_s + ",\"pivot\":" + pivot_s + ",\"region\":" + region_s +
+            ",\"billboard\":\"" + billboard_name(s.billboard) + "\",\"alpha_mode\":\"" + alpha_mode_name(s.alpha_mode) +
+            "\",\"alpha_cutoff\":" + cutoff + ",\"double_sided\":" + str(s.double_sided) +
+            ",\"cast_shadow\":" + str(s.cast_shadow) + ",\"shaded\":" + str(s.shaded) +
+            ",\"flip_x\":" + str(s.flip_x) + ",\"flip_y\":" + str(s.flip_y) +
+            ",\"tint\":" + tint_s + ",\"pixel_art\":" + str(s.pixel_art))
+        if s.alpha_mode == sprite3d.ALPHA_MODE_BLEND {
+            op_s := strconv.format_float(s.opacity, 103, -1) or >>
+            out.write_str(",\"opacity\":" + op_s)
+        }
+        out.write_str("}")
+    }
+    out.write_str("\n]")
+    << out.to_string()
+}

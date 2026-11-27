@@ -1,0 +1,235 @@
+#include <metal_stdlib>
+using namespace metal;
+
+struct SimParams {
+    float4 time_counts;     // x=dt, y=elapsed_time, z=capacity, w=spawn_count
+    float4 seed_shape;      // x=frame_seed, y=shape_kind, z=shape_param0, w=shape_param1
+    float4 origin_boxz;     // xyz=origin, w=box_hz
+    float4 dir_spread;      // xyz=normalized dir, w=velocity_spread
+    float4 base_vel_drag;   // xyz=base_velocity, w=drag
+    float4 speed_life;      // x=speed_min, y=speed_max, z=life_min, w=life_max
+    float4 size_rot;        // x=size_start_min, y=size_start_max, z=size_end_scale, w=rot_range
+    float4 ang_stretch_add; // x=ang_vel_min, y=ang_vel_max, z=stretch_factor, w=start_additive
+    float4 end_add_pad;     // x=end_additive, y=turb_strength, z=turb_freq, w=turb_scroll
+    float4 gravity_wind;    // xyz=gravity+wind, w=0
+    float4 attractor;       // xyz=attractor_pos, w=attractor_strength
+    float4 vortex;          // xyz=normalized vortex_axis, w=vortex_strength
+    float4 plane_eq;        // xyz=normalized plane_normal, w=plane_d
+    float4 plane_mat;       // x=plane_enabled, y=restitution, z=friction, w=0
+    float4 reserved0;
+    float4 reserved1;
+};
+
+struct ParticleGpu {
+    float4 pos_age;   // xyz=pos, w=age (<0 dead)
+    float4 vel_life;  // xyz=vel, w=lifetime (<=0 dead)
+    float4 size_rot;  // x=size_start, y=size_end, z=rotation, w=angular_vel
+    float4 aux;       // x=rand01, y=stretch_factor, z=start_additive, w=end_additive
+};
+
+static inline uint pcg_hash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+static inline float rand_next(thread uint& state) {
+    state = pcg_hash(state);
+    return float(state & 0x00FFFFFFu) / 16777216.0;
+}
+
+static inline float3 vec_potential(float3 q) {
+    return float3(
+        sin(q.y * 1.13 + 0.7) * cos(q.z * 0.91 - 0.3) + 0.5 * sin(q.z * 2.11 + q.x * 0.67),
+        sin(q.z * 1.27 - 1.1) * cos(q.x * 0.89 + 0.5) + 0.5 * sin(q.x * 2.03 + q.y * 0.71),
+        sin(q.x * 1.07 + 0.4) * cos(q.y * 1.19 + 0.9) + 0.5 * sin(q.y * 1.97 + q.z * 0.61)
+    );
+}
+
+static inline float3 curl_noise_3d(float3 pos, float freq, float elapsed, float scroll) {
+    float3 q = pos * freq + float3(elapsed * scroll, elapsed * scroll * 0.73, elapsed * scroll * 0.41);
+    const float eps = 0.05;
+    float3 px1 = vec_potential(q + float3(eps, 0.0, 0.0));
+    float3 px0 = vec_potential(q - float3(eps, 0.0, 0.0));
+    float3 py1 = vec_potential(q + float3(0.0, eps, 0.0));
+    float3 py0 = vec_potential(q - float3(0.0, eps, 0.0));
+    float3 pz1 = vec_potential(q + float3(0.0, 0.0, eps));
+    float3 pz0 = vec_potential(q - float3(0.0, 0.0, eps));
+    float inv2 = 0.5 / eps;
+    float dpsi_z_dy = (py1.z - py0.z) * inv2;
+    float dpsi_y_dz = (pz1.y - pz0.y) * inv2;
+    float dpsi_x_dz = (pz1.x - pz0.x) * inv2;
+    float dpsi_z_dx = (px1.z - px0.z) * inv2;
+    float dpsi_y_dx = (px1.y - px0.y) * inv2;
+    float dpsi_x_dy = (py1.x - py0.x) * inv2;
+    return float3(dpsi_z_dy - dpsi_y_dz, dpsi_x_dz - dpsi_z_dx, dpsi_y_dx - dpsi_x_dy);
+}
+
+kernel void main0(
+    constant SimParams& params [[buffer(0)]],
+    device ParticleGpu* particles [[buffer(1)]],
+    device uint* alive_indices [[buffer(2)]],
+    device atomic_uint* counters [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint cap = uint(params.time_counts.z);
+    if (gid >= cap) return;
+
+    ParticleGpu p = particles[gid];
+    bool alive = (p.vel_life.w > 0.0 && p.pos_age.w >= 0.0 && p.pos_age.w < p.vel_life.w);
+    bool spawned = false;
+
+    uint spawn_target = uint(params.time_counts.w);
+    if (!alive && spawn_target > 0u) {
+        if (atomic_load_explicit(&counters[4], memory_order_relaxed) < spawn_target) {
+            uint ticket = atomic_fetch_add_explicit(&counters[4], 1u, memory_order_relaxed);
+            if (ticket < spawn_target) {
+                uint rng = (gid + 1u) ^ (uint(params.seed_shape.x) * 747796405u) ^ (ticket * 2891336453u);
+                float3 axis = normalize(params.dir_spread.xyz);
+                if (!isfinite(axis.x) || !isfinite(axis.y) || !isfinite(axis.z)) {
+                    axis = float3(0.0, 1.0, 0.0);
+                }
+                float3 up_ref = abs(axis.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+                float3 tang = normalize(cross(up_ref, axis));
+                float3 bitang = cross(axis, tang);
+
+                int shape_kind = int(params.seed_shape.y + 0.5);
+                float sp0 = params.seed_shape.z;
+                float sp1 = params.seed_shape.w;
+                float3 spawn_offset = float3(0.0);
+                float3 emit_dir = axis;
+
+                if (shape_kind == 1) {
+                    // Sphere
+                    float u = rand_next(rng) * 2.0 - 1.0;
+                    float phi = rand_next(rng) * 6.283185307;
+                    float rr = sqrt(max(0.0, 1.0 - u * u));
+                    float3 radial = float3(rr * cos(phi), u, rr * sin(phi));
+                    float rad_t = rand_next(rng);
+                    float r_frac = mix(clamp(sp1, 0.0, 1.0), 1.0, pow(rad_t, 0.33333334));
+                    spawn_offset = radial * (sp0 * r_frac);
+                    emit_dir = length(radial) > 1e-4 ? normalize(radial) : axis;
+                } else if (shape_kind == 2) {
+                    // Box
+                    float rx = rand_next(rng) * 2.0 - 1.0;
+                    float ry = rand_next(rng) * 2.0 - 1.0;
+                    float rz = rand_next(rng) * 2.0 - 1.0;
+                    spawn_offset = float3(rx * sp0, ry * sp1, rz * params.origin_boxz.w);
+                } else if (shape_kind == 3) {
+                    // Cone
+                    float phi = rand_next(rng) * 6.283185307;
+                    float r = sqrt(rand_next(rng)) * sp0;
+                    float3 radial = tang * cos(phi) + bitang * sin(phi);
+                    spawn_offset = radial * r;
+                    float half_ang = clamp(sp1, 0.0, 1.56);
+                    float cos_a = cos(half_ang);
+                    float cos_t = mix(cos_a, 1.0, rand_next(rng));
+                    float sin_t = sqrt(max(0.0, 1.0 - cos_t * cos_t));
+                    float phi_d = rand_next(rng) * 6.283185307;
+                    emit_dir = normalize(axis * cos_t + (tang * cos(phi_d) + bitang * sin(phi_d)) * sin_t);
+                } else if (shape_kind == 4) {
+                    // Ring
+                    float phi = rand_next(rng) * 6.283185307;
+                    float3 radial = tang * cos(phi) + bitang * sin(phi);
+                    spawn_offset = radial * sp0;
+                    emit_dir = axis;
+                }
+
+                float spread = params.dir_spread.w;
+                float3 jdir = float3(
+                    rand_next(rng) * 2.0 - 1.0,
+                    rand_next(rng) * 2.0 - 1.0,
+                    rand_next(rng) * 2.0 - 1.0
+                );
+                float speed = mix(params.speed_life.x, params.speed_life.y, rand_next(rng));
+                float life = max(0.001, mix(params.speed_life.z, params.speed_life.w, rand_next(rng)));
+                float s0 = mix(params.size_rot.x, params.size_rot.y, rand_next(rng));
+                float rot0 = (rand_next(rng) * 2.0 - 1.0) * params.size_rot.w;
+                float ang_v = mix(params.ang_stretch_add.x, params.ang_stretch_add.y, rand_next(rng));
+                float r01 = rand_next(rng);
+
+                p.pos_age = float4(params.origin_boxz.xyz + spawn_offset, 0.0);
+                p.vel_life = float4(params.base_vel_drag.xyz + emit_dir * speed + jdir * spread, life);
+                p.size_rot = float4(s0, s0 * params.size_rot.z, rot0, ang_v);
+                p.aux = float4(r01, params.ang_stretch_add.z, params.ang_stretch_add.w, params.end_add_pad.x);
+                atomic_fetch_add_explicit(&counters[5], 1u, memory_order_relaxed);
+                alive = true;
+                spawned = true;
+            }
+        }
+    }
+
+    if (!alive) return;
+
+    if (!spawned) {
+        float dt = params.time_counts.x;
+        float new_age = p.pos_age.w + dt;
+        if (new_age >= p.vel_life.w) {
+            p.pos_age.w = -1.0;
+            p.vel_life.w = 0.0;
+            particles[gid] = p;
+            return;
+        }
+        p.pos_age.w = new_age;
+
+        float3 pos = p.pos_age.xyz;
+        float3 vel = p.vel_life.xyz;
+
+        vel += params.gravity_wind.xyz * dt;
+
+        float turb_str = params.end_add_pad.y;
+        if (turb_str > 0.0) {
+            float3 curl = curl_noise_3d(pos, params.end_add_pad.z, params.time_counts.y, params.end_add_pad.w);
+            vel += curl * turb_str * dt;
+        }
+
+        float attr_str = params.attractor.w;
+        if (attr_str != 0.0) {
+            float3 to_a = params.attractor.xyz - pos;
+            float dist = max(length(to_a), 0.25);
+            vel += (to_a / dist) * (attr_str / (dist * dist + 0.5)) * dt;
+        }
+
+        float vortex_str = params.vortex.w;
+        if (vortex_str != 0.0) {
+            float3 radial = pos - params.attractor.xyz;
+            float3 tang = cross(params.vortex.xyz, radial);
+            float tlen = length(tang);
+            if (tlen > 1e-4) {
+                vel += (tang / tlen) * vortex_str * dt;
+            }
+        }
+
+        float drag = params.base_vel_drag.w;
+        if (drag > 0.0) {
+            vel *= exp(-drag * dt);
+        }
+
+        pos += vel * dt;
+        p.size_rot.z += p.size_rot.w * dt;
+
+        if (params.plane_mat.x > 0.5) {
+            float3 pn = params.plane_eq.xyz;
+            float signed_d = dot(pos, pn) + params.plane_eq.w;
+            if (signed_d < 0.0) {
+                pos -= pn * signed_d;
+                float vn = dot(vel, pn);
+                if (vn < 0.0) {
+                    float3 v_n = pn * vn;
+                    float3 v_t = vel - v_n;
+                    vel = v_t * max(0.0, 1.0 - params.plane_mat.z) - v_n * params.plane_mat.y;
+                    atomic_fetch_add_explicit(&counters[6], 1u, memory_order_relaxed);
+                }
+            }
+        }
+
+        p.pos_age.xyz = pos;
+        p.vel_life.xyz = vel;
+    }
+
+    particles[gid] = p;
+    uint idx = atomic_fetch_add_explicit(&counters[1], 1u, memory_order_relaxed);
+    if (idx < cap) {
+        alive_indices[idx] = gid;
+    }
+}

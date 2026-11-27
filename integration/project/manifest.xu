@@ -1,0 +1,691 @@
+@"github.com/xulang-org/nexus/integration/project"
+
+resource #"github.com/xulang-org/nexus/resources/scene"
+rp #"github.com/xulang-org/nexus/resources/project"
+node_files #"github.com/xulang-org/nexus/integration/scene"
+scene_fmt #"github.com/xulang-org/nexus/formats/scene"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#encoding/json
+#path/filepath
+#strings
+#os
+#errors
+
+pub const FORMAT = "nexus.project"
+pub const VERSION = 1
+pub const GENERATION_FORMAT = "nexus.generation"
+pub const DEFAULT_VALIDATOR = "build/nexus-project-validate"
+
+pub struct Entry {
+    pub key string
+    pub path string
+    pub resolved string
+}
+
+pub struct Project {
+    pub path string
+    pub directory string
+    pub scenes []Entry
+    pub assets []Entry
+    pub has_meta bool
+    pub meta rp.ProjectMeta
+    pub has_paths bool
+    pub paths rp.ProjectPaths
+    pub has_platforms bool
+    pub platforms rp.ProjectPlatformConfigs
+}
+
+pub fn make_project(path string, directory string, scenes []Entry, assets []Entry) Project {
+    << Project{
+        path: path,
+        directory: directory,
+        scenes: scenes,
+        assets: assets,
+        has_meta: false,
+        meta: rp.empty_meta(),
+        has_paths: false,
+        paths: rp.empty_paths(),
+        has_platforms: false,
+        platforms: rp.empty_platforms()
+    }
+}
+
+pub fn (project &Project) entry_scene_key() string {
+    if project.has_meta && project.meta.entry_scene.len > 0 {
+        << project.meta.entry_scene + ""
+    }
+    if project.scenes.len > 0 {
+        << project.scenes[0].key + ""
+    }
+    << ""
+}
+
+pub fn dict_unique_keys(doc &json.Doc, obj int, label &string) []string {
+    if obj < 0 || !doc.is_dict(obj) {
+        >> errors.new("nexus project: expected object for " + label)
+    }
+    keys := doc.dict_keys(obj)
+    $seen := map[string]int{}
+    for k in keys {
+        key := k + ""
+        if seen.has(key + "") {
+            >> errors.new("nexus project: duplicate JSON key '" + key + "' in " + label)
+        }
+        seen[key + ""] = 1
+    }
+    << keys
+}
+
+fn check_no_control_bytes(raw &string, label string) int {
+    for i in 0:raw.len {
+        b := raw[i] & 255
+        if b < 32 || b == 127 {
+            >> errors.new("nexus project: control character in " + label)
+        }
+    }
+    << 0
+}
+
+pub fn relative_file(raw &string) string {
+    text := strings.trim_space(raw)
+    if text.len < 1 || text.len > 1024 {
+        >> errors.new("nexus project: empty or overlong relative path")
+    }
+    check_no_control_bytes(&text, "relative path") or >>
+    if (text[0] & 255) == 47 || (text[0] & 255) == 92 {
+        >> errors.new("nexus project: path must be relative to project directory: " + text)
+    }
+    if text.len >= 2 && (text[1] & 255) == 58 {
+        >> errors.new("nexus project: drive-qualified path is forbidden: " + text)
+    }
+    slashed := strings.replace_all(&text, "\\", "/")
+    parts := strings.split(&slashed, "/")
+    $clean := []string{}
+    for part in parts {
+        seg := part + ""
+        if seg.len == 0 || seg == "." || seg == ".." {
+            >> errors.new("nexus project: invalid path segment in " + text)
+        }
+        clean.push(seg)
+    }
+    << strings.join(clean, "/")
+}
+
+pub fn scene_name(raw &string) string {
+    text := raw + ""
+    if text.len < 1 || text.len > 255 {
+        >> errors.new("nexus project: scene name must be 1..255 UTF-8 bytes")
+    }
+    check_no_control_bytes(&text, "scene name") or >>
+    if text == "." || text == ".." || strings.contains(&text, "/") || strings.contains(&text, "\\") {
+        >> errors.new("nexus project: invalid scene name: " + text)
+    }
+    << text
+}
+
+fn path_within_root(root_abs &string, candidate_abs &string) bool {
+    root := filepath.clean(root_abs)
+    cand := filepath.clean(candidate_abs)
+    if cand == root {
+        << true
+    }
+    if strings.ends_with(&root, "/") || strings.ends_with(&root, "\\") {
+        << strings.has_prefix(&cand, root + "")
+    }
+    << strings.has_prefix(&cand, root + "/") || strings.has_prefix(&cand, root + "\\")
+}
+
+fn path_exists(path string) bool {
+    _ := os.stat(path + "") or (err) {
+        << false
+    }
+    << true
+}
+
+fn try_project_rel(directory &string, raw &string, must_exist bool) string {
+    cand_rel := relative_file(raw) or (err) {
+        << ""
+    }
+    if cand_rel.len == 0 {
+        << ""
+    }
+    _ := resolve_project_path(directory, &cand_rel, must_exist) or (err) {
+        << ""
+    }
+    << cand_rel
+}
+
+pub fn resolve_segment_symlink(abs_root &string, abs_cur &string) string {
+    $current := abs_cur + ""
+    $hops := 0
+    while hops < 16 {
+        target := os.readlink(current + "") or (err) {
+            << current
+        }
+        $next := target + ""
+        if !filepath.is_abs(&next) {
+            base_dir := filepath.dir(&current)
+            next = filepath.join([base_dir, next])
+        }
+        next = filepath.clean(&next)
+        if !path_within_root(abs_root, &next) {
+            >> errors.new("nexus project: symlink escapes project directory: " + next)
+        }
+        current = next
+        hops = hops + 1
+    }
+    >> errors.new("nexus project: symlink loop inside project directory")
+    << ""
+}
+
+pub fn resolve_project_path(directory &string, relative &string, must_exist bool) string {
+    rel := relative_file(relative) or >>
+    abs_root := filepath.abs(directory) or >>
+    abs_root_dir := filepath.clean(&abs_root)
+    // Reject symlink root escaping or ensure root is a directory.
+    root_info := os.stat(abs_root_dir + "") or >>
+    if !root_info.is_dir {
+        >> errors.new("nexus project: project directory is not a directory: " + abs_root_dir)
+    }
+    parts := strings.split(&rel, "/")
+    $cur := abs_root_dir + ""
+    for i in 0:parts.len {
+        cur = filepath.join([cur, parts[i] + ""])
+        cur = filepath.clean(&cur)
+        if !path_within_root(&abs_root_dir, &cur) {
+            >> errors.new("nexus project: path escapes project directory: " + rel)
+        }
+        resolved := resolve_segment_symlink(&abs_root_dir, &cur) or >>
+        cur = resolved
+        if i + 1 < parts.len {
+            if path_exists(cur + "") {
+                dir_info := os.stat(cur + "") or >>
+                if !dir_info.is_dir {
+                    >> errors.new("nexus project: non-directory parent component in " + rel)
+                }
+            } else if must_exist {
+                >> errors.new("nexus project: missing parent directory for " + rel)
+            }
+        }
+    }
+    if must_exist {
+        info := os.stat(cur + "") or >>
+        if info.is_dir {
+            >> errors.new("nexus project: expected file, found directory: " + rel)
+        }
+    }
+    << cur
+}
+
+pub fn project_source(directory &string, relative &string) string {
+    << resolve_project_path(directory, relative, true) or >>
+}
+
+pub fn resolve_input_to_project_rel(directory &string, source_path &string, must_exist bool) string {
+    raw := strings.trim_space(source_path)
+    if raw.len == 0 {
+        >> errors.new("nexus project: empty source path")
+    }
+    if !filepath.is_abs(&raw) {
+        direct := try_project_rel(directory, &raw, must_exist)
+        if direct.len > 0 {
+            << direct
+        }
+    }
+    abs_dir := filepath.abs(directory) or >>
+    abs_src := filepath.abs(&raw) or >>
+    rel := filepath.rel(&abs_dir, &abs_src) or >>
+    slashed := filepath.to_slash(&rel)
+    norm := relative_file(&slashed) or >>
+    _ := resolve_project_path(&abs_dir, &norm, must_exist) or >>
+    << norm
+}
+
+pub fn load_project(path string) Project {
+    << load_project_with_relocating(path, "") or >>
+}
+
+fn load_project_with_relocating(path string, allow_missing_uid string) Project {
+    abs_path := filepath.abs(&path) or >>
+    directory := filepath.dir(&abs_path)
+    raw := snapshot.read(abs_path + "", snapshot.MAX_BYTES) or >>
+    doc := json.parse_max(&raw, snapshot.MAX_BYTES)
+    if !doc.ok() {
+        >> errors.new("nexus project JSON: " + doc.error())
+    }
+    root := doc.root()
+    root_keys := dict_unique_keys(&doc, root, &"project root") or >>
+    if !doc.has(root, "format") || !doc.has(root, "version") ||
+        !doc.has(root, "assets") || !doc.has(root, "scenes") {
+        >> errors.new("nexus project: invalid project manifest fields (expected format, version, assets, scenes)")
+    }
+    for ki in 0:root_keys.len {
+        rk := root_keys[ki] + ""
+        if rk != "format" && rk != "version" && rk != "meta" && rk != "paths" && rk != "platforms" &&
+            rk != "assets" && rk != "scenes" {
+            >> errors.new("nexus project: unknown project manifest field '" + rk + "'")
+        }
+    }
+    format := doc.as_string(doc.get(root, "format")) or >>
+    if format != FORMAT {
+        >> errors.new("nexus project: unsupported format '" + format + "'")
+    }
+    version := doc.as_int(doc.get(root, "version")) or >>
+    if version != VERSION {
+        >> errors.new("nexus project: unsupported version " + str(version))
+    }
+
+    $has_meta := false
+    $meta := rp.empty_meta()
+    if doc.has(root, "meta") {
+        has_meta = true
+        meta = rp.decode_meta_node(&doc, doc.get(root, "meta")) or >>
+    }
+
+    $has_paths := false
+    $paths := rp.empty_paths()
+    if doc.has(root, "paths") {
+        has_paths = true
+        paths = rp.decode_paths_node(&doc, doc.get(root, "paths")) or >>
+    }
+
+    $has_platforms := false
+    $platforms := rp.empty_platforms()
+    if doc.has(root, "platforms") {
+        has_platforms = true
+        platforms = rp.decode_platforms_node(&doc, doc.get(root, "platforms")) or >>
+    }
+
+    assets_node := doc.get(root, "assets")
+    asset_keys := dict_unique_keys(&doc, assets_node, &"assets") or >>
+    $assets := []Entry{}
+    for key in asset_keys {
+        uid := key + ""
+        if !resource.valid_resource_id(&uid) {
+            >> errors.new("nexus project: invalid asset UID '" + uid + "'")
+        }
+        val := doc.as_string(doc.get(assets_node, uid + "")) or >>
+        rel := relative_file(&val) or >>
+        must_exist := allow_missing_uid.len == 0 || uid != allow_missing_uid
+        resolved := resolve_project_path(&directory, &rel, must_exist) or >>
+        assets.push(Entry{key: uid, path: rel, resolved: resolved})
+    }
+
+    scenes_node := doc.get(root, "scenes")
+    scene_keys := dict_unique_keys(&doc, scenes_node, &"scenes") or >>
+    $scenes := []Entry{}
+    $seen_scene_paths := map[string]int{}
+    for key in scene_keys {
+        name := scene_name(&key) or >>
+        val := doc.as_string(doc.get(scenes_node, name + "")) or >>
+        rel := relative_file(&val) or >>
+        if seen_scene_paths.has(rel + "") {
+            >> errors.new("nexus project: duplicate scene path '" + rel + "'")
+        }
+        seen_scene_paths[rel + ""] = 1
+        resolved := project_source(&directory, &rel) or >>
+        scenes.push(Entry{key: name, path: rel, resolved: resolved})
+    }
+    if scenes.len == 0 {
+        >> errors.new("nexus project: project manifest must declare at least one scene")
+    }
+    if has_meta && meta.entry_scene.len > 0 {
+        $entry_found := false
+        for si in 0:scenes.len {
+            if scenes[si].key == meta.entry_scene {
+                entry_found = true
+                <-
+            }
+        }
+        if !entry_found {
+            >> errors.new("nexus project: entry_scene '" + meta.entry_scene + "' not declared in scenes")
+        }
+    }
+    << Project{
+        path: abs_path,
+        directory: directory,
+        scenes: scenes,
+        assets: assets,
+        has_meta: has_meta,
+        meta: meta,
+        has_paths: has_paths,
+        paths: paths,
+        has_platforms: has_platforms,
+        platforms: platforms
+    }
+}
+
+pub fn save_project_manifest(project &Project) int {
+    $out := strings.new_byte_builder(1024)
+    out.write_str("{\n  \"format\": \"nexus.project\",\n  \"version\": 1,")
+    if project.has_meta {
+        meta_json := rp.encode_meta_json(&project.meta, "  ") or >>
+        out.write_str("\n  \"meta\": " + meta_json + ",")
+    }
+    if project.has_paths {
+        paths_json := rp.encode_paths_json(&project.paths, "  ") or >>
+        out.write_str("\n  \"paths\": " + paths_json + ",")
+    }
+    if project.has_platforms {
+        plats_json := rp.encode_platforms_json(&project.platforms, "  ") or >>
+        out.write_str("\n  \"platforms\": " + plats_json + ",")
+    }
+    out.write_str("\n  \"assets\": {")
+    for i in 0:project.assets.len {
+        if i > 0 { out.write_str(",") }
+        a := project.assets[i]
+        uid := a.key + ""
+        rel := a.path + ""
+        out.write_str("\n    " + json.quote(&uid) + ": " + json.quote(&rel))
+    }
+    if project.assets.len > 0 { out.write_str("\n  ") }
+    out.write_str("},\n  \"scenes\": {")
+    for i in 0:project.scenes.len {
+        if i > 0 { out.write_str(",") }
+        s := project.scenes[i]
+        key := s.key + ""
+        rel := s.path + ""
+        out.write_str("\n    " + json.quote(&key) + ": " + json.quote(&rel))
+    }
+    if project.scenes.len > 0 { out.write_str("\n  ") }
+    out.write_str("}\n}\n")
+    raw := out.to_string()
+    snapshot.write_atomic(project.path + "", &raw) or >>
+    << 0
+}
+
+pub fn (project &Project) scene_index(name &string) int {
+    target := name + ""
+    for i in 0:project.scenes.len {
+        if project.scenes[i].key == target {
+            << i
+        }
+    }
+    << -1
+}
+
+pub fn (project &Project) scene_source(index int) string {
+    if index < 0 || index >= project.scenes.len {
+        >> errors.new("nexus project: scene index out of bounds")
+    }
+    entry := project.scenes[index]
+    << project_source(&project.directory, &entry.path) or >>
+}
+
+pub fn (project &Project) asset_source(uid &string) string {
+    target := uid + ""
+    for a in project.assets {
+        if a.key == target {
+            << project_source(&project.directory, &a.path) or >>
+        }
+    }
+    >> errors.new("nexus project: unregistered asset UID '" + target + "'")
+    << ""
+}
+
+pub fn (project &Project) find_asset_uid_by_rel(rel &string) string {
+    norm := relative_file(rel) or (err) { << "" }
+    if norm.len == 0 { << "" }
+    for a in project.assets {
+        if a.path == norm {
+            << a.key + ""
+        }
+    }
+    << ""
+}
+
+pub fn register_asset(project_path string, source_path string) string {
+    $project := load_project(project_path) or >>
+    rel := resolve_input_to_project_rel(&project.directory, &source_path, true) or >>
+    resolved := project_source(&project.directory, &rel) or >>
+    uid := node_files.new_resource_id() or >>
+    for existing in project.assets {
+        if existing.key == uid {
+            >> errors.new("nexus project: duplicate generated UID")
+        }
+    }
+    project.assets.push(Entry{key: uid + "", path: rel, resolved: resolved})
+    save_project_manifest(&project) or >>
+    << uid
+}
+
+pub fn relocate_asset(project_path string, uid string, source_path string) int {
+    if !resource.valid_resource_id(&uid) {
+        >> errors.new("nexus project: invalid asset UID '" + uid + "'")
+    }
+    $project := load_project_with_relocating(project_path, uid + "") or >>
+    rel := resolve_input_to_project_rel(&project.directory, &source_path, true) or >>
+    resolved := project_source(&project.directory, &rel) or >>
+    $found := false
+    for i in 0:project.assets.len {
+        if project.assets[i].key == uid {
+            project.assets[i] = Entry{key: uid + "", path: rel + "", resolved: resolved + ""}
+            found = true
+        }
+    }
+    if !found {
+        >> errors.new("nexus project: unknown asset UID '" + uid + "'")
+    }
+    save_project_manifest(&project) or >>
+    << 0
+}
+
+fn ensure_parent_dir(path &string) int {
+    dir := filepath.dir(path)
+    if dir.len > 0 && dir != "." {
+        os.mkdir_all(dir + "") or >>
+    }
+    << 0
+}
+
+pub fn create_scene(project_path string, raw_key string, raw_root_name string) string {
+    $project := load_project(project_path) or >>
+    $key := scene_name(&raw_key) or >>
+    if !strings.ends_with(&key, ".xuscene") {
+        key = key + ".xuscene"
+        key = scene_name(&key) or >>
+    }
+    if project.scene_index(&key) >= 0 {
+        >> errors.new("nexus project: scene '" + key + "' already exists")
+    }
+    $scene_dir := "assets"
+    if project.has_paths && project.paths.scenes.len > 0 {
+        scene_dir = project.paths.scenes + ""
+    }
+    rel := relative_file(&(scene_dir + "/" + key)) or >>
+    dest := resolve_project_path(&project.directory, &rel, false) or >>
+    if path_exists(dest + "") {
+        >> errors.new("nexus project: destination file already exists: " + rel)
+    }
+    $root_label := strings.trim_space(&raw_root_name)
+    if root_label.len == 0 {
+        root_label = "World"
+    }
+    root_node := resource.node(-1, root_label, resource.NODE_3D)
+    document := resource.make_document([root_node]) or >>
+    encoded := scene_fmt.encode(&document) or >>
+    ensure_parent_dir(&dest) or >>
+    snapshot.write_atomic(dest + "", &encoded) or >>
+    project.scenes.push(Entry{key: key + "", path: rel, resolved: dest + ""})
+    save_project_manifest(&project) or (err) {
+        _ := os.remove(dest + "")
+        >> err
+    }
+    << key
+}
+
+fn scene_uses_asset(doc &resource.Document, uid &string) bool {
+    target := uid + ""
+    for i in 0:doc.resource_count() {
+        r := doc.resource(i) or >>
+        if r.uid == target { << true }
+    }
+    for i in 0:doc.surface_count() {
+        s := doc.surface(i) or >>
+        if s.resource_uid == target { << true }
+        for j in 0:s.levels.len {
+            if s.levels[j].resource_uid == target { << true }
+        }
+    }
+    for i in 0:doc.audio_count() {
+        ae := doc.audio_emitter(i) or >>
+        if ae.resource_uid == target { << true }
+    }
+    for i in 0:doc.script_count() {
+        sc := doc.script(i) or >>
+        if sc.resource_uid == target { << true }
+    }
+    for i in 0:doc.sprite_3d_count() {
+        sp := doc.sprite_3d(i) or >>
+        if sp.resource_uid == target { << true }
+    }
+    for i in 0:doc.tilemap_2d_count() {
+        tm := doc.tilemap_2d(i) or >>
+        if tm.resource_uid == target { << true }
+    }
+    << false
+}
+
+pub fn remove_asset(project_path string, uid string) int {
+    if !resource.valid_resource_id(&uid) {
+        >> errors.new("nexus project: invalid asset UID '" + uid + "'")
+    }
+    $project := load_project(project_path) or >>
+    $found := false
+    for i in 0:project.assets.len {
+        if project.assets[i].key == uid {
+            found = true
+            <-
+        }
+    }
+    if !found {
+        >> errors.new("nexus project: unknown asset UID '" + uid + "'")
+    }
+    for i in 0:project.scenes.len {
+        s := &project.scenes[i]
+        raw := snapshot.read(s.resolved + "", scene_fmt.MAX_BYTES) or >>
+        doc := scene_fmt.decode(&raw) or >>
+        in_use := scene_uses_asset(&doc, &uid) or >>
+        if in_use {
+            >> errors.new("nexus project: asset '" + uid + "' is referenced by scene '" + s.key + "'")
+        }
+    }
+    $next_assets := []Entry{}
+    for i in 0:project.assets.len {
+        a := &project.assets[i]
+        if a.key != uid {
+            next_assets.push(Entry{key: a.key + "", path: a.path + "", resolved: a.resolved + ""})
+        }
+    }
+    project.assets = next_assets
+    save_project_manifest(&project) or >>
+    << 0
+}
+
+fn normalize_scene_key(raw_key &string) string {
+    $key := scene_name(raw_key) or >>
+    if !strings.ends_with(&key, ".xuscene") {
+        key = key + ".xuscene"
+        key = scene_name(&key) or >>
+    }
+    << key
+}
+
+fn sibling_scene_rel(old_rel &string, new_key &string) string {
+    dir := filepath.dir(old_rel)
+    if dir.len == 0 || dir == "." {
+        << relative_file(new_key) or >>
+    }
+    joined := dir + "/" + *new_key
+    << relative_file(&joined) or >>
+}
+
+pub fn rename_scene(project_path string, old_key string, raw_new_key string) string {
+    $project := load_project(project_path) or >>
+    idx := project.scene_index(&old_key)
+    if idx < 0 {
+        >> errors.new("nexus project: unknown scene '" + old_key + "'")
+    }
+    new_key := normalize_scene_key(&raw_new_key) or >>
+    if new_key == old_key {
+        >> errors.new("nexus project: scene name unchanged: " + new_key)
+    }
+    if project.scene_index(&new_key) >= 0 {
+        >> errors.new("nexus project: scene '" + new_key + "' already exists")
+    }
+    next_rel := sibling_scene_rel(&project.scenes[idx].path, &new_key) or >>
+    dest := resolve_project_path(&project.directory, &next_rel, false) or >>
+    if path_exists(dest + "") {
+        >> errors.new("nexus project: destination file already exists: " + next_rel)
+    }
+    old_resolved := project.scenes[idx].resolved + ""
+    ensure_parent_dir(&dest) or >>
+    os.rename(old_resolved + "", dest + "") or >>
+    project.scenes[idx] = Entry{key: new_key + "", path: next_rel, resolved: dest + ""}
+    $old_entry := ""
+    $changed_entry := false
+    if project.has_meta && project.meta.entry_scene == old_key {
+        old_entry = project.meta.entry_scene + ""
+        project.meta.entry_scene = new_key + ""
+        changed_entry = true
+    }
+    save_project_manifest(&project) or (err) {
+        if changed_entry { project.meta.entry_scene = old_entry }
+        _ := os.rename(dest + "", old_resolved + "")
+        >> err
+    }
+    << new_key
+}
+
+pub fn duplicate_scene(project_path string, src_key string, raw_new_key string) string {
+    $project := load_project(project_path) or >>
+    idx := project.scene_index(&src_key)
+    if idx < 0 {
+        >> errors.new("nexus project: unknown scene '" + src_key + "'")
+    }
+    new_key := normalize_scene_key(&raw_new_key) or >>
+    if project.scene_index(&new_key) >= 0 {
+        >> errors.new("nexus project: scene '" + new_key + "' already exists")
+    }
+    next_rel := sibling_scene_rel(&project.scenes[idx].path, &new_key) or >>
+    dest := resolve_project_path(&project.directory, &next_rel, false) or >>
+    if path_exists(dest + "") {
+        >> errors.new("nexus project: destination file already exists: " + next_rel)
+    }
+    raw := snapshot.read(project.scenes[idx].resolved + "", scene_fmt.MAX_BYTES) or >>
+    _ := scene_fmt.decode(&raw) or >>
+    ensure_parent_dir(&dest) or >>
+    snapshot.write_atomic(dest + "", &raw) or >>
+    project.scenes.push(Entry{key: new_key + "", path: next_rel, resolved: dest + ""})
+    save_project_manifest(&project) or (err) {
+        _ := os.remove(dest + "")
+        >> err
+    }
+    << new_key
+}
+
+pub fn delete_scene(project_path string, target_key string) int {
+    $project := load_project(project_path) or >>
+    if project.scenes.len <= 1 {
+        >> errors.new("nexus project: cannot delete the last scene in a project")
+    }
+    if project.has_meta && project.meta.entry_scene == target_key {
+        >> errors.new("nexus project: cannot delete active entry_scene '" + target_key + "'")
+    }
+    idx := project.scene_index(&target_key)
+    if idx < 0 {
+        >> errors.new("nexus project: unknown scene '" + target_key + "'")
+    }
+    target_resolved := project.scenes[idx].resolved + ""
+    $next_scenes := []Entry{}
+    for i in 0:project.scenes.len {
+        if i != idx {
+            s := &project.scenes[i]
+            next_scenes.push(Entry{key: s.key + "", path: s.path + "", resolved: s.resolved + ""})
+        }
+    }
+    project.scenes = next_scenes
+    save_project_manifest(&project) or >>
+    _ := os.remove(target_resolved + "")
+    << 0
+}

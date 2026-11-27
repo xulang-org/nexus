@@ -1,0 +1,368 @@
+@main
+
+anim #"github.com/xulang-org/nexus/animation/timeline"
+mix #"github.com/xulang-org/nexus/audio/mixer"
+ecs #"github.com/xulang-org/nexus/ecs"
+fm #"github.com/xulang-org/nexus/foundation/math"
+netw #"github.com/xulang-org/nexus/networking"
+pcm #"github.com/xulang-org/nexus/resources/audio"
+scene #"github.com/xulang-org/nexus/scene"
+#errors
+#math
+
+fn near_f(a f64, b f64, eps f64) bool {
+    << math.abs(a - b) <= eps
+}
+
+fn near_v2(a fm.Vec2, b fm.Vec2, eps f64) bool {
+    << near_f(a.x, b.x, eps) && near_f(a.y, b.y, eps)
+}
+
+fn near_v3(a fm.Vec3, b fm.Vec3, eps f64) bool {
+    << near_f(a.x, b.x, eps) && near_f(a.y, b.y, eps) && near_f(a.z, b.z, eps)
+}
+
+fn voice_is_playing(mixer &mix.Mixer, id int) bool {
+    if !mixer.is_voice(id) { << false }
+    << mixer.is_playing(id) or (err) {
+        _ := err
+        << false
+    }
+}
+
+fn rejects_bad_template_mask() bool {
+    _ := ecs.default_entity_template(256) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn rejects_bad_cue_spec(bank $&mix.AudioCueBank) bool {
+    _ := bank.register_cue("bad", mix.default_cue_spec([]int{}, 0)) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn rejects_bad_spring_cfg() bool {
+    _ := anim.spring_config(0.0, 1.0) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn rejects_bad_rpc_direction(reg &netw.RpcRegistry, rpc_id int) bool {
+    args := [netw.rpc_int(1)]
+    _ := reg.encode_call(rpc_id, true, 7, &args) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn rejects_bad_rpc_decode_direction(reg &netw.RpcRegistry, wire &[]u8) bool {
+    _ := reg.decode_call(wire, true) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn rejects_exhausted_pool(pool $&scene.NodePool, tree $&scene.SceneTree) bool {
+    _ := pool.acquire(tree) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn test_ecs_commands_and_templates() int {
+    assert(rejects_bad_template_mask())
+    $world := ecs.new_ecs_world()
+
+    $tpl := ecs.default_entity_template(ecs.COMP_TRANSFORM | ecs.COMP_VELOCITY | ecs.COMP_HEALTH) or >>
+    tpl.scale = fm.vec3(2.0, 2.0, 2.0)
+    tpl.velocity = fm.vec3(1.5, 0.0, -0.5)
+    tpl.hp = 60.0
+    tpl.max_hp = 80.0
+    tpl.regen = 2.0
+
+    hero := world.spawn_from_template_at(&tpl, fm.vec3(4.0, 1.0, -3.0)) or >>
+    assert(world.is_alive(hero))
+    assert(near_v3(world.get_position(hero) or >>, fm.vec3(4.0, 1.0, -3.0), 1e-6))
+    assert(near_f(world.get_health(hero) or >>, 60.0, 1e-6))
+
+    victim := world.spawn(ecs.COMP_TRANSFORM) or >>
+    world.despawn(victim) or >>
+
+    $buf := ecs.new_command_buffer()
+    _ := buf.queue_spawn_template(&tpl, fm.vec3(10.0, 0.0, 2.0)) or >>
+    _ := buf.queue_spawn(ecs.COMP_TRANSFORM | ecs.COMP_AUDIO) or >>
+    _ := buf.queue_set_transform(hero, fm.vec3(7.0, 2.0, 1.0), fm.vec3(1.0, 1.0, 1.0))
+    _ := buf.queue_add_component(hero, ecs.COMP_BOUNDS) or >>
+    _ := buf.queue_remove_component(hero, ecs.COMP_VELOCITY) or >>
+    _ := buf.queue_set_health(hero, 75.0, 80.0, 1.0)
+    // Stale handle tolerance
+    _ := buf.queue_despawn(victim)
+    _ := buf.queue_set_transform(victim, fm.vec3(0.0, 0.0, 0.0), fm.vec3(1.0, 1.0, 1.0))
+    // Live entity missing COMP_VELOCITY after queued remove -> counted as failed, does not abort
+    _ := buf.queue_set_velocity(hero, fm.vec3(9.0, 0.0, 0.0))
+
+    assert(buf.pending_count() == 9)
+    report := buf.flush($&world)
+    assert(buf.pending_count() == 0)
+    assert(report.spawned.len == 2)
+    assert(report.applied == 6)
+    assert(report.skipped_stale == 2)
+    assert(report.failed == 1)
+
+    assert(near_v3(world.get_position(hero) or >>, fm.vec3(7.0, 2.0, 1.0), 1e-6))
+    assert(near_f(world.get_health(hero) or >>, 75.0, 1e-6))
+    assert((world.entity_mask(hero) or >>) == (ecs.COMP_TRANSFORM | ecs.COMP_HEALTH | ecs.COMP_BOUNDS))
+    assert(near_v3(world.get_position(report.spawned[0]) or >>, fm.vec3(10.0, 0.0, 2.0), 1e-6))
+    << 0
+}
+
+fn test_audio_cue_bank() int {
+    $mixer := mix.new_mixer(48000, 16) or >>
+    c0 := mixer.add_clip(pcm.pcm16(48000, 1, [1000, 2000, 3000, 4000]) or >>) or >>
+    c1 := mixer.add_clip(pcm.pcm16(48000, 1, [5000, 6000, 7000, 8000]) or >>) or >>
+    c2 := mixer.add_clip(pcm.pcm16(48000, 1, [9000, 10000, 11000, 12000]) or >>) or >>
+    sfx := mixer.add_bus(0, "SFX", 1.0) or >>
+
+    $bank := mix.new_cue_bank(42)
+    assert(rejects_bad_cue_spec($&bank))
+
+    // Round-robin + cooldown check
+    $rr_spec := mix.default_cue_spec([c0, c1, c2], sfx)
+    rr_spec.looping = true
+    rr_spec.cooldown_s = 0.05
+    bank.register_cue("footstep", rr_spec) or >>
+
+    r0 := bank.trigger($&mixer, "footstep") or >>
+    assert(r0.triggered && r0.clip_id == c0)
+    r_cd := bank.trigger($&mixer, "footstep") or >>
+    assert(!r_cd.triggered && r_cd.reject_reason == "cooldown")
+
+    _ := bank.update(&mixer, 0.06) or >>
+    r1 := bank.trigger($&mixer, "footstep") or >>
+    _ := bank.update(&mixer, 0.06) or >>
+    r2 := bank.trigger($&mixer, "footstep") or >>
+    _ := bank.update(&mixer, 0.06) or >>
+    r3 := bank.trigger($&mixer, "footstep") or >>
+    assert(r1.clip_id == c1 && r2.clip_id == c2 && r3.clip_id == c0)
+
+    stopped := bank.stop_cue($&mixer, "footstep") or >>
+    assert(stopped == 4 && bank.active_count(&mixer, "footstep") == 0)
+
+    // Shuffle no-repeat & voice stealing (STEAL_OLDEST)
+    $shuf_spec := mix.default_cue_spec([c0, c1, c2], sfx)
+    shuf_spec.looping = true
+    shuf_spec.selection_mode = mix.CUE_SHUFFLE_NO_REPEAT
+    shuf_spec.max_concurrent = 2
+    shuf_spec.steal_policy = mix.STEAL_OLDEST
+    shuf_spec.gain_jitter = 0.1
+    shuf_spec.pitch_jitter = 0.05
+    bank.register_cue("hit", shuf_spec) or >>
+
+    h0 := bank.trigger($&mixer, "hit") or >>
+    h1 := bank.trigger($&mixer, "hit") or >>
+    h2 := bank.trigger($&mixer, "hit") or >>
+    h3 := bank.trigger($&mixer, "hit") or >>
+    assert(h2.triggered && h2.stolen_voice_id == h0.voice_id)
+    assert(!voice_is_playing(&mixer, h0.voice_id) && voice_is_playing(&mixer, h2.voice_id) && voice_is_playing(&mixer, h3.voice_id))
+    assert(h1.clip_id != h0.clip_id && h2.clip_id != h1.clip_id && h3.clip_id != h2.clip_id)
+
+    // STEAL_NONE rejects at concurrency cap
+    $none_spec := mix.default_cue_spec([c0], sfx)
+    none_spec.looping = true
+    none_spec.max_concurrent = 1
+    none_spec.steal_policy = mix.STEAL_NONE
+    bank.register_cue("ui", none_spec) or >>
+    u0 := bank.trigger($&mixer, "ui") or >>
+    u1 := bank.trigger($&mixer, "ui") or >>
+    assert(u0.triggered && !u1.triggered && u1.reject_reason == "max_concurrent")
+    << 0
+}
+
+fn test_springs_and_motion_sequence() int {
+    assert(rejects_bad_spring_cfg())
+
+    // Underdamped + critically damped + overdamped convergence (pole-safe on large dt too)
+    crit_cfg := anim.spring_config(3.0, 1.0) or >>
+    under_cfg := anim.spring_config(2.5, 0.4) or >>
+    over_cfg := anim.spring_config(2.0, 2.5) or >>
+
+    $sf := anim.new_spring_f64(0.0, crit_cfg) or >>
+    sf.set_target(10.0) or >>
+    for _i in 0:120 {
+        _ := sf.step(1.0 / 60.0) or >>
+    }
+    assert(sf.is_settled(1e-3, 1e-2) && near_f(sf.value, 10.0, 1e-3))
+
+    $sv2 := anim.new_spring_vec2(fm.vec2(0.0, 0.0), under_cfg) or >>
+    sv2.set_target(fm.vec2(4.0, -8.0)) or >>
+    sv2.impulse(fm.vec2(2.0, -3.0)) or >>
+    _ := sv2.step(5.0) or >> // Large dt stays finite & settles toward target
+    assert(sv2.value.is_finite() && near_v2(sv2.value, fm.vec2(4.0, -8.0), 1e-4))
+
+    $sv3 := anim.new_spring_vec3(fm.vec3(1.0, 2.0, 3.0), over_cfg) or >>
+    sv3.set_target(fm.vec3(-3.0, 6.0, 11.0)) or >>
+    _ := sv3.step(10.0) or >>
+    assert(near_v3(sv3.value, fm.vec3(-3.0, 6.0, 11.0), 1e-4))
+
+    // MotionSequence: then + join + wait + marker + loop yoyo
+    $seq := anim.new_motion_sequence()
+    _ := seq.then_scalar(0.0, 10.0, 1.0, fm.EASE_LINEAR) or >>
+    _ := seq.join_vec3(fm.vec3(0.0, 0.0, 0.0), fm.vec3(10.0, 20.0, 30.0), 1.0, fm.EASE_LINEAR) or >>
+    _ := seq.then_marker("apex") or >>
+    _ := seq.then_wait(0.5) or >>
+    _ := seq.then_scalar(10.0, 0.0, 0.5, fm.EASE_LINEAR) or >>
+    seq.set_loops(1, true) or >>
+    assert(near_f(seq.duration(), 2.0, 1e-9))
+
+    s1 := seq.step(0.5) or >>
+    assert(s1.scalar_updated && near_f(s1.scalar, 5.0, 1e-6))
+    assert(s1.vec3_updated && near_v3(s1.vec3, fm.vec3(5.0, 10.0, 15.0), 1e-6))
+    assert(s1.markers.len == 0 && !s1.finished)
+
+    s2 := seq.step(0.75) or >> // t = 1.25 crosses "apex" at 1.0
+    assert(s2.markers.len == 1 && s2.markers[0] == "apex")
+    assert(near_f(s2.scalar, 10.0, 1e-6))
+
+    s3 := seq.step(0.75) or >> // t = 2.0 finishes cycle 0
+    assert(s3.loop_completed && !s3.finished && near_f(s3.scalar, 0.0, 1e-6))
+
+    s4 := seq.step(1.0) or >> // yoyo reverse from 2.0 back to 1.0 crosses "apex"
+    assert(s4.markers.len == 1 && s4.markers[0] == "apex")
+
+    s5 := seq.step(1.5) or >> // completes second cycle cleanly
+    assert(s5.finished && seq.is_finished())
+    << 0
+}
+
+fn test_networking_rpc_rate_and_heartbeat() int {
+    $reg := netw.new_rpc_registry()
+    move_id := reg.register(
+        "player_move",
+        netw.RPC_DIR_CLIENT_TO_SERVER,
+        [netw.RPC_ARG_INT, netw.RPC_ARG_VEC3, netw.RPC_ARG_BOOL, netw.RPC_ARG_F32, netw.RPC_ARG_BYTES],
+        2.5
+    ) or >>
+    fx_id := reg.register("spawn_fx", netw.RPC_DIR_SERVER_TO_CLIENT, [netw.RPC_ARG_VEC3], 1.0) or >>
+    assert(near_f(reg.rate_cost(move_id) or >>, 2.5, 1e-9))
+    assert((reg.rpc_id_of("spawn_fx") or >>) == fx_id)
+
+    assert(rejects_bad_rpc_direction(&reg, move_id))
+
+    call_args := [
+        netw.rpc_int(-42),
+        netw.rpc_vec3(fm.vec3(1.5, -2.5, 8.25)) or >>,
+        netw.rpc_bool(true),
+        netw.rpc_f32(3.5) or >>,
+        netw.rpc_bytes([u8(10), u8(20), u8(30)]) or >>
+    ]
+    wire := reg.encode_call(move_id, false, 99, &call_args) or >>
+    assert(rejects_bad_rpc_decode_direction(&reg, &wire))
+
+    decoded := reg.decode_call(&wire, false) or >>
+    assert(decoded.rpc_id == move_id && decoded.name == "player_move" && decoded.target_id == 99)
+    assert(decoded.args.len == 5 && decoded.args[0].i == -42 && decoded.args[2].b)
+    assert(near_v3(decoded.args[1].v3, fm.vec3(1.5, -2.5, 8.25), 1e-3))
+    assert(near_f(decoded.args[3].f, 3.5, 1e-5))
+    assert(decoded.args[4].bytes.len == 3 && decoded.args[4].bytes[1] == u8(20))
+
+    $rl := netw.new_peer_rate_limiter(5.0, 2.0) or >>
+    cost := reg.rate_cost(move_id) or >>
+    assert(rl.allow(1, cost) or >>)
+    assert(rl.allow(1, cost) or >>)
+    assert(!(rl.allow(1, cost) or >>)) // bucket empty
+    rl.step(1.5) or >>                // +3.0 tokens -> now 3.0 >= 2.5
+    assert(rl.allow(1, cost) or >>)
+
+    $ht := netw.new_heartbeat_tracker(1.0, 2.5) or >>
+    ht.touch(10)
+    ht.touch(20)
+    r1 := ht.step(1.2) or >>
+    assert(r1.stale_peers.len == 2 && r1.timed_out_peers.len == 0)
+    ht.touch(10) // peer 10 recovered
+    r2 := ht.step(1.4) or >> // peer 10 at 1.4s (stale), peer 20 at 2.6s (timed out)
+    assert(r2.stale_peers.len == 1 && r2.stale_peers[0] == 10)
+    assert(r2.timed_out_peers.len == 1 && r2.timed_out_peers[0] == 20)
+    assert(ht.peer_count() == 1)
+    << 0
+}
+
+fn test_scene_constraints_and_node_pool() int {
+    $tree := scene.new_scene_tree_3d("World", 64) or >>
+    root := tree.root()
+    target := tree.add_child_3d(root, "Target") or >>
+    follower := tree.add_child_3d(root, "Follower") or >>
+    turret := tree.add_child_3d(root, "Turret") or >>
+
+    tree.set_position_3d(target, fm.vec3(0.0, 0.0, 10.0)) or >>
+    tree.set_position_3d(follower, fm.vec3(0.0, 0.0, 0.0)) or >>
+    tree.set_position_3d(turret, fm.vec3(0.0, 0.0, 0.0)) or >>
+
+    $solver := scene.new_constraint_solver_3d()
+    c_follow := solver.add_follow_3d(follower, target, fm.vec3(2.0, 3.0, 0.0), 1.0, 1) or >>
+    // Turret aims at follower AFTER follow runs (priority 2 > priority 1)
+    c_aim := solver.add_aim_3d(turret, follower, scene.AXIS_NEG_Z, fm.vec3(0.0, 1.0, 0.0), 1.0, 2) or >>
+    assert(solver.count() == 2)
+
+    applied := solver.solve($&tree) or >>
+    assert(applied == 2)
+
+    follower_pos := (tree.global_transform_3d(follower) or >>).translation()
+    assert(near_v3(follower_pos, fm.vec3(2.0, 3.0, 10.0), 1e-6))
+
+    turret_w := tree.global_transform_3d(turret) or >>
+    turret_fwd := turret_w.basis_z().neg().normalized() or >>
+    expected_dir := follower_pos.normalized() or >>
+    assert(turret_fwd.dot(expected_dir) > 0.999)
+
+    solver.set_enabled(c_follow, false) or >>
+    solver.remove(c_aim) or >>
+    assert(solver.count() == 1)
+
+    // NodePool 3D recycling + reset + exhaustion check
+    $pool := scene.new_node_pool(root, scene.NODE_3D, "Bullet", 2) or >>
+    pre := pool.prewarm($&tree, 1) or >>
+    assert(pre == 1 && pool.allocated_count() == 1 && pool.active_count() == 0)
+
+    b0 := pool.acquire($&tree) or >>
+    tree.set_position_3d(b0, fm.vec3(99.0, 5.0, -2.0)) or >>
+    b1 := pool.acquire($&tree) or >>
+    assert(b0 != b1 && pool.active_count() == 2 && pool.available_count() == 0)
+    assert(rejects_exhausted_pool($&pool, $&tree))
+
+    pool.release($&tree, b0) or >>
+    assert(!(tree.is_visible(b0) or >>))
+    assert(!(tree.can_process(b0) or >>))
+    b0_pos := (tree.node_3d(b0) or >>).transform.translation()
+    assert(near_v3(b0_pos, fm.vec3(0.0, 0.0, 0.0), 1e-6))
+
+    b2 := pool.acquire($&tree) or >>
+    assert(b2 == b0 && (tree.is_visible(b2) or >>) && (tree.can_process(b2) or >>))
+    << 0
+}
+
+fn run() int {
+    test_ecs_commands_and_templates() or >>
+    test_audio_cue_bank() or >>
+    test_springs_and_motion_sequence() or >>
+    test_networking_rpc_rate_and_heartbeat() or >>
+    test_scene_constraints_and_node_pool() or >>
+    println("PASS: developer_systems_r4_checks (EcsCommandBuffer/Template, AudioCueBank, Spring/MotionSequence, RpcRegistry/RateLimiter/Heartbeat, ConstraintSolver3D/NodePool)")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln("FAIL: " + err.msg())
+        << 1
+    }
+}

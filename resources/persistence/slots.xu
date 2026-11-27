@@ -1,0 +1,419 @@
+@"github.com/xulang-org/nexus/resources/persistence"
+
+#crypto/sha256
+#encoding/json
+#errors
+#strconv
+#strings
+
+pub const SAVE_CATALOG_FORMAT = "nexus.save_catalog"
+pub const SAVE_CATALOG_VERSION = 1
+
+pub struct SaveSlotMeta {
+    pub slot_id string
+    pub label string
+    pub scene string
+    pub schema_version int
+    pub timestamp_ms int
+    pub play_seconds int
+    pub payload_sha256 string
+    pub payload_bytes int
+    pub is_autosave bool
+    pub generation int
+}
+
+pub struct SaveWriteResult {
+    pub meta SaveSlotMeta
+    pub envelope_json string
+}
+
+pub struct SaveRecoveryResult {
+    pub found bool
+    pub slot_id string
+    pub meta SaveSlotMeta
+    pub envelope SaveEnvelope
+    pub skipped_corrupt []string
+}
+
+pub struct SaveSlotCatalog {
+    max_manual_slots int
+    max_autosave_slots int
+    autosave_cursor int
+    slots []SaveSlotMeta
+    slot_index map[string]int
+}
+
+fn empty_slot_meta() SaveSlotMeta {
+    << SaveSlotMeta{
+        slot_id: "",
+        label: "",
+        scene: "",
+        schema_version: 1,
+        timestamp_ms: 0,
+        play_seconds: 0,
+        payload_sha256: "",
+        payload_bytes: 0,
+        is_autosave: false,
+        generation: 0
+    }
+}
+
+fn empty_envelope() SaveEnvelope {
+    << SaveEnvelope{
+        format: SAVE_ENVELOPE_FORMAT,
+        schema_version: 1,
+        checksum: "",
+        payload: "{}"
+    }
+}
+
+fn validate_slot_id(slot_id string) string {
+    if slot_id.len == 0 || slot_id.len > 64 {
+        >> errors.new("nexus persistence: slot_id length must be in 1..64")
+    }
+    if strings.contains(&slot_id, "..") {
+        >> errors.new("nexus persistence: slot_id cannot contain '..'")
+    }
+    for i in 0:slot_id.len {
+        c := slot_id[i] & 255
+        is_digit := c >= 48 && c <= 57
+        is_upper := c >= 65 && c <= 90
+        is_lower := c >= 97 && c <= 122
+        is_ok := is_digit || is_upper || is_lower || c == 95 || c == 45
+        if !is_ok {
+            >> errors.new("nexus persistence: slot_id allows only [A-Za-z0-9_-]")
+        }
+    }
+    << slot_id + ""
+}
+
+pub fn new_save_catalog(max_manual_slots int, max_autosave_slots int) SaveSlotCatalog {
+    if max_manual_slots < 1 || max_manual_slots > 256 ||
+        max_autosave_slots < 1 || max_autosave_slots > 64 {
+        >> errors.new("nexus persistence: invalid save slot catalog limits")
+    }
+    << SaveSlotCatalog{
+        max_manual_slots: max_manual_slots,
+        max_autosave_slots: max_autosave_slots,
+        autosave_cursor: 0,
+        slots: []SaveSlotMeta{},
+        slot_index: map[string]int{}
+    }
+}
+
+fn (c &SaveSlotCatalog) manual_count() int {
+    $cnt := 0
+    for i in 0:c.slots.len {
+        if !c.slots[i].is_autosave { cnt += 1 }
+    }
+    << cnt
+}
+
+fn (c $&SaveSlotCatalog) write_slot_internal(
+    slot_id string,
+    label string,
+    scene string,
+    schema_version int,
+    timestamp_ms int,
+    play_seconds int,
+    payload_json string,
+    is_autosave bool
+) SaveWriteResult {
+    sid := validate_slot_id(slot_id) or >>
+    if timestamp_ms < 0 || play_seconds < 0 {
+        >> errors.new("nexus persistence: timestamp_ms and play_seconds must be >= 0")
+    }
+    exists := c.slot_index.has(sid + "")
+    if !exists && !is_autosave && c.manual_count() >= c.max_manual_slots {
+        >> errors.new("nexus persistence: manual save slot limit reached")
+    }
+    env := wrap_save_envelope(schema_version, payload_json + "") or >>
+    env_json := encode_envelope(&env) or >>
+    $next_gen := 1
+    if exists {
+        prev_idx := c.slot_index[sid + ""]
+        next_gen = c.slots[prev_idx].generation + 1
+    }
+    meta := SaveSlotMeta{
+        slot_id: sid + "",
+        label: label + "",
+        scene: scene + "",
+        schema_version: schema_version,
+        timestamp_ms: timestamp_ms,
+        play_seconds: play_seconds,
+        payload_sha256: env.checksum + "",
+        payload_bytes: payload_json.len,
+        is_autosave: is_autosave,
+        generation: next_gen
+    }
+    if exists {
+        idx := c.slot_index[sid + ""]
+        c.slots[idx] = clone_slot_meta(&meta)
+    } else {
+        idx := c.slots.len
+        c.slots.push(clone_slot_meta(&meta))
+        c.slot_index[sid + ""] = idx
+    }
+    << SaveWriteResult{meta: meta, envelope_json: env_json}
+}
+
+pub fn (c $&SaveSlotCatalog) save_manual_slot(
+    slot_id string,
+    label string,
+    scene string,
+    schema_version int,
+    timestamp_ms int,
+    play_seconds int,
+    payload_json string
+) SaveWriteResult {
+    << c.write_slot_internal(slot_id, label, scene, schema_version, timestamp_ms, play_seconds, payload_json, false) or >>
+}
+
+pub fn (c $&SaveSlotCatalog) save_autosave(
+    label string,
+    scene string,
+    schema_version int,
+    timestamp_ms int,
+    play_seconds int,
+    payload_json string
+) SaveWriteResult {
+    ring_slot := c.autosave_cursor
+    sid := "autosave-" + str(ring_slot)
+    res := c.write_slot_internal(sid, label, scene, schema_version, timestamp_ms, play_seconds, payload_json, true) or >>
+    $next := ring_slot + 1
+    if next >= c.max_autosave_slots { next = 0 }
+    c.autosave_cursor = next
+    << res
+}
+
+fn clone_slot_meta(m &SaveSlotMeta) SaveSlotMeta {
+    << SaveSlotMeta{
+        slot_id: m.slot_id + "",
+        label: m.label + "",
+        scene: m.scene + "",
+        schema_version: m.schema_version,
+        timestamp_ms: m.timestamp_ms,
+        play_seconds: m.play_seconds,
+        payload_sha256: m.payload_sha256 + "",
+        payload_bytes: m.payload_bytes,
+        is_autosave: m.is_autosave,
+        generation: m.generation
+    }
+}
+
+pub fn (c $&SaveSlotCatalog) delete_slot(slot_id string) bool {
+    if !c.slot_index.has(slot_id + "") { << false }
+    $next_slots := []SaveSlotMeta{}
+    $next_map := map[string]int{}
+    for i in 0:c.slots.len {
+        if c.slots[i].slot_id != slot_id {
+            nidx := next_slots.len
+            m := clone_slot_meta(&c.slots[i])
+            next_map[m.slot_id + ""] = nidx
+            next_slots.push(m)
+        }
+    }
+    c.slots = next_slots
+    c.slot_index = next_map
+    << true
+}
+
+pub fn (c &SaveSlotCatalog) has_slot(slot_id string) bool {
+    << c.slot_index.has(slot_id + "")
+}
+
+pub fn (c &SaveSlotCatalog) slot_count() int {
+    << c.slots.len
+}
+
+fn str_less(a &string, b &string) bool {
+    $limit := a.len
+    if b.len < limit { limit = b.len }
+    for i in 0:limit {
+        ca := (*a)[i] & 255
+        cb := (*b)[i] & 255
+        if ca < cb { << true }
+        if ca > cb { << false }
+    }
+    << a.len < b.len
+}
+
+pub fn (c &SaveSlotCatalog) list_slots_newest_first() []SaveSlotMeta {
+    $order := []int{}
+    for i in 0:c.slots.len {
+        order.push(i)
+    }
+    for i in 1:order.len {
+        cur_idx := order[i]
+        cur := &c.slots[cur_idx]
+        $j := i - 1
+        while j >= 0 {
+            prev_idx := order[j]
+            prev := &c.slots[prev_idx]
+            before := prev.timestamp_ms < cur.timestamp_ms ||
+                (prev.timestamp_ms == cur.timestamp_ms && prev.generation < cur.generation) ||
+                (prev.timestamp_ms == cur.timestamp_ms && prev.generation == cur.generation && str_less(&cur.slot_id, &prev.slot_id))
+            if before {
+                order[j + 1] = prev_idx
+                j -= 1
+            } else {
+                <-
+            }
+        }
+        order[j + 1] = cur_idx
+    }
+    $out := []SaveSlotMeta{}
+    for idx in order {
+        out.push(clone_slot_meta(&c.slots[idx]))
+    }
+    << out
+}
+
+struct EnvelopeDecodeAttempt {
+    env SaveEnvelope
+    ok bool
+}
+
+fn try_decode_slot_envelope(raw &string, expected_sha string, expected_ver int) EnvelopeDecodeAttempt {
+    env := decode_envelope(raw) or (err) {
+        _ := err
+        << EnvelopeDecodeAttempt{env: empty_envelope(), ok: false}
+    }
+    if env.checksum != expected_sha || env.schema_version != expected_ver {
+        << EnvelopeDecodeAttempt{env: empty_envelope(), ok: false}
+    }
+    << EnvelopeDecodeAttempt{env: env, ok: true}
+}
+
+pub fn (c &SaveSlotCatalog) recover_newest_valid(raw_envelopes &map[string]string) SaveRecoveryResult {
+    ordered := c.list_slots_newest_first()
+    $skipped := []string{}
+    for i in 0:ordered.len {
+        meta := clone_slot_meta(&ordered[i])
+        sid := meta.slot_id + ""
+        if !raw_envelopes.has(sid + "") {
+            skipped.push(meta.slot_id + "")
+            ->
+        }
+        raw := &raw_envelopes[sid]
+        attempt := try_decode_slot_envelope(raw, meta.payload_sha256 + "", meta.schema_version)
+        if !attempt.ok {
+            skipped.push(meta.slot_id + "")
+            ->
+        }
+        copied_env := SaveEnvelope{
+            format: attempt.env.format + "",
+            schema_version: attempt.env.schema_version,
+            checksum: attempt.env.checksum + "",
+            payload: attempt.env.payload + ""
+        }
+        << SaveRecoveryResult{
+            found: true,
+            slot_id: meta.slot_id + "",
+            meta: meta,
+            envelope: copied_env,
+            skipped_corrupt: skipped
+        }
+    }
+    << SaveRecoveryResult{
+        found: false,
+        slot_id: "",
+        meta: empty_slot_meta(),
+        envelope: empty_envelope(),
+        skipped_corrupt: skipped
+    }
+}
+
+pub fn (c &SaveSlotCatalog) encode_catalog_json() string {
+    $b := strings.new_byte_builder(512)
+    fmt := SAVE_CATALOG_FORMAT + ""
+    b.write_str("{\"format\":" + json.quote(&fmt) +
+        ",\"version\":" + str(SAVE_CATALOG_VERSION) +
+        ",\"max_manual_slots\":" + str(c.max_manual_slots) +
+        ",\"max_autosave_slots\":" + str(c.max_autosave_slots) +
+        ",\"autosave_cursor\":" + str(c.autosave_cursor) +
+        ",\"slots\":[")
+    for i in 0:c.slots.len {
+        if i > 0 { b.write_byte(44) }
+        s := &c.slots[i]
+        sid := s.slot_id + ""
+        lbl := s.label + ""
+        sc := s.scene + ""
+        cs := s.payload_sha256 + ""
+        $auto_s := "false"
+        if s.is_autosave { auto_s = "true" }
+        b.write_str("{\"slot_id\":" + json.quote(&sid) +
+            ",\"label\":" + json.quote(&lbl) +
+            ",\"scene\":" + json.quote(&sc) +
+            ",\"schema_version\":" + str(s.schema_version) +
+            ",\"timestamp_ms\":" + str(s.timestamp_ms) +
+            ",\"play_seconds\":" + str(s.play_seconds) +
+            ",\"payload_sha256\":" + json.quote(&cs) +
+            ",\"payload_bytes\":" + str(s.payload_bytes) +
+            ",\"is_autosave\":" + auto_s +
+            ",\"generation\":" + str(s.generation) + "}")
+    }
+    b.write_str("]}\n")
+    << b.to_string()
+}
+
+pub fn decode_catalog_json(raw &string) SaveSlotCatalog {
+    if raw.len == 0 || raw.len > MANIFEST_MAX_BYTES {
+        >> errors.new("nexus persistence: save catalog size out of bounds")
+    }
+    doc := json.parse_max(raw, MANIFEST_MAX_BYTES)
+    if !doc.ok() {
+        >> errors.new("nexus persistence: save catalog JSON parse error: " + doc.error())
+    }
+    root := doc.root()
+    if !doc.is_dict(root) {
+        >> errors.new("nexus persistence: save catalog root must be JSON object")
+    }
+    fmt := doc.as_string(doc.get(root, "format")) or >>
+    ver := doc.as_int(doc.get(root, "version")) or >>
+    if fmt != SAVE_CATALOG_FORMAT || ver != SAVE_CATALOG_VERSION {
+        >> errors.new("nexus persistence: invalid save catalog format or version")
+    }
+    max_m := doc.as_int(doc.get(root, "max_manual_slots")) or >>
+    max_a := doc.as_int(doc.get(root, "max_autosave_slots")) or >>
+    cursor := doc.as_int(doc.get(root, "autosave_cursor")) or >>
+    $cat := new_save_catalog(max_m, max_a) or >>
+    if cursor < 0 || cursor >= max_a {
+        >> errors.new("nexus persistence: invalid autosave_cursor")
+    }
+    cat.autosave_cursor = cursor
+    arr := doc.get(root, "slots")
+    if arr < 0 || !doc.is_list(arr) {
+        >> errors.new("nexus persistence: save catalog slots must be array")
+    }
+    n := doc.count(arr)
+    for i in 0:n {
+        item := doc.at(arr, i)
+        if !doc.is_dict(item) {
+            >> errors.new("nexus persistence: slot entry must be object")
+        }
+        sid := validate_slot_id(doc.as_string(doc.get(item, "slot_id")) or >>) or >>
+        if cat.slot_index.has(sid + "") {
+            >> errors.new("nexus persistence: duplicate slot_id in catalog: " + sid)
+        }
+        meta := SaveSlotMeta{
+            slot_id: sid + "",
+            label: doc.as_string(doc.get(item, "label")) or >>,
+            scene: doc.as_string(doc.get(item, "scene")) or >>,
+            schema_version: doc.as_int(doc.get(item, "schema_version")) or >>,
+            timestamp_ms: doc.as_int(doc.get(item, "timestamp_ms")) or >>,
+            play_seconds: doc.as_int(doc.get(item, "play_seconds")) or >>,
+            payload_sha256: doc.as_string(doc.get(item, "payload_sha256")) or >>,
+            payload_bytes: doc.as_int(doc.get(item, "payload_bytes")) or >>,
+            is_autosave: doc.as_bool(doc.get(item, "is_autosave")) or >>,
+            generation: doc.as_int(doc.get(item, "generation")) or >>
+        }
+        if meta.schema_version < 1 || meta.timestamp_ms < 0 || meta.play_seconds < 0 || meta.generation < 1 {
+            >> errors.new("nexus persistence: invalid save slot metadata")
+        }
+        idx := cat.slots.len
+        cat.slots.push(meta)
+        cat.slot_index[sid + ""] = idx
+    }
+    << cat
+}

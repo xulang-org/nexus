@@ -44,6 +44,11 @@ pub struct Device3D {
     soft_pixels []u8
     soft_depth []f64
     pixels []u8
+    viewport_active bool
+    vp_x int
+    vp_y int
+    vp_w int
+    vp_h int
 }
 fn target_size(width int, height int) int {
     if width<1 || height<1 || width>4096 || height>4096 || width*height>4194304 {
@@ -57,8 +62,12 @@ fn new_color(device &gpu.Device, width int, height int) gpu.Texture {
         usage: gpu.TEXTURE_COLOR_TARGET | gpu.TEXTURE_SAMPLED}) or >>
 }
 fn new_depth(device &gpu.Device, width int, height int) gpu.Texture {
+    $usage := gpu.TEXTURE_DEPTH_TARGET
+    if device.supports_texture_2d(layout.DEPTH32_FLOAT, gpu.TEXTURE_DEPTH_TARGET | gpu.TEXTURE_SAMPLED) or >> {
+        usage = usage | gpu.TEXTURE_SAMPLED
+    }
     << device.texture_2d(gpu.Texture2DDesc{format: layout.DEPTH32_FLOAT,width: width,height: height,levels: 1,
-        usage: gpu.TEXTURE_DEPTH_TARGET}) or >>
+        usage: usage}) or >>
 }
 fn mesh_pipeline() gpu.PipelineDesc {
     $desc := gpu.pipeline_defaults(layout.RGBA8_UNORM)
@@ -126,7 +135,8 @@ fn init_3d_session(session present.Session, program &ShaderProgram3D, width int,
             pipelines: []gpu.GraphicsPipeline{},linear_samplers: []gpu.Sampler{},render_scale: 1,max_render_pixels: 4194304,
             encoders: []gpu.CommandEncoder{},passes: []gpu.RenderPass{},target_width: width,target_height: height,
             surface_format: 0,draw_count: 0,lit_draws: 0,light_candidates: 0,selected_lights: 0,device_id: dev_id,
-            active: false,sealed: false,closed: false,cached: false,soft_pixels: []u8{},soft_depth: []f64{},pixels: []u8{}}
+            active: false,sealed: false,closed: false,cached: false,soft_pixels: []u8{},soft_depth: []f64{},pixels: []u8{},
+            viewport_active: false,vp_x: 0,vp_y: 0,vp_w: 0,vp_h: 0}
         soft_resize_and_clear($&out,255) or >>
         << out
     }
@@ -147,7 +157,7 @@ fn init_3d_session(session present.Session, program &ShaderProgram3D, width int,
     sampling.mag_filter=gpu.LINEAR
     $linear_sampler := dev.sampler(sampling) or >>
     vs_desc := gpu.ShaderDesc{stage: gpu.VERTEX,format: program.format,entrypoint: program.entrypoint+"",samplers: 0,uniform_sizes: [192]}
-    fs_desc := gpu.ShaderDesc{stage: gpu.FRAGMENT,format: program.format,entrypoint: program.entrypoint+"",samplers: 6,uniform_sizes: [64,lighting_uniform_size(),416]}
+    fs_desc := gpu.ShaderDesc{stage: gpu.FRAGMENT,format: program.format,entrypoint: program.entrypoint+"",samplers: 6,uniform_sizes: [80,lighting_uniform_size(),416]}
     $vs := dev.shader(&vs_desc,&program.vertex) or >>
     $fs := dev.shader(&fs_desc,&program.fragment) or >>
     $desc := mesh_pipeline()
@@ -156,6 +166,14 @@ fn init_3d_session(session present.Session, program &ShaderProgram3D, width int,
     $ccw := dev.graphics_pipeline(&vs,&fs,&desc) or >>
     desc.front_face = gpu.CLOCKWISE
     $cw := dev.graphics_pipeline(&vs,&fs,&desc) or >>
+    $bdesc := mesh_pipeline()
+    bdesc.blend = gpu.BLEND_ALPHA
+    bdesc.depth_write = false
+    $blend_none := dev.graphics_pipeline(&vs,&fs,&bdesc) or >>
+    bdesc.cull = gpu.CULL_BACK
+    $blend_ccw := dev.graphics_pipeline(&vs,&fs,&bdesc) or >>
+    bdesc.front_face = gpu.CLOCKWISE
+    $blend_cw := dev.graphics_pipeline(&vs,&fs,&bdesc) or >>
     vs.close() or >>
     fs.close() or >>
     format := sess.swapchain_format()
@@ -164,10 +182,11 @@ fn init_3d_session(session present.Session, program &ShaderProgram3D, width int,
     sw := size[0]
     sh := size[1]
     << Device3D{session: sess,targets: targets,whites: [white],white_samplers: [white_sampler],
-        pipelines: [pipeline,ccw,cw,copying,resolving],linear_samplers: [linear_sampler],render_scale: 1,max_render_pixels: 4194304,
+        pipelines: [pipeline,ccw,cw,copying,resolving,blend_none,blend_ccw,blend_cw],linear_samplers: [linear_sampler],render_scale: 1,max_render_pixels: 4194304,
         encoders: []gpu.CommandEncoder{},passes: []gpu.RenderPass{},target_width: sw,target_height: sh,
         surface_format: format,draw_count: 0,lit_draws: 0,light_candidates: 0,selected_lights: 0,device_id: 0,
-        active: false,sealed: false,closed: false,cached: false,soft_pixels: []u8{},soft_depth: []f64{},pixels: []u8{}}
+        active: false,sealed: false,closed: false,cached: false,soft_pixels: []u8{},soft_depth: []f64{},pixels: []u8{},
+        viewport_active: false,vp_x: 0,vp_y: 0,vp_w: 0,vp_h: 0}
 }
 // CPU submission counters for the current/last frame, not hardware timings or
 // fragment counts. Only successfully recorded material draws increment them.
@@ -317,6 +336,63 @@ pub fn (device $&Device3D) begin(background int) int {
     device.lit_draws = 0
     device.light_candidates = 0
     device.selected_lights = 0
+    device.viewport_active = false
+    << 0
+}
+pub fn (device $&Device3D) set_viewport(x int, y int, width int, height int) int {
+    device.recording() or >>
+    if x < 0 || y < 0 || width <= 0 || height <= 0 ||
+        x + width > device.target_width || y + height > device.target_height {
+        >> errors.new("nexus 3D: viewport rect out of render target bounds")
+    }
+    device.viewport_active = true
+    device.vp_x = x
+    device.vp_y = y
+    device.vp_w = width
+    device.vp_h = height
+    if device.is_gpu() && device.passes.len > 0 {
+        pass := &device.passes[0]
+        pass.viewport(x, y, width, height) or >>
+        pass.scissor(x, y, width, height) or >>
+    }
+    << 0
+}
+pub fn (device $&Device3D) reset_viewport() int {
+    device.recording() or >>
+    device.viewport_active = false
+    if device.is_gpu() && device.passes.len > 0 {
+        pass := &device.passes[0]
+        pass.viewport(0, 0, device.target_width, device.target_height) or >>
+        pass.scissor(0, 0, device.target_width, device.target_height) or >>
+    }
+    << 0
+}
+fn (device $&Device3D) pause_render_pass() int {
+    device.recording() or >>
+    if !device.is_gpu() || device.sealed { << 0 }
+    if device.passes.len > 0 {
+        pass := $&device.passes[0]
+        pass.end() or(err){ device.abandon_frame()
+            >> err }
+        device.passes = []gpu.RenderPass{}
+    }
+    << 0
+}
+fn (device $&Device3D) resume_render_pass() int {
+    device.recording() or >>
+    if !device.is_gpu() || device.sealed { << 0 }
+    if device.passes.len > 0 { << 0 }
+    encoder := $&device.encoders[0]
+    attachment := gpu.ColorAttachment{view: device.targets[0].view(0) or >>,load: gpu.LOAD,store: gpu.STORE,clear: gpu.Color{r: 0.0,g: 0.0,b: 0.0,a: 1.0}}
+    depth := gpu.depth_attachment(&device.targets[1],gpu.LOAD,gpu.STORE,0.0)
+    pass := encoder.begin_render(attachment,depth) or(err){ device.abandon_frame()
+        >> err }
+    device.passes = [pass]
+    if device.viewport_active {
+        rp := &device.passes[0]
+        rp.viewport(device.vp_x, device.vp_y, device.vp_w, device.vp_h) or >>
+        rp.scissor(device.vp_x, device.vp_y, device.vp_w, device.vp_h) or >>
+    }
     << 0
 }
 fn (device $&Device3D) seal() int {
@@ -328,9 +404,7 @@ fn (device $&Device3D) seal() int {
         device.sealed = true
         << 0
     }
-    pass := $&device.passes[0]
-    pass.end() or(err){ device.abandon_frame()
-        >> err }
+    device.pause_render_pass() or >>
     device.resolve_target() or(err){ device.abandon_frame()
         >> err }
     encoder := $&device.encoders[0]

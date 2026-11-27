@@ -1,0 +1,266 @@
+@"github.com/xulang-org/nexus/foundation/math"
+
+#math
+#errors
+
+pub struct Ray3D {
+    pub origin Vec3
+    pub direction Vec3
+}
+
+pub struct RayHit {
+    pub hit bool
+    pub t f64
+    pub point Vec3
+    pub normal Vec3
+}
+
+pub struct Plane3D {
+    pub normal Vec3
+    pub d f64
+}
+
+pub struct Sphere3D {
+    pub center Vec3
+    pub radius f64
+}
+
+pub struct Frustum3D {
+    pub planes []Plane3D
+}
+
+pub fn ray3d(origin Vec3, direction Vec3) Ray3D {
+    if !origin.is_finite() { >> errors.new("nexus math: ray origin must be finite") }
+    unit := direction.normalized() or >>
+    << Ray3D{origin: origin, direction: unit}
+}
+
+pub fn (r Ray3D) point_at(t f64) Vec3 {
+    << r.origin.add(r.direction.scaled(t))
+}
+
+pub fn plane_from_point_normal(point Vec3, normal Vec3) Plane3D {
+    if !point.is_finite() { >> errors.new("nexus math: plane point must be finite") }
+    n := normal.normalized() or >>
+    << Plane3D{normal: n, d: -n.dot(point)}
+}
+
+// Plane equation: normal . p + d = 0 (positive half-space is n . p + d >= 0).
+pub fn plane_from_coeffs(a f64, b f64, c f64, d f64) Plane3D {
+    raw := vec3(a, b, c)
+    if !raw.is_finite() || !finite(d) {
+        >> errors.new("nexus math: plane coefficients must be finite")
+    }
+    len := raw.length()
+    if len <= 1e-12 { >> errors.new("nexus math: zero plane normal") }
+    inv := 1.0 / len
+    << Plane3D{normal: raw.scaled(inv), d: d * inv}
+}
+
+pub fn (p Plane3D) signed_distance(point Vec3) f64 {
+    << p.normal.dot(point) + p.d
+}
+
+pub fn sphere3d(center Vec3, radius f64) Sphere3D {
+    if !center.is_finite() || !finite(radius) || radius <= 0.0 {
+        >> errors.new("nexus math: invalid sphere center or radius")
+    }
+    << Sphere3D{center: center, radius: radius}
+}
+
+pub fn (s Sphere3D) contains(point Vec3) bool {
+    << s.center.distance_sq(point) <= s.radius * s.radius
+}
+
+pub fn (s Sphere3D) overlaps_sphere(other Sphere3D) bool {
+    r := s.radius + other.radius
+    << s.center.distance_sq(other.center) <= r * r
+}
+
+pub fn (s Sphere3D) overlaps_aabb(box Aabb3) bool {
+    dist_sq := box.distance_squared(s.center) or (err) {
+        _ := err.msg()
+        << false
+    }
+    << dist_sq <= s.radius * s.radius
+}
+
+// Extracts 6 inward-facing frustum planes from a Reverse-Z view-projection matrix
+// matching clip3.xu conventions: -w <= x, y <= w and 0 <= z <= w.
+pub fn extract_frustum_from_vp(vp Mat4) Frustum3D {
+    if !vp.is_finite() {
+        >> errors.new("nexus math: frustum extraction requires finite matrix")
+    }
+    rows := vp.transposed()
+    r0 := rows.c0
+    r1 := rows.c1
+    r2 := rows.c2
+    r3 := rows.c3
+    left := plane_from_coeffs(r3.x + r0.x, r3.y + r0.y, r3.z + r0.z, r3.w + r0.w) or >>
+    right := plane_from_coeffs(r3.x - r0.x, r3.y - r0.y, r3.z - r0.z, r3.w - r0.w) or >>
+    bottom := plane_from_coeffs(r3.x + r1.x, r3.y + r1.y, r3.z + r1.z, r3.w + r1.w) or >>
+    top := plane_from_coeffs(r3.x - r1.x, r3.y - r1.y, r3.z - r1.z, r3.w - r1.w) or >>
+    // Reverse-Z: near is z <= w (row3 - row2 >= 0), far is z >= 0 (row2 >= 0).
+    near_p := plane_from_coeffs(r3.x - r2.x, r3.y - r2.y, r3.z - r2.z, r3.w - r2.w) or >>
+    far_p := plane_from_coeffs(r2.x, r2.y, r2.z, r2.w) or >>
+    << Frustum3D{planes: [left, right, bottom, top, near_p, far_p]}
+}
+
+pub fn (f &Frustum3D) contains_point(p Vec3) bool {
+    for pl in f.planes {
+        if pl.signed_distance(p) < -1e-6 { << false }
+    }
+    << true
+}
+
+pub fn (f &Frustum3D) intersects_sphere(s Sphere3D) bool {
+    for pl in f.planes {
+        if pl.signed_distance(s.center) < -s.radius { << false }
+    }
+    << true
+}
+
+pub fn (f &Frustum3D) intersects_aabb(box Aabb3) bool {
+    for pl in f.planes {
+        $px := box.minimum.x
+        $py := box.minimum.y
+        $pz := box.minimum.z
+        if pl.normal.x >= 0.0 { px = box.maximum.x }
+        if pl.normal.y >= 0.0 { py = box.maximum.y }
+        if pl.normal.z >= 0.0 { pz = box.maximum.z }
+        if pl.signed_distance(vec3(px, py, pz)) < -1e-6 { << false }
+    }
+    << true
+}
+
+fn no_ray_hit() RayHit {
+    << RayHit{hit: false, t: 0.0, point: vec3(0.0, 0.0, 0.0), normal: vec3(0.0, 0.0, 0.0)}
+}
+
+pub fn ray_plane_intersect(ray Ray3D, plane Plane3D) RayHit {
+    denom := plane.normal.dot(ray.direction)
+    if math.abs(denom) <= 1e-12 { << no_ray_hit() }
+    t := -(plane.normal.dot(ray.origin) + plane.d) / denom
+    if t < 0.0 { << no_ray_hit() }
+    $n := plane.normal
+    if denom > 0.0 { n = n.neg() }
+    << RayHit{hit: true, t: t, point: ray.point_at(t), normal: n}
+}
+
+pub fn ray_sphere_intersect(ray Ray3D, sphere Sphere3D) RayHit {
+    oc := ray.origin.sub(sphere.center)
+    b := oc.dot(ray.direction)
+    c := oc.dot(oc) - sphere.radius * sphere.radius
+    disc := b * b - c
+    if disc < 0.0 { << no_ray_hit() }
+    s := math.sqrt(disc)
+    $t := -b - s
+    if t < 0.0 {
+        t = -b + s
+        if t < 0.0 { << no_ray_hit() }
+    }
+    pt := ray.point_at(t)
+    n := pt.sub(sphere.center).normalized_or_zero()
+    << RayHit{hit: true, t: t, point: pt, normal: n}
+}
+
+pub fn ray_aabb_intersect(ray Ray3D, box Aabb3) RayHit {
+    $tmin := 0.0
+    $tmax := 1e30
+    $hit_n := vec3(0.0, 0.0, 0.0)
+
+    for axis in 0:3 {
+        $o := ray.origin.x
+        $d := ray.direction.x
+        $lo := box.minimum.x
+        $hi := box.maximum.x
+        $ax_pos := vec3(1.0, 0.0, 0.0)
+        $ax_neg := vec3(-1.0, 0.0, 0.0)
+        if axis == 1 {
+            o = ray.origin.y
+            d = ray.direction.y
+            lo = box.minimum.y
+            hi = box.maximum.y
+            ax_pos = vec3(0.0, 1.0, 0.0)
+            ax_neg = vec3(0.0, -1.0, 0.0)
+        } else if axis == 2 {
+            o = ray.origin.z
+            d = ray.direction.z
+            lo = box.minimum.z
+            hi = box.maximum.z
+            ax_pos = vec3(0.0, 0.0, 1.0)
+            ax_neg = vec3(0.0, 0.0, -1.0)
+        }
+        if math.abs(d) <= 1e-12 {
+            if o < lo || o > hi { << no_ray_hit() }
+        } else {
+            inv_d := 1.0 / d
+            $t1 := (lo - o) * inv_d
+            $t2 := (hi - o) * inv_d
+            $n_enter := ax_neg
+            if t1 > t2 {
+                tmp := t1
+                t1 = t2
+                t2 = tmp
+                n_enter = ax_pos
+            }
+            if t1 > tmin {
+                tmin = t1
+                hit_n = n_enter
+            }
+            if t2 < tmax { tmax = t2 }
+            if tmin > tmax { << no_ray_hit() }
+        }
+    }
+    << RayHit{hit: true, t: tmin, point: ray.point_at(tmin), normal: hit_n}
+}
+
+pub fn ray_triangle_intersect(ray Ray3D, a Vec3, b Vec3, c Vec3, backface_cull bool) RayHit {
+    e1 := b.sub(a)
+    e2 := c.sub(a)
+    pvec := ray.direction.cross(e2)
+    det := e1.dot(pvec)
+    if backface_cull {
+        if det <= 1e-12 { << no_ray_hit() }
+    } else {
+        if math.abs(det) <= 1e-12 { << no_ray_hit() }
+    }
+    inv_det := 1.0 / det
+    tvec := ray.origin.sub(a)
+    u := tvec.dot(pvec) * inv_det
+    if u < 0.0 || u > 1.0 { << no_ray_hit() }
+    qvec := tvec.cross(e1)
+    v := ray.direction.dot(qvec) * inv_det
+    if v < 0.0 || u + v > 1.0 { << no_ray_hit() }
+    t := e2.dot(qvec) * inv_det
+    if t < 0.0 { << no_ray_hit() }
+    $n := e1.cross(e2).normalized_or_zero()
+    if det < 0.0 { n = n.neg() }
+    << RayHit{hit: true, t: t, point: ray.point_at(t), normal: n}
+}
+
+pub fn closest_point_on_segment_2d(p Vec2, a Vec2, b Vec2) Vec2 {
+    ab := b.sub(a)
+    denom := ab.length_sq()
+    if denom <= 1e-12 { << a }
+    t := math.max(0.0, math.min(1.0, p.sub(a).dot(ab) / denom))
+    << a.add(ab.scaled(t))
+}
+
+pub fn closest_point_on_segment_3d(p Vec3, a Vec3, b Vec3) Vec3 {
+    ab := b.sub(a)
+    denom := ab.length_sq()
+    if denom <= 1e-12 { << a }
+    t := math.max(0.0, math.min(1.0, p.sub(a).dot(ab) / denom))
+    << a.add(ab.scaled(t))
+}
+
+pub fn point_segment_distance_sq_2d(p Vec2, a Vec2, b Vec2) f64 {
+    c := closest_point_on_segment_2d(p, a, b)
+    << p.distance_sq(c)
+}
+
+pub fn point_segment_distance_sq_3d(p Vec3, a Vec3, b Vec3) f64 {
+    c := closest_point_on_segment_3d(p, a, b)
+    << p.distance_sq(c)
+}

@@ -25,6 +25,21 @@ base=dict(format='xu.scene',version=1,
 def write(name,data):
     (OUT/(name+'.xuscene')).write_text(json.dumps(data,ensure_ascii=False,separators=(',',':'))+'\n')
 write('base',base)
+profile = dict(count=3, resolution=256, distance=42.98765432101234, split_lambda=.71, blend_fraction=.19,
+               caster_padding=7.5, stabilization_step=.03125, raster_bias_texels=.0078125)
+authored = copy.deepcopy(base)
+authored['version'] = 4
+authored['lights'][0]['cascades'] = profile
+authored['lights'][3] = dict(node=5, type='directional', direction=[1,0,0], radiance=[2,2,2],
+                             cascades=dict(profile, count=4))
+write('cascades', authored)
+point_shadow = dict(near=.12345678901234567, resolution=512, constant_bias=.00002, slope_bias=.00005)
+spot_shadow = dict(near=.375, resolution=1024, constant_bias=.00003, slope_bias=.00004)
+punctual = copy.deepcopy(authored)
+punctual['version'] = 5
+punctual['lights'][1]['shadow'] = point_shadow
+punctual['lights'][2]['shadow'] = spot_shadow
+write('punctual', punctual)
 full=copy.deepcopy(base)
 full['nodes']=[node(-1,'World')]+[node(0,'Light'+str(i),visible=False) for i in range(256)]
 full['lights']=[dict(node=i+1,type='point',position=[0,0,0],radiance=[1,1,1],radius=5) for i in range(256)]
@@ -57,6 +72,53 @@ for name,index,change in [
     ('cone-string',2,dict(inner_cosine='0.9')),('cone-degrees',2,dict(inner_half_angle=20)),
 ]:bad(name,lambda d,i=index,c=change:d['lights'][i].update(c))
 bad('duplicate-node',lambda d:d['lights'].append(copy.deepcopy(d['lights'][0])))
+for label, version, index, value in [
+    ('legacy', 3, 0, profile),
+    ('point', 4, 1, profile),
+    ('spot', 4, 2, profile),
+    ('null', 4, 0, None),
+    ('extra', 4, 0, dict(profile, atlas_handle=7)),
+    ('missing', 4, 0, {k: v for k, v in profile.items() if k != 'distance'}),
+    ('count-zero', 4, 0, dict(profile, count=0)),
+    ('count-high', 4, 0, dict(profile, count=5)),
+    ('count-fraction', 4, 0, dict(profile, count=3.5)),
+    ('resolution', 4, 0, dict(profile, resolution=260)),
+    ('distance-zero', 4, 0, dict(profile, distance=0)),
+    ('lambda', 4, 0, dict(profile, split_lambda=1.1)),
+    ('blend', 4, 0, dict(profile, blend_fraction=.31)),
+    ('padding', 4, 0, dict(profile, caster_padding=-1)),
+    ('step', 4, 0, dict(profile, stabilization_step=0)),
+    ('bias', 4, 0, dict(profile, raster_bias_texels=.51)),
+]:
+    def invalid_cascades(scene, schema=version, light=index, cascades=value):
+        scene['version'] = schema
+        scene['lights'][light]['cascades'] = cascades
+    bad('cascades-' + label, invalid_cascades)
+for label, version, index, value in [
+    ('legacy', 4, 1, point_shadow),
+    ('directional', 5, 0, point_shadow),
+    ('null', 5, 1, None),
+    ('extra', 5, 1, dict(point_shadow, face_count=6)),
+    ('missing', 5, 2, {k: v for k, v in spot_shadow.items() if k != 'near'}),
+    ('point-resolution', 5, 1, dict(point_shadow, resolution=1024)),
+    ('non-power-of-two', 5, 2, dict(spot_shadow, resolution=300)),
+    ('resolution-zero', 5, 2, dict(spot_shadow, resolution=0)),
+    ('resolution-fraction', 5, 2, dict(spot_shadow, resolution=128.5)),
+    ('near-small', 5, 1, dict(point_shadow, near=.00009)),
+    ('near-at-range', 5, 2, dict(spot_shadow, near=12)),
+    ('near-almost-range', 5, 2, dict(spot_shadow, near=11.999999)),
+    ('bias-negative', 5, 1, dict(point_shadow, constant_bias=-.01)),
+    ('bias-too-large', 5, 2, dict(spot_shadow, slope_bias=.05001)),
+    ('bias-string', 5, 2, dict(spot_shadow, slope_bias='.01')),
+]:
+    def invalid_shadow(scene, schema=version, light=index, shadow=value):
+        scene['version'] = schema
+        scene['lights'][light]['shadow'] = shadow
+    bad('shadow-' + label, invalid_shadow)
+def invalid_shadow_cone(scene):
+    scene['version'] = 5
+    scene['lights'][2].update(outer_cosine=.0009, shadow=spot_shadow)
+bad('shadow-spot-cone', invalid_shadow_cone)
 large=copy.deepcopy(full);large['nodes'].append(node(0,'Overflow'));large['lights'].append(dict(node=257,type='point',position=[0,0,0],radiance=[0,0,0],radius=1));write('reject-count',large);rejects.append('reject-count.xuscene')
 # JSON duplicate fields must fail before a last-write-wins dictionary can hide them.
 raw=json.dumps(base,separators=(',',':'))

@@ -1,0 +1,527 @@
+@"github.com/xulang-org/nexus/ai/bt"
+
+#errors
+#math
+#strconv
+#strings
+
+pub const BT_SUCCESS = 0
+pub const BT_FAILURE = 1
+pub const BT_RUNNING = 2
+
+pub const BT_SEQUENCE = 0
+pub const BT_SELECTOR = 1
+pub const BT_PARALLEL = 2
+pub const BT_INVERTER = 3
+pub const BT_REPEATER = 4
+pub const BT_COOLDOWN = 5
+pub const BT_SUCCEEDER = 6
+pub const BT_COND_GT = 7
+pub const BT_COND_LT = 8
+pub const BT_COND_EQ = 9
+pub const BT_COND_BOOL = 10
+pub const BT_SET_F64 = 11
+pub const BT_SET_BOOL = 12
+pub const BT_WAIT = 13
+pub const BT_ACTION = 14
+
+pub const BT_REQUIRE_ALL = 0
+pub const BT_REQUIRE_ONE = 1
+
+pub const MAX_BT_DEPTH = 64
+
+pub struct Blackboard {
+    f64_keys []string
+    f64_vals []f64
+    bool_keys []string
+    bool_vals []bool
+    str_keys []string
+    str_vals []string
+}
+
+pub struct BtActionCall {
+    pub node_id int
+    pub name string
+    pub payload f64
+}
+
+pub struct BtNode {
+    pub id int
+    pub kind int
+    pub name string
+    pub children []int
+    pub bb_key string
+    pub threshold f64
+    pub flag_val bool
+    pub repeat_count int
+    pub duration f64
+    pub policy int
+}
+
+pub struct BehaviorTree {
+    pub nodes []BtNode
+    pub root_id int
+}
+
+pub struct BtRunner {
+    elapsed []f64
+    cooldown_left []f64
+    repeat_done []int
+    running_child []int
+    action_ids []int
+    action_results []int
+    emitted []BtActionCall
+    trace []string
+}
+
+pub fn new_blackboard() Blackboard {
+    << Blackboard{
+        f64_keys: []string{},
+        f64_vals: []f64{},
+        bool_keys: []string{},
+        bool_vals: []bool{},
+        str_keys: []string{},
+        str_vals: []string{}
+    }
+}
+
+pub fn (b $&Blackboard) set_f64(key string, val f64) {
+    for i in 0:b.f64_keys.len {
+        if b.f64_keys[i] == key {
+            b.f64_vals[i] = val
+            <<
+        }
+    }
+    b.f64_keys.push(key)
+    b.f64_vals.push(val)
+}
+
+pub fn (b &Blackboard) has_f64(key string) bool {
+    for k in b.f64_keys {
+        if k == key { << true }
+    }
+    << false
+}
+
+pub fn (b &Blackboard) get_f64(key string, fallback f64) f64 {
+    for i in 0:b.f64_keys.len {
+        if b.f64_keys[i] == key { << b.f64_vals[i] }
+    }
+    << fallback
+}
+
+pub fn (b $&Blackboard) set_bool(key string, val bool) {
+    for i in 0:b.bool_keys.len {
+        if b.bool_keys[i] == key {
+            b.bool_vals[i] = val
+            <<
+        }
+    }
+    b.bool_keys.push(key)
+    b.bool_vals.push(val)
+}
+
+pub fn (b &Blackboard) has_bool(key string) bool {
+    for k in b.bool_keys {
+        if k == key { << true }
+    }
+    << false
+}
+
+pub fn (b &Blackboard) get_bool(key string, fallback bool) bool {
+    for i in 0:b.bool_keys.len {
+        if b.bool_keys[i] == key { << b.bool_vals[i] }
+    }
+    << fallback
+}
+
+pub fn (b $&Blackboard) set_str(key string, val string) {
+    for i in 0:b.str_keys.len {
+        if b.str_keys[i] == key {
+            b.str_vals[i] = val
+            <<
+        }
+    }
+    b.str_keys.push(key)
+    b.str_vals.push(val)
+}
+
+pub fn (b &Blackboard) get_str(key string, fallback string) string {
+    for i in 0:b.str_keys.len {
+        if b.str_keys[i] == key { << b.str_vals[i] + "" }
+    }
+    << fallback
+}
+
+pub fn new_tree() BehaviorTree {
+    << BehaviorTree{nodes: []BtNode{}, root_id: 0}
+}
+
+fn push_bt_node(
+    t $&BehaviorTree,
+    kind int,
+    name string,
+    bb_key string,
+    threshold f64,
+    flag_val bool,
+    repeat_count int,
+    duration f64,
+    policy int
+) int {
+    id := t.nodes.len + 1
+    t.nodes.push(BtNode{
+        id: id,
+        kind: kind,
+        name: name,
+        children: []int{},
+        bb_key: bb_key,
+        threshold: threshold,
+        flag_val: flag_val,
+        repeat_count: repeat_count,
+        duration: duration,
+        policy: policy
+    })
+    if t.root_id == 0 {
+        t.root_id = id
+    }
+    << id
+}
+
+pub fn (t $&BehaviorTree) set_root(id int) int {
+    if id < 1 || id > t.nodes.len { >> errors.new("nexus bt: invalid root node id") }
+    t.root_id = id
+    << 0
+}
+
+pub fn (t $&BehaviorTree) add_sequence(name string) int {
+    << push_bt_node(t, BT_SEQUENCE, name, "", 0.0, false, 0, 0.0, BT_REQUIRE_ALL)
+}
+
+pub fn (t $&BehaviorTree) add_selector(name string) int {
+    << push_bt_node(t, BT_SELECTOR, name, "", 0.0, false, 0, 0.0, BT_REQUIRE_ALL)
+}
+
+pub fn (t $&BehaviorTree) add_parallel(name string, policy int) int {
+    << push_bt_node(t, BT_PARALLEL, name, "", 0.0, false, 0, 0.0, policy)
+}
+
+pub fn (t $&BehaviorTree) add_inverter(name string) int {
+    << push_bt_node(t, BT_INVERTER, name, "", 0.0, false, 0, 0.0, BT_REQUIRE_ALL)
+}
+
+pub fn (t $&BehaviorTree) add_repeater(name string, count int) int {
+    << push_bt_node(t, BT_REPEATER, name, "", 0.0, false, count, 0.0, BT_REQUIRE_ALL)
+}
+
+pub fn (t $&BehaviorTree) add_cooldown(name string, seconds f64) int {
+    << push_bt_node(t, BT_COOLDOWN, name, "", 0.0, false, 0, math.max(0.0, seconds), BT_REQUIRE_ALL)
+}
+
+pub fn (t $&BehaviorTree) add_succeeder(name string) int {
+    << push_bt_node(t, BT_SUCCEEDER, name, "", 0.0, false, 0, 0.0, BT_REQUIRE_ALL)
+}
+
+pub fn (t $&BehaviorTree) add_cond_gt(key string, threshold f64) int {
+    << push_bt_node(t, BT_COND_GT, key + "_gt", key, threshold, false, 0, 0.0, BT_REQUIRE_ALL)
+}
+
+pub fn (t $&BehaviorTree) add_cond_lt(key string, threshold f64) int {
+    << push_bt_node(t, BT_COND_LT, key + "_lt", key, threshold, false, 0, 0.0, BT_REQUIRE_ALL)
+}
+
+pub fn (t $&BehaviorTree) add_cond_eq(key string, threshold f64) int {
+    << push_bt_node(t, BT_COND_EQ, key + "_eq", key, threshold, false, 0, 0.0, BT_REQUIRE_ALL)
+}
+
+pub fn (t $&BehaviorTree) add_cond_bool(key string, expected bool) int {
+    << push_bt_node(t, BT_COND_BOOL, key + "_bool", key, 0.0, expected, 0, 0.0, BT_REQUIRE_ALL)
+}
+
+pub fn (t $&BehaviorTree) add_set_f64(key string, value f64) int {
+    << push_bt_node(t, BT_SET_F64, key + "_set", key, value, false, 0, 0.0, BT_REQUIRE_ALL)
+}
+
+pub fn (t $&BehaviorTree) add_set_bool(key string, value bool) int {
+    << push_bt_node(t, BT_SET_BOOL, key + "_setb", key, 0.0, value, 0, 0.0, BT_REQUIRE_ALL)
+}
+
+pub fn (t $&BehaviorTree) add_wait(name string, seconds f64) int {
+    << push_bt_node(t, BT_WAIT, name, "", 0.0, false, 0, math.max(0.0, seconds), BT_REQUIRE_ALL)
+}
+
+pub fn (t $&BehaviorTree) add_action(name string, payload f64) int {
+    << push_bt_node(t, BT_ACTION, name, "", payload, false, 0, 0.0, BT_REQUIRE_ALL)
+}
+
+pub fn (t $&BehaviorTree) add_child(parent int, child int) int {
+    if parent < 1 || parent > t.nodes.len || child < 1 || child > t.nodes.len || parent == child {
+        >> errors.new("nexus bt: invalid parent or child id")
+    }
+    idx := parent - 1
+    ch := $&t.nodes[idx].children
+    ch.push(child)
+    << 0
+}
+
+pub fn new_runner(tree &BehaviorTree) BtRunner {
+    $elapsed := []f64{}
+    $cd := []f64{}
+    $rep := []int{}
+    $rchild := []int{}
+    for _ in 0:tree.nodes.len {
+        elapsed.push(0.0)
+        cd.push(0.0)
+        rep.push(0)
+        rchild.push(0)
+    }
+    << BtRunner{
+        elapsed: elapsed,
+        cooldown_left: cd,
+        repeat_done: rep,
+        running_child: rchild,
+        action_ids: []int{},
+        action_results: []int{},
+        emitted: []BtActionCall{},
+        trace: []string{}
+    }
+}
+
+pub fn (r $&BtRunner) reset() {
+    for i in 0:r.elapsed.len {
+        r.elapsed[i] = 0.0
+        r.cooldown_left[i] = 0.0
+        r.repeat_done[i] = 0
+        r.running_child[i] = 0
+    }
+    r.action_ids = []int{}
+    r.action_results = []int{}
+    r.emitted = []BtActionCall{}
+    r.trace = []string{}
+}
+
+pub fn (r $&BtRunner) set_action_status(node_id int, status int) {
+    for i in 0:r.action_ids.len {
+        if r.action_ids[i] == node_id {
+            r.action_results[i] = status
+            <<
+        }
+    }
+    r.action_ids.push(node_id)
+    r.action_results.push(status)
+}
+
+pub fn (r $&BtRunner) clear_action_status(node_id int) {
+    $next_ids := []int{}
+    $next_res := []int{}
+    for i in 0:r.action_ids.len {
+        if r.action_ids[i] != node_id {
+            next_ids.push(r.action_ids[i])
+            next_res.push(r.action_results[i])
+        }
+    }
+    r.action_ids = next_ids
+    r.action_results = next_res
+}
+
+fn (r &BtRunner) lookup_action_status(node_id int) int {
+    for i in 0:r.action_ids.len {
+        if r.action_ids[i] == node_id { << r.action_results[i] }
+    }
+    << BT_SUCCESS
+}
+
+pub fn (r $&BtRunner) drain_actions() []BtActionCall {
+    $out := []BtActionCall{}
+    for a in r.emitted {
+        out.push(BtActionCall{node_id: a.node_id, name: a.name + "", payload: a.payload})
+    }
+    r.emitted = []BtActionCall{}
+    << out
+}
+
+pub fn (r &BtRunner) last_trace() []string {
+    $out := []string{}
+    for s in r.trace { out.push(s + "") }
+    << out
+}
+
+fn eval_node(tree &BehaviorTree, r $&BtRunner, bb $&Blackboard, id int, dt f64, depth int) int {
+    if depth >= MAX_BT_DEPTH { >> errors.new("nexus bt: recursion depth limit exceeded") }
+    if id < 1 || id > tree.nodes.len { >> errors.new("nexus bt: invalid node id") }
+    idx := id - 1
+    n := &tree.nodes[idx]
+    k := n.kind
+
+    if k == BT_COND_GT {
+        res := bb.get_f64(n.bb_key + "", 0.0) > n.threshold
+        $st := BT_FAILURE
+        if res { st = BT_SUCCESS }
+        r.trace.push(n.name + "=" + str(st))
+        << st
+    }
+    if k == BT_COND_LT {
+        res := bb.get_f64(n.bb_key + "", 0.0) < n.threshold
+        $st := BT_FAILURE
+        if res { st = BT_SUCCESS }
+        r.trace.push(n.name + "=" + str(st))
+        << st
+    }
+    if k == BT_COND_EQ {
+        res := math.abs(bb.get_f64(n.bb_key + "", 0.0) - n.threshold) < 1e-6
+        $st := BT_FAILURE
+        if res { st = BT_SUCCESS }
+        r.trace.push(n.name + "=" + str(st))
+        << st
+    }
+    if k == BT_COND_BOOL {
+        res := bb.get_bool(n.bb_key + "", false) == n.flag_val
+        $st := BT_FAILURE
+        if res { st = BT_SUCCESS }
+        r.trace.push(n.name + "=" + str(st))
+        << st
+    }
+    if k == BT_SET_F64 {
+        bb.set_f64(n.bb_key + "", n.threshold)
+        r.trace.push(n.name + "=0")
+        << BT_SUCCESS
+    }
+    if k == BT_SET_BOOL {
+        bb.set_bool(n.bb_key + "", n.flag_val)
+        r.trace.push(n.name + "=0")
+        << BT_SUCCESS
+    }
+    if k == BT_WAIT {
+        r.elapsed[idx] = r.elapsed[idx] + dt
+        if r.elapsed[idx] >= n.duration {
+            r.elapsed[idx] = 0.0
+            r.trace.push(n.name + "=0")
+            << BT_SUCCESS
+        }
+        r.trace.push(n.name + "=2")
+        << BT_RUNNING
+    }
+    if k == BT_ACTION {
+        r.emitted.push(BtActionCall{node_id: id, name: n.name + "", payload: n.threshold})
+        st := r.lookup_action_status(id)
+        r.trace.push(n.name + "=" + str(st))
+        << st
+    }
+
+    if k == BT_SEQUENCE {
+        $start := r.running_child[idx]
+        if start < 0 || start >= n.children.len { start = 0 }
+        for ci in start:n.children.len {
+            st := eval_node(tree, r, bb, n.children[ci], dt, depth + 1) or >>
+            if st == BT_RUNNING {
+                r.running_child[idx] = ci
+                << BT_RUNNING
+            }
+            if st == BT_FAILURE {
+                r.running_child[idx] = 0
+                << BT_FAILURE
+            }
+        }
+        r.running_child[idx] = 0
+        << BT_SUCCESS
+    }
+    if k == BT_SELECTOR {
+        $start := r.running_child[idx]
+        if start < 0 || start >= n.children.len { start = 0 }
+        for ci in start:n.children.len {
+            st := eval_node(tree, r, bb, n.children[ci], dt, depth + 1) or >>
+            if st == BT_RUNNING {
+                r.running_child[idx] = ci
+                << BT_RUNNING
+            }
+            if st == BT_SUCCESS {
+                r.running_child[idx] = 0
+                << BT_SUCCESS
+            }
+        }
+        r.running_child[idx] = 0
+        << BT_FAILURE
+    }
+    if k == BT_PARALLEL {
+        $succ := 0
+        $fail := 0
+        for ci in 0:n.children.len {
+            st := eval_node(tree, r, bb, n.children[ci], dt, depth + 1) or >>
+            if st == BT_SUCCESS { succ = succ + 1 }
+            else if st == BT_FAILURE { fail = fail + 1 }
+        }
+        if n.policy == BT_REQUIRE_ONE {
+            if succ > 0 { << BT_SUCCESS }
+            if fail == n.children.len { << BT_FAILURE }
+            << BT_RUNNING
+        }
+        if fail > 0 { << BT_FAILURE }
+        if succ == n.children.len { << BT_SUCCESS }
+        << BT_RUNNING
+    }
+    if k == BT_INVERTER {
+        if n.children.len != 1 { >> errors.new("nexus bt: inverter requires 1 child") }
+        st := eval_node(tree, r, bb, n.children[0], dt, depth + 1) or >>
+        if st == BT_SUCCESS { << BT_FAILURE }
+        if st == BT_FAILURE { << BT_SUCCESS }
+        << BT_RUNNING
+    }
+    if k == BT_SUCCEEDER {
+        if n.children.len != 1 { >> errors.new("nexus bt: succeeder requires 1 child") }
+        st := eval_node(tree, r, bb, n.children[0], dt, depth + 1) or >>
+        if st == BT_RUNNING { << BT_RUNNING }
+        << BT_SUCCESS
+    }
+    if k == BT_REPEATER {
+        if n.children.len != 1 { >> errors.new("nexus bt: repeater requires 1 child") }
+        target := n.repeat_count
+        st := eval_node(tree, r, bb, n.children[0], dt, depth + 1) or >>
+        if st == BT_RUNNING { << BT_RUNNING }
+        if st == BT_FAILURE {
+            r.repeat_done[idx] = 0
+            << BT_FAILURE
+        }
+        r.repeat_done[idx] = r.repeat_done[idx] + 1
+        if target > 0 && r.repeat_done[idx] >= target {
+            r.repeat_done[idx] = 0
+            << BT_SUCCESS
+        }
+        << BT_RUNNING
+    }
+    if k == BT_COOLDOWN {
+        if n.children.len != 1 { >> errors.new("nexus bt: cooldown requires 1 child") }
+        if r.cooldown_left[idx] > 0.0 {
+            r.trace.push(n.name + "=cooldown")
+            << BT_FAILURE
+        }
+        st := eval_node(tree, r, bb, n.children[0], dt, depth + 1) or >>
+        if st == BT_SUCCESS {
+            r.cooldown_left[idx] = n.duration
+        }
+        << st
+    }
+    >> errors.new("nexus bt: unknown node kind")
+}
+
+pub fn (r $&BtRunner) tick(tree &BehaviorTree, bb $&Blackboard, dt f64) int {
+    if !fm_finite(dt) || dt < 0.0 { >> errors.new("nexus bt: dt must be finite and non-negative") }
+    if tree.root_id <= 0 { >> errors.new("nexus bt: tree has no root node") }
+    if r.elapsed.len < tree.nodes.len {
+        while r.elapsed.len < tree.nodes.len {
+            r.elapsed.push(0.0)
+            r.cooldown_left.push(0.0)
+            r.repeat_done.push(0)
+            r.running_child.push(0)
+        }
+    }
+    for i in 0:r.cooldown_left.len {
+        if r.cooldown_left[i] > 0.0 {
+            r.cooldown_left[i] = math.max(0.0, r.cooldown_left[i] - dt)
+        }
+    }
+    r.trace = []string{}
+    << eval_node(tree, r, bb, tree.root_id, dt, 0) or >>
+}
+
+fn fm_finite(v f64) bool {
+    << !math.is_nan(v) && !math.is_inf(v)
+}

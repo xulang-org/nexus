@@ -1,0 +1,523 @@
+@"github.com/xulang-org/nexus/resources/terrain"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const MAX_TERRAIN_DIM = 1025
+pub const MAX_TERRAIN_LOD = 4
+
+pub struct TerrainConfig {
+    pub width int
+    pub depth int
+    pub origin fm.Vec3
+    pub cell_size f64
+    pub height_scale f64
+}
+
+pub struct HeightmapTerrain {
+    pub width int
+    pub depth int
+    pub origin fm.Vec3
+    pub cell_size f64
+    pub height_scale f64
+    pub heights []f64
+    pub splat []f64
+    pub min_height f64
+    pub max_height f64
+}
+
+pub struct TerrainRayHit {
+    pub hit bool
+    pub distance f64
+    pub point fm.Vec3
+    pub normal fm.Vec3
+}
+
+fn clamp_i(v int, lo int, hi int) int {
+    if v < lo { << lo }
+    if v > hi { << hi }
+    << v
+}
+
+fn clamp_f(v f64, lo f64, hi f64) f64 {
+    if v < lo { << lo }
+    if v > hi { << hi }
+    << v
+}
+
+fn smoothstep_f(edge0 f64, edge1 f64, x f64) f64 {
+    if edge1 <= edge0 {
+        if x >= edge0 { << 1.0 }
+        << 0.0
+    }
+    t := clamp_f((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    << t * t * (3.0 - 2.0 * t)
+}
+
+fn hash2d_01(ix int, iz int, seed int) f64 {
+    $h := ((ix * 374761393) ^ (iz * 668265263) ^ (seed * 1442695041)) & 0x7fffffff
+    h = ((h ^ (h >> 13)) * 1274126177) & 0x7fffffff
+    h = (h ^ (h >> 16)) & 0x7fffffff
+    << f64(h) / 2147483647.0
+}
+
+fn value_noise_2d(x f64, z f64, seed int) f64 {
+    ix := int(math.floor(x))
+    iz := int(math.floor(z))
+    fx := x - f64(ix)
+    fz := z - f64(iz)
+    ux := fx * fx * (3.0 - 2.0 * fx)
+    uz := fz * fz * (3.0 - 2.0 * fz)
+
+    n00 := hash2d_01(ix, iz, seed)
+    n10 := hash2d_01(ix + 1, iz, seed)
+    n01 := hash2d_01(ix, iz + 1, seed)
+    n11 := hash2d_01(ix + 1, iz + 1, seed)
+
+    nx0 := n00 + (n10 - n00) * ux
+    nx1 := n01 + (n11 - n01) * ux
+    << nx0 + (nx1 - nx0) * uz
+}
+
+fn fbm_ridged(x f64, z f64, seed int, octaves int, base_freq f64, ridge_weight f64) f64 {
+    $freq := base_freq
+    $amp := 1.0
+    $norm := 0.0
+    $fbm_sum := 0.0
+    $ridge_sum := 0.0
+    for oct in 0:octaves {
+        n := value_noise_2d(x * freq + f64(oct) * 19.37, z * freq + f64(oct) * 31.13, seed + oct * 97)
+        fbm_sum += n * amp
+        r := 1.0 - math.abs(n * 2.0 - 1.0)
+        ridge_sum += (r * r) * amp
+        norm += amp
+        freq *= 2.0
+        amp *= 0.5
+    }
+    if norm <= 0.0 { << 0.0 }
+    base_val := fbm_sum / norm
+    ridge_val := ridge_sum / norm
+    << base_val * (1.0 - ridge_weight) + ridge_val * ridge_weight
+}
+
+pub fn default_terrain_config(width int, depth int) TerrainConfig {
+    << TerrainConfig{
+        width: width,
+        depth: depth,
+        origin: fm.vec3(0.0, 0.0, 0.0),
+        cell_size: 1.0,
+        height_scale: 1.0
+    }
+}
+
+pub fn new_heightmap_terrain(cfg TerrainConfig, heights []f64) HeightmapTerrain {
+    if cfg.width < 2 || cfg.depth < 2 || cfg.width > MAX_TERRAIN_DIM || cfg.depth > MAX_TERRAIN_DIM {
+        >> errors.new("nexus terrain: width and depth must be in 2..1025")
+    }
+    if !cfg.origin.is_finite() || !fm.finite(cfg.cell_size) || cfg.cell_size <= 0.0 ||
+        !fm.finite(cfg.height_scale) || cfg.height_scale <= 0.0 {
+        >> errors.new("nexus terrain: origin, cell_size (>0), and height_scale (>0) must be finite")
+    }
+    expected := cfg.width * cfg.depth
+    if heights.len != expected {
+        >> errors.new("nexus terrain: heights slice length must equal width * depth")
+    }
+    $min_h := cfg.origin.y + heights[0] * cfg.height_scale
+    $max_h := min_h
+    $splat := []f64{}
+    for i in 0:expected {
+        h := heights[i]
+        if !fm.finite(h) {
+            >> errors.new("nexus terrain: height value must be finite")
+        }
+        wy := cfg.origin.y + h * cfg.height_scale
+        if wy < min_h { min_h = wy }
+        if wy > max_h { max_h = wy }
+        splat.push(1.0)
+        splat.push(0.0)
+        splat.push(0.0)
+        splat.push(0.0)
+    }
+    << HeightmapTerrain{
+        width: cfg.width,
+        depth: cfg.depth,
+        origin: cfg.origin,
+        cell_size: cfg.cell_size,
+        height_scale: cfg.height_scale,
+        heights: heights,
+        splat: splat,
+        min_height: min_h,
+        max_height: max_h
+    }
+}
+
+pub fn generate_procedural_terrain(
+    cfg TerrainConfig,
+    seed int,
+    octaves int,
+    base_freq f64,
+    amplitude f64,
+    ridge_weight f64
+) HeightmapTerrain {
+    if octaves < 1 || octaves > 10 {
+        >> errors.new("nexus terrain: octaves must be in 1..10")
+    }
+    if !fm.finite(base_freq) || base_freq <= 0.0 || !fm.finite(amplitude) || amplitude < 0.0 ||
+        !fm.finite(ridge_weight) || ridge_weight < 0.0 || ridge_weight > 1.0 {
+        >> errors.new("nexus terrain: invalid procedural generation parameters")
+    }
+    if cfg.width < 2 || cfg.depth < 2 || cfg.width > MAX_TERRAIN_DIM || cfg.depth > MAX_TERRAIN_DIM {
+        >> errors.new("nexus terrain: width and depth must be in 2..1025")
+    }
+    $heights := []f64{}
+    for iz in 0:cfg.depth {
+        wz := cfg.origin.z + f64(iz) * cfg.cell_size
+        for ix in 0:cfg.width {
+            wx := cfg.origin.x + f64(ix) * cfg.cell_size
+            n := fbm_ridged(wx, wz, seed, octaves, base_freq, ridge_weight)
+            heights.push(n * amplitude)
+        }
+    }
+    $terr := new_heightmap_terrain(cfg, heights) or >>
+    span := terr.max_height - terr.min_height
+    dirt_h := terr.min_height + span * 0.18
+    snow_h := terr.min_height + span * 0.72
+    terr.auto_generate_splat(snow_h, 0.80, dirt_h) or >>
+    << terr
+}
+
+pub fn (t $&HeightmapTerrain) recompute_height_bounds() int {
+    if t.heights.len != t.width * t.depth || t.heights.len == 0 {
+        >> errors.new("nexus terrain: invalid terrain buffer")
+    }
+    $min_h := t.origin.y + t.heights[0] * t.height_scale
+    $max_h := min_h
+    for i in 1:t.heights.len {
+        wy := t.origin.y + t.heights[i] * t.height_scale
+        if wy < min_h { min_h = wy }
+        if wy > max_h { max_h = wy }
+    }
+    t.min_height = min_h
+    t.max_height = max_h
+    << 0
+}
+
+pub fn (t $&HeightmapTerrain) set_height(vx int, vz int, h f64) int {
+    if vx < 0 || vx >= t.width || vz < 0 || vz >= t.depth || !fm.finite(h) {
+        >> errors.new("nexus terrain: vertex index or height out of range")
+    }
+    t.heights[vz * t.width + vx] = h
+    wy := t.origin.y + h * t.height_scale
+    if wy < t.min_height { t.min_height = wy }
+    if wy > t.max_height { t.max_height = wy }
+    << 0
+}
+
+pub fn (t $&HeightmapTerrain) set_splat(vx int, vz int, r f64, g f64, b f64, a f64) int {
+    if vx < 0 || vx >= t.width || vz < 0 || vz >= t.depth {
+        >> errors.new("nexus terrain: splat vertex index out of range")
+    }
+    if !fm.finite(r) || !fm.finite(g) || !fm.finite(b) || !fm.finite(a) {
+        >> errors.new("nexus terrain: splat weights must be finite")
+    }
+    $cr := math.max(0.0, r)
+    $cg := math.max(0.0, g)
+    $cb := math.max(0.0, b)
+    $ca := math.max(0.0, a)
+    sum := cr + cg + cb + ca
+    if sum <= 1e-12 {
+        cr = 1.0
+        cg = 0.0
+        cb = 0.0
+        ca = 0.0
+    } else {
+        cr /= sum
+        cg /= sum
+        cb /= sum
+        ca /= sum
+    }
+    base := (vz * t.width + vx) * 4
+    t.splat[base] = cr
+    t.splat[base + 1] = cg
+    t.splat[base + 2] = cb
+    t.splat[base + 3] = ca
+    << 0
+}
+
+pub fn (t $&HeightmapTerrain) auto_generate_splat(snow_height f64, rock_slope_ny f64, dirt_height f64) int {
+    if !fm.finite(snow_height) || !fm.finite(rock_slope_ny) || !fm.finite(dirt_height) {
+        >> errors.new("nexus terrain: splat thresholds must be finite")
+    }
+    span := math.max(t.max_height - t.min_height, 0.5)
+    snow_band := math.min(1.25, span * 0.14)
+    dirt_band := math.min(0.80, span * 0.10)
+    for iz in 0:t.depth {
+        for ix in 0:t.width {
+            wy := t.vertex_height(ix, iz)
+            n := t.vertex_normal(ix, iz)
+            snow_w := smoothstep_f(snow_height - snow_band, snow_height + snow_band, wy)
+            rock_w := (1.0 - smoothstep_f(rock_slope_ny - 0.10, rock_slope_ny + 0.06, n.y)) * (1.0 - snow_w * 0.4)
+            dirt_w := (1.0 - smoothstep_f(dirt_height - dirt_band, dirt_height + dirt_band, wy)) * (1.0 - rock_w) * (1.0 - snow_w)
+            grass_w := math.max(0.0, 1.0 - snow_w - rock_w - dirt_w)
+            _ := t.set_splat(ix, iz, grass_w, dirt_w, rock_w, snow_w) or >>
+        }
+    }
+    << 0
+}
+
+pub fn (t &HeightmapTerrain) splat_rgba_pixels() []int {
+    total := t.width * t.depth
+    $pixels := []int{}
+    for i in 0:total {
+        base := i * 4
+        r := clamp_i(int(math.round(t.splat[base] * 255.0)), 0, 255)
+        g := clamp_i(int(math.round(t.splat[base + 1] * 255.0)), 0, 255)
+        b := clamp_i(int(math.round(t.splat[base + 2] * 255.0)), 0, 255)
+        a := clamp_i(int(math.round(t.splat[base + 3] * 255.0)), 0, 255)
+        rgba := (r << 24) | (g << 16) | (b << 8) | a
+        pixels.push(rgba)
+    }
+    << pixels
+}
+
+pub fn (t &HeightmapTerrain) world_size_x() f64 {
+    << f64(t.width - 1) * t.cell_size
+}
+
+pub fn (t &HeightmapTerrain) world_size_z() f64 {
+    << f64(t.depth - 1) * t.cell_size
+}
+
+pub fn (t &HeightmapTerrain) world_bounds() fm.Aabb3 {
+    min_pt := fm.vec3(t.origin.x, t.min_height, t.origin.z)
+    max_pt := fm.vec3(t.origin.x + t.world_size_x(), t.max_height, t.origin.z + t.world_size_z())
+    << fm.Aabb3{minimum: min_pt, maximum: max_pt}
+}
+
+pub fn (t &HeightmapTerrain) vertex_height(vx int, vz int) f64 {
+    cx := clamp_i(vx, 0, t.width - 1)
+    cz := clamp_i(vz, 0, t.depth - 1)
+    << t.origin.y + t.heights[cz * t.width + cx] * t.height_scale
+}
+
+pub fn (t &HeightmapTerrain) vertex_position(vx int, vz int) fm.Vec3 {
+    cx := clamp_i(vx, 0, t.width - 1)
+    cz := clamp_i(vz, 0, t.depth - 1)
+    << fm.vec3(
+        t.origin.x + f64(cx) * t.cell_size,
+        t.vertex_height(cx, cz),
+        t.origin.z + f64(cz) * t.cell_size
+    )
+}
+
+pub fn (t &HeightmapTerrain) vertex_normal(vx int, vz int) fm.Vec3 {
+    cx := clamp_i(vx, 0, t.width - 1)
+    cz := clamp_i(vz, 0, t.depth - 1)
+    x0 := clamp_i(cx - 1, 0, t.width - 1)
+    x1 := clamp_i(cx + 1, 0, t.width - 1)
+    z0 := clamp_i(cz - 1, 0, t.depth - 1)
+    z1 := clamp_i(cz + 1, 0, t.depth - 1)
+    dx := math.max(f64(x1 - x0) * t.cell_size, 0.0001)
+    dz := math.max(f64(z1 - z0) * t.cell_size, 0.0001)
+    sx := (t.vertex_height(x1, cz) - t.vertex_height(x0, cz)) / dx
+    sz := (t.vertex_height(cx, z1) - t.vertex_height(cx, z0)) / dz
+    raw := fm.vec3(-sx, 1.0, -sz)
+    n := raw.normalized() or (err) { << fm.vec3(0.0, 1.0, 0.0) }
+    << n
+}
+
+// Exact height matching the cell triangulation:
+// Tri A: (v00, v01, v11) for fz >= fx
+// Tri B: (v00, v11, v10) for fz < fx
+pub fn (t &HeightmapTerrain) sample_height(wx f64, wz f64) f64 {
+    gx_f := clamp_f((wx - t.origin.x) / t.cell_size, 0.0, f64(t.width - 1))
+    gz_f := clamp_f((wz - t.origin.z) / t.cell_size, 0.0, f64(t.depth - 1))
+    gx := clamp_i(int(math.floor(gx_f)), 0, t.width - 2)
+    gz := clamp_i(int(math.floor(gz_f)), 0, t.depth - 2)
+    fx := clamp_f(gx_f - f64(gx), 0.0, 1.0)
+    fz := clamp_f(gz_f - f64(gz), 0.0, 1.0)
+
+    h00 := t.vertex_height(gx, gz)
+    h10 := t.vertex_height(gx + 1, gz)
+    h01 := t.vertex_height(gx, gz + 1)
+    h11 := t.vertex_height(gx + 1, gz + 1)
+    if fz >= fx {
+        << h00 + (h01 - h00) * fz + (h11 - h01) * fx
+    }
+    << h00 + (h10 - h00) * fx + (h11 - h10) * fz
+}
+
+pub fn (t &HeightmapTerrain) sample_normal(wx f64, wz f64) fm.Vec3 {
+    eps := math.max(t.cell_size * 0.25, 0.02)
+    hl := t.sample_height(wx - eps, wz)
+    hr := t.sample_height(wx + eps, wz)
+    hd := t.sample_height(wx, wz - eps)
+    hu := t.sample_height(wx, wz + eps)
+    raw := fm.vec3(hl - hr, 2.0 * eps, hd - hu)
+    n := raw.normalized() or (err) { << fm.vec3(0.0, 1.0, 0.0) }
+    << n
+}
+
+pub fn (t &HeightmapTerrain) sample_splat(wx f64, wz f64) fm.Vec4 {
+    gx_f := clamp_f((wx - t.origin.x) / t.cell_size, 0.0, f64(t.width - 1))
+    gz_f := clamp_f((wz - t.origin.z) / t.cell_size, 0.0, f64(t.depth - 1))
+    gx := clamp_i(int(math.floor(gx_f)), 0, t.width - 2)
+    gz := clamp_i(int(math.floor(gz_f)), 0, t.depth - 2)
+    fx := clamp_f(gx_f - f64(gx), 0.0, 1.0)
+    fz := clamp_f(gz_f - f64(gz), 0.0, 1.0)
+
+    i00 := (gz * t.width + gx) * 4
+    i10 := (gz * t.width + (gx + 1)) * 4
+    i01 := ((gz + 1) * t.width + gx) * 4
+    i11 := ((gz + 1) * t.width + (gx + 1)) * 4
+
+    w00 := (1.0 - fx) * (1.0 - fz)
+    w10 := fx * (1.0 - fz)
+    w01 := (1.0 - fx) * fz
+    w11 := fx * fz
+
+    r := t.splat[i00] * w00 + t.splat[i10] * w10 + t.splat[i01] * w01 + t.splat[i11] * w11
+    g := t.splat[i00 + 1] * w00 + t.splat[i10 + 1] * w10 + t.splat[i01 + 1] * w01 + t.splat[i11 + 1] * w11
+    b := t.splat[i00 + 2] * w00 + t.splat[i10 + 2] * w10 + t.splat[i01 + 2] * w01 + t.splat[i11 + 2] * w11
+    a := t.splat[i00 + 3] * w00 + t.splat[i10 + 3] * w10 + t.splat[i01 + 3] * w01 + t.splat[i11 + 3] * w11
+    << fm.vec4(r, g, b, a)
+}
+
+fn ray_aabb_interval(origin fm.Vec3, dir fm.Vec3, box fm.Aabb3, max_dist f64) fm.Vec2 {
+    $t0 := 0.0
+    $t1 := max_dist
+    origins := [origin.x, origin.y, origin.z]
+    dirs := [dir.x, dir.y, dir.z]
+    mins := [box.minimum.x, box.minimum.y, box.minimum.z]
+    maxs := [box.maximum.x, box.maximum.y, box.maximum.z]
+    for axis in 0:3 {
+        d := dirs[axis]
+        o := origins[axis]
+        lo := mins[axis] - 0.001
+        hi := maxs[axis] + 0.001
+        if math.abs(d) <= 1e-12 {
+            if o < lo || o > hi { << fm.vec2(1.0, -1.0) }
+        } else {
+            inv := 1.0 / d
+            $a := (lo - o) * inv
+            $b := (hi - o) * inv
+            if a > b {
+                tmp := a
+                a = b
+                b = tmp
+            }
+            if a > t0 { t0 = a }
+            if b < t1 { t1 = b }
+            if t0 > t1 { << fm.vec2(1.0, -1.0) }
+        }
+    }
+    << fm.vec2(t0, t1)
+}
+
+fn ray_tri_hit(origin fm.Vec3, dir fm.Vec3, a fm.Vec3, b fm.Vec3, c fm.Vec3, max_dist f64) TerrainRayHit {
+    miss := TerrainRayHit{hit: false, distance: max_dist, point: fm.vec3(0.0, 0.0, 0.0), normal: fm.vec3(0.0, 1.0, 0.0)}
+    e1 := b.sub(a)
+    e2 := c.sub(a)
+    pvec := dir.cross(e2)
+    det := e1.dot(pvec)
+    if math.abs(det) < 1e-12 { << miss }
+    inv_det := 1.0 / det
+    tvec := origin.sub(a)
+    u := tvec.dot(pvec) * inv_det
+    eps := 1e-7
+    if u < -eps || u > 1.0 + eps { << miss }
+    qvec := tvec.cross(e1)
+    v := dir.dot(qvec) * inv_det
+    if v < -eps || u + v > 1.0 + eps { << miss }
+    t := e2.dot(qvec) * inv_det
+    if t < 0.0 || t > max_dist { << miss }
+    $n := e1.cross(e2).normalized() or (err) { << miss }
+    if n.dot(dir) > 0.0 { n = n.scaled(-1.0) }
+    << TerrainRayHit{hit: true, distance: t, point: origin.add(dir.scaled(t)), normal: n}
+}
+
+pub fn (t &HeightmapTerrain) raycast(origin fm.Vec3, direction fm.Vec3, max_distance f64) TerrainRayHit {
+    if !origin.is_finite() || !fm.finite(max_distance) || max_distance <= 0.0 {
+        >> errors.new("nexus terrain: invalid ray origin or max_distance")
+    }
+    dir := direction.normalized() or >>
+    miss := TerrainRayHit{hit: false, distance: max_distance, point: fm.vec3(0.0, 0.0, 0.0), normal: fm.vec3(0.0, 1.0, 0.0)}
+    bounds := t.world_bounds()
+    span := ray_aabb_interval(origin, dir, bounds, max_distance)
+    if span.x > span.y { << miss }
+
+    t_enter := math.max(0.0, span.x)
+    t_exit := math.min(max_distance, span.y)
+    start_pt := origin.add(dir.scaled(t_enter))
+
+    max_cx := t.width - 2
+    max_cz := t.depth - 2
+    $cx := clamp_i(int(math.floor((start_pt.x - t.origin.x) / t.cell_size)), 0, max_cx)
+    $cz := clamp_i(int(math.floor((start_pt.z - t.origin.z) / t.cell_size)), 0, max_cz)
+
+    $step_x := 0
+    $t_max_x := 1e30
+    $t_delta_x := 1e30
+    if math.abs(dir.x) > 1e-12 {
+        if dir.x > 0.0 {
+            step_x = 1
+            next_x := t.origin.x + f64(cx + 1) * t.cell_size
+            t_max_x = (next_x - origin.x) / dir.x
+        } else {
+            step_x = -1
+            next_x := t.origin.x + f64(cx) * t.cell_size
+            t_max_x = (next_x - origin.x) / dir.x
+        }
+        t_delta_x = t.cell_size / math.abs(dir.x)
+    }
+
+    $step_z := 0
+    $t_max_z := 1e30
+    $t_delta_z := 1e30
+    if math.abs(dir.z) > 1e-12 {
+        if dir.z > 0.0 {
+            step_z = 1
+            next_z := t.origin.z + f64(cz + 1) * t.cell_size
+            t_max_z = (next_z - origin.z) / dir.z
+        } else {
+            step_z = -1
+            next_z := t.origin.z + f64(cz) * t.cell_size
+            t_max_z = (next_z - origin.z) / dir.z
+        }
+        t_delta_z = t.cell_size / math.abs(dir.z)
+    }
+
+    $best := miss
+    max_steps := (t.width + t.depth) * 2 + 4
+    for _ in 0:max_steps {
+        if cx < 0 || cx > max_cx || cz < 0 || cz > max_cz { <- }
+        v00 := t.vertex_position(cx, cz)
+        v10 := t.vertex_position(cx + 1, cz)
+        v01 := t.vertex_position(cx, cz + 1)
+        v11 := t.vertex_position(cx + 1, cz + 1)
+
+        ha := ray_tri_hit(origin, dir, v00, v01, v11, best.distance)
+        if ha.hit && (!best.hit || ha.distance < best.distance) {
+            best = ha
+        }
+        hb := ray_tri_hit(origin, dir, v00, v11, v10, best.distance)
+        if hb.hit && (!best.hit || hb.distance < best.distance) {
+            best = hb
+        }
+        if best.hit && best.distance <= math.min(t_max_x, t_max_z) + 1e-6 {
+            << best
+        }
+
+        if t_max_x < t_max_z {
+            if t_max_x > t_exit { <- }
+            t_max_x += t_delta_x
+            cx += step_x
+        } else {
+            if t_max_z > t_exit { <- }
+            t_max_z += t_delta_z
+            cz += step_z
+        }
+    }
+    << best
+}

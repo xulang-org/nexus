@@ -73,7 +73,8 @@ with tempfile.TemporaryDirectory(prefix='phone checkpoint ') as directory:
     module.mkdir()
     (module/'state.xu').write_text((ROOT/'examples/phone_arena/state.xu').read_text())
     (module/'main.xu').write_text('@main\n#strings\n#os\nfm #"github.com/xulang-org/nexus/foundation/math"\n' + SOURCE.removeprefix('@main\n'))
-    (module/'xu.xun').write_text('module: test/phone_checkpoint\nversion: !ver 0.1.0\nxu: !ver 0.12.5\nrequire:\n  "github.com/xulang-org/nexus": file:' + str(ROOT) + '\n')
+    sdk = next(line for line in (ROOT/'xu.xun').read_text().splitlines() if line.startswith('xu:'))
+    (module/'xu.xun').write_text('module: test/phone_checkpoint\nversion: !ver 0.1.0\n' + sdk + '\nrequire:\n  "github.com/xulang-org/nexus": file:' + str(ROOT) + '\n')
     binary = temporary/'check'
     data = temporary/'data'
     data.mkdir()

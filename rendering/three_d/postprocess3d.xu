@@ -1,0 +1,876 @@
+@"github.com/xulang-org/nexus/rendering/three_d"
+
+#gpu
+#errors
+#math
+layout #gpu/layout
+fm #"github.com/xulang-org/nexus/foundation/math"
+
+pub struct PostProcessProgram3D {
+    pub format int
+    pub entrypoint string
+    pub hdr_vertex []u8
+    pub hdr_fragment []u8
+    pub gtao []u8
+    pub gtao_blur []u8
+    pub ssr []u8
+    pub bloom_down []u8
+    pub bloom_up []u8
+    pub taa_resolve []u8
+    pub composite_vertex []u8
+    pub composite_fragment []u8
+}
+
+pub fn empty_postprocess_program_3d() PostProcessProgram3D {
+    << PostProcessProgram3D{
+        format: 0, entrypoint: "",
+        hdr_vertex: []u8{}, hdr_fragment: []u8{},
+        gtao: []u8{}, gtao_blur: []u8{}, ssr: []u8{},
+        bloom_down: []u8{}, bloom_up: []u8{}, taa_resolve: []u8{},
+        composite_vertex: []u8{}, composite_fragment: []u8{}
+    }
+}
+
+pub struct PostProcessConfig3D {
+    pub ao_enabled bool
+    pub ao_radius f64
+    pub ao_strength f64
+    pub ao_bias f64
+    pub ssr_enabled bool
+    pub ssr_strength f64
+    pub ssr_max_roughness f64
+    pub ssr_max_distance f64
+    pub ssr_thickness f64
+    pub bloom_enabled bool
+    pub bloom_threshold f64
+    pub bloom_knee f64
+    pub bloom_intensity f64
+    pub taa_enabled bool
+    pub taa_blend f64
+    pub exposure f64
+    pub aces_tonemap bool
+    pub dither_strength f64
+}
+
+pub fn post_process_defaults_3d() PostProcessConfig3D {
+    << PostProcessConfig3D{
+        ao_enabled: true,
+        ao_radius: 1.2,
+        ao_strength: 0.85,
+        ao_bias: 0.04,
+        ssr_enabled: true,
+        ssr_strength: 0.9,
+        ssr_max_roughness: 0.55,
+        ssr_max_distance: 10.0,
+        ssr_thickness: 0.45,
+        bloom_enabled: true,
+        bloom_threshold: 1.0,
+        bloom_knee: 0.25,
+        bloom_intensity: 0.35,
+        taa_enabled: false,
+        taa_blend: 0.85,
+        exposure: 1.0,
+        aces_tonemap: true,
+        dither_strength: 1.0
+    }
+}
+
+pub fn (cfg &PostProcessConfig3D) validate() int {
+    if !fm.finite(cfg.ao_radius) || cfg.ao_radius <= 0.0 || cfg.ao_radius > 20.0 ||
+        !fm.finite(cfg.ao_strength) || cfg.ao_strength < 0.0 || cfg.ao_strength > 1.0 ||
+        !fm.finite(cfg.ao_bias) || cfg.ao_bias < 0.0 || cfg.ao_bias > 1.0 ||
+        !fm.finite(cfg.ssr_strength) || cfg.ssr_strength < 0.0 || cfg.ssr_strength > 4.0 ||
+        !fm.finite(cfg.ssr_max_roughness) || cfg.ssr_max_roughness < 0.045 || cfg.ssr_max_roughness > 1.0 ||
+        !fm.finite(cfg.ssr_max_distance) || cfg.ssr_max_distance <= 0.0 || cfg.ssr_max_distance > 200.0 ||
+        !fm.finite(cfg.ssr_thickness) || cfg.ssr_thickness <= 0.0 || cfg.ssr_thickness > 10.0 ||
+        !fm.finite(cfg.bloom_threshold) || cfg.bloom_threshold < 0.0 || cfg.bloom_threshold > 64.0 ||
+        !fm.finite(cfg.bloom_knee) || cfg.bloom_knee < 0.0 || cfg.bloom_knee > 4.0 ||
+        !fm.finite(cfg.bloom_intensity) || cfg.bloom_intensity < 0.0 || cfg.bloom_intensity > 4.0 ||
+        !fm.finite(cfg.taa_blend) || cfg.taa_blend < 0.0 || cfg.taa_blend > 0.95 ||
+        !fm.finite(cfg.exposure) || cfg.exposure <= 0.0 || cfg.exposure > 32.0 ||
+        !fm.finite(cfg.dither_strength) || cfg.dither_strength < 0.0 || cfg.dither_strength > 1.0 {
+        >> errors.new("nexus postprocess: invalid configuration scalar range")
+    }
+    << 0
+}
+
+pub struct HdrTarget3D {
+    owner DeviceRef3D
+    textures []gpu.Texture // [0]=hdr_color RGBA16F, [1]=normal_roughness RGBA16F, [2]=depth DEPTH32F
+    pipelines []gpu.GraphicsPipeline // [0..2]=opaque CULL_{NONE,BACK,FRONT}, [3..5]=transparent alpha-blend
+    buffers []gpu.Buffer // [0]=dummy 64B probe fallback
+    encoders []gpu.CommandEncoder
+    passes []gpu.RenderPass
+    width int
+    height int
+    active bool
+    transparent_pass bool
+    ready bool
+    closed bool
+}
+
+pub fn (device &Device3D) hdr_target(program &PostProcessProgram3D) HdrTarget3D {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: create HDR target outside a frame") }
+    if !device.is_gpu() { >> errors.new("nexus 3D: HDR target requires GPU backend") }
+    dev := device.gpu_device() or >>
+    if (dev.shader_formats() & program.format) == 0 || program.entrypoint.len == 0 ||
+        program.hdr_vertex.len == 0 || program.hdr_fragment.len == 0 {
+        >> errors.new("nexus 3D: invalid or unsupported HDR shader program")
+    }
+    if !(dev.supports_texture_2d(layout.RGBA16_FLOAT, gpu.TEXTURE_COLOR_TARGET | gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COMPUTE_STORAGE_WRITE) or >>) {
+        >> errors.new("nexus 3D: GPU does not support RGBA16_FLOAT render/compute target")
+    }
+    if !(dev.supports_texture_2d(layout.DEPTH32_FLOAT, gpu.TEXTURE_DEPTH_TARGET | gpu.TEXTURE_SAMPLED) or >>) {
+        >> errors.new("nexus 3D: GPU does not support sampled DEPTH32_FLOAT target")
+    }
+
+    w := device.target_width * device.render_scale
+    h := device.target_height * device.render_scale
+    stats := dev.stats() or >>
+    internal_bytes := device.target_width * device.target_height * 8 + 4
+    needed := w * h * 20
+    if stats.texture_count + 3 > 513 + device.targets.len || needed > 67108864 - (stats.texture_bytes - internal_bytes) {
+        >> errors.new("nexus 3D: HDR MRT target exceeds texture count or 64 MiB VRAM budget")
+    }
+
+    $hdr_col := dev.texture_2d(gpu.Texture2DDesc{
+        format: layout.RGBA16_FLOAT,
+        width: w, height: h, levels: 1,
+        usage: gpu.TEXTURE_COLOR_TARGET | gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COMPUTE_STORAGE_WRITE
+    }) or >>
+    $norm_rough := dev.texture_2d(gpu.Texture2DDesc{
+        format: layout.RGBA16_FLOAT,
+        width: w, height: h, levels: 1,
+        usage: gpu.TEXTURE_COLOR_TARGET | gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COMPUTE_STORAGE_WRITE
+    }) or >>
+    $depth_tex := dev.texture_2d(gpu.Texture2DDesc{
+        format: layout.DEPTH32_FLOAT,
+        width: w, height: h, levels: 1,
+        usage: gpu.TEXTURE_DEPTH_TARGET | gpu.TEXTURE_SAMPLED
+    }) or >>
+
+    vs_desc := gpu.ShaderResourcesDesc{
+        stage: gpu.VERTEX,
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 0, storage_textures: 0, storage_buffers: 0,
+        uniform_sizes: [256]
+    }
+    fs_desc := gpu.ShaderResourcesDesc{
+        stage: gpu.FRAGMENT,
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 6, storage_textures: 0, storage_buffers: 4,
+        uniform_sizes: [112, 80, 416, 48]
+    }
+    $vs := dev.shader_with_resources(&vs_desc, &program.hdr_vertex) or >>
+    $fs := dev.shader_with_resources(&fs_desc, &program.hdr_fragment) or >>
+
+    mrt := [gpu.ColorTargetDesc{format: layout.RGBA16_FLOAT, blend: gpu.BLEND_DISABLED},
+            gpu.ColorTargetDesc{format: layout.RGBA16_FLOAT, blend: gpu.BLEND_DISABLED}]
+    $pdesc := mesh_pipeline()
+    $p_none := dev.graphics_pipeline_targets(&vs, &fs, &pdesc, &mrt) or >>
+    pdesc.cull = gpu.CULL_BACK
+    $p_back := dev.graphics_pipeline_targets(&vs, &fs, &pdesc, &mrt) or >>
+    pdesc.cull = gpu.CULL_FRONT
+    $p_front := dev.graphics_pipeline_targets(&vs, &fs, &pdesc, &mrt) or >>
+
+    mrt_blend := [gpu.ColorTargetDesc{format: layout.RGBA16_FLOAT, blend: gpu.BLEND_ALPHA}]
+    $bdesc := mesh_pipeline()
+    bdesc.depth_write = false
+    bdesc.depth_compare = gpu.GREATER
+    $p_b_none := dev.graphics_pipeline_targets(&vs, &fs, &bdesc, &mrt_blend) or >>
+    bdesc.cull = gpu.CULL_BACK
+    $p_b_back := dev.graphics_pipeline_targets(&vs, &fs, &bdesc, &mrt_blend) or >>
+    bdesc.cull = gpu.CULL_FRONT
+    $p_b_front := dev.graphics_pipeline_targets(&vs, &fs, &bdesc, &mrt_blend) or >>
+    vs.close() or >>
+    fs.close() or >>
+
+    $dummy_probe := dev.buffer(64, gpu.BUFFER_GRAPHICS_STORAGE_READ | gpu.BUFFER_COMPUTE_STORAGE_READ) or >>
+    zeros := zero_bytes(64)
+    $up := dev.upload(&dummy_probe, 0, &zeros) or >>
+    up.close() or >>
+
+    << HdrTarget3D{
+        owner: device.reference(),
+        textures: [hdr_col, norm_rough, depth_tex],
+        pipelines: [p_none, p_back, p_front, p_b_none, p_b_back, p_b_front],
+        buffers: [dummy_probe],
+        encoders: []gpu.CommandEncoder{},
+        passes: []gpu.RenderPass{},
+        width: w,
+        height: h,
+        active: false,
+        transparent_pass: false,
+        ready: false,
+        closed: false
+    }
+}
+
+fn (hdr $&HdrTarget3D) begin_mode(device &Device3D, clear_rgba int, clear_targets bool) int {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: end main frame before recording HDR pass, or run HDR before device.begin") }
+    if hdr.closed || hdr.active || !hdr.owner.matches(device) {
+        >> errors.new("nexus 3D: closed, already active or foreign HDR target")
+    }
+    dev := device.gpu_device() or >>
+    $enc := dev.command_encoder() or >>
+    clear := rgba_color(clear_rgba) or >>
+    $load_op := gpu.LOAD
+    if clear_targets { load_op = gpu.CLEAR }
+    c0 := gpu.ColorAttachment{view: hdr.textures[0].view(0) or >>, load: load_op, store: gpu.STORE, clear: clear}
+    c1 := gpu.ColorAttachment{view: hdr.textures[1].view(0) or >>, load: load_op, store: gpu.STORE, clear: gpu.Color{r: 0.0, g: 0.0, b: 0.0, a: 0.0}}
+    cols := [c0, c1]
+    dep := gpu.depth_attachment(&hdr.textures[2], load_op, gpu.STORE, 0.0)
+    $pass := enc.begin_render_targets(&cols, dep) or >>
+    hdr.encoders = [enc]
+    hdr.passes = [pass]
+    hdr.active = true
+    hdr.transparent_pass = false
+    hdr.ready = false
+    << 0
+}
+
+pub fn (hdr $&HdrTarget3D) begin(device &Device3D, clear_rgba int) int {
+    << hdr.begin_mode(device, clear_rgba, true) or >>
+}
+
+// Resumes rendering into existing HDR color/normal/depth contents (e.g. dynamic skinned meshes after VisBuffer shading).
+pub fn (hdr $&HdrTarget3D) begin_overlay(device &Device3D) int {
+    << hdr.begin_mode(device, 0, false) or >>
+}
+
+// Resumes rendering alpha-blended transparent meshes into existing HDR color + depth (depth_write=false, preserving normal_roughness).
+pub fn (hdr $&HdrTarget3D) begin_transparent_overlay(device &Device3D) int {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: end main frame before recording HDR transparent pass") }
+    if hdr.closed || hdr.active || !hdr.owner.matches(device) {
+        >> errors.new("nexus 3D: closed, already active or foreign HDR target")
+    }
+    dev := device.gpu_device() or >>
+    $enc := dev.command_encoder() or >>
+    c0 := gpu.ColorAttachment{
+        view: hdr.textures[0].view(0) or >>,
+        load: gpu.LOAD,
+        store: gpu.STORE,
+        clear: gpu.Color{r: 0.0, g: 0.0, b: 0.0, a: 0.0}
+    }
+    cols := [c0]
+    dep := gpu.depth_attachment(&hdr.textures[2], gpu.LOAD, gpu.STORE, 0.0)
+    $pass := enc.begin_render_targets(&cols, dep) or >>
+    hdr.encoders = [enc]
+    hdr.passes = [pass]
+    hdr.active = true
+    hdr.transparent_pass = true
+    hdr.ready = false
+    << 0
+}
+
+pub fn (hdr $&HdrTarget3D) draw_clustered(
+    device &Device3D,
+    clustered &ClusteredRenderer3D,
+    mesh MeshRef3D,
+    world fm.Mat4,
+    view fm.Mat4,
+    view_projection fm.Mat4,
+    material &Material3D
+) int {
+    words := [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+    $w := []int{}
+    for v in words { w.push(scalar_word(v) or >>) }
+    irr_bytes := word_bytes(&w) or >>
+    << hdr.draw_hdr_internal(device, clustered, &hdr.buffers[0], &irr_bytes, mesh, world, view, view_projection, material) or >>
+}
+
+pub fn (hdr $&HdrTarget3D) draw_clustered_gi(
+    device &Device3D,
+    clustered &ClusteredRenderer3D,
+    irradiance &IrradianceGpu3D,
+    irr_strength f64,
+    mesh MeshRef3D,
+    world fm.Mat4,
+    view fm.Mat4,
+    view_projection fm.Mat4,
+    material &Material3D
+) int {
+    if irradiance.closed || !irradiance.owner.matches(device) {
+        >> errors.new("nexus GI: closed or foreign irradiance probe buffer")
+    }
+    if !fm.finite(irr_strength) || irr_strength < 0.0 || irr_strength > 8.0 {
+        >> errors.new("nexus GI: irradiance strength must be in 0...8")
+    }
+    words := [irradiance.origin.x, irradiance.origin.y, irradiance.origin.z, f64(irradiance.nx),
+        irradiance.spacing.x, irradiance.spacing.y, irradiance.spacing.z, f64(irradiance.ny),
+        f64(irradiance.nz), 1.0, irr_strength, 0.0]
+    $w := []int{}
+    for v in words { w.push(scalar_word(v) or >>) }
+    irr_bytes := word_bytes(&w) or >>
+    << hdr.draw_hdr_internal(device, clustered, &irradiance.buffers[0], &irr_bytes, mesh, world, view, view_projection, material) or >>
+}
+
+pub fn (hdr $&HdrTarget3D) draw_clustered_ddgi(
+    device &Device3D,
+    clustered &ClusteredRenderer3D,
+    ddgi &DdgiVolume3D,
+    irr_strength f64,
+    mesh MeshRef3D,
+    world fm.Mat4,
+    view fm.Mat4,
+    view_projection fm.Mat4,
+    material &Material3D
+) int {
+    if ddgi.closed || !ddgi.owner.matches(device) {
+        >> errors.new("nexus DDGI: closed or foreign DdgiVolume3D")
+    }
+    if !fm.finite(irr_strength) || irr_strength < 0.0 || irr_strength > 8.0 {
+        >> errors.new("nexus DDGI: irradiance strength must be in 0...8")
+    }
+    irr_bytes := ddgi.irradiance_uniform_bytes(irr_strength) or >>
+    sh_idx := ddgi.active_slot
+    << hdr.draw_hdr_internal(device, clustered, &ddgi.buffers[sh_idx], &irr_bytes, mesh, world, view, view_projection, material) or >>
+}
+
+fn (hdr $&HdrTarget3D) draw_hdr_internal(
+    device &Device3D,
+    clustered &ClusteredRenderer3D,
+    probe_buf &gpu.Buffer,
+    irr_bytes &[]u8,
+    mesh MeshRef3D,
+    world fm.Mat4,
+    view fm.Mat4,
+    view_projection fm.Mat4,
+    material &Material3D
+) int {
+    device.alive() or >>
+    if hdr.closed || !hdr.active || !hdr.owner.matches(device) {
+        >> errors.new("nexus 3D: HDR draw requires active HdrTarget3D.begin")
+    }
+    if clustered.closed || !clustered.owner.matches(device) || !clustered.ready {
+        >> errors.new("nexus 3D: HDR clustered draw requires binned ClusteredRenderer3D")
+    }
+    if !view.is_affine() || !view_projection.is_finite() {
+        >> errors.new("nexus 3D: invalid HDR view or view-projection")
+    }
+    device.reference().validate_material(mesh, material) or >>
+
+    base_mats := lit_matrix_words(world, view_projection) or >>
+    $mat_words := []int{}
+    for w in base_mats { mat_words.push(w) }
+    for w in matrix_words(view) or >> { mat_words.push(w) }
+    vert_bytes := word_bytes(&mat_words) or >>
+
+    sign := view_projection.multiply(world).determinant_sign() or >>
+    $orientation := 1.0
+    if sign < 0 { orientation = -1.0 }
+    params := material_hdr_words(material, orientation) or >>
+    frag_bytes := word_bytes(&params) or >>
+    light_bytes := clustered.lighting_uniform_bytes() or >>
+    shadow_bytes := zero_bytes(416)
+
+    pass := $&hdr.passes[0]
+    $pidx := 0
+    if hdr.transparent_pass { pidx = 3 }
+    if material.surface_mode == 0 {
+        if orientation < 0.0 {
+            pidx += 2
+        } else {
+            pidx += 1
+        }
+    }
+    pass.pipeline(&hdr.pipelines[pidx]) or >>
+    pass.vertex_buffer_ref(0, mesh.vertices, 0) or >>
+    pass.index_buffer_ref(mesh.indices, 0, gpu.INDEX32) or >>
+    maps := material.maps()
+    for i in 0:5 {
+        tex := &maps[i]
+        if tex.present {
+            pass.sampler_ref(gpu.FRAGMENT, i, tex.image, tex.sampler) or >>
+        } else {
+            pass.sampler(gpu.FRAGMENT, i, &device.whites[0], &device.white_samplers[0]) or >>
+        }
+    }
+    pass.sampler(gpu.FRAGMENT, 5, &device.whites[0], &device.white_samplers[0]) or >>
+    pass.uniform(gpu.VERTEX, 0, &vert_bytes) or >>
+    pass.uniform(gpu.FRAGMENT, 0, &frag_bytes) or >>
+    pass.uniform(gpu.FRAGMENT, 1, &light_bytes) or >>
+    pass.uniform(gpu.FRAGMENT, 2, &shadow_bytes) or >>
+    pass.uniform(gpu.FRAGMENT, 3, irr_bytes) or >>
+    pass.storage_buffer(gpu.FRAGMENT, 0, &clustered.buffers[0]) or >>
+    pass.storage_buffer(gpu.FRAGMENT, 1, &clustered.buffers[1]) or >>
+    pass.storage_buffer(gpu.FRAGMENT, 2, &clustered.buffers[2]) or >>
+    pass.storage_buffer(gpu.FRAGMENT, 3, probe_buf) or >>
+    pass.draw_indexed(mesh.count, 0, 0, 1, 0) or >>
+    << mesh.count / 3
+}
+
+pub fn (hdr $&HdrTarget3D) end() int {
+    if hdr.closed || !hdr.active { >> errors.new("nexus 3D: HDR target is not recording") }
+    pass := $&hdr.passes[0]
+    pass.end() or >>
+    enc := $&hdr.encoders[0]
+    $fence := enc.submit() or >>
+    fence.wait() or >>
+    fence.close() or >>
+    hdr.passes = []gpu.RenderPass{}
+    hdr.encoders = []gpu.CommandEncoder{}
+    hdr.active = false
+    hdr.transparent_pass = false
+    hdr.ready = true
+    << 0
+}
+
+pub fn (hdr &HdrTarget3D) is_ready() bool { << hdr.ready }
+
+pub fn (hdr $&HdrTarget3D) close() int {
+    if hdr.closed { << 0 }
+    if hdr.passes.len > 0 {
+        p := $&hdr.passes[0]
+        p.end() or >>
+    }
+    if hdr.encoders.len > 0 {
+        e := $&hdr.encoders[0]
+        e.close() or >>
+    }
+    for i in 0:hdr.pipelines.len {
+        p := $&hdr.pipelines[i]
+        p.close() or >>
+    }
+    for i in 0:hdr.textures.len {
+        t := $&hdr.textures[i]
+        t.close() or >>
+    }
+    for i in 0:hdr.buffers.len {
+        b := $&hdr.buffers[i]
+        b.close() or >>
+    }
+    hdr.passes = []gpu.RenderPass{}
+    hdr.encoders = []gpu.CommandEncoder{}
+    hdr.pipelines = []gpu.GraphicsPipeline{}
+    hdr.textures = []gpu.Texture{}
+    hdr.buffers = []gpu.Buffer{}
+    hdr.active = false
+    hdr.ready = false
+    hdr.closed = true
+    << 0
+}
+
+fn (hdr $&HdrTarget3D) drop() {
+    hdr.close() or (err) { << }
+}
+
+pub struct PostProcessPipeline3D {
+    owner DeviceRef3D
+    compute []gpu.ComputePipeline // [0]=gtao, [1]=gtao_blur, [2]=ssr, [3]=bloom_down, [4]=bloom_up, [5]=taa
+    pipelines []gpu.GraphicsPipeline // [0]=composite
+    samplers []gpu.Sampler // [0]=nearest, [1]=linear
+    // [0]=ao_raw R16F, [1]=ao_blur R16F, [2]=ssr RGBA16F
+    // [3..6]=bloom_down[0..3] RGBA16F, [7..9]=bloom_up[0..2] RGBA16F
+    // [10..11]=taa_history[0..1] RGBA16F
+    textures []gpu.Texture
+    bloom_w []int
+    bloom_h []int
+    width int
+    height int
+    taa_idx int
+    taa_valid bool
+    prev_vp fm.Mat4
+    closed bool
+}
+
+fn pp_compute_pipe(
+    dev &gpu.Device,
+    program &PostProcessProgram3D,
+    samplers int,
+    uniform_sz int,
+    code &[]u8
+) gpu.ComputePipeline {
+    cdesc := gpu.ComputeResourcesDesc{
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: samplers,
+        read_textures: 0,
+        read_buffers: 0,
+        write_textures: 1,
+        write_buffers: 0,
+        uniform_sizes: [uniform_sz],
+        threads_x: 8,
+        threads_y: 8,
+        threads_z: 1
+    }
+    << dev.compute_pipeline_with_resources(&cdesc, code) or >>
+}
+
+pub fn (device &Device3D) postprocess_pipeline(program &PostProcessProgram3D) PostProcessPipeline3D {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus postprocess: create pipeline outside a frame") }
+    if !device.is_gpu() { >> errors.new("nexus postprocess: requires GPU backend") }
+    dev := device.gpu_device() or >>
+    if (dev.shader_formats() & program.format) == 0 || program.entrypoint.len == 0 ||
+        program.gtao.len == 0 || program.gtao_blur.len == 0 || program.ssr.len == 0 ||
+        program.bloom_down.len == 0 || program.bloom_up.len == 0 || program.taa_resolve.len == 0 ||
+        program.composite_vertex.len == 0 || program.composite_fragment.len == 0 {
+        >> errors.new("nexus postprocess: incomplete shader program")
+    }
+    if !(dev.supports_texture_2d(layout.R16_FLOAT, gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COMPUTE_STORAGE_WRITE) or >>) ||
+        !(dev.supports_texture_2d(layout.RGBA16_FLOAT, gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COMPUTE_STORAGE_WRITE) or >>) {
+        >> errors.new("nexus postprocess: GPU lacks R16_FLOAT or RGBA16_FLOAT compute storage")
+    }
+
+    w := device.target_width * device.render_scale
+    h := device.target_height * device.render_scale
+    $bw := []int{}
+    $bh := []int{}
+    $mw := (w + 1) / 2
+    $mh := (h + 1) / 2
+    for _ in 0:4 {
+        if mw < 1 { mw = 1 }
+        if mh < 1 { mh = 1 }
+        bw.push(mw)
+        bh.push(mh)
+        if mw > 1 { mw = (mw + 1) / 2 }
+        if mh > 1 { mh = (mh + 1) / 2 }
+    }
+
+    stats := dev.stats() or >>
+    internal_bytes := device.target_width * device.target_height * 8 + 4
+    if stats.texture_count + 12 > 513 + device.targets.len || stats.texture_bytes - internal_bytes > 48000000 {
+        >> errors.new("nexus postprocess: exceeds texture count or VRAM budget")
+    }
+
+    $c_gtao := pp_compute_pipe(dev, program, 2, 144, &program.gtao) or >>
+    $c_blur := pp_compute_pipe(dev, program, 2, 16, &program.gtao_blur) or >>
+    $c_ssr := pp_compute_pipe(dev, program, 4, 224, &program.ssr) or >>
+    $c_bdown := pp_compute_pipe(dev, program, 1, 32, &program.bloom_down) or >>
+    $c_bup := pp_compute_pipe(dev, program, 2, 32, &program.bloom_up) or >>
+    $c_taa := pp_compute_pipe(dev, program, 3, 80, &program.taa_resolve) or >>
+
+    vs_desc := gpu.ShaderResourcesDesc{
+        stage: gpu.VERTEX, format: program.format, entrypoint: program.entrypoint + "",
+        samplers: 0, storage_textures: 0, storage_buffers: 0, uniform_sizes: []int{}
+    }
+    fs_desc := gpu.ShaderResourcesDesc{
+        stage: gpu.FRAGMENT, format: program.format, entrypoint: program.entrypoint + "",
+        samplers: 4, storage_textures: 0, storage_buffers: 0, uniform_sizes: [32]
+    }
+    $vs := dev.shader_with_resources(&vs_desc, &program.composite_vertex) or >>
+    $fs := dev.shader_with_resources(&fs_desc, &program.composite_fragment) or >>
+    $pdesc := gpu.pipeline_defaults(layout.RGBA8_UNORM)
+    pdesc.cull = gpu.CULL_NONE
+    pdesc.depth_format = layout.DEPTH32_FLOAT
+    pdesc.depth_compare = gpu.DEPTH_DISABLED
+    pdesc.depth_write = false
+    $p_comp := dev.graphics_pipeline(&vs, &fs, &pdesc) or >>
+    vs.close() or >>
+    fs.close() or >>
+
+    $s_near := gpu.sampler_defaults()
+    s_near.min_filter = gpu.NEAREST
+    s_near.mag_filter = gpu.NEAREST
+    s_near.mip_filter = gpu.NEAREST
+    $near_samp := dev.sampler(s_near) or >>
+    s_lin := gpu.sampler_defaults()
+    $lin_samp := dev.sampler(s_lin) or >>
+
+    usage_comp := gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COMPUTE_STORAGE_WRITE
+    $ao_raw := dev.texture_2d(gpu.Texture2DDesc{format: layout.R16_FLOAT, width: w, height: h, levels: 1, usage: usage_comp}) or >>
+    $ao_blur := dev.texture_2d(gpu.Texture2DDesc{format: layout.R16_FLOAT, width: w, height: h, levels: 1, usage: usage_comp}) or >>
+    $ssr_tex := dev.texture_2d(gpu.Texture2DDesc{format: layout.RGBA16_FLOAT, width: w, height: h, levels: 1, usage: usage_comp}) or >>
+    $bd0 := dev.texture_2d(gpu.Texture2DDesc{format: layout.RGBA16_FLOAT, width: bw[0], height: bh[0], levels: 1, usage: usage_comp}) or >>
+    $bd1 := dev.texture_2d(gpu.Texture2DDesc{format: layout.RGBA16_FLOAT, width: bw[1], height: bh[1], levels: 1, usage: usage_comp}) or >>
+    $bd2 := dev.texture_2d(gpu.Texture2DDesc{format: layout.RGBA16_FLOAT, width: bw[2], height: bh[2], levels: 1, usage: usage_comp}) or >>
+    $bd3 := dev.texture_2d(gpu.Texture2DDesc{format: layout.RGBA16_FLOAT, width: bw[3], height: bh[3], levels: 1, usage: usage_comp}) or >>
+    $bu0 := dev.texture_2d(gpu.Texture2DDesc{format: layout.RGBA16_FLOAT, width: bw[2], height: bh[2], levels: 1, usage: usage_comp}) or >>
+    $bu1 := dev.texture_2d(gpu.Texture2DDesc{format: layout.RGBA16_FLOAT, width: bw[1], height: bh[1], levels: 1, usage: usage_comp}) or >>
+    $bu2 := dev.texture_2d(gpu.Texture2DDesc{format: layout.RGBA16_FLOAT, width: bw[0], height: bh[0], levels: 1, usage: usage_comp}) or >>
+    $taa0 := dev.texture_2d(gpu.Texture2DDesc{format: layout.RGBA16_FLOAT, width: w, height: h, levels: 1, usage: usage_comp}) or >>
+    $taa1 := dev.texture_2d(gpu.Texture2DDesc{format: layout.RGBA16_FLOAT, width: w, height: h, levels: 1, usage: usage_comp}) or >>
+
+    << PostProcessPipeline3D{
+        owner: device.reference(),
+        compute: [c_gtao, c_blur, c_ssr, c_bdown, c_bup, c_taa],
+        pipelines: [p_comp],
+        samplers: [near_samp, lin_samp],
+        textures: [ao_raw, ao_blur, ssr_tex, bd0, bd1, bd2, bd3, bu0, bu1, bu2, taa0, taa1],
+        bloom_w: bw,
+        bloom_h: bh,
+        width: w,
+        height: h,
+        taa_idx: 0,
+        taa_valid: false,
+        prev_vp: fm.identity_3d(),
+        closed: false
+    }
+}
+
+fn pack_f32_words(vals &[]f64) []u8 {
+    $words := []int{}
+    for v in vals { words.push(scalar_word(v) or >>) }
+    << word_bytes(&words) or >>
+}
+
+fn (pp $&PostProcessPipeline3D) run_compute_graph_textures(
+    enc $&gpu.CommandEncoder,
+    hdr_col &gpu.Texture,
+    norm_rough &gpu.Texture,
+    depth_tex &gpu.Texture,
+    hiz $&HizPyramid3D,
+    view fm.Mat4,
+    proj fm.Mat4,
+    z_near f64,
+    z_far f64,
+    cfg &PostProcessConfig3D
+) int {
+    inv_proj := mat4_inverse(proj) or >>
+    vp := proj.multiply(view)
+    inv_vp := mat4_inverse(vp) or >>
+    bw_empty := []gpu.StorageBufferWrite{}
+    gw := (pp.width + 7) / 8
+    gh := (pp.height + 7) / 8
+
+    // 0. Hi-Z min-depth pyramid from source depth target.
+    hiz.record_build_from(depth_tex, enc) or >>
+    hiz.ready = true
+
+    // 1. GTAO + Bilateral Blur.
+    $gtao_w := []int{}
+    for w in matrix_words(inv_proj) or >> { gtao_w.push(w) }
+    for w in matrix_words(view) or >> { gtao_w.push(w) }
+    for v in [f64(pp.width), f64(pp.height), cfg.ao_radius, cfg.ao_bias] { gtao_w.push(scalar_word(v) or >>) }
+    gtao_bytes := word_bytes(&gtao_w) or >>
+
+    tw_ao0 := [gpu.write_texture(&pp.textures[0], 0, 0, true)]
+    $p_gtao := enc.begin_compute_with_resources(&tw_ao0, &bw_empty) or >>
+    p_gtao.pipeline(&pp.compute[0]) or >>
+    p_gtao.sampler(0, depth_tex, &pp.samplers[0]) or >>
+    p_gtao.sampler(1, norm_rough, &pp.samplers[0]) or >>
+    p_gtao.uniform(0, &gtao_bytes) or >>
+    p_gtao.dispatch(gw, gh, 1) or >>
+    p_gtao.end() or >>
+
+    blur_bytes := pack_f32_words(&[f64(pp.width), f64(pp.height), z_near, z_far]) or >>
+    tw_ao1 := [gpu.write_texture(&pp.textures[1], 0, 0, true)]
+    $p_blur := enc.begin_compute_with_resources(&tw_ao1, &bw_empty) or >>
+    p_blur.pipeline(&pp.compute[1]) or >>
+    p_blur.sampler(0, &pp.textures[0], &pp.samplers[0]) or >>
+    p_blur.sampler(1, depth_tex, &pp.samplers[0]) or >>
+    p_blur.uniform(0, &blur_bytes) or >>
+    p_blur.dispatch(gw, gh, 1) or >>
+    p_blur.end() or >>
+
+    // 2. Hi-Z Accelerated Screen-Space Reflections.
+    $ssr_w := []int{}
+    for w in matrix_words(view) or >> { ssr_w.push(w) }
+    for w in matrix_words(proj) or >> { ssr_w.push(w) }
+    for w in matrix_words(inv_proj) or >> { ssr_w.push(w) }
+    $ssr_flag := 0.0
+    if cfg.ssr_enabled { ssr_flag = 1.0 }
+    for v in [f64(pp.width), f64(pp.height), cfg.ssr_max_roughness, cfg.ssr_max_distance,
+              z_near, z_far, cfg.ssr_thickness, ssr_flag] {
+        ssr_w.push(scalar_word(v) or >>)
+    }
+    ssr_bytes := word_bytes(&ssr_w) or >>
+    tw_ssr := [gpu.write_texture(&pp.textures[2], 0, 0, true)]
+    $p_ssr := enc.begin_compute_with_resources(&tw_ssr, &bw_empty) or >>
+    p_ssr.pipeline(&pp.compute[2]) or >>
+    p_ssr.sampler(0, hdr_col, &pp.samplers[1]) or >>
+    p_ssr.sampler(1, norm_rough, &pp.samplers[0]) or >>
+    p_ssr.sampler(2, depth_tex, &pp.samplers[0]) or >>
+    p_ssr.sampler(3, &hiz.mips[0], &pp.samplers[0]) or >>
+    p_ssr.uniform(0, &ssr_bytes) or >>
+    p_ssr.dispatch(gw, gh, 1) or >>
+    p_ssr.end() or >>
+
+    // 3. Multi-Mip HDR Bloom Downsample -> Upsample.
+    $thresh := cfg.bloom_threshold
+    if !cfg.bloom_enabled { thresh = 100000.0 }
+    bd0_bytes := pack_f32_words(&[f64(pp.width), f64(pp.height), f64(pp.bloom_w[0]), f64(pp.bloom_h[0]), thresh, cfg.bloom_knee, 1.0, 0.0]) or >>
+    tw_bd0 := [gpu.write_texture(&pp.textures[3], 0, 0, true)]
+    $p_bd0 := enc.begin_compute_with_resources(&tw_bd0, &bw_empty) or >>
+    p_bd0.pipeline(&pp.compute[3]) or >>
+    p_bd0.sampler(0, hdr_col, &pp.samplers[1]) or >>
+    p_bd0.uniform(0, &bd0_bytes) or >>
+    p_bd0.dispatch((pp.bloom_w[0] + 7) / 8, (pp.bloom_h[0] + 7) / 8, 1) or >>
+    p_bd0.end() or >>
+
+    for k in 1:4 {
+        src_i := 3 + k - 1
+        dst_i := 3 + k
+        prev_k := k - 1
+        bdk_bytes := pack_f32_words(&[f64(pp.bloom_w[prev_k]), f64(pp.bloom_h[prev_k]), f64(pp.bloom_w[k]), f64(pp.bloom_h[k]), 0.0, 0.0, 0.0, 0.0]) or >>
+        tw_bdk := [gpu.write_texture(&pp.textures[dst_i], 0, 0, true)]
+        $p_bdk := enc.begin_compute_with_resources(&tw_bdk, &bw_empty) or >>
+        p_bdk.pipeline(&pp.compute[3]) or >>
+        p_bdk.sampler(0, &pp.textures[src_i], &pp.samplers[1]) or >>
+        p_bdk.uniform(0, &bdk_bytes) or >>
+        p_bdk.dispatch((pp.bloom_w[k] + 7) / 8, (pp.bloom_h[k] + 7) / 8, 1) or >>
+        p_bdk.end() or >>
+    }
+
+    // Upsample: (bd3 + bd2 -> bu0[7]), (bu0 + bd1 -> bu1[8]), (bu1 + bd0 -> bu2[9])
+    up_low_idx := [6, 7, 8]
+    up_curr_idx := [5, 4, 3]
+    up_dst_idx := [7, 8, 9]
+    up_low_lv := [3, 2, 1]
+    up_dst_lv := [2, 1, 0]
+    for s in 0:3 {
+        li := up_low_idx[s]
+        ci := up_curr_idx[s]
+        di := up_dst_idx[s]
+        llv := up_low_lv[s]
+        dlv := up_dst_lv[s]
+        up_bytes := pack_f32_words(&[f64(pp.bloom_w[llv]), f64(pp.bloom_h[llv]), f64(pp.bloom_w[dlv]), f64(pp.bloom_h[dlv]), 0.85, 0.0, 0.0, 0.0]) or >>
+        tw_up := [gpu.write_texture(&pp.textures[di], 0, 0, true)]
+        $p_up := enc.begin_compute_with_resources(&tw_up, &bw_empty) or >>
+        p_up.pipeline(&pp.compute[4]) or >>
+        p_up.sampler(0, &pp.textures[li], &pp.samplers[1]) or >>
+        p_up.sampler(1, &pp.textures[ci], &pp.samplers[1]) or >>
+        p_up.uniform(0, &up_bytes) or >>
+        p_up.dispatch((pp.bloom_w[dlv] + 7) / 8, (pp.bloom_h[dlv] + 7) / 8, 1) or >>
+        p_up.end() or >>
+    }
+
+    // 4. TAA Temporal Resolve (curr_hdr + prev_history -> curr_history).
+    $prev_slot := 10 + (1 - pp.taa_idx)
+    $curr_slot := 10 + pp.taa_idx
+    reproj := pp.prev_vp.multiply(inv_vp)
+    $taa_w := []int{}
+    for w in matrix_words(reproj) or >> { taa_w.push(w) }
+    $taa_valid_f := 0.0
+    if cfg.taa_enabled && pp.taa_valid { taa_valid_f = 1.0 }
+    for v in [f64(pp.width), f64(pp.height), cfg.taa_blend, taa_valid_f] { taa_w.push(scalar_word(v) or >>) }
+    taa_bytes := word_bytes(&taa_w) or >>
+    tw_taa := [gpu.write_texture(&pp.textures[curr_slot], 0, 0, true)]
+    $p_taa := enc.begin_compute_with_resources(&tw_taa, &bw_empty) or >>
+    p_taa.pipeline(&pp.compute[5]) or >>
+    p_taa.sampler(0, hdr_col, &pp.samplers[1]) or >>
+    p_taa.sampler(1, &pp.textures[prev_slot], &pp.samplers[1]) or >>
+    p_taa.sampler(2, depth_tex, &pp.samplers[0]) or >>
+    p_taa.uniform(0, &taa_bytes) or >>
+    p_taa.dispatch(gw, gh, 1) or >>
+    p_taa.end() or >>
+
+    pp.prev_vp = vp
+    pp.taa_valid = cfg.taa_enabled
+    << curr_slot
+}
+
+fn (pp $&PostProcessPipeline3D) apply_textures_internal(
+    device $&Device3D,
+    hdr_col &gpu.Texture,
+    norm_rough &gpu.Texture,
+    depth_tex &gpu.Texture,
+    src_w int,
+    src_h int,
+    hiz $&HizPyramid3D,
+    view fm.Mat4,
+    proj fm.Mat4,
+    z_near f64,
+    z_far f64,
+    cfg &PostProcessConfig3D
+) int {
+    device.drawing() or >>
+    if !device.is_gpu() { >> errors.new("nexus postprocess: requires GPU backend") }
+    if pp.closed || !pp.owner.matches(device) {
+        >> errors.new("nexus postprocess: closed or foreign postprocess pipeline")
+    }
+    if hiz.closed || !hiz.owner.matches(device) || hiz.source_width != src_w || hiz.source_height != src_h {
+        >> errors.new("nexus postprocess: closed, foreign or resolution-mismatched Hi-Z pyramid")
+    }
+    if pp.width != src_w || pp.height != src_h {
+        >> errors.new("nexus postprocess: resolution mismatch with source target")
+    }
+    cfg.validate() or >>
+    if !view.is_affine() || !proj.is_finite() || z_near <= 0.0 || z_far <= z_near {
+        >> errors.new("nexus postprocess: invalid camera matrices or depth range")
+    }
+
+    device.pause_render_pass() or >>
+    enc := $&device.encoders[0]
+    curr_taa_tex := pp.run_compute_graph_textures(enc, hdr_col, norm_rough, depth_tex, hiz, view, proj, z_near, z_far, cfg) or(err){
+        device.abandon_frame()
+        >> err
+    }
+    device.resume_render_pass() or >>
+
+    $ao_str := 0.0
+    if cfg.ao_enabled { ao_str = cfg.ao_strength }
+    $ssr_str := 0.0
+    if cfg.ssr_enabled { ssr_str = cfg.ssr_strength }
+    $bloom_str := 0.0
+    if cfg.bloom_enabled { bloom_str = cfg.bloom_intensity }
+    $aces := 0.0
+    if cfg.aces_tonemap { aces = 1.0 }
+
+    comp_bytes := pack_f32_words(&[ao_str, ssr_str, bloom_str, cfg.exposure, aces, f64(pp.width), f64(pp.height), cfg.dither_strength]) or >>
+
+    pass := $&device.passes[0]
+    pass.pipeline(&pp.pipelines[0]) or >>
+    if cfg.taa_enabled {
+        pass.sampler(gpu.FRAGMENT, 0, &pp.textures[curr_taa_tex], &pp.samplers[1]) or >>
+    } else {
+        pass.sampler(gpu.FRAGMENT, 0, hdr_col, &pp.samplers[1]) or >>
+    }
+    pass.sampler(gpu.FRAGMENT, 1, &pp.textures[1], &pp.samplers[1]) or >>
+    pass.sampler(gpu.FRAGMENT, 2, &pp.textures[2], &pp.samplers[1]) or >>
+    pass.sampler(gpu.FRAGMENT, 3, &pp.textures[9], &pp.samplers[1]) or >>
+    pass.uniform(gpu.FRAGMENT, 0, &comp_bytes) or >>
+    pass.draw(3, 0, 1, 0) or >>
+
+    pp.taa_idx = 1 - pp.taa_idx
+    device.cached = false
+    device.draw_count += 1
+    << 0
+}
+
+// Applies full HDR Post-Processing (Hi-Z + GTAO + SSR + Bloom + TAA + ACES) into Device3D's active frame!
+pub fn (pp $&PostProcessPipeline3D) apply(
+    device $&Device3D,
+    hdr &HdrTarget3D,
+    hiz $&HizPyramid3D,
+    view fm.Mat4,
+    proj fm.Mat4,
+    z_near f64,
+    z_far f64,
+    cfg &PostProcessConfig3D
+) int {
+    if hdr.closed || !hdr.owner.matches(device) || !hdr.ready {
+        >> errors.new("nexus postprocess: closed, foreign or unrendered HDR target")
+    }
+    << pp.apply_textures_internal(device, &hdr.textures[0], &hdr.textures[1], &hdr.textures[2], hdr.width, hdr.height, hiz, view, proj, z_near, z_far, cfg) or >>
+}
+
+pub fn (pp $&PostProcessPipeline3D) reset_taa() {
+    pp.taa_valid = false
+}
+
+pub fn (pp $&PostProcessPipeline3D) close() int {
+    if pp.closed { << 0 }
+    for i in 0:pp.compute.len {
+        c := $&pp.compute[i]
+        c.close() or >>
+    }
+    for i in 0:pp.pipelines.len {
+        p := $&pp.pipelines[i]
+        p.close() or >>
+    }
+    for i in 0:pp.samplers.len {
+        s := $&pp.samplers[i]
+        s.close() or >>
+    }
+    for i in 0:pp.textures.len {
+        t := $&pp.textures[i]
+        t.close() or >>
+    }
+    pp.compute = []gpu.ComputePipeline{}
+    pp.pipelines = []gpu.GraphicsPipeline{}
+    pp.samplers = []gpu.Sampler{}
+    pp.textures = []gpu.Texture{}
+    pp.closed = true
+    << 0
+}
+
+fn (pp $&PostProcessPipeline3D) drop() {
+    pp.close() or (err) { << }
+}

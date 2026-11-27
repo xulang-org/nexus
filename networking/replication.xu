@@ -1,0 +1,405 @@
+@"github.com/xulang-org/nexus/networking"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const FIELD_META = 1
+pub const FIELD_POS = 2
+pub const FIELD_VEL = 4
+pub const FIELD_YAW = 8
+pub const FIELD_PITCH = 16
+pub const FIELD_HEALTH = 32
+pub const FIELD_FLAGS = 64
+pub const FIELD_ALL = 127
+
+pub struct NetEntityState {
+    pub net_id int
+    pub archetype int
+    pub owner_peer int
+    pub position fm.Vec3
+    pub velocity fm.Vec3
+    pub yaw f64
+    pub pitch f64
+    pub health f64
+    pub flags int
+}
+
+pub struct WorldSnapshot {
+    pub tick int
+    pub ack_input_seq int
+    pub entities []NetEntityState
+}
+
+pub struct SnapshotBounds {
+    pub pos_min fm.Vec3
+    pub pos_max fm.Vec3
+    pub vel_min fm.Vec3
+    pub vel_max fm.Vec3
+}
+
+pub fn default_snapshot_bounds() SnapshotBounds {
+    << SnapshotBounds{
+        pos_min: fm.vec3(-512.0, -128.0, -512.0),
+        pos_max: fm.vec3(512.0, 384.0, 512.0),
+        vel_min: fm.vec3(-128.0, -128.0, -128.0),
+        vel_max: fm.vec3(128.0, 128.0, 128.0)
+    }
+}
+
+pub fn default_entity_state(net_id int, archetype int, owner_peer int, pos fm.Vec3) NetEntityState {
+    << NetEntityState{
+        net_id: net_id,
+        archetype: archetype,
+        owner_peer: owner_peer,
+        position: pos,
+        velocity: fm.vec3(0.0, 0.0, 0.0),
+        yaw: 0.0,
+        pitch: 0.0,
+        health: 100.0,
+        flags: 0
+    }
+}
+
+pub fn new_world_snapshot(tick int, ack_input_seq int) WorldSnapshot {
+    << WorldSnapshot{
+        tick: tick,
+        ack_input_seq: ack_input_seq,
+        entities: []NetEntityState{}
+    }
+}
+
+pub fn clone_snapshot(src &WorldSnapshot) WorldSnapshot {
+    $ents := []NetEntityState{}
+    for i in 0:src.entities.len { ents.push(src.entities[i]) }
+    << WorldSnapshot{
+        tick: src.tick,
+        ack_input_seq: src.ack_input_seq,
+        entities: ents
+    }
+}
+
+fn find_entity_idx(list &[]NetEntityState, net_id int) int {
+    for i in 0:list.len {
+        if list[i].net_id == net_id { << i }
+    }
+    << -1
+}
+
+fn vec3_changed(a fm.Vec3, b fm.Vec3, eps f64) bool {
+    << math.abs(a.x - b.x) > eps || math.abs(a.y - b.y) > eps || math.abs(a.z - b.z) > eps
+}
+
+fn compute_dirty_mask(curr &NetEntityState, prev &NetEntityState) int {
+    $mask := 0
+    if curr.archetype != prev.archetype || curr.owner_peer != prev.owner_peer {
+        mask = mask | FIELD_META
+    }
+    if vec3_changed(curr.position, prev.position, 0.004) {
+        mask = mask | FIELD_POS
+    }
+    if vec3_changed(curr.velocity, prev.velocity, 0.015) {
+        mask = mask | FIELD_VEL
+    }
+    if math.abs(wrap_angle_rad(curr.yaw - prev.yaw)) > 0.002 {
+        mask = mask | FIELD_YAW
+    }
+    if math.abs(wrap_angle_rad(curr.pitch - prev.pitch)) > 0.002 {
+        mask = mask | FIELD_PITCH
+    }
+    if math.abs(curr.health - prev.health) > 0.25 {
+        mask = mask | FIELD_HEALTH
+    }
+    if curr.flags != prev.flags {
+        mask = mask | FIELD_FLAGS
+    }
+    << mask
+}
+
+struct DirtyEntityRecord {
+    ent NetEntityState
+    mask int
+}
+
+pub fn encode_snapshot_delta(
+    curr &WorldSnapshot,
+    baseline &WorldSnapshot,
+    has_baseline bool,
+    bounds &SnapshotBounds
+) []u8 {
+    $bw := new_bit_writer()
+    bw.write_u32(curr.tick) or >>
+    bw.write_u32(curr.ack_input_seq) or >>
+    bw.write_bool(has_baseline) or >>
+    if has_baseline {
+        bw.write_u32(baseline.tick) or >>
+    }
+
+    $removed := []int{}
+    if has_baseline {
+        for i in 0:baseline.entities.len {
+            id := baseline.entities[i].net_id
+            if find_entity_idx(&curr.entities, id) < 0 {
+                removed.push(id)
+            }
+        }
+    }
+
+    $dirty := []DirtyEntityRecord{}
+    for i in 0:curr.entities.len {
+        e := curr.entities[i]
+        if !has_baseline {
+            dirty.push(DirtyEntityRecord{ent: e, mask: FIELD_ALL})
+        } else {
+            bidx := find_entity_idx(&baseline.entities, e.net_id)
+            if bidx < 0 {
+                dirty.push(DirtyEntityRecord{ent: e, mask: FIELD_ALL})
+            } else {
+                prev := &baseline.entities[bidx]
+                m := compute_dirty_mask(&e, prev)
+                if m != 0 {
+                    dirty.push(DirtyEntityRecord{ent: e, mask: m})
+                }
+            }
+        }
+    }
+
+    bw.write_u16(removed.len) or >>
+    for i in 0:removed.len {
+        bw.write_u32(removed[i]) or >>
+    }
+
+    bw.write_u16(dirty.len) or >>
+    for i in 0:dirty.len {
+        rec := &dirty[i]
+        e := &rec.ent
+        m := rec.mask
+        bw.write_u32(e.net_id) or >>
+        bw.write_bits(m, 7) or >>
+        if (m & FIELD_META) != 0 {
+            bw.write_u16(e.archetype) or >>
+            bw.write_i32(e.owner_peer) or >>
+        }
+        if (m & FIELD_POS) != 0 {
+            bw.write_vec3_quantized(e.position, bounds.pos_min, bounds.pos_max, 18) or >>
+        }
+        if (m & FIELD_VEL) != 0 {
+            bw.write_vec3_quantized(e.velocity, bounds.vel_min, bounds.vel_max, 14) or >>
+        }
+        if (m & FIELD_YAW) != 0 {
+            bw.write_angle_rad(e.yaw, 12) or >>
+        }
+        if (m & FIELD_PITCH) != 0 {
+            bw.write_angle_rad(e.pitch, 12) or >>
+        }
+        if (m & FIELD_HEALTH) != 0 {
+            bw.write_quantized_f64(e.health, 0.0, 1000.0, 12) or >>
+        }
+        if (m & FIELD_FLAGS) != 0 {
+            bw.write_u16(e.flags) or >>
+        }
+    }
+    << bw.finish()
+}
+
+pub fn decode_snapshot_delta(
+    raw &[]u8,
+    baseline &WorldSnapshot,
+    bounds &SnapshotBounds
+) WorldSnapshot {
+    $br := new_bit_reader(raw)
+    tick := br.read_u32() or >>
+    ack_input := br.read_u32() or >>
+    has_base := br.read_bool() or >>
+    $base_tick := 0
+    if has_base {
+        base_tick = br.read_u32() or >>
+        _ := base_tick
+    }
+
+    rem_count := br.read_u16() or >>
+    $removed_ids := []int{}
+    for _ in 0:rem_count {
+        rid := br.read_u32() or >>
+        removed_ids.push(rid)
+    }
+
+    $entities := []NetEntityState{}
+    if has_base {
+        for i in 0:baseline.entities.len {
+            e := baseline.entities[i]
+            $is_rem := false
+            for j in 0:removed_ids.len {
+                if removed_ids[j] == e.net_id {
+                    is_rem = true
+                    <-
+                }
+            }
+            if !is_rem { entities.push(e) }
+        }
+    }
+
+    dirty_count := br.read_u16() or >>
+    for _ in 0:dirty_count {
+        nid := br.read_u32() or >>
+        m := br.read_bits(7) or >>
+        eidx := find_entity_idx(&entities, nid)
+        $e := default_entity_state(nid, 0, 0, fm.vec3(0.0, 0.0, 0.0))
+        if eidx >= 0 { e = entities[eidx] }
+
+        if (m & FIELD_META) != 0 {
+            e.archetype = br.read_u16() or >>
+            e.owner_peer = br.read_i32() or >>
+        }
+        if (m & FIELD_POS) != 0 {
+            e.position = br.read_vec3_quantized(bounds.pos_min, bounds.pos_max, 18) or >>
+        }
+        if (m & FIELD_VEL) != 0 {
+            e.velocity = br.read_vec3_quantized(bounds.vel_min, bounds.vel_max, 14) or >>
+        }
+        if (m & FIELD_YAW) != 0 {
+            e.yaw = br.read_angle_rad(12) or >>
+        }
+        if (m & FIELD_PITCH) != 0 {
+            e.pitch = br.read_angle_rad(12) or >>
+        }
+        if (m & FIELD_HEALTH) != 0 {
+            e.health = br.read_quantized_f64(0.0, 1000.0, 12) or >>
+        }
+        if (m & FIELD_FLAGS) != 0 {
+            e.flags = br.read_u16() or >>
+        }
+
+        if eidx >= 0 {
+            entities[eidx] = e
+        } else {
+            entities.push(e)
+        }
+    }
+
+    << WorldSnapshot{
+        tick: tick,
+        ack_input_seq: ack_input,
+        entities: entities
+    }
+}
+
+// --- Interest Management (AOI Radius + Hysteresis + Priority Accumulator) ---
+pub struct InterestConfig {
+    pub aoi_radius f64
+    pub hysteresis_margin f64
+    pub max_entities_per_snapshot int
+}
+
+pub fn default_interest_config() InterestConfig {
+    << InterestConfig{
+        aoi_radius: 40.0,
+        hysteresis_margin: 6.0,
+        max_entities_per_snapshot: 64
+    }
+}
+
+struct EntityPriorityRecord {
+    net_id int
+    visible bool
+    accum_priority f64
+}
+
+pub struct InterestManager {
+    cfg InterestConfig
+    records []EntityPriorityRecord
+}
+
+pub fn new_interest_manager(cfg InterestConfig) InterestManager {
+    if !fm.finite(cfg.aoi_radius) || cfg.aoi_radius <= 0.0 ||
+        !fm.finite(cfg.hysteresis_margin) || cfg.hysteresis_margin < 0.0 ||
+        cfg.max_entities_per_snapshot < 1 {
+        >> errors.new("nexus net: invalid InterestConfig")
+    }
+    << InterestManager{cfg: cfg, records: []EntityPriorityRecord{}}
+}
+
+fn (im $&InterestManager) find_or_insert(net_id int) int {
+    for i in 0:im.records.len {
+        if im.records[i].net_id == net_id { << i }
+    }
+    idx := im.records.len
+    im.records.push(EntityPriorityRecord{net_id: net_id, visible: false, accum_priority: 100.0})
+    << idx
+}
+
+struct ScoredEntity {
+    idx int
+    score f64
+    rec_idx int
+}
+
+pub fn (im $&InterestManager) filter_snapshot(
+    full_entities &[]NetEntityState,
+    owner_peer int,
+    observer_pos fm.Vec3,
+    tick int,
+    ack_input_seq int
+) WorldSnapshot {
+    $candidates := []ScoredEntity{}
+    enter_r2 := im.cfg.aoi_radius * im.cfg.aoi_radius
+    exit_r := im.cfg.aoi_radius + im.cfg.hysteresis_margin
+    exit_r2 := exit_r * exit_r
+
+    for i in 0:full_entities.len {
+        e := &full_entities[i]
+        ridx := im.find_or_insert(e.net_id)
+        if e.owner_peer == owner_peer {
+            im.records[ridx].visible = true
+            candidates.push(ScoredEntity{idx: i, score: 1000000.0, rec_idx: ridx})
+            ->
+        }
+        d := e.position.sub(observer_pos)
+        d2 := d.dot(d)
+        $vis := im.records[ridx].visible
+        if vis {
+            if d2 > exit_r2 {
+                vis = false
+            }
+        } else {
+            if d2 <= enter_r2 {
+                vis = true
+            }
+        }
+        im.records[ridx].visible = vis
+        if vis {
+            dist_factor := math.max(1.0, im.cfg.aoi_radius + 1.0 - math.sqrt(d2))
+            im.records[ridx].accum_priority += dist_factor
+            candidates.push(ScoredEntity{idx: i, score: im.records[ridx].accum_priority, rec_idx: ridx})
+        } else {
+            im.records[ridx].accum_priority = 0.0
+        }
+    }
+
+    // Descending insertion sort by accumulated priority.
+    for i in 1:candidates.len {
+        key := candidates[i]
+        $j := i - 1
+        while j >= 0 && candidates[j].score < key.score {
+            candidates[j + 1] = candidates[j]
+            j -= 1
+        }
+        candidates[j + 1] = key
+    }
+
+    $limit := candidates.len
+    if limit > im.cfg.max_entities_per_snapshot {
+        limit = im.cfg.max_entities_per_snapshot
+    }
+    $out := []NetEntityState{}
+    for k in 0:limit {
+        c := candidates[k]
+        out.push(full_entities[c.idx])
+        im.records[c.rec_idx].accum_priority = 0.0
+    }
+    << WorldSnapshot{
+        tick: tick,
+        ack_input_seq: ack_input_seq,
+        entities: out
+    }
+}

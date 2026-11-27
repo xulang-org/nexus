@@ -1,6 +1,7 @@
 @"github.com/xulang-org/nexus/scene"
 
 fm #"github.com/xulang-org/nexus/foundation/math"
+camera_data #"github.com/xulang-org/nexus/resources/camera"
 #errors
 #strings
 
@@ -38,8 +39,20 @@ pub struct SceneTree {
     capacity int
     spatial_2d []Spatial2D
     spatial_3d []Spatial3D
+    world_2d []fm.Transform2D
+    dirty_2d []bool
+    world_3d []fm.Mat4
+    dirty_3d []bool
+    transforms_dirty bool
     free_2d int
     free_3d int
+    slot_groups [][]string
+    slot_meta_keys [][]string
+    slot_meta_kinds [][]int
+    slot_meta_strs [][]string
+    slot_meta_ints [][]int
+    slot_meta_f64s [][]f64
+    slot_meta_bools [][]bool
     pub paused bool
 }
 // Common identity and lifecycle data; transforms live in dimension-specific pools.
@@ -57,6 +70,7 @@ pub struct Node2D {
     pub parent int
     pub name string
     pub transform fm.Transform2D
+    pub camera camera_data.View2D
     pub visible bool
     pub process_mode int
 }
@@ -85,7 +99,17 @@ fn make_scene_tree(name string, capacity int, root_kind int) SceneTree {
     $slots := []NodeSlot{}
     slots.push(new_slot(name, -1, 0))
     $tree := SceneTree{slots: slots, free_head: -1, capacity: capacity, paused: false,
-        spatial_2d: []Spatial2D{}, spatial_3d: []Spatial3D{}, free_2d: -1, free_3d: -1}
+        spatial_2d: []Spatial2D{}, spatial_3d: []Spatial3D{},
+        world_2d: []fm.Transform2D{}, dirty_2d: []bool{},
+        world_3d: []fm.Mat4{}, dirty_3d: []bool{},
+        transforms_dirty: true, free_2d: -1, free_3d: -1,
+        slot_groups: [[]string{}],
+        slot_meta_keys: [[]string{}],
+        slot_meta_kinds: [[]int{}],
+        slot_meta_strs: [[]string{}],
+        slot_meta_ints: [[]int{}],
+        slot_meta_f64s: [[]f64{}],
+        slot_meta_bools: [[]bool{}]}
     tree.allocate_spatial(0, root_kind)
     << tree
 }
@@ -118,7 +142,7 @@ pub fn (tree &SceneTree) node(id int) Node2D {
     index := tree.index(id) or >>
     component := tree.require_spatial(index, NODE_2D) or >>
     << Node2D{id: id, parent: tree.node_id(tree.slots[index].parent), name: tree.slots[index].name + "",
-        transform: tree.spatial_2d[component].local, visible: tree.slots[index].visible,
+        transform: tree.spatial_2d[component].local, camera: tree.spatial_2d[component].camera, visible: tree.slots[index].visible,
         process_mode: tree.slots[index].process_mode}
 }
 pub fn (tree &SceneTree) node_info(id int) Node {
@@ -202,13 +226,23 @@ fn (tree $&SceneTree) add_typed_child(parent_id int, name string, kind int) int 
         generation := tree.slots[index].generation
         tree.free_head = tree.slots[index].free_next
         tree.slots[index] = new_slot(name, parent, generation)
+        tree.slot_groups[index] = []string{}
+        tree.clear_slot_meta(index)
     } else {
         if tree.slots.len >= tree.capacity { >> errors.new("nexus: scene node capacity exceeded") }
         index = tree.slots.len
         tree.slots.push(new_slot(name, parent, 0))
+        tree.slot_groups.push([]string{})
+        tree.slot_meta_keys.push([]string{})
+        tree.slot_meta_kinds.push([]int{})
+        tree.slot_meta_strs.push([]string{})
+        tree.slot_meta_ints.push([]int{})
+        tree.slot_meta_f64s.push([]f64{})
+        tree.slot_meta_bools.push([]bool{})
     }
     tree.allocate_spatial(index, kind)
     tree.attach(index, parent)
+    if kind == NODE_2D || kind == NODE_3D { tree.transforms_dirty = true }
     << tree.node_id(index)
 }
 // Iterative pre-order traversal, bounded by the configured node capacity.
@@ -253,6 +287,7 @@ pub fn (tree $&SceneTree) set_transform(id int, value fm.Transform2D) int {
     component := tree.require_spatial(index, NODE_2D) or >>
     if !value.is_finite() { >> errors.new("nexus: node transform must be finite") }
     tree.spatial_2d[component].local = value
+    tree.mark_dirty_subtree_2d(index)
     << 0
 }
 pub fn (tree $&SceneTree) set_position(id int, position fm.Vec2) int {
@@ -261,6 +296,7 @@ pub fn (tree $&SceneTree) set_position(id int, position fm.Vec2) int {
     if !fm.finite(position.x) || !fm.finite(position.y) { >> errors.new("nexus: position must be finite") }
     tree.spatial_2d[component].local.tx = position.x
     tree.spatial_2d[component].local.ty = position.y
+    tree.mark_dirty_subtree_2d(index)
     << 0
 }
 pub fn (tree $&SceneTree) set_visible(id int, visible bool) int {
@@ -348,6 +384,14 @@ pub fn (tree $&SceneTree) reparent(id int, parent_id int, keep_global bool) int 
     tree.attach(index, parent)
     if keep_global && kind == NODE_2D { tree.spatial_2d[component].local = local_2d }
     if keep_global && kind == NODE_3D { tree.spatial_3d[component].local = local_3d }
+    if kind == NODE_2D {
+        tree.mark_dirty_subtree_2d(index)
+    } else if kind == NODE_3D {
+        tree.mark_dirty_subtree_3d(index)
+    } else {
+        tree.mark_dirty_subtree_2d(index)
+        tree.mark_dirty_subtree_3d(index)
+    }
     << 0
 }
 pub fn (tree $&SceneTree) queue_free(id int) int {
@@ -371,6 +415,8 @@ pub fn (tree $&SceneTree) flush_free() []int {
         tree.slots[index].alive = false
         tree.slots[index].generation = tree.slots[index].generation + 1
         tree.slots[index].name = ""
+        tree.slot_groups[index] = []string{}
+        tree.clear_slot_meta(index)
         tree.slots[index].free_next = tree.free_head
         tree.free_head = index
         freed.push(id)

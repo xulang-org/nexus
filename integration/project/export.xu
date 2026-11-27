@@ -1,0 +1,71 @@
+@"github.com/xulang-org/nexus/integration/project"
+
+gltf #"github.com/xulang-org/nexus/formats/gltf"
+obj #"github.com/xulang-org/nexus/formats/obj"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#crypto/sha256
+#errors
+#os
+#path/filepath
+#strings
+
+// Writes a validated binary GLB 2.0 stream to a project-relative path (e.g.
+// "assets/models/whitebox.glb"), validates it against Nexus GLB profile (and
+// optional external validator), and registers/updates its 32-hex UID in project.json.
+pub fn export_glb_bytes_to_project(
+    project_path string,
+    rel_asset_path string,
+    glb_raw &string,
+    validator_bin string
+) ImportAssetResult {
+    project := load_project(project_path + "") or >>
+    rel := relative_file(&rel_asset_path) or >>
+    lower := strings.to_lower(&rel)
+    if !strings.ends_with(&lower, ".glb") {
+        >> errors.new("nexus project: exported GLB asset path must end with .glb")
+    }
+    asset := gltf.decode_glb_geometry(glb_raw) or >>
+    dest := resolve_project_path(&project.directory, &rel, false) or >>
+    ensure_parent_dir(&dest) or >>
+    snapshot.write_atomic(dest + "", glb_raw) or >>
+    if strings.trim_space(&validator_bin).len > 0 {
+        _ := validate_glb_primitives(validator_bin + "", dest + "") or >>
+    }
+    existing_uid := project.find_asset_uid_by_rel(&rel)
+    if existing_uid.len > 0 {
+        << ImportAssetResult{
+            uid: existing_uid,
+            rel_path: rel,
+            resolved: dest,
+            reused: true,
+            primitive_count: asset.primitive_count()
+        }
+    }
+    new_uid := register_asset(project_path + "", rel + "") or >>
+    << ImportAssetResult{
+        uid: new_uid,
+        rel_path: rel,
+        resolved: dest,
+        reused: false,
+        primitive_count: asset.primitive_count()
+    }
+}
+
+// Writes a validated OBJ text stream to a project-relative path (e.g. "assets/models/whitebox.obj").
+pub fn export_obj_bytes_to_project(
+    project_path string,
+    rel_asset_path string,
+    obj_raw &string
+) string {
+    project := load_project(project_path + "") or >>
+    rel := relative_file(&rel_asset_path) or >>
+    lower := strings.to_lower(&rel)
+    if !strings.ends_with(&lower, ".obj") {
+        >> errors.new("nexus project: exported OBJ asset path must end with .obj")
+    }
+    _ := obj.decode(obj_raw) or >>
+    dest := resolve_project_path(&project.directory, &rel, false) or >>
+    ensure_parent_dir(&dest) or >>
+    snapshot.write_atomic(dest + "", obj_raw) or >>
+    << dest
+}

@@ -4,8 +4,72 @@ fm #"github.com/xulang-org/nexus/foundation/math"
 #math
 #errors
 
+pub const ATTEN_LINEAR_SQUARED = 0
+pub const ATTEN_INVERSE = 1
+pub const ATTEN_EXPONENTIAL = 2
+
+pub fn speed_of_sound() f64 { << 343.0 }
+pub fn head_radius_m() f64 { << 0.0875 }
+
 pub struct Spatial { pub volume f64
     pub pan f64 }
+
+pub struct AcousticBox {
+    pub min fm.Vec3
+    pub max fm.Vec3
+    pub absorption f64
+}
+
+pub struct Spatial3DParams {
+    pub source fm.Vec3
+    pub listener fm.Vec3
+    pub listener_right fm.Vec3
+    pub listener_forward fm.Vec3
+    pub source_velocity fm.Vec3
+    pub listener_velocity fm.Vec3
+    pub min_distance f64
+    pub max_distance f64
+    pub rolloff f64
+    pub atten_model int
+    pub doppler_factor f64
+    pub speed_of_sound f64
+    pub sample_rate int
+    pub enable_hrtf bool
+    pub boxes []AcousticBox
+}
+
+pub struct Spatial3DResult {
+    pub volume f64
+    pub pan f64
+    pub pitch f64
+    pub occlusion f64
+    pub itd_frames int
+    pub left_gain f64
+    pub right_gain f64
+    pub lpf_cutoff_left_hz f64
+    pub lpf_cutoff_right_hz f64
+}
+
+pub fn default_spatial_3d_params(source fm.Vec3, listener fm.Vec3, listener_right fm.Vec3, listener_forward fm.Vec3) Spatial3DParams {
+    << Spatial3DParams{
+        source: source,
+        listener: listener,
+        listener_right: listener_right,
+        listener_forward: listener_forward,
+        source_velocity: fm.vec3(0.0, 0.0, 0.0),
+        listener_velocity: fm.vec3(0.0, 0.0, 0.0),
+        min_distance: 1.0,
+        max_distance: 50.0,
+        rolloff: 1.0,
+        atten_model: ATTEN_INVERSE,
+        doppler_factor: 1.0,
+        speed_of_sound: 343.0,
+        sample_rate: 48000,
+        enable_hrtf: true,
+        boxes: []AcousticBox{}
+    }
+}
+
 fn spatial_result(distance f64, toward_right f64, maximum f64) Spatial {
     if !fm.finite(distance) || !fm.finite(maximum) || maximum <= 0.0 || maximum > 1000000000.0 { >> errors.new("nexus spatial audio: invalid distance range") }
     weight := math.max(0.0, 1.0 - distance / maximum)
@@ -27,4 +91,158 @@ pub fn spatial_3d(source fm.Vec3, listener fm.Vec3, listener_right fm.Vec3, maxi
     right := listener_right.normalized() or >>
     delta := source.sub(listener)
     << spatial_result(delta.length(), delta.dot(right), maximum) or >>
+}
+
+fn clamp_s(v f64, lo f64, hi f64) f64 {
+    << math.max(lo, math.min(hi, v))
+}
+
+fn slab_axis(o f64, d f64, bmin f64, bmax f64, t_lo $&f64, t_hi $&f64) bool {
+    if math.abs(d) < 1e-12 {
+        << o >= bmin && o <= bmax
+    }
+    inv := 1.0 / d
+    $t0 := (bmin - o) * inv
+    $t1 := (bmax - o) * inv
+    if t0 > t1 {
+        tmp := t0
+        t0 = t1
+        t1 = tmp
+    }
+    if t0 > *t_lo { *t_lo = t0 }
+    if t1 < *t_hi { *t_hi = t1 }
+    << *t_lo <= *t_hi
+}
+
+pub fn compute_box_occlusion(source fm.Vec3, listener fm.Vec3, boxes &[]AcousticBox) f64 {
+    if !source.is_finite() || !listener.is_finite() {
+        >> errors.new("nexus spatial audio: non-finite occlusion endpoint")
+    }
+    delta := listener.sub(source)
+    $trans := 1.0
+    for i in 0:boxes.len {
+        b := &boxes[i]
+        if !b.min.is_finite() || !b.max.is_finite() || !fm.finite(b.absorption) ||
+            b.min.x > b.max.x || b.min.y > b.max.y || b.min.z > b.max.z ||
+            b.absorption < 0.0 || b.absorption > 1.0 {
+            >> errors.new("nexus spatial audio: invalid acoustic box")
+        }
+        $t_lo := 0.0
+        $t_hi := 1.0
+        hit := slab_axis(source.x, delta.x, b.min.x, b.max.x, $&t_lo, $&t_hi) &&
+            slab_axis(source.y, delta.y, b.min.y, b.max.y, $&t_lo, $&t_hi) &&
+            slab_axis(source.z, delta.z, b.min.z, b.max.z, $&t_lo, $&t_hi)
+        if hit && t_hi >= 0.0 && t_lo <= 1.0 {
+            trans = trans * (1.0 - b.absorption)
+        }
+    }
+    << clamp_s(1.0 - trans, 0.0, 1.0)
+}
+
+pub fn spatial_3d_advanced(params &Spatial3DParams) Spatial3DResult {
+    if !params.source.is_finite() || !params.listener.is_finite() ||
+        !params.source_velocity.is_finite() || !params.listener_velocity.is_finite() {
+        >> errors.new("nexus spatial audio: non-finite spatial parameters")
+    }
+    if !fm.finite(params.min_distance) || !fm.finite(params.max_distance) || !fm.finite(params.rolloff) ||
+        !fm.finite(params.doppler_factor) || !fm.finite(params.speed_of_sound) ||
+        params.min_distance <= 0.0 || params.max_distance <= params.min_distance ||
+        params.rolloff < 0.0 || params.doppler_factor < 0.0 || params.speed_of_sound <= 1.0 ||
+        params.sample_rate < 8000 || params.sample_rate > 192000 ||
+        params.atten_model < ATTEN_LINEAR_SQUARED || params.atten_model > ATTEN_EXPONENTIAL {
+        >> errors.new("nexus spatial audio: invalid distance, speed, or rate parameter")
+    }
+    right := params.listener_right.normalized() or >>
+    fwd := params.listener_forward.normalized() or >>
+
+    to_src := params.source.sub(params.listener)
+    dist := to_src.length()
+
+    $atten := 0.0
+    if dist < params.max_distance {
+        d_eff := math.max(dist, params.min_distance)
+        if params.atten_model == ATTEN_LINEAR_SQUARED {
+            w := clamp_s(1.0 - (d_eff - params.min_distance) / (params.max_distance - params.min_distance), 0.0, 1.0)
+            atten = w * w
+        } else if params.atten_model == ATTEN_INVERSE {
+            denom := params.min_distance + params.rolloff * (d_eff - params.min_distance)
+            atten = clamp_s(params.min_distance / math.max(denom, 1e-6), 0.0, 1.0)
+        } else {
+            ratio := d_eff / params.min_distance
+            atten = clamp_s(math.exp(-params.rolloff * math.log(ratio)), 0.0, 1.0)
+        }
+    }
+
+    $pitch := 1.0
+    $az_sin := 0.0
+    $fwd_cos := 1.0
+    if dist > 1e-9 {
+        dir_l_to_s := to_src.scaled(1.0 / dist)
+        dir_s_to_l := dir_l_to_s.scaled(-1.0)
+        az_sin = clamp_s(dir_l_to_s.dot(right), -1.0, 1.0)
+        fwd_cos = clamp_s(dir_l_to_s.dot(fwd), -1.0, 1.0)
+
+        if params.doppler_factor > 0.0 {
+            v_s := params.source_velocity.dot(dir_s_to_l) * params.doppler_factor
+            v_l := params.listener_velocity.dot(dir_l_to_s) * params.doppler_factor
+            c := params.speed_of_sound
+            num := math.max(0.1 * c, c + v_l)
+            den := math.max(0.1 * c, c - v_s)
+            pitch = clamp_s(num / den, 0.5, 2.0)
+        }
+    }
+
+    occ := compute_box_occlusion(params.source, params.listener, &params.boxes) or >>
+    volume := clamp_s(atten * (1.0 - 0.72 * occ), 0.0, 1.0)
+
+    $itd_frames := 0
+    $left_gain := clamp_s(1.0 - math.max(az_sin, 0.0), 0.0, 1.0)
+    $right_gain := clamp_s(1.0 + math.min(az_sin, 0.0), 0.0, 1.0)
+    $lpf_l := 18000.0
+    $lpf_r := 18000.0
+
+    if params.enable_hrtf {
+        side := math.abs(az_sin)
+        theta := math.asin(side)
+        tau := (0.0875 / params.speed_of_sound) * (theta + math.sin(theta))
+        raw_frames := int(math.round_to_even(tau * f64(params.sample_rate)))
+        if az_sin > 0.0 {
+            itd_frames = raw_frames
+            left_gain = clamp_s(1.0 - 0.55 * side, 0.25, 1.25)
+            right_gain = clamp_s(1.0 + 0.15 * side, 0.25, 1.25)
+            lpf_l = 18000.0 - 14500.0 * side
+        } else if az_sin < 0.0 {
+            itd_frames = -raw_frames
+            right_gain = clamp_s(1.0 - 0.55 * side, 0.25, 1.25)
+            left_gain = clamp_s(1.0 + 0.15 * side, 0.25, 1.25)
+            lpf_r = 18000.0 - 14500.0 * side
+        } else {
+            left_gain = 1.0
+            right_gain = 1.0
+        }
+        if fwd_cos < 0.0 {
+            rear_cap := 18000.0 + 7000.0 * fwd_cos
+            if rear_cap < lpf_l { lpf_l = rear_cap }
+            if rear_cap < lpf_r { lpf_r = rear_cap }
+        }
+    }
+
+    if itd_frames > 48 { itd_frames = 48 }
+    if itd_frames < -48 { itd_frames = -48 }
+
+    occ_cap := 18000.0 - occ * (18000.0 - 400.0)
+    if occ_cap < lpf_l { lpf_l = occ_cap }
+    if occ_cap < lpf_r { lpf_r = occ_cap }
+
+    << Spatial3DResult{
+        volume: volume,
+        pan: az_sin,
+        pitch: pitch,
+        occlusion: occ,
+        itd_frames: itd_frames,
+        left_gain: left_gain,
+        right_gain: right_gain,
+        lpf_cutoff_left_hz: lpf_l,
+        lpf_cutoff_right_hz: lpf_r
+    }
 }

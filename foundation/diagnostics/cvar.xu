@@ -1,0 +1,628 @@
+@"github.com/xulang-org/nexus/foundation/diagnostics"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#encoding/json
+#errors
+#math
+#strconv
+#strings
+
+pub const CVAR_BOOL = 0
+pub const CVAR_INT = 1
+pub const CVAR_FLOAT = 2
+pub const CVAR_STRING = 3
+
+pub const CVAR_NONE = 0
+pub const CVAR_ARCHIVE = 1
+pub const CVAR_CHEAT = 2
+pub const CVAR_READONLY = 4
+
+struct CVarDef {
+    name string
+    kind int
+    flags int
+    help string
+    has_bounds bool
+    min_num f64
+    max_num f64
+    def_bool bool
+    val_bool bool
+    def_int int
+    val_int int
+    def_float f64
+    val_float f64
+    def_str string
+    val_str string
+    dirty bool
+}
+
+struct CVarCommand {
+    name string
+    help string
+}
+
+pub struct CommandInvocation {
+    pub name string
+    pub args []string
+}
+
+pub struct ExecResult {
+    pub ok bool
+    pub output string
+    pub is_command bool
+}
+
+pub struct CVarRegistry {
+    vars []CVarDef
+    var_index map[string]int
+    cmds []CVarCommand
+    cmd_index map[string]int
+    pending_cmds []CommandInvocation
+    cheats_enabled bool
+}
+
+pub fn new_cvar_registry() CVarRegistry {
+    << CVarRegistry{
+        vars: []CVarDef{},
+        var_index: map[string]int{},
+        cmds: []CVarCommand{},
+        cmd_index: map[string]int{},
+        pending_cmds: []CommandInvocation{},
+        cheats_enabled: false
+    }
+}
+
+fn valid_symbol_name(name &string) bool {
+    if name.len == 0 || name.len > 96 { << false }
+    for i in 0:name.len {
+        c := name[i]
+        ok := (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 || c == 46 || c == 45
+        if !ok { << false }
+    }
+    << true
+}
+
+fn is_reserved_builtin(name &string) bool {
+    << *name == "help" || *name == "list" || *name == "find" || *name == "reset"
+}
+
+fn (r &CVarRegistry) ensure_unique_symbol(name &string) int {
+    if !valid_symbol_name(name) || is_reserved_builtin(name) {
+        >> errors.new("nexus diagnostics: invalid or reserved CVar/command name")
+    }
+    if r.var_index.has(*name) || r.cmd_index.has(*name) {
+        >> errors.new("nexus diagnostics: duplicate CVar or command: " + *name)
+    }
+    << 0
+}
+
+pub fn (r $&CVarRegistry) set_cheats_enabled(enabled bool) {
+    r.cheats_enabled = enabled
+}
+
+pub fn (r &CVarRegistry) cheats_enabled() bool { << r.cheats_enabled }
+
+pub fn (r $&CVarRegistry) register_bool(name string, default_val bool, flags int, help string) int {
+    r.ensure_unique_symbol(&name) or >>
+    idx := r.vars.len
+    r.vars.push(CVarDef{
+        name: name + "", kind: CVAR_BOOL, flags: flags, help: help + "",
+        has_bounds: false, min_num: 0.0, max_num: 0.0,
+        def_bool: default_val, val_bool: default_val,
+        def_int: 0, val_int: 0, def_float: 0.0, val_float: 0.0,
+        def_str: "", val_str: "", dirty: false
+    })
+    r.var_index[name + ""] = idx
+    << idx
+}
+
+pub fn (r $&CVarRegistry) register_int(name string, default_val int, flags int, help string) int {
+    r.ensure_unique_symbol(&name) or >>
+    idx := r.vars.len
+    r.vars.push(CVarDef{
+        name: name + "", kind: CVAR_INT, flags: flags, help: help + "",
+        has_bounds: false, min_num: 0.0, max_num: 0.0,
+        def_bool: false, val_bool: false,
+        def_int: default_val, val_int: default_val, def_float: 0.0, val_float: 0.0,
+        def_str: "", val_str: "", dirty: false
+    })
+    r.var_index[name + ""] = idx
+    << idx
+}
+
+pub fn (r $&CVarRegistry) register_int_range(name string, default_val int, min_val int, max_val int, flags int, help string) int {
+    if min_val > max_val { >> errors.new("nexus diagnostics: int CVar min > max") }
+    r.ensure_unique_symbol(&name) or >>
+    $clamped := default_val
+    if clamped < min_val { clamped = min_val }
+    if clamped > max_val { clamped = max_val }
+    idx := r.vars.len
+    r.vars.push(CVarDef{
+        name: name + "", kind: CVAR_INT, flags: flags, help: help + "",
+        has_bounds: true, min_num: f64(min_val), max_num: f64(max_val),
+        def_bool: false, val_bool: false,
+        def_int: clamped, val_int: clamped, def_float: 0.0, val_float: 0.0,
+        def_str: "", val_str: "", dirty: false
+    })
+    r.var_index[name + ""] = idx
+    << idx
+}
+
+pub fn (r $&CVarRegistry) register_float(name string, default_val f64, flags int, help string) int {
+    if !fm.finite(default_val) { >> errors.new("nexus diagnostics: float CVar default must be finite") }
+    r.ensure_unique_symbol(&name) or >>
+    idx := r.vars.len
+    r.vars.push(CVarDef{
+        name: name + "", kind: CVAR_FLOAT, flags: flags, help: help + "",
+        has_bounds: false, min_num: 0.0, max_num: 0.0,
+        def_bool: false, val_bool: false,
+        def_int: 0, val_int: 0, def_float: default_val, val_float: default_val,
+        def_str: "", val_str: "", dirty: false
+    })
+    r.var_index[name + ""] = idx
+    << idx
+}
+
+pub fn (r $&CVarRegistry) register_float_range(name string, default_val f64, min_val f64, max_val f64, flags int, help string) int {
+    if !fm.finite(default_val) || !fm.finite(min_val) || !fm.finite(max_val) || min_val > max_val {
+        >> errors.new("nexus diagnostics: invalid float CVar range")
+    }
+    r.ensure_unique_symbol(&name) or >>
+    clamped := fm.clamp(default_val, min_val, max_val)
+    idx := r.vars.len
+    r.vars.push(CVarDef{
+        name: name + "", kind: CVAR_FLOAT, flags: flags, help: help + "",
+        has_bounds: true, min_num: min_val, max_num: max_val,
+        def_bool: false, val_bool: false,
+        def_int: 0, val_int: 0, def_float: clamped, val_float: clamped,
+        def_str: "", val_str: "", dirty: false
+    })
+    r.var_index[name + ""] = idx
+    << idx
+}
+
+pub fn (r $&CVarRegistry) register_string(name string, default_val string, flags int, help string) int {
+    r.ensure_unique_symbol(&name) or >>
+    idx := r.vars.len
+    r.vars.push(CVarDef{
+        name: name + "", kind: CVAR_STRING, flags: flags, help: help + "",
+        has_bounds: false, min_num: 0.0, max_num: 0.0,
+        def_bool: false, val_bool: false,
+        def_int: 0, val_int: 0, def_float: 0.0, val_float: 0.0,
+        def_str: default_val + "", val_str: default_val + "", dirty: false
+    })
+    r.var_index[name + ""] = idx
+    << idx
+}
+
+pub fn (r $&CVarRegistry) register_command(name string, help string) int {
+    r.ensure_unique_symbol(&name) or >>
+    idx := r.cmds.len
+    r.cmds.push(CVarCommand{name: name + "", help: help + ""})
+    r.cmd_index[name + ""] = idx
+    << idx
+}
+
+pub fn (r &CVarRegistry) has_cvar(name string) bool { << r.var_index.has(name) }
+pub fn (r &CVarRegistry) has_command(name string) bool { << r.cmd_index.has(name) }
+
+fn (r &CVarRegistry) lookup_idx(name &string, expected_kind int) int {
+    if !r.var_index.has(*name) { >> errors.new("nexus diagnostics: unknown CVar: " + *name) }
+    idx := r.var_index[*name]
+    if expected_kind >= 0 && r.vars[idx].kind != expected_kind {
+        >> errors.new("nexus diagnostics: CVar type mismatch: " + *name)
+    }
+    << idx
+}
+
+fn (r &CVarRegistry) check_writable(idx int) int {
+    v := &r.vars[idx]
+    if (v.flags & CVAR_READONLY) != 0 {
+        >> errors.new("nexus diagnostics: CVar is readonly: " + v.name)
+    }
+    if (v.flags & CVAR_CHEAT) != 0 && !r.cheats_enabled {
+        >> errors.new("nexus diagnostics: CVar requires cheats enabled: " + v.name)
+    }
+    << 0
+}
+
+pub fn (r &CVarRegistry) get_bool(name string) bool {
+    idx := r.lookup_idx(&name, CVAR_BOOL) or >>
+    << r.vars[idx].val_bool
+}
+
+pub fn (r &CVarRegistry) get_int(name string) int {
+    idx := r.lookup_idx(&name, CVAR_INT) or >>
+    << r.vars[idx].val_int
+}
+
+pub fn (r &CVarRegistry) get_float(name string) f64 {
+    idx := r.lookup_idx(&name, CVAR_FLOAT) or >>
+    << r.vars[idx].val_float
+}
+
+pub fn (r &CVarRegistry) get_string(name string) string {
+    idx := r.lookup_idx(&name, CVAR_STRING) or >>
+    << r.vars[idx].val_str + ""
+}
+
+pub fn (r $&CVarRegistry) set_bool(name string, val bool) int {
+    idx := r.lookup_idx(&name, CVAR_BOOL) or >>
+    r.check_writable(idx) or >>
+    if r.vars[idx].val_bool != val {
+        r.vars[idx].val_bool = val
+        r.vars[idx].dirty = true
+    }
+    << 0
+}
+
+pub fn (r $&CVarRegistry) set_int(name string, val int) int {
+    idx := r.lookup_idx(&name, CVAR_INT) or >>
+    r.check_writable(idx) or >>
+    $next := val
+    if r.vars[idx].has_bounds {
+        lo := int(r.vars[idx].min_num)
+        hi := int(r.vars[idx].max_num)
+        if next < lo { next = lo }
+        if next > hi { next = hi }
+    }
+    if r.vars[idx].val_int != next {
+        r.vars[idx].val_int = next
+        r.vars[idx].dirty = true
+    }
+    << 0
+}
+
+pub fn (r $&CVarRegistry) set_float(name string, val f64) int {
+    if !fm.finite(val) { >> errors.new("nexus diagnostics: float CVar value must be finite") }
+    idx := r.lookup_idx(&name, CVAR_FLOAT) or >>
+    r.check_writable(idx) or >>
+    $next := val
+    if r.vars[idx].has_bounds {
+        next = fm.clamp(val, r.vars[idx].min_num, r.vars[idx].max_num)
+    }
+    if r.vars[idx].val_float != next {
+        r.vars[idx].val_float = next
+        r.vars[idx].dirty = true
+    }
+    << 0
+}
+
+pub fn (r $&CVarRegistry) set_string(name string, val string) int {
+    idx := r.lookup_idx(&name, CVAR_STRING) or >>
+    r.check_writable(idx) or >>
+    if r.vars[idx].val_str != val {
+        r.vars[idx].val_str = val + ""
+        r.vars[idx].dirty = true
+    }
+    << 0
+}
+
+fn cvar_value_str(v &CVarDef) string {
+    if v.kind == CVAR_BOOL {
+        if v.val_bool { << "true" }
+        << "false"
+    }
+    if v.kind == CVAR_INT {
+        << strconv.itoa(v.val_int)
+    }
+    if v.kind == CVAR_FLOAT {
+        << strconv.format_float(v.val_float, 103, -1) or (err) {
+            _ := err.msg()
+            << "0"
+        }
+    }
+    << v.val_str + ""
+}
+
+pub fn (r $&CVarRegistry) set_from_string(name string, raw string) int {
+    idx := r.lookup_idx(&name, -1) or >>
+    kind := r.vars[idx].kind
+    trimmed := strings.trim_space(&raw)
+    if kind == CVAR_BOOL {
+        low := strings.to_lower(&trimmed)
+        if low == "1" || low == "true" || low == "on" || low == "yes" {
+            << r.set_bool(name, true) or >>
+        } else if low == "0" || low == "false" || low == "off" || low == "no" {
+            << r.set_bool(name, false) or >>
+        }
+        b := strconv.parse_bool(&trimmed) or >>
+        << r.set_bool(name, b) or >>
+    }
+    if kind == CVAR_INT {
+        n := strconv.atoi(&trimmed) or >>
+        << r.set_int(name, n) or >>
+    }
+    if kind == CVAR_FLOAT {
+        f := strconv.parse_float(&trimmed) or >>
+        << r.set_float(name, f) or >>
+    }
+    << r.set_string(name, raw) or >>
+}
+
+pub fn (r $&CVarRegistry) reset(name string) int {
+    idx := r.lookup_idx(&name, -1) or >>
+    r.check_writable(idx) or >>
+    v := $&r.vars[idx]
+    if v.kind == CVAR_BOOL && v.val_bool != v.def_bool {
+        v.val_bool = v.def_bool
+        v.dirty = true
+    } else if v.kind == CVAR_INT && v.val_int != v.def_int {
+        v.val_int = v.def_int
+        v.dirty = true
+    } else if v.kind == CVAR_FLOAT && v.val_float != v.def_float {
+        v.val_float = v.def_float
+        v.dirty = true
+    } else if v.kind == CVAR_STRING && v.val_str != v.def_str {
+        v.val_str = v.def_str + ""
+        v.dirty = true
+    }
+    << 0
+}
+
+pub fn (r $&CVarRegistry) reset_all() int {
+    $n := 0
+    for i in 0:r.vars.len {
+        if (r.vars[i].flags & CVAR_READONLY) != 0 { -> }
+        if (r.vars[i].flags & CVAR_CHEAT) != 0 && !r.cheats_enabled { -> }
+        r.reset(r.vars[i].name + "") or >>
+        n += 1
+    }
+    << n
+}
+
+pub fn (r $&CVarRegistry) take_changed() []string {
+    $out := []string{}
+    for i in 0:r.vars.len {
+        if r.vars[i].dirty {
+            out.push(r.vars[i].name + "")
+            r.vars[i].dirty = false
+        }
+    }
+    << out
+}
+
+pub fn (r $&CVarRegistry) drain_commands() []CommandInvocation {
+    $out := []CommandInvocation{}
+    for i in 0:r.pending_cmds.len {
+        $args := []string{}
+        for a in r.pending_cmds[i].args { args.push(a + "") }
+        out.push(CommandInvocation{name: r.pending_cmds[i].name + "", args: args})
+    }
+    r.pending_cmds = []CommandInvocation{}
+    << out
+}
+
+fn sort_strings(items $&[]string) {
+    if items.len < 2 { << }
+    for i in 0:(items.len - 1) {
+        for j in (i + 1):items.len {
+            if strings.compare(&items[j], &items[i]) < 0 {
+                tmp := items[i]
+                items[i] = items[j]
+                items[j] = tmp
+            }
+        }
+    }
+}
+
+pub fn (r &CVarRegistry) autocomplete(prefix string) []string {
+    $out := []string{}
+    for v in r.vars {
+        if prefix.len == 0 || strings.has_prefix(&v.name, prefix) {
+            out.push(v.name + "")
+        }
+    }
+    for c in r.cmds {
+        if prefix.len == 0 || strings.has_prefix(&c.name, prefix) {
+            out.push(c.name + "")
+        }
+    }
+    sort_strings($&out)
+    << out
+}
+
+fn tokenize_command_line(line &string) []string {
+    $tokens := []string{}
+    $cur := strings.new_byte_builder(64)
+    $in_tok := false
+    $in_quotes := false
+    $escape := false
+    $i := 0
+    while i < line.len {
+        c := line[i]
+        if escape {
+            if c == 110 { cur.write_byte(10) }
+            else if c == 116 { cur.write_byte(9) }
+            else { cur.write_byte(c) }
+            escape = false
+            in_tok = true
+            i += 1
+            ->
+        }
+        if in_quotes {
+            if c == 92 {
+                escape = true
+            } else if c == 34 {
+                in_quotes = false
+            } else {
+                cur.write_byte(c)
+            }
+            i += 1
+            ->
+        }
+        if c == 35 { <- } // '#' comment
+        if c == 47 && i + 1 < line.len && line[i + 1] == 47 { <- } // '//' comment
+        if c == 34 {
+            in_quotes = true
+            in_tok = true
+            i += 1
+            ->
+        }
+        if c == 32 || c == 9 || c == 13 || c == 10 {
+            if in_tok {
+                tokens.push(cur.to_string())
+                cur = strings.new_byte_builder(64)
+                in_tok = false
+            }
+            i += 1
+            ->
+        }
+        cur.write_byte(c)
+        in_tok = true
+        i += 1
+    }
+    if in_quotes {
+        >> errors.new("nexus diagnostics: unterminated quoted argument")
+    }
+    if in_tok {
+        tokens.push(cur.to_string())
+    }
+    << tokens
+}
+
+pub fn (r $&CVarRegistry) exec_line(line string) ExecResult {
+    tokens := tokenize_command_line(&line) or (err) {
+        << ExecResult{ok: false, output: err.msg(), is_command: false}
+    }
+    if tokens.len == 0 {
+        << ExecResult{ok: true, output: "", is_command: false}
+    }
+    head := tokens[0] + ""
+    if head == "help" {
+        if tokens.len >= 2 {
+            target := tokens[1] + ""
+            if r.var_index.has(target) {
+                vi := r.var_index[target]
+                v := &r.vars[vi]
+                << ExecResult{ok: true, output: v.name + " = " + cvar_value_str(v) + " -- " + v.help, is_command: false}
+            }
+            if r.cmd_index.has(target) {
+                ci := r.cmd_index[target]
+                c := &r.cmds[ci]
+                << ExecResult{ok: true, output: c.name + " (cmd) -- " + c.help, is_command: false}
+            }
+            << ExecResult{ok: false, output: "unknown symbol: " + target, is_command: false}
+        }
+        names := r.autocomplete("")
+        << ExecResult{ok: true, output: strings.join(names, ", "), is_command: false}
+    }
+    if head == "list" {
+        $prefix := ""
+        if tokens.len >= 2 { prefix = tokens[1] + "" }
+        names := r.autocomplete(prefix)
+        << ExecResult{ok: true, output: strings.join(names, "\n"), is_command: false}
+    }
+    if head == "find" {
+        if tokens.len < 2 {
+            << ExecResult{ok: false, output: "usage: find <substring>", is_command: false}
+        }
+        sub := strings.to_lower(&tokens[1])
+        $hits := []string{}
+        for v in r.vars {
+            low := strings.to_lower(&v.name)
+            if strings.contains(&low, sub) { hits.push(v.name + "") }
+        }
+        for c in r.cmds {
+            low := strings.to_lower(&c.name)
+            if strings.contains(&low, sub) { hits.push(c.name + "") }
+        }
+        sort_strings($&hits)
+        << ExecResult{ok: true, output: strings.join(hits, "\n"), is_command: false}
+    }
+    if head == "reset" {
+        if tokens.len < 2 {
+            << ExecResult{ok: false, output: "usage: reset <cvar>", is_command: false}
+        }
+        r.reset(tokens[1] + "") or (err) {
+            << ExecResult{ok: false, output: err.msg(), is_command: false}
+        }
+        vi := r.var_index[tokens[1]]
+        v := &r.vars[vi]
+        << ExecResult{ok: true, output: v.name + " = " + cvar_value_str(v), is_command: false}
+    }
+    if r.var_index.has(head) {
+        if tokens.len == 1 {
+            vi := r.var_index[head]
+            v := &r.vars[vi]
+            << ExecResult{ok: true, output: v.name + " = " + cvar_value_str(v), is_command: false}
+        }
+        r.set_from_string(head + "", tokens[1] + "") or (err) {
+            << ExecResult{ok: false, output: err.msg(), is_command: false}
+        }
+        vi := r.var_index[head]
+        v := &r.vars[vi]
+        << ExecResult{ok: true, output: v.name + " = " + cvar_value_str(v), is_command: false}
+    }
+    if r.cmd_index.has(head) {
+        $args := []string{}
+        for i in 1:tokens.len { args.push(tokens[i] + "") }
+        r.pending_cmds.push(CommandInvocation{name: head, args: args})
+        << ExecResult{ok: true, output: "queued " + head, is_command: true}
+    }
+    << ExecResult{ok: false, output: "unknown cvar or command: " + head, is_command: false}
+}
+
+pub fn (r &CVarRegistry) export_archive_json() string {
+    $b := strings.new_byte_builder(512)
+    b.write_str("{\"cvars\":{")
+    $first := true
+    for v in r.vars {
+        if (v.flags & CVAR_ARCHIVE) == 0 { -> }
+        if !first { b.write_str(",") }
+        first = false
+        nm := v.name + ""
+        b.write_str(json.quote(&nm) + ":")
+        if v.kind == CVAR_BOOL {
+            if v.val_bool { b.write_str("true") } else { b.write_str("false") }
+        } else if v.kind == CVAR_INT {
+            b.write_str(strconv.itoa(v.val_int))
+        } else if v.kind == CVAR_FLOAT {
+            b.write_str(cvar_value_str(&v))
+        } else {
+            sv := v.val_str + ""
+            b.write_str(json.quote(&sv))
+        }
+    }
+    b.write_str("}}")
+    << b.to_string()
+}
+
+pub fn (r $&CVarRegistry) import_json(raw &string) int {
+    doc := json.parse_max(raw, 262144)
+    if !doc.ok() { >> errors.new("nexus diagnostics: CVar JSON parse error: " + doc.error()) }
+    root := doc.root()
+    if !doc.is_dict(root) || !doc.has(root, "cvars") {
+        >> errors.new("nexus diagnostics: CVar JSON missing cvars dict")
+    }
+    cv := doc.get(root, "cvars")
+    if cv < 0 || !doc.is_dict(cv) {
+        >> errors.new("nexus diagnostics: invalid cvars dict")
+    }
+    keys := doc.dict_keys(cv)
+    $applied := 0
+    for key in keys {
+        k := key + ""
+        if !r.var_index.has(k) { -> }
+        idx := r.var_index[k]
+        if (r.vars[idx].flags & CVAR_READONLY) != 0 { -> }
+        if (r.vars[idx].flags & CVAR_CHEAT) != 0 && !r.cheats_enabled { -> }
+        node := doc.get(cv, k + "")
+        kind := r.vars[idx].kind
+        if kind == CVAR_BOOL {
+            val := doc.as_bool(node) or >>
+            r.set_bool(k + "", val) or >>
+        } else if kind == CVAR_INT {
+            val := doc.as_int(node) or >>
+            r.set_int(k + "", val) or >>
+        } else if kind == CVAR_FLOAT {
+            val := doc.as_f64(node) or >>
+            r.set_float(k + "", val) or >>
+        } else {
+            val := doc.as_string(node) or >>
+            r.set_string(k + "", val) or >>
+        }
+        applied += 1
+    }
+    << applied
+}

@@ -1,0 +1,49 @@
+@main
+
+gltf #"github.com/xulang-org/nexus/formats/gltf"
+images #"github.com/xulang-org/nexus/assets/image"
+wav #"github.com/xulang-org/nexus/formats/wav"
+bytecode #"github.com/xulang-org/nexus/script/bytecode"
+model #"github.com/xulang-org/nexus/integration/gltf_render"
+scenes #"github.com/xulang-org/nexus/integration/scene"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#os
+#errors
+
+fn flag(value bool) string {
+    if value { << "1" }
+    << "0"
+}
+fn run() int {
+    args := os.args()
+    if args.len != 3 {
+        >> errors.new("usage: nexus-project-validate glb|png|wav|script|scene <path>")
+    }
+    path := args[2] + ""
+    if args[1] == "glb" {
+        raw := snapshot.read(path, gltf.MAX_GLB_BYTES) or >>
+        asset := gltf.decode_glb_geometry(&raw) or >>
+        primitives := model.validate_static_model(&asset) or >>
+        for primitive in primitives {
+            println(str(primitive.triangles) + " " + flag(primitive.has_uvs) + " " +
+                flag(primitive.has_tangents) + " " + flag(primitive.needs_uvs) + " " + flag(primitive.needs_tangents))
+        }
+    } else if args[1] == "png" {
+        images.load_png(path) or >>
+    } else if args[1] == "wav" {
+        raw := snapshot.read(path, wav.MAX_BYTES) or >>
+        _ := wav.decode(&raw) or >>
+    } else if args[1] == "script" {
+        raw := snapshot.read(path, bytecode.MAX_BYTES) or >>
+        program := bytecode.decode(&raw) or >>
+        _ := program.check() or >>
+    } else if args[1] == "scene" {
+        document := scenes.load(path) or >>
+        scenes.to_packed_nodes(&document) or >>
+    } else {
+        >> errors.new("expected glb, png, wav, script or scene")
+    }
+    << 0
+}
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

@@ -1,0 +1,363 @@
+@"github.com/xulang-org/nexus/script/vm"
+
+bc #"github.com/xulang-org/nexus/script/bytecode"
+#errors
+#math
+
+pub const STEP_COMPLETED = 0
+pub const STEP_HOST_CALL = 1
+pub const STEP_YIELD_FRAME = 2
+pub const STEP_YIELD_SECONDS = 3
+pub const STEP_YIELD_SIGNAL = 4
+
+pub struct StepOutcome {
+    pub status int
+    pub value f64
+    pub host_fn int
+    pub host_arg_count int
+    pub host_args []f64
+    pub wait_signal int
+    pub remaining_budget int
+}
+
+pub struct Fiber {
+    fn_index int
+    fn_kind int
+    pc int
+    epoch int
+    regs []f64
+    stamps []int
+    stamp int
+    pending_state []f64
+    pending_signals []SignalEvent
+    host_args []f64
+    result_dst int
+    waiting_result bool
+    sync_state_on_resume bool
+    budget int
+    result_limit f64
+    finished bool
+}
+
+fn empty_fiber() Fiber {
+    << Fiber{
+        fn_index: -1, fn_kind: 0, pc: 0, epoch: 0,
+        regs: []f64{}, stamps: []int{}, stamp: 0,
+        pending_state: []f64{}, pending_signals: []SignalEvent{},
+        host_args: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        result_dst: 0, waiting_result: false, sync_state_on_resume: false,
+        budget: 0, result_limit: 0.0, finished: true
+    }
+}
+
+fn (instance &Instance) start_fiber_entry(index int, arg_a f64, arg_b f64, budget int, result_limit f64) Fiber {
+    if instance.epoch < 1 { >> errors.new("XuScript: uninitialized VM instance") }
+    if !bc.valid_scalar(arg_a) || !bc.valid_scalar(arg_b) || budget < 1 || budget > MAX_BUDGET ||
+        !bc.valid_scalar(result_limit) || result_limit <= 0.0 {
+        >> errors.new("XuScript: invalid callback arguments/budget/result bound")
+    }
+    function := instance.program.function(index) or >>
+    reg_n := instance.program.register_count()
+    $regs := init_scratch_regs(reg_n)
+    $stamps := init_scratch_stamps(reg_n)
+    stamp := 1
+    regs[0] = arg_a
+    stamps[0] = stamp
+    if function.kind == bc.PHYSICS_FUNCTION {
+        regs[1] = arg_b
+        stamps[1] = stamp
+    }
+    $pstate := []f64{}
+    for v in instance.values { pstate.push(v) }
+    << Fiber{
+        fn_index: index,
+        fn_kind: function.kind,
+        pc: function.entry,
+        epoch: instance.epoch,
+        regs: regs,
+        stamps: stamps,
+        stamp: stamp,
+        pending_state: pstate,
+        pending_signals: []SignalEvent{},
+        host_args: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        result_dst: 0,
+        waiting_result: false,
+        sync_state_on_resume: false,
+        budget: budget,
+        result_limit: result_limit,
+        finished: false
+    }
+}
+
+pub fn (instance &Instance) start_physics_fiber(delta f64, axis f64, budget int, result_limit f64) Fiber {
+    if instance.epoch < 1 { >> errors.new("XuScript: uninitialized VM instance") }
+    index := instance.program.physics_index()
+    if index < 0 { >> errors.new("XuScript: module has no physics_process callback") }
+    << instance.start_fiber_entry(index, delta, axis, budget, result_limit) or >>
+}
+
+pub fn (instance &Instance) start_handler_fiber(id int, value f64, budget int, result_limit f64) Fiber {
+    if instance.epoch < 1 { >> errors.new("XuScript: uninitialized VM instance") }
+    index := instance.program.handler_index(id)
+    if index < 0 { >> errors.new("XuScript: unknown signal handler ID") }
+    << instance.start_fiber_entry(index, value, 0.0, budget, result_limit) or >>
+}
+
+pub fn (instance &Instance) start_coroutine_fiber(id int, arg f64, budget int, result_limit f64) Fiber {
+    if instance.epoch < 1 { >> errors.new("XuScript: uninitialized VM instance") }
+    index := instance.program.coroutine_index(id)
+    if index < 0 { >> errors.new("XuScript: unknown coroutine callback ID") }
+    << instance.start_fiber_entry(index, arg, 0.0, budget, result_limit) or >>
+}
+
+pub fn (fiber &Fiber) is_finished() bool { << fiber.finished }
+pub fn (fiber &Fiber) is_waiting_result() bool { << fiber.waiting_result }
+pub fn (fiber &Fiber) fiber_epoch() int { << fiber.epoch }
+
+pub fn (fiber $&Fiber) reset_budget(budget int) int {
+    if budget < 1 || budget > MAX_BUDGET {
+        >> errors.new("XuScript: invalid fiber budget")
+    }
+    fiber.budget = budget
+    << 0
+}
+
+pub fn (fiber $&Fiber) provide_host_result(value f64) int {
+    if fiber.finished || !fiber.waiting_result {
+        >> errors.new("XuScript: fiber is not waiting for host call result")
+    }
+    if !bc.valid_scalar(value) {
+        >> errors.new("XuScript: host call returned non-finite or out-of-range scalar")
+    }
+    fiber.regs[fiber.result_dst] = value
+    fiber.stamps[fiber.result_dst] = fiber.stamp
+    fiber.waiting_result = false
+    << 0
+}
+
+pub fn (fiber $&Fiber) provide_signal_result(value f64) int {
+    if fiber.finished || !fiber.waiting_result {
+        >> errors.new("XuScript: fiber is not waiting for signal payload")
+    }
+    if !bc.valid_scalar(value) {
+        >> errors.new("XuScript: signal payload is non-finite or out-of-range")
+    }
+    fiber.regs[fiber.result_dst] = value
+    fiber.stamps[fiber.result_dst] = fiber.stamp
+    fiber.waiting_result = false
+    << 0
+}
+
+fn (instance $&Instance) commit_fiber_state(fiber $&Fiber) int {
+    state_len := instance.values.len
+    for i in 0:state_len {
+        instance.values[i] = fiber.pending_state[i]
+    }
+    if instance.signals.len + fiber.pending_signals.len > MAX_PENDING_SIGNALS {
+        >> errors.new("XuScript: signal outbox limit exceeded")
+    }
+    for ev in fiber.pending_signals {
+        instance.signals.push(ev)
+    }
+    fiber.pending_signals = []SignalEvent{}
+    << 0
+}
+
+pub fn (instance $&Instance) resume_fiber(fiber $&Fiber) StepOutcome {
+    if instance.epoch < 1 { >> errors.new("XuScript: uninitialized VM instance") }
+    if fiber.epoch != instance.epoch {
+        >> errors.new("XuScript: fiber invalidated by module reload")
+    }
+    if fiber.finished {
+        >> errors.new("XuScript: cannot resume finished fiber")
+    }
+    if fiber.waiting_result {
+        >> errors.new("XuScript: fiber still waiting for host or signal result")
+    }
+    function := instance.program.function(fiber.fn_index) or >>
+    state_len := instance.values.len
+    if fiber.fn_kind == bc.COROUTINE_FUNCTION && fiber.sync_state_on_resume {
+        while fiber.pending_state.len < state_len { fiber.pending_state.push(0.0) }
+        for i in 0:state_len { fiber.pending_state[i] = instance.values[i] }
+    }
+    fiber.sync_state_on_resume = false
+
+    while true {
+        if fiber.pc < function.entry || fiber.pc >= function.end {
+            >> errors.new("XuScript: callback escaped function range")
+        }
+        instruction := instance.program.instruction(fiber.pc) or >>
+        if fiber.budget <= 0 {
+            >> errors.new(failure(&instance.program, instruction, "instruction budget exhausted"))
+        }
+        fiber.budget = fiber.budget - 1
+        fiber.pc = fiber.pc + 1
+        op := instruction.op
+
+        if op == bc.JUMP {
+            fiber.pc = instruction.dst
+            ->
+        }
+        if op == bc.BRANCH_FALSE {
+            cond := read_stamped(&fiber.regs, &fiber.stamps, fiber.stamp, instruction.a, &instance.program, instruction) or >>
+            if cond == 0.0 { fiber.pc = instruction.dst }
+            ->
+        }
+        if op == bc.RETURN {
+            result := read_stamped(&fiber.regs, &fiber.stamps, fiber.stamp, instruction.a, &instance.program, instruction) or >>
+            if !bc.valid_scalar(result) || math.abs(result) > fiber.result_limit {
+                >> errors.new(failure(&instance.program, instruction, "callback result outside host bound"))
+            }
+            if instance.calls >= 9223372036854775806 {
+                >> errors.new("XuScript: callback counter exhausted")
+            }
+            instance.commit_fiber_state(fiber) or >>
+            instance.calls = instance.calls + 1
+            fiber.finished = true
+            << StepOutcome{
+                status: STEP_COMPLETED,
+                value: result,
+                host_fn: 0,
+                host_arg_count: 0,
+                host_args: []f64{},
+                wait_signal: 0,
+                remaining_budget: fiber.budget
+            }
+        }
+        if op == bc.EMIT_SIGNAL {
+            if fiber.pending_signals.len >= MAX_SIGNALS_PER_CALL ||
+                instance.signals.len + fiber.pending_signals.len >= MAX_PENDING_SIGNALS {
+                >> errors.new(failure(&instance.program, instruction, "signal outbox limit exceeded"))
+            }
+            val := read_stamped(&fiber.regs, &fiber.stamps, fiber.stamp, instruction.a, &instance.program, instruction) or >>
+            sig := instance.program.signal(instruction.dst) or >>
+            fiber.pending_signals.push(SignalEvent{id: sig.id, value: val, epoch: instance.epoch, call: instance.calls + 1})
+            ->
+        }
+        if op == bc.STORE_FIELD {
+            val := read_stamped(&fiber.regs, &fiber.stamps, fiber.stamp, instruction.a, &instance.program, instruction) or >>
+            fiber.pending_state[instruction.dst] = val
+            ->
+        }
+        if op == bc.HOST_ARG {
+            val := read_stamped(&fiber.regs, &fiber.stamps, fiber.stamp, instruction.a, &instance.program, instruction) or >>
+            fiber.host_args[instruction.dst] = val
+            ->
+        }
+        if op == bc.CALL_HOST {
+            fiber.result_dst = instruction.dst
+            fiber.waiting_result = true
+            fiber.sync_state_on_resume = false
+            $args_out := []f64{}
+            for k in 0:instruction.b { args_out.push(fiber.host_args[k]) }
+            << StepOutcome{
+                status: STEP_HOST_CALL,
+                value: 0.0,
+                host_fn: instruction.a,
+                host_arg_count: instruction.b,
+                host_args: args_out,
+                wait_signal: 0,
+                remaining_budget: fiber.budget
+            }
+        }
+        if op == bc.YIELD_FRAME {
+            instance.commit_fiber_state(fiber) or >>
+            fiber.sync_state_on_resume = true
+            << StepOutcome{
+                status: STEP_YIELD_FRAME,
+                value: 0.0,
+                host_fn: 0,
+                host_arg_count: 0,
+                host_args: []f64{},
+                wait_signal: 0,
+                remaining_budget: fiber.budget
+            }
+        }
+        if op == bc.YIELD_SECONDS {
+            dur := read_stamped(&fiber.regs, &fiber.stamps, fiber.stamp, instruction.a, &instance.program, instruction) or >>
+            if !bc.valid_scalar(dur) || dur < 0.0 {
+                >> errors.new(failure(&instance.program, instruction, "yield_seconds expects non-negative duration"))
+            }
+            instance.commit_fiber_state(fiber) or >>
+            fiber.sync_state_on_resume = true
+            << StepOutcome{
+                status: STEP_YIELD_SECONDS,
+                value: dur,
+                host_fn: 0,
+                host_arg_count: 0,
+                host_args: []f64{},
+                wait_signal: 0,
+                remaining_budget: fiber.budget
+            }
+        }
+        if op == bc.YIELD_SIGNAL {
+            sv := read_stamped(&fiber.regs, &fiber.stamps, fiber.stamp, instruction.a, &instance.program, instruction) or >>
+            if !bc.valid_scalar(sv) || sv < 1.0 || sv > 2147483647.0 {
+                >> errors.new(failure(&instance.program, instruction, "yield_signal expects positive signal ID"))
+            }
+            sig_id := int(math.round(sv))
+            instance.commit_fiber_state(fiber) or >>
+            fiber.result_dst = instruction.dst
+            fiber.waiting_result = true
+            fiber.sync_state_on_resume = true
+            << StepOutcome{
+                status: STEP_YIELD_SIGNAL,
+                value: 0.0,
+                host_fn: 0,
+                host_arg_count: 0,
+                host_args: []f64{},
+                wait_signal: sig_id,
+                remaining_budget: fiber.budget
+            }
+        }
+
+        $value := 0.0
+        if op == bc.CONSTANT {
+            value = instance.program.constant(instruction.a) or >>
+        } else if op == bc.BOOLEAN {
+            value = f64(instruction.a)
+        } else if op == bc.LOAD_FIELD {
+            value = fiber.pending_state[instruction.a]
+        } else if op == bc.MATH_UNARY {
+            x := read_stamped(&fiber.regs, &fiber.stamps, fiber.stamp, instruction.b, &instance.program, instruction) or >>
+            if instruction.a == bc.MATH_ABS { value = math.abs(x)
+            } else if instruction.a == bc.MATH_SQRT {
+                if x < 0.0 { >> errors.new(failure(&instance.program, instruction, "sqrt of negative scalar")) }
+                value = math.sqrt(x)
+            } else if instruction.a == bc.MATH_SIN { value = math.sin(x)
+            } else if instruction.a == bc.MATH_COS { value = math.cos(x)
+            } else if instruction.a == bc.MATH_FLOOR { value = math.floor(x)
+            } else if instruction.a == bc.MATH_CEIL { value = math.ceil(x) }
+        } else if op == bc.MIN || op == bc.MAX {
+            a := read_stamped(&fiber.regs, &fiber.stamps, fiber.stamp, instruction.a, &instance.program, instruction) or >>
+            b := read_stamped(&fiber.regs, &fiber.stamps, fiber.stamp, instruction.b, &instance.program, instruction) or >>
+            if op == bc.MIN { value = math.min(a, b) } else { value = math.max(a, b) }
+        } else {
+            a := read_stamped(&fiber.regs, &fiber.stamps, fiber.stamp, instruction.a, &instance.program, instruction) or >>
+            if op == bc.MOVE { value = a
+            } else if op == bc.NEGATE { value = -a
+            } else if op == bc.NOT { if a == 0.0 { value = 1.0 }
+            } else {
+                b := read_stamped(&fiber.regs, &fiber.stamps, fiber.stamp, instruction.b, &instance.program, instruction) or >>
+                if op == bc.ADD { value = a + b
+                } else if op == bc.SUBTRACT { value = a - b
+                } else if op == bc.MULTIPLY { value = a * b
+                } else if op == bc.DIVIDE {
+                    if b == 0.0 { >> errors.new(failure(&instance.program, instruction, "division by zero")) }
+                    value = a / b
+                } else if op == bc.EQUAL { if a == b { value = 1.0 }
+                } else if op == bc.NOT_EQUAL { if a != b { value = 1.0 }
+                } else if op == bc.LESS { if a < b { value = 1.0 }
+                } else if op == bc.LESS_EQUAL { if a <= b { value = 1.0 }
+                } else if op == bc.GREATER { if a > b { value = 1.0 }
+                } else if op == bc.GREATER_EQUAL { if a >= b { value = 1.0 } }
+            }
+        }
+        if !bc.valid_scalar(value) {
+            >> errors.new(failure(&instance.program, instruction, "non-finite or out-of-range scalar result"))
+        }
+        fiber.regs[instruction.dst] = value
+        fiber.stamps[instruction.dst] = fiber.stamp
+    }
+    >> errors.new("XuScript: callback did not return")
+}

@@ -1,0 +1,430 @@
+@"github.com/xulang-org/nexus/physics3d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub struct StaticTriangle3D {
+    pub a fm.Vec3
+    pub b fm.Vec3
+    pub c fm.Vec3
+    pub layer int
+}
+
+fn triangle_area_min() f64 { << 0.00000001 }
+
+fn check_triangle(tri StaticTriangle3D) int {
+    if !valid_point(tri.a) || !valid_point(tri.b) || !valid_point(tri.c) {
+        >> errors.new("nexus physics3d: triangle vertices must be finite and within world bounds")
+    }
+    if tri.layer <= 0 || tri.layer > 0x7fffffff {
+        >> errors.new("nexus physics3d: invalid triangle collision layer")
+    }
+    edge_ab := tri.b.sub(tri.a)
+    edge_ac := tri.c.sub(tri.a)
+    cross := edge_ab.cross(edge_ac)
+    if !cross.is_finite() || cross.length() < triangle_area_min() {
+        >> errors.new("nexus physics3d: degenerate or oversized triangle collider")
+    }
+    << 0
+}
+
+pub fn static_triangle_3d(a fm.Vec3, b fm.Vec3, c fm.Vec3, layer int) StaticTriangle3D {
+    tri := StaticTriangle3D{a: a, b: b, c: c, layer: layer}
+    check_triangle(tri) or >>
+    << tri
+}
+
+pub fn transform_triangle_3d(a fm.Vec3, b fm.Vec3, c fm.Vec3, world fm.Mat4, layer int) StaticTriangle3D {
+    if !world.is_affine() || !a.is_finite() || !b.is_finite() || !c.is_finite() {
+        >> errors.new("nexus physics3d: triangle transform requires finite affine matrix and vertices")
+    }
+    ta := world.transform(fm.vec4(a.x, a.y, a.z, 1.0)).xyz()
+    tb := world.transform(fm.vec4(b.x, b.y, b.z, 1.0)).xyz()
+    tc := world.transform(fm.vec4(c.x, c.y, c.z, 1.0)).xyz()
+    << static_triangle_3d(ta, tb, tc, layer) or >>
+}
+
+pub fn (tri StaticTriangle3D) normal() fm.Vec3 {
+    check_triangle(tri) or >>
+    << tri.b.sub(tri.a).cross(tri.c.sub(tri.a)).normalized() or >>
+}
+
+fn triangle_bounds_unchecked(tri StaticTriangle3D) fm.Aabb3 {
+    min_x := math.min(tri.a.x, math.min(tri.b.x, tri.c.x))
+    min_y := math.min(tri.a.y, math.min(tri.b.y, tri.c.y))
+    min_z := math.min(tri.a.z, math.min(tri.b.z, tri.c.z))
+    max_x := math.max(tri.a.x, math.max(tri.b.x, tri.c.x))
+    max_y := math.max(tri.a.y, math.max(tri.b.y, tri.c.y))
+    max_z := math.max(tri.a.z, math.max(tri.b.z, tri.c.z))
+    << fm.Aabb3{minimum: fm.vec3(min_x, min_y, min_z), maximum: fm.vec3(max_x, max_y, max_z)}
+}
+
+pub fn (tri StaticTriangle3D) bounds() fm.Aabb3 {
+    check_triangle(tri) or >>
+    << triangle_bounds_unchecked(tri)
+}
+
+// Exact Voronoi-region closest point on triangle ABC to point P.
+fn closest_on_triangle(p fm.Vec3, a fm.Vec3, b fm.Vec3, c fm.Vec3) fm.Vec3 {
+    ab := b.sub(a)
+    ac := c.sub(a)
+    ap := p.sub(a)
+    d1 := ab.dot(ap)
+    d2 := ac.dot(ap)
+    if d1 <= 0.0 && d2 <= 0.0 { << a }
+
+    bp := p.sub(b)
+    d3 := ab.dot(bp)
+    d4 := ac.dot(bp)
+    if d3 >= 0.0 && d4 <= d3 { << b }
+
+    vc := d1 * d4 - d3 * d2
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        v := d1 / (d1 - d3)
+        << a.add(ab.scaled(v))
+    }
+
+    cp := p.sub(c)
+    d5 := ab.dot(cp)
+    d6 := ac.dot(cp)
+    if d6 >= 0.0 && d5 <= d6 { << c }
+
+    vb := d5 * d2 - d1 * d6
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        w := d2 / (d2 - d6)
+        << a.add(ac.scaled(w))
+    }
+
+    va := d3 * d6 - d5 * d4
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        w := (d4 - d3) / ((d4 - d3) + (d5 - d6))
+        << b.add(c.sub(b).scaled(w))
+    }
+
+    denom := 1.0 / (va + vb + vc)
+    v := vb * denom
+    w := vc * denom
+    << a.add(ab.scaled(v)).add(ac.scaled(w))
+}
+
+pub fn closest_point_triangle(point fm.Vec3, tri StaticTriangle3D) fm.Vec3 {
+    if !valid_point(point) { >> errors.new("nexus physics3d: invalid query point") }
+    check_triangle(tri) or >>
+    << closest_on_triangle(point, tri.a, tri.b, tri.c)
+}
+
+// Shortest vector (point on segment P1Q1 - point on segment P2Q2).
+fn closest_segment_segment_delta(p1 fm.Vec3, q1 fm.Vec3, p2 fm.Vec3, q2 fm.Vec3) fm.Vec3 {
+    d1 := q1.sub(p1)
+    d2 := q2.sub(p2)
+    r := p1.sub(p2)
+    a := d1.dot(d1)
+    e := d2.dot(d2)
+    f := d2.dot(r)
+    eps := 0.000000000001
+    $s := 0.0
+    $t := 0.0
+    if a <= eps && e <= eps {
+        << r
+    }
+    if a <= eps {
+        t = clamp_value(f / e, 0.0, 1.0)
+    } else {
+        c := d1.dot(r)
+        if e <= eps {
+            s = clamp_value(-c / a, 0.0, 1.0)
+        } else {
+            b := d1.dot(d2)
+            denom := a * e - b * b
+            if denom > eps {
+                s = clamp_value((b * f - c * e) / denom, 0.0, 1.0)
+            } else {
+                s = 0.0
+            }
+            t = (b * s + f) / e
+            if t < 0.0 {
+                t = 0.0
+                s = clamp_value(-c / a, 0.0, 1.0)
+            } else if t > 1.0 {
+                t = 1.0
+                s = clamp_value((b - c) / a, 0.0, 1.0)
+            }
+        }
+    }
+    c1 := p1.add(d1.scaled(s))
+    c2 := p2.add(d2.scaled(t))
+    << c1.sub(c2)
+}
+
+// Exact shortest vector from triangle ABC to upright capsule segment
+// [center - (0, half_segment, 0), center + (0, half_segment, 0)].
+fn segment_triangle_delta(center fm.Vec3, half_segment f64, tri StaticTriangle3D) fm.Vec3 {
+    if half_segment == 0.0 {
+        << center.sub(closest_on_triangle(center, tri.a, tri.b, tri.c))
+    }
+    p0 := fm.vec3(center.x, center.y - half_segment, center.z)
+    p1 := fm.vec3(center.x, center.y + half_segment, center.z)
+    $best := p0.sub(closest_on_triangle(p0, tri.a, tri.b, tri.c))
+    $best_d2 := best.dot(best)
+
+    d_top := p1.sub(closest_on_triangle(p1, tri.a, tri.b, tri.c))
+    if d_top.dot(d_top) < best_d2 {
+        best = d_top
+        best_d2 = d_top.dot(d_top)
+    }
+
+    // Check if the vertical segment pierces the triangle plane.
+    raw_normal := tri.b.sub(tri.a).cross(tri.c.sub(tri.a))
+    denom := raw_normal.y * (2.0 * half_segment)
+    if math.abs(denom) > 0.000000000001 {
+        t := raw_normal.dot(tri.a.sub(p0)) / denom
+        if t >= 0.0 && t <= 1.0 {
+            hit_pt := fm.vec3(center.x, p0.y + t * 2.0 * half_segment, center.z)
+            d_hit := hit_pt.sub(closest_on_triangle(hit_pt, tri.a, tri.b, tri.c))
+            if d_hit.dot(d_hit) < best_d2 {
+                best = d_hit
+                best_d2 = d_hit.dot(d_hit)
+            }
+        }
+    }
+
+    // Check segment against all three triangle edges.
+    d_ab := closest_segment_segment_delta(p0, p1, tri.a, tri.b)
+    if d_ab.dot(d_ab) < best_d2 {
+        best = d_ab
+        best_d2 = d_ab.dot(d_ab)
+    }
+    d_bc := closest_segment_segment_delta(p0, p1, tri.b, tri.c)
+    if d_bc.dot(d_bc) < best_d2 {
+        best = d_bc
+        best_d2 = d_bc.dot(d_bc)
+    }
+    d_ca := closest_segment_segment_delta(p0, p1, tri.c, tri.a)
+    if d_ca.dot(d_ca) < best_d2 {
+        best = d_ca
+        best_d2 = d_ca.dot(d_ca)
+    }
+
+    << best
+}
+
+fn triangle_separation_at(body Capsule3D, motion fm.Vec3, time f64, tri StaticTriangle3D) fm.Vec3 {
+    << segment_triangle_delta(body.center.add(motion.scaled(time)), body.half_segment, tri)
+}
+
+fn sweep_capsule_triangle_unchecked(body Capsule3D, motion fm.Vec3, tri StaticTriangle3D) SweepHit3D {
+    origin := body.center
+    bounds := triangle_bounds_unchecked(tri)
+    r := body.radius
+    h := body.half_segment
+    x := slab(origin.x - r, origin.x + r, bounds.minimum.x, bounds.maximum.x, motion.x, true)
+    y := slab(origin.y - r - h, origin.y + r + h, bounds.minimum.y, bounds.maximum.y, motion.y, true)
+    z := slab(origin.z - r, origin.z + r, bounds.minimum.z, bounds.maximum.z, motion.z, true)
+    entry := math.max(0.0, math.max(x.entry, math.max(y.entry, z.entry)))
+    exit := math.min(1.0, math.min(x.exit, math.min(y.exit, z.exit)))
+    if x.separated || y.separated || z.separated || entry > exit { << capsule_miss() }
+
+    initial := triangle_separation_at(body, motion, entry, tri)
+    epsilon := contact_epsilon()
+    inner := (r - epsilon) * (r - epsilon)
+    outer := (r + epsilon) * (r + epsilon)
+    if entry == 0.0 && initial.dot(initial) < inner {
+        << SweepHit3D{hit: true, time: 0.0, normal: zero(), started_overlapping: true}
+    }
+    speed := math.max(math.abs(motion.x), math.max(math.abs(motion.y), math.abs(motion.z)))
+    if speed == 0.0 { << capsule_miss() }
+    derivative_tolerance := r * epsilon * 0.01
+    if motion.dot(initial) >= -derivative_tolerance { << capsule_miss() }
+    if initial.dot(initial) <= outer { << capsule_contact(entry, initial) or >> }
+
+    end := triangle_separation_at(body, motion, exit, tri)
+    radius2 := r * r
+    $upper := exit
+    if end.dot(end) >= inner {
+        if motion.dot(end) < -derivative_tolerance {
+            if end.dot(end) <= outer { << capsule_contact(exit, end) or >> }
+            << capsule_miss()
+        }
+        $lower := entry
+        for i in 0:56 {
+            mid := lower + (upper - lower) * 0.5
+            delta := triangle_separation_at(body, motion, mid, tri)
+            if motion.dot(delta) < 0.0 { lower = mid }
+            else { upper = mid }
+        }
+        minimum := triangle_separation_at(body, motion, upper, tri)
+        if minimum.dot(minimum) >= inner { << capsule_miss() }
+    }
+    $safe := entry
+    for i in 0:56 {
+        if (upper - safe) * speed < epsilon * 0.125 { <- }
+        mid := safe + (upper - safe) * 0.5
+        delta := triangle_separation_at(body, motion, mid, tri)
+        if delta.dot(delta) < radius2 { upper = mid }
+        else { safe = mid }
+    }
+    << capsule_contact(safe, triangle_separation_at(body, motion, safe, tri)) or >>
+}
+
+pub fn sweep_capsule_triangle(body Capsule3D, motion fm.Vec3, tri StaticTriangle3D) SweepHit3D {
+    body.bounds() or >>
+    advance_capsule(body, motion).bounds() or >>
+    check_triangle(tri) or >>
+    << sweep_capsule_triangle_unchecked(body, motion, tri) or >>
+}
+
+struct RayCastHit {
+    hit bool
+    started_inside bool
+    time f64
+    normal fm.Vec3
+}
+
+fn ray_miss() RayCastHit { << RayCastHit{hit: false, started_inside: false, time: 1.0, normal: zero()} }
+
+fn ray_triangle_cast(origin fm.Vec3, dir_unit fm.Vec3, distance f64, tri StaticTriangle3D, bounds fm.Aabb3) RayCastHit {
+    eps := contact_epsilon()
+    on_delta := origin.sub(closest_on_triangle(origin, tri.a, tri.b, tri.c))
+    if on_delta.dot(on_delta) <= eps * eps {
+        << RayCastHit{hit: true, started_inside: true, time: 0.0, normal: zero()}
+    }
+    motion := dir_unit.scaled(distance)
+    pad := fm.vec3(eps, eps, eps)
+    padded := fm.Aabb3{minimum: bounds.minimum.sub(pad), maximum: bounds.maximum.add(pad)}
+    point := fm.Aabb3{minimum: origin, maximum: origin}
+    in_padded := origin.x >= padded.minimum.x && origin.x <= padded.maximum.x &&
+        origin.y >= padded.minimum.y && origin.y <= padded.maximum.y &&
+        origin.z >= padded.minimum.z && origin.z <= padded.maximum.z
+    if !in_padded {
+        broad := cast_box(point, motion, padded, true)
+        if !broad.hit { << ray_miss() }
+    }
+
+    e1 := tri.b.sub(tri.a)
+    e2 := tri.c.sub(tri.a)
+    pvec := dir_unit.cross(e2)
+    det := e1.dot(pvec)
+    if math.abs(det) < 0.000000000001 { << ray_miss() }
+    inv_det := 1.0 / det
+    tvec := origin.sub(tri.a)
+    u := tvec.dot(pvec) * inv_det
+    bary_eps := 0.0000001
+    if u < -bary_eps || u > 1.0 + bary_eps { << ray_miss() }
+    qvec := tvec.cross(e1)
+    v := dir_unit.dot(qvec) * inv_det
+    if v < -bary_eps || u + v > 1.0 + bary_eps { << ray_miss() }
+    t := e2.dot(qvec) * inv_det
+    if t < 0.0 || t > distance { << ray_miss() }
+    $n := e1.cross(e2).normalized() or (err) { << ray_miss() }
+    if n.dot(dir_unit) > 0.0 { n = n.scaled(-1.0) }
+    << RayCastHit{hit: true, started_inside: false, time: t / distance, normal: n}
+}
+
+pub fn raycast_triangles(origin fm.Vec3, direction fm.Vec3, distance f64, triangles &[]StaticTriangle3D) RayHit3D {
+    if !fm.finite(distance) || distance <= 0.0 || !valid_point(origin) {
+        >> errors.new("nexus physics3d: invalid ray origin or distance")
+    }
+    if triangles.len > MAX_COLLIDERS {
+        >> errors.new("nexus physics3d: static triangle budget exceeded")
+    }
+    unit := direction.normalized() or >>
+    motion := unit.scaled(distance)
+    end := origin.add(motion)
+    if !valid_point(end) { >> errors.new("nexus physics3d: ray endpoint outside world bounds") }
+    for tri in triangles { check_triangle(tri) or >> }
+    $best := ray_miss()
+    $collider := -1
+    for i in 0:triangles.len {
+        tri := triangles[i]
+        candidate := ray_triangle_cast(origin, unit, distance, tri, triangle_bounds_unchecked(tri))
+        if candidate.started_inside {
+            << RayHit3D{collider: i, distance: 0.0, point: origin, normal: zero(), started_inside: true}
+        }
+        if candidate.hit && (!best.hit || candidate.time < best.time) {
+            best = candidate
+            collider = i
+        }
+    }
+    << RayHit3D{collider: collider, distance: best.time * distance,
+        point: origin.add(motion.scaled(best.time)), normal: best.normal, started_inside: false}
+}
+
+// Compute outward slope normal and plane offset (n.dot(p) <= d) for a StaticRamp3D.
+fn ramp_slope_plane(ramp StaticRamp3D) fm.Vec4 {
+    size := ramp.bounds.maximum.sub(ramp.bounds.minimum)
+    $nx := 0.0
+    $ny := 1.0
+    $nz := 0.0
+    $anchor := ramp.bounds.maximum
+    if ramp.direction == RAMP_POSITIVE_X {
+        nx = -size.y
+        ny = size.x
+        anchor = fm.vec3(ramp.bounds.maximum.x, ramp.bounds.maximum.y, ramp.bounds.minimum.z)
+    } else if ramp.direction == RAMP_NEGATIVE_X {
+        nx = size.y
+        ny = size.x
+        anchor = fm.vec3(ramp.bounds.minimum.x, ramp.bounds.maximum.y, ramp.bounds.minimum.z)
+    } else if ramp.direction == RAMP_POSITIVE_Z {
+        nz = -size.y
+        ny = size.z
+        anchor = fm.vec3(ramp.bounds.minimum.x, ramp.bounds.maximum.y, ramp.bounds.maximum.z)
+    } else {
+        nz = size.y
+        ny = size.z
+        anchor = fm.vec3(ramp.bounds.minimum.x, ramp.bounds.maximum.y, ramp.bounds.minimum.z)
+    }
+    length := math.sqrt(nx * nx + ny * ny + nz * nz)
+    n := fm.vec3(nx / length, ny / length, nz / length)
+    << fm.vec4(n.x, n.y, n.z, n.dot(anchor))
+}
+
+// Exact ray vs convex StaticRamp3D prism (5 half-spaces: 4 AABB bounds + slope plane).
+fn ray_ramp_cast(origin fm.Vec3, dir_unit fm.Vec3, distance f64, ramp StaticRamp3D) RayCastHit {
+    plane := ramp_slope_plane(ramp)
+    sn := plane.xyz()
+    sd := plane.w
+    eps := contact_epsilon()
+    low := ramp.bounds.minimum
+    high := ramp.bounds.maximum
+    // Check if origin is inside or on the closed prism.
+    if origin.x >= low.x - eps && origin.x <= high.x + eps &&
+        origin.y >= low.y - eps && origin.y <= high.y + eps &&
+        origin.z >= low.z - eps && origin.z <= high.z + eps &&
+        sn.dot(origin) <= sd + eps {
+        << RayCastHit{hit: true, started_inside: true, time: 0.0, normal: zero()}
+    }
+    motion := dir_unit.scaled(distance)
+    // Clip ray segment [0, 1] against 7 half-spaces (6 box faces + 1 slope plane).
+    planes_n := [fm.vec3(-1.0, 0.0, 0.0), fm.vec3(1.0, 0.0, 0.0),
+        fm.vec3(0.0, -1.0, 0.0), fm.vec3(0.0, 1.0, 0.0),
+        fm.vec3(0.0, 0.0, -1.0), fm.vec3(0.0, 0.0, 1.0), sn]
+    planes_d := [-low.x, high.x, -low.y, high.y, -low.z, high.z, sd]
+    $t_enter := 0.0
+    $t_exit := 1.0
+    $hit_normal := zero()
+    $entered := false
+    for i in 0:7 {
+        n := planes_n[i]
+        d := planes_d[i]
+        dist_o := n.dot(origin) - d
+        denom := n.dot(motion)
+        if math.abs(denom) <= 0.000000000001 {
+            if dist_o > 0.0 { << ray_miss() }
+            ->
+        }
+        t := -dist_o / denom
+        if denom < 0.0 {
+            if t > t_enter {
+                t_enter = t
+                hit_normal = n
+                entered = true
+            }
+        } else {
+            if t < t_exit { t_exit = t }
+        }
+        if t_enter > t_exit { << ray_miss() }
+    }
+    if !entered || t_enter < 0.0 || t_enter > 1.0 { << ray_miss() }
+    << RayCastHit{hit: true, started_inside: false, time: t_enter, normal: hit_normal}
+}

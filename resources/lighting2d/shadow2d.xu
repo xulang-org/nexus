@@ -1,0 +1,264 @@
+@"github.com/xulang-org/nexus/resources/lighting2d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub fn ray_segment_hit(origin fm.Vec2, dir fm.Vec2, max_dist f64, seg &OccluderSegment2D) f64 {
+    if !fm.finite(origin.x) || !fm.finite(origin.y) || !fm.finite(dir.x) || !fm.finite(dir.y) ||
+        !fm.finite(max_dist) || max_dist <= 0.0 {
+        << -1.0
+    }
+    sx := seg.b.x - seg.a.x
+    sy := seg.b.y - seg.a.y
+    denom := dir.x * sy - dir.y * sx
+    if math.abs(denom) <= 1e-12 {
+        << -1.0
+    }
+    qx := seg.a.x - origin.x
+    qy := seg.a.y - origin.y
+    t := (qx * sy - qy * sx) / denom
+    u := (qx * dir.y - qy * dir.x) / denom
+    if t >= 0.0 && t <= max_dist && u >= -1e-6 && u <= 1.0 + 1e-6 {
+        << t
+    }
+    << -1.0
+}
+
+pub fn segment_occluded(
+    from fm.Vec2,
+    to fm.Vec2,
+    occluders &[]OccluderSegment2D,
+    layer_mask int,
+    bias f64
+) bool {
+    delta := to.sub(from)
+    dist := delta.length()
+    if dist <= bias + 1e-6 {
+        << false
+    }
+    dir := delta.scaled(1.0 / dist)
+    max_t := dist - bias
+    for i in 0:occluders.len {
+        seg := &occluders[i]
+        if (seg.layer_mask & layer_mask) == 0 { -> }
+        t := ray_segment_hit(from, dir, max_t, seg)
+        if t > 0.001 && t < max_t {
+            << true
+        }
+    }
+    << false
+}
+
+pub fn point_shadow_factor(
+    light &Light2D,
+    target fm.Vec2,
+    occluders &[]OccluderSegment2D,
+    bias f64
+) f64 {
+    if !light.cast_shadows || light.kind == LIGHT_2D_DIRECTIONAL {
+        << 1.0
+    }
+    delta := target.sub(light.position)
+    dist := delta.length()
+    if dist <= bias + 1e-4 {
+        << 1.0
+    }
+    if light.shadow_softness <= 0.0001 {
+        if segment_occluded(light.position, target, occluders, light.layer_mask, bias) {
+            << 0.0
+        }
+        << 1.0
+    }
+    perp := fm.vec2(-delta.y / dist, delta.x / dist)
+    offsets := [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0]
+    weights := [0.0190, 0.0558, 0.1209, 0.1922, 0.2242, 0.1922, 0.1209, 0.0558, 0.0190]
+    $visible := 0.0
+    for i in 0:9 {
+        tap_pos := light.position.add(perp.scaled(offsets[i] * light.shadow_softness))
+        if !segment_occluded(tap_pos, target, occluders, light.layer_mask, bias) {
+            visible = visible + weights[i]
+        }
+    }
+    << visible
+}
+
+fn sort_f64(values $&[]f64) {
+    n := values.len
+    if n < 2 { << }
+    $scratch := []f64{}
+    for _ in 0:n { scratch.push(0.0) }
+    $width := 1
+    while width < n {
+        $left := 0
+        while left < n {
+            $mid := left + width
+            if mid > n { mid = n }
+            $right := left + width * 2
+            if right > n { right = n }
+            $li := left
+            $ri := mid
+            $out := left
+            while li < mid && ri < right {
+                if values[li] <= values[ri] {
+                    scratch[out] = values[li]
+                    li += 1
+                } else {
+                    scratch[out] = values[ri]
+                    ri += 1
+                }
+                out += 1
+            }
+            while li < mid {
+                scratch[out] = values[li]
+                li += 1
+                out += 1
+            }
+            while ri < right {
+                scratch[out] = values[ri]
+                ri += 1
+                out += 1
+            }
+            for k in left:right {
+                values[k] = scratch[k]
+            }
+            left += width * 2
+        }
+        width = width * 2
+    }
+}
+
+pub fn visibility_polygon_2d(
+    origin fm.Vec2,
+    radius f64,
+    occluders &[]OccluderSegment2D,
+    layer_mask int,
+    angular_samples int
+) []fm.Vec2 {
+    if !fm.finite(origin.x) || !fm.finite(origin.y) || !fm.finite(radius) || radius <= 0.0 {
+        >> errors.new("nexus lighting2d: invalid origin or radius for visibility polygon")
+    }
+    samples := max_i(16, angular_samples)
+    $angles := []f64{}
+    two_pi := 2.0 * math.pi()
+    for i in 0:samples {
+        angles.push(two_pi * f64(i) / f64(samples) - math.pi())
+    }
+    reach := radius * 1.5
+    eps := 0.0002
+    for i in 0:occluders.len {
+        seg := &occluders[i]
+        if (seg.layer_mask & layer_mask) == 0 { -> }
+        for pt in [seg.a, seg.b] {
+            d := pt.sub(origin)
+            if d.length() <= reach && d.length() > 1e-6 {
+                ang := math.atan2(d.y, d.x)
+                angles.push(ang - eps)
+                angles.push(ang)
+                angles.push(ang + eps)
+            }
+        }
+    }
+    sort_f64($&angles)
+    $pts := []fm.Vec2{}
+    for i in 0:angles.len {
+        ang := angles[i]
+        dir := fm.vec2(math.cos(ang), math.sin(ang))
+        $best_t := radius
+        for j in 0:occluders.len {
+            seg := &occluders[j]
+            if (seg.layer_mask & layer_mask) == 0 { -> }
+            hit := ray_segment_hit(origin, dir, best_t, seg)
+            if hit >= 0.0 && hit < best_t {
+                best_t = hit
+            }
+        }
+        pts.push(origin.add(dir.scaled(best_t)))
+    }
+    << pts
+}
+
+pub fn decode_normal_rgba(r u8, g u8, b u8) fm.Vec3 {
+    nx := (f64(int(r)) / 255.0) * 2.0 - 1.0
+    ny := (f64(int(g)) / 255.0) * 2.0 - 1.0
+    nz := (f64(int(b)) / 255.0) * 2.0 - 1.0
+    raw := fm.vec3(nx, ny, nz)
+    if raw.length() <= 1e-6 {
+        << fm.vec3(0.0, 0.0, 1.0)
+    }
+    << raw.normalized() or >>
+}
+
+fn smoothstep_2d(edge0 f64, edge1 f64, x f64) f64 {
+    if edge1 <= edge0 {
+        if x >= edge0 { << 1.0 }
+        << 0.0
+    }
+    t := clamp_f((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    << t * t * (3.0 - 2.0 * t)
+}
+
+pub fn evaluate_point_2d(
+    env &LightEnvironment2D,
+    pos fm.Vec2,
+    normal fm.Vec3,
+    layer_mask int
+) fm.Vec3 {
+    if !fm.finite(pos.x) || !fm.finite(pos.y) || !normal.is_finite() {
+        >> errors.new("nexus lighting2d: evaluate position and normal must be finite")
+    }
+    $n := fm.vec3(0.0, 0.0, 1.0)
+    if normal.length() > 1e-6 {
+        n = normal.normalized() or >>
+    }
+    $acc := env.ambient
+    view_dir := fm.vec3(0.0, 0.0, 1.0)
+    for i in 0:env.lights.len {
+        l := &env.lights[i]
+        if !l.enabled || (l.layer_mask & layer_mask) == 0 { -> }
+        if l.kind == LIGHT_2D_DIRECTIONAL {
+            l3 := fm.vec3(-l.direction.x, -l.direction.y, math.max(l.height, 1.0) / 32.0).normalized() or >>
+            ndotl := math.max(0.0, n.dot(l3))
+            $term := ndotl
+            if env.specular_strength > 0.0 && ndotl > 0.0 {
+                h := l3.add(view_dir).normalized() or >>
+                term += math.pow_f64(math.max(0.0, n.dot(h)), 24.0) * env.specular_strength
+            }
+            acc = acc.add(l.color.scaled(l.intensity * term))
+            ->
+        }
+        to_light := l.position.sub(pos)
+        dist := to_light.length()
+        if dist >= l.radius { -> }
+        u := clamp_f(1.0 - dist / l.radius, 0.0, 1.0)
+        $atten := math.pow_f64(u, l.falloff)
+        if l.kind == LIGHT_2D_SPOT {
+            $out_dir := fm.vec2(1.0, 0.0)
+            if dist > 1e-6 {
+                out_dir = pos.sub(l.position).scaled(1.0 / dist)
+            }
+            cos_a := l.direction.dot(out_dir)
+            atten = atten * smoothstep_2d(l.outer_cos, l.inner_cos, cos_a)
+        }
+        if atten <= 0.0 { -> }
+        l3 := fm.vec3(to_light.x, to_light.y, math.max(l.height, 1.0)).normalized() or >>
+        ndotl := math.max(0.0, n.dot(l3))
+        if ndotl <= 0.0 { -> }
+        vis := point_shadow_factor(l, pos, &env.occluders, env.shadow_bias)
+        $term := ndotl
+        if env.specular_strength > 0.0 {
+            h := l3.add(view_dir).normalized() or >>
+            term += math.pow_f64(math.max(0.0, n.dot(h)), 24.0) * env.specular_strength
+        }
+        acc = acc.add(l.color.scaled(l.intensity * atten * term * vis))
+    }
+    exposed := acc.scaled(env.exposure)
+    if env.soft_tonemap {
+        << fm.vec3(
+            exposed.x / (1.0 + math.max(exposed.x, 0.0)),
+            exposed.y / (1.0 + math.max(exposed.y, 0.0)),
+            exposed.z / (1.0 + math.max(exposed.z, 0.0))
+        )
+    }
+    << exposed
+}

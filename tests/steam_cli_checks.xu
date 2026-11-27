@@ -1,0 +1,117 @@
+@main
+
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+rs #"github.com/xulang-org/nexus/resources/steam"
+#errors
+#os
+exec #os/exec
+#path/filepath
+#strings
+
+struct CmdOutcome {
+    ok bool
+    output string
+}
+
+fn check(ok bool, msg string) int {
+    if !ok { >> errors.new("steam_cli_checks: " + msg) }
+    << 0
+}
+
+fn clean_dir(path string) int {
+    os.remove_all(path) or (err) {
+        _ := err.msg()
+        << 0
+    }
+    << 0
+}
+
+fn run_cmd(bin string, args &[]string) CmdOutcome {
+    $cmd := exec.command(bin + "")
+    for i in 0:args.len {
+        cmd.args.push(args[i] + "")
+    }
+    out := cmd.combined_output() or (err) {
+        << CmdOutcome{ok: false, output: err.msg()}
+    }
+    << CmdOutcome{ok: true, output: out}
+}
+
+fn resolve_cli() string {
+    args := os.args()
+    $i := 1
+    while i < args.len {
+        if args[i] == "--project-cli" && i + 1 < args.len {
+            << args[i + 1] + ""
+        }
+        i = i + 1
+    }
+    << "build/nexus-project"
+}
+
+fn run() int {
+    cli := resolve_cli()
+    tmp := filepath.join(["build", "steam-cli-tmp"])
+    clean_dir(tmp + "")
+    os.mkdir_all(tmp + "") or >>
+
+    $cfg := rs.default_config(480, 481)
+    cfg.branch = "staging"
+    cfg.dlc_ids = [482]
+    cfg.achievement_ids = ["ACH_LAUNCH"]
+    steam_json := filepath.join([tmp + "", "steam.json"])
+    cfg_raw := rs.encode_config_json(&cfg)
+    snapshot.write_atomic(steam_json + "", &cfg_raw) or >>
+
+    val_args := ["steam-validate", steam_json + ""]
+    val_res := run_cmd(cli + "", &val_args)
+    check(val_res.ok && strings.contains(&val_res.output, "VALID app_id=480 depot_id=481"),
+        "steam-validate: " + val_res.output) or >>
+
+    bad_json := filepath.join([tmp + "", "bad_steam.json"])
+    bad_raw := "{\"format\":\"nexus.steam\",\"version\":1,\"app_id\":0,\"depot_id\":481}"
+    snapshot.write_atomic(bad_json + "", &bad_raw) or >>
+    bad_args := ["steam-validate", bad_json + ""]
+    bad_res := run_cmd(cli + "", &bad_args)
+    check(!bad_res.ok, "steam-validate should reject app_id=0") or >>
+
+    stage_out := filepath.join([tmp + "", "staged"])
+    stage_args := [
+        "steam-stage", "examples/modern_sandbox/project.json",
+        "--steam", steam_json + "",
+        "--output", stage_out + "",
+        "--desc", "SteamPipe Verification",
+        "--preview"
+    ]
+    stage_res := run_cmd(cli + "", &stage_args)
+    check(stage_res.ok && strings.contains(&stage_res.output, "STAGED app_id=480 depot_id=481"),
+        "steam-stage: " + stage_res.output) or >>
+
+    appid := snapshot.read(filepath.join([stage_out + "", "content", "steam_appid.txt"]), 4096) or >>
+    check(appid == "480\n", "steam_appid.txt mismatch") or >>
+
+    depot_vdf := snapshot.read(filepath.join([stage_out + "", "scripts", "depot_build_481.vdf"]), 65536) or >>
+    check(strings.contains(&depot_vdf, "\"DepotID\"\t\t\"481\""), "depot_build_481.vdf content") or >>
+
+    app_vdf := snapshot.read(filepath.join([stage_out + "", "scripts", "app_build_480.vdf"]), 65536) or >>
+    check(strings.contains(&app_vdf, "\"AppID\"\t\t\t\"480\"") &&
+        strings.contains(&app_vdf, "\"Preview\"\t\t\"1\"") &&
+        strings.contains(&app_vdf, "\"SetLive\"\t\t\"staging\""),
+        "app_build_480.vdf content") or >>
+
+    manifest := snapshot.read(filepath.join([stage_out + "", "steam_stage_manifest.json"]), 1048576) or >>
+    check(strings.contains(&manifest, "\"app_id\": 480") && strings.contains(&manifest, "\"steam_appid.txt\""),
+        "steam_stage_manifest.json content") or >>
+
+    clean_dir(tmp + "")
+    println("PASS: steam_cli_checks")
+    << 0
+}
+
+fn main() int {
+    run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

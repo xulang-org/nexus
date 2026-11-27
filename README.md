@@ -1,31 +1,98 @@
 # Nexus Engine
 
-Nexus Engine 是独立的 Xu 游戏引擎库，模块为 `github.com/xulang-org/nexus`，当前开发版本 `0.1.1-dev.3`。
+Nexus Engine 是独立的 Xu 游戏引擎库，模块为 `github.com/xulang-org/nexus`，当前版本 `0.1.1`。
 场景树、可复用场景、变换、相机、图集动画、输入、时钟、碰撞、画布和精灵逻辑使用 Xu。
 3D 向量、矩阵、透视相机、网格构建、父子变换、材质参数和场景绘制同样使用 Xu。
-音频资源、重采样、声像、总线混音和节点播放状态也由 Xu 实现；设备提交使用独立音频 C ABI。
+音频资源、重采样、声像、IMA ADPCM（`0x0011`）编解码、每总线 DSP 效果架（RBJ Biquad 低通/高通/带通滤波、回声延迟与 Schroeder/Moorer 立体声混响）、总线混音和节点播放状态也由 Xu 实现；设备提交使用独立音频 C ABI。
 2D/3D 都通过 Xu 标准 `gpu` / `window` 管理设备、资源、绘制、事件和呈现；nexus 不再维护 GPU 原生桥接。
 
 参考 Godot 的 [Node / SceneTree](https://docs.godotengine.org/en/stable/tutorials/scripting/scene_tree.html)
 和 [Resource](https://docs.godotengine.org/en/stable/tutorials/scripting/resources.html) 分工。
 Xu 侧使用组合与显式生命周期通知，不依赖类继承。目前已有 2D 库、3D 节点/相机/网格场景、受限 GLB 静态几何与不透明 PBR 材质导入、受限 OBJ 和 ASCII/二进制 STL 静态网格导入，
-WAV/总线/声源的场景恢复，以及沿用 Xu 语法的开发态标量脚本 VM、保留状态热重载、脚本处理函数和延迟节点信号。
-GLB 已支持受限 TRS 动画采样、CPU 四权重线性蒙皮和相对路径 PNG，真实人物/动物/植物素材验收见下文。
-3D 已加入带法线/切线/UV 的金属度/粗糙度直接光材质、基础颜色/ORM/自发光/法线/独立 AO 纹理与 mipmap、单双面渲染、最多 256 个候选方向光/点光/聚光、每网格最多 16 源、场景光源绑定、自发光和曝光。
-3D 可选择 GPU 2× 超采样（四个源像素合成一个输出像素）和方向/聚光/点光 3×3 PCF 阴影及 2–4 级 CSM，图片已接通标准库的受限 baseline JPEG 解码。完整 glTF 材质/纹理、IBL、编辑器、完整脚本类型/绑定/协程、生产更新分发、压缩音频/异步解码与 DSP、刚体求解器、用户材质着色器、GPU 粒子和计算纹理仍待实现。
+WAV/IMA ADPCM/总线 DSP/声源的场景恢复，以及沿用 Xu 语法的开发态零分配寄存器复用标量脚本 VM（`vm.Instance`）、保留状态热重载、脚本处理函数、延迟节点信号与 `script/aot`（`cmd/scriptc aot-c`）双轨 C99/Xu AOT 编译器（`AotBundle` / `DualTrackRunner`，支持指令预算、除零回滚与热重载无缝退回 VM）。
+GLB 已支持受限 TRS 动画采样、双动画剪辑 TRS/SLERP 姿态融合（`sample_blended_pose`）、GPU 计算着色器 3×4 仿射线性蒙皮（保留 CPU 蒙皮兼容路径）、保守骨骼包围体及相对路径 PNG，真实人物/动物/植物素材验收见下文。
+3D 已加入带法线/切线/UV 的金属度/粗糙度直接光材质、基础颜色/ORM/自发光/法线/独立 AO 纹理与 mipmap、单双面渲染、传统前向每网格 16 光源与新分簇前向着色（Clustered Forward `16×16×24`，最高 1024 动态光源）、Split-Sum GGX 环境光 IBL 烘焙（`EnvironmentIbl3D`：64×64 BRDF DFG LUT + 5 级预过滤环境贴图）、30-bit Morton 空间排序 Meshlet（`MeshletVisRenderer3D`：64 顶点/124 三角面簇 + 保守法线锥背面剔除 + Reverse-Z 7 级 `R32_FLOAT` Hi-Z 遮挡剔除 + `R32_UINT` Visibility Buffer 解耦计算着色，含解析屏幕空间重心/UV 梯度纹理采样与方向/级联阴影）、GPU `draw_indexed_indirect` 间接绘制、`RGBA16_FLOAT` 线性 HDR + L1 球谐 3D 辐照度探针网格（`IrradianceGrid3D`）、GTAO 环境光遮蔽（含双边滤波）、Hi-Z 加速屏幕空间反射（SSR）、多级 HDR Bloom、ACES Filmic 色调映射与 TAA 历史混合后处理管线，并由 `ModernPipeline3D`（`integration/rendering/three_d/modern_frame3d.xu`）统一串联静态 Meshlet VisBuffer、Split-Sum IBL 与 GPU 蒙皮网格单帧合成。
+3D 场景树与核心服务已加入脏标记拓扑 SoA 变换缓存（`SceneTree`）、静态三角面/AABB/斜坡 BVH、1D X-axis SAP 与增量式 SAH+AVL 平衡动态包围体树（`DynamicBvh3D`）、扩展位置动力学求解器（`XPBD`：15 轴动态 OBB 间互碰与静态三角面库仑摩擦/恢复求解、柔度距离/牵引约束、8×8 布料网格、刚体堆叠与 6 自由度四元数转动 `JointedWorld3D` 球铰链/摆锤/带伺服电机与限位铰链关节，配合 `SkeletonRagdoll3D` 与动画权重平滑融合并驱动 GPU 蒙皮骨骼布娃娃）、3D 导航网格与人群避障（`navigation`：斜率过滤、拓扑边缝合、`A*` 区域代价与 XZ Funnel 路径拉直 + RVO 互惠人群避障）、基于连续分块 SoA 与常驻协程工作池（`ecs.EcsWorkerPool`）的无锁并发 Archetype `ecs` 模块，以及后台解码 + 帧预算分片上传 + LRU 显存淘汰的异步资源流式管理器（`integration/streaming`）；场景序列化已升级到 v9（Environment / RigidBody3D / Joint3D / Terrain / ParticleEmitter3D / PrefabInstance 附件，同步接入 `cmd/project_editor` v9 组件检视器与 `cmd/project_viewport --modern` 视口管线）；所有 45 个 3D 着色器已提供 MSL / GLSL 450 / HLSL SM 6.0 三后端源码（本机未安装 MetalToolchain/`glslangValidator`/`dxc` 时 `shader-cross-backend-test` 完成全量奇偶校验、入口点与寄存器约定验证，实际 GPU 像素验证当前覆盖 macOS arm64 / Metal）；引擎整合层新增持久 UI 控件树与焦点/模态路由（`integration/ui/tree.xu`）、120 帧滚动 `FrameProfiler` + GPU/资源驻留 `EngineTelemetry`（`timing/profiler.xu`、`integration/diagnostics`）、HMAC-SHA256 签名资源包与防回滚原子热更新/回滚（`resources/bundle`、`integration/bundle`），并提供全功能 3D 沙盒示例 `examples/modern_sandbox`。完整 glTF 复杂材质扩展与真机跨平台图形驱动运行仍可按需继续扩展。
 
-当前对齐 Xu **0.12.6** 并包含原生 Phone game 工具链分支，用于原生 Phone game 宿主、安全区/触摸与多点手势事件、纯 Xu FFI 绑定及随包资源；编译器、标准库、native/phone 工具必须来自同一完整 SDK。macOS arm64 / Metal / CoreAudio 已完成桌面与主机回归；`iPhone 8`（iOS 16.7.16）与 `Sony XQ-BE72`（Android 13）已实机验证 `examples/phone_arena`（Metal+CoreAudio / Vulkan+AAudio、安全区与断点续玩存档）及 `examples/phone_3d`（Metal/Vulkan PBR 贴图场景、像素预算上限 `921600`、`Overlay2D` + `UiFrame` HUD 与触控轨道视角），真机物理双指捏合等手势仍按真机边界单独说明。
+当前使用 Xu **0.14.2**（本地 `../xu-dev` 工具链，包含 Nexus 所需图形/计算存储缓冲区、计算采样器/读写存储纹理、`R32_UINT`、`draw_indexed_indirect` 及 ARM64 `f64` 索引移位/LICM 优化修复）。该 SDK 包含 Phone game 对象对原生导入的支持，并随生成工程导出原生归档与 C 桥接。编译器、标准库、native/phone 工具必须来自同一 SDK。两个移动示例此前使用 Xu 0.12.7-dev.1 在 Sony XQ-BE72（Android 13）上运行，并完成 iOS 应用构建。iPhone 8（iOS 16.7.16）的真机结果来自 Xu 0.12.5 构建。
 
+## 构建所需的 Xu SDK
+
+使用 Xu **0.14.2** 工具链（可直接复用已自举构建的 `../xu-dev`）：
+
+```sh
+# 1. 若已将同一版本 SDK 安装到 ~/.xu 或设置 env，先激活环境：
+source ~/.xu/env.sh
+make sdk
+
+# 2. 或直接使用本地 ../xu-dev 工具链（macOS arm64）：
+NEXUS_XU_SDK="$(cd ../xu-dev && pwd)"
+export NEXUS_XU_SDK
+export XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" XUPATH="$NEXUS_XU_SDK/src" XU="$NEXUS_XU_SDK/bin/xu"
+export PATH="$NEXUS_XU_SDK/bin:$PATH"
+make sdk
+```
+
+`make sdk` 应输出 `PASS: Xu SDK 0.14.2`。已有同一版本 SDK 时，直接设置上述环境变量或执行 `source /path/to/xu/env.sh` 即可。
+
+核心引擎突破与专项测试目标：
+- `make prefab-runtime-test`：验证 `integration/scene/prefabs.xu` 递归多级嵌套 Prefab 实例化、SHA-256 校验、循环引用拦截与节点可见性/位置覆盖应用。
+- `make ai-bt-nav-test`：验证 `navigation/obstacles.xu` 动态球柱/AABB 障碍物避让与路径重路由，及 `ai/bt` 行为树（Selector/Sequence/Parallel/Inverter/Repeater/Cooldown/Wait/Blackboard/Trace）。
+- `make input-replay-timing-test`：验证键位重绑定/JSON 导入导出、手柄死区整形、`InputRecorder`/`InputReplayer` 帧确定性回放及 `ScaledClock`（慢动作/倍速/暂停/顿帧 Hitstop）。
+- `make timeline-test`：验证 `animation/timeline` 通用属性时间轴（Step/Linear/Cubic-Hermite 标量、`Vec3`、RGBA8 颜色混合与循环跨越事件触发）。
+- `make project-bundle-cli-test`：验证 `cmd/project`（`nexus-project bundle-pack` / `bundle-verify`）从工程清单打包与 HMAC-SHA256 校验资源包。
+- `make scene-v9-test`：验证 Scene v9 现代组件与 `PrefabInstance` 覆盖编解码往返及旧版本兼容。
+- `make shader-cross-backend-test`：验证全部 45 个 3D 着色器的 MSL / GLSL 450 / HLSL SM 6.0 源码奇偶性、入口点与 SDL3 GPU set/space 约定（本机存在可用编译器时同步执行语法/SPIR-V/DXIL 检查）。
+- `make ui-tree-test`：验证 `UiControlTree` 固定/行列布局、`Tab`/`Shift+Tab` 焦点遍历、模态弹窗焦点隔离与 `HudRouter` 输入仲裁。
+- `make profiler-test`：验证 120 帧环形缓冲区 `FrameProfiler`（`p50`/`p95`/`p99`/作用域/JSON）与 `EngineTelemetry` GPU/资产 HUD 渲染。
+- `make bundle-test`：验证 HMAC-SHA256 签名 `BundleManifest`、SHA-256 校验、防重放序号检查、路径穿越拦截及 `BundleMount` 原子热更新与回滚。
+- `make modern-sandbox-test`：无窗口/离屏自动运行 `examples/modern_sandbox` 60 帧（串联 Scene v9、`ModernPipeline3D`、角色/载具切换、Terrain、`NavMesh` + `Crowd3D`、XuScript 协程、Audio DSP、`UiControlTree` 与 `EngineTelemetry` HUD）。
+- `make scene-soa-test`：验证 `SceneTree` 拓扑序脏标记 SoA 全局变换缓存。
+- `make ecs-parallel-test`：验证 Archetype Chunk 分块 ECS 与常驻工作池 `EcsWorkerPool` 无锁并发调度。
+- `make script-aot-test`：验证 `script/aot`（`cmd/scriptc aot-c`）双轨 C99/Xu AOT 语义一致、指令预算/除零回滚与热重载 VM 回退。
+- `make physics3d-test`：含 `physics3d_bvh_sap_checks` 与 `physics3d_xpbd_checks`，验证 3D 静态 BVH、1D SAP 宽相碰撞及 XPBD 绳链/布料/刚体堆叠求解器。
+- `make physics3d-joints-ragdoll-test`：验证增量式 `DynamicBvh3D`、15-axis 动态 OBB 互碰/静态三角面摩擦求解、6-DOF `JointedWorld3D` 球铰链/伺服电机与限位铰链关节、`SkeletonRagdoll3D` GPU 蒙皮布娃娃坍塌与姿态混合（macOS Arm64 / Metal）。
+- `make navigation-test`：验证 3D 导航网格构建、斜率过滤、`A*` 区域寻路、XZ Funnel 路径拉直与 RVO 互惠人群避障。
+- `make audio-dsp-test`：验证 IMA ADPCM（`0x0011`）4:1 编解码、每总线 Biquad/Delay/Reverb 效果架与 glTF 双剪辑 TRS/SLERP 姿态融合。
+- `make gpu-skinning-test`：验证 GPU Compute 3×4 仿射线性蒙皮（含非一致缩放/负行列式反射与保守骨骼包围盒）。
+- `make clustered-lighting-gpu-test`：验证 `16×16×24` Clustered Forward Shading（打破 16/256 光源限制，单网格 513 光源实时着色）。
+- `make indirect-cull-hiz-gpu-test`：验证 GPU 视锥剔除 + 7 级 `R32_FLOAT` Hi-Z 遮挡剔除 + 单次 `draw_indexed_indirect` 间接绘制。
+- `make hdr-postprocess-gpu-test`：验证 `RGBA16_FLOAT` HDR MRT、3D `IrradianceGrid3D` SH 探针、GTAO 环境光遮蔽、Hi-Z SSR 反射、Bloom、ACES 与 TAA 后处理链路。
+- `make meshlet-visbuffer-gpu-test`：验证 Meshlet（64v/124t + 保守法线锥剔除 + Reverse-Z Hi-Z）+ Split-Sum IBL + `R32_UINT` Visibility Buffer（含解析屏幕空间 UV 梯度纹理采样与方向阴影）与 `ModernPipeline3D` 统一单帧渲染（macOS Arm64 / Metal）。
+- `make streaming-lru-gpu-test`：验证后台协程解码、优先级调度、每帧预算分片上传与 LRU 显存淘汰恢复。
+- `make effects-detail-test`：汇总运行 `combined-audio-effects-test`（ADPCM + Spatial 2.0 多普勒/声学遮挡/HRTF + Bus DSP/Reverb + active fade 保持与 1×1024/4×256 bit-exact）、`combined-2d-25d-effects-gpu-test`（视差 + 纹理瓦片地图 + Y-Sort + 2D 粒子/拖尾 + 裁剪框像素精度 + 2.5D Metal 深度排序）、`combined-3d-effects-gpu-test`（`ModernPipeline3D` 全链路 GTAO+SSR+Bloom+TAA+ACES、`reset_taa()` 无重影切镜、贴花+体积雾+排序透明+深度拒绝+前向 HDR GPU 粒子+Clearcoat/Sheen 与 90% 安全区 `Overlay2D` HUD 合成）及 `combined-gameplay-effects-test`（手柄输入缓冲 + 顿帧慢动作耦合 + IK/Morph/Timeline/Ragdoll + Switch 掌机/底座切换 + `FrameProfiler` 回归门禁）。
+- `make gameplay-test`：运行 `gameplay` 与 `integration/gameplay` 游戏核心组件测试（属性表与 Buff/Debuff 状态栈、血量/护盾/韧性/暴击抗性/Hitbox 伤害结算与多充能连招技能、背包负重/排序/装备词条同步与保底掉落表、前置任务链与条件分支对话、2D/3D 弹簧臂防穿墙相机与 Trauma 震屏、波次刷怪/FSM 状态锁/面向交互触发，以及与 `SceneTree`/`ScaledClock`/`Physics3D`/`Mixer`/`vfx`/`i18n` 的全链路联调）。
+- `make lighting-2d-gpu-test`：验证 `resources/lighting2d`（动态点/聚/方向 2D 光照、遮挡物线段硬/软阴影、2D 法线贴图、可见性多边形）、`rendering/two_d` Metal GPU 与无头软件像素一致性，以及 `Sprite3D` `ALPHA_MODE_BLEND` 前向与 HDR 后向前深度排序透明混合（macOS Arm64 / Metal）。
+- `make persistent-entities-test`：验证 `resources/persistence` 与 `integration/scene/persistent.xu`（`EntityGuid`、跨世界解析/迁移 `transfer_entity_world`、重载重绑与已销毁实体裁剪 `rebind_world`、SHA-256 存档信封与 `SaveMigrationChain` 多跳版本迁移 `v1 -> v3`）。
+- `make mikktspace-gpu-test`：验证 `resources/mesh/mikktspace.xu` 与 `integration/gltf_render`（镜像 UV 接缝拆分、对抗法线/共线退化兜底、`upload_model_with_mikktspace` 对无切线法线贴图 GLB 在 Metal GPU 上的正常着色）。
+- `make audio-async-music-test`：验证 `integration/audio_stream/async_pool.xu`（多协程后台解码池、乱序分块重排、`seek_frames` 代际屏障、48MB 大 WAV 寻址与无缝循环）及 `audio/mixer/music_director.xu`（拍/小节量化多轨 `MusicDirector` 与空间 `AmbientZoneMixer` 优先级闪避）。
+- `make physics2d-platformer-test`：验证 `physics2d/world2d.xu`（层级过滤射线检测、单向穿透平台、`Enter`/`Stay`/`Exit` 触发器生命周期，及包含土狼时间、跳跃缓存、松键变速跳与蹬墙滑/蹬墙跳的 `PlatformerController2D`）。
+- `make detail-optimizations-test`：验证五项底层质感深度优化（3D TAA Karis 亮度加权 YCoCg 方差裁剪 + Reverse-Z 深度膨胀 + IGN 蓝噪抖动去色带、2D 9-Tap 高斯半影 + Reinhard 压缩与 2D Blinn-Phong 高光 Metal/软件像素一致性、音频总线 Soft-Knee 限幅器/去非正规数/平滑斜坡、2D 移动平台同步与起跳动量继承/MTV/顶角挤压/微台阶抬升、MikkTSpace 散片顶点重合角自动焊接）。
+- `make detail-optimizations-r2-test`：验证第二轮细节增强（13-Tap Jimenez Karis Bloom 下采样、Reverse-Z 线性深度缩放 GTAO 双边滤波、IGN 抖动 SSR + 距离/迎角平滑淡出、Soft Two-Bone IK 渐近缓冲伸展与上肢扭转对齐、以及无序依赖 Crowd RVO 右行规避与卡死自动重寻路）。
+- `make detail-optimizations-r3-test`：验证第三轮引擎深水区能力（3D PBR 多重散射能量补偿、可选 PCSS 接触硬化软阴影、GPU/软件像素一致 2D 屏幕空间泛光与纯 CPU `Skeleton2D`/`SkinnedMesh2D` 2D 骨骼蒙皮变形、状态机惯性平滑过渡与步态相位同步组、`RigidBody3D` 6-DOF 四元数旋转/滚动摩擦扭矩与休眠唤醒、`WorldPartitionGrid` 滞回流式卸载与持久化迁移，以及弱网输入冗余窗口恢复与自适应 RTT/Jitter 缓冲）。
+- `make developer-ergonomics-test`：验证面向应用程序开发的完整工具链与人机工学底座（`foundation/math` 完整 2D/3D 几何/四元数/`Mat4.inverse`/31 种缓动与弧长样条、`Ray3D`/`Plane3D`/`Sphere3D`/`Frustum3D` 解析相交与 Perlin/fBm 噪声；`foundation/color` Hex/HSV/IEC sRGB↔Linear 与预处理混合；`foundation/diagnostics` 环形日志与 CVar/控制台指令注册表；`foundation/events` 优先级与前缀订阅事件总线；`foundation/spatial` 2D/3D 空间哈希去重与最近邻查询；`scene` 节点分组/元数据/路径/克隆/全局坐标与 `Camera3D` 屏幕↔世界拾取；`input` 鼠标按键/滚轮/Modifier 组合键与蓄力按住时长；`timing/timers`、`animation/timeline` 补间管理；`resources/canvas` 2D 矢量与调试图元、`resources/mesh` 3D 程序化几何体与 `DebugDraw3D`；以及 `ecs` 动态组件迁移/自定义稀疏存储与 `physics2d`/`physics3d` 扩展碰撞查询）。
+- `make modeling-test`：验证 3D 建模与白盒编辑全链路（`resources/modeling` `EditableMesh` B-Rep/`CsgTree`/`MaterialAsset` 校验与 JSON 往返；`modeling` 原生白盒生成器、流形倒角/挤出/内插/合并/CSG 布尔求值/次物体拾取；`formats/gltf/encode_glb.xu` 与 `formats/obj/encode.xu` 导出往返及工程 UID 复用；`integration/modeling` Metal GPU 实时重载与 Physics3D 三角碰撞；以及 `cmd/project_viewport` `--live-script` 与 `--live-connect` TCP 实时白盒命令、截屏和 GLB 导出验证）。
+- `make developer-systems-r2-test`：验证面向游戏开发者的第二轮核心运行期能力（`foundation/math/random.xu` Xoshiro128++ 确定性随机数/分布/二维泊松盘采样；`formats/stl/encode.xu` 二进制与 ASCII STL 导出及无损往返；`physics3d/triggers.xu` `TriggerTracker3D` Enter/Stay/Exit 触发器状态机；`timing/jobs.xu` 分帧预算与 DAG 依赖任务队列 + `integration/scene/world_partition.xu` `PartitionStreamingScheduler` 多锚点限流流式调度器；以及 `input/contexts.xu` 分层输入上下文栈与同上下文按键冲突检测/互换重绑定）。
+- `make developer-systems-r3-test`：验证面向游戏开发者的第三轮核心系统（`navigation/tiles.xu` 多瓦片动态 NavMesh 分块重烘焙、边界传送门缝合与跨块 A*；`ai/bt/utility.xu` Utility AI 效用响应曲线/补偿评分/迟滞与冷却仲裁器；`resources/persistence/slots.xu` 多槽位手动+环形自动存档目录及 SHA-256 损坏自动降级恢复；`foundation/diagnostics/history.xu` 带窗口合并、原子事务组回滚与脏标记的通用 Undo/Redo 命令历史；以及 `foundation/spatial/quadtree.xu` 动态松散二维四叉树 `Quadtree2D` 矩形/圆形/2D 射线查询）。
+- `make developer-systems-r4-test`：验证面向游戏开发者的第四轮核心系统（`ecs/commands.xu` 可复用 `EntityTemplate` 与支持失效句柄容错的 FIFO `EcsCommandBuffer` 延迟批处理；`audio/mixer/cues.xu` 支持轮询/随机/无重复洗牌选音、音高增益抖动、冷却与声道抢占的 `AudioCueBank`；`animation/timeline/spring.xu` 极点安全二阶弹性阻尼器 `SpringF64`/`SpringVec2`/`SpringVec3` 与串并混排 `MotionSequence`；`networking/rpc.xu` 方向权威校验字节码 `RpcRegistry`、令牌桶 `PeerRateLimiter` 与 `PeerHeartbeatTracker`；以及 `scene/constraints.xu` `ConstraintSolver3D` 三维节点约束求解器与 `NodePool` 节点对象池）。
+
+## CI 与版本发布
+
+- `python3 tools/ci_run.py --modes all --sdl-include <SDL3/include>`：跨平台 CI 入口，涵盖架构/边界/跨后端着色器与版本身份契约检查（`contracts`）、5 个原生 `.xulib` 桥接构建（`native`）、各后端着色器生成（`shaders`）、核心入口静态检查（`check`）、无窗口/无 GPU 核心回归测试集（`test`）及 7 个发行 CLI/Studio 工具构建（`build-tools`）。
+- `python3 tools/check_release_identity.py`（或 `make release-identity-check`）：校验根 `xu.xun`、全仓子模块 `xu:`、`resources/project/mod.xu`、`README.md` 与 `RELEASES*.md` 版本一致性。
+- `.github/workflows/ci.yml` 在 `macos-arm64`、`macos-x64`、`linux-x64`、`linux-arm64` 与 `windows-x64` 五平台运行全量 CI；`.github/workflows/release.yml` 采用构建与发布隔离架构，在 Tag（`v*`）或手动触发时分平台构建工具与多平台原生 `.xulib` 归档，汇总校验 `SHA256SUMS` 与 `validation.json` 后发布 GitHub Release（发行记录见 [RELEASES.zh-CN.md](RELEASES.zh-CN.md) 与 [RELEASES.md](RELEASES.md)）。
 
 ## Phone 原生 2D / 3D 示例
 
-`examples/phone_arena`（2D）与 `examples/phone_3d`（3D）均使用场景树、固定时钟与标准 GPU 渲染，经 `--phone-profile game` 原生宿主直出画面，不经 WebView：
+`examples/phone_arena`（2D）、`examples/phone_3d`（3D）、`examples/isometric_2d` 和 `examples/hd2d_scene`（2.5D）使用场景树、固定时钟与标准 GPU 渲染，经 `--phone-profile game` 原生宿主直出画面：
 - `integration/viewport` 与 `integration/application`（`AppHost` / `Viewport` / `fit_letterbox`）统一处理 `safe_area()` 屏幕安全区布局、前后台恢复代次、`EVENT_BACK_REQUESTED` 暂停/退出与双端资源/私有存档路径解析。
 - `examples/phone_arena`：左下半屏浮动摇杆 + 右侧加速（Hold）+ 暂停（Tap）收集六枚宝石，结合 `nexus_image.xulib`、`nexus_audio.xulib` 与 `arena-v1.json` 原子存档恢复；触摸使用逻辑窗口坐标并按屏幕尺度缩放 HUD 控件，渲染按像素分辨率缩放。
 - `examples/phone_3d`：`AppHost` + `TouchControls` + `TouchPad`（未命中按钮区域由单指拖动控制轨道旋转，双指支持捏合缩放/桌面滚轮），通过 `Device3D.set_max_render_pixels(921600)` 控制移动端 3D 渲染像素预算并保留全分辨率 `Overlay2D` + `UiFrame` HUD 叠加、贴图 PBR 立方体与 `Back` 暂停/退出。
+- `examples/isometric_2d`：左下角浮动摇杆移动，轻触地面格着色，右上角按钮暂停或继续。Android 返回键暂停，再按一次退出。场景和图集由应用包提供，角色移动沿用桌面的瓦片碰撞。
+- `examples/hd2d_scene`：浮动摇杆移动，左上角切换正交与透视镜头，右上角暂停。窄屏保留横向取景。画布 HUD 以输出分辨率合成，3D 内部分辨率最多 921,600 像素，单张阴影或单级级联最多 256×256。
 
 ```sh
-NEXUS_PHONE_SDK=/path/to/xu-0.12.6-phone
+NEXUS_PHONE_SDK=/path/to/xu-0.14.1
 export XU_ROOT="$NEXUS_PHONE_SDK" XU_STDLIB_ROOT="$NEXUS_PHONE_SDK/src"
 python3 tools/build_phone.py --xu "$NEXUS_PHONE_SDK/bin/xu" \
   --example phone_arena --target ios-arm64 --sdl-source /path/to/SDL-3.4.14 \
@@ -38,15 +105,49 @@ python3 tools/build_phone.py --xu "$NEXUS_PHONE_SDK/bin/xu" \
 ./build/phone-3d-android/build.sh
 ```
 
-SDL 必须是锁定提交 `147a8ee32dbf9ac02f3794964490687b6bbda1bc`。
+SDL 必须是 Git 检出，HEAD 为锁定提交 `147a8ee32dbf9ac02f3794964490687b6bbda1bc`。
 生成工程携带源码、对象和资源，之后原生构建可离线执行；iOS 安装需要匹配的开发签名与 provisioning。
-Android 准备 Android SDK/NDK、JDK 与 `glslangValidator`，生成 `libmain.so` + `libSDL3.so`（强制 16 KiB ELF 对齐与 `zipalign -P 16` / `apksigner verify`）。
+Android 准备 Android SDK/NDK、JDK，以及 PATH 中的 `glslangValidator` 或 `glslc`。生成 `libmain.so` + `libSDL3.so`，执行 16 KiB ELF 对齐、`zipalign -P 16` 和 `apksigner verify`。
 原生 PNG 与音频桥接均提供 `macos-arm64` / `ios-arm64` / `android-arm64` 三切片。示例构建脚本在忽略的 `build` 目录准备 shader、PNG 与 WAV 清单 `phone.resources`，资源通过 `app_host.resolve_resource` / `app.resource_path()` 读取。
 
 `phone_arena` 使用 `app_host.resolve_data("arena-v1.json", "build")` / `app.data_path("arena-v1.json")` 保存位置、六个宝石收集mask和暂停状态：
 移动时最多每秒写一次，松手、收集、暂停变化和正常退出会立即写入；同目录临时文件 + rename 原子替换；损坏小文件保留为 `.rejected-<timestamp>` 并重置。
 
 `integration/frame` 本身不依赖 Phone、GPU 或 SceneTree：宿主传入单调时间和恢复代数即可使用；`integration/application.AppHost` 在此基础上收口窗口事件流、恢复复位、`safe_area` 与返回键调度。
+
+## 微信小程序 WebGL
+
+`examples/miniprogram` 是微信小程序页面中的 2D WebGL 1 示例。Xu 编译成随包 WASM，运行碰撞与宝石收集并录制带纹理的画布批次。微信宿主通过 `WXWebAssembly` 加载模块，通过原生 `canvas type="webgl"` 上传图集和顶点，处理触摸、尺寸变化及页面前后台。按住或拖动可以绕过墙壁收集宝石。
+
+使用上文的 SDK 和 Node.js，在 Nexus 根目录运行 `make miniprogram-test`。
+
+用微信开发者工具打开 `build/nexus-miniprogram`。仅生成工程可运行 `make miniprogram`。需要使用自己的小程序 AppID 时，用 `tools/build_miniprogram.py --appid` 生成对应工程。当前 SDK 需要支持 `--wasm-export`，小程序需要提供 `WXWebAssembly` 和 WebGL Canvas。
+
+## 抖音小游戏 WebGL
+
+抖音小游戏与微信小程序共用同一份 2D Wasm 和 WebGL 1 渲染器。抖音入口通过 `tt.createCanvas()` 获取全屏画布，处理触摸、尺寸与前后台，并用 `TTWebAssembly` 加载随包模块。按住或拖动控制角色，集齐三颗宝石后点画布内任意位置可以重开。基础库从 3.7.0.0 提供 `TTWebAssembly`。 [抖音小游戏开发指南](https://developer.open-douyin.com/docs/resource/zh-CN/mini-game/develop/guide/dev-guide/bytedance-mini-game) · [TTWebAssembly](https://developer.open-douyin.com/docs/resource/zh-CN/mini-game/guide/minigame/optimization)
+
+使用上文的 SDK 和 Node.js，在 Nexus 根目录运行 `make douyin-test`。
+
+`make douyin` 仅生成 `build/nexus-douyin`。在抖音开发者工具中按「小游戏」导入此目录并选择自己的小游戏 AppID，也可用 `tools/build_miniprogram.py --platform douyin --appid <AppID>` 写入工程配置。 [导入指南](https://developer.open-douyin.com/docs/resource/zh-CN/mini-game/guide/minigame/develop/)
+
+## 小程序与小游戏 3D WebGL 测试
+
+使用上文的 SDK，安装 Node.js，在 Nexus 根目录运行测试。
+
+```bash
+make webgl-3d-test
+```
+
+分别导入 `build/nexus-miniprogram-3d` 和 `build/nexus-douyin-3d`。拖动画布旋转相机，观察贴图箱子和球体的透视与遮挡。微信页面的「复位」恢复初始视角。单独生成工程可运行 `make miniprogram-3d` 或 `make douyin-3d`。 [WebGL 帧协议](integration/rendering/webgl/frame.xu)
+
+两端打包相同的 `assets/crate.glb` 和 Wasm。GLB 生成时内嵌现有的 UV 测试图。运行时由 Xu 解码静态索引图元和 PNG，WebGL 1 上传网格和 RGBA 纹理，并使用 Reverse-Z 深度测试。旋转视角时只更新 68 字节相机包。该示例覆盖单个图元、UV0、内嵌不透明底色 PNG 和简单方向光，原生管线另有 PBR 材质与阴影回归。
+
+`make webgl-3d-test` 对比两端的 GLB、解码数据和相机包，检查 300 次相机更新后 Wasm 线性内存的页数保持稳定。当前 GLB 为 3,080 字节，静态网格数据与 RGBA 纹理合计 169,396 字节。设备的进程内存和帧时间需另外测量。
+
+微信和抖音开发者工具的模拟器已验证 2D 触控、收集与重开。带贴图的 3D 示例也在两端模拟器通过贴图与深度的像素对照，以及触控改变视角的检查。微信另验证了页面隐藏后返回仍保留视角，及手动复位恢复初始矩阵。
+
+真机预览使用有开发权限的平台 AppID，在手机微信或抖音客户端中打开。本次微信预览包为 629,585 字节。两端带贴图 3D 的真机结果、进程内存和帧时间仍待验收。
 
 ## 功能完整性
 
@@ -55,23 +156,24 @@ Android 准备 Android SDK/NDK、JDK 与 `glslangValidator`，生成 `libmain.so
 
 | 子系统 | 当前可用能力 | 继续补齐的验收范围 |
 | --- | --- | --- |
-| 场景/对象 | 混合 2D/3D 树、变换、分组、生命周期、PackedScene、版本化节点及 GLB/音频/脚本/光源附件、初始字段和稳定信号路由 | 全局 UID 索引、实例覆盖、镜头附件、跨世界引用 |
-| 2D 渲染 | GPU 批次、精灵、PNG/图集、裁剪、透明、相机 | TileMap、2D 光照/阴影、粒子、字体与画布特效 |
-| 标准 GPU | 独立设备/缓冲传输、纹理/mip、采样器、Shader、图形管线、深度/索引/实例化命令、离屏像素读回、缓冲区计算管线/dispatch、独立窗口/键鼠文本/多点触摸队列与 SDR Surface/Frame | 自绘 IME 候选/剪贴板/手柄、HDR 呈现、计算采样/纹理、间接 dispatch、立方体/3D 纹理、MRT/MSAA/存储绑定及其它高级渲染能力 |
-| 3D 渲染 | 网格/相机、Reverse-Z、法线/UV、程序网格切线生成、256 候选/每网格 16 源方向/点/聚光材质、范围/锥体剔除、场景网格视锥剔除、距离 LOD/滞回、GPU 2× 超采样、方向/聚光/点光 3×3 PCF 阴影及 2–4 级 CSM、节点光源收集与持久化、五槽贴图、单双面、mipmap 与三线性采样 | glTF MikkTSpace 切线生成、IBL、HDR、后处理、MSAA/TAA/FXAA、屏幕误差 LOD/自动简化与 LOD 持久化、遮挡剔除、分簇光照 |
-| 资源管线 | PNG/baseline JPEG、受限 GLB 几何/PBR/图片/采样器、受限 OBJ、ASCII/二进制 STL、实例共享、固定资源 ID/来源哈希与失败回滚 | 完整材质、更多模型格式、异步加载、全局缓存/重导入、其他附件、资源包与热替换 |
-| 脚本 | Xu 标量 VM、多入口、场景挂载、稳定 ID 信号与批量热重载 | 完整类型/对象/绑定、普通函数调用、协程、生命周期、调试器、更新分发 |
-| 动画 | 图集帧动画、glTF TRS 关键帧/LINEAR/STEP/CUBICSPLINE、四权重 CPU 线性蒙皮与独立实例 | 通用属性时间轴、GPU 蒙皮、morph、混合树、状态机、事件、根运动及动画场景持久化 |
-| 物理 | 2D AABB 运动/滑动与碰撞 | 2D/3D 形状查询、宽相位、刚体、约束、连续碰撞与物理事件 |
-| 输入/时间 | 键盘与独立模拟输入源、帧边沿、固定/浮动摇杆与按钮、多指捕获/取消、固定步进、暂停 | 手柄、鼠标完整映射、重绑定、回放与时间缩放 |
-| 音频 | 静态/流式 WAV、32 路混音、分层总线、音量/声像/暂停/循环、定位/重播、逐样本淡化/交叉淡化、2D/3D 距离与声像、节点生命周期、场景 WAV/总线/声源恢复 | 压缩编解码、异步解码、音效 DSP、遮挡、Doppler、HRTF、调试工具 |
-| 游戏 UI | 未实现 | 控件树、布局、主题、文本、焦点、输入路由、无障碍 |
-| 导航/AI | 未实现 | 路径查询、导航网格、动态障碍、避让与行为设施 |
-| 网络游戏 | 未实现 | 会话、同步/RPC、权限、插值、预测与重连；传输复用 Xu 基础库 |
-| 编辑器 | 未实现 | 项目/场景/资源面板、属性检查器、视口、撤销重做、脚本调试 |
-| 项目/导出 | Xu CLI 编译；Phone game 原生工程、显式随包 shader/PNG 清单 | 编辑器导出配置、资源包/热替换、商店发布流程 |
-| 调试/性能 | 源位置错误、回归程序、GPU 像素回读 | 断点/堆栈、CPU/GPU 分析、内存/资源监测与性能基线 |
-| 平台 | macOS arm64 / Metal / CoreAudio；iPhone 8 / Metal 原生 2D 已运行 | Android Vulkan 真机、iOS 更多设备/生命周期压力、移动音频/3D、Linux/Windows 真机与 Web |
+| 场景/对象 | 混合 2D/3D 树与拓扑序脏标记 SoA 变换缓存、Archetype 分块并发 `ecs`、分组、生命周期、PackedScene、2D 相机与 3D 透视/正交镜头持久化、v9 现代组件与 `PrefabInstance` 递归实例化/SHA-256 校验/循环防护/属性覆盖、GLB/音频/脚本/光源/Sprite3D/TileMap2D 附件、方向光 CSM 与点光/聚光阴影配置、初始字段和稳定信号路由 | 跨世界持久化实体引用 |
+| 2D 渲染 | GPU 批次、精灵、PNG/图集、裁剪、透明、相机、位图/TrueType 文本、SDF 图元、正交/菱形等距/交错等距 TileMap、跨图集 Y 排序、视差、地面格拾取与 2D GPU 粒子/丝带 | 2D 光照/阴影、画布特效 |
+| 2.5D 渲染 | 等距瓦片场景、HD-2D 图集精灵、3D 深度遮挡、方向光照与轮廓阴影、正交/透视切换、瓦片编辑器、iOS 与 Android 原生运行 | 透明混合精灵、通用 2.5D 场景属性编辑 |
+| 标准 GPU | 独立设备/缓冲传输、纹理/mip、采样器、Shader、图形管线、深度/索引/实例化/`draw_indexed_indirect` 命令、离屏像素读回、计算管线/存储缓冲/计算采样与存储纹理、`R32_UINT`、MRT 颜色目标、独立窗口/键鼠文本/多点触摸队列与 SDR Surface/Frame | 自绘 IME 候选/剪贴板/手柄、HDR 呈现、立方体/3D 纹理、MSAA 及其它高级渲染能力 |
+| 3D 渲染 | 网格/相机、Reverse-Z、法线/UV、程序网格切线生成、传统前向与 `16×16×24` Clustered Forward（最高 1024 光源）、Split-Sum GGX IBL、Meshlet + Hi-Z 遮挡剔除 + `R32_UINT` Visibility Buffer、距离 LOD/滞回、GPU 2× 超采样、方向/聚光/点光 3×3 PCF 与 2–4 级 CSM、`RGBA16_FLOAT` HDR + L1 SH `IrradianceGrid3D` + DDGI 光追探针 GI + GTAO + Hi-Z SSR + Bloom + ACES + TAA、投影 Decal、Froxel 体积雾、大气散射天空、分块地形与风吹植被、半透明 PBR 队列、`ModernPipeline3D` 单帧合成，以及 45/45 3D 着色器 MSL/GLSL450/HLSL-SM6 三后端源码 | glTF MikkTSpace 切线生成、屏幕误差 LOD/自动简化、Vulkan/D3D12 实机 GPU 像素对照 |
+| 资源管线 | PNG/baseline JPEG、受限 GLB 几何/PBR/图片/采样器、受限 OBJ、ASCII/二进制 STL、实例共享、静态 GLB 项目 UID 与依赖索引、增量导入、多场景发布回滚、后台协程/帧预算分片上传/LRU 显存流式管理器，以及 HMAC-SHA256 签名 `BundleManifest` 与 `BundleMount` 原子热更新/回滚 | 完整材质扩展与更多模型格式 |
+| 脚本 | Xu 零分配寄存器复用标量 VM、C99/Xu 双轨 AOT（`script/aot`）、多入口、场景挂载、稳定 ID 信号、协同协程与统一宿主 ABI 绑定（Scene/Input/Physics3D/Audio/Nav/VFX）及批量热重载 | 完整类型/对象/绑定、调试器、签名更新包分发 |
+| 动画 | 图集帧动画、glTF TRS 关键帧/LINEAR/STEP/CUBICSPLINE、Pose 代数与双剪辑 TRS/SLERP 融合、BoneMask、BlendSpace 1D/2D、状态机、Two-Bone/LookAt/FABRIK IK、Root Motion、GPU MorphSet3D、GPU 计算 3×4 线性蒙皮，以及 `animation/timeline` 通用属性时间轴（Step/Linear/Cubic-Hermite 标量、`Vec3`、RGBA8 颜色与事件轨迹） | 动画时间轴编辑器面板与状态机序列化 |
+| 物理 | 2D AABB 与静态瓦片地面碰撞、连续扫掠和滑动；3D 静态 BVH/盒/斜坡/任意三角面射线与连续扫掠、直立胶囊体、1D SAP 与增量 SAH+AVL `DynamicBvh3D`、XPBD 15 轴 OBB 互碰摩擦/柔度布料/四面体软体/刚体堆叠、6-DOF 关节与 GPU 蒙皮布娃娃、流体浮力、Ackermann/Pacejka 射线载具与 Scene v9 RigidBody3D/Joint3D 持久化 | 运行中全量约束编辑器可视化拖拽 |
+| 输入/时间 | 键盘与独立模拟输入源、帧边沿、键位重绑定/JSON 导入导出、`InputRecorder`/`InputReplayer` 确定性回放带、死区轴整形、固定/浮动摇杆与按钮、多指捕获/取消、固定步进、`ScaledClock`（倍速/暂停/顿帧 Hitstop） | 原生多手柄热插拔绑定模板 |
+| 音频 | 静态/流式 WAV、IMA ADPCM（`0x0011`）4:1 编解码、32 路混音、分层总线、每总线 DSP 效果架（RBJ Biquad/Delay/Reverb）、音量/声像/暂停/循环、定位/重播、逐样本淡化/交叉淡化、2D/3D 距离与声像、节点生命周期与场景恢复 | 异步解码、遮挡、Doppler、HRTF、调试工具 |
+| 游戏 UI | UiFrame 与 Xu 布局/样式、按钮/滑块等控件、持久 `UiControlTree`（Fixed/Row/Column 布局、`Tab`/`Shift+Tab` 焦点循环、模态焦点锁定与 `HudRouter` 仲裁）、文本输入、窗口事件适配、XDF1 回放和 3D HUD 叠加 | 完整文本选区编辑与无障碍读屏桥接 |
+| 导航/AI | 3D 导航网格构建（斜率过滤/拓扑缝合）、`A*` 区域代价寻路、XZ Funnel 路径拉直、RVO 互惠人群避障、`NavObstacleManager` 动态障碍重路由，以及 `ai/bt` 行为树与类型化黑板（Sequence/Selector/Parallel/Inverter/Repeater/Cooldown/Wait/Trace） | 可视化行为树编辑器与多层级导航网格分块 |
+| 网络游戏 | 二进制比特流（`networking/bitstream`）、UDP/可靠消息传输与模拟弱网（`SimulatedLink`）、服务端权威会话、Delta 快照、AOI 滞回兴趣管理、客户端预测/校正、Hermite 插值与 `SceneTree` 同步 | 真实互联网 NAT/穿透、跨平台确定性锁步 |
+| 编辑器 | 纯 Xu 原生 XUUI（Paper 令牌）工作区、场景树和资产栏、可缩放平移的 XZ 俯视图、属性检查器（含 Scene v9 现代组件与 `PrefabInstance` 检查/编辑）、原生 GPU 透视视口（含 `--modern` `ModernPipeline3D` 渲染路径）、网格拾取、多选、世界轴和本地轴变换、可配置的网格/角度/缩放吸附、撤销重做、保存与瓦片编辑器 | 编辑器内嵌子场景实例实时展开与覆盖编辑可视化 |
+| 项目/导出 | Xu CLI 编译；原生 XUUI 项目构建器；`nexus-project bundle-pack`/`bundle-verify` HMAC-SHA256 签名资源包（`resources/bundle`、`integration/bundle`）；Phone game 原生工程；微信小程序和抖音小游戏 2D/3D WebGL 工程及随包 Wasm | 商店发布自动化签名配置 |
+| 调试/性能 | 源位置错误、回归程序、GPU 像素回读、XACP 协议控制、120 帧滚动 `FrameProfiler`（`p50`/`p95`/`p99`/作用域/JSON）、`EngineTelemetry` GPU/资产 HUD 覆层与桌面/Wasm 基线 | 源码断点调试与分平台性能回归门槛 |
+| 平台 | macOS arm64 / Metal / CoreAudio，iPhone 8 / Metal / CoreAudio，Sony XQ-BE72 / Vulkan / AAudio，双端有原生 2D 与 3D 样例，微信/抖音 2D 与 3D 模拟器验收 | 更多手机型号、实机捏合与生命周期压力、音频中断、微信/抖音真机、Linux/Windows 真机与浏览器部署 |
 
 实施顺序优先打通端到端链路：3D 材质/纹理/光照 → 资源与场景持久化 → 动画/物理/音频/UI → 编辑器与独立导出。
 每项只有接入示例、错误处理和回归后才更新状态；声明 API 或预留目录不算功能完成。
@@ -106,9 +208,9 @@ Android 准备 Android SDK/NDK、JDK 与 `glslangValidator`，生成 `libmain.so
 | `platform/sdl_image` | 独立 CPU PNG 原生解码；不初始化视频/GPU/音频 |
 | `formats/gltf` | GLB 解码与节点/图元/材质/图像/采样器描述；不读文件、不实例化场景、不上传 GPU |
 | `formats/obj`、`formats/stl`、`assets/mesh` | 纯 CPU 静态网格解码，以及独立的有界文件读取/扩展名分派；不创建场景或 GPU，不读材质旁文件 |
-| `resources/scene`、`formats/scene` | 不可变节点、GLB/WAV/字节码来源、表面/总线/声源/脚本/局部光源描述和版本化 JSON 编解码；无文件、SceneTree 或平台依赖 |
+| `resources/scene`、`formats/scene` | 不可变节点、2D/3D 相机、GLB/WAV/字节码来源、表面/总线/声源/脚本/局部光源描述和版本化 JSON 编解码；无文件、SceneTree 或平台依赖 |
 | `integration/scene` | 节点捕获、有界加载、原子文件替换、转换 PackedScene 与节点实例化；不创建 GPU 服务对象 |
-| `integration/scene_render` | 固定哈希 GLB 资源准备、共享模型、表面恢复、保留来源信息的捕获与保存 |
+| `integration/scene_render` | 固定哈希 GLB 资源准备、共享模型、表面恢复、当前 LOD 三角形拾取、保留来源信息的捕获与保存 |
 | `integration/scene_audio` | 隔离声音世界、固定 WAV 来源/总线/声源恢复、节点暂停/空间参数同步、离线混音或外部设备泵送 |
 | `integration/scene_script` | 固定字节码来源、初始字段覆盖、稳定 ID 路由、独立实例与事务重载；无编译器/GPU/音频依赖 |
 | `integration/scene_lighting` | 局部光源捕获、整批绑定与节点/光源实例化；无渲染、音频、脚本服务或 GPU 依赖 |
@@ -129,6 +231,7 @@ Android 准备 Android SDK/NDK、JDK 与 `glslangValidator`，生成 `libmain.so
 | `integration/image_render/two_d`、`three_d` | 分别把 CPU 图片上传到对应 GPU 服务；不互相导入 |
 | `integration/rendering/two_d`、`three_d` | 2D 仅录制 CPU 批次；3D 连接场景与网格/材质服务 |
 | `integration/input` | 标准窗口事件到输入动作的显式适配 |
+| `physics2d`、`physics3d` | 纯 CPU 的盒、直立胶囊体、任意 3D 三角面碰撞与动态刚体冲量求解，由调用方维护碰撞体和场景状态 |
 | `assets/gltf`、`integration/gltf_render` | 文件读取/场景实例化适配，以及独立的 GLB 网格/材质/纹理上传和场景绑定；完整资源管理器尚未实现 |
 | `resources/audio`、`formats/wav`、`assets/audio` | 不可变 PCM、共享 WAV 布局/分块解码、有界快照与流式文件读取；均无设备依赖 |
 | `audio/mixer`、`audio` | 纯 Xu 混音/空间参数、PCM 环形缓冲与淡化，以及独立设备输出/有界补队列 |
@@ -138,7 +241,7 @@ Android 准备 Android SDK/NDK、JDK 与 `glslangValidator`，生成 `libmain.so
 | `script/host` | 节点身份、脚本调度、信号、内存重载；无文件轮询或编译器依赖 |
 | `script/development`、`script/compiler` | 分离的开发轮询与编译工具链；不被 VM/host 导入 |
 
-`scene` 保存节点树、PackedScene 与相机；`input`、`timing`、`physics2d`、`animation/sprite` 分别维护动作、固定时钟、运动碰撞和图集动画。
+`scene` 保存节点树、PackedScene 与相机；`input`、`timing`、`physics2d` / `physics3d`、`animation/sprite` 分别提供动作、固定时钟、运动碰撞和图集动画。
 2D/3D 都直接使用 `foundation/math` 的数学类型。`assets/gltf` 读取标准格式数据并实例化场景，没有重复拥有的格式包装。
 
 首次发布前只维护一套当前接口和格式，消费者同步迁移。根包、`gpu` 门面、重复数学类型和开发中间格式已经移除。
@@ -182,7 +285,7 @@ PNG 文件上传、最近邻/线性采样、透明混合、GPU 裁剪、有序�
 
 ## 运行
 
-需要 **Xu 0.12.6**（桌面/主机测试使用含 native FFI 修复的 SDK，移动端打包使用 Phone game 工具链分支）、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
+需要 **Xu 0.14.2**、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
 默认通过 `pkg-config sdl3` 查找头文件；Windows 可显式传入包含 `SDL3/SDL.h` 的目录。
 桥接在运行时加载 SDL，不把 SDL 源码或二进制复制进本库。
 
@@ -194,6 +297,7 @@ make check
 make demo
 make demo2d
 make demo3d
+make demo-physics3d
 make demo-glb
 make demo-models
 make demo-script
@@ -234,14 +338,13 @@ make demo-glb-materials
 ./build/glb-materials --frames 120 --capture build/glb-materials.png
 ```
 
-当前使用完整的 Xu 0.12.6 开发 SDK；编译器、标准库、native 工具必须来自同一发行包。
-`make sdk` 核对实际编译器版本。默认使用 PATH 中的正式版 `xu`；不再依赖开发工作区或混用不同 SDK 的标准库。
+`make sdk` 核对实际编译器版本。默认使用 PATH 中的 `xu`，也可用 `XU` 选择完整的 Xu 0.14.2 SDK。
 修复内容属于编译器：解析 native 模块、校验归档/目标/ABI、生成 C 调用适配和链接，调用所选 SDK 的配套工具，
 并为资源所有者及资源数组生成自动析构。标准库新增 `gpu/layout` 统一纹理格式、mip 链、行 pitch 与 mip offset 的受检计算，UI 图片上传与引擎 2D/3D 纹理共用；标准 `gpu` 已提供无窗口设备、缓冲区与异步传输、fence/读回、纹理/采样器、Shader/Pipeline 和离屏 render pass，以及 compact `[]u8` 借用 ABI。标准窗口/呈现已补齐，2D/3D 均已迁移标准事件、资源和绘制命令；PBR、场景和游戏预算仍在引擎。
 完整 SDK 的编译器、标准库和包搜索路径必须一致：
 
 ```sh
-NEXUS_XU_SDK="$HOME/.xu"  # 或完整的 0.12.6 SDK 目录
+NEXUS_XU_SDK=/path/to/xu-dev
 XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" \
 XUPATH="$NEXUS_XU_SDK/src:$NEXUS_XU_SDK/packages" XU="$NEXUS_XU_SDK/bin/xu" \
 make native-probe check test gpu-smoke smoke script-live-smoke
@@ -252,12 +355,109 @@ make native-probe check test gpu-smoke smoke script-live-smoke
 `make native-probe` 在无 SDL 的独立模块中验证整数、十二参数、混合参数/数组、空数组、结构体字段借用、
 可写数组 COW 隔离与 void 返回，编译、链接并执行真实 C 调用。
 `make check test gpu-smoke smoke script-live-smoke` 包含设备与运行中热更新检查；失败直接报告。
-本轮 macOS arm64 使用 `0.12.6` 已通过上述完整命令（smoke 含独立标准 GPU 传输），覆盖：Metal 2D/3D 绘制与回读、CoreAudio、资源回收与失败回滚、
+macOS arm64 回归覆盖独立标准 GPU 传输、Metal 2D/3D 绘制与回读、CoreAudio、资源回收与失败回滚、
 场景保存/新进程恢复，以及真实 GPU 进程内 300 帧脚本热重载（状态和信号连接保留，错误源码/产物拒绝）。
 SDL 动态库不在标准位置时，标准 GPU/window 与 CPU PNG codec 使用 `XU_SDL_LIBRARY`；音频设备仍使用独立的 `XU_NEXUS_SDL_AUDIO_LIBRARY`。
 3D 着色器通过 `make mesh-shaders` 或 `tools/mesh_shaders.py --backend ... --out-dir ...` 显式准备。
 macOS 使用 MSL 源码（驱动编译），Vulkan 需 glslangValidator，D3D12 需 DXC；运行服务只接收内存数据。
 Linux / Windows 的构建配方与着色器源文件已提供，尚未在对应系统验证。
+
+## 2.5D 示例
+
+```sh
+make demo-isometric-2d
+make demo-hd2d
+make 25d-core-test 25d-gpu-test
+```
+
+- 等距瓦片示例用 WASD 移动，左键给指针下的地面格着色，Esc 退出。角色碰到柱子的菱形地面轮廓时会沿边滑动。瓦片按地面锚点参与 Y 排序，抬高瓦片只改变绘制位置。前景柱按深度遮挡角色，背景随相机视差滚动。
+- HD-2D 示例用 WASD 移动，C 切换正交和透视相机，Esc 退出。`Sprite3D` 支持固定平面、绕 Y 轴和随相机三种朝向，以及图集帧、翻转、光照和透明裁切。方向光的级联阴影按精灵的裁切轮廓投到 3D 场景。
+
+两个示例均支持 `--scene`、`--save`、`--frames` 和 `--capture`。保存位置须在图集所在目录或其上级，使资源路径仍在该位置之下。下例复制场景和资源后保存，再用新进程加载存档。
+
+```sh
+make hd2d-scene
+mkdir -p build/hd2d-assets
+cp examples/hd2d_scene/assets/* build/hd2d-assets/
+./build/hd2d-scene --scene build/hd2d-assets/world.xuscene --frames 12 --save build/hd2d-assets/saved.xuscene
+./build/hd2d-scene --scene build/hd2d-assets/saved.xuscene --camera CameraPersp --frames 1 --capture build/hd2d.png
+```
+
+场景 v8 的 `tilemaps_2d[].solid_tiles` 列出每层可阻挡角色的图集编号。`physics2d.new_tilemap_collider_2d` 根据瓦片层及其世界变换创建静态碰撞数据。移动传入世界坐标、世界位移和沿网格两轴以单元格为单位的角色半尺寸。碰撞最多检查 4,096 个候选实心格，起点已重叠时返回错误。地图内容、碰撞标记或瓦片层变换更改后，重新创建碰撞数据。等距示例使用一个静态碰撞层，留空的单元格可通行。
+
+核心回归检查三种布局的拾取、深度、视差与碰撞，包括大步长防穿透和沿边滑动。GPU 回归另外覆盖跨图集遮挡、相机切换、动画与阴影，并对比等距示例存档前后的移动路径。2.5D 的 GPU 回归已在 macOS Metal 运行。
+
+### 瓦片绘制
+
+```sh
+make demo-tilemap-editor
+make isometric-2d
+./build/isometric-2d --scene build/isometric-edit/world.xuscene
+```
+
+独立的 Xu 桌面瓦片编辑器打开已有 `.xuscene`。左侧选层，右侧选图集瓦片，左键或拖动绘制。Erase 橡皮擦清除单元格。滚轮缩放，右键拖动平移，F 居中适配。每次笔划可用 Cmd/Ctrl+Z 撤销，按住 Shift 重做，Cmd/Ctrl+S 保存。示例入口编辑 `build/isometric-edit` 下的副本。
+
+编辑器逐层显示瓦片，保存时保留碰撞编号、高度、色调和其它场景附件。`make tilemap-editor-test` 在原生窗口中验证笔刷、橡皮擦、撤销重做和保存重载，再用等距运行时加载编辑结果。两张截图位于 `build/tilemap-editor-check/`。
+
+### Phone 等距场景
+
+```sh
+python3 tools/build_phone.py --example isometric_2d --target android-arm64 \
+  --sdl-source /path/to/SDL-3.4.14 --output build/isometric-phone \
+  --bundle-id org.xulang.nexus.isometric
+./build/isometric-phone/build.sh
+```
+
+加上 `--scene build/isometric-edit/world.xuscene` 可打包编辑后的场景。构建器校对 PNG 图集哈希，并保留 `.xuscene` 中的相对图集路径。改用 `--target ios-arm64` 生成 iOS 工程。`make phone-isometric-test` 从独立目录读取打包结构并验证竖屏控件、瓦片碰撞和存档。桌面可通过 `./build/isometric-2d --touch` 检查竖屏布局。
+
+应用退出时保存角色位置、镜头位置和暂停状态。Android 重建 Activity 后从同一场景的私有存档继续。场景更换或存档位置与实心瓦片重叠时，使用场景的初始状态。
+
+### 等距两图项目
+
+`examples/isometric_2d/project.json` 注册两张地图和共用图集。先把项目复制到可写目录，再从项目清单打开要改的场景。
+
+```sh
+make tilemap-editor isometric-2d project-validator
+mkdir -p build/isometric-campaign/assets
+cp -n examples/isometric_2d/project.json build/isometric-campaign/
+cp -n examples/isometric_2d/assets/* build/isometric-campaign/assets/
+./build/nexus-tilemap-editor --project build/isometric-campaign/project.json world.xuscene
+```
+
+第一张地图的青色菱形是出口。点击 **Move Exit**，再点击地图上的落点。移动出口和画瓦片共用撤销与重做历史。保存后重新发布，并从发布结果运行。
+
+```sh
+make project-cli project-validator
+./build/nexus-project build build/isometric-campaign/project.json --output build/isometric-published --validator build/nexus-project-validate
+./build/isometric-2d --campaign --scene "$(./build/nexus-project scene world.xuscene --output build/isometric-published)" \
+  --data build/isometric-campaign-save.json
+```
+
+角色走到 `Exit_grove` 节点附近会进入同一项目中的 `grove.xuscene`，以目标地图的角色和镜头初始位置开始。其他出口使用根节点下的 `Exit_<目标场景名去掉扩展名>` 型 Node2D。新地图出帧后原子写入关卡、角色和镜头存档。移动期间定期保存，松手或暂停时提交当次进度。`make isometric-campaign-test` 验证编辑出口、发布、过图，以及结束进程后恢复第二张地图。
+
+用同一份项目清单导出 Android。改用 `--target ios-arm64` 和独立输出目录可生成 iOS 工程。
+
+```sh
+python3 tools/build_phone.py --example isometric_2d --project build/isometric-campaign/project.json \
+  --target android-arm64 --sdl-source /path/to/SDL-3.4.14 --output build/isometric-campaign-android \
+  --bundle-id org.xulang.nexus.isometric.campaign
+./build/isometric-campaign-android/build.sh
+```
+
+`--entry` 可选择项目中的入口场景，默认 `world.xuscene`。导出校验出口目的地并将多个关卡的共用图集打包一次。
+
+### Phone HD-2D 场景
+
+```sh
+python3 tools/build_phone.py --example hd2d_scene --target android-arm64 \
+  --sdl-source /path/to/SDL-3.4.14 --output build/hd2d-phone \
+  --bundle-id org.xulang.nexus.hd2d
+./build/hd2d-phone/build.sh
+```
+
+改用 `--target ios-arm64` 可生成 iOS 工程。`--scene` 可指定包含 `sprites_3d` 和可选 `lights` 的场景。移动版使用原来的图集、裁切和光照数据，并在呈现时应用分辨率上限。运行 `make phone-hd2d-test` 可复测打包资源加载、两指操作、分辨率上限和透明裁切阴影。桌面运行 `./build/hd2d-scene --touch` 可预览 Phone 布局。
+
+应用退出时写入私有存档。Android 因应用语言等配置变更重建 Activity 时，会从存档恢复角色位置、朝向、镜头和暂停状态。打包独立场景时可使用不同的 `--bundle-id`，让各自的存档保存在独立沙盒。
 
 ## 2D 分层接口
 
@@ -938,13 +1138,27 @@ RGB 4:4:4、4:2:0、灰度和奇数尺寸结果与独立 libjpeg/Pillow 比较�
 ## 节点场景文件
 
 `integration/scene` 将节点场景保存为 `.xuscene`，加载后可转换为既有 `PackedScene`，供多次实例化复用。
-保存范围为普通分组、Node2D/Node3D 的层级、名称、局部变换、可见性和处理模式。
-唯一的场景格式版本为 1，同时描述节点、资源、表面、音频与脚本；所有附件数组必须出现，未使用时为空。
-相机镜头参数和树的暂停/执行状态仍由应用管理。节点捕获入口只捕获节点；其他附件由各服务整合包管理。
+保存范围包括普通分组、Node2D/Node3D 的层级、名称、局部变换、可见性、处理模式和相机参数。
+读取支持版本 1 至 8。保存时按声明的功能写出所需的最低版本。该版本规定的附件数组即使未使用也写为 `[]`。
+树的暂停和执行状态由应用管理。表面、音频、脚本、光源、3D 精灵和瓦片附件由各服务整合包管理。
+
+| 最低版本 | 增加的场景字段 |
+| --- | --- |
+| 1 | 节点和基本附件 |
+| 2 | Node3D 透视镜头 |
+| 3 | Node3D 正交镜头和 Node2D 相机 |
+| 4 | 方向光的 `lights[].cascades` |
+| 5 | 点光和聚光的 `lights[].shadow`，见[光源场景保存与恢复](#光源场景保存与恢复) |
+| 6 | GLB 表面的 `surfaces[].lod`，见[在场景中声明距离 LOD](#在场景中声明距离-lod) |
+| 7 | `sprites_3d`、`tilemaps_2d` 及其 `image_rgba` PNG 资源，见 [2.5D 示例](#25d-示例) |
+| 8 | `tilemaps_2d[].solid_tiles` 保存每层的碰撞瓦片编号。该层没有碰撞瓦片时填 `[]` |
 
 ```xu
 files #"github.com/xulang-org/nexus/integration/scene"
+camera_data #"github.com/xulang-org/nexus/resources/camera"
 
+lens := camera_data.perspective(0.94, 0.2, 96.0) or >>
+tree.set_camera_3d(camera_node, lens) or >>
 document := files.capture_nodes(&tree, subtree_root) or >>
 files.save("world.xuscene", &document) or >>
 loaded := files.load("world.xuscene") or >>
@@ -954,7 +1168,7 @@ instance := packed.instantiate($&tree, parent, "Loaded") or >>
 // 只实例化一次时，也可 files.instantiate(&loaded, $&tree, parent, "Loaded")。
 ```
 
-[`examples/scene_file/main.xu`](examples/scene_file/main.xu) 从文件恢复八个混合节点，显式绑定材质，保留隐藏节点，并从文件里的相机节点绘制。
+[`examples/scene_file/main.xu`](examples/scene_file/main.xu) 从文件恢复混合节点，显式绑定材质，保留隐藏节点，并通过 `tree.camera_view_projection_3d` 根据节点镜头选择透视或正交投影。普通 Node3D 沿用默认透视镜头。`scene.new_camera_node_2d` 以节点的世界位置和 X 轴方向生成相机，缩放由镜头的 `zoom` 控制。父节点移动后重新读取即可更新视角。
 保存后退出，再由新进程加载的运行方式：
 
 ```sh
@@ -963,15 +1177,18 @@ make demo-scene-file
 ./build/scene-file --scene build/saved-world.xuscene --frames 120 --capture build/scene-file.png
 ```
 
-| 契约 | 版本 1 行为 |
+运行 `make scene-camera-gpu-test` 可复测同一场景的正交与 2D 画面。该目标用 `scene-file --camera Ortho` 和 `two-d --camera-scene` 渲染原始文件及新进程加载后的存档，并比较 PNG。
+
+| 契约 | 行为 |
 | --- | --- |
-| 文件 | UTF-8 JSON，`format: "xu.scene"`、整数 `version: 1`、`nodes`、`resources`、`surfaces`、`audio_buses`、`audio_emitters`、`scripts`、`script_connections`、`lights`；未知版本/字段/类型报错，不静默丢弃附件或扩展 |
+| 文件 | UTF-8 JSON，`format: "xu.scene"`、整数 `version` 1 至 8、`nodes`、`resources`、`surfaces`、`audio_buses`、`audio_emitters`、`scripts`、`script_connections`、`lights`。版本 7 起另含 `sprites_3d`、`tilemaps_2d`。未知版本、字段或类型报错 |
 | 节点 | 单根、先序数组；根 parent=-1，其他 parent 为数组索引且在当前祖先链内；同级名称唯一 |
 | 名称 | 1...255 UTF-8 字节；拒绝控制字符、`/`、`.`、`..`；JSON 标准转义保留引号、反斜杠与 Unicode |
 | 变换 | Node2D 的 `[a,b,c,d,tx,ty]`；Node3D 列主序 16 个数，末行 `[0,0,0,1]`；分组无 transform |
+| 镜头 | Node3D 透视镜头自版本 2 支持，字段为弧度制 `vertical_fov`、`near`、`far`。版本 3 的 Node3D 正交镜头使用 `projection: "orthographic"`、`vertical_size`、`near`、`far`。版本 3 的 Node2D 相机使用 `design_width`、`design_height`、`zoom`。镜头随 PackedScene 独立复制，3D 投影沿用有限 Reverse-Z |
 | 数值 | 有限 f64，使用 SDK 最短可往返十进制，避免普通字符串转换损失精度；支持剪切/负缩放，不强制 TRS 分解 |
 | 模式 | inherit / pausable / always / when_paused / disabled；可见性和模式均保存局部值，加载后再沿目标树继承 |
-| 规模 | 文件最多 4 MiB、解析 JSON 节点最多 131,072、场景节点最多 4,096、根计入最多 256 层 |
+| 规模 | 读取和保存均检查文件 4 MiB、JSON 节点 131,072 的上限。场景最多 4,096 个节点，深度最多 256 层，包含根节点 |
 | 实例化 | 先在私有树验证，再复用 PackedScene 的目标名称/容量预检；失败不改变目标树或 ready 通知 |
 | 身份 | 每次实例化分配目标树 ID；父索引只属于文件，不是资源 UID 或跨保存稳定的节点身份；根名由实例化参数指定 |
 | 文件发布 | 编码完成后写同目录独占临时文件、关闭并 rename；失败保留旧文件并清理临时文件；没有 fsync 持久性或多文件事务承诺 |
@@ -982,13 +1199,13 @@ make demo-scene-file
 场景节点与脚本恢复均已在不提供原生归档、渲染/音频/编译前端源码的临时目录中构建并跨进程运行。音频恢复只链接音频设备归档，不需要 GPU 归档。
 
 所有场景语义留在引擎；JSON、UTF-8 校验、精确浮点格式化与文件操作复用 Xu 标准库。编译器修复单独维护，不把场景语义移入 SDK。
-70 项异常文件检查、4,096 节点/256 层边界、失败绑定/文件替换、跨进程重载与 Metal 120 帧均有回归。
-GLB 来源和表面附件见下节；全局 UID 索引、其他附件、实例覆盖、全局缓存/重导入及热替换仍待实施。
+94 项异常文件检查、4,096 节点/256 层边界、失败绑定/文件替换和跨进程重载均有回归。相机保存再恢复后，Metal 示例的正交与 2D 画面逐像素一致。
+GLB 来源和表面附件见下节；静态 GLB 项目级 UID 索引和增量重导入见项目工具章节。其他资源类型的项目索引、实例覆盖和运行时热替换仍待实施。
 
 ## 场景资源与 GLB 表面恢复
 
 `.xuscene` 的 `resources` 和 `surfaces` 描述固定来源与表面绑定，可在新进程中自动恢复 GLB 网格、材质和五槽贴图。
-所有场景均使用同一版本 1；不会根据附件种类改变协议版本，其他版本明确拒绝。
+版本 6 起，`surfaces` 可通过 `lod` 声明各个较粗级别的 GLB 图元和切换阈值。`resources` 在各版本采用相同的字段和校验。
 
 ```xu
 loader #"github.com/xulang-org/nexus/integration/scene_render"
@@ -996,7 +1213,8 @@ loader #"github.com/xulang-org/nexus/integration/scene_render"
 $models := loader.load(&device, "world.xuscene") or >>
 parent := tree.root()
 instance := models.instantiate($&scene, $&tree, parent, "World") or >>
-// 之后使用 scene.draw_lit；models 必须在这些弱引用绘制期间存活。
+// 读取活动相机的世界位置，在 scene.draw_lit 前调用 scene.select_lods。
+// models 必须在这些弱引用绘制期间存活。
 models.save("saved.xuscene", &tree, instance) or >>
 ```
 
@@ -1031,27 +1249,115 @@ cp examples/scene_assets/assets/world.xuscene examples/scene_assets/assets/panel
 | --- | --- |
 | 身份/版本 | 非零 32 字符小写十六进制资源 ID 表示身份，64 字符 SHA-256 表示来源版本；`integration/scene.new_resource_id()` 复用标准加密随机源生成 128 位 ID |
 | 定位 | 路径相对场景文件所在目录，1...1,024 UTF-8 字节，使用 `/`；拒绝绝对路径、盘符、反斜杠、空段和 `.` / `..` 段 |
-| 资源 | 当前仅 `glb_model`；文档内 ID/路径唯一，所有资源必须被表面使用；UID 不是全局索引，文件移动后仍须更新路径 |
-| 表面 | 每个 Node3D 最多一个表面，声明资源 ID 和源图元序号；按固定来源版本的展平图元读取，不重新导入 GLB 节点层级/变换 |
+| 资源 | 表面使用 `glb_model`；文档内 ID/路径唯一。项目清单可为多个场景的同一 GLB 维护一个稳定 UID |
+| 表面 | 每个 Node3D 最多一个表面，声明基础资源 ID、源图元序号与可选 LOD；按固定来源版本的展平图元读取，使用场景节点的变换 |
 | 准备 | 有界读取每份来源，先校验完整字节 SHA-256，再解析/上传；同一次准备中，哈希相同的来源共享一个拥有型 GLB 模型，每条路径仍单独读取校验 |
 | 预算 | 1...32 个资源、1...4,096 个表面；每个 GLB 最多 16 MiB、全部来源读取累计 32 MiB；已有单模型 PNG 解码与 GPU 网格/图片预算继续生效 |
 | 发布 | 上传全部成功并校验实际图元范围后，离树预检全部 GPU 表面，再实例化目标节点和绑定；容量、名称、跨设备或关闭资源失败不留下部分目标节点 |
 | 重绑 | `models.bind` 对已有实例先校验完整节点数量/名字/类型/父关系和所有候选资源，再批量写入；运行时可修改局部变换/可见性/处理模式 |
 | 拥有 | SceneModels3D 拥有去重后的源模型，源模型拥有网格/图片，场景保存弱引用；关闭或析构后旧绑定失效，`close` 可重复调用 |
-| 保存 | `models.capture` 保存当前节点值并保留声明的资源 ID/路径/哈希/图元；`models.save` 根据目标目录调整相对路径，再复用原子文件替换；来源不能位于目标目录之外 |
+| 保存 | `models.capture` 保存当前节点值并保留声明的资源 ID、路径、哈希、图元与 LOD 配置；`models.save` 根据目标目录调整相对路径，再复用原子文件替换；来源必须位于目标目录内 |
 
 需要分步组装时，`loader.prepare(&device, document, base_directory)` 接收已验证文档并准备资源；
 `resource.with_attachments` 一次提供来源、表面、音频、脚本、路由和光源描述，空的类别显式传空数组。`files.to_packed` / `files.instantiate` 会拒绝含附件文档，
 显式 `files.to_packed_nodes` 可只建节点，调用方随后须用 `models.bind` 恢复表面。`capture_nodes` 的范围仍明确为节点。
 
 保存不会复制、打包或改写 GLB，也不推断运行时临时材质替换/附件增删；捕获依赖原声明的拓扑，重命名/增删/换父节点需重建声明。
-图元序号属于被哈希固定的来源版本，重导入需要显式核对映射。当前没有自动 UID 搜索、跨场景全局缓存、自动重导入或资源热替换。
-GLB 表面与下节音频附件已实现，脚本附件见下节，镜头附件及实例覆盖尚未实现；GLB 自身仍沿用 PNG/OPAQUE/UV0/显式法线切线的受限范围。
+图元序号属于被哈希固定的来源版本。项目构建检查序号范围、LOD 三角形数和基础材质所需的顶点数据。调整源 GLB 图元的顺序后，需要核对场景绑定。
+GLB 表面、音频、脚本和 2D/3D 相机可保存到场景文件，实例覆盖待实现。GLB 自身沿用 PNG/OPAQUE/UV0/显式法线切线的受限范围。
 
 纯数据与编解码包保持无文件/SceneTree/GPU 依赖，隔离构建包含完整附件描述；新增运行整合包只组合既有服务，没有修改原生渲染器或 Xu 标准库。
-新增 54 项资源/路径/绑定异常、4,096 表面往返、SHA 失配/损坏 PNG/无效法线/实际图元越界/累计来源预算失败回滚，
+回归包含 69 项资源、路径、绑定和 LOD 格式异常、4,096 个普通表面往返及密集 LOD 文档的写入预算检查。GPU 检查覆盖 SHA 失配、损坏 PNG、无效法线、实际图元越界与来源预算失败时的资源回滚，
 以及跨设备、关闭模型、后部节点失效时不覆盖前部旧材质、保存调整路径与失败保留旧文件的检查。
 本轮实机仍为 macOS arm64 / Metal，Vulkan/D3D12 待各自平台验收。
+
+## 用户游戏项目结构（Standard Game Project Layout）
+
+使用 Nexus 开发独立游戏推荐采用官方标准工程布局，通过 `nexus-project init`、`doctor` 与 `layout` 一键创建、体检并衔接多平台发布：
+
+```text
+<my_game>/
+├── xu.xun                  # Xu 模块清单（require github.com/xulang-org/nexus）
+├── project.json            # nexus.project v1 主清单（可选 meta / paths / platforms + assets / scenes）
+├── .gitignore              # 忽略 build/、.nexus/、*.xubc
+├── src/                    # 游戏源码（main.xu 入口与 src/game/ 模块）
+├── scenes/                 # .xuscene 场景（create_scene 自动落入此目录）
+├── prefabs/                # 可复用 .xuscene Prefab 模板
+├── assets/                 # models/、textures/、audio/、animations/、shaders/
+├── scripts/                # XuScript (.xus) 与 .schema.json
+├── locales/                # strings.json（nexus.i18n v1 多语言目录）
+├── config/                 # input_bindings.json、perf_budgets.json、platform_mapping.json
+├── platforms/              # steam.json、xbox.json、playstation.json、switch.json、taptap.json、mobile/、miniprogram/
+├── tests/                  # 游戏测试与性能预算回归
+└── build/ & .nexus/        # [Git 忽略] 构建产物、generations/ 与编辑器缓存
+```
+
+```sh
+make project-cli project-validator
+./build/nexus-project layout
+./build/nexus-project init ./my_game --name "Star Odyssey" --id com.studio.starodyssey --template 3d --locale zh-CN --platforms all --nexus-path "$(pwd)"
+./build/nexus-project doctor ./my_game/project.json --strict
+(cd ./my_game && xu check src/main.xu && xu build src/main.xu -o build/game && ./build/game --smoke)
+./build/nexus-project steam-stage ./my_game/project.json --output ./my_game/build/stage-steam
+```
+
+仅包含 `format`、`version`、`assets`、`scenes` 4 个字段的最小工程清单（如本仓库 `examples/*`）保持 100% 向后兼容。完整结构、字段与协作规范见 [GAME_PROJECT_STRUCTURE.zh-CN.md](docs/GAME_PROJECT_STRUCTURE.zh-CN.md)，自动化验收入口 `make project-scaffold-test`。
+
+## 项目资源索引与场景编辑
+
+`project.json` 使用 `format: "nexus.project"`、`version: 1`、`assets` 与 `scenes`。资产表把固定的 128 位 UID 映射到项目内 GLB 或 PNG 路径。场景表把输出文件名映射到项目内的 `.xuscene` 源文件。网格表面、瓦片和 Sprite3D 图集可通过 UID 引用资产。多个场景可以复用同一 UID。
+
+```sh
+make project-cli project-validator project-preview
+./build/nexus-project build examples/scene_assets/project.json --output build/project-gallery --validator build/nexus-project-validate
+./build/nexus-project-preview --scene "$(./build/nexus-project scene gallery.xuscene --output build/project-gallery)"
+```
+
+`register <project.json> <source-relative.glb>` 分配 ID。移动源文件后，用 `relocate <project.json> <uid> <new-relative.glb>` 更新位置。后续运行 `build` 时，改名不改变场景引用；素材修改只重新验证该内容及依赖它的场景。变更依据为 SHA-256，换用验证器时重新验证缓存。导入复用 Xu 场景解码、GLB PBR 校验和图片解码，范围为带内嵌图片的静态 GLB。
+
+构建生成只读的场景和资源版本，并通过 `current.json` 一次切换发布入口。GLB 或任一依赖场景校验失败时，上一版入口和产物可继续使用。输出目录需支持同一文件系统的硬链接。运行时继续使用原有 `.xuscene` 与来源哈希契约。
+
+```sh
+make demo-project-editor
+make demo-course-editor
+```
+
+桌面编辑器（`cmd/project_editor`）与项目构建器（`cmd/project`）均使用纯 Xu 实现（原生 XUUI 桌面界面），无需 Python/Tk 运行时。示例命令编辑 `build/` 内的可写副本。工作区、吸附设置和原生 3D 视口使用 XUUI Light（Paper）浅色令牌。拖动分隔条可调整场景树、俯视图与检查器的宽度。
+
+- 左侧从 **Scene Tree** 选节点，在 **Assets** 选择 GLB 后点击 **Place GLB**，再在俯视图中放置。按 Esc 结束放置。
+- 中间在 **Top View** 用滚轮围绕指针缩放，右键拖动平移，点击 **Fit** 或聚焦画布后按 `F` 框入节点。用 **3D View** 打开透视视口。
+- 右侧在 **Inspector** 编辑名称、可见性和本地位置，再点击 **Apply Changes**。名称使用 XUUI 描边式 Field，标签嵌在边框上，长度和校验提示在框下，点击 × 可清空当前输入。顶部提供撤销、重做、**Save Scene** 与 **Preview**。可用 `Cmd+S` 或 `Ctrl+S` 保存当前场景，底栏标记保存状态。
+
+关卡从 `Solids` 子树读取轴对齐盒，从可选的 `Ramps` 子树读取朝 −Z 升高的楔形斜坡。`Spawn` 与 `Finish` 分别指定出生位置与终点。
+
+CPU 与真实 GPU 回归用两个场景共享一个 GLB，同时保留第三个独立场景。覆盖 UID 改名、选择性重建、损坏素材、图元越界和 LOD 材质不兼容时的回滚。用 `make project-test project-gpu-test project-editor-test` 验证资源、渲染和编辑器三条路径。
+
+### 原生 3D 编辑视口
+
+在 **Top View** 标题栏点击 **3D View**。独立的原生 GPU 窗口使用当前场景草稿，包括还未保存的编辑。场景以静态 GLB 的 PBR 材质和固定编辑照明渲染。
+
+| 操作 | 行为 |
+| --- | --- |
+| 左键点击 | 拾取视线上的最近可见网格三角形，遵循相机裁剪、单/双面材质和当前 LOD |
+| Shift + 左键 | 添加或移除一个网格。所选节点的位置以深色标记显示，本地轴模式用朱红色标出最后选中的节点 |
+| `1`，拖动箭头 | 沿当前坐标系的 X、Y 或 Z 轴平移 |
+| `2`，拖动圆环 | 绕对应轴旋转。近乎侧对相机的圆环会隐藏，可转动视角后操作 |
+| `3`，拖动方柄 | 沿对应轴缩放。拖动中心方块可在三个轴上等比缩放 |
+| `Q` | 切换世界轴与本地轴。多选时以最后选中的节点为本地轴参考 |
+| `S` | 切换吸附。默认平移步长为 0.25 个世界单位，旋转为 15°，缩放为相对倍率的 10% |
+| 右键拖动、中键拖动、滚轮 | 环绕旋转、平移、缩放观察距离 |
+| `F`、`Home` | 聚焦当前选区、框入全部可见网格 |
+| Enter、Esc | 应用变换并返回编辑器、取消。拖动中按 Esc 或窗口失焦会恢复本次拖动前的整组选区 |
+
+多选围绕所选有效节点原点的平均位置变换。父子节点同时选中时，子节点随父节点一起变换。本地轴从参考节点的世界矩阵正交化，剥离尺度和剪切并保留镜像方向。拖动期间锁定轴方向，结果写回每个节点的本地仿射矩阵。
+
+在 **Top View** 标题栏点击 **Snap Settings**，分别填写平移步长（0.0001–1,000,000 个世界单位）、旋转步长（0.01–180°）和缩放步长（0.01–100%）。描边式 Field 在框内显示单位，在框下分别显示校验提示，并保留待修正的输入。点击 **Apply** 后，步长记录在 `--output` 目录的 `editor-snap.json`。下次打开 3D 视口会沿用这些步长，重启编辑器后也会恢复。独立启动 `nexus-project-viewport` 时也可指定 `--snap-move`、`--snap-rotate` 和 `--snap-scale`。每次打开视口后按 `S` 开启吸附，状态栏显示当前工具的步长。
+
+世界轴平移把共同枢轴在拖动轴上的坐标对齐到网格，本地轴平移从拖动起点按所设步长对齐。单击手柄保持位置。旋转和缩放从拖动开始时的状态计量。缩放倍率限制在 `[0.01, 100]` 内，吸附开启时取此范围内最接近的倍率步进。例如，40% 的步长允许缩到 0.2 倍或放到 1.4 倍。
+
+应用会将节点变换合并回同一份草稿，整次视口会话可统一撤销或重做。若草稿同时在主编辑器被修改，会拒绝旧的视口结果。点击 **Save Scene** 写入场景源文件，之后可用 **Preview** 构建并运行发布版本。
+
+`make project-picking-test` 核对遮挡顺序、镜像与非均匀缩放、继承可见性、裁剪范围，以及包围盒内但三角形外的空白区域。`make project-editor-test` 验证步长输入校验和持久化，并在 Metal 上核对多选、父子变换继承、默认与自定义步长、镜像及剪切下的本地轴吸附、撤销重做、发布和过期结果拒绝。另保留平移斜坡并自动通关的回归。
 
 ## 场景音频附件与音画组合
 
@@ -1116,12 +1422,12 @@ make demo-scene-av
 源读取/PCM 库预算失败隔离、无 SDL 运行库的跨进程重开，以及关闭/采样率错误输出不推进游标的检查。
 纯编解码无需 native/SceneTree；音频运行适配只链接音频归档，离线混音不加载 SDL，构建不需要 GPU 源码或归档。
 本轮没有修改 Xu 标准库或原生传输桥接；随机、哈希、UTF-8、JSON 和路径继续复用现有公开能力。
-流式音乐的场景恢复、压缩解码、DSP/遮挡/Doppler/HRTF、全局音频服务、镜头附件和实例覆盖仍待实现。
+流式音乐的场景恢复、压缩解码、DSP/遮挡/Doppler/HRTF、全局音频服务和实例覆盖仍待实现。
 
 ## 场景脚本附件、稳定信号与热重载
 
 `scripts` / `script_connections` 描述脚本挂载和稳定路由，来源类型为 `xu_bytecode`。
-节点、表面、音频和脚本在同一版本 1 文档中恢复。
+节点、表面、音频和脚本可从同一场景文档恢复。脚本构建工具保留模板里的镜头。
 脚本仍是已有 `xu-scalar-v1` 子集：物理更新和标量信号处理函数、有限 f64 状态；尚无完整对象绑定、协程或通用函数调用。
 
 ```xu
@@ -1328,7 +1634,7 @@ python3 tools/watch_script.py --tool build/xu-nexus-script \
   --output build/player.xubc
 ```
 
-首个 profile 为 `xu-scalar-v1`。编译工具直接复用 SDK 0.12.6 的 `xu/scanner`、`xu/parser`、公开 AST 常量，
+首个 profile 为 `xu-scalar-v1`。编译工具直接复用 SDK 的 `xu/scanner`、`xu/parser`、公开 AST 常量，
 再做标量 profile 类型/作用域检查与寄存器指令生成，没有复制一套 Xu 解析器。
 SDK 前端在语法错误时会结束进程，因此源码编译由独立子进程执行；游戏只加载、验证并解释编译产物。
 每个开发轮询器每 200 ms 检查一个源码和一个 JSON 元数据文件，读取有界快照，编译超时为 5 秒。
@@ -1468,7 +1774,7 @@ report := scripts.dispatch(&tree, host.DEFAULT_DISPATCH_LIMIT) or >>
 ```yaml
 module: example/my_game
 version: !ver 0.1.0
-xu: !ver 0.12.6
+xu: !ver 0.14.2
 require:
   "github.com/xulang-org/nexus": file:/path/to/nexus
 ```
@@ -1498,6 +1804,62 @@ $input := controls.new_input_map()
 [`examples/arena/main.xu`](examples/arena/main.xu)。可用
 [`examples/headless/main.xu`](examples/headless/main.xu) 单独运行模拟。
 
+## 基础 3D 物理
+
+`github.com/xulang-org/nexus/physics3d` 以 +Y 为上方，复用 `foundation/math.Aabb3` 和向量。调用方按固定时间步计算位移，将碰撞结果写回角色或节点。查询在 CPU 上执行，碰撞体由调用方传入。
+
+| 接口 | 行为 |
+| --- | --- |
+| `raycast(origin, direction, distance, &solids)` | 按指定世界距离返回最近的静态盒，以及命中点和法线。同距离返回输入靠前的盒。起点在盒内或表面时距离和法线为零，未命中时 `collider == -1`。 |
+| `sweep_aabb(body, motion, solid)` | 沿整段位移查询首次阻挡，`time` 为 0 至 1 的比例。支持高速越过薄墙的检测，纯擦边可通过。起始重叠通过 `started_overlapping` 返回。 |
+| `move_and_slide(body, motion, &solids)` | 返回最终包围盒和实际位移。碰撞时移除法线方向的位移，沿接触面继续运动。`on_floor`、`on_wall`、`on_ceiling` 表示本次运动中的接触。起始盒与静态盒重叠时报错。 |
+
+查询坐标限制在各轴 ±10⁹，盒的三个轴均须具有正长度。多个静态盒的查询最多接受 4096 个碰撞体并线性扫描。
+
+`StaticWorld3D.move_character` 为轴对齐盒角色提供独立的实体和触发区掩码、地面探测及上台阶。触发区查询返回步进结束时相交的索引。
+
+```sh
+make physics3d-test physics3d-gpu-test
+make demo-physics3d
+```
+
+交互示例支持方向键移动、Space 重置、Esc 退出。自动样例以 60 Hz 运行 120 帧，检查落地、薄墙阻挡、贴墙滑动与射线命中，并把最终 Metal 画面保存到 `build/physics3d.png`。 [示例源码](examples/physics_3d/main.xu)
+
+### 胶囊体与斜坡
+
+`capsule_3d(center, radius, half_segment)` 构造直立胶囊体，总高度为 `2 * (radius + half_segment)`。半径至少 `0.0001`，`half_segment == 0` 表示球。`sweep_capsule_box` 和 `sweep_capsule_ramp` 沿整段位移查询首次阻挡，返回归一化时间、法线和起始重叠状态。接触采用 `0.000001` 世界单位容差。
+
+`StaticRamp3D` 是由 AABB 定义边界的实体三棱柱。沿 ±X 或 ±Z 从最低点线性升至最高点，另一水平轴保持等宽。升高与水平长度至少为 `0.0001`。扫掠按斜面、侧边与圆角接触计算。
+
+`CapsuleWorld3D.move_capsule` 接收独立的实体和触发区掩码。`min_floor_y` 是可行走坡角的余弦，范围为 `[0.1, 1]`。可行走坡面保留水平输入，陡坡阻止上攀。`floor_ramp` 返回当前支撑斜坡的索引，盒面或腾空时为 `-1`。角色离地前可用 `ground_snap` 沿短距离向下贴地，主动向上位移时跳过吸附。静态盒上台阶验证头部空间、水平路径和可行走落点。单帧到不了圆角后的落点时，可沿原输入方向额外前探至多半径的一半，且不会超过配置的台阶高度。
+
+世界合计最多 4096 个盒、斜坡与任意三角面。触发区是轴对齐盒，在移动终点与实际胶囊体检查重叠。`make physics3d-test` 覆盖高速薄墙、圆角擦过、四向斜坡、任意 3D 三角面扫掠与网格行走、地面接缝、上下坡、陡坡限制、台阶净空、跳离地面和异常输入。
+
+### 任意 3D 三角面与动态刚体
+
+`StaticTriangle3D`（`static_triangle_3d` / `transform_triangle_3d`）描述任意朝向的非退化 3D 静态三角碰撞面，支持精确 Voronoi 最近点 `closest_point_triangle`、双面射线 `raycast_triangles` 以及直立胶囊体/球体连续扫掠 `sweep_capsule_triangle`。通过 `new_capsule_mesh_world(boxes, ramps, triangles)` 可将任意角度斜坡、墙体或网格三角面接入 `CapsuleWorld3D.move_capsule`（`floor_triangle` 返回当前支撑三角面索引）。
+
+`RigidWorld3D`（`new_rigid_world`）提供纯 CPU 的平移式 3D 动态刚体与运动学刚体模拟，最多容纳 `MAX_RIGID_BODIES = 256` 个刚体（`dynamic_sphere_3d`、`dynamic_box_3d`、`kinematic_sphere_3d`、`kinematic_box_3d`）：
+- **宽相位与 CCD**：静态碰撞体预计算包围盒，动态刚体高速位移超过半尺寸 0.5 倍时自动执行连续防穿透扫掠（支持薄盒、斜坡与零厚度任意三角面）。
+- **窄相位与迭代冲量求解**：支持球-盒、球-斜坡、球-三角面、盒-盒、盒-斜坡（4 轴 SAT）、盒-任意三角面（13 轴 SAT）以及刚体间（球-球、球-盒、盒-盒）碰撞；求解器采用累积冲量限幅、静止接触阈值防抖、3D 各向同性库仑摩擦锥与分离冲量位置投影（支持多盒稳定堆叠）。
+- **休眠、唤醒与查询**：静止受支撑刚体自动进入休眠，外力/冲量/位置改动或高速撞击自动沿接触岛链唤醒；支持双向层掩码过滤、触发区查询 `body_triggers` 及覆盖静态盒/斜坡/三角面与动态刚体的统一射线 `raycast_all`。刚体旋转惯量/角动量、关节约束与通用物理组件场景持久化待后续实现。
+
+`examples/physics_3d/main.xu` 同时驱动运动学玩家盒与包含斜向 3D 三角斜坡、动态球体及双层堆叠箱体的 `RigidWorld3D`。`make physics3d-test` 回归覆盖 7 区域最近点、旋转三角斜坡行走、自由落体回弹、弹性与不等质量动量守恒、高低摩擦斜坡、300 m/s CCD 防穿透、三盒堆叠休眠与岛链唤醒、运动学推挤、层掩码隔离、统一射线与异常参数拒绝。
+
+## 可玩 3D 关卡与性能基线
+
+```sh
+make demo-character-course
+make character-course-test
+make benchmark-course benchmark-webgl
+```
+
+方向键移动、Space 跳跃、R 重开、Esc 退出。样例从 `.xuscene` 读取静态盒和斜坡，使用胶囊体角色、第三人称跟随相机和待机、移动、腾空三种程序化姿态。240 帧 Metal 自动验收要求沿斜坡上行、爬过两级台阶、跳过缺口并接触终点，同时覆盖三种姿态。截图位于 `build/character-course.png`。 [关卡项目](examples/character_course/project.json)
+
+`benchmark-course` 先构建项目，再使用同一条路线采样。原始帧数据保存到 `build/nexus-benchmark/frames.csv`。`report.json` 记录热身后通关前的 p50/p95/p99 墙钟帧时间、CPU 模拟和编码耗时、呈现等待、首次出帧、绘制数、三角形计数及 macOS/Linux 子进程峰值 RSS。呈现等待包括排队和同步，GPU 执行计时需要后端时间戳。
+
+`benchmark-webgl` 用 Node.js 分别测量微信小程序与抖音小游戏的 3D Wasm 加载、3000 次相机更新和线性内存，写入 `build/nexus-benchmark/webgl-wasm.json`。这一基线覆盖本地 Wasm 与帧包生成。宿主 GPU、应用进程内存和真机帧时间单独验收。
+
 ## XACP (智能体自动化控制)
 
 本库原生内置了对 **Xu Agent Control Protocol (XACP)** 的完整支持，模块路径为 `github.com/xulang-org/nexus/xacp`。外部 AI 智能体（Agent）、自动化测试套件或调试器可以通过标准 XACP/1 TCP 协议帧连接正在运行的游戏，实现对场景状态的高精度无感检测与闭环控制。
@@ -1506,14 +1868,16 @@ $input := controls.new_input_map()
 
 | XACP 操作 | 对应能力 | 说明 |
 | --- | --- | --- |
-| `xacp.hello` | 握手与能力协商 | 返回 `view_state \| control_input \| step_exec \| pause_resume` 权限集与目标信息 |
-| `proc.status` | 运行健康探测 | 返回引擎运行状态、已用时钟及节点统计 |
-| `ui.tree` | 场景树序列化 | 递归导出 `SceneTree` 层级结构（节点 ID、名称、类型、可见性、全局坐标与仿射变换） |
-| `ui.input` | 虚拟输入注入 | 将虚拟按键、指针位移等事件无损映射并注入到 `InputMap` |
-| `ui.act` | 仿真行为控制 | 支持 `pause` / `unpause` 等系统动作 |
-| `nexus.step` | 逐帧步进控制 | 支持暂停状态下推进 `N` 物理帧后重新挂起，用于精准逐帧仿真与评测 |
-| `nexus.state` | 引擎指标快照 | 查询当前帧序号、节点总数、暂停状态与调试计数 |
-| `ui.screenshot` | 渲染周期同步截图 | 配合 GPU 渲染生命周期在 `present()` 前捕获当前画面，支持 Base64 返回或路径回传 |
+| `xacp.hello` | 握手与能力协商 | 校验 `XU_XACP_TOKEN` 与跨连接 Nonce 防重放，返回权限集与目标信息 |
+| `proc.status` | 运行健康探测 | 返回进程 PID 与 `OPEN` 状态 |
+| `proc.output` | 日志与输出分页 | 分页读取受控环形输出缓冲或 `foundation/diagnostics.Logger` 日志流 |
+| `ui.tree` | 场景与 UI 树序列化 | 支持 `scope`（`scene`/`ui`/`all`）、`node` 子树过滤、`focused_only`、`revision` 与路径脱敏 |
+| `ui.input` | 全量虚拟输入注入 | 支持键盘、`pointer_move`/`pointer_down`/`pointer_up`、`scroll` 与修饰键，返回消费动作列表 |
+| `ui.act` | 仿真与控件行为控制 | 支持 `pause`/`unpause` 及 UI 控件 `focus`/`click`/`set_checked`/`set_text`/`set_value` |
+| `nexus.step` | 逐帧步进控制 | 支持暂停状态下推进 `N` 物理帧，支持 `wait: !b true` 在步进完成后再回包 |
+| `nexus.state` | 引擎指标快照 | 查询帧号、`revision`、节点计数、鼠标坐标；接入 `poll_full` 后含 `FrameProfiler` FPS/耗时与日志数 |
+| `nexus.cvar` | 运行时调试控制台 | 接入 `poll_full` 后可直接执行 `CVarRegistry` 查询/赋值/命令 |
+| `ui.screenshot` | 渲染周期同步截图 | 在 `present()` 前捕获画面，支持 Base64 帧预算检查、文件路径回传及 `reject_screenshot` 错误反馈 |
 
 ### 快速启用
 
@@ -1522,8 +1886,9 @@ $input := controls.new_input_map()
 # 启用默认 XACP 控制端口（127.0.0.1:19876）
 ./build/arena --xacp-tcp
 
-# 或自定义端口
+# 或自定义端口，并使用 xu xacp call 一键探针查询
 ./build/arena --xacp-port 20000
+xu xacp call 20000 nexus.state
 ```
 
 在自定义游戏中接入：
@@ -1533,18 +1898,26 @@ xacp #"github.com/xulang-org/nexus/xacp"
 // 1. 初始化控制实例（例如监听 19876）
 $ctrl := xacp.attach_tcp(19876)
 
-// 2. 在游戏主循环中轮询
+// 2. 在游戏主循环中轮询（或使用 ctrl.poll_full 接入 Logger/CVar/FrameProfiler）
 while !quit {
     input.begin_frame()
     if ctrl.is_open() {
-        ctrl.poll($&tree, $&input)
+        ctrl.set_frame(frame_number)
+        for _ in 0:8 {
+            if !ctrl.poll($&tree, $&input) { <- }
+        }
         if ctrl.screenshot_requested() {
             shot_path := "build/shot.png"
-            renderer.capture(shot_path + "") or >>
-            ctrl.fulfill_screenshot(renderer.width() or >>, renderer.height() or >>, shot_path)
+            renderer.capture(shot_path + "") or (err) {
+                ctrl.reject_screenshot("capture failed: " + err.msg())
+            }
+            if ctrl.screenshot_requested() {
+                ctrl.fulfill_screenshot(renderer.width() or >>, renderer.height() or >>, shot_path)
+            }
         }
     }
     // ... 原有事件轮询、物理步进与渲染流程 ...
+    if ctrl.is_open() { _ := ctrl.complete_step_if_done(tree.paused) }
 }
 ```
 
@@ -1608,8 +1981,7 @@ $animator := sprite_anim.new_sprite_animator(clip) or >>
 2D/3D 窗口共用标准事件入口：每轮调用一次 `window.pump()`，再按窗口 `poll()`。`InputMap.begin_frame()` 在事件处理前调用；
 边沿以渲染帧为单位，跨多个物理步的一次性动作须由游戏消费一次。
 
-`PackedScene` 是内存节点资源，只复制节点类型、局部变换和公共属性；文档的来源与表面声明由 `integration/scene_render` 独立管理。
-不序列化 GPU 句柄、脚本执行状态或相机镜头参数；节点转换不会静默丢弃来源/表面/音频声明。
+`PackedScene` 是内存节点资源，复制节点类型、局部变换、公共属性和相机镜头。文档的来源与表面声明由 `integration/scene_render` 独立管理，GPU 句柄与脚本执行状态留在运行实例中。
 `Canvas2D` 按场景先序录制颜色节点；纹理精灵用 `Sprite2D.record` 录入共享纹理批次。
 批次按提交顺序绘制，跨纹理的透明对象需要调用者按需要拆分批次。
 回读和截图须在 `submit` 之后、`present` 之前调用，会使 GPU 与 CPU 同步。
@@ -1620,63 +1992,6 @@ $animator := sprite_anim.new_sprite_animator(clip) or >>
 CPU 图片与输入字节在当前 SDK 中使用整数数组，CPU 内存不等于压缩文件大小，也不计入这个 GPU 预算。
 PNG 输入文件最多 32 MiB，先检查签名和 IHDR 尺寸，再从不可变字节副本解码；
 文件、尺寸、解码或 GPU 上传失败都会抛错。解码表面和文件副本不会在返回后保留。
-
-## XACP (智能体自动化控制)
-
-本库原生内置了对 **Xu Agent Control Protocol (XACP)** 的完整支持，模块路径为 `github.com/xulang-org/nexus/xacp`。外部 AI 智能体（Agent）、自动化测试套件或调试器可以通过标准 XACP/1 TCP 协议帧连接正在运行的游戏，实现对场景状态的高精度无感检测与闭环控制。
-
-### 核心支持功能
-
-| XACP 操作 | 对应能力 | 说明 |
-| --- | --- | --- |
-| `xacp.hello` | 握手与能力协商 | 返回 `view_state \| control_input \| step_exec \| pause_resume` 权限集与目标信息 |
-| `proc.status` | 运行健康探测 | 返回引擎运行状态、已用时钟及节点统计 |
-| `ui.tree` | 场景树序列化 | 递归导出 `SceneTree` 层级结构（节点 ID、名称、类型、可见性、全局坐标与仿射变换） |
-| `ui.input` | 虚拟输入注入 | 将虚拟按键、指针位移等事件无损映射并注入到 `InputMap` |
-| `ui.act` | 仿真行为控制 | 支持 `pause` / `unpause` 等系统动作 |
-| `nexus.step` | 逐帧步进控制 | 支持暂停状态下推进 `N` 物理帧后重新挂起，用于精准逐帧仿真与评测 |
-| `nexus.state` | 引擎指标快照 | 查询当前帧序号、节点总数、暂停状态与调试计数 |
-| `ui.screenshot` | 渲染周期同步截图 | 配合 GPU 渲染生命周期在 `present()` 前捕获当前画面，支持 Base64 返回或路径回传 |
-
-### 快速启用
-
-启动示例游戏并暴露 XACP 端口：
-```sh
-# 启用默认 XACP 控制端口（127.0.0.1:19876）
-./build/arena --xacp-tcp
-
-# 或自定义端口
-./build/arena --xacp-port 20000
-```
-
-在自定义游戏中接入：
-```xu
-xacp #"github.com/xulang-org/nexus/xacp"
-
-// 1. 初始化控制实例（例如监听 19876）
-$ctrl := xacp.attach_tcp(19876)
-
-// 2. 在游戏主循环中轮询
-while !quit {
-    input.begin_frame()
-    if ctrl.is_open() {
-        ctrl.poll($&tree, $&input)
-        if ctrl.screenshot_requested() {
-            shot_path := "build/shot.png"
-            renderer.capture(shot_path + "") or >>
-            ctrl.fulfill_screenshot(renderer.width() or >>, renderer.height() or >>, shot_path)
-        }
-    }
-    // ... 原有事件轮询、物理步进与渲染流程 ...
-}
-```
-
-### 运行 XACP 回归测试
-
-```sh
-# 运行全部 8 项 XACP 协议端到端集成测试
-make xacp-test
-```
 
 ## 本机验收
 
@@ -1736,7 +2051,7 @@ License: MIT。
 ## 独立标准 GPU 离屏示例
 
 ```sh
-XU_ROOT=/path/to/xu-0.12.6-sdk XU_STDLIB_ROOT=/path/to/xu-0.12.6-sdk/src XUPATH=/path/to/xu-0.12.6-sdk/src XU=/path/to/xu-0.12.6-sdk/bin/xu make gpu-offscreen-smoke
+make gpu-offscreen-smoke
 ```
 
 `examples/gpu_offscreen` 只依赖标准库：创建采样纹理、Shader、图形管线和命令编码器，
@@ -1751,7 +2066,7 @@ macOS 直接使用 MSL，Linux 需 glslangValidator，Windows 需 DXC 预编译 
 ## 独立标准 GPU 计算示例
 
 ```sh
-XU_ROOT=/path/to/xu-0.12.6-sdk XU_STDLIB_ROOT=/path/to/xu-0.12.6-sdk/src XUPATH=/path/to/xu-0.12.6-sdk/src XU=/path/to/xu-0.12.6-sdk/bin/xu make gpu-compute-smoke
+make gpu-compute-smoke
 ```
 
 `examples/gpu_compute` 只导入标准库；上传 1,027 个 uint32 值，先计算 `3x+7`，在新的计算 Pass 中计算 `5x+11`，
@@ -1774,7 +2089,7 @@ Xu `math.float64_bits/from_bits` 保留 binary64 位模式；`float32_bits/from_
 ## 独立标准窗口与 GPU 呈现示例
 
 ```sh
-XU_ROOT=/path/to/xu-0.12.6-sdk XU_STDLIB_ROOT=/path/to/xu-0.12.6-sdk/src XUPATH=/path/to/xu-0.12.6-sdk/src XU=/path/to/xu-0.12.6-sdk/bin/xu make gpu-surface-smoke
+make gpu-surface-smoke
 ./build/gpu-surface --frames 240 --backend auto --shaders build/gpu-surface-shaders
 ```
 
@@ -1797,7 +2112,7 @@ MSL、GLSL、HLSL 源码与独立 shader 准备工具均已提供；本机真实
 ## 标准窗口输入与引擎动作示例
 
 ```sh
-NEXUS_XU_SDK="$HOME/.xu"  # 或完整的 0.12.6 SDK 目录
+NEXUS_XU_SDK=/path/to/xu-dev
 XU_ROOT="$NEXUS_XU_SDK" XU_STDLIB_ROOT="$NEXUS_XU_SDK/src" XUPATH="$NEXUS_XU_SDK/src" XU="$NEXUS_XU_SDK/bin/xu" make window-input-smoke
 ./build/window-input --frames 600
 ```
@@ -1914,10 +2229,10 @@ make shadow-core-test shadow-gpu-test gpu-failure-test
 
 ### 方向光级联（CSM）
 
-`shadow.cascade_camera(view,projection)` 接受仿射世界到相机矩阵与标准有限 Reverse-Z 透视投影；不支持正交镜头、偏轴或抖动投影。纯资源层从相机矩阵恢复 near/far 和视锥，不导入 SceneTree。`integration/rendering/three_d.cascade_camera` 与 `cascade_node_camera` 分别适配 `scene.Camera3D`、含父子世界变换的 `CameraNode3D`。
+`shadow.cascade_camera(view,projection)` 接受仿射世界到相机矩阵与居中的有限 Reverse-Z 投影，支持透视和正交镜头。`integration/rendering/three_d.cascade_scene_camera` 从 Node3D 当前镜头及父级世界变换取得两种投影。显式透视相机可继续使用 `cascade_camera` 或 `cascade_node_camera`。偏轴和抖动投影仍待支持。
 
 ```xu
-shadow_camera := scene_render.cascade_camera(&camera,aspect) or >>
+shadow_camera := scene_render.cascade_scene_camera(&tree, camera_node, aspect) or >>
 $settings := shadow.default_cascades()
 settings.count=4
 settings.distance=50.0
@@ -1931,13 +2246,13 @@ $shadow_map := device.shadow_map(description,&program) or >>
 | count | 4 | 2、3、4；创建图后不改变 |
 | resolution | 512 | 每级 128...1024 的 2 次幂；创建图后不改变 |
 | distance | 100 | 相机空间阴影距离，截取到相机 far，必须大于 near |
-| split_lambda | 0.6 | 0...1，混合均匀与对数分段 |
+| split_lambda | 0.6 | 0...1，控制透视镜头的均匀与对数分段比例；正交镜头始终等距分段 |
 | blend_fraction | 0.1 | 0...0.3，各级尾段的交界混合比例及最后一级淡出比例；0 关闭混合 |
 | caster_padding | 20 | 世界单位，沿光轴对拟合球两侧增加的遮挡物深度余量 |
 | stabilization_step | 0.0625 | 世界单位，拟合球半径量化步长，按项目尺度选择 |
 | raster_bias_texels | 1/256 | 0...0.5，接收面的几何斜率偏置，以每级局部纹素为单位 |
 
-各段拟合覆盖球，量化尺寸并将光平面中心对齐到纹素网格；额外预留三个纹素，覆盖中心取整与过滤范围。下一级视锥提前覆盖前一级混合带；片元按线性相机深度选级，在重叠带以 smoothstep 混合两图，最远端平滑淡出到受光状态。只计算首级投影导数，再按各级尺度换算，避免在空间选择分支中求导。
+各段用透视视锥或正交盒拟合覆盖球，量化尺寸并将光平面中心对齐到纹素网格。预留三个纹素覆盖中心取整与过滤范围。下一级提前覆盖前一级混合带。片元按线性相机深度选级，在重叠带以 smoothstep 混合两图，最远端平滑淡出到受光状态。只计算首级投影导数，再按各级尺度换算，避免在空间选择分支中求导。
 CSM 默认深度/角度偏置为 0.0003 / 0.001，可通过 `with_bias` 调整；按首级深度换算其它级，使基础深度/法线角度偏置的世界距离一致。几何斜率纹素偏置额外处理栅格精度与平滑作者法线。偏置过大会损失接触细节，可按模型尺度调整。
 
 图集为两列：2 级一行，3/4 级两行。512/级的四纹理双缓冲分别占 8 MiB 或 16 MiB；1024/级、3/4 级占满 64 MiB 共享纹理预算，存在其它用户纹理时会明确拒绝。所有投影和接收端参数均在录制前验证；一次提交后整体发布。缓存的旧图只适用于其拟合相机，场景入口和直接材质绘制都拒绝不同 view-projection，避免相机移动后静默使用旧分段。
@@ -1946,16 +2261,20 @@ CSM 默认深度/角度偏置为 0.0003 / 0.001，可通过 `with_bias` 调整�
 
 ```sh
 ./build/model-formats --model build/detail-models/head-prepared.glb --view pbr --studio true --pitch 0 --ground true --render-scale 2 --shadows true --cascades 4 --shadow-distance 15 --camera-motion true --frames 120 --capture build/cascaded-shadows/head-on.png
+make scene-camera-gpu-test
+./build/scene-camera-gpu/scene-file --camera Ortho --frames 1 --capture build/scene-camera-gpu/ortho-preview.png
 ```
 
-预览 `--cascades 0|2|3|4`（默认 0）只允许方向光；`--shadow-distance` 为 0.1...100，默认 15；`--camera-motion true` 绕目标移动相机并逐帧重拟合。纯 CPU 隔离检查覆盖旋转/缩放相机、全部重叠角点与纹素稳定。独立参考使用物理相机射线/斜面交点、解析包围球、实际遮挡矩形、帐篷 PCF 和交界/远端混合，核对 61,440 个像素（7,680 个混合带、864 个远端淡出），最大误差 1 个码值。测试几何先验证边界远离硬件覆盖的亚像素平局，不跳过输出像素。
+模型预览的 `--cascades 0|2|3|4`（默认 0）只允许方向光。`--shadow-distance` 为 0.1...100，默认 15。`--camera-motion true` 绕目标移动相机并逐帧重拟合。场景示例默认读取场景中的镜头和阴影配置，传入 `--cascades 2|3|4` 会改用可见方向光预览，`--cascades 0` 会关闭预览阴影。保存时保留场景里的配置。
+
+纯 CPU 隔离检查覆盖旋转和缩放后的相机、全部重叠角点与纹素稳定。独立参考以相机射线、斜面交点、解析包围球、遮挡矩形和帐篷 PCF 核对 110,592 个像素，其中正交画面 49,152 个。全部样本包含 10,944 个混合带像素和 2,784 个远端淡出像素，最大误差为 1 个 8 位码值。测试几何先验证边界远离硬件覆盖的亚像素平局，随后核对所有输出像素。
 Metal 另覆盖斜面自阴影、错误相机与不可编码参数保留旧图、父级相机适配、64 MiB 预算恢复及级联分配/提交故障；扫描人头开关对照、人物/猫/树分别用 4/2/3 级完成移动相机运行。
 
-当前仍缺多灯共享图集/分配器、自动更新调度、透明阴影、阴影场景持久化与 IBL。真实 GPU 证据仅 macOS arm64 Metal，GLSL/HLSL 已同步，Vulkan/D3D12 尚未编译或真机执行。未发布接口统一为 `ShadowDescription3D` / `ShadowMap3D`，无历史门面；六面投影、图集和过滤策略属于 nexus，通用设备/纹理/viewport/scissor/采样/提交复用 Xu 0.12.6 标准库。
+当前仍缺多灯共享图集与分配器、自动更新调度、透明阴影和 IBL。场景阴影回归已在 macOS arm64 Metal 上执行，Vulkan 和 D3D12 的设备验收仍待完成。Nexus 的 `ShadowDescription3D` 和 `ShadowMap3D` 管理六面投影、图集和过滤，设备、纹理、viewport、scissor、采样与提交复用 Xu 标准库。
 
 ## 光源场景保存与恢复
 
-当前唯一的 `xu.scene` 版本 1 格式要求 `lights` 数组，无光源时使用 `[]`。首次发布前同步迁移示例、模板和工具，不读取开发中的旧字段集合。
+`xu.scene` 版本 1 至 8 均要求 `lights` 数组，无光源时使用 `[]`。
 每项 `node` 为文件中的 Node3D 索引，同一节点只能有一个源；参数均为节点局部空间，世界坐标在每次收集时计算。
 
 | type | 其余必需字段 |
@@ -1963,6 +2282,29 @@ Metal 另覆盖斜面自阴影、错误相机与不可编码参数保留旧图�
 | `directional` | `node`、`radiance: [r,g,b]`、`direction: [x,y,z]`（表面指向光源） |
 | `point` | `node`、`radiance`、`position: [x,y,z]`、`radius` |
 | `spot` | `node`、`radiance`、`position`、`radius`、`direction`（光源射向锥体）、`inner_cosine`、`outer_cosine` |
+
+版本 4 起的方向光可带 `cascades`，包含前节列出的 `CascadeSettings3D` 八个字段。[场景文件示例](examples/scene_file/assets/world.xuscene)
+
+版本 5 起的点光和聚光可带 `shadow`。四个字段都必填。将 `shadow` 从光源移除即可关闭该源的阴影。
+
+| `shadow` 字段 | 范围与单位 |
+| --- | --- |
+| `near` | 光源空间裁剪近面，至少 0.0001 世界单位，且与光源 `radius` 的差至少为 `near × 0.000001` |
+| `resolution` | 每面像素边长，点光使用 128、256 或 512，聚光另支持 1024 |
+| `constant_bias` | Reverse-Z 深度偏置，0…0.05 |
+| `slope_bias` | 按接收面法线角度计算的偏置，0…0.05 |
+
+`shadow.cascade_profile(settings)` 与 `shadow.punctual_profile(source, settings)` 创建可随光源保存的 CPU 配置。隐藏光源仍保留配置。`SceneLights3D.gather_with_shadows` 将第一个已配置阴影的可见光源及其候选索引写入 `ShadowSelection3D`。方向光按当前镜头拟合级联，点光与聚光由 `selection.punctual.description(source)` 根据收集后的世界空间光源构建投影。每次绘制使用一张阴影图，换用不同投影类型或分辨率时重新创建图。场景只保存配置，GPU 预算在创建阴影图时校验。
+
+`make scene-camera-gpu-test` 生成 `build/scene-camera-gpu/point-authored.xuscene` 与 `spot-authored.xuscene`。例如，在 Nexus 根目录运行下面的命令可查看聚光阴影并另存场景。
+
+```sh
+./build/scene-camera-gpu/scene-file --scene build/scene-camera-gpu/spot-authored.xuscene \
+  --camera Ortho --frames 1 --capture build/scene-camera-gpu/spot.png \
+  --save build/scene-camera-gpu/spot-saved.xuscene
+```
+
+Metal 回归对比点光和聚光场景保存前与新进程加载后的整张图像，两组分别逐像素一致。仅提高保存的 `constant_bias`，红通道至少增加 8 个码值的像素在点光场景有 134,708 个，在聚光场景有 131,534 个。`make scene-lighting-test` 另覆盖版本 4 和 5 的无 GPU 跨进程保存与读取，以及 89 个无效光源文件。
 
 文件存聚光锥的 cosine 值，避免反复 acos/cos 转换；`spot(...)` 继续接收弧度半角，`spot_cosines(...)` 接收上述数值并执行相同校验。位置、强度、半径和 cosine 使用最短可往返 f64 十进制；方向在解码时归一化。未知/缺失/重复字段、非法类型、节点重复、非有限值、零方向和过窄锥域均报错。
 每个文件最多 256 个光源，包含隐藏节点上的源；运行时环境最多 256 个可见候选源，每个网格筛选后最多 16 源。文件保存不受当前隐藏状态影响，候选或单网格筛选结果超额时明确报错。
@@ -1992,7 +2334,7 @@ make scene-lighting-test scene-lighting-services-test lighting-demo-test
 ```
 
 灯光示例默认从 `examples/lighting/assets/lights.xuscene` 读取四个源；自定义文件沿用示例中的命名节点。`--scene` 加载后保持保存的姿态/可见性，Space 可恢复运动，显式 `--mode` 可覆盖类型开关。
-自动验收在独立进程保存/加载，验证恢复前后的 Metal PNG 字节完全一致；纯 CPU 验收在无原生归档、SDL、GPU、音频和脚本服务的隔离目录以 `--no-opt` / `--release` 运行。组合验收验证同一场景的 PBR 绘制、PCM、脚本信号，以及保存光源编辑和已接受脚本版本时其它附件不丢失。
+自动验收在独立进程保存和加载，验证恢复前后的 Metal PNG 一致。仅修改存档里的阴影距离时，阴影画面随之改变。纯 CPU 验收在无原生归档、SDL、GPU、音频和脚本服务的隔离目录以 `--no-opt` / `--release` 运行。组合验收覆盖同一场景的 PBR 绘制、PCM、脚本信号，以及保存光源编辑和已接受脚本版本时保留其它附件。
 
 ## 每网格光源剔除与计数
 
@@ -2086,4 +2428,81 @@ make lod-core-test lod-gpu-test lod-demo-test
 示例 Up/Down 移动相机，Esc 退出，`--shaders DIR` / `--backend auto|metal|vulkan|d3d12` 指定产物和后端。15 个实例共享三份球体网格：每份 2208/224/48 三角形；近/中/远实际提交 33,120/3,360/720 个，固定高精度对照为 33,120 个，绘制次数仍为 15。退出时输出级别分布与实际提交/节省数量，未据此推断帧率收益。
 
 纯策略在无向量/场景/GPU 源码的临时目录以 `--no-opt` / `--release` 通过，包含一万次边界抖动与多级跳转；Metal 验证 4/2/1 三角形真实网格切换，与直接绘制相应网格的整张 PNG 一致，并检查全级材质/资源验证、批量回滚、独立节点、重绑、代次复用和所有权。
-当前为运行时显式距离 LOD；屏幕误差/自动简化、级间渐变及场景/GLB 中的 LOD 链声明仍待实现。现有场景保存保留原始表面来源，不从 GPU 弱引用推断 LOD 附件，恢复后由调用方重新绑定。
+
+### 在场景中声明距离 LOD
+
+在 `.xuscene` v6 的 `surfaces` 条目中，`resource` 和 `primitive` 指定最高精度几何与各级使用的材质。`lod.levels` 按由近到远顺序列出 1～7 个较粗级别，每级可引用同一 GLB 或另一个经过 SHA-256 验证的 GLB。示例条目使用两个已声明的资源。
+
+```json
+{
+  "node": 1,
+  "resource": "11001100110011001100110011001100",
+  "primitive": 0,
+  "lod": {
+    "hysteresis": 0.125,
+    "levels": [{"distance": 12.5, "resource": "22002200220022002200220022002200", "primitive": 0}]
+  }
+}
+```
+
+加载器先核对所有模型来源及图元索引，再校验每级三角形数量和基础材质所需的顶点属性。整批预检成功后才发布各节点的绑定。保存时保留声明的几何来源、阈值与滞回。加载后首次调用 `scene.select_lods` 时根据当前相机距离选择级别，之后在同一实例中应用滞回。
+
+```sh
+make scene-lod-gpu-test
+./build/scene-lod-preview --scene build/scene-asset-fixtures/lod-far.xuscene \
+  --frames 1 --capture build/scene-lod-far.png
+```
+
+Metal 回归验证近景与远景各自保存后由新进程重开，整张画面逐像素一致，实际提交从两个三角形降到一个。屏幕误差 LOD、自动简化、级间渐变和 GLB 自带 LOD 声明的导入仍待实现。
+
+## Steamworks 与 SteamPipe 集成
+
+Nexus 按四层边界接入 Steam 生态，保持引擎核心仓库**零专有 SDK 头文件或二进制**：
+
+- **数据层 (`resources/steam`)**：`SteamAppConfig`（AppID、DepotID、分支、Cloud 配额、DLC、成就、统计、排行榜）JSON 编解码、严格云存档路径校验，以及 SteamPipe `steam_appid.txt`、`depot_build_<id>.vdf` 与 `app_build_<id>.vdf` 生成器。
+- **平台层 (`native/steam.c` + `platform/steam`)**：`nexus_steam.xulib` 通过 `dlopen`/`LoadLibraryA` 在运行时按需查找 `XU_NEXUS_STEAM_LIBRARY` 或标准 `libsteam_api.dylib` / `libsteam_api.so` / `steam_api64.dll` 符号并绑定 Valve Flat C API。
+- **服务层 (`steam`)**：提供统一 `SteamClient`（`init_native` / `init_mock` / `init_auto` 无库自动回退），覆盖成就与进度、Int/Float 统计、Cloud 读写删与配额校验、排行榜排序、DLC 检测、Workshop UGC 列表、大厅元数据与 `SteamMockBus` P2P 路由。
+- **集成层 (`integration/steam`)**：`SteamRuntimeBridge`（Overlay 激活自动暂停 `ScaledClock`、清零 `InputMap` 与 Steam Deck 1.25× HUD 缩放）、`SteamSaveStore`（`NXSV1|<sha256>|` 完整性存档信封）、`SteamNetBridge`（封装 `networking` 二进制包走 Steam P2P）与 `mount_workshop_bundle`（HMAC-SHA256 校验订阅模组）。
+- **工具链 (`cmd/project`)**：新增 `nexus-project steam-validate <steam.json>` 与 `nexus-project steam-stage <project.json> --steam <steam.json> --output <dir>`。
+
+```sh
+make native-steam steam-data-test steam-test steam-native-test
+```
+
+## 主机平台（Xbox GDK、PlayStation 5/4、Nintendo Switch）与统一平台层
+
+Nexus 为 **Steam PC、Xbox（Series X|S / Xbox PC GDK）、PlayStation（PS5 / PS5 Pro / PS4）与 Nintendo Switch（Switch / Switch 2）**提供统一四层接口，同样坚持**仓库零专有主机 SDK**：
+
+- **主机数据与认证规则 (`resources/console`)**：12 档硬件渲染/显存/安全区预算（Series X/S、Xbox PC、PS5/5 Pro、PS4、Switch、Switch 2、PC Steam、TapTap Android/iOS/PC），`XboxAppConfig`（`MicrosoftGame.config`、`layout.xml`）、`PlayStationAppConfig`（`sce_sys/param.json`、`package.gp5`、UDS 奖杯/活动 JSON）、`SwitchAppConfig`（`.nmeta` XML 声明、掌机/底座动态分辨率表 `switch_resolution`）、HD Rumble（40–1280 Hz）/脉冲扳机/自适应扳机校验，以及 XR/TRC/Lotcheck 自动合规检查。
+- **动态原生桥 (`native/console.c` + `platform/console`)**：按平台族分别动态加载 `XU_NEXUS_XBOX_DRIVER`（Xbox GDK）、`XU_NEXUS_PS_DRIVER`（PlayStation SDK）或 `XU_NEXUS_SWITCH_DRIVER`（Nintendo SDK）导出的 `nexus_console_v1_*` C 符号（含 Switch `operation_mode` 与 `npad_style` 查询），未提供驱动时无缝切换至离线模拟器。
+- **主机运行时 (`console`)**：Xbox 成就/脉冲扳机/Connected Storage/Quick Resume/MPSD 会话；PlayStation 奖杯（全解锁自动颁发白金奖杯）/PS5 Activities/DualSense 自适应扳机与灯条/亚区 `Circle`/`Cross` 确认键切换/`sceSaveData` 配额管理；Nintendo Switch 掌机（100% 安全区 + 触屏 + `A` 东侧确认键）与底座（90% 电视安全区 + Pro 手柄）动态切换、HD Rumble 频率控制、AOC（追加内容索引）与 `save:/` 挂载配额。
+- **跨平台统一门面 (`integration/platform_services`)**：`PlatformServices`、`UnifiedRuntimeBridge`（Overlay/Constrained/Rest Mode/Home-Sleep/TapTap Moment & 防沉迷自动暂停并清零按键、挂起冲刷存档、断连暂停、主账号登出或切换账号回标题、`90%` 电视安全边距、Switch 掌机/底座实时分辨率与触屏状态切换）与 `UnifiedSaveStore`（跨五端 **Steam / Xbox / PlayStation / Switch / TapTap** SHA-256 `NXSV1` 防篡改存档）。
+- **主机打包 CLI (`cmd/project`)**：新增 `xbox-validate`、`xbox-stage`、`ps-validate`、`ps-stage`、`switch-validate`、`switch-stage`、`taptap-validate`、`taptap-stage`。
+
+```sh
+make native-console console-data-test console-test console-native-test
+```
+
+## TapTap（TapSDK v4：Android / iOS / PC）集成
+
+Nexus 为 **TapTap 中国区（CN）与国际区（Global）**的 **Android / iOS / PC** 发行提供完整四层接入，同样坚持**仓库零专有 TapSDK 头文件或二进制**：
+
+- **配置、防沉迷法规与审核 (`resources/taptap`)**：`TapTapAppConfig` JSON 编解码与校验、CN 国家新闻出版署未成年人充值单笔与月累计限额检查（8 岁以下禁止、8–15 岁单笔 ¥50/月 ¥200、16–17 岁单笔 ¥100/月 ¥400）、CN 实名防沉迷/CADPA 适龄提示与版号上线审计，以及 `taptap_sdk_config.json` / `TapTapAndroidManifest.xml` / `TapTapInfo.plist` / `taptap_client_id.txt` 生成器。
+- **动态原生桥 (`native/taptap.c` + `platform/taptap`)**：`nexus_taptap.xulib` 通过 `dlopen`/`LoadLibraryA` 运行时按需加载 `XU_NEXUS_TAPTAP_LIBRARY` 或 `libnexus_taptap_sdk.*` 导出的 `nexus_taptap_v1_*` C 符号（34 个导出函数），未加载外部库时无缝回退本地确定性模拟器。
+- **TapTap 运行时 (`taptap`)**：`TapTapClient` 统一提供 TapTap 登录/登出/切换账号、实名防沉迷与消费限额、正版校验（TapLicense）与 DLC 检查、普通与增量成就、CloudSave 存档与配额校验、排行榜降序排名、TapTap Moments 动态社区与更新检查，并支持本地 JSON/Cloud 状态持久化。
+- **分发 CLI (`cmd/project`)**：新增 `nexus-project taptap-validate <taptap.json>` 与 `nexus-project taptap-stage <project.json> --taptap <taptap.json> --output <dir>`。
+
+```sh
+make native-taptap taptap-data-test taptap-test taptap-native-test
+```
+
+## 核心子系统强化（Spatial Audio 2.0 / 多手柄 / 本地化 i18n / 性能门槛 / ASM 序列化）
+
+- **3D 空间音频 2.0 (`audio/mixer`)**：在 `spatial.xu` 与 `mod.xu` 中实现反平方/指数/线性三种衰减模型、多普勒频移、多 AABB 声学遮挡率计算、Woodworth 球面头模双耳 ITD/ILD 与耳背滚降，并在混音器中支持逐音轨浮点音高、样本级双耳延迟与单极点 IIR 头影遮挡低通滤波器。
+- **多手柄热插拔与输入缓冲 (`input/gamepad.xu`)**：`GamepadManager` 支持 4 路手柄连接/断开事件、Xbox/PlayStation/Switch/Steam Deck 模板同步至 `InputMap`、径向死区与幂曲线整形，以及支持土狼时间与出招搓招序列匹配的 `InputBuffer`。
+- **多语言本地化 (`resources/i18n` + `i18n`)**：支持 BCP-47 语言标签规范化与回退链（如 `zh-Hans-CN -> zh-Hans -> zh -> en-US -> en`）、RTL 检测、单复数词、参数模板插值、JSON/RFC-4180 CSV 目录编解码与运行时热切换。
+- **性能回归门槛 (`timing/budget.xu`) & 状态机序列化 (`animation/skeletal/serialize.xu`)**：提供 4 档平台性能预算（Desktop 60 / Console 120 / Switch Handheld 30 / Mobile 60）及相对基线 `p95`/`avg` 回归判定，以及完整覆盖 1D/2D 混合空间、转换条件、事件与 Root Motion 的骨骼动画状态机 JSON 编解码。
+
+```sh
+make spatial-audio-test gamepad-test i18n-test anim-serialize-budget-test
+```

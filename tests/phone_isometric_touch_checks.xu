@@ -1,0 +1,62 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+actions #"github.com/xulang-org/nexus/input"
+phone_controls #"github.com/xulang-org/nexus/integration/phone_controls"
+vp #"github.com/xulang-org/nexus/integration/viewport"
+ev #window/events
+#math
+
+fn touch_event(kind int, finger int, point fm.Vec2) ev.Event {
+    $event := ev.empty()
+    event.kind = kind
+    event.touch_id = finger
+    event.x = point.x
+    event.y = point.y
+    << event
+}
+
+fn run() int {
+    portrait := vp.from_metrics(390, 844, 1170, 2532, 10, 50, 368, 756) or >>
+    layout := phone_controls.layout(&portrait, false)
+    area := scene_area(&portrait, true) or >>
+    assert(portrait.safe_rect.contains(layout.stick_center) && portrait.safe_rect.contains(layout.pause_center))
+    assert(!area.contains(portrait.screen_transform().point(layout.stick_center)))
+    assert(!area.contains(portrait.screen_transform().point(layout.pause_center)))
+    assert(math.abs(area.position.x - 30.0) < 0.000001 && math.abs(area.size.x - 1104.0) < 0.000001)
+    landscape := vp.from_metrics(844, 390, 2532, 1170, 50, 0, 748, 378) or >>
+    landscape_area := scene_area(&landscape, true) or >>
+    assert(math.abs(landscape_area.position.x - 150.0) < 0.000001 && math.abs(landscape_area.size.x - 2244.0) < 0.000001)
+
+    $input := actions.new_input_map()
+    input.bind_source("up", 2) or >>
+    input.bind_source("pause", phone_controls.PAUSE_SOURCE) or >>
+    $controls := layout.controls() or >>
+    $tap := no_tap()
+    stick_down := touch_event(ev.EVENT_TOUCH_DOWN, 1, layout.stick_center)
+    stick_move := touch_event(ev.EVENT_TOUCH_MOVE, 1, layout.stick_center.sub(fm.vec2(0.0, layout.stick_radius)))
+    controls.apply($&input, &stick_down) or >>
+    controls.apply($&input, &stick_move) or >>
+    assert((input.pressed("up") or >>) && !tap.feed(&stick_down, &layout))
+    pause_down := touch_event(ev.EVENT_TOUCH_DOWN, 2, layout.pause_center)
+    pause_up := touch_event(ev.EVENT_TOUCH_UP, 2, layout.pause_center)
+    controls.apply($&input, &pause_down) or >>
+    controls.apply($&input, &pause_up) or >>
+    assert((input.just_pressed("pause") or >>) && (input.pressed("up") or >>))
+    assert(!tap.feed(&pause_down, &layout) && !tap.feed(&pause_up, &layout))
+    controls.cancel($&input) or >>
+    assert(!(input.pressed("up") or >>))
+
+    center := fm.vec2(195.0, 410.0)
+    down := touch_event(ev.EVENT_TOUCH_DOWN, 3, center)
+    up := touch_event(ev.EVENT_TOUCH_UP, 3, center)
+    wrong_up := touch_event(ev.EVENT_TOUCH_UP, 4, center)
+    drag := touch_event(ev.EVENT_TOUCH_MOVE, 3, center.add(fm.vec2(16.0, 0.0)))
+    assert(!tap.feed(&down, &layout) && !tap.feed(&wrong_up, &layout) && tap.feed(&up, &layout))
+    assert(!tap.feed(&down, &layout) && !tap.feed(&drag, &layout) && !tap.feed(&up, &layout))
+    println("PASS: isometric safe areas, separate joystick and pause fingers, and ground tap filtering")
+    << 0
+}
+
+fn main() int { << run() or (err) { eprintln(err.msg())
+    << 1 } }

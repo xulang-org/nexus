@@ -1,0 +1,958 @@
+@main
+
+resource #"github.com/xulang-org/nexus/resources/scene"
+camera_data #"github.com/xulang-org/nexus/resources/camera"
+light_data #"github.com/xulang-org/nexus/resources/lighting"
+proj_pkg #"github.com/xulang-org/nexus/integration/project"
+files #"github.com/xulang-org/nexus/integration/scene"
+fm #"github.com/xulang-org/nexus/foundation/math"
+sprite3d #"github.com/xulang-org/nexus/resources/sprite3d"
+tilemap #"github.com/xulang-org/nexus/resources/tilemap"
+#crypto/sha256
+#image/png
+#ui
+#ui/draw
+#ui/layout
+widgets #ui/widgets
+#os
+#os/exec
+#path/filepath
+#math
+#strings
+#errors
+
+fn t_fail(msg string) {
+    eprintln("FAIL: " + msg)
+    assert(false)
+}
+
+fn t_true(cond bool, msg string) {
+    if !cond {
+        t_fail(msg)
+    }
+}
+
+fn t_near(actual f64, expected f64, tol f64, msg string) {
+    if math.abs(actual - expected) > tol {
+        t_fail(msg + " (got " + fmt_coord(actual) + ", want " + fmt_coord(expected) + ")")
+    }
+}
+
+fn copy_file_exact(src string, dst string) int {
+    data := os.read(src + "") or >>
+    parent := filepath.dir(&dst)
+    os.mkdir_all(parent + "") or >>
+    os.write(dst + "", data) or >>
+    << 0
+}
+
+fn setup_fixture_project() string {
+    tmp := os.mkdir_temp("", "nexus-ed-test-") or (err) {
+        t_fail("mkdir_temp: " + err.msg())
+        << ""
+    }
+    _ := copy_file_exact("examples/scene_assets/project.json", filepath.join([tmp + "", "project.json"])) or (err) {
+        t_fail("copy project.json: " + err.msg())
+        << ""
+    }
+    _ := copy_file_exact("examples/scene_assets/assets/world.xuscene", filepath.join([tmp + "", "assets", "world.xuscene"])) or (err) {
+        t_fail("copy world.xuscene: " + err.msg())
+        << ""
+    }
+    _ := copy_file_exact("examples/scene_assets/assets/panels.glb", filepath.join([tmp + "", "assets", "panels.glb"])) or (err) {
+        t_fail("copy panels.glb: " + err.msg())
+        << ""
+    }
+    << tmp
+}
+
+fn setup_external_glb_file() string {
+    ext_dir := os.mkdir_temp("", "nexus-ed-ext-") or (err) {
+        t_fail("mkdir_temp ext: " + err.msg())
+        << ""
+    }
+    _ := copy_file_exact("examples/scene_assets/assets/panels.glb", filepath.join([ext_dir + "", "crate_extra.glb"])) or (err) {
+        cleanup_dir(ext_dir + "")
+        t_fail("copy external crate_extra.glb: " + err.msg())
+        << ""
+    }
+    << ext_dir
+}
+
+fn cleanup_dir(dir string) {
+    if dir.len > 0 {
+        _ := os.remove_all(dir + "") or (err) {
+            _ := err
+            <<
+        }
+    }
+}
+
+fn rect_inside(inner &layout.Rect, outer &layout.Rect) bool {
+    << inner.x >= outer.x - 0.5 &&
+        inner.y >= outer.y - 0.5 &&
+        inner.x + inner.width <= outer.x + outer.width + 0.5 &&
+        inner.y + inner.height <= outer.y + outer.height + 0.5
+}
+
+fn vec4_exact_eq(a &fm.Vec4, b &fm.Vec4) bool {
+    << a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w
+}
+
+fn run_theme_paper_tokens() int {
+    pal := default_palette()
+    t_true(pal.canvas.value() == draw.rgb(246, 243, 239).value(), "canvas token #f6f3ef")
+    t_true(pal.surface.value() == draw.rgb(255, 253, 251).value(), "surface token #fffdfb")
+    t_true(pal.elevated.value() == draw.rgb(238, 235, 231).value(), "elevated token #eeebe7")
+    t_true(pal.text.value() == draw.rgb(40, 35, 41).value(), "text token #282329")
+    t_true(pal.muted.value() == draw.rgb(109, 98, 110).value(), "muted token #6d626e")
+    t_true(pal.brand.value() == draw.rgb(190, 18, 60).value(), "brand token #be123c")
+    t_true(pal.success.value() == draw.rgb(20, 103, 71).value(), "success token #146747")
+    t_true(pal.danger.value() == draw.rgb(184, 33, 56).value(), "danger token #b82138")
+    t_true(pal.focus.value() == draw.rgb(0, 95, 158).value(), "focus token #005f9e")
+
+    styles := make_paper_styles(&pal) or >>
+    cf := compact_field_style(&styles)
+    cb := compact_button_style(&styles, widgets.BUTTON_PRIMARY)
+    t_true(cf.min_height >= 26.0, "compact field style height")
+    t_true(cb.min_height >= 24.0, "compact button style height")
+    t_true(byte_counter_text(&"hero", 255) == "4 / 255 bytes", "byte counter format")
+    t_true(fmt_coord(-0.0) == "0", "fmt_coord strips negative zero")
+    t_true(fmt_coord(1.2500) == "1.25", "fmt_coord trims trailing zeroes")
+    << 0
+}
+
+fn test_theme_paper_tokens() {
+    _ := run_theme_paper_tokens() or (err) {
+        t_fail("theme test: " + err.msg())
+        <<
+    }
+}
+
+fn try_reparent_ok(d $&Draft, idx int, new_parent int, preserve bool) bool {
+    _ := d.reparent_node(idx, new_parent, preserve) or (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn try_create_scene_ok(proj_path &string, raw_key &string, root &string) bool {
+    _ := create_scene(proj_path, raw_key, root) or (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn try_merge_ok(d $&Draft, captured &resource.Document, rev &string) bool {
+    _ := d.merge_viewport(captured, rev) or (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn try_save_ok(d $&Draft, proj &Project, validator &string) bool {
+    _ := d.save(proj, validator) or (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn test_top_view_math_and_labels() {
+    s1 := grid_step(10.0)
+    t_true(s1 == 5.0 || s1 == 10.0, "grid_step finite power/5x step")
+    $tv := default_top_view()
+    bounds := layout.Rect{x: 0.0, y: 0.0, width: 500.0, height: 400.0}
+    $pts := []StagePoint{}
+    pts.push(make_stage_point(0, "Root", 0.0, 0.0, true, false, true))
+    pts.push(make_stage_point(1, "PanelA", 4.0, 2.0, true, true, false))
+    pts.push(make_stage_point(2, "PanelB", 4.05, 2.02, true, true, false))
+
+    tv.fit_points(&pts, &bounds)
+    t_near(tv.center_x, 2.025, 0.05, "fit_points centers X")
+    t_near(tv.center_z, 1.01, 0.05, "fit_points centers Z")
+
+    // Zooming around a cursor must keep the world coordinate under that cursor fixed.
+    cx := 340.0
+    cy := 150.0
+    wx_before := screen_to_world_x(&tv, &bounds, cx)
+    wz_before := screen_to_world_z(&tv, &bounds, cy)
+    tv.zoom_around(&bounds, cx, cy, 3.0)
+    wx_after := screen_to_world_x(&tv, &bounds, cx)
+    wz_after := screen_to_world_z(&tv, &bounds, cy)
+    t_near(wx_after, wx_before, 1e-6, "zoom_around keeps world X fixed under cursor")
+    t_near(wz_after, wz_before, 1e-6, "zoom_around keeps world Z fixed under cursor")
+
+    // Pan shifts world center inversely by pixel delta / scale.
+    old_cx := tv.center_x
+    old_cz := tv.center_z
+    tv.begin_pan(100.0, 100.0)
+    tv.update_pan(100.0 + tv.scale * 2.0, 100.0 - tv.scale * 1.0)
+    tv.end_pan()
+    t_near(tv.center_x, old_cx - 2.0, 1e-5, "pan moves world center X")
+    t_near(tv.center_z, old_cz + 1.0, 1e-5, "pan moves world center Z")
+
+    // Hit testing picks node close to screen coordinates and ignores far misses.
+    px1 := world_to_screen_x(&tv, &bounds, 4.0)
+    py1 := world_to_screen_y(&tv, &bounds, 2.0)
+    t_true(pick_stage_node(&tv, &bounds, &pts, px1, py1) == 1, "pick_stage_node hits exact point")
+    t_true(pick_stage_node(&tv, &bounds, &pts, 12.0, 12.0) == -1, "pick_stage_node misses empty region")
+
+    // Non-overlapping placed labels for nearly-coincident points.
+    labels := compute_placed_labels(&tv, &bounds, &pts, 1)
+    t_true(labels.len == 3, "placed label count matches pts")
+    if labels[1].width > 0.0 && labels[2].width > 0.0 {
+        t_true(!rects_overlap(&labels[1], &labels[2]), "nearby node labels must not overlap")
+    }
+}
+
+fn run_draft_crud_undo_redo_and_trs(tmp string) int {
+    scene_path := filepath.join([tmp + "", "assets", "world.xuscene"])
+    $draft := open_draft(scene_path + "") or >>
+    t_true(!draft.dirty(), "fresh draft not dirty")
+    t_true(!draft.can_undo(), "fresh draft cannot undo")
+
+    doc0 := draft.document() or >>
+    base_nodes := doc0.node_count()
+    t_true(base_nodes >= 2, "world.xuscene has at least 2 nodes")
+
+    // Add node under root (0).
+    added_idx := draft.add_node_under(0, resource.NODE_3D, "PropAnchor") or >>
+    t_true(added_idx == base_nodes, "added index appended cleanly")
+    t_true(draft.dirty(), "draft marks dirty after edit")
+
+    // Position parent anchor at (10, 0, -4).
+    _ := draft.set_node_properties(
+        added_idx,
+        "PropAnchor",
+        true,
+        fm.vec3(10.0, 0.0, -4.0),
+        false,
+        fm.vec3(0.0, 0.0, 0.0),
+        fm.vec3(1.0, 1.0, 1.0)
+    ) or >>
+
+    // Duplicate a surface node (node 1) -> clones node + surface attachment.
+    surf_before := doc0.surface_count()
+    dup_idx := draft.duplicate_node(1) or >>
+    doc_dup := draft.document() or >>
+    t_true(doc_dup.surface_count() > surf_before, "duplicate_node clones surface attachment")
+
+    // Verify zero drift when setting only position on a rotated/scaled node with rs_changed = false.
+    _ := draft.set_node_properties(
+        dup_idx,
+        "RotBox",
+        true,
+        fm.vec3(3.0, 1.0, 2.0),
+        true,
+        fm.vec3(0.0, 45.0, 0.0),
+        fm.vec3(2.0, 0.5, 1.5)
+    ) or >>
+    doc_rot := draft.document() or >>
+    nd_before := doc_rot.describe_node(dup_idx) or >>
+
+    _ := draft.set_node_properties(
+        dup_idx,
+        "RotBoxMoved",
+        true,
+        fm.vec3(7.0, 1.0, 2.0),
+        false,
+        fm.vec3(0.0, 45.0, 0.0),
+        fm.vec3(2.0, 0.5, 1.5)
+    ) or >>
+    doc_moved := draft.document() or >>
+    nd_after := doc_moved.describe_node(dup_idx) or >>
+
+    // Basis columns c0, c1, c2 must match bitwise when rs_changed == false.
+    t_true(vec4_exact_eq(&nd_before.local_3d.c0, &nd_after.local_3d.c0), "zero c0 drift")
+    t_true(vec4_exact_eq(&nd_before.local_3d.c1, &nd_after.local_3d.c1), "zero c1 drift")
+    t_true(vec4_exact_eq(&nd_before.local_3d.c2, &nd_after.local_3d.c2), "zero c2 drift")
+    t_near(nd_after.local_3d.c3.x, 7.0, 1e-6, "updated position X")
+    t_near(nd_after.local_3d.c3.y, 1.0, 1e-6, "updated position Y")
+    t_near(nd_after.local_3d.c3.z, 2.0, 1e-6, "updated position Z")
+
+    // Reparent dup_idx under added_idx preserving world position (7, 1, 2) relative to (10, 0, -4) -> (-3, 1, 6).
+    new_dup_idx := draft.reparent_node(dup_idx, added_idx, true) or >>
+    doc_rep := draft.document() or >>
+    rep_nd := doc_rep.describe_node(new_dup_idx) or >>
+    t_near(rep_nd.local_3d.c3.x, -3.0, 1e-4, "reparent preserve_world local X")
+    t_near(rep_nd.local_3d.c3.y, 1.0, 1e-4, "reparent preserve_world local Y")
+    t_near(rep_nd.local_3d.c3.z, 6.0, 1e-4, "reparent preserve_world local Z")
+
+    // Cycle check: reparenting parent (added_idx) under child (new_dup_idx) must error!
+    cycle_failed := !try_reparent_ok($&draft, added_idx, new_dup_idx, true)
+    t_true(cycle_failed, "reparent cycle must be rejected")
+
+    // Delete parent branch (added_idx + child new_dup_idx) -> restores base_nodes!
+    _ := draft.delete_node(added_idx) or >>
+    doc_del := draft.document() or >>
+    t_true(doc_del.node_count() == base_nodes, "delete subtree restores node count")
+
+    // Verify 32-step undo/redo cap.
+    for step_i in 0:35 {
+        _ := draft.add_node_under(0, resource.NODE_GROUP, "Step" + str(step_i)) or >>
+    }
+    $undo_n := 0
+    while draft.can_undo() {
+        _ := draft.undo_edit() or >>
+        undo_n = undo_n + 1
+    }
+    t_true(undo_n == MAX_HISTORY, "undo history capped at 32")
+    $redo_n := 0
+    while draft.can_redo() {
+        _ := draft.redo_edit() or >>
+        redo_n = redo_n + 1
+    }
+    t_true(redo_n == MAX_HISTORY, "redo replays all 32 steps")
+    << 0
+}
+
+fn test_draft_crud_undo_redo_and_trs() {
+    tmp := setup_fixture_project()
+    _ := run_draft_crud_undo_redo_and_trs(tmp + "") or (err) {
+        cleanup_dir(tmp + "")
+        t_fail("draft crud/trs: " + err.msg())
+        <<
+    }
+    cleanup_dir(tmp + "")
+}
+
+fn test_path_exists(path string) bool {
+    _ := os.stat(path + "") or (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn run_project_scene_import_place_save_and_viewport_merge(tmp string, ext_dir string) int {
+    proj_path := filepath.join([tmp + "", "project.json"])
+    validator := filepath.abs(&"build/nexus-project-validate") or >>
+
+    // Create new scene and verify manifest registration + duplicate rejection.
+    new_key := create_scene(&proj_path, &"level_2.xuscene", &"StageRoot") or >>
+    t_true(new_key == "level_2.xuscene", "create_scene normalizes .xuscene suffix")
+    dup_scene_err := !try_create_scene_ok(&proj_path, &"level_2", &"StageRoot")
+    t_true(dup_scene_err, "duplicate scene key rejected")
+
+    // Import truly external GLB -> copies to assets/ and reuses on second import.
+    ext_glb := filepath.join([ext_dir + "", "crate_extra.glb"])
+    imp1 := import_external_glb(&proj_path, &ext_glb, &validator) or >>
+    t_true(!imp1.reused, "first external GLB import creates new entry")
+    t_true(imp1.primitive_count > 0, "external GLB primitive count > 0")
+    imp2 := import_external_glb(&proj_path, &ext_glb, &validator) or >>
+    t_true(imp2.reused && imp2.uid == imp1.uid, "identical external GLB reuses existing asset")
+
+    // Place imported asset at (4.5, -2.5) with explicit primitive 0, save & verify validator passes.
+    proj := load_project(proj_path + "") or >>
+    lvl2_path := proj.scene_source(1) or >>
+    $draft := open_draft(lvl2_path + "") or >>
+    placed_idx := draft.place_asset(&proj, imp1.uid + "", 0, 4.5, -2.5) or >>
+    doc_placed := draft.document() or >>
+    t_true(doc_placed.resource_count() == 1, "place_asset adds GLB resource")
+    t_true(doc_placed.surface_count() == 1, "place_asset binds surface")
+
+    // Test viewport revision merge + stale revision conflict rejection.
+    rev_ok := draft.current + ""
+    _ := draft.merge_viewport(&doc_placed, &rev_ok) or >>
+    stale_err := !try_merge_ok($&draft, &doc_placed, &"stale-json")
+    t_true(stale_err, "merge_viewport rejects stale revision conflict")
+
+    // Save succeeds against nexus-project-validate.
+    _ := draft.save(&proj, &validator) or >>
+    t_true(!draft.dirty(), "draft clean after save")
+
+    // Deleting last referencing node removes surface and prunes GLB resource.
+    _ := draft.delete_node(placed_idx) or >>
+    doc_pruned := draft.document() or >>
+    t_true(doc_pruned.surface_count() == 0, "deleting node removes surface")
+    t_true(doc_pruned.resource_count() == 0, "deleting last referencing node prunes GLB resource")
+
+    // External modification conflict detection on disk before save.
+    disk_raw := os.read(lvl2_path + "") or >>
+    os.write(lvl2_path + "", disk_raw + "\n") or >>
+    ext_conflict := !try_save_ok($&draft, &proj, &validator)
+    t_true(ext_conflict, "draft.save rejects external disk modification conflict")
+
+    // End-to-end stage_scene -> nexus-project-viewport -> merge_viewport integration.
+    vp_bin := "build/nexus-project-viewport"
+    if test_path_exists(vp_bin + "") {
+        world_path := proj.scene_source(0) or >>
+        $wdraft := open_draft(world_path + "") or >>
+        wdoc0 := wdraft.document() or >>
+        factor_before := (wdoc0.describe_node(1) or >>).local_3d.c3.x
+        vp_dir := filepath.join([tmp + "", "vp_stage"])
+        staged := stage_scene(&proj, &wdoc0, &world_path, &vp_dir) or >>
+        vp_out := filepath.join([vp_dir + "", "viewport-output.xuscene"])
+        wrev := wdraft.current + ""
+        _ := exec.command(
+            vp_bin + "",
+            "--scene", staged + "",
+            "--output", vp_out + "",
+            "--check-node", "Factor",
+            "--snap-move", "0.5",
+            "--snap-rotate", "15",
+            "--snap-scale", "10"
+        ).combined_output() or >>
+        captured := files.load(vp_out + "") or >>
+        wdraft.merge_viewport(&captured, &wrev) or >>
+        t_true(wdraft.dirty(), "real viewport apply marks draft dirty")
+        wdoc1 := wdraft.document() or >>
+        factor_after := (wdoc1.describe_node(1) or >>).local_3d.c3.x
+        t_near(factor_after - factor_before, 0.20, 1e-4, "real viewport Factor X shift merged")
+    }
+    << 0
+}
+
+fn test_project_scene_import_place_save_and_viewport_merge() {
+    tmp := setup_fixture_project()
+    ext_dir := setup_external_glb_file()
+    _ := run_project_scene_import_place_save_and_viewport_merge(tmp + "", ext_dir + "") or (err) {
+        cleanup_dir(ext_dir + "")
+        cleanup_dir(tmp + "")
+        t_fail("project/scene/import: " + err.msg())
+        <<
+    }
+    cleanup_dir(ext_dir + "")
+    cleanup_dir(tmp + "")
+}
+
+fn run_snap_modal_validation_and_persistence(tmp string) int {
+    // Invalid inputs must populate field errors cleanly.
+    bad := validate_snap_inputs(&"0", &"abc", &"15000")
+    t_true(!bad.valid, "out-of-range/non-numeric snap validation fails")
+    t_true(bad.move_err.len > 0, "move=0 fails range [0.0001, 1000000]")
+    t_true(bad.rotate_err.len > 0, "rotate=abc fails numeric check")
+    t_true(bad.scale_err.len > 0, "scale=15000 fails range [1, 10000]")
+
+    good := validate_snap_inputs(&"0.5", &"15", &"25")
+    t_true(good.valid, "valid snap settings pass validation")
+    t_near(snap_scale_factor(&good.settings), 0.25, 1e-6, "snap_scale_factor converts % to ratio")
+
+    _ := save_snap_settings(&tmp, &good.settings) or >>
+    loaded := load_snap_settings(&tmp)
+    t_near(loaded.move_step, 0.5, 1e-6, "loaded move_step")
+    t_near(loaded.rotate_deg, 15.0, 1e-6, "loaded rotate_deg")
+    t_near(loaded.scale_pct, 25.0, 1e-6, "loaded scale_pct")
+    << 0
+}
+
+fn test_snap_modal_validation_and_persistence() {
+    tmp := os.mkdir_temp("", "nexus-snap-test-") or (err) {
+        t_fail("mkdir_temp snap: " + err.msg())
+        <<
+    }
+    _ := run_snap_modal_validation_and_persistence(tmp + "") or (err) {
+        cleanup_dir(tmp + "")
+        t_fail("snap modal: " + err.msg())
+        <<
+    }
+    cleanup_dir(tmp + "")
+}
+
+fn run_phase1_fidelity_surface_lod_2d_and_hierarchy(tmp string) int {
+    // 1. Test Sprite3D & TileMap2D preservation across node edits, duplicate, reparent, and merge_viewport.
+    iso_png_path := filepath.join([tmp + "", "assets", "sprite.png"])
+    iso_raw := os.read("examples/isometric_2d/assets/iso_tiles.png") or >>
+    iso_hash := sha256.sum256(iso_raw + "")
+    os.write(iso_png_path + "", iso_raw + "") or >>
+
+    uid_img := "b2000000000000000000000000000099"
+    $n0 := resource.node(-1, "Root", resource.NODE_GROUP)
+    $n1 := resource.node(0, "SpriteNode", resource.NODE_3D)
+    $n2 := resource.node(0, "TileNode", resource.NODE_2D)
+    base := resource.make_document([n0, n1, n2]) or >>
+
+    sp_att := resource.sprite_3d_attachment(1, uid_img + "", sprite3d.sprite_3d(fm.vec2(1.5, 2.0)))
+    ts := tilemap.tileset_2d(4, 4, 64.0, 32.0, fm.vec2(0.5, 0.5)) or >>
+    $grid := tilemap.new_tilemap_2d(tilemap.LAYOUT_ISOMETRIC, 4, 4, 64.0, 32.0, 16.0, ts) or >>
+    grid.set_cell(1, 1, 2) or >>
+    tm_att := resource.tilemap_2d_attachment(2, uid_img + "", 1, true, 0.0, true, grid)
+    iref := resource.ResourceReference{uid: uid_img + "", kind: "image_rgba", path: "sprite.png", content_hash: iso_hash}
+    full := resource.with_all_attachments(
+        &base,
+        [iref],
+        []resource.Surface{},
+        []resource.AudioBus{},
+        []resource.AudioEmitter{},
+        []resource.ScriptAttachment{},
+        []resource.ScriptConnection{},
+        []resource.LightAttachment{},
+        [sp_att],
+        [tm_att]
+    ) or >>
+
+    custom_scene := filepath.join([tmp + "", "assets", "mixed.xuscene"])
+    files.save(custom_scene + "", &full) or >>
+    $md := open_draft(custom_scene + "") or >>
+
+    // Edit Node2D rot/scale + process_mode -> must preserve Sprite3D & TileMap2D!
+    md.set_node_full_properties(2, "TileNodeEdited", true, resource.PROCESS_ALWAYS, fm.vec3(12.0, -8.0, 0.0), true, fm.vec3(0.0, 0.0, 45.0), fm.vec3(2.0, 0.5, 1.0)) or >>
+    mdoc1 := md.document() or >>
+    t_true(mdoc1.sprite_3d_count() == 1, "Sprite3D preserved after set_node_full_properties")
+    t_true(mdoc1.tilemap_2d_count() == 1, "TileMap2D preserved after set_node_full_properties")
+    nd2 := mdoc1.describe_node(2) or >>
+    t_true(nd2.process_mode == resource.PROCESS_ALWAYS, "process_mode updated")
+    t2 := decompose_2d(&nd2.local)
+    t_near(t2.x, 12.0, 1e-6, "Node2D tx")
+    t_near(t2.y, -8.0, 1e-6, "Node2D ty")
+    t_near(t2.rot_deg, 45.0, 1e-4, "Node2D rotation deg")
+    t_near(t2.sx, 2.0, 1e-4, "Node2D scale x")
+    t_near(t2.sy, 0.5, 1e-4, "Node2D scale y")
+
+    // Duplicate & merge_viewport preserve Sprite3D & TileMap2D
+    dup_sp := md.duplicate_node(1) or >>
+    t_true(dup_sp > 0, "duplicate sprite node")
+    mdoc2 := md.document() or >>
+    t_true(mdoc2.sprite_3d_count() == 2, "duplicate_node clones Sprite3D")
+    t_true(mdoc2.tilemap_2d_count() == 1, "duplicate_node preserves TileMap2D")
+
+    rev2 := md.current + ""
+    md.merge_viewport(&mdoc2, &rev2) or >>
+    mdoc3 := md.document() or >>
+    t_true(mdoc3.sprite_3d_count() == 2 && mdoc3.tilemap_2d_count() == 1, "merge_viewport preserves Sprite3D & TileMap2D")
+
+    // 2. Test Surface bind/LOD/clear, sibling reorder, move_nodes_delta, and delete_nodes on project fixture
+    proj := load_project(filepath.join([tmp + "", "project.json"])) or >>
+    world_path := proj.scene_source(0) or >>
+    $d := open_draft(world_path + "") or >>
+    empty_idx := d.add_node_under(0, resource.NODE_3D, "EmptyProp") or >>
+    uid := proj.assets[0].key + ""
+    d.set_node_surface(&proj, empty_idx, uid + "", 0, [resource.SurfaceLevel{distance: 15.0, resource_uid: uid + "", primitive: 0}], 0.25) or >>
+    doc_s := d.document() or >>
+    $found_s := false
+    for i in 0:doc_s.surface_count() {
+        sf := doc_s.surface(i) or >>
+        if sf.node == empty_idx {
+            found_s = sf.levels.len == 1 && sf.hysteresis == 0.25
+        }
+    }
+    t_true(found_s, "set_node_surface binds surface + LOD level + hysteresis")
+
+    d.clear_node_surface(empty_idx) or >>
+    doc_c := d.document() or >>
+    $still_has := false
+    for i in 0:doc_c.surface_count() {
+        sf := doc_c.surface(i) or >>
+        if sf.node == empty_idx { still_has = true }
+    }
+    t_true(!still_has, "clear_node_surface removes attachment")
+
+    // move_node_sibling & move_nodes_delta & set_node_visible_only & delete_nodes
+    moved_idx := d.move_node_sibling(empty_idx, -1) or >>
+    t_true(moved_idx < empty_idx, "move_node_sibling -1 moves node earlier")
+    before_x := (d.document() or >>).describe_node(moved_idx) or >>
+    d.move_nodes_delta(&[moved_idx], 2.5, 0.0, -1.25) or >>
+    after_x := (d.document() or >>).describe_node(moved_idx) or >>
+    t_near(after_x.local_3d.c3.x - before_x.local_3d.c3.x, 2.5, 1e-6, "move_nodes_delta shifts X")
+    t_near(after_x.local_3d.c3.z - before_x.local_3d.c3.z, -1.25, 1e-6, "move_nodes_delta shifts Z")
+
+    d.set_node_visible_only(moved_idx, false) or >>
+    t_true(!((d.document() or >>).describe_node(moved_idx) or >>).visible, "set_node_visible_only hides node")
+    _ := d.delete_nodes(&[moved_idx]) or >>
+    t_true((d.document() or >>).node_count() == doc_c.node_count() - 1, "delete_nodes removes target")
+    << 0
+}
+
+fn test_phase1_fidelity_surface_lod_2d_and_hierarchy() {
+    tmp := setup_fixture_project()
+    _ := run_phase1_fidelity_surface_lod_2d_and_hierarchy(tmp + "") or (err) {
+        cleanup_dir(tmp + "")
+        t_fail("phase1: " + err.msg())
+        <<
+    }
+    cleanup_dir(tmp + "")
+}
+
+fn run_phase2_top_view_modes_snap_and_marquee() int {
+    $n0 := resource.node(-1, "Root", resource.NODE_GROUP)
+    $n1 := resource.node(0, "CamNode", resource.NODE_3D)
+    n1.camera = camera_data.perspective(1.047, 0.1, 120.0) or >>
+    n1.local_3d = fm.translation_3d(fm.vec3(2.0, 5.0, -3.0))
+    $n2 := resource.node(0, "LightNode", resource.NODE_3D)
+    n2.local_3d = fm.translation_3d(fm.vec3(-4.0, 3.0, 6.0))
+    $n3 := resource.node(0, "HUD2D", resource.NODE_2D)
+    n3.local = fm.transform_2d(fm.vec2(8.0, 12.0), 0.0, fm.vec2(1.0, 1.0))
+
+    base := resource.make_document([n0, n1, n2, n3]) or >>
+    l_src := light_data.point(fm.vec3(0.0, 0.0, 0.0), fm.vec3(2.0, 1.8, 1.5), 14.0) or >>
+    l_att := resource.light_attachment(2, l_src)
+    full := resource.with_lights(&base, [l_att]) or >>
+
+    pts := extract_stage_points(&full)
+    t_true(pts.len == 4, "extract_stage_points extracts all 4 nodes")
+    t_true(pts[1].has_camera && !pts[1].has_light, "camera flag extracted")
+    t_true(pts[2].has_light && !pts[2].has_camera, "light flag extracted")
+    t_near(pts[2].light_radius, 14.0, 1e-6, "light radius extracted")
+    t_true(pts[3].kind == resource.NODE_2D, "2D node kind extracted")
+
+    $tv := default_top_view()
+    bounds := layout.Rect{x: 0.0, y: 0.0, width: 500.0, height: 400.0}
+    tv.axis_mode = STAGE_XZ
+    t_near(stage_point_v(&pts[1], STAGE_XZ), -3.0, 1e-6, "STAGE_XZ uses Z")
+    tv.axis_mode = STAGE_XY
+    t_near(stage_point_v(&pts[1], STAGE_XY), 5.0, 1e-6, "STAGE_XY uses Y")
+    tv.fit_points(&pts, &bounds)
+    sx1 := world_to_screen_x(&tv, &bounds, 2.0)
+    sy1 := world_to_screen_y(&tv, &bounds, 5.0)
+    t_true(pick_stage_node(&tv, &bounds, &pts, sx1, sy1) == 1, "pick_stage_node picks in STAGE_XY")
+
+    // Marquee selects both n1 and n2 when enclosing them, excluding root
+    sx2 := world_to_screen_x(&tv, &bounds, -4.0)
+    sy2 := world_to_screen_y(&tv, &bounds, 3.0)
+    marq := pick_stage_marquee(&tv, &bounds, &pts, math.min(sx1, sx2) - 2.0, math.min(sy1, sy2) - 2.0, math.max(sx1, sx2) + 2.0, math.max(sy1, sy2) + 2.0)
+    t_true(is_selected_node(&marq, 1) && is_selected_node(&marq, 2), "marquee hits enclosed nodes")
+    t_true(!is_selected_node(&marq, 0), "marquee skips root")
+
+    t_near(snap_coord(1.37, 0.25), 1.25, 1e-6, "snap_coord rounds down cleanly")
+    t_near(snap_coord(-1.38, 0.25), -1.5, 1e-6, "snap_coord rounds negative cleanly")
+    << 0
+}
+
+fn test_phase2_top_view_modes_snap_and_marquee() {
+    _ := run_phase2_top_view_modes_snap_and_marquee() or (err) {
+        t_fail("phase2: " + err.msg())
+        <<
+    }
+}
+
+fn write_minimal_wav(path string) int {
+    bytes := [82, 73, 70, 70, 40, 0, 0, 0, 87, 65, 86, 69, 102, 109, 116, 32, 16, 0, 0, 0, 1, 0, 1, 0, 68, 172, 0, 0, 136, 88, 1, 0, 2, 0, 16, 0, 100, 97, 116, 97, 4, 0, 0, 0, 0, 0, 0, 0]
+    $bb := strings.new_byte_builder(64)
+    for b in bytes { bb.write_byte(b) }
+    raw := bb.to_string()
+    os.write(path + "", raw) or >>
+    << 0
+}
+
+fn write_minimal_png(path string) int {
+    px := [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]
+    $bb := strings.new_byte_builder(16)
+    for b in px { bb.write_byte(b) }
+    raw_px := bb.to_string()
+    enc := png.encode_rgba_bytes(&raw_px, 2, 2) or >>
+    os.write(path + "", enc) or >>
+    << 0
+}
+
+fn write_minimal_xubc(path string) int {
+    src_hash := sha256.sum256("test_script")
+    encoded := "XUNEXUS-SCRIPT-1\n{\"format\":1,\"api\":1,\"profile\":\"xu-scalar-v1\",\"module\":\"test_mod\",\"class\":\"TestActor\",\"source_hash\":\"" +
+        src_hash +
+        "\",\"fields\":[{\"id\":1,\"name\":\"speed\",\"default\":2}],\"signals\":[],\"functions\":[{\"id\":0,\"name\":\"physics_process\",\"kind\":1,\"entry\":0,\"end\":2}],\"registers\":[1,1,1],\"constants\":[1],\"code\":[[1,2,0,0,1,1],[20,0,2,0,1,1]]}"
+    os.write(path + "", encoded) or >>
+    << 0
+}
+
+fn run_phase3_components_and_globals(tmp string) int {
+    p_png := filepath.join([tmp + "", "assets", "sprite.png"])
+    p_wav := filepath.join([tmp + "", "assets", "beep.wav"])
+    p_xubc := filepath.join([tmp + "", "assets", "actor.xubc"])
+    write_minimal_png(p_png + "") or >>
+    write_minimal_wav(p_wav + "") or >>
+    write_minimal_xubc(p_xubc + "") or >>
+
+    proj_json := filepath.join([tmp + "", "project.json"])
+    uid_png := proj_pkg.register_asset(proj_json + "", "assets/sprite.png") or >>
+    uid_wav := proj_pkg.register_asset(proj_json + "", "assets/beep.wav") or >>
+    uid_xubc := proj_pkg.register_asset(proj_json + "", "assets/actor.xubc") or >>
+
+    proj := load_project(proj_json + "") or >>
+    world_path := proj.scene_source(0) or >>
+    $d := open_draft(world_path + "") or >>
+
+    // 1. Camera Perspective, Orthographic, View2D, Clear + Undo
+    n3 := d.add_node_under(0, resource.NODE_3D, "Hero") or >>
+    d.set_node_camera_perspective(n3, 60.0, 0.1, 150.0) or >>
+    t_true(((d.document() or >>).describe_node(n3) or >>).camera.is_set(), "camera perspective set")
+    d.set_node_camera_orthographic(n3, 12.0, 0.5, 90.0) or >>
+    nd_ortho := (d.document() or >>).describe_node(n3) or >>
+    t_true(nd_ortho.orthographic.is_set() && !nd_ortho.camera.is_set(), "camera orthographic clears perspective")
+    d.clear_node_camera(n3) or >>
+    t_true(!((d.document() or >>).describe_node(n3) or >>).orthographic.is_set(), "camera cleared")
+    d.undo_edit() or >>
+    t_true(((d.document() or >>).describe_node(n3) or >>).orthographic.is_set(), "undo restores cleared camera")
+
+    n2 := d.add_node_under(0, resource.NODE_2D, "Layer2D") or >>
+    d.set_node_camera_2d(n2, 1280.0, 720.0, 1.5) or >>
+    t_true(((d.document() or >>).describe_node(n2) or >>).camera_2d.is_set(), "camera_2d set on Node2D")
+
+    // 2. Light + Shadow (Directional CSM, Point Punctual, Spot Punctual, Clear)
+    d.set_node_light(n3, light_data.DIRECTIONAL, 2.0, 2.0, 1.8, 10.0, 15.0, 35.0, 0.3, 0.8, 0.5, true, 512, 60.0, 3) or >>
+    t_true(((d.document() or >>).light(0) or >>).cascades.enabled(), "directional CSM enabled")
+    d.set_node_light(n3, light_data.POINT, 3.0, 1.5, 1.0, 14.0, 15.0, 35.0, 0.0, 1.0, 0.0, true, 256, 40.0, 3) or >>
+    t_true(((d.document() or >>).light(0) or >>).punctual.enabled(), "point punctual shadow enabled")
+    d.set_node_light(n3, light_data.SPOT, 2.5, 2.5, 2.5, 16.0, 12.0, 30.0, 0.0, 1.0, 0.2, true, 512, 40.0, 3) or >>
+    t_true(((d.document() or >>).light(0) or >>).source.kind() == light_data.SPOT, "spot light updated")
+    d.clear_node_light(n3) or >>
+    t_true((d.document() or >>).light_count() == 0, "clear_node_light removes light")
+
+    // 3. Script + Initials + Connections + cascading clear
+    inits := parse_script_initials(&"1=3.5, 2=7") or >>
+    t_true(inits.len == 2 && format_script_initials(&inits) == "1=3.5, 2=7", "script initials roundtrip")
+    d.set_node_script(&proj, n3, uid_xubc + "", inits) or >>
+    t_true((d.document() or >>).script_count() == 1, "script attached")
+    d.add_script_connection(n3, 1, n3, 1) or >>
+    t_true((d.document() or >>).script_connection_count() == 1, "script connection added")
+    d.remove_script_connection(0) or >>
+    t_true((d.document() or >>).script_connection_count() == 0, "script connection removed")
+    d.add_script_connection(n3, 1, n3, 1) or >>
+    d.clear_node_script(n3) or >>
+    doc_sc := d.document() or >>
+    t_true(doc_sc.script_count() == 0 && doc_sc.script_connection_count() == 0, "clear_node_script cascades connections")
+
+    // 4. AudioEmitter auto-Master bus + SFX sub-bus + mute + remove + auto-clear
+    d.set_node_audio_emitter(&proj, n3, uid_wav + "", 0, 0.9, 0.0, true, false, "3d", n3, 25.0) or >>
+    doc_a1 := d.document() or >>
+    t_true(doc_a1.audio_count() == 1 && doc_a1.audio_bus_count() == 1 && (doc_a1.audio_bus(0) or >>).name == "Master", "auto-creates Master bus")
+    d.add_audio_bus(0, "SFX", 0.8, false, false) or >>
+    t_true((d.document() or >>).audio_bus_count() == 2, "sub-bus SFX added")
+    d.toggle_audio_bus_mute(1) or >>
+    t_true(((d.document() or >>).audio_bus(1) or >>).muted, "SFX bus muted")
+    d.remove_audio_bus(1) or >>
+    t_true((d.document() or >>).audio_bus_count() == 1, "SFX sub-bus removed")
+    d.clear_node_audio_emitter(n3) or >>
+    doc_a2 := d.document() or >>
+    t_true(doc_a2.audio_count() == 0 && doc_a2.audio_bus_count() == 0, "clearing last emitter auto-clears buses")
+
+    // 5. Sprite3D attach & clear
+    d.set_node_sprite_3d(&proj, n3, uid_png + "", 2.0, 1.5, sprite3d.BILLBOARD_Y_AXIS, sprite3d.ALPHA_MODE_CUTOUT, 0.4, true, false, false) or >>
+    t_true((d.document() or >>).sprite_3d_count() == 1, "Sprite3D attached")
+    d.clear_node_sprite_3d(n3) or >>
+    t_true((d.document() or >>).sprite_3d_count() == 0, "Sprite3D cleared")
+
+    // 6. TileMap2D ensure + merge_tilemaps
+    d.ensure_node_tilemap_2d(&proj, n2, uid_png + "") or >>
+    t_true((d.document() or >>).tilemap_2d_count() == 1, "TileMap2D created")
+    tm_doc := d.document() or >>
+    tm_rev := d.current + ""
+    d.merge_tilemaps(&tm_doc, &tm_rev) or >>
+    t_true((d.document() or >>).tilemap_2d_count() == 1, "merge_tilemaps preserves attachment")
+
+    // 7. Single-undo Presets (+ Cam / + Lgt)
+    cam_idx := d.add_preset_camera_node(0) or >>
+    t_true(((d.document() or >>).describe_node(cam_idx) or >>).camera.is_set(), "preset camera created")
+    d.undo_edit() or >>
+    t_true((d.document() or >>).node_count() == tm_doc.node_count(), "single undo removes preset camera")
+
+    lgt_idx := d.add_preset_light_node(0) or >>
+    t_true((d.document() or >>).light_count() == 1 && ((d.document() or >>).light(0) or >>).node == lgt_idx, "preset light created")
+    d.undo_edit() or >>
+    t_true((d.document() or >>).light_count() == 0 && (d.document() or >>).node_count() == tm_doc.node_count(), "single undo removes preset light")
+    d.redo_edit() or >>
+    t_true((d.document() or >>).light_count() == 1, "redo restores preset light")
+    << 0
+}
+
+fn test_phase3_components_and_globals() {
+    tmp := setup_fixture_project()
+    _ := run_phase3_components_and_globals(tmp + "") or (err) {
+        cleanup_dir(tmp + "")
+        t_fail("phase3: " + err.msg())
+        <<
+    }
+    cleanup_dir(tmp + "")
+}
+
+fn try_remove_asset_ok(proj_path &string, uid &string) bool {
+    _ := remove_asset(proj_path, uid) or (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn try_delete_scene_ok(proj_path &string, target_key &string) bool {
+    _ := delete_scene(proj_path, target_key) or (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn run_phase4_project_crud_multi_asset_and_reorder(tmp string) int {
+    val_bin := "build/nexus-project-validate"
+    ext_dir := os.mkdir_temp("", "nexus-ed-p4-ext-") or >>
+    p_png := filepath.join([ext_dir + "", "icon.png"])
+    p_wav := filepath.join([ext_dir + "", "fx.wav"])
+    p_xubc := filepath.join([ext_dir + "", "ctrl.xubc"])
+    write_minimal_png(p_png + "") or >>
+    write_minimal_wav(p_wav + "") or >>
+    write_minimal_xubc(p_xubc + "") or >>
+
+    proj_json := filepath.join([tmp + "", "project.json"])
+    imp_png := import_external_asset(&proj_json, &p_png, &val_bin) or >>
+    imp_wav := import_external_asset(&proj_json, &p_wav, &val_bin) or >>
+    imp_xubc := import_external_asset(&proj_json, &p_xubc, &val_bin) or >>
+    _ := os.remove_all(ext_dir + "")
+    t_true(strings.ends_with(&imp_png.rel_path, ".png"), "imported external png")
+    t_true(strings.ends_with(&imp_wav.rel_path, ".wav"), "imported external wav")
+    t_true(strings.ends_with(&imp_xubc.rel_path, ".xubc"), "imported external xubc")
+
+    // Reorder + Visibility toggle + Undo/Redo
+    proj1 := load_project(proj_json + "") or >>
+    t_true(proj1.assets.len == 4, "4 total project assets")
+    world_path := proj1.scene_source(0) or >>
+    $d := open_draft(world_path + "") or >>
+    n_test := d.add_node_under(0, resource.NODE_3D, "ZOrderTest") or >>
+    up_idx := d.move_node_sibling(n_test, -1) or >>
+    t_true(up_idx < n_test, "sibling move up")
+    dn_idx := d.move_node_sibling(up_idx, 1) or >>
+    t_true(dn_idx == n_test, "sibling move down")
+    d.set_node_visible_only(dn_idx, false) or >>
+    t_true(!((d.document() or >>).describe_node(dn_idx) or >>).visible, "visibility toggled off")
+    d.undo_edit() or >>
+    t_true(((d.document() or >>).describe_node(dn_idx) or >>).visible, "undo restores visibility")
+
+    // Attach imported PNG / WAV / XUBC and save scene
+    d.set_node_sprite_3d(&proj1, dn_idx, imp_png.uid + "", 1.0, 1.0, sprite3d.BILLBOARD_DISABLED, sprite3d.ALPHA_MODE_OPAQUE, 0.0, false, false, false) or >>
+    d.set_node_audio_emitter(&proj1, dn_idx, imp_wav.uid + "", 0, 1.0, 0.0, false, false, "none", -1, 0.0) or >>
+    d.set_node_script(&proj1, dn_idx, imp_xubc.uid + "", []resource.ScriptInitial{}) or >>
+    d.save(&proj1, &val_bin) or >>
+
+    // remove_asset refuses while referenced, succeeds once unreferenced
+    t_true(!try_remove_asset_ok(&proj_json, &imp_png.uid), "remove_asset refuses referenced png")
+    extra_png := filepath.join([tmp + "", "assets", "unused.png"])
+    write_minimal_png(extra_png + "") or >>
+    imp_unused := import_external_asset(&proj_json, &extra_png, &val_bin) or >>
+    reloc_png := filepath.join([tmp + "", "assets", "relocated.png"])
+    write_minimal_png(reloc_png + "") or >>
+    relocate_asset(&proj_json, &imp_unused.uid, &reloc_png) or >>
+    t_true(try_remove_asset_ok(&proj_json, &imp_unused.uid), "remove_asset succeeds on unreferenced asset")
+
+    // Scene CRUD: duplicate, rename, delete, refuse deleting last scene
+    main_key := proj1.scenes[0].key + ""
+    dup_key := duplicate_scene(&proj_json, &main_key, &"stage2") or >>
+    t_true(dup_key == "stage2.xuscene", "duplicate_scene adds stage2")
+    ren_key := rename_scene(&proj_json, &"stage2.xuscene", &"stage_renamed") or >>
+    t_true(ren_key == "stage_renamed.xuscene", "rename_scene renames scene")
+    out_dir := filepath.join([tmp + "", "pub_out"])
+    pub_res := publish_project(&proj_json, &out_dir, &val_bin) or >>
+    t_true(pub_res.generation.len == 64 && pub_res.rebuilt_assets >= 4, "publish_project cooks multi-asset project")
+    t_true(try_delete_scene_ok(&proj_json, &ren_key), "delete_scene removes duplicated scene")
+    t_true(!try_delete_scene_ok(&proj_json, &main_key), "delete_scene refuses deleting last scene")
+    << 0
+}
+
+fn test_phase4_project_crud_multi_asset_and_reorder() {
+    tmp := setup_fixture_project()
+    _ := run_phase4_project_crud_multi_asset_and_reorder(tmp + "") or (err) {
+        cleanup_dir(tmp + "")
+        t_fail("phase4: " + err.msg())
+        <<
+    }
+    cleanup_dir(tmp + "")
+}
+
+fn test_i18n_persistence_and_strings() {
+    tmp := setup_fixture_project()
+    t_true(load_editor_lang(&tmp) == LANG_EN, "default editor language is English")
+    _ := save_editor_lang(&tmp, LANG_ZH) or (err) {
+        cleanup_dir(tmp + "")
+        t_fail("save ZH failed: " + err.msg())
+        <<
+    }
+    t_true(load_editor_lang(&tmp) == LANG_ZH, "loaded editor language preserves Chinese")
+    _ := save_editor_lang(&tmp, LANG_EN) or (err) {
+        cleanup_dir(tmp + "")
+        t_fail("save EN failed: " + err.msg())
+        <<
+    }
+    t_true(load_editor_lang(&tmp) == LANG_EN, "loaded editor language preserves English")
+    t_true(lang_toggle_label(LANG_EN) == "中文", "English mode shows 中文 switch label")
+    t_true(lang_toggle_label(LANG_ZH) == "EN", "Chinese mode shows EN switch label")
+    t_true(tr(LANG_ZH, "Save", "保存") == "保存", "tr selects Chinese string")
+    w := approx_label_width(&"0.5 单位/格", 7.0)
+    t_true(w > 45.0 && w < 85.0, "approx_label_width handles mixed ASCII and UTF-8 Chinese cleanly")
+    cleanup_dir(tmp + "")
+}
+
+fn run_phase5_modern_v9_components(tmp string) int {
+    proj_json := filepath.join([tmp + "", "project.json"])
+    val_bin := "build/nexus-project-validate"
+    scene_path := filepath.join([tmp + "", "assets", "world.xuscene"])
+    proj0 := load_project(proj_json + "") or >>
+    main_key := proj0.scenes[0].key + ""
+    sub_key := duplicate_scene(&proj_json, &main_key, &"sub_prop") or >>
+    proj := load_project(proj_json + "") or >>
+    $d := open_draft(scene_path + "") or >>
+    env_node := d.add_node_under(0, resource.NODE_3D, "WorldEnv") or >>
+    rb_node := d.add_node_under(0, resource.NODE_3D, "PhysCrate") or >>
+    terr_node := d.add_node_under(0, resource.NODE_3D, "HeightTerrain") or >>
+    part_node := d.add_node_under(0, resource.NODE_3D, "Sparks") or >>
+    pf_node := d.add_node_under(0, resource.NODE_3D, "TurretInst") or >>
+
+    d.set_node_environment(env_node, resource.SKY_ATMOSPHERE, 2.5, 1.15, 0.02, true, true, false, true, true) or >>
+    d.set_node_rigid_body_3d(rb_node, resource.BODY_DYNAMIC, resource.SHAPE_BOX, fm.vec3(0.5, 0.5, 0.5), 0.5, 8.0, 0.25, 0.7, false) or >>
+    d.set_node_terrain(terr_node, 33, 1.0, 2.5, 0.8) or >>
+    d.set_node_particle_emitter_3d(part_node, 512, 60.0, 1.8, 3.0, 0.25, true) or >>
+    d.set_node_prefab_instance(&proj, pf_node, sub_key + "", "TurretHead", false) or >>
+
+    doc_set := d.document() or >>
+    t_true(doc_set.environment_count() == 1 && doc_set.rigid_body_3d_count() == 1, "v9 env and rb set")
+    t_true(doc_set.terrain_count() == 1 && doc_set.particle_emitter_3d_count() == 1, "v9 terrain and particles set")
+    t_true(doc_set.prefab_instance_count() == 1, "v9 prefab set")
+
+    // Undo and redo preserve v9 attachments
+    d.undo_edit() or >>
+    t_true((d.document() or >>).prefab_instance_count() == 0, "undo removes prefab instance")
+    d.redo_edit() or >>
+    t_true((d.document() or >>).prefab_instance_count() == 1, "redo restores prefab instance")
+
+    // Save and reload in fresh draft
+    d.save(&proj, &val_bin) or >>
+    $d2 := open_draft(scene_path + "") or >>
+    doc_reopen := d2.document() or >>
+    t_true(doc_reopen.environment_count() == 1 && (doc_reopen.environment(0) or >>).node == env_node, "reopened env matches")
+    t_true(doc_reopen.rigid_body_3d_count() == 1 && math.abs((doc_reopen.rigid_body_3d(0) or >>).mass - 8.0) < 1e-9, "reopened rb mass matches")
+    t_true(doc_reopen.terrain_count() == 1 && (doc_reopen.terrain(0) or >>).grid_x == 33, "reopened terrain matches")
+    t_true(doc_reopen.particle_emitter_3d_count() == 1 && (doc_reopen.particle_emitter_3d(0) or >>).max_particles == 512, "reopened particles matches")
+    t_true(doc_reopen.prefab_instance_count() == 1 && (doc_reopen.prefab_instance(0) or >>).overrides[0].target_path == "TurretHead", "reopened prefab matches")
+
+    d2.clear_node_environment(env_node) or >>
+    d2.clear_node_rigid_body_3d(rb_node) or >>
+    d2.clear_node_terrain(terr_node) or >>
+    d2.clear_node_particle_emitter_3d(part_node) or >>
+    d2.clear_node_prefab_instance(pf_node) or >>
+    t_true(!(d2.document() or >>).has_modern_attachments(), "clear removes all v9 attachments")
+    << 0
+}
+
+fn test_phase5_modern_v9_components() {
+    tmp := setup_fixture_project()
+    _ := run_phase5_modern_v9_components(tmp + "") or (err) {
+        cleanup_dir(tmp + "")
+        t_fail("phase5: " + err.msg())
+        <<
+    }
+    cleanup_dir(tmp + "")
+}
+
+fn main() int {
+    test_theme_paper_tokens()
+    println("PASS: test_theme_paper_tokens")
+    test_top_view_math_and_labels()
+    println("PASS: test_top_view_math_and_labels")
+    test_draft_crud_undo_redo_and_trs()
+    println("PASS: test_draft_crud_undo_redo_and_trs")
+    test_project_scene_import_place_save_and_viewport_merge()
+    println("PASS: test_project_scene_import_place_save_and_viewport_merge")
+    test_snap_modal_validation_and_persistence()
+    println("PASS: test_snap_modal_validation_and_persistence")
+    test_phase1_fidelity_surface_lod_2d_and_hierarchy()
+    println("PASS: test_phase1_fidelity_surface_lod_2d_and_hierarchy")
+    test_phase2_top_view_modes_snap_and_marquee()
+    println("PASS: test_phase2_top_view_modes_snap_and_marquee")
+    test_phase3_components_and_globals()
+    println("PASS: test_phase3_components_and_globals")
+    test_phase4_project_crud_multi_asset_and_reorder()
+    println("PASS: test_phase4_project_crud_multi_asset_and_reorder")
+    test_i18n_persistence_and_strings()
+    println("PASS: test_i18n_persistence_and_strings")
+    test_phase5_modern_v9_components()
+    println("PASS: test_phase5_modern_v9_components")
+    << 0
+}

@@ -1,0 +1,305 @@
+@"github.com/xulang-org/nexus/vfx"
+
+#errors
+#math
+fm #"github.com/xulang-org/nexus/foundation/math"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+
+pub struct TrailConfig {
+    pub lifetime f64
+    pub min_vertex_distance f64
+    pub start_width f64
+    pub end_width f64
+    pub uv_tile_length f64
+    pub max_points int
+}
+
+struct TrailNode2D {
+    pos fm.Vec2
+    age f64
+    dist f64
+}
+
+pub struct Trail2D {
+    config TrailConfig
+    nodes []TrailNode2D
+    gradient ColorGradient
+    width_curve FloatCurve
+    has_width_curve bool
+    total_dist f64
+}
+
+struct TrailNode3D {
+    pos fm.Vec3
+    age f64
+    dist f64
+}
+
+pub struct RibbonTrail3D {
+    config TrailConfig
+    nodes []TrailNode3D
+    gradient ColorGradient
+    width_curve FloatCurve
+    has_width_curve bool
+    total_dist f64
+}
+
+pub fn default_trail_config() TrailConfig {
+    << TrailConfig{
+        lifetime: 0.45,
+        min_vertex_distance: 0.08,
+        start_width: 0.35,
+        end_width: 0.02,
+        uv_tile_length: 1.0,
+        max_points: 128
+    }
+}
+
+pub fn (cfg &TrailConfig) validate() int {
+    if !valid_f(cfg.lifetime) || cfg.lifetime <= 0.0 || cfg.lifetime > 60.0 ||
+        !valid_f(cfg.min_vertex_distance) || cfg.min_vertex_distance < 0.0 ||
+        !valid_f(cfg.start_width) || cfg.start_width < 0.0 ||
+        !valid_f(cfg.end_width) || cfg.end_width < 0.0 ||
+        !valid_f(cfg.uv_tile_length) || cfg.uv_tile_length <= 0.0 ||
+        cfg.max_points < 2 || cfg.max_points > 4096 {
+        >> errors.new("nexus vfx: invalid trail configuration")
+    }
+    << 0
+}
+
+fn default_trail_gradient() ColorGradient {
+    $g := new_color_gradient()
+    g.add_stop(0.0, 0.9, 0.95, 1.0, 1.0) or >>
+    g.add_stop(1.0, 0.2, 0.5, 1.0, 0.0) or >>
+    << g
+}
+
+pub fn new_trail_2d(cfg TrailConfig) Trail2D {
+    cfg.validate() or >>
+    << Trail2D{
+        config: cfg,
+        nodes: []TrailNode2D{},
+        gradient: default_trail_gradient() or >>,
+        width_curve: new_float_curve(),
+        has_width_curve: false,
+        total_dist: 0.0
+    }
+}
+
+pub fn (t $&Trail2D) set_color_gradient(grad ColorGradient) { t.gradient = grad }
+
+pub fn (t $&Trail2D) set_width_curve(curve FloatCurve) {
+    has_keys := curve.key_count() > 0
+    t.width_curve = curve
+    t.has_width_curve = has_keys
+}
+
+pub fn (t &Trail2D) point_count() int { << t.nodes.len }
+
+pub fn (t $&Trail2D) clear() {
+    t.nodes = []TrailNode2D{}
+    t.total_dist = 0.0
+}
+
+pub fn (t $&Trail2D) push_point(pos fm.Vec2) int {
+    if !vec2_valid(pos) { >> errors.new("nexus vfx: non-finite 2D trail point") }
+    if t.nodes.len > 0 {
+        last_idx := t.nodes.len - 1
+        d := pos.sub(t.nodes[last_idx].pos).length()
+        if d < t.config.min_vertex_distance { << t.nodes.len }
+        t.total_dist += d
+    }
+    if t.nodes.len >= t.config.max_points {
+        $trimmed := []TrailNode2D{}
+        for i in 1:t.nodes.len { trimmed.push(t.nodes[i]) }
+        t.nodes = trimmed
+    }
+    t.nodes.push(TrailNode2D{pos: pos, age: 0.0, dist: t.total_dist})
+    << t.nodes.len
+}
+
+pub fn (t $&Trail2D) update(dt f64) int {
+    if !valid_f(dt) || dt < 0.0 { >> errors.new("nexus vfx: invalid 2D trail dt") }
+    $kept := []TrailNode2D{}
+    for i in 0:t.nodes.len {
+        $node := t.nodes[i]
+        node.age += dt
+        if node.age < t.config.lifetime {
+            kept.push(node)
+        }
+    }
+    t.nodes = kept
+    << t.nodes.len
+}
+
+pub fn (t &Trail2D) emit_batch(batch $&canvas.Batch2D) int {
+    if t.nodes.len < 2 { << 0 }
+    n := t.nodes.len
+    $lefts := []fm.Vec2{}
+    $rights := []fm.Vec2{}
+    $colors := []int{}
+    $us := []f64{}
+
+    for i in 0:n {
+        p := t.nodes[i].pos
+        $tang := fm.vec2(1.0, 0.0)
+        if i == 0 {
+            tang = safe_norm_2(t.nodes[1].pos.sub(p), fm.vec2(1.0, 0.0)) or >>
+        } else if i == n - 1 {
+            prev := i - 1
+            tang = safe_norm_2(p.sub(t.nodes[prev].pos), fm.vec2(1.0, 0.0)) or >>
+        } else {
+            prev := i - 1
+            next := i + 1
+            tang = safe_norm_2(t.nodes[next].pos.sub(t.nodes[prev].pos), fm.vec2(1.0, 0.0)) or >>
+        }
+        perp := fm.vec2(-tang.y, tang.x)
+        // t_norm=0 at head (newest), t_norm=1 at tail (oldest).
+        age_t := clamp_01(t.nodes[i].age / t.config.lifetime)
+        $width := lerp_scalar(t.config.start_width, t.config.end_width, age_t)
+        if t.has_width_curve { width = math.max(0.0, t.width_curve.evaluate(age_t) or >>) }
+        half := width * 0.5
+        lefts.push(p.add(perp.scaled(half)))
+        rights.push(p.sub(perp.scaled(half)))
+        colors.push(t.gradient.evaluate_rgba8(age_t) or >>)
+        us.push(t.nodes[i].dist / t.config.uv_tile_length)
+    }
+
+    $tris := 0
+    for i in 0:(n - 1) {
+        ni := i + 1
+        c0 := colors[i]
+        c1 := colors[ni]
+        u0 := us[i]
+        u1 := us[ni]
+        batch.triangle_uv(lefts[i], lefts[ni], rights[ni], c0, c1, c1,
+            fm.vec2(u0, 0.0), fm.vec2(u1, 0.0), fm.vec2(u1, 1.0)) or >>
+        batch.triangle_uv(lefts[i], rights[ni], rights[i], c0, c1, c0,
+            fm.vec2(u0, 0.0), fm.vec2(u1, 1.0), fm.vec2(u0, 1.0)) or >>
+        tris += 2
+    }
+    << tris
+}
+
+pub fn new_ribbon_trail_3d(cfg TrailConfig) RibbonTrail3D {
+    cfg.validate() or >>
+    << RibbonTrail3D{
+        config: cfg,
+        nodes: []TrailNode3D{},
+        gradient: default_trail_gradient() or >>,
+        width_curve: new_float_curve(),
+        has_width_curve: false,
+        total_dist: 0.0
+    }
+}
+
+pub fn (t $&RibbonTrail3D) set_color_gradient(grad ColorGradient) { t.gradient = grad }
+
+pub fn (t $&RibbonTrail3D) set_width_curve(curve FloatCurve) {
+    has_keys := curve.key_count() > 0
+    t.width_curve = curve
+    t.has_width_curve = has_keys
+}
+
+pub fn (t &RibbonTrail3D) point_count() int { << t.nodes.len }
+
+pub fn (t $&RibbonTrail3D) clear() {
+    t.nodes = []TrailNode3D{}
+    t.total_dist = 0.0
+}
+
+fn vec3_ok(v fm.Vec3) bool {
+    << fm.finite(v.x) && fm.finite(v.y) && fm.finite(v.z) &&
+        math.abs(v.x) <= 1000000.0 && math.abs(v.y) <= 1000000.0 && math.abs(v.z) <= 1000000.0
+}
+
+fn safe_norm3(v fm.Vec3, fb fm.Vec3) fm.Vec3 {
+    if v.dot(v) <= 1e-12 { << fb }
+    << v.normalized() or >>
+}
+
+pub fn (t $&RibbonTrail3D) push_point(pos fm.Vec3) int {
+    if !vec3_ok(pos) { >> errors.new("nexus vfx: non-finite 3D ribbon point") }
+    if t.nodes.len > 0 {
+        last_idx := t.nodes.len - 1
+        d := pos.sub(t.nodes[last_idx].pos).length()
+        if d < t.config.min_vertex_distance { << t.nodes.len }
+        t.total_dist += d
+    }
+    if t.nodes.len >= t.config.max_points {
+        $trimmed := []TrailNode3D{}
+        for i in 1:t.nodes.len { trimmed.push(t.nodes[i]) }
+        t.nodes = trimmed
+    }
+    t.nodes.push(TrailNode3D{pos: pos, age: 0.0, dist: t.total_dist})
+    << t.nodes.len
+}
+
+pub fn (t $&RibbonTrail3D) update(dt f64) int {
+    if !valid_f(dt) || dt < 0.0 { >> errors.new("nexus vfx: invalid 3D ribbon dt") }
+    $kept := []TrailNode3D{}
+    for i in 0:t.nodes.len {
+        $node := t.nodes[i]
+        node.age += dt
+        if node.age < t.config.lifetime {
+            kept.push(node)
+        }
+    }
+    t.nodes = kept
+    << t.nodes.len
+}
+
+pub fn (t &RibbonTrail3D) build_mesh(camera_eye fm.Vec3) meshes.MeshData3D {
+    if t.nodes.len < 2 { >> errors.new("nexus vfx: 3D ribbon requires at least 2 points") }
+    if !vec3_ok(camera_eye) { >> errors.new("nexus vfx: invalid camera eye for 3D ribbon") }
+
+    $out := meshes.new_mesh_data_3d()
+    n := t.nodes.len
+    for i in 0:n {
+        p := t.nodes[i].pos
+        $tang := fm.vec3(1.0, 0.0, 0.0)
+        if i == 0 {
+            tang = safe_norm3(t.nodes[1].pos.sub(p), fm.vec3(1.0, 0.0, 0.0)) or >>
+        } else if i == n - 1 {
+            prev := i - 1
+            tang = safe_norm3(p.sub(t.nodes[prev].pos), fm.vec3(1.0, 0.0, 0.0)) or >>
+        } else {
+            prev := i - 1
+            next := i + 1
+            tang = safe_norm3(t.nodes[next].pos.sub(t.nodes[prev].pos), fm.vec3(1.0, 0.0, 0.0)) or >>
+        }
+
+        to_cam := safe_norm3(camera_eye.sub(p), fm.vec3(0.0, 0.0, 1.0)) or >>
+        $side := tang.cross(to_cam)
+        if side.dot(side) <= 1e-10 {
+            side = tang.cross(fm.vec3(0.0, 1.0, 0.0))
+        }
+        if side.dot(side) <= 1e-10 {
+            side = tang.cross(fm.vec3(0.0, 0.0, 1.0))
+        }
+        side_u := safe_norm3(side, fm.vec3(1.0, 0.0, 0.0)) or >>
+
+        age_t := clamp_01(t.nodes[i].age / t.config.lifetime)
+        $width := lerp_scalar(t.config.start_width, t.config.end_width, age_t)
+        if t.has_width_curve { width = math.max(0.0, t.width_curve.evaluate(age_t) or >>) }
+        half := math.max(0.0005, width * 0.5)
+        rgba_f := t.gradient.evaluate(age_t) or >>
+        color := pack_rgba8(rgba_f[0], rgba_f[1], rgba_f[2], 1.0)
+        u := t.nodes[i].dist / t.config.uv_tile_length
+
+        p_l := p.add(side_u.scaled(half))
+        p_r := p.sub(side_u.scaled(half))
+        out.vertex_lit_uv(p_l, color, to_cam, fm.vec2(u, 0.0)) or >>
+        out.vertex_lit_uv(p_r, color, to_cam, fm.vec2(u, 1.0)) or >>
+    }
+
+    for i in 0:(n - 1) {
+        b0 := i * 2
+        b1 := (i + 1) * 2
+        out.triangle(b0, b1, b1 + 1) or >>
+        out.triangle(b0, b1 + 1, b0 + 1) or >>
+    }
+    out.validate() or >>
+    << out
+}

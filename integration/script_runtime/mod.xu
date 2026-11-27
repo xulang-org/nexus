@@ -1,0 +1,392 @@
+@"github.com/xulang-org/nexus/integration/script_runtime"
+
+#errors
+#math
+fm #"github.com/xulang-org/nexus/foundation/math"
+nexus #"github.com/xulang-org/nexus/scene"
+inp #"github.com/xulang-org/nexus/input"
+phys #"github.com/xulang-org/nexus/physics3d"
+mixer #"github.com/xulang-org/nexus/audio/mixer"
+nav #"github.com/xulang-org/nexus/navigation"
+vfx #"github.com/xulang-org/nexus/vfx"
+bc #"github.com/xulang-org/nexus/script/bytecode"
+vm #"github.com/xulang-org/nexus/script/vm"
+host #"github.com/xulang-org/nexus/script/host"
+
+pub const MAX_HOST_CALLS_PER_TICK = 128
+
+pub struct VfxBurstEvent {
+    pub emitter_id int
+    pub count int
+    pub is_pos_update bool
+    pub pos fm.Vec3
+}
+
+pub struct ScriptHostContext {
+    actions map[int]string
+    blackboard map[int]f64
+    vfx_events []VfxBurstEvent
+    elapsed f64
+    last_dt f64
+    host_calls int
+}
+
+pub fn new_script_host_context() ScriptHostContext {
+    << ScriptHostContext{
+        actions: map[int]string{},
+        blackboard: map[int]f64{},
+        vfx_events: []VfxBurstEvent{},
+        elapsed: 0.0,
+        last_dt: 0.0,
+        host_calls: 0
+    }
+}
+
+pub fn (ctx $&ScriptHostContext) register_input_action(action_id int, name string) int {
+    if action_id < 0 || name.len == 0 { >> errors.new("XuScript host: invalid action ID or name") }
+    ctx.actions[action_id] = name + ""
+    << 0
+}
+
+pub fn (ctx $&ScriptHostContext) set_bb(key int, value f64) int {
+    if !bc.valid_scalar(value) { >> errors.new("XuScript host: invalid blackboard scalar") }
+    ctx.blackboard[key] = value
+    << 0
+}
+
+pub fn (ctx &ScriptHostContext) get_bb(key int) f64 {
+    if ctx.blackboard.has(key) { << ctx.blackboard[key] }
+    << 0.0
+}
+
+pub fn (ctx $&ScriptHostContext) advance_time(dt f64) int {
+    if !fm.finite(dt) || dt < 0.0 || dt > 1.0 { >> errors.new("XuScript host: invalid frame delta") }
+    ctx.elapsed += dt
+    ctx.last_dt = dt
+    << 0
+}
+
+pub fn (ctx &ScriptHostContext) elapsed_time() f64 { << ctx.elapsed }
+pub fn (ctx &ScriptHostContext) host_call_count() int { << ctx.host_calls }
+
+pub fn (ctx $&ScriptHostContext) drain_vfx_events() []VfxBurstEvent {
+    $out := []VfxBurstEvent{}
+    for ev in ctx.vfx_events { out.push(ev) }
+    ctx.vfx_events = []VfxBurstEvent{}
+    << out
+}
+
+fn clamp_f(v f64, lo f64, hi f64) f64 {
+    if v < lo { << lo }
+    if v > hi { << hi }
+    << v
+}
+
+pub fn (ctx $&ScriptHostContext) eval_host_call(
+    node int,
+    fn_id int,
+    args &[]f64,
+    tree $&nexus.SceneTree,
+    input_map &inp.InputMap,
+    has_phys bool,
+    phys_world $&phys.RigidWorld3D,
+    has_audio bool,
+    audio_mixer $&mixer.Mixer,
+    has_nav bool,
+    nav_mesh &nav.NavMesh3D,
+    has_vfx2d bool,
+    vfx2d $&vfx.ParticleSystem2D
+) f64 {
+    ctx.host_calls += 1
+
+    // Scene 3D / 2D bindings (101..111)
+    if fn_id == bc.HOST_NODE_POS_X {
+        n := tree.node_3d(node) or >>
+        << n.transform.c3.x
+    }
+    if fn_id == bc.HOST_NODE_POS_Y {
+        n := tree.node_3d(node) or >>
+        << n.transform.c3.y
+    }
+    if fn_id == bc.HOST_NODE_POS_Z {
+        n := tree.node_3d(node) or >>
+        << n.transform.c3.z
+    }
+    if fn_id == bc.HOST_NODE_SET_POS {
+        if args.len < 3 { >> errors.new("XuScript host: node_set_pos requires 3 args") }
+        tree.set_position_3d(node, fm.vec3(args[0], args[1], args[2])) or >>
+        << 0.0
+    }
+    if fn_id == bc.HOST_NODE_TRANSLATE {
+        if args.len < 3 { >> errors.new("XuScript host: node_translate requires 3 args") }
+        n := tree.node_3d(node) or >>
+        cur := fm.vec3(n.transform.c3.x, n.transform.c3.y, n.transform.c3.z)
+        tree.set_position_3d(node, cur.add(fm.vec3(args[0], args[1], args[2]))) or >>
+        << 0.0
+    }
+    if fn_id == bc.HOST_NODE_SET_VISIBLE {
+        if args.len < 1 { >> errors.new("XuScript host: node_set_visible requires 1 arg") }
+        tree.set_visible(node, args[0] != 0.0) or >>
+        << 0.0
+    }
+    if fn_id == bc.HOST_NODE_IS_VISIBLE {
+        if tree.is_visible(node) or >> { << 1.0 }
+        << 0.0
+    }
+    if fn_id == bc.HOST_NODE_QUEUE_FREE {
+        tree.queue_free(node) or >>
+        << 0.0
+    }
+    if fn_id == bc.HOST_NODE_POS_2D_X {
+        n := tree.node(node) or >>
+        << n.transform.tx
+    }
+    if fn_id == bc.HOST_NODE_POS_2D_Y {
+        n := tree.node(node) or >>
+        << n.transform.ty
+    }
+    if fn_id == bc.HOST_NODE_SET_POS_2D {
+        if args.len < 2 { >> errors.new("XuScript host: node_set_pos_2d requires 2 args") }
+        tree.set_position(node, fm.vec2(args[0], args[1])) or >>
+        << 0.0
+    }
+
+    // Input bindings (201..204)
+    if fn_id == bc.HOST_INPUT_PRESSED {
+        if args.len < 1 { >> errors.new("XuScript host: input_pressed requires 1 arg") }
+        aid := int(math.round(args[0]))
+        if !ctx.actions.has(aid) { << 0.0 }
+        if input_map.pressed(ctx.actions[aid] + "") { << 1.0 }
+        << 0.0
+    }
+    if fn_id == bc.HOST_INPUT_JUST_PRESSED {
+        if args.len < 1 { >> errors.new("XuScript host: input_just_pressed requires 1 arg") }
+        aid := int(math.round(args[0]))
+        if !ctx.actions.has(aid) { << 0.0 }
+        if input_map.just_pressed(ctx.actions[aid] + "") { << 1.0 }
+        << 0.0
+    }
+    if fn_id == bc.HOST_INPUT_AXIS {
+        if args.len < 2 { >> errors.new("XuScript host: input_axis requires 2 args") }
+        neg_id := int(math.round(args[0]))
+        pos_id := int(math.round(args[1]))
+        $neg := ""
+        $pos := ""
+        if ctx.actions.has(neg_id) { neg = ctx.actions[neg_id] + "" }
+        if ctx.actions.has(pos_id) { pos = ctx.actions[pos_id] + "" }
+        if neg.len == 0 || pos.len == 0 { << 0.0 }
+        << input_map.axis(neg, pos)
+    }
+    if fn_id == bc.HOST_INPUT_VALUE {
+        if args.len < 1 { >> errors.new("XuScript host: input_value requires 1 arg") }
+        aid := int(math.round(args[0]))
+        if !ctx.actions.has(aid) { << 0.0 }
+        << input_map.value(ctx.actions[aid] + "")
+    }
+
+    // Physics3D bindings (301..306)
+    if fn_id >= bc.HOST_PHYS_RAYCAST && fn_id <= bc.HOST_PHYS_SET_VEL {
+        if !has_phys { >> errors.new("XuScript host: physics3d world unavailable") }
+        if fn_id == bc.HOST_PHYS_RAYCAST {
+            if args.len < 6 { >> errors.new("XuScript host: phys_raycast requires 6 args") }
+            ray_v := fm.vec3(args[3], args[4], args[5])
+            max_d := ray_v.length()
+            if max_d <= 1e-9 { << -1.0 }
+            dir := ray_v.scaled(1.0 / max_d)
+            hit := phys_world.raycast_all(fm.vec3(args[0], args[1], args[2]), dir, max_d, 2147483647) or >>
+            if hit.kind != 0 { << hit.distance }
+            << -1.0
+        }
+        if args.len < 1 { >> errors.new("XuScript host: physics body binding requires body index") }
+        bid := int(math.round(args[0]))
+        if fn_id == bc.HOST_PHYS_BODY_X { << phys_world.body(bid).position.x }
+        if fn_id == bc.HOST_PHYS_BODY_Y { << phys_world.body(bid).position.y }
+        if fn_id == bc.HOST_PHYS_BODY_Z { << phys_world.body(bid).position.z }
+        if fn_id == bc.HOST_PHYS_APPLY_IMPULSE {
+            if args.len < 4 { >> errors.new("XuScript host: phys_apply_impulse requires 4 args") }
+            phys_world.apply_impulse(bid, fm.vec3(args[1], args[2], args[3])) or >>
+            << 0.0
+        }
+        if fn_id == bc.HOST_PHYS_SET_VEL {
+            if args.len < 4 { >> errors.new("XuScript host: phys_set_vel requires 4 args") }
+            phys_world.set_velocity(bid, fm.vec3(args[1], args[2], args[3])) or >>
+            << 0.0
+        }
+    }
+
+    // Audio mixer bindings (401..403)
+    if fn_id >= bc.HOST_AUDIO_PLAY && fn_id <= bc.HOST_AUDIO_SET_BUS_VOLUME {
+        if !has_audio { >> errors.new("XuScript host: audio mixer unavailable") }
+        if fn_id == bc.HOST_AUDIO_PLAY {
+            if args.len < 3 { >> errors.new("XuScript host: audio_play requires 3 args (clip, volume, pan)") }
+            clip := int(math.round(args[0]))
+            vol := clamp_f(args[1], 0.0, 2.0)
+            pan := clamp_f(args[2], -1.0, 1.0)
+            vid := audio_mixer.play(clip, 0, vol, pan, false) or >>
+            << f64(vid)
+        }
+        if fn_id == bc.HOST_AUDIO_STOP {
+            if args.len < 1 { >> errors.new("XuScript host: audio_stop requires 1 arg") }
+            vid := int(math.round(args[0]))
+            audio_mixer.stop(vid) or >>
+            << 0.0
+        }
+        if fn_id == bc.HOST_AUDIO_SET_BUS_VOLUME {
+            if args.len < 2 { >> errors.new("XuScript host: audio_set_bus_volume requires 2 args") }
+            bus := int(math.round(args[0]))
+            vol := clamp_f(args[1], 0.0, 2.0)
+            audio_mixer.set_bus_volume(bus, vol) or >>
+            << 0.0
+        }
+    }
+
+    // Navigation bindings (501..504)
+    if fn_id >= bc.HOST_NAV_PATH_LENGTH && fn_id <= bc.HOST_NAV_NEXT_Z {
+        if !has_nav { >> errors.new("XuScript host: navigation mesh unavailable") }
+        if args.len < 6 { >> errors.new("XuScript host: navigation binding requires 6 args") }
+        start := fm.vec3(args[0], args[1], args[2])
+        goal := fm.vec3(args[3], args[4], args[5])
+        empty_costs := []f64{}
+        pts := nav_mesh.find_path(start, goal, -1, &empty_costs) or (err) {
+            if fn_id == bc.HOST_NAV_PATH_LENGTH { << -1.0 }
+            << 0.0
+        }
+        if fn_id == bc.HOST_NAV_PATH_LENGTH {
+            if pts.len < 2 { << 0.0 }
+            $total := 0.0
+            for i in 0:(pts.len - 1) {
+                ni := i + 1
+                total += pts[ni].sub(pts[i]).length()
+            }
+            << total
+        }
+        $wp := pts[0]
+        if pts.len > 1 { wp = pts[1] }
+        if fn_id == bc.HOST_NAV_NEXT_X { << wp.x }
+        if fn_id == bc.HOST_NAV_NEXT_Y { << wp.y }
+        << wp.z
+    }
+
+    // VFX bindings (601..602)
+    if fn_id == bc.HOST_VFX_BURST {
+        if args.len < 2 { >> errors.new("XuScript host: vfx_burst requires 2 args") }
+        eid := int(math.round(args[0]))
+        cnt := int(math.round(args[1]))
+        if has_vfx2d && eid == 0 && cnt > 0 {
+            vfx2d.burst(cnt) or >>
+        }
+        ctx.vfx_events.push(VfxBurstEvent{
+            emitter_id: eid,
+            count: cnt,
+            is_pos_update: false,
+            pos: fm.vec3(0.0, 0.0, 0.0)
+        })
+        << 0.0
+    }
+    if fn_id == bc.HOST_VFX_SET_POS {
+        if args.len < 4 { >> errors.new("XuScript host: vfx_set_pos requires 4 args") }
+        eid := int(math.round(args[0]))
+        ctx.vfx_events.push(VfxBurstEvent{
+            emitter_id: eid,
+            count: 0,
+            is_pos_update: true,
+            pos: fm.vec3(args[1], args[2], args[3])
+        })
+        << 0.0
+    }
+
+    // Blackboard & Time bindings (701..704)
+    if fn_id == bc.HOST_BB_GET {
+        if args.len < 1 { >> errors.new("XuScript host: bb_get requires 1 arg") }
+        << ctx.get_bb(int(math.round(args[0])))
+    }
+    if fn_id == bc.HOST_BB_SET {
+        if args.len < 2 { >> errors.new("XuScript host: bb_set requires 2 args") }
+        ctx.set_bb(int(math.round(args[0])), args[1]) or >>
+        << args[1]
+    }
+    if fn_id == bc.HOST_TIME_ELAPSED { << ctx.elapsed }
+    if fn_id == bc.HOST_TIME_DELTA { << ctx.last_dt }
+
+    >> errors.new("XuScript host: unsupported host function ID " + str(fn_id))
+}
+
+pub fn (ctx $&ScriptHostContext) run_physics_process(
+    scripts $&host.SceneScripts,
+    tree $&nexus.SceneTree,
+    script_id int,
+    delta f64,
+    axis f64,
+    input_map &inp.InputMap,
+    has_phys bool,
+    phys_world $&phys.RigidWorld3D,
+    has_audio bool,
+    audio_mixer $&mixer.Mixer,
+    has_nav bool,
+    nav_mesh &nav.NavMesh3D,
+    has_vfx2d bool,
+    vfx2d $&vfx.ParticleSystem2D
+) f64 {
+    node := scripts.node_of(script_id) or >>
+    if !(tree.can_process(node) or >>) { << 0.0 }
+    $fiber := scripts.start_physics_fiber(tree, script_id, delta, axis) or >>
+    $calls := 0
+    while true {
+        out := scripts.resume_fiber(script_id, $&fiber) or >>
+        if out.status == vm.STEP_COMPLETED {
+            << out.value
+        }
+        if out.status != vm.STEP_HOST_CALL {
+            >> errors.new("XuScript host: physics_process cannot yield")
+        }
+        calls += 1
+        if calls > MAX_HOST_CALLS_PER_TICK {
+            >> errors.new("XuScript host: per-tick host call limit exceeded")
+        }
+        res := ctx.eval_host_call(node, out.host_fn, &out.host_args, tree, input_map,
+            has_phys, phys_world, has_audio, audio_mixer, has_nav, nav_mesh, has_vfx2d, vfx2d) or >>
+        fiber.provide_host_result(res) or >>
+    }
+    << 0.0
+}
+
+pub fn (ctx $&ScriptHostContext) tick_coroutines(
+    scheduler $&host.CoroutineScheduler,
+    scripts $&host.SceneScripts,
+    tree $&nexus.SceneTree,
+    dt f64,
+    input_map &inp.InputMap,
+    has_phys bool,
+    phys_world $&phys.RigidWorld3D,
+    has_audio bool,
+    audio_mixer $&mixer.Mixer,
+    has_nav bool,
+    nav_mesh &nav.NavMesh3D,
+    has_vfx2d bool,
+    vfx2d $&vfx.ParticleSystem2D
+) int {
+    ctx.advance_time(dt) or >>
+    handles := scheduler.prepare_tick(scripts, tree, dt) or >>
+    for h in handles {
+        sid := scheduler.task_script_id(h) or >>
+        node := scripts.node_of(sid) or >>
+        $calls := 0
+        $stepping := true
+        while stepping {
+            out := scheduler.step_task(scripts, h) or >>
+            if out.status == vm.STEP_HOST_CALL {
+                calls += 1
+                if calls > MAX_HOST_CALLS_PER_TICK {
+                    scheduler.cancel(h) or >>
+                    >> errors.new("XuScript host: coroutine per-tick host call limit exceeded")
+                }
+                res := ctx.eval_host_call(node, out.host_fn, &out.host_args, tree, input_map,
+                    has_phys, phys_world, has_audio, audio_mixer, has_nav, nav_mesh, has_vfx2d, vfx2d) or >>
+                scheduler.provide_host_result(h, res) or >>
+            } else {
+                stepping = false
+            }
+        }
+    }
+    << handles.len
+}

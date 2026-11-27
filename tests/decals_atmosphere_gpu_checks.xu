@@ -1,0 +1,502 @@
+@main
+
+#gpu
+#math
+#errors
+fm #"github.com/xulang-org/nexus/foundation/math"
+mesh #"github.com/xulang-org/nexus/resources/mesh"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+nexus #"github.com/xulang-org/nexus/scene"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+shd #"github.com/xulang-org/nexus/assets/shaders/three_d"
+modern #"github.com/xulang-org/nexus/integration/rendering/three_d"
+
+fn ch_r(c int) int { << (c >> 24) & 255 }
+fn ch_g(c int) int { << (c >> 16) & 255 }
+fn ch_b(c int) int { << (c >> 8) & 255 }
+fn abs_i(v int) int { if v < 0 { << -v } << v }
+fn luma(c int) int { << ch_r(c) + ch_g(c) + ch_b(c) }
+
+fn make_box_mesh(hx f64, hy f64, hz f64) mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    white := (255 << 24) | (255 << 16) | (255 << 8) | 255
+    // +Z front
+    p0 := fm.vec3(-hx, -hy, hz)
+    p1 := fm.vec3(hx, -hy, hz)
+    p2 := fm.vec3(hx, hy, hz)
+    p3 := fm.vec3(-hx, hy, hz)
+    // -Z back
+    p4 := fm.vec3(-hx, -hy, -hz)
+    p5 := fm.vec3(hx, -hy, -hz)
+    p6 := fm.vec3(hx, hy, -hz)
+    p7 := fm.vec3(-hx, hy, -hz)
+
+    nf := fm.vec3(0.0, 0.0, 1.0)
+    nb := fm.vec3(0.0, 0.0, -1.0)
+    nr := fm.vec3(1.0, 0.0, 0.0)
+    nl := fm.vec3(-1.0, 0.0, 0.0)
+    nu := fm.vec3(0.0, 1.0, 0.0)
+    nd := fm.vec3(0.0, -1.0, 0.0)
+
+    faces := [p0, p1, p2, p3, nf, p5, p4, p7, p6, nb, p1, p5, p6, p2, nr, p4, p0, p3, p7, nl, p3, p2, p6, p7, nu, p4, p5, p1, p0, nd]
+    for f in 0:6 {
+        base := d.vertices.len
+        fi := f * 5
+        n := faces[fi + 4]
+        a := faces[fi]
+        b := faces[fi + 1]
+        c := faces[fi + 2]
+        e := faces[fi + 3]
+        uvs := [fm.vec2(0.0, 0.0), fm.vec2(1.0, 0.0), fm.vec2(1.0, 1.0), fm.vec2(0.0, 1.0)]
+        pts := [a, b, c, e]
+        for k in 0:4 {
+            d.vertices.push(mesh.Vertex3D{position: pts[k], color: white, normal: n, uv: uvs[k], tangent: fm.vec4(0.0, 0.0, 0.0, 0.0), has_uv: true, has_tangent: false})
+        }
+        d.triangle(base, base + 1, base + 2) or >>
+        d.triangle(base, base + 2, base + 3) or >>
+    }
+    d.validate() or >>
+    << d
+}
+
+fn quad_xy_lit(w f64, h f64, n fm.Vec3) mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    white := (255 << 24) | (255 << 16) | (255 << 8) | 255
+    uvs := [fm.vec2(0.0, 0.0), fm.vec2(1.0, 0.0), fm.vec2(1.0, 1.0), fm.vec2(0.0, 1.0)]
+    pts := [fm.vec3(-w, -h, 0.0), fm.vec3(w, -h, 0.0), fm.vec3(w, h, 0.0), fm.vec3(-w, h, 0.0)]
+    for k in 0:4 {
+        d.vertices.push(mesh.Vertex3D{position: pts[k], color: white, normal: n, uv: uvs[k], tangent: fm.vec4(0.0, 0.0, 0.0, 0.0), has_uv: true, has_tangent: false})
+    }
+    d.triangle(0, 1, 2) or >>
+    d.triangle(0, 2, 3) or >>
+    d.validate() or >>
+    << d
+}
+
+fn quad_xz_lit(w f64, d_len f64) mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    white := (255 << 24) | (255 << 16) | (255 << 8) | 255
+    n := fm.vec3(0.0, 1.0, 0.0)
+    uvs := [fm.vec2(0.0, 0.0), fm.vec2(1.0, 0.0), fm.vec2(1.0, 1.0), fm.vec2(0.0, 1.0)]
+    pts := [fm.vec3(-w, 0.0, -d_len), fm.vec3(-w, 0.0, d_len), fm.vec3(w, 0.0, d_len), fm.vec3(w, 0.0, -d_len)]
+    for k in 0:4 {
+        d.vertices.push(mesh.Vertex3D{position: pts[k], color: white, normal: n, uv: uvs[k], tangent: fm.vec4(0.0, 0.0, 0.0, 0.0), has_uv: true, has_tangent: false})
+    }
+    d.triangle(0, 1, 2) or >>
+    d.triangle(0, 2, 3) or >>
+    d.validate() or >>
+    << d
+}
+
+fn run_checks() int {
+    w := 192
+    h := 144
+    aspect := f64(w) / f64(h)
+    z_near := 0.25
+    z_far := 120.0
+
+    prog := shd.load_mesh("build/mesh-shaders") or >>
+    cprog := shd.load_clustered_program("build/mesh-shaders") or >>
+    iprog := shd.load_indirect_program("build/mesh-shaders") or >>
+    pprog := shd.load_postprocess_program("build/mesh-shaders") or >>
+    vprog := shd.load_particle_program("build/mesh-shaders") or >>
+    dprog := shd.load_decal_program("build/mesh-shaders") or >>
+    aprog := shd.load_atmosphere_program("build/mesh-shaders") or >>
+
+    $device := ren.open_3d("Decals + Atmosphere GPU Checks", w, h, gpu.METAL, &prog) or >>
+    $mp := modern.new_modern_pipeline_3d(&device, &cprog, &iprog, &pprog) or >>
+    $dren := device.decal_renderer(&dprog) or >>
+    $aren := device.atmosphere_renderer(&aprog) or >>
+
+    $irr_grid := ren.irradiance_grid_3d(fm.vec3(-30.0, -5.0, -50.0), fm.vec3(60.0, 30.0, 60.0), 2, 2, 2) or >>
+    irr_grid.bake_hemisphere(fm.vec3(0.2, 0.25, 0.35), fm.vec3(0.1, 0.1, 0.1), fm.vec3(0.0, 1.0, 0.0), fm.vec3(0.1, 0.1, 0.1)) or >>
+    $irr_gpu := irr_grid.upload(&device) or >>
+    empty_tq := ren.new_transparent_queue_3d()
+    $empty_ps := device.gpu_particle_system(&vprog, 1, 1) or >>
+    empty_atm := ren.default_atmosphere_config_3d()
+
+    $pp_cfg := ren.post_process_defaults_3d()
+    pp_cfg.ao_enabled = false
+    pp_cfg.ssr_enabled = false
+    pp_cfg.bloom_enabled = false
+    pp_cfg.taa_enabled = false
+
+    wall_cpu := quad_xy_lit(5.0, 5.0, fm.vec3(0.0, 0.0, 1.0)) or >>
+    floor_cpu := quad_xz_lit(5.0, 5.0) or >>
+    pillar_cpu := make_box_mesh(0.85, 1.8, 0.85) or >>
+    tall_cpu := make_box_mesh(1.1, 7.0, 1.1) or >>
+
+    $wall_gpu := device.upload(&wall_cpu) or >>
+    $floor_gpu := device.upload(&floor_cpu) or >>
+    $pillar_gpu := device.upload(&pillar_cpu) or >>
+    $tall_gpu := device.upload(&tall_cpu) or >>
+
+    wall_mat := ren.material_3d(fm.vec3(0.45, 0.45, 0.45), 0.0, 0.85, fm.vec3(0.0, 0.0, 0.0)) or >>
+    dark_mat := ren.material_3d(fm.vec3(0.03, 0.03, 0.035), 0.0, 0.90, fm.vec3(0.0, 0.0, 0.0)) or >>
+
+    eye_d := fm.vec3(0.0, 0.0, 3.0)
+    view_d := nexus.look_at_3d(eye_d, fm.vec3(0.0, 0.0, 0.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+    proj := nexus.perspective_3d(0.95, aspect, z_near, z_far) or >>
+    key_sun := lights.directional(fm.vec3(0.0, 0.45, 0.89).normalized() or >>, fm.vec3(2.0, 2.0, 2.0)) or >>
+    suns_d := [key_sun]
+    mp.prepare_lights(&device, fm.vec3(0.32, 0.32, 0.32), eye_d, 1.0, &suns_d, view_d, proj, z_near, z_far) or >>
+
+    // --- 1a. Alpha-blended projected decal on grey wall + clean perimeter ---
+    $dq1 := ren.new_decal_queue_3d()
+    decal_rot := fm.rotation_x(1.57079632679) // local +Y -> +Z (wall normal)
+    w_scorch := decal_rot.multiply(fm.scale_3d(fm.vec3(1.6, 1.5, 1.6)))
+    $d1 := ren.default_decal_3d(w_scorch)
+    d1.albedo = fm.vec3(0.95, 0.05, 0.05)
+    d1.opacity = 0.92
+    d1.shape_mode = ren.DECAL_SHAPE_SOFT_DISC
+    dq1.submit(d1) or >>
+
+    w_refs := [wall_gpu.reference()]
+    w_worlds := [fm.identity_3d()]
+    w_mats := [wall_mat]
+    mp.render_unified_atmosphere_frame(
+        $&device, &w_refs, &w_worlds, &w_mats,
+        true, &dren, &dq1, false, &aren, &empty_atm,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &empty_ps,
+        eye_d, view_d, proj, z_near, z_far, 255, &pp_cfg
+    ) or >>
+    px_d1_in := device.read_pixel(w / 2, h / 2) or >>
+    px_d1_out := device.read_pixel(24, 24) or >>
+    device.present() or >>
+    if ch_r(px_d1_in) <= ch_g(px_d1_in) + 45 || abs_i(ch_r(px_d1_out) - ch_g(px_d1_out)) > 8 {
+        >> errors.new("decal 1a alpha projection failed center red / perimeter neutral check")
+    }
+
+    // --- 1b. Painter sort order (blue sort=10 over red sort=5 even when submitted in reverse) ---
+    $dq_sort := ren.new_decal_queue_3d()
+    $d_blue := d1
+    d_blue.albedo = fm.vec3(0.05, 0.12, 0.98)
+    d_blue.sort_order = 10
+    d1.sort_order = 5
+    dq_sort.submit(d_blue) or >> // submitted FIRST, sorted SECOND
+    dq_sort.submit(d1) or >>     // submitted SECOND, sorted FIRST
+    mp.render_unified_atmosphere_frame(
+        $&device, &w_refs, &w_worlds, &w_mats,
+        true, &dren, &dq_sort, false, &aren, &empty_atm,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &empty_ps,
+        eye_d, view_d, proj, z_near, z_far, 255, &pp_cfg
+    ) or >>
+    px_sort := device.read_pixel(w / 2, h / 2) or >>
+    device.present() or >>
+    if ch_b(px_sort) <= ch_r(px_sort) + 35 {
+        >> errors.new("decal 1b sort_order painter ordering failed")
+    }
+
+    // --- 1c. Surface-normal angle fade: floor (+Y) accepts decal, perpendicular wall (+Z) rejects ---
+    eye_ang := fm.vec3(0.0, 2.2, 3.8)
+    view_ang := nexus.look_at_3d(eye_ang, fm.vec3(0.0, 0.0, 0.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+    mp.prepare_lights(&device, fm.vec3(0.32, 0.32, 0.32), eye_ang, 1.0, &suns_d, view_ang, proj, z_near, z_far) or >>
+    corner_refs := [floor_gpu.reference(), wall_gpu.reference()]
+    corner_worlds := [fm.identity_3d(), fm.translation_3d(fm.vec3(0.0, 1.5, -1.5))]
+    corner_mats := [wall_mat, wall_mat]
+
+    $dq_ang := ren.new_decal_queue_3d()
+    // Box spans floor AND wall, oriented with decal_up = +Y (identity rotation)!
+    $d_ang := ren.default_decal_3d(fm.translation_3d(fm.vec3(0.0, 0.5, -1.0)).multiply(fm.scale_3d(fm.vec3(3.2, 2.4, 3.2))))
+    d_ang.albedo = fm.vec3(0.05, 0.95, 0.08)
+    d_ang.opacity = 0.95
+    d_ang.angle_fade = 0.45
+    d_ang.edge_fade = 0.0
+    d_ang.shape_mode = ren.DECAL_SHAPE_TEXTURED
+    dq_ang.submit(d_ang) or >>
+
+    mp.render_unified_atmosphere_frame(
+        $&device, &corner_refs, &corner_worlds, &corner_mats,
+        true, &dren, &dq_ang, false, &aren, &empty_atm,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &empty_ps,
+        eye_ang, view_ang, proj, z_near, z_far, 255, &pp_cfg
+    ) or >>
+    px_floor := device.read_pixel(w / 2, h / 2) or >>
+    px_wall := device.read_pixel(w / 2, 28) or >>
+    device.present() or >>
+    if ch_g(px_floor) <= ch_r(px_floor) + 35 || abs_i(ch_g(px_wall) - ch_r(px_wall)) > 12 {
+        >> errors.new("decal 1c angle_fade failed floor-accept / wall-reject check")
+    }
+
+    // --- 1d. Camera-inside-decal-box check (CULL_FRONT keeps box alive) ---
+    mp.prepare_lights(&device, fm.vec3(0.32, 0.32, 0.32), eye_d, 1.0, &suns_d, view_d, proj, z_near, z_far) or >>
+    $dq_in := ren.new_decal_queue_3d()
+    // Center at (0,0,1.5) with Y-depth 8.0 => extends well past eye_d (0,0,3.0) to z=+5.5!
+    w_big := fm.translation_3d(fm.vec3(0.0, 0.0, 1.5)).multiply(decal_rot).multiply(fm.scale_3d(fm.vec3(2.2, 8.0, 2.2)))
+    $d_in := ren.default_decal_3d(w_big)
+    d_in.albedo = fm.vec3(0.95, 0.05, 0.05)
+    d_in.opacity = 0.90
+    d_in.edge_fade = 0.0
+    d_in.shape_mode = ren.DECAL_SHAPE_SOFT_DISC
+    dq_in.submit(d_in) or >>
+    mp.render_unified_atmosphere_frame(
+        $&device, &w_refs, &w_worlds, &w_mats,
+        true, &dren, &dq_in, false, &aren, &empty_atm,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &empty_ps,
+        eye_d, view_d, proj, z_near, z_far, 255, &pp_cfg
+    ) or >>
+    px_inside := device.read_pixel(w / 2, h / 2) or >>
+    device.present() or >>
+    if ch_r(px_inside) <= ch_g(px_inside) + 35 {
+        >> errors.new("decal 1d camera-inside-box CULL_FRONT failed")
+    }
+
+    // --- 1e. Additive HDR Emissive Rune Ring + Bloom Halo ---
+    pp_cfg.bloom_enabled = true
+    pp_cfg.bloom_threshold = 1.0
+    pp_cfg.bloom_knee = 0.25
+    pp_cfg.bloom_intensity = 0.85
+
+    $dq_add := ren.new_decal_queue_3d()
+    $d_rune := ren.default_decal_3d(decal_rot.multiply(fm.scale_3d(fm.vec3(1.6, 1.5, 1.6))))
+    d_rune.albedo = fm.vec3(0.0, 0.0, 0.0)
+    d_rune.emission = fm.vec3(6.0, 2.2, 0.2)
+    d_rune.opacity = 1.0
+    d_rune.blend_mode = ren.DECAL_BLEND_ADDITIVE
+    d_rune.shape_mode = ren.DECAL_SHAPE_RING
+    d_rune.ring_inner = 0.45
+    dq_add.submit(d_rune) or >>
+
+    dark_mats := [dark_mat]
+    mp.render_unified_atmosphere_frame(
+        $&device, &w_refs, &w_worlds, &dark_mats,
+        true, &dren, &dq_add, false, &aren, &empty_atm,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &empty_ps,
+        eye_d, view_d, proj, z_near, z_far, 255, &pp_cfg
+    ) or >>
+    px_rune_core := device.read_pixel(w / 2 + 24, h / 2) or >>
+    px_rune_halo := device.read_pixel(w / 2, h / 2) or >>
+    px_rune_bg := device.read_pixel(12, 12) or >>
+    device.present() or >>
+    if ch_r(px_rune_halo) <= ch_r(px_rune_bg) + 6 || ch_r(px_rune_core) <= ch_r(px_rune_halo) {
+        >> errors.new("decal 1e additive HDR bloom halo failed")
+    }
+
+    // --- 2. Physical Atmospheric Sky Scattering: Noon Blue vs Sunset Red + Sun Disc ---
+    pp_cfg.bloom_enabled = false
+    empty_refs := []ren.MeshRef3D{}
+    empty_worlds := []fm.Mat4{}
+    empty_mats := []ren.Material3D{}
+    empty_dq := ren.new_decal_queue_3d()
+
+    sky_eye := fm.vec3(0.0, 2.0, 0.0)
+    sky_view := nexus.look_at_3d(sky_eye, fm.vec3(0.0, 6.5, -10.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+
+    // 2a. Noon sky (high sun -> Rayleigh blue sky)
+    $atm_noon := ren.default_atmosphere_config_3d()
+    atm_noon.fog_enabled = false
+    atm_noon.sun_direction = fm.vec3(0.2, 0.90, 0.38).normalized() or >>
+    mp.prepare_lights(&device, fm.vec3(0.1, 0.1, 0.1), sky_eye, 1.0, &suns_d, sky_view, proj, z_near, z_far) or >>
+    mp.render_unified_atmosphere_frame(
+        $&device, &empty_refs, &empty_worlds, &empty_mats,
+        false, &dren, &empty_dq, true, &aren, &atm_noon,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &empty_ps,
+        sky_eye, sky_view, proj, z_near, z_far, 255, &pp_cfg
+    ) or >>
+    px_noon := device.read_pixel(w / 2, h / 2) or >>
+    device.present() or >>
+    if ch_b(px_noon) <= ch_r(px_noon) + 25 {
+        >> errors.new("sky 2a noon sky not Rayleigh blue: rgb=(" + str(ch_r(px_noon)) + "," + str(ch_g(px_noon)) + "," + str(ch_b(px_noon)) + ")")
+    }
+
+    // 2b/2c. Sunset sky + Sun Disc facing horizon toward sun
+    $atm_sunset := ren.default_atmosphere_config_3d()
+    atm_sunset.fog_enabled = false
+    atm_sunset.mie_scale = 2.2
+    atm_sunset.sun_direction = fm.vec3(0.0, 0.07, -0.9975).normalized() or >>
+    sun_look := nexus.look_at_3d(sky_eye, sky_eye.add(atm_sunset.sun_direction.scaled(10.0)), fm.vec3(0.0, 1.0, 0.0)) or >>
+    mp.prepare_lights(&device, fm.vec3(0.1, 0.1, 0.1), sky_eye, 1.0, &suns_d, sun_look, proj, z_near, z_far) or >>
+    mp.render_unified_atmosphere_frame(
+        $&device, &empty_refs, &empty_worlds, &empty_mats,
+        false, &dren, &empty_dq, true, &aren, &atm_sunset,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &empty_ps,
+        sky_eye, sun_look, proj, z_near, z_far, 255, &pp_cfg
+    ) or >>
+    px_sun_disc := device.read_pixel(w / 2, h / 2) or >>
+    px_sunset_side := device.read_pixel(16, h / 2) or >>
+    device.present() or >>
+    if ch_r(px_sunset_side) <= ch_b(px_sunset_side) + 20 || luma(px_sun_disc) <= luma(px_sunset_side) + 50 {
+        >> errors.new("sky 2b/2c sunset check failed: disc=(" + str(ch_r(px_sun_disc)) + "," + str(ch_g(px_sun_disc)) + "," + str(ch_b(px_sun_disc)) + ") side=(" + str(ch_r(px_sunset_side)) + "," + str(ch_g(px_sunset_side)) + "," + str(ch_b(px_sunset_side)) + ")")
+    }
+
+    // --- 3. 3D Froxel Volumetric Fog ---
+    // 3a. Distance fog: dark pillars at z=-5m (left) vs z=-28m (right)
+    fog_eye := fm.vec3(0.0, 1.8, 0.0)
+    fog_view := nexus.look_at_3d(fog_eye, fm.vec3(0.0, 1.8, -10.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+    $fog_cfg := ren.default_atmosphere_config_3d()
+    fog_cfg.sky_enabled = true
+    fog_cfg.fog_enabled = true
+    fog_cfg.fog_near = 0.5
+    fog_cfg.fog_far = 60.0
+    fog_cfg.fog_density = 0.065
+    fog_cfg.fog_height_falloff = 0.01
+    fog_cfg.fog_ambient = fm.vec3(0.55, 0.65, 0.85)
+    fog_cfg.sun_direction = fm.vec3(0.0, 0.35, -0.936).normalized() or >>
+    fog_cfg.fog_anisotropy = 0.78
+    fog_cfg.sun_shaft_boost = 2.0
+
+    dist_refs := [pillar_gpu.reference(), pillar_gpu.reference()]
+    dist_worlds := [fm.translation_3d(fm.vec3(-1.8, 1.8, -5.0)), fm.translation_3d(fm.vec3(6.5, 1.8, -26.0))]
+    dist_mats := [dark_mat, dark_mat]
+    fog_dir := lights.directional(fog_cfg.sun_direction, fm.vec3(1.5, 1.4, 1.3)) or >>
+    f_lights := [fog_dir]
+    mp.prepare_lights(&device, fm.vec3(0.04, 0.04, 0.04), fog_eye, 1.0, &f_lights, fog_view, proj, z_near, z_far) or >>
+
+    mp.render_unified_atmosphere_frame(
+        $&device, &dist_refs, &dist_worlds, &dist_mats,
+        false, &dren, &empty_dq, true, &aren, &fog_cfg,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &empty_ps,
+        fog_eye, fog_view, proj, z_near, z_far, 255, &pp_cfg
+    ) or >>
+    px_near := device.read_pixel(54, h / 2) or >>
+    px_far := device.read_pixel(130, h / 2) or >>
+    device.present() or >>
+    if luma(px_far) <= luma(px_near) + 25 {
+        >> errors.new("fog 3a distance fog attenuation check failed")
+    }
+
+    // 3b. Exponential height fog: vertical pillar at z=-16m, bottom pixel vs high pixel
+    hfog_eye := fm.vec3(0.0, 5.5, 0.0)
+    hfog_view := nexus.look_at_3d(hfog_eye, fm.vec3(0.0, 5.5, -16.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+    $hfog := fog_cfg
+    hfog.fog_density = 0.16
+    hfog.fog_height_falloff = 0.35
+    hfog.fog_base_height = 0.0
+    hfog.fog_anisotropy = 0.0
+    hfog.sun_shaft_boost = 0.2
+    t_refs := [tall_gpu.reference()]
+    t_worlds := [fm.translation_3d(fm.vec3(0.0, 6.0, -16.0))]
+    t_mats := [dark_mat]
+    mp.prepare_lights(&device, fm.vec3(0.04, 0.04, 0.04), hfog_eye, 1.0, &f_lights, hfog_view, proj, z_near, z_far) or >>
+    mp.render_unified_atmosphere_frame(
+        $&device, &t_refs, &t_worlds, &t_mats,
+        false, &dren, &empty_dq, true, &aren, &hfog,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &empty_ps,
+        hfog_eye, hfog_view, proj, z_near, z_far, 255, &pp_cfg
+    ) or >>
+    px_low_fog := device.read_pixel(w / 2, h - 20) or >>
+    px_high_fog := device.read_pixel(w / 2, 20) or >>
+    device.present() or >>
+    if luma(px_low_fog) <= luma(px_high_fog) + 20 {
+        >> errors.new("fog 3b height falloff ground>high check failed: low=(" + str(ch_r(px_low_fog)) + "," + str(ch_g(px_low_fog)) + "," + str(ch_b(px_low_fog)) + ") high=(" + str(ch_r(px_high_fog)) + "," + str(ch_g(px_high_fog)) + "," + str(ch_b(px_high_fog)) + ")")
+    }
+
+    // 3c. Henyey-Greenstein sun forward vs back anisotropy (wall ahead vs sun in front vs sun behind)
+    bw_refs := [wall_gpu.reference()]
+    bw_worlds := [fm.translation_3d(fm.vec3(0.0, 1.8, -22.0))]
+    bw_mats := [dark_mat]
+    $ani_cfg := fog_cfg
+    ani_cfg.fog_density = 0.075
+    ani_cfg.fog_height_falloff = 0.0
+    ani_cfg.fog_ambient = fm.vec3(0.05, 0.05, 0.06)
+    ani_cfg.fog_anisotropy = 0.80
+    ani_cfg.sun_shaft_boost = 2.5
+    ani_cfg.sun_direction = fm.vec3(0.0, 0.15, -0.988).normalized() or >> // Sun in FRONT
+    mp.prepare_lights(&device, fm.vec3(0.02, 0.02, 0.02), fog_eye, 1.0, &f_lights, fog_view, proj, z_near, z_far) or >>
+    mp.render_unified_atmosphere_frame(
+        $&device, &bw_refs, &bw_worlds, &bw_mats,
+        false, &dren, &empty_dq, true, &aren, &ani_cfg,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &empty_ps,
+        fog_eye, fog_view, proj, z_near, z_far, 255, &pp_cfg
+    ) or >>
+    px_fwd := device.read_pixel(w / 2, h / 2) or >>
+    device.present() or >>
+
+    ani_cfg.sun_direction = fm.vec3(0.0, 0.15, 0.988).normalized() or >> // Sun BEHIND
+    mp.render_unified_atmosphere_frame(
+        $&device, &bw_refs, &bw_worlds, &bw_mats,
+        false, &dren, &empty_dq, true, &aren, &ani_cfg,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &empty_ps,
+        fog_eye, fog_view, proj, z_near, z_far, 255, &pp_cfg
+    ) or >>
+    px_back := device.read_pixel(w / 2, h / 2) or >>
+    device.present() or >>
+    if luma(px_fwd) <= luma(px_back) + 25 {
+        >> errors.new("fog 3c HG forward anisotropy check failed")
+    }
+
+    // 3d. Local colored point-light volumetric halo floating in mid-air before far dark wall
+    mag_pt := lights.point(fm.vec3(0.0, 1.8, -8.0), fm.vec3(28.0, 1.0, 26.0), 7.5) or >>
+    pt_lights := [mag_pt]
+    mp.prepare_lights(&device, fm.vec3(0.01, 0.01, 0.01), fog_eye, 1.0, &pt_lights, fog_view, proj, z_near, z_far) or >>
+    $halo_cfg := ani_cfg
+    halo_cfg.fog_density = 0.08
+    halo_cfg.fog_ambient = fm.vec3(0.02, 0.02, 0.02)
+    halo_cfg.sun_shaft_boost = 0.0
+    halo_cfg.local_light_boost = 3.0
+    halo_cfg.fog_anisotropy = 0.45
+    mp.render_unified_atmosphere_frame(
+        $&device, &bw_refs, &bw_worlds, &bw_mats,
+        false, &dren, &empty_dq, true, &aren, &halo_cfg,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &empty_ps,
+        fog_eye, fog_view, proj, z_near, z_far, 255, &pp_cfg
+    ) or >>
+    px_pt_halo := device.read_pixel(w / 2, h / 2) or >>
+    px_pt_edge := device.read_pixel(12, h / 2) or >>
+    device.present() or >>
+    if ch_r(px_pt_halo) <= ch_g(px_pt_halo) + 25 || ch_b(px_pt_halo) <= ch_g(px_pt_halo) + 25 ||
+        luma(px_pt_halo) <= luma(px_pt_edge) + 20 {
+        >> errors.new("fog 3d local point-light magenta volumetric halo failed")
+    }
+
+    // --- 4. Unified frame: opaque pillar + projected decal + froxel fog + Rayleigh noon sky + Bloom ---
+    pp_cfg.bloom_enabled = true
+    $uni_atm := ren.default_atmosphere_config_3d()
+    uni_atm.fog_density = 0.04
+    uni_atm.fog_height_falloff = 0.05
+    uni_atm.sun_direction = fm.vec3(0.25, 0.85, 0.45).normalized() or >>
+    uni_sun := lights.directional(uni_atm.sun_direction, fm.vec3(1.8, 1.8, 1.7)) or >>
+    uni_lights := [uni_sun]
+    mp.prepare_lights(&device, fm.vec3(0.20, 0.22, 0.25), fog_eye, 1.0, &uni_lights, fog_view, proj, z_near, z_far) or >>
+
+    $dq_uni := ren.new_decal_queue_3d()
+    $d_uni := ren.default_decal_3d(fm.translation_3d(fm.vec3(0.0, 1.8, -5.1)).multiply(decal_rot).multiply(fm.scale_3d(fm.vec3(1.5, 1.8, 1.5))))
+    d_uni.albedo = fm.vec3(0.95, 0.08, 0.05)
+    d_uni.opacity = 0.95
+    dq_uni.submit(d_uni) or >>
+    uni_refs := [pillar_gpu.reference()]
+    uni_worlds := [fm.translation_3d(fm.vec3(0.0, 1.8, -6.0))]
+    uni_mats := [wall_mat]
+    mp.render_unified_atmosphere_frame(
+        $&device, &uni_refs, &uni_worlds, &uni_mats,
+        true, &dren, &dq_uni, true, &aren, &uni_atm,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &empty_ps,
+        fog_eye, fog_view, proj, z_near, z_far, 255, &pp_cfg
+    ) or >>
+    px_uni_decal := device.read_pixel(w / 2, h / 2) or >>
+    px_uni_sky := device.read_pixel(16, 16) or >>
+    device.present() or >>
+    if ch_r(px_uni_decal) <= ch_g(px_uni_decal) + 35 || ch_b(px_uni_sky) <= ch_r(px_uni_sky) + 20 {
+        >> errors.new("unified atmosphere frame failed simultaneous decal + blue sky check")
+    }
+
+    empty_ps.close() or >>
+    irr_gpu.close() or >>
+    wall_gpu.close() or >>
+    floor_gpu.close() or >>
+    pillar_gpu.close() or >>
+    tall_gpu.close() or >>
+    aren.close() or >>
+    dren.close() or >>
+    mp.close() or >>
+    device.close() or >>
+
+    println("PASS: Projected Decals + Froxel Volumetric Fog + Rayleigh/Mie Sky (decal_r=" + str(ch_r(px_d1_in)) +
+        ", sort_b=" + str(ch_b(px_sort)) + ", floor_g=" + str(ch_g(px_floor)) +
+        ", wall_g=" + str(ch_g(px_wall)) + ", inside_r=" + str(ch_r(px_inside)) +
+        ", bloom_halo=" + str(ch_r(px_rune_bg)) + "->" + str(ch_r(px_rune_halo)) + "->" + str(ch_r(px_rune_core)) +
+        ", noon_b=" + str(ch_b(px_noon)) + ", sunset_r=" + str(ch_r(px_sunset_side)) +
+        ", sun_luma=" + str(luma(px_sun_disc)) + ", fog_dist=" + str(luma(px_near)) + "->" + str(luma(px_far)) +
+        ", fog_h=" + str(luma(px_low_fog)) + ">" + str(luma(px_high_fog)) +
+        ", hg_ani=" + str(luma(px_fwd)) + ">" + str(luma(px_back)) +
+        ", pt_halo=(" + str(ch_r(px_pt_halo)) + "," + str(ch_g(px_pt_halo)) + "," + str(ch_b(px_pt_halo)) + "))")
+    << 0
+}
+
+fn main() int {
+    run_checks() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

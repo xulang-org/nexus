@@ -1,0 +1,1078 @@
+@"github.com/xulang-org/nexus/console"
+
+plat #"github.com/xulang-org/nexus/platform/console"
+rc #"github.com/xulang-org/nexus/resources/console"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#encoding/json
+#errors
+#math
+#os
+#path/filepath
+#strconv
+#strings
+
+pub const BACKEND_NONE = 0
+pub const BACKEND_NATIVE = 1
+pub const BACKEND_LOCAL_MOCK = 2
+
+const MAX_EVENTS = 256
+const MAX_SAVE_FILE_BYTES = 16777216
+
+struct ConsoleAchRecord {
+    id string
+    numeric_id int
+    unlocked bool
+    progress_pct int
+}
+
+pub struct ConsoleService {
+    platform_id int
+    hw rc.ConsoleHardwareProfile
+    backend int
+    initialized bool
+    save_dir string
+    quota_bytes int
+    xbox_cfg rc.XboxAppConfig
+    ps_cfg rc.PlayStationAppConfig
+    switch_cfg rc.SwitchAppConfig
+    user rc.ConsoleUser
+    lifecycle int
+    confirm_layout int
+    safe_pct int
+    op_mode int
+    npad_style_val int
+    controller_disconnected bool
+    presence string
+    active_activity string
+    ach_map map[string]ConsoleAchRecord
+    ach_keys []string
+    save_mem map[string][]u8
+    save_keys []string
+    entitlements map[string]bool
+    entitlement_keys []string
+    haptics map[int]rc.GamepadHapticCommand
+    haptic_keys []int
+    session rc.ConsoleSessionInfo
+    next_session_id int
+    events []rc.ConsoleEvent
+}
+
+fn empty_session() rc.ConsoleSessionInfo {
+    << rc.ConsoleSessionInfo{session_id: 0, max_players: 0, crossplay: false, active: false}
+}
+
+fn resolve_hw_profile(platform int) rc.ConsoleHardwareProfile {
+    hw := rc.hardware_profile(platform) or (err) {
+        _ := err.msg()
+        << rc.ConsoleHardwareProfile{
+            platform: platform, name: "Console", gfx_api: rc.GFX_D3D12,
+            target_width: 1920, target_height: 1080, max_refresh_hz: 60,
+            memory_budget_mb: 8192, tv_safe_area_pct: 90,
+            supports_hdr: true, supports_vrr: false, supports_spatial_audio: true
+        }
+    }
+    << hw
+}
+
+fn new_shell(platform int, backend int, quota_mb int, xcfg rc.XboxAppConfig,
+        pcfg rc.PlayStationAppConfig, scfg rc.SwitchAppConfig) ConsoleService {
+    hw := resolve_hw_profile(platform)
+    $safe := hw.tv_safe_area_pct
+    $cf := rc.CONFIRM_CROSS_A
+    $om := rc.OPERATION_MODE_DOCKED
+    $np := rc.NPAD_PRO_CONTROLLER
+    if rc.is_switch_platform(platform) {
+        safe = 100
+        cf = rc.CONFIRM_SWITCH_A_EAST
+        om = rc.OPERATION_MODE_HANDHELD
+        np = rc.NPAD_HANDHELD
+    }
+    << ConsoleService{
+        platform_id: platform,
+        hw: hw,
+        backend: backend,
+        initialized: true,
+        save_dir: "",
+        quota_bytes: quota_mb * 1024 * 1024,
+        xbox_cfg: xcfg,
+        ps_cfg: pcfg,
+        switch_cfg: scfg,
+        user: rc.ConsoleUser{
+            user_id: "",
+            display_name: "",
+            signed_in: false,
+            is_guest: false,
+            has_multiplayer_privilege: false,
+            crossplay_allowed: false
+        },
+        lifecycle: rc.LIFECYCLE_ACTIVE,
+        confirm_layout: cf,
+        safe_pct: safe,
+        op_mode: om,
+        npad_style_val: np,
+        controller_disconnected: false,
+        presence: "",
+        active_activity: "",
+        ach_map: map[string]ConsoleAchRecord{},
+        ach_keys: []string{},
+        save_mem: map[string][]u8{},
+        save_keys: []string{},
+        entitlements: map[string]bool{},
+        entitlement_keys: []string{},
+        haptics: map[int]rc.GamepadHapticCommand{},
+        haptic_keys: []int{},
+        session: empty_session(),
+        next_session_id: 5001,
+        events: []rc.ConsoleEvent{}
+    }
+}
+
+pub fn empty_service() ConsoleService {
+    $s := new_shell(rc.PLATFORM_XBOX_SERIES_X, BACKEND_NONE, 64,
+        rc.default_xbox_config(), rc.default_ps_config(), rc.default_switch_config())
+    s.initialized = false
+    << s
+}
+
+fn push_unique_str(list $&[]string, key string) {
+    for i in 0:list.len {
+        if list[i] == key { << }
+    }
+    list.push(key)
+}
+
+fn push_unique_int(list $&[]int, key int) {
+    for i in 0:list.len {
+        if list[i] == key { << }
+    }
+    list.push(key)
+}
+
+fn push_event(c $&ConsoleService, ev rc.ConsoleEvent) {
+    if c.events.len >= MAX_EVENTS { << }
+    c.events.push(ev)
+}
+
+fn path_exists(p &string) bool {
+    _ := os.stat(p + "") or (err) { << false }
+    << true
+}
+
+fn clone_bytes(src &[]u8) []u8 {
+    $out := []u8{}
+    for i in 0:src.len { out.push(src[i]) }
+    << out
+}
+
+fn bytes_to_str(src &[]u8) string {
+    $b := strings.new_byte_builder(src.len + 1)
+    for i in 0:src.len { b.write_byte(int(src[i])) }
+    << b.to_string()
+}
+
+fn str_to_bytes(raw &string) []u8 {
+    $out := []u8{}
+    for i in 0:raw.len { out.push(u8(raw[i] & 255)) }
+    << out
+}
+
+fn ach_key_for_platform(platform_id int, id &string, numeric_id int) string {
+    if rc.is_playstation_platform(platform_id) { << "N:" + str(numeric_id) }
+    if id.len > 0 { << "S:" + id + "" }
+    << "N:" + str(numeric_id)
+}
+
+fn ach_key(id &string, numeric_id int) string {
+    if id.len > 0 { << "S:" + id + "" }
+    << "N:" + str(numeric_id)
+}
+
+fn save_slot_key(container &string, blob &string) string {
+    << container + "/" + blob + ""
+}
+
+fn load_mock_state(c $&ConsoleService) int {
+    if c.save_dir.len == 0 { << 0 }
+    state_path := filepath.join([c.save_dir + "", "console_state.json"])
+    if !path_exists(&state_path) { << 0 }
+    raw := snapshot.read(state_path + "", 4194304) or >>
+    doc := json.parse_max(&raw, 4194304)
+    if !doc.ok() { >> errors.new("nexus console state JSON: " + doc.error()) }
+    root := doc.root()
+    if !doc.is_dict(root) { >> errors.new("nexus console: invalid state root") }
+    if doc.has(root, "achievements") {
+        al := doc.get(root, "achievements")
+        if doc.is_dict(al) {
+            keys := doc.dict_keys(al)
+            for k in keys {
+                ak := k + ""
+                n := doc.get(al, ak + "")
+                c.ach_map[ak + ""] = ConsoleAchRecord{
+                    id: doc.as_string(doc.get(n, "id")) or >>,
+                    numeric_id: doc.as_int(doc.get(n, "numeric_id")) or >>,
+                    unlocked: doc.as_bool(doc.get(n, "unlocked")) or >>,
+                    progress_pct: doc.as_int(doc.get(n, "progress_pct")) or >>
+                }
+                push_unique_str($&c.ach_keys, ak + "")
+            }
+        }
+    }
+    if doc.has(root, "saves") {
+        sl := doc.get(root, "saves")
+        if doc.is_list(sl) {
+            c.save_keys = []string{}
+            for i in 0:doc.count(sl) {
+                sk := doc.as_string(doc.at(sl, i)) or >>
+                c.save_keys.push(sk)
+            }
+        }
+    }
+    if doc.has(root, "entitlements") {
+        el := doc.get(root, "entitlements")
+        if doc.is_list(el) {
+            for i in 0:doc.count(el) {
+                ek := doc.as_string(doc.at(el, i)) or >>
+                c.entitlements[ek + ""] = true
+                push_unique_str($&c.entitlement_keys, ek + "")
+            }
+        }
+    }
+    << 0
+}
+
+fn save_mock_state(c &ConsoleService) int {
+    if c.save_dir.len == 0 { << 0 }
+    os.mkdir_all(c.save_dir + "") or >>
+    $b := strings.new_byte_builder(1024)
+    b.write_str("{\n  \"achievements\": {")
+    for i in 0:c.ach_keys.len {
+        if i > 0 { b.write_str(", ") }
+        ak := c.ach_keys[i] + ""
+        key_var := c.ach_keys[i] + ""
+        rec := &c.ach_map[key_var]
+        rid := rec.id + ""
+        $un := "false"
+        if rec.unlocked { un = "true" }
+        b.write_str(json.quote(&ak) + ": {\"id\": " + json.quote(&rid) +
+            ", \"numeric_id\": " + str(rec.numeric_id) +
+            ", \"unlocked\": " + un +
+            ", \"progress_pct\": " + str(rec.progress_pct) + "}")
+    }
+    b.write_str("},\n  \"saves\": [")
+    for i in 0:c.save_keys.len {
+        if i > 0 { b.write_str(", ") }
+        sk := c.save_keys[i] + ""
+        b.write_str(json.quote(&sk))
+    }
+    b.write_str("],\n  \"entitlements\": [")
+    $first_e := true
+    for i in 0:c.entitlement_keys.len {
+        ek := c.entitlement_keys[i] + ""
+        if c.entitlements.has(ek + "") && c.entitlements[ek + ""] {
+            if !first_e { b.write_str(", ") }
+            first_e = false
+            b.write_str(json.quote(&ek))
+        }
+    }
+    b.write_str("]\n}\n")
+    raw := b.to_string()
+    snapshot.write_atomic(filepath.join([c.save_dir + "", "console_state.json"]), &raw) or >>
+    << 0
+}
+
+fn populate_native_user(c $&ConsoleService) {
+    $ibuf := plat.alloc_u8(128)
+    ilen := plat.raw_user_id($&ibuf)
+    uid := plat.u8_to_str(&ibuf, ilen)
+    $nbuf := plat.alloc_u8(128)
+    nlen := plat.raw_user_name($&nbuf)
+    uname := plat.u8_to_str(&nbuf, nlen)
+    flags := plat.raw_user_flags()
+    c.user = rc.ConsoleUser{
+        user_id: uid,
+        display_name: uname,
+        signed_in: (flags & 1) != 0,
+        is_guest: (flags & 2) != 0,
+        has_multiplayer_privilege: (flags & 4) != 0,
+        crossplay_allowed: (flags & 8) != 0
+    }
+    c.confirm_layout = plat.raw_confirm_button()
+    sp := plat.raw_safe_area_percent()
+    if sp > 0 { c.safe_pct = sp }
+    if rc.is_switch_platform(c.platform_id) {
+        c.op_mode = plat.raw_operation_mode()
+        c.npad_style_val = plat.raw_npad_style()
+    }
+}
+
+pub fn init_xbox_native(cfg rc.XboxAppConfig, platform int) ConsoleService {
+    if !rc.is_xbox_platform(platform) { >> errors.new("nexus console: invalid Xbox platform id") }
+    rc.validate_xbox_config(&cfg) or >>
+    plat.checked(plat.raw_init(platform)) or >>
+    $s := new_shell(platform, BACKEND_NATIVE, cfg.save_quota_mb, cfg, rc.default_ps_config(), rc.default_switch_config())
+    populate_native_user($&s)
+    push_event($&s, rc.ConsoleEvent{kind: rc.EVENT_USER_SIGNED_IN, code: 0, text: s.user.display_name + ""})
+    << s
+}
+
+pub fn init_xbox_mock(cfg rc.XboxAppConfig, platform int, save_dir string, gamertag string) ConsoleService {
+    if !rc.is_xbox_platform(platform) { >> errors.new("nexus console: invalid Xbox platform id") }
+    rc.validate_xbox_config(&cfg) or >>
+    if gamertag.len == 0 { >> errors.new("nexus console: Xbox gamertag must not be empty") }
+    $s := new_shell(platform, BACKEND_LOCAL_MOCK, cfg.save_quota_mb, cfg, rc.default_ps_config(), rc.default_switch_config())
+    s.save_dir = save_dir + ""
+    s.user = rc.ConsoleUser{
+        user_id: "xuid:2533274790000001",
+        display_name: gamertag + "",
+        signed_in: true,
+        is_guest: false,
+        has_multiplayer_privilege: true,
+        crossplay_allowed: s.xbox_cfg.supports_crossplay
+    }
+    load_mock_state($&s) or >>
+    push_event($&s, rc.ConsoleEvent{kind: rc.EVENT_USER_SIGNED_IN, code: 0, text: gamertag + ""})
+    << s
+}
+
+pub fn init_xbox_auto(cfg rc.XboxAppConfig, platform int, fallback_save_dir string) ConsoleService {
+    if !rc.is_xbox_platform(platform) { >> errors.new("nexus console: invalid Xbox platform id") }
+    rc.validate_xbox_config(&cfg) or >>
+    if plat.raw_is_available(platform) == 1 {
+        res := init_xbox_native(cfg.clone(), platform) or (err) {
+            _ := err.msg()
+            << init_xbox_mock(cfg.clone(), platform, fallback_save_dir + "", "XboxPlayer") or >>
+        }
+        << res
+    }
+    << init_xbox_mock(cfg, platform, fallback_save_dir + "", "XboxPlayer") or >>
+}
+
+pub fn init_ps_native(cfg rc.PlayStationAppConfig, platform int) ConsoleService {
+    if !rc.is_playstation_platform(platform) { >> errors.new("nexus console: invalid PlayStation platform id") }
+    rc.validate_ps_config(&cfg) or >>
+    plat.checked(plat.raw_init(platform)) or >>
+    $s := new_shell(platform, BACKEND_NATIVE, cfg.save_quota_mb, rc.default_xbox_config(), cfg, rc.default_switch_config())
+    populate_native_user($&s)
+    push_event($&s, rc.ConsoleEvent{kind: rc.EVENT_USER_SIGNED_IN, code: 0, text: s.user.display_name + ""})
+    << s
+}
+
+pub fn init_ps_mock(cfg rc.PlayStationAppConfig, platform int, save_dir string, online_id string) ConsoleService {
+    if !rc.is_playstation_platform(platform) { >> errors.new("nexus console: invalid PlayStation platform id") }
+    rc.validate_ps_config(&cfg) or >>
+    if online_id.len == 0 { >> errors.new("nexus console: PSN online_id must not be empty") }
+    $s := new_shell(platform, BACKEND_LOCAL_MOCK, cfg.save_quota_mb, rc.default_xbox_config(), cfg, rc.default_switch_config())
+    s.save_dir = save_dir + ""
+    s.user = rc.ConsoleUser{
+        user_id: "psn:1000000000000001",
+        display_name: online_id + "",
+        signed_in: true,
+        is_guest: false,
+        has_multiplayer_privilege: true,
+        crossplay_allowed: s.ps_cfg.supports_crossplay
+    }
+    load_mock_state($&s) or >>
+    push_event($&s, rc.ConsoleEvent{kind: rc.EVENT_USER_SIGNED_IN, code: 0, text: online_id + ""})
+    << s
+}
+
+pub fn init_ps_auto(cfg rc.PlayStationAppConfig, platform int, fallback_save_dir string) ConsoleService {
+    if !rc.is_playstation_platform(platform) { >> errors.new("nexus console: invalid PlayStation platform id") }
+    rc.validate_ps_config(&cfg) or >>
+    if plat.raw_is_available(platform) == 1 {
+        res := init_ps_native(cfg.clone(), platform) or (err) {
+            _ := err.msg()
+            << init_ps_mock(cfg.clone(), platform, fallback_save_dir + "", "PSNPlayer") or >>
+        }
+        << res
+    }
+    << init_ps_mock(cfg, platform, fallback_save_dir + "", "PSNPlayer") or >>
+}
+
+pub fn init_switch_native(cfg rc.SwitchAppConfig, platform int) ConsoleService {
+    if !rc.is_switch_platform(platform) { >> errors.new("nexus console: invalid Switch platform id") }
+    rc.validate_switch_config(&cfg) or >>
+    plat.checked(plat.raw_init(platform)) or >>
+    $s := new_shell(platform, BACKEND_NATIVE, cfg.save_quota_mb, rc.default_xbox_config(), rc.default_ps_config(), cfg)
+    populate_native_user($&s)
+    push_event($&s, rc.ConsoleEvent{kind: rc.EVENT_USER_SIGNED_IN, code: 0, text: s.user.display_name + ""})
+    << s
+}
+
+pub fn init_switch_mock(cfg rc.SwitchAppConfig, platform int, save_dir string, nickname string) ConsoleService {
+    if !rc.is_switch_platform(platform) { >> errors.new("nexus console: invalid Switch platform id") }
+    rc.validate_switch_config(&cfg) or >>
+    if nickname.len == 0 { >> errors.new("nexus console: Nintendo Account nickname must not be empty") }
+    $s := new_shell(platform, BACKEND_LOCAL_MOCK, cfg.save_quota_mb, rc.default_xbox_config(), rc.default_ps_config(), cfg)
+    s.save_dir = save_dir + ""
+    s.user = rc.ConsoleUser{
+        user_id: "nsa:0100000000000001",
+        display_name: nickname + "",
+        signed_in: true,
+        is_guest: false,
+        has_multiplayer_privilege: true,
+        crossplay_allowed: s.switch_cfg.supports_crossplay
+    }
+    load_mock_state($&s) or >>
+    push_event($&s, rc.ConsoleEvent{kind: rc.EVENT_USER_SIGNED_IN, code: 0, text: nickname + ""})
+    << s
+}
+
+pub fn init_switch_auto(cfg rc.SwitchAppConfig, platform int, fallback_save_dir string) ConsoleService {
+    if !rc.is_switch_platform(platform) { >> errors.new("nexus console: invalid Switch platform id") }
+    rc.validate_switch_config(&cfg) or >>
+    if plat.raw_is_available(platform) == 1 {
+        res := init_switch_native(cfg.clone(), platform) or (err) {
+            _ := err.msg()
+            << init_switch_mock(cfg.clone(), platform, fallback_save_dir + "", "SwitchPlayer") or >>
+        }
+        << res
+    }
+    << init_switch_mock(cfg, platform, fallback_save_dir + "", "SwitchPlayer") or >>
+}
+
+pub fn (c &ConsoleService) platform() int { << c.platform_id }
+pub fn (c &ConsoleService) hardware() rc.ConsoleHardwareProfile {
+    << rc.ConsoleHardwareProfile{
+        platform: c.hw.platform,
+        name: c.hw.name + "",
+        gfx_api: c.hw.gfx_api,
+        target_width: c.hw.target_width,
+        target_height: c.hw.target_height,
+        max_refresh_hz: c.hw.max_refresh_hz,
+        memory_budget_mb: c.hw.memory_budget_mb,
+        tv_safe_area_pct: c.hw.tv_safe_area_pct,
+        supports_hdr: c.hw.supports_hdr,
+        supports_vrr: c.hw.supports_vrr,
+        supports_spatial_audio: c.hw.supports_spatial_audio
+    }
+}
+pub fn (c &ConsoleService) is_xbox() bool { << rc.is_xbox_platform(c.platform_id) }
+pub fn (c &ConsoleService) is_playstation() bool { << rc.is_playstation_platform(c.platform_id) }
+pub fn (c &ConsoleService) is_switch() bool { << rc.is_switch_platform(c.platform_id) }
+pub fn (c &ConsoleService) is_native() bool { << c.backend == BACKEND_NATIVE }
+
+pub fn (c &ConsoleService) operation_mode() int {
+    if c.backend == BACKEND_NATIVE && c.initialized && c.is_switch() {
+        << plat.raw_operation_mode()
+    }
+    << c.op_mode
+}
+
+pub fn (c &ConsoleService) npad_style() int {
+    if c.backend == BACKEND_NATIVE && c.initialized && c.is_switch() {
+        << plat.raw_npad_style()
+    }
+    << c.npad_style_val
+}
+
+pub fn (c &ConsoleService) is_docked() bool {
+    << c.operation_mode() == rc.OPERATION_MODE_DOCKED
+}
+
+pub fn (c &ConsoleService) touch_screen_active() bool {
+    << c.is_switch() && c.switch_cfg.supports_touch_screen && c.operation_mode() == rc.OPERATION_MODE_HANDHELD
+}
+
+pub fn (c $&ConsoleService) simulate_operation_mode(mode int) int {
+    if mode != rc.OPERATION_MODE_HANDHELD && mode != rc.OPERATION_MODE_DOCKED {
+        >> errors.new("nexus console: invalid Switch operation mode")
+    }
+    if c.backend != BACKEND_LOCAL_MOCK { << 0 }
+    if c.op_mode != mode {
+        c.op_mode = mode
+        if c.is_switch() {
+            if mode == rc.OPERATION_MODE_DOCKED {
+                c.safe_pct = 90
+                c.npad_style_val = rc.NPAD_PRO_CONTROLLER
+            } else {
+                c.safe_pct = 100
+                c.npad_style_val = rc.NPAD_HANDHELD
+            }
+        }
+        push_event(c, rc.ConsoleEvent{kind: rc.EVENT_OPERATION_MODE_CHANGED, code: mode, text: ""})
+    }
+    << 0
+}
+
+pub fn (c $&ConsoleService) simulate_npad_style(style int) int {
+    if style < rc.NPAD_HANDHELD || style > rc.NPAD_PRO_CONTROLLER {
+        >> errors.new("nexus console: invalid Npad style")
+    }
+    if c.backend != BACKEND_LOCAL_MOCK { << 0 }
+    c.npad_style_val = style
+    << 0
+}
+pub fn (c &ConsoleService) is_initialized() bool { << c.initialized }
+pub fn (c &ConsoleService) backend_name() string {
+    if c.backend == BACKEND_NATIVE { << "console_native" }
+    if c.backend == BACKEND_LOCAL_MOCK { << "console_mock" }
+    << "none"
+}
+
+pub fn (c &ConsoleService) lifecycle_state() int {
+    if c.backend == BACKEND_NATIVE && c.initialized { << plat.raw_lifecycle_state() }
+    << c.lifecycle
+}
+
+pub fn (c &ConsoleService) confirm_button_layout() int {
+    if c.backend == BACKEND_NATIVE && c.initialized { << plat.raw_confirm_button() }
+    << c.confirm_layout
+}
+
+pub fn (c $&ConsoleService) set_mock_confirm_button(layout int) int {
+    if c.backend != BACKEND_LOCAL_MOCK { << 0 }
+    if layout != rc.CONFIRM_CROSS_A && layout != rc.CONFIRM_CIRCLE_B {
+        >> errors.new("nexus console: invalid confirm button layout")
+    }
+    c.confirm_layout = layout
+    << 0
+}
+
+pub fn (c &ConsoleService) safe_area_percent() int {
+    if c.backend == BACKEND_NATIVE && c.initialized {
+        v := plat.raw_safe_area_percent()
+        if v > 0 { << v }
+    }
+    << c.safe_pct
+}
+
+pub fn (c &ConsoleService) primary_user() rc.ConsoleUser {
+    << rc.ConsoleUser{
+        user_id: c.user.user_id + "",
+        display_name: c.user.display_name + "",
+        signed_in: c.user.signed_in,
+        is_guest: c.user.is_guest,
+        has_multiplayer_privilege: c.user.has_multiplayer_privilege,
+        crossplay_allowed: c.user.crossplay_allowed
+    }
+}
+
+pub fn (c $&ConsoleService) set_mock_user_privileges(signed_in bool, multiplayer bool, crossplay bool) {
+    if c.backend != BACKEND_LOCAL_MOCK { << }
+    c.user = rc.ConsoleUser{
+        user_id: c.user.user_id + "",
+        display_name: c.user.display_name + "",
+        signed_in: signed_in,
+        is_guest: c.user.is_guest,
+        has_multiplayer_privilege: multiplayer,
+        crossplay_allowed: crossplay
+    }
+}
+
+pub fn (c $&ConsoleService) simulate_user_sign_out() {
+    if c.backend != BACKEND_LOCAL_MOCK { << }
+    c.user = rc.ConsoleUser{
+        user_id: "",
+        display_name: "",
+        signed_in: false,
+        is_guest: false,
+        has_multiplayer_privilege: false,
+        crossplay_allowed: false
+    }
+    push_event(c, rc.ConsoleEvent{kind: rc.EVENT_USER_SIGNED_OUT, code: 0, text: ""})
+}
+
+pub fn (c $&ConsoleService) simulate_controller_disconnect(disconnected bool) {
+    if c.backend != BACKEND_LOCAL_MOCK { << }
+    if c.controller_disconnected != disconnected {
+        c.controller_disconnected = disconnected
+        if disconnected {
+            push_event(c, rc.ConsoleEvent{kind: rc.EVENT_CONTROLLER_DISCONNECTED, code: 0, text: ""})
+        } else {
+            push_event(c, rc.ConsoleEvent{kind: rc.EVENT_CONTROLLER_RECONNECTED, code: 0, text: ""})
+        }
+    }
+}
+
+pub fn (c $&ConsoleService) simulate_constrained(active bool) {
+    if c.backend != BACKEND_LOCAL_MOCK { << }
+    if active {
+        c.lifecycle = rc.LIFECYCLE_CONSTRAINED
+        push_event(c, rc.ConsoleEvent{kind: rc.EVENT_CONSTRAINED, code: 1, text: ""})
+    } else {
+        c.lifecycle = rc.LIFECYCLE_ACTIVE
+        push_event(c, rc.ConsoleEvent{kind: rc.EVENT_RESUMED, code: 0, text: ""})
+    }
+}
+
+pub fn (c $&ConsoleService) simulate_suspend() {
+    if c.backend != BACKEND_LOCAL_MOCK { << }
+    c.lifecycle = rc.LIFECYCLE_SUSPENDED
+    push_event(c, rc.ConsoleEvent{kind: rc.EVENT_SUSPENDED, code: 0, text: ""})
+}
+
+pub fn (c $&ConsoleService) simulate_resume() {
+    if c.backend != BACKEND_LOCAL_MOCK { << }
+    c.lifecycle = rc.LIFECYCLE_RESUMED
+    push_event(c, rc.ConsoleEvent{kind: rc.EVENT_RESUMED, code: 1, text: ""})
+}
+
+pub fn (c $&ConsoleService) poll() int {
+    if !c.initialized { >> errors.new("nexus console: service not initialized") }
+    if c.backend == BACKEND_NATIVE {
+        $evbuf := [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        cnt := plat.raw_poll_events($&evbuf)
+        for i in 0:cnt {
+            push_event(c, rc.ConsoleEvent{kind: evbuf[i], code: 0, text: ""})
+        }
+        c.lifecycle = plat.raw_lifecycle_state()
+        populate_native_user(c)
+    }
+    << 0
+}
+
+pub fn (c $&ConsoleService) shutdown() int {
+    if !c.initialized { << 0 }
+    if c.backend == BACKEND_NATIVE {
+        plat.raw_shutdown()
+    } else if c.backend == BACKEND_LOCAL_MOCK {
+        save_mock_state(c) or >>
+    }
+    c.initialized = false
+    << 0
+}
+
+pub fn (c $&ConsoleService) drain_events() []rc.ConsoleEvent {
+    $out := []rc.ConsoleEvent{}
+    for i in 0:c.events.len {
+        e := &c.events[i]
+        out.push(rc.ConsoleEvent{kind: e.kind, code: e.code, text: e.text + ""})
+    }
+    c.events = []rc.ConsoleEvent{}
+    << out
+}
+
+fn check_auto_platinum(c $&ConsoleService) {
+    if !rc.is_playstation_platform(c.platform_id) { << }
+    $plat_id := -1
+    $all_non_plat_unlocked := false
+    $non_plat_count := 0
+    $unlocked_count := 0
+    for i in 0:c.ps_cfg.trophies.len {
+        t := &c.ps_cfg.trophies[i]
+        if t.grade == rc.TROPHY_PLATINUM {
+            plat_id = t.trophy_id
+        } else {
+            non_plat_count += 1
+            k := ach_key(&"", t.trophy_id)
+            if c.ach_map.has(k + "") {
+                kv := k + ""
+                rec := &c.ach_map[kv]
+                if rec.unlocked { unlocked_count += 1 }
+            }
+        }
+    }
+    all_non_plat_unlocked = non_plat_count > 0 && unlocked_count == non_plat_count
+    if plat_id >= 0 && all_non_plat_unlocked {
+        pk := ach_key(&"", plat_id)
+        if !c.ach_map.has(pk + "") {
+            c.ach_map[pk + ""] = ConsoleAchRecord{
+                id: "",
+                numeric_id: plat_id,
+                unlocked: true,
+                progress_pct: 100
+            }
+            push_unique_str($&c.ach_keys, pk + "")
+            push_event(c, rc.ConsoleEvent{kind: rc.EVENT_ACHIEVEMENT_UNLOCKED, code: plat_id, text: "PLATINUM"})
+        } else {
+            pk_var := pk + ""
+            existing := &c.ach_map[pk_var]
+            if !existing.unlocked {
+                c.ach_map[pk + ""] = ConsoleAchRecord{
+                    id: "",
+                    numeric_id: plat_id,
+                    unlocked: true,
+                    progress_pct: 100
+                }
+                push_event(c, rc.ConsoleEvent{kind: rc.EVENT_ACHIEVEMENT_UNLOCKED, code: plat_id, text: "PLATINUM"})
+            }
+        }
+    }
+}
+
+pub fn (c $&ConsoleService) unlock_achievement(id string, numeric_id int) int {
+    << c.set_achievement_progress(id + "", numeric_id, 100) or >>
+}
+
+pub fn (c $&ConsoleService) set_achievement_progress(id string, numeric_id int, percent int) int {
+    if !c.initialized { >> errors.new("nexus console: service not initialized") }
+    if percent < 0 || percent > 100 { >> errors.new("nexus console: achievement progress must be 0..100") }
+    if c.backend == BACKEND_NATIVE {
+        ib := plat.str_to_u8(&id)
+        plat.checked(plat.raw_unlock_achievement(&ib, numeric_id, percent)) or >>
+        << 0
+    }
+    k := ach_key_for_platform(c.platform_id, &id, numeric_id)
+    un := percent >= 100
+    c.ach_map[k + ""] = ConsoleAchRecord{
+        id: id + "",
+        numeric_id: numeric_id,
+        unlocked: un,
+        progress_pct: percent
+    }
+    push_unique_str($&c.ach_keys, k + "")
+    if un {
+        push_event(c, rc.ConsoleEvent{kind: rc.EVENT_ACHIEVEMENT_UNLOCKED, code: numeric_id, text: id + ""})
+        check_auto_platinum(c)
+    }
+    save_mock_state(c) or >>
+    << 0
+}
+
+pub fn (c &ConsoleService) has_achievement(id string, numeric_id int) bool {
+    if !c.initialized { << false }
+    if c.backend == BACKEND_NATIVE {
+        ib := plat.str_to_u8(&id)
+        << plat.raw_has_achievement(&ib, numeric_id) == 1
+    }
+    k := ach_key_for_platform(c.platform_id, &id, numeric_id)
+    if c.ach_map.has(k + "") {
+        kv := k + ""
+        r := &c.ach_map[kv]
+        << r.unlocked
+    }
+    << false
+}
+
+pub fn (c &ConsoleService) platinum_unlocked() bool {
+    for i in 0:c.ps_cfg.trophies.len {
+        if c.ps_cfg.trophies[i].grade == rc.TROPHY_PLATINUM {
+            << c.has_achievement("", c.ps_cfg.trophies[i].trophy_id)
+        }
+    }
+    << false
+}
+
+pub fn (c $&ConsoleService) set_presence(status string, activity_id string) int {
+    if !c.initialized { >> errors.new("nexus console: service not initialized") }
+    if c.backend == BACKEND_NATIVE {
+        sb := plat.str_to_u8(&status)
+        ab := plat.str_to_u8(&activity_id)
+        plat.checked(plat.raw_set_presence(&sb, &ab)) or >>
+    }
+    c.presence = status + ""
+    if activity_id.len > 0 { c.active_activity = activity_id + "" }
+    << 0
+}
+
+pub fn (c &ConsoleService) current_presence() string { << c.presence + "" }
+pub fn (c &ConsoleService) active_activity_id() string { << c.active_activity + "" }
+
+pub fn (c $&ConsoleService) start_activity(activity_id string) int {
+    if !c.initialized { >> errors.new("nexus console: service not initialized") }
+    if activity_id.len == 0 { >> errors.new("nexus console: activity_id must not be empty") }
+    if c.backend == BACKEND_NATIVE {
+        ab := plat.str_to_u8(&activity_id)
+        plat.checked(plat.raw_activity_start(&ab)) or >>
+    }
+    c.active_activity = activity_id + ""
+    push_event(c, rc.ConsoleEvent{kind: rc.EVENT_ACTIVITY_UPDATED, code: 1, text: activity_id + ""})
+    << 0
+}
+
+pub fn (c $&ConsoleService) end_activity(activity_id string, outcome int) int {
+    if !c.initialized { >> errors.new("nexus console: service not initialized") }
+    if outcome < rc.ACTIVITY_COMPLETED || outcome > rc.ACTIVITY_ABANDONED {
+        >> errors.new("nexus console: invalid activity outcome")
+    }
+    if c.backend == BACKEND_NATIVE {
+        ab := plat.str_to_u8(&activity_id)
+        plat.checked(plat.raw_activity_end(&ab, outcome)) or >>
+    }
+    if c.active_activity == activity_id { c.active_activity = "" }
+    push_event(c, rc.ConsoleEvent{kind: rc.EVENT_ACTIVITY_UPDATED, code: outcome, text: activity_id + ""})
+    << 0
+}
+
+fn read_disk_len_safe(path string) int {
+    raw := snapshot.read(path, MAX_SAVE_FILE_BYTES) or (err) {
+        _ := err.msg()
+        << 0
+    }
+    << raw.len
+}
+
+pub fn (c &ConsoleService) save_bytes_used() int {
+    $total := 0
+    for i in 0:c.save_keys.len {
+        sk := c.save_keys[i] + ""
+        if c.save_mem.has(sk + "") {
+            kv := c.save_keys[i] + ""
+            buf := &c.save_mem[kv]
+            total += buf.len
+        } else if c.save_dir.len > 0 {
+            p := filepath.join([c.save_dir + "", "saves", sk + ""])
+            if path_exists(&p) { total += read_disk_len_safe(p + "") }
+        }
+    }
+    << total
+}
+
+pub fn (c &ConsoleService) save_quota_bytes() int { << c.quota_bytes }
+
+fn save_existing_len(c &ConsoleService, container &string, blob &string) int {
+    data := c.save_read(container + "", blob + "") or (err) {
+        _ := err.msg()
+        << 0
+    }
+    << data.len
+}
+
+pub fn (c $&ConsoleService) save_write(container string, blob string, data &[]u8) int {
+    if !c.initialized { >> errors.new("nexus console: service not initialized") }
+    rc.validate_save_key(&container, &blob) or >>
+    if data.len > MAX_SAVE_FILE_BYTES { >> errors.new("nexus console: save payload exceeds 16 MiB") }
+    if c.backend == BACKEND_NATIVE {
+        cb := plat.str_to_u8(&container)
+        bb := plat.str_to_u8(&blob)
+        plat.checked(plat.raw_save_write(&cb, &bb, data)) or >>
+        push_event(c, rc.ConsoleEvent{kind: rc.EVENT_SAVE_COMPLETED, code: data.len, text: blob + ""})
+        << 0
+    }
+    $prev_len := 0
+    if c.save_exists(container + "", blob + "") {
+        prev_len = save_existing_len(c, &container, &blob)
+    }
+    used := c.save_bytes_used() - prev_len
+    if used + data.len > c.quota_bytes {
+        >> errors.new("nexus console: save quota exceeded")
+    }
+    sk := save_slot_key(&container, &blob)
+    copied := clone_bytes(data)
+    raw := bytes_to_str(&copied)
+    c.save_mem[sk + ""] = copied
+    push_unique_str($&c.save_keys, sk + "")
+    if c.save_dir.len > 0 {
+        dest := filepath.join([c.save_dir + "", "saves", container + "", blob + ""])
+        os.mkdir_all(filepath.dir(dest)) or >>
+        snapshot.write_atomic(dest + "", &raw) or >>
+        save_mock_state(c) or >>
+    }
+    push_event(c, rc.ConsoleEvent{kind: rc.EVENT_SAVE_COMPLETED, code: data.len, text: blob + ""})
+    << 0
+}
+
+pub fn (c &ConsoleService) save_read(container string, blob string) []u8 {
+    if !c.initialized { >> errors.new("nexus console: service not initialized") }
+    rc.validate_save_key(&container, &blob) or >>
+    if c.backend == BACKEND_NATIVE {
+        cb := plat.str_to_u8(&container)
+        bb := plat.str_to_u8(&blob)
+        if plat.raw_save_exists(&cb, &bb) != 1 {
+            >> errors.new("nexus console: save missing: " + blob + "")
+        }
+        $out := plat.alloc_u8(MAX_SAVE_FILE_BYTES)
+        n := plat.checked(plat.raw_save_read(&cb, &bb, $&out)) or >>
+        << out[0:n]
+    }
+    sk := save_slot_key(&container, &blob)
+    if c.save_mem.has(sk + "") {
+        sk_var := save_slot_key(&container, &blob)
+        src := &c.save_mem[sk_var]
+        << clone_bytes(src)
+    }
+    if c.save_dir.len > 0 {
+        p := filepath.join([c.save_dir + "", "saves", container + "", blob + ""])
+        if path_exists(&p) {
+            raw := snapshot.read(p + "", MAX_SAVE_FILE_BYTES) or >>
+            << str_to_bytes(&raw)
+        }
+    }
+    >> errors.new("nexus console: save missing: " + blob + "")
+}
+
+pub fn (c &ConsoleService) save_exists(container string, blob string) bool {
+    if !c.initialized { << false }
+    _ := rc.validate_save_key(&container, &blob) or (err) {
+        _ := err.msg()
+        << false
+    }
+    if c.backend == BACKEND_NATIVE {
+        cb := plat.str_to_u8(&container)
+        bb := plat.str_to_u8(&blob)
+        << plat.raw_save_exists(&cb, &bb) == 1
+    }
+    sk := save_slot_key(&container, &blob)
+    if c.save_mem.has(sk + "") { << true }
+    if c.save_dir.len > 0 {
+        p := filepath.join([c.save_dir + "", "saves", container + "", blob + ""])
+        << path_exists(&p)
+    }
+    << false
+}
+
+pub fn (c $&ConsoleService) save_delete(container string, blob string) int {
+    if !c.initialized { >> errors.new("nexus console: service not initialized") }
+    rc.validate_save_key(&container, &blob) or >>
+    if c.backend == BACKEND_NATIVE {
+        cb := plat.str_to_u8(&container)
+        bb := plat.str_to_u8(&blob)
+        plat.checked(plat.raw_save_delete(&cb, &bb)) or >>
+        << 0
+    }
+    sk := save_slot_key(&container, &blob)
+    if c.save_mem.has(sk + "") {
+        sm := $&c.save_mem
+        sm.delete(sk + "")
+    }
+    $next := []string{}
+    for i in 0:c.save_keys.len {
+        if c.save_keys[i] != sk { next.push(c.save_keys[i] + "") }
+    }
+    c.save_keys = next
+    if c.save_dir.len > 0 {
+        p := filepath.join([c.save_dir + "", "saves", container + "", blob + ""])
+        if path_exists(&p) { os.remove(p + "") or >> }
+        save_mock_state(c) or >>
+    }
+    << 0
+}
+
+pub fn (c $&ConsoleService) grant_mock_entitlement(id string) int {
+    if id.len == 0 { >> errors.new("nexus console: empty entitlement id") }
+    c.entitlements[id + ""] = true
+    push_unique_str($&c.entitlement_keys, id + "")
+    save_mock_state(c) or >>
+    << 0
+}
+
+pub fn (c &ConsoleService) has_entitlement(id string) bool {
+    if !c.initialized || id.len == 0 { << false }
+    if c.backend == BACKEND_NATIVE {
+        ib := plat.str_to_u8(&id)
+        << plat.raw_has_entitlement(&ib) == 1
+    }
+    if c.entitlements.has(id + "") { << c.entitlements[id + ""] }
+    << false
+}
+
+pub fn (c $&ConsoleService) grant_mock_aoc(aoc_index int) int {
+    if aoc_index < 1 || aoc_index > 2000 { >> errors.new("nexus console: Switch AOC index must be 1..2000") }
+    << c.grant_mock_entitlement("AOC:" + str(aoc_index)) or >>
+}
+
+pub fn (c &ConsoleService) has_aoc(aoc_index int) bool {
+    if aoc_index <= 0 { << false }
+    << c.has_entitlement("AOC:" + str(aoc_index))
+}
+
+pub fn (c $&ConsoleService) apply_haptics(pad_idx int, cmd rc.GamepadHapticCommand) int {
+    if !c.initialized { >> errors.new("nexus console: service not initialized") }
+    if pad_idx < 0 || pad_idx > 3 { >> errors.new("nexus console: controller index must be 0..3") }
+    rc.validate_haptic_command(&cmd) or >>
+    rgb := ((cmd.lightbar_r & 255) << 16) | ((cmd.lightbar_g & 255) << 8) | (cmd.lightbar_b & 255)
+    params := [
+        cmd.left_adaptive.mode, cmd.left_adaptive.start_position, cmd.left_adaptive.end_position,
+        cmd.left_adaptive.strength, cmd.left_adaptive.frequency,
+        cmd.right_adaptive.mode, cmd.right_adaptive.start_position, cmd.right_adaptive.end_position,
+        cmd.right_adaptive.strength, cmd.right_adaptive.frequency,
+        rgb,
+        int(cmd.hd_rumble_freq_low),
+        int(cmd.hd_rumble_freq_high)
+    ]
+    if c.backend == BACKEND_NATIVE {
+        plat.checked(plat.raw_set_haptics(pad_idx, cmd.low_freq_motor, cmd.high_freq_motor,
+            cmd.left_trigger_rumble, cmd.right_trigger_rumble, &params)) or >>
+    }
+    c.haptics[pad_idx] = cmd
+    push_unique_int($&c.haptic_keys, pad_idx)
+    << 0
+}
+
+pub fn (c &ConsoleService) last_haptics(pad_idx int) rc.GamepadHapticCommand {
+    if c.haptics.has(pad_idx) {
+        pk := pad_idx
+        h := &c.haptics[pk]
+        << rc.GamepadHapticCommand{
+            low_freq_motor: h.low_freq_motor,
+            high_freq_motor: h.high_freq_motor,
+            left_trigger_rumble: h.left_trigger_rumble,
+            right_trigger_rumble: h.right_trigger_rumble,
+            left_adaptive: h.left_adaptive,
+            right_adaptive: h.right_adaptive,
+            lightbar_r: h.lightbar_r,
+            lightbar_g: h.lightbar_g,
+            lightbar_b: h.lightbar_b,
+            hd_rumble_freq_low: h.hd_rumble_freq_low,
+            hd_rumble_freq_high: h.hd_rumble_freq_high
+        }
+    }
+    << rc.default_haptic_command()
+}
+
+pub fn (c $&ConsoleService) show_system_ui(kind int, arg string) int {
+    if !c.initialized { >> errors.new("nexus console: service not initialized") }
+    if kind < rc.SYSUI_ACCOUNT_PICKER || kind > rc.SYSUI_CONTROLLER_APPLET {
+        >> errors.new("nexus console: invalid system UI dialog kind")
+    }
+    if c.backend == BACKEND_NATIVE {
+        ab := plat.str_to_u8(&arg)
+        plat.checked(plat.raw_show_system_ui(kind, &ab)) or >>
+        << 0
+    }
+    c.lifecycle = rc.LIFECYCLE_CONSTRAINED
+    push_event(c, rc.ConsoleEvent{kind: rc.EVENT_CONSTRAINED, code: kind, text: arg + ""})
+    << 0
+}
+
+pub fn (c $&ConsoleService) create_session(max_players int, crossplay bool) int {
+    if !c.initialized { >> errors.new("nexus console: service not initialized") }
+    if !c.user.signed_in || !c.user.has_multiplayer_privilege {
+        >> errors.new("nexus console: signed-in user lacks multiplayer privilege")
+    }
+    if crossplay && !c.user.crossplay_allowed {
+        >> errors.new("nexus console: crossplay privilege denied by platform policy")
+    }
+    if max_players < 2 || max_players > 64 { >> errors.new("nexus console: session max_players must be 2..64") }
+    $sid := 0
+    if c.backend == BACKEND_NATIVE {
+        $xp := 0
+        if crossplay { xp = 1 }
+        sid = plat.checked(plat.raw_session_create(max_players, xp)) or >>
+    } else {
+        sid = c.next_session_id
+        c.next_session_id += 1
+    }
+    c.session = rc.ConsoleSessionInfo{
+        session_id: sid,
+        max_players: max_players,
+        crossplay: crossplay,
+        active: true
+    }
+    push_event(c, rc.ConsoleEvent{kind: rc.EVENT_SESSION_CHANGED, code: sid, text: "created"})
+    << sid
+}
+
+pub fn (c $&ConsoleService) join_session(session_id int) int {
+    if !c.initialized { >> errors.new("nexus console: service not initialized") }
+    if !c.user.signed_in || !c.user.has_multiplayer_privilege {
+        >> errors.new("nexus console: signed-in user lacks multiplayer privilege")
+    }
+    if session_id <= 0 { >> errors.new("nexus console: invalid session_id") }
+    if c.backend == BACKEND_NATIVE {
+        plat.checked(plat.raw_session_join(session_id)) or >>
+    }
+    c.session = rc.ConsoleSessionInfo{
+        session_id: session_id,
+        max_players: 8,
+        crossplay: c.user.crossplay_allowed,
+        active: true
+    }
+    push_event(c, rc.ConsoleEvent{kind: rc.EVENT_SESSION_CHANGED, code: session_id, text: "joined"})
+    << 0
+}
+
+pub fn (c $&ConsoleService) leave_session() int {
+    if !c.initialized || !c.session.active { << 0 }
+    sid := c.session.session_id
+    if c.backend == BACKEND_NATIVE {
+        plat.raw_session_leave()
+    }
+    c.session = empty_session()
+    push_event(c, rc.ConsoleEvent{kind: rc.EVENT_SESSION_CHANGED, code: sid, text: "left"})
+    << 0
+}
+
+pub fn (c &ConsoleService) has_session() bool { << c.session.active }
+pub fn (c &ConsoleService) current_session() rc.ConsoleSessionInfo { << c.session }

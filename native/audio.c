@@ -1,3 +1,8 @@
+#ifdef _WIN32
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#endif
 // Audio device transport only. Mixing, resampling and playback state live in Xu.
 #define SDL_MAIN_HANDLED
 #include <SDL3/SDL.h>
@@ -48,7 +53,7 @@ static bool load_sdl(void) {
     const char *override = getenv("XU_NEXUS_SDL_AUDIO_LIBRARY");
 #ifdef _WIN32
     HMODULE library = LoadLibraryA(override && *override ? override : "SDL3.dll");
-#define FIND(name) GetProcAddress(library, #name)
+#define FIND(name) ((void *)GetProcAddress(library, #name))
 #define UNLOAD() FreeLibrary(library)
 #else
     void *library = NULL;

@@ -1,0 +1,405 @@
+@"github.com/xulang-org/nexus/physics3d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+const DBVH_NULL = -1
+
+struct DynamicBvhNode {
+    aabb fm.Aabb3
+    parent int
+    left int
+    right int
+    next_free int
+    height int
+    user_id int
+    moved bool
+}
+
+// Incremental SAH + AVL-balanced Dynamic AABB BVH Tree with fat proxies for broadphase & CCD ray queries.
+pub struct DynamicBvh3D {
+    nodes []DynamicBvhNode
+    root int
+    free_head int
+    active_count int
+}
+
+pub fn new_dynamic_bvh_3d() DynamicBvh3D {
+    << DynamicBvh3D{
+        nodes: []DynamicBvhNode{},
+        root: DBVH_NULL,
+        free_head: DBVH_NULL,
+        active_count: 0
+    }
+}
+
+fn empty_dbvh_node() DynamicBvhNode {
+    z := fm.vec3(0.0, 0.0, 0.0)
+    << DynamicBvhNode{
+        aabb: fm.Aabb3{minimum: z, maximum: z},
+        parent: DBVH_NULL,
+        left: DBVH_NULL,
+        right: DBVH_NULL,
+        next_free: DBVH_NULL,
+        height: -1,
+        user_id: -1,
+        moved: false
+    }
+}
+
+fn aabb_area(b fm.Aabb3) f64 {
+    d := b.maximum.sub(b.minimum)
+    << 2.0 * (d.x * d.y + d.y * d.z + d.z * d.x)
+}
+
+fn aabb_union(a fm.Aabb3, b fm.Aabb3) fm.Aabb3 {
+    << fm.Aabb3{
+        minimum: fm.vec3(
+            math.min(a.minimum.x, b.minimum.x),
+            math.min(a.minimum.y, b.minimum.y),
+            math.min(a.minimum.z, b.minimum.z)
+        ),
+        maximum: fm.vec3(
+            math.max(a.maximum.x, b.maximum.x),
+            math.max(a.maximum.y, b.maximum.y),
+            math.max(a.maximum.z, b.maximum.z)
+        )
+    }
+}
+
+fn aabb_contains_box(outer fm.Aabb3, inner fm.Aabb3) bool {
+    << outer.minimum.x <= inner.minimum.x && outer.maximum.x >= inner.maximum.x &&
+        outer.minimum.y <= inner.minimum.y && outer.maximum.y >= inner.maximum.y &&
+        outer.minimum.z <= inner.minimum.z && outer.maximum.z >= inner.maximum.z
+}
+
+fn fatten_box(box fm.Aabb3, disp fm.Vec3) fm.Aabb3 {
+    r := fm.vec3(0.12, 0.12, 0.12)
+    $lo := box.minimum.sub(r)
+    $hi := box.maximum.add(r)
+    dx := disp.x * 2.0
+    dy := disp.y * 2.0
+    dz := disp.z * 2.0
+    if dx < 0.0 { lo = fm.vec3(lo.x + dx, lo.y, lo.z) } else { hi = fm.vec3(hi.x + dx, hi.y, hi.z) }
+    if dy < 0.0 { lo = fm.vec3(lo.x, lo.y + dy, lo.z) } else { hi = fm.vec3(hi.x, hi.y + dy, hi.z) }
+    if dz < 0.0 { lo = fm.vec3(lo.x, lo.y, lo.z + dz) } else { hi = fm.vec3(hi.x, hi.y, hi.z + dz) }
+    << fm.Aabb3{minimum: lo, maximum: hi}
+}
+
+fn (tree $&DynamicBvh3D) alloc_node() int {
+    if tree.free_head == DBVH_NULL {
+        idx := tree.nodes.len
+        tree.nodes.push(empty_dbvh_node())
+        << idx
+    }
+    idx := tree.free_head
+    tree.free_head = tree.nodes[idx].next_free
+    tree.nodes[idx] = empty_dbvh_node()
+    << idx
+}
+
+fn (tree $&DynamicBvh3D) free_node(idx int) {
+    tree.nodes[idx].next_free = tree.free_head
+    tree.nodes[idx].height = -1
+    tree.nodes[idx].user_id = -1
+    tree.free_head = idx
+}
+
+fn (tree &DynamicBvh3D) is_leaf(idx int) bool {
+    << tree.nodes[idx].left == DBVH_NULL
+}
+
+fn max_int_2(a int, b int) int {
+    if a > b { << a }
+    << b
+}
+
+fn (tree $&DynamicBvh3D) balance(na int) int {
+    if tree.is_leaf(na) || tree.nodes[na].height < 2 {
+        << na
+    }
+    nb := tree.nodes[na].left
+    nc := tree.nodes[na].right
+    bal := tree.nodes[nc].height - tree.nodes[nb].height
+
+    if bal > 1 {
+        nf := tree.nodes[nc].left
+        ng := tree.nodes[nc].right
+        tree.nodes[nc].left = na
+        tree.nodes[nc].parent = tree.nodes[na].parent
+        tree.nodes[na].parent = nc
+        if tree.nodes[nc].parent != DBVH_NULL {
+            p := tree.nodes[nc].parent
+            if tree.nodes[p].left == na { tree.nodes[p].left = nc } else { tree.nodes[p].right = nc }
+        } else {
+            tree.root = nc
+        }
+        if tree.nodes[nf].height > tree.nodes[ng].height {
+            tree.nodes[nc].right = nf
+            tree.nodes[na].right = ng
+            tree.nodes[ng].parent = na
+            tree.nodes[na].aabb = aabb_union(tree.nodes[nb].aabb, tree.nodes[ng].aabb)
+            tree.nodes[nc].aabb = aabb_union(tree.nodes[na].aabb, tree.nodes[nf].aabb)
+            tree.nodes[na].height = 1 + max_int_2(tree.nodes[nb].height, tree.nodes[ng].height)
+            tree.nodes[nc].height = 1 + max_int_2(tree.nodes[na].height, tree.nodes[nf].height)
+        } else {
+            tree.nodes[nc].right = ng
+            tree.nodes[na].right = nf
+            tree.nodes[nf].parent = na
+            tree.nodes[na].aabb = aabb_union(tree.nodes[nb].aabb, tree.nodes[nf].aabb)
+            tree.nodes[nc].aabb = aabb_union(tree.nodes[na].aabb, tree.nodes[ng].aabb)
+            tree.nodes[na].height = 1 + max_int_2(tree.nodes[nb].height, tree.nodes[nf].height)
+            tree.nodes[nc].height = 1 + max_int_2(tree.nodes[na].height, tree.nodes[ng].height)
+        }
+        << nc
+    }
+
+    if bal < -1 {
+        nd := tree.nodes[nb].left
+        ne := tree.nodes[nb].right
+        tree.nodes[nb].left = na
+        tree.nodes[nb].parent = tree.nodes[na].parent
+        tree.nodes[na].parent = nb
+        if tree.nodes[nb].parent != DBVH_NULL {
+            p := tree.nodes[nb].parent
+            if tree.nodes[p].left == na { tree.nodes[p].left = nb } else { tree.nodes[p].right = nb }
+        } else {
+            tree.root = nb
+        }
+        if tree.nodes[nd].height > tree.nodes[ne].height {
+            tree.nodes[nb].right = nd
+            tree.nodes[na].left = ne
+            tree.nodes[ne].parent = na
+            tree.nodes[na].aabb = aabb_union(tree.nodes[nc].aabb, tree.nodes[ne].aabb)
+            tree.nodes[nb].aabb = aabb_union(tree.nodes[na].aabb, tree.nodes[nd].aabb)
+            tree.nodes[na].height = 1 + max_int_2(tree.nodes[nc].height, tree.nodes[ne].height)
+            tree.nodes[nb].height = 1 + max_int_2(tree.nodes[na].height, tree.nodes[nd].height)
+        } else {
+            tree.nodes[nb].right = ne
+            tree.nodes[na].left = nd
+            tree.nodes[nd].parent = na
+            tree.nodes[na].aabb = aabb_union(tree.nodes[nc].aabb, tree.nodes[nd].aabb)
+            tree.nodes[nb].aabb = aabb_union(tree.nodes[na].aabb, tree.nodes[ne].aabb)
+            tree.nodes[na].height = 1 + max_int_2(tree.nodes[nc].height, tree.nodes[nd].height)
+            tree.nodes[nb].height = 1 + max_int_2(tree.nodes[na].height, tree.nodes[ne].height)
+        }
+        << nb
+    }
+    << na
+}
+
+fn (tree $&DynamicBvh3D) insert_leaf(leaf int) {
+    if tree.root == DBVH_NULL {
+        tree.root = leaf
+        tree.nodes[leaf].parent = DBVH_NULL
+        <<
+    }
+    leaf_aabb := tree.nodes[leaf].aabb
+    $index := tree.root
+    while !tree.is_leaf(index) {
+        c1 := tree.nodes[index].left
+        c2 := tree.nodes[index].right
+        area := aabb_area(tree.nodes[index].aabb)
+        comb := aabb_union(tree.nodes[index].aabb, leaf_aabb)
+        comb_area := aabb_area(comb)
+        cost := 2.0 * comb_area
+        inheritance_cost := 2.0 * (comb_area - area)
+
+        $cost1 := 0.0
+        if tree.is_leaf(c1) {
+            cost1 = aabb_area(aabb_union(leaf_aabb, tree.nodes[c1].aabb)) + inheritance_cost
+        } else {
+            old_area := aabb_area(tree.nodes[c1].aabb)
+            new_area := aabb_area(aabb_union(leaf_aabb, tree.nodes[c1].aabb))
+            cost1 = (new_area - old_area) + inheritance_cost
+        }
+
+        $cost2 := 0.0
+        if tree.is_leaf(c2) {
+            cost2 = aabb_area(aabb_union(leaf_aabb, tree.nodes[c2].aabb)) + inheritance_cost
+        } else {
+            old_area := aabb_area(tree.nodes[c2].aabb)
+            new_area := aabb_area(aabb_union(leaf_aabb, tree.nodes[c2].aabb))
+            cost2 = (new_area - old_area) + inheritance_cost
+        }
+
+        if cost < cost1 && cost < cost2 { <- }
+        if cost1 < cost2 { index = c1 } else { index = c2 }
+    }
+
+    sibling := index
+    old_parent := tree.nodes[sibling].parent
+    new_parent := tree.alloc_node()
+    tree.nodes[new_parent].parent = old_parent
+    tree.nodes[new_parent].user_id = -1
+    tree.nodes[new_parent].aabb = aabb_union(leaf_aabb, tree.nodes[sibling].aabb)
+    tree.nodes[new_parent].height = tree.nodes[sibling].height + 1
+
+    if old_parent != DBVH_NULL {
+        if tree.nodes[old_parent].left == sibling {
+            tree.nodes[old_parent].left = new_parent
+        } else {
+            tree.nodes[old_parent].right = new_parent
+        }
+    } else {
+        tree.root = new_parent
+    }
+    tree.nodes[new_parent].left = sibling
+    tree.nodes[new_parent].right = leaf
+    tree.nodes[sibling].parent = new_parent
+    tree.nodes[leaf].parent = new_parent
+
+    $walk := tree.nodes[leaf].parent
+    while walk != DBVH_NULL {
+        walk = tree.balance(walk)
+        l := tree.nodes[walk].left
+        r := tree.nodes[walk].right
+        tree.nodes[walk].height = 1 + max_int_2(tree.nodes[l].height, tree.nodes[r].height)
+        tree.nodes[walk].aabb = aabb_union(tree.nodes[l].aabb, tree.nodes[r].aabb)
+        walk = tree.nodes[walk].parent
+    }
+}
+
+fn (tree $&DynamicBvh3D) remove_leaf(leaf int) {
+    if leaf == tree.root {
+        tree.root = DBVH_NULL
+        <<
+    }
+    parent := tree.nodes[leaf].parent
+    grand := tree.nodes[parent].parent
+    $sibling := tree.nodes[parent].left
+    if sibling == leaf { sibling = tree.nodes[parent].right }
+
+    if grand != DBVH_NULL {
+        if tree.nodes[grand].left == parent {
+            tree.nodes[grand].left = sibling
+        } else {
+            tree.nodes[grand].right = sibling
+        }
+        tree.nodes[sibling].parent = grand
+        tree.free_node(parent)
+        $walk := grand
+        while walk != DBVH_NULL {
+            walk = tree.balance(walk)
+            l := tree.nodes[walk].left
+            r := tree.nodes[walk].right
+            tree.nodes[walk].aabb = aabb_union(tree.nodes[l].aabb, tree.nodes[r].aabb)
+            tree.nodes[walk].height = 1 + max_int_2(tree.nodes[l].height, tree.nodes[r].height)
+            walk = tree.nodes[walk].parent
+        }
+    } else {
+        tree.root = sibling
+        tree.nodes[sibling].parent = DBVH_NULL
+        tree.free_node(parent)
+    }
+}
+
+pub fn (tree $&DynamicBvh3D) create_proxy(aabb fm.Aabb3, user_id int) int {
+    aabb.validate() or >>
+    proxy := tree.alloc_node()
+    tree.nodes[proxy].aabb = fatten_box(aabb, fm.vec3(0.0, 0.0, 0.0))
+    tree.nodes[proxy].user_id = user_id
+    tree.nodes[proxy].height = 0
+    tree.nodes[proxy].moved = true
+    tree.insert_leaf(proxy)
+    tree.active_count += 1
+    << proxy
+}
+
+pub fn (tree $&DynamicBvh3D) destroy_proxy(proxy_id int) int {
+    if proxy_id < 0 || proxy_id >= tree.nodes.len || tree.nodes[proxy_id].height != 0 {
+        >> errors.new("nexus dynamic bvh: invalid proxy id")
+    }
+    tree.remove_leaf(proxy_id)
+    tree.free_node(proxy_id)
+    tree.active_count -= 1
+    << 0
+}
+
+pub fn (tree $&DynamicBvh3D) move_proxy(proxy_id int, aabb fm.Aabb3, displacement fm.Vec3) bool {
+    if proxy_id < 0 || proxy_id >= tree.nodes.len || tree.nodes[proxy_id].height != 0 {
+        >> errors.new("nexus dynamic bvh: invalid proxy id")
+    }
+    aabb.validate() or >>
+    if !displacement.is_finite() { >> errors.new("nexus dynamic bvh: invalid displacement") }
+    fat := fatten_box(aabb, displacement)
+    old_fat := tree.nodes[proxy_id].aabb
+    if aabb_contains_box(old_fat, aabb) {
+        // Check that old fat AABB isn't wildly oversized compared to current box.
+        huge := fm.Aabb3{
+            minimum: fat.minimum.sub(fm.vec3(0.5, 0.5, 0.5)),
+            maximum: fat.maximum.add(fm.vec3(0.5, 0.5, 0.5))
+        }
+        if aabb_contains_box(huge, old_fat) {
+            << false
+        }
+    }
+    tree.remove_leaf(proxy_id)
+    tree.nodes[proxy_id].aabb = fat
+    tree.nodes[proxy_id].moved = true
+    tree.insert_leaf(proxy_id)
+    << true
+}
+
+fn push_at(stack $&[]int, sp int, val int) int {
+    if sp == stack.len {
+        stack.push(val)
+    } else {
+        stack[sp] = val
+    }
+    << sp + 1
+}
+
+pub fn (tree &DynamicBvh3D) query_aabb(box fm.Aabb3) []int {
+    box.validate() or >>
+    $hits := []int{}
+    if tree.root == DBVH_NULL { << hits }
+    $stack := [tree.root]
+    $sp := 1
+    while sp > 0 {
+        sp -= 1
+        ni := stack[sp]
+        nd := &tree.nodes[ni]
+        if !node_box_overlap(nd.aabb.minimum, nd.aabb.maximum, box) { -> }
+        if nd.left == DBVH_NULL {
+            hits.push(nd.user_id)
+        } else {
+            sp = push_at($&stack, sp, nd.right)
+            sp = push_at($&stack, sp, nd.left)
+        }
+    }
+    sort_hits($&hits)
+    << hits
+}
+
+pub fn (tree &DynamicBvh3D) query_ray(origin fm.Vec3, motion fm.Vec3) []int {
+    if !origin.is_finite() || !motion.is_finite() {
+        >> errors.new("nexus dynamic bvh: invalid ray parameters")
+    }
+    $hits := []int{}
+    if tree.root == DBVH_NULL { << hits }
+    $stack := [tree.root]
+    $sp := 1
+    while sp > 0 {
+        sp -= 1
+        ni := stack[sp]
+        nd := &tree.nodes[ni]
+        if !ray_segment_hits_box(origin, motion, nd.aabb.minimum, nd.aabb.maximum) { -> }
+        if nd.left == DBVH_NULL {
+            hits.push(nd.user_id)
+        } else {
+            sp = push_at($&stack, sp, nd.right)
+            sp = push_at($&stack, sp, nd.left)
+        }
+    }
+    sort_hits($&hits)
+    << hits
+}
+
+pub fn (tree &DynamicBvh3D) tree_height() int {
+    if tree.root == DBVH_NULL { << 0 }
+    << tree.nodes[tree.root].height
+}
+
+pub fn (tree &DynamicBvh3D) proxy_count() int { << tree.active_count }

@@ -1,0 +1,78 @@
+#version 450
+
+layout(set = 0, binding = 0) uniform sampler2D src_depth;
+layout(set = 0, binding = 1) uniform sampler2D src_normal;
+layout(set = 1, binding = 0, r16f) uniform writeonly image2D dst_ao;
+
+layout(set = 2, binding = 0, std140) uniform GtaoParams {
+    mat4 inv_proj;
+    mat4 view;
+    vec4 info;
+} params;
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+vec3 reconstruct_view(mat4 inv_proj, vec2 uv, float depth) {
+    float ndc_x = uv.x * 2.0 - 1.0;
+    float ndc_y = 1.0 - uv.y * 2.0;
+    vec4 v = inv_proj * vec4(ndc_x, ndc_y, depth, 1.0);
+    return v.xyz / max(v.w, 1e-6);
+}
+
+void main() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    uint w = uint(params.info.x), h = uint(params.info.y);
+    if (gid.x >= w || gid.y >= h) return;
+
+    vec2 inv_res = vec2(1.0 / params.info.x, 1.0 / params.info.y);
+    vec2 uv = (vec2(gid) + 0.5) * inv_res;
+    float d = textureLod(src_depth, uv, 0.0).r;
+    if (d <= 1e-6) {
+        imageStore(dst_ao, ivec2(gid), vec4(1.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    vec3 P = reconstruct_view(params.inv_proj, uv, d);
+    vec3 nw = textureLod(src_normal, uv, 0.0).xyz;
+    float nlen = length(nw);
+    if (nlen < 1e-4) {
+        imageStore(dst_ao, ivec2(gid), vec4(1.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    vec3 N = normalize((params.view * vec4(nw / nlen, 0.0)).xyz);
+    vec3 V = normalize(-P);
+
+    float radius = params.info.z;
+    float bias = params.info.w;
+    float dist_view = max(-P.z, 0.1);
+    float screen_radius = clamp((radius / dist_view) * 0.45, inv_res.x * 2.0, 0.18);
+
+    float rot = fract(sin(dot(vec2(gid), vec2(12.9898, 78.233))) * 43758.5453) * 6.283185307;
+
+    float occ_sum = 0.0;
+    const int DIRS = 8;
+    const int STEPS = 3;
+    for (int d_i = 0; d_i < DIRS; ++d_i) {
+        float ang = rot + float(d_i) * (6.283185307 / float(DIRS));
+        vec2 dir_uv = vec2(cos(ang), sin(ang));
+        float max_h = 0.0;
+        for (int s_i = 1; s_i <= STEPS; ++s_i) {
+            float t = float(s_i) / float(STEPS);
+            vec2 suv = uv + dir_uv * (screen_radius * t * t);
+            if (suv.x <= 0.0 || suv.x >= 1.0 || suv.y <= 0.0 || suv.y >= 1.0) break;
+            float sd = textureLod(src_depth, suv, 0.0).r;
+            if (sd <= 1e-6) continue;
+            vec3 Q = reconstruct_view(params.inv_proj, suv, sd);
+            vec3 diff = Q - P;
+            float dlen = length(diff);
+            if (dlen < 1e-4 || dlen > radius) continue;
+            float horizon = dot(diff / dlen, N) - bias;
+            float falloff = clamp(1.0 - (dlen / radius) * (dlen / radius), 0.0, 1.0);
+            max_h = max(max_h, horizon * falloff);
+        }
+        occ_sum += clamp(max_h, 0.0, 1.0);
+    }
+
+    float ao = clamp(1.0 - (occ_sum / float(DIRS)) * (1.0 + 0.35 * max(dot(N, V), 0.0)), 0.0, 1.0);
+    imageStore(dst_ao, ivec2(gid), vec4(ao, 0.0, 0.0, 1.0));
+}

@@ -1,0 +1,488 @@
+@"github.com/xulang-org/nexus/navigation"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub struct TiledNavPath3D {
+    pub found bool
+    pub waypoints []fm.Vec3
+    pub total_cost f64
+    pub tiles_traversed int
+}
+
+struct NavTileEntry {
+    tx int
+    tz int
+    active bool
+    mesh NavMesh3D
+    cost_mult f64
+}
+
+struct TilePortalLink {
+    tile_a int
+    poly_a int
+    tile_b int
+    poly_b int
+    mid fm.Vec3
+}
+
+pub struct TiledNavMesh3D {
+    tile_size f64
+    max_slope_rad f64
+    stitch_tol f64
+    max_step_height f64
+    tiles []NavTileEntry
+    portals []TilePortalLink
+}
+
+pub fn new_tiled_navmesh(
+    tile_size f64,
+    max_slope_rad f64,
+    stitch_tol f64,
+    max_step_height f64
+) TiledNavMesh3D {
+    if !fm.finite(tile_size) || tile_size <= 0.0 ||
+        !fm.finite(stitch_tol) || stitch_tol <= 0.0 ||
+        !fm.finite(max_step_height) || max_step_height < 0.0 ||
+        !fm.finite(max_slope_rad) || max_slope_rad < 0.0 || max_slope_rad > 1.57079632679 {
+        >> errors.new("nexus nav: invalid tiled navmesh configuration")
+    }
+    << TiledNavMesh3D{
+        tile_size: tile_size,
+        max_slope_rad: max_slope_rad,
+        stitch_tol: stitch_tol,
+        max_step_height: max_step_height,
+        tiles: []NavTileEntry{},
+        portals: []TilePortalLink{}
+    }
+}
+
+fn (t &TiledNavMesh3D) find_tile_slot(tx int, tz int) int {
+    for i in 0:t.tiles.len {
+        if t.tiles[i].active && t.tiles[i].tx == tx && t.tiles[i].tz == tz {
+            << i
+        }
+    }
+    << -1
+}
+
+struct EdgeMatchRes {
+    ok bool
+    mid fm.Vec3
+}
+
+fn edges_match_stitch(
+    a0 fm.Vec3,
+    a1 fm.Vec3,
+    b0 fm.Vec3,
+    b1 fm.Vec3,
+    tol2 f64,
+    max_dy f64
+) EdgeMatchRes {
+    match_fwd := dist_xz2(a0, b0) <= tol2 && math.abs(a0.y - b0.y) <= max_dy &&
+        dist_xz2(a1, b1) <= tol2 && math.abs(a1.y - b1.y) <= max_dy
+    if match_fwd {
+        mid := a0.add(a1).add(b0).add(b1).scaled(0.25)
+        << EdgeMatchRes{ok: true, mid: mid}
+    }
+    match_rev := dist_xz2(a0, b1) <= tol2 && math.abs(a0.y - b1.y) <= max_dy &&
+        dist_xz2(a1, b0) <= tol2 && math.abs(a1.y - b0.y) <= max_dy
+    if match_rev {
+        mid := a0.add(a1).add(b0).add(b1).scaled(0.25)
+        << EdgeMatchRes{ok: true, mid: mid}
+    }
+    << EdgeMatchRes{ok: false, mid: fm.vec3(0.0, 0.0, 0.0)}
+}
+
+fn (t $&TiledNavMesh3D) strip_portals_for_tile(tile_idx int) {
+    $kept := []TilePortalLink{}
+    for i in 0:t.portals.len {
+        p := t.portals[i]
+        if p.tile_a != tile_idx && p.tile_b != tile_idx {
+            kept.push(p)
+        }
+    }
+    t.portals = kept
+}
+
+fn (t $&TiledNavMesh3D) stitch_tile_with_neighbor(slot_a int, slot_b int) {
+    if slot_a < 0 || slot_b < 0 || slot_a == slot_b { << }
+    if !t.tiles[slot_a].active || !t.tiles[slot_b].active { << }
+    nav_a := &t.tiles[slot_a].mesh
+    nav_b := &t.tiles[slot_b].mesh
+    tol2 := t.stitch_tol * t.stitch_tol
+
+    for pa in 0:nav_a.polys.len {
+        poly_a := &nav_a.polys[pa]
+        for ea in 0:3 {
+            if poly_neighbor(poly_a, ea) >= 0 { -> }
+            eva := poly_edge_verts(nav_a, pa, ea)
+            a0 := nav_a.vertices[eva[0]]
+            a1 := nav_a.vertices[eva[1]]
+            for pb in 0:nav_b.polys.len {
+                poly_b := &nav_b.polys[pb]
+                for eb in 0:3 {
+                    if poly_neighbor(poly_b, eb) >= 0 { -> }
+                    evb := poly_edge_verts(nav_b, pb, eb)
+                    b0 := nav_b.vertices[evb[0]]
+                    b1 := nav_b.vertices[evb[1]]
+                    mres := edges_match_stitch(a0, a1, b0, b1, tol2, t.max_step_height)
+                    if mres.ok {
+                        t.portals.push(TilePortalLink{
+                            tile_a: slot_a, poly_a: pa,
+                            tile_b: slot_b, poly_b: pb,
+                            mid: mres.mid
+                        })
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn (t $&TiledNavMesh3D) build_tile(
+    tx int,
+    tz int,
+    vertices &[]fm.Vec3,
+    tri_indices &[]int,
+    area_ids &[]int,
+    flags &[]int
+) int {
+    local := build_navmesh(vertices, tri_indices, t.max_slope_rad, area_ids, flags) or >>
+    p_cnt := local.poly_count()
+    $slot := t.find_tile_slot(tx, tz)
+    $cost_mult := 1.0
+    if slot >= 0 {
+        t.strip_portals_for_tile(slot)
+        cost_mult = t.tiles[slot].cost_mult
+    } else {
+        for i in 0:t.tiles.len {
+            if !t.tiles[i].active {
+                slot = i
+                <-
+            }
+        }
+        if slot < 0 {
+            slot = t.tiles.len
+            t.tiles.push(NavTileEntry{
+                tx: tx,
+                tz: tz,
+                active: false,
+                mesh: NavMesh3D{
+                    vertices: []fm.Vec3{},
+                    polys: []NavPoly3D{},
+                    bounds_min: fm.vec3(0.0, 0.0, 0.0),
+                    bounds_max: fm.vec3(0.0, 0.0, 0.0)
+                },
+                cost_mult: 1.0
+            })
+        }
+    }
+    t.tiles[slot] = NavTileEntry{
+        tx: tx,
+        tz: tz,
+        active: true,
+        mesh: local,
+        cost_mult: cost_mult
+    }
+
+    dxs := [1, -1, 0, 0]
+    dzs := [0, 0, 1, -1]
+    for di in 0:4 {
+        nbr_slot := t.find_tile_slot(tx + dxs[di], tz + dzs[di])
+        if nbr_slot >= 0 {
+            t.stitch_tile_with_neighbor(slot, nbr_slot)
+        }
+    }
+    << p_cnt
+}
+
+pub fn (t $&TiledNavMesh3D) remove_tile(tx int, tz int) bool {
+    slot := t.find_tile_slot(tx, tz)
+    if slot < 0 { << false }
+    t.tiles[slot].active = false
+    t.strip_portals_for_tile(slot)
+    << true
+}
+
+pub fn (t &TiledNavMesh3D) has_tile(tx int, tz int) bool {
+    << t.find_tile_slot(tx, tz) >= 0
+}
+
+pub fn (t &TiledNavMesh3D) tile_count() int {
+    $cnt := 0
+    for i in 0:t.tiles.len {
+        if t.tiles[i].active { cnt += 1 }
+    }
+    << cnt
+}
+
+pub fn (t &TiledNavMesh3D) portal_count() int {
+    << t.portals.len
+}
+
+pub fn (t $&TiledNavMesh3D) set_tile_cost_multiplier(tx int, tz int, mult f64) int {
+    if !fm.finite(mult) || mult <= 0.0 {
+        >> errors.new("nexus nav: tile cost multiplier must be finite and > 0")
+    }
+    slot := t.find_tile_slot(tx, tz)
+    if slot < 0 {
+        >> errors.new("nexus nav: unknown active tile (" + str(tx) + ", " + str(tz) + ")")
+    }
+    t.tiles[slot].cost_mult = mult
+    << 0
+}
+
+struct ClosestTilePoly {
+    ok bool
+    tile_idx int
+    poly_idx int
+    point fm.Vec3
+}
+
+fn (t &TiledNavMesh3D) find_closest_tile_poly(pos fm.Vec3) ClosestTilePoly {
+    $best_tile := -1
+    $best_poly := -1
+    $best_pt := pos
+    $best_d2 := 1e30
+    for ti in 0:t.tiles.len {
+        if !t.tiles[ti].active { -> }
+        nav := &t.tiles[ti].mesh
+        for pi in 0:nav.polys.len {
+            p := &nav.polys[pi]
+            a := nav.vertices[p.v0]
+            b := nav.vertices[p.v1]
+            c := nav.vertices[p.v2]
+            cp := closest_point_tri(pos, a, b, c)
+            diff := cp.sub(pos)
+            $d2 := diff.dot(diff)
+            if point_in_tri_xz(pos, a, b, c) {
+                d2 = d2 * 0.85
+            }
+            if d2 < best_d2 {
+                best_d2 = d2
+                best_tile = ti
+                best_poly = pi
+                best_pt = cp
+            }
+        }
+    }
+    if best_tile < 0 {
+        << ClosestTilePoly{ok: false, tile_idx: -1, poly_idx: -1, point: pos}
+    }
+    << ClosestTilePoly{ok: true, tile_idx: best_tile, poly_idx: best_poly, point: best_pt}
+}
+
+fn area_cost_val(area_costs &[]f64, area_id int) f64 {
+    if area_id >= 0 && area_id < area_costs.len && area_costs[area_id] > 0.0 {
+        << area_costs[area_id]
+    }
+    << 1.0
+}
+
+pub fn (t &TiledNavMesh3D) find_path(
+    start fm.Vec3,
+    goal fm.Vec3,
+    area_costs &[]f64
+) TiledNavPath3D {
+    if !start.is_finite() || !goal.is_finite() {
+        >> errors.new("nexus nav: invalid start or goal coordinate")
+    }
+    s_hit := t.find_closest_tile_poly(start)
+    g_hit := t.find_closest_tile_poly(goal)
+    if !s_hit.ok || !g_hit.ok {
+        << TiledNavPath3D{found: false, waypoints: []fm.Vec3{}, total_cost: 0.0, tiles_traversed: 0}
+    }
+    s_tile := s_hit.tile_idx
+    s_poly := s_hit.poly_idx
+    s_pt := s_hit.point
+    g_tile := g_hit.tile_idx
+    g_poly := g_hit.poly_idx
+    g_pt := g_hit.point
+    if s_tile == g_tile && s_poly == g_poly {
+        cost := s_pt.sub(g_pt).length() * t.tiles[s_tile].cost_mult
+        << TiledNavPath3D{found: true, waypoints: [s_pt, g_pt], total_cost: cost, tiles_traversed: 1}
+    }
+
+    // Map each active (tile_slot, poly_id) into flat node index 0..total_polys-1.
+    $tile_base := []int{}
+    $node_tile := []int{}
+    $node_poly := []int{}
+    $total_nodes := 0
+    for ti in 0:t.tiles.len {
+        tile_base.push(total_nodes)
+        if t.tiles[ti].active {
+            pc := t.tiles[ti].mesh.polys.len
+            for pi in 0:pc {
+                node_tile.push(ti)
+                node_poly.push(pi)
+            }
+            total_nodes += pc
+        }
+    }
+    if total_nodes == 0 {
+        << TiledNavPath3D{found: false, waypoints: []fm.Vec3{}, total_cost: 0.0, tiles_traversed: 0}
+    }
+
+    // Build portal adjacency per flat node.
+    $portal_nbrs := [][]int{}
+    $portal_mids := [][]fm.Vec3{}
+    for _ in 0:total_nodes {
+        portal_nbrs.push([]int{})
+        portal_mids.push([]fm.Vec3{})
+    }
+    for pr in t.portals {
+        if !t.tiles[pr.tile_a].active || !t.tiles[pr.tile_b].active { -> }
+        na := tile_base[pr.tile_a] + pr.poly_a
+        nb := tile_base[pr.tile_b] + pr.poly_b
+        portal_nbrs[na].push(nb)
+        portal_mids[na].push(pr.mid)
+        portal_nbrs[nb].push(na)
+        portal_mids[nb].push(pr.mid)
+    }
+
+    start_n := tile_base[s_tile] + s_poly
+    goal_n := tile_base[g_tile] + g_poly
+
+    $g_score := []f64{}
+    $f_score := []f64{}
+    $parent := []int{}
+    $state := []int{}
+    for _ in 0:total_nodes {
+        g_score.push(1e30)
+        f_score.push(1e30)
+        parent.push(-1)
+        state.push(0)
+    }
+    g_score[start_n] = 0.0
+    f_score[start_n] = s_pt.sub(g_pt).length()
+    state[start_n] = 1
+    $open := [start_n]
+    $open_len := 1
+    $found := false
+
+    while open_len > 0 {
+        $best_pos := 0
+        $best_f := f_score[open[0]]
+        for oi in 1:open_len {
+            cnd := open[oi]
+            if f_score[cnd] < best_f {
+                best_f = f_score[cnd]
+                best_pos = oi
+            }
+        }
+        cur := open[best_pos]
+        open_len -= 1
+        open[best_pos] = open[open_len]
+        if cur == goal_n {
+            found = true
+            <-
+        }
+        state[cur] = 2
+
+        cti := node_tile[cur]
+        cpi := node_poly[cur]
+        c_poly := &t.tiles[cti].mesh.polys[cpi]
+
+        // 1. Intra-tile polygon neighbors
+        for e in 0:3 {
+            pn := poly_neighbor(c_poly, e)
+            if pn < 0 { -> }
+            nbr := tile_base[cti] + pn
+            if state[nbr] == 2 { -> }
+            np := &t.tiles[cti].mesh.polys[pn]
+            w := t.tiles[cti].cost_mult * area_cost_val(area_costs, np.area_id)
+            step := c_poly.center.sub(np.center).length() * w
+            tg := g_score[cur] + step
+            if tg < g_score[nbr] {
+                parent[nbr] = cur
+                g_score[nbr] = tg
+                f_score[nbr] = tg + np.center.sub(g_pt).length()
+                if state[nbr] == 0 {
+                    state[nbr] = 1
+                    if open_len == open.len { open.push(nbr) }
+                    else { open[open_len] = nbr }
+                    open_len += 1
+                }
+            }
+        }
+
+        // 2. Cross-tile portal neighbors
+        pn_list := &portal_nbrs[cur]
+        for ki in 0:pn_list.len {
+            nbr := pn_list[ki]
+            if state[nbr] == 2 { -> }
+            nti := node_tile[nbr]
+            npi := node_poly[nbr]
+            np := &t.tiles[nti].mesh.polys[npi]
+            mid := portal_mids[cur][ki]
+            w := t.tiles[nti].cost_mult * area_cost_val(area_costs, np.area_id)
+            step := (c_poly.center.sub(mid).length() + mid.sub(np.center).length()) * w
+            tg := g_score[cur] + step
+            if tg < g_score[nbr] {
+                parent[nbr] = cur
+                g_score[nbr] = tg
+                f_score[nbr] = tg + np.center.sub(g_pt).length()
+                if state[nbr] == 0 {
+                    state[nbr] = 1
+                    if open_len == open.len { open.push(nbr) }
+                    else { open[open_len] = nbr }
+                    open_len += 1
+                }
+            }
+        }
+    }
+
+    if !found {
+        << TiledNavPath3D{found: false, waypoints: []fm.Vec3{}, total_cost: 0.0, tiles_traversed: 0}
+    }
+
+    // Reconstruct reverse chain
+    $rev := []int{}
+    $walk := goal_n
+    while walk >= 0 {
+        rev.push(walk)
+        if walk == start_n { <- }
+        walk = parent[walk]
+    }
+
+    $wps := [s_pt]
+    $seen_tiles := map[int]bool{}
+    $ri := rev.len - 1
+    while ri >= 0 {
+        nid := rev[ri]
+        ti := node_tile[nid]
+        pi := node_poly[nid]
+        seen_tiles[ti] = true
+        if ri > 0 {
+            next_nid := rev[ri - 1]
+            if node_tile[next_nid] != ti {
+                // Insert cross-tile portal midpoint for clean corner-free crossing
+                pn_list := &portal_nbrs[nid]
+                for ki in 0:pn_list.len {
+                    if pn_list[ki] == next_nid {
+                        wps.push(portal_mids[nid][ki])
+                        <-
+                    }
+                }
+            } else {
+                pt_c := t.tiles[ti].mesh.polys[pi].center
+                if pt_c.sub(wps[wps.len - 1]).length() > 1e-4 {
+                    wps.push(pt_c)
+                }
+            }
+        }
+        ri -= 1
+    }
+    if g_pt.sub(wps[wps.len - 1]).length() > 1e-4 {
+        wps.push(g_pt)
+    }
+
+    << TiledNavPath3D{
+        found: true,
+        waypoints: wps,
+        total_cost: g_score[goal_n],
+        tiles_traversed: seen_tiles.len()
+    }
+}

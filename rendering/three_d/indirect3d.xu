@@ -1,0 +1,825 @@
+@"github.com/xulang-org/nexus/rendering/three_d"
+
+#gpu
+#encoding/binary
+#errors
+#math
+layout #gpu/layout
+fm #"github.com/xulang-org/nexus/foundation/math"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+
+pub const MAX_INDIRECT_INSTANCES = 4096
+pub const MAX_INDIRECT_MATERIALS = 256
+pub const INDIRECT_RESULT_VISIBLE = 1
+pub const INDIRECT_RESULT_FRUSTUM_CULLED = 2
+pub const INDIRECT_RESULT_HIZ_OCCLUDED = 3
+
+pub struct IndirectProgram3D {
+    pub format int
+    pub entrypoint string
+    pub hiz_depth []u8
+    pub hiz_mip []u8
+    pub cull []u8
+    pub vertex []u8
+    pub fragment []u8
+}
+
+pub fn empty_indirect_program_3d() IndirectProgram3D {
+    << IndirectProgram3D{
+        format: 0, entrypoint: "",
+        hiz_depth: []u8{}, hiz_mip: []u8{}, cull: []u8{},
+        vertex: []u8{}, fragment: []u8{}
+    }
+}
+
+pub struct HizPyramid3D {
+    owner DeviceRef3D
+    pipelines []gpu.ComputePipeline
+    samplers []gpu.Sampler
+    mips []gpu.Texture
+    mip_widths []int
+    mip_heights []int
+    source_width int
+    source_height int
+    ready bool
+    closed bool
+}
+
+pub fn (device &Device3D) hiz_pyramid(program &IndirectProgram3D) HizPyramid3D {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: create Hi-Z pyramid outside a frame") }
+    if !device.is_gpu() { >> errors.new("nexus 3D: Hi-Z pyramid requires GPU backend") }
+    dev := device.gpu_device() or >>
+    if (dev.shader_formats() & program.format) == 0 || program.entrypoint.len == 0 ||
+        program.hiz_depth.len == 0 || program.hiz_mip.len == 0 {
+        >> errors.new("nexus 3D: invalid or unsupported Hi-Z compute shaders")
+    }
+    if !(dev.supports_texture_2d(layout.DEPTH32_FLOAT, gpu.TEXTURE_DEPTH_TARGET | gpu.TEXTURE_SAMPLED) or >>) {
+        >> errors.new("nexus 3D: GPU device does not support sampled depth targets for Hi-Z")
+    }
+    if !(dev.supports_texture_2d(layout.R32_FLOAT, gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COMPUTE_STORAGE_WRITE) or >>) {
+        >> errors.new("nexus 3D: GPU device does not support R32_FLOAT compute Hi-Z storage")
+    }
+
+    sw := device.target_width * device.render_scale
+    sh := device.target_height * device.render_scale
+    $mw := (sw + 1) / 2
+    $mh := (sh + 1) / 2
+    if mw < 1 { mw = 1 }
+    if mh < 1 { mh = 1 }
+
+    $mip_widths := []int{}
+    $mip_heights := []int{}
+    $done := false
+    $total_bytes := 0
+    for lvl in 0:8 {
+        if !done {
+            mip_widths.push(mw)
+            mip_heights.push(mh)
+            total_bytes += mw * mh * 4
+            if mw == 1 && mh == 1 {
+                done = true
+            } else {
+                if mw > 1 { mw = (mw + 1) / 2 }
+                if mh > 1 { mh = (mh + 1) / 2 }
+            }
+        }
+    }
+
+    stats := dev.stats() or >>
+    internal_bytes := device.target_width * device.target_height * 8 + 4
+    if stats.texture_count + mip_widths.len > 513 + device.targets.len ||
+        total_bytes > 67108864 - (stats.texture_bytes - internal_bytes) {
+        >> errors.new("nexus 3D: Hi-Z pyramid exceeds texture count or 64 MiB VRAM budget")
+    }
+
+    hdesc := gpu.ComputeResourcesDesc{
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 1,
+        read_textures: 0,
+        read_buffers: 0,
+        write_textures: 1,
+        write_buffers: 0,
+        uniform_sizes: [16],
+        threads_x: 8,
+        threads_y: 8,
+        threads_z: 1
+    }
+    $depth_pipe := dev.compute_pipeline_with_resources(&hdesc, &program.hiz_depth) or >>
+    $mip_pipe := dev.compute_pipeline_with_resources(&hdesc, &program.hiz_mip) or >>
+
+    $sdesc := gpu.sampler_defaults()
+    sdesc.min_filter = gpu.NEAREST
+    sdesc.mag_filter = gpu.NEAREST
+    sdesc.mip_filter = gpu.NEAREST
+    $samp := dev.sampler(sdesc) or >>
+
+    $mips := []gpu.Texture{}
+    for lvl in 0:mip_widths.len {
+        $tex := dev.texture_2d(gpu.Texture2DDesc{
+            format: layout.R32_FLOAT,
+            width: mip_widths[lvl],
+            height: mip_heights[lvl],
+            levels: 1,
+            usage: gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COMPUTE_STORAGE_WRITE
+        }) or >>
+        mips.push(tex)
+    }
+
+    << HizPyramid3D{
+        owner: device.reference(),
+        pipelines: [depth_pipe, mip_pipe],
+        samplers: [samp],
+        mips: mips,
+        mip_widths: mip_widths,
+        mip_heights: mip_heights,
+        source_width: sw,
+        source_height: sh,
+        ready: false,
+        closed: false
+    }
+}
+
+fn hiz_params_bytes(sw int, sh int, dw int, dh int) []u8 {
+    order := binary.little_endian()
+    $buf := zero_bytes(16)
+    order.put_u32_bytes($&buf, 0, sw) or >>
+    order.put_u32_bytes($&buf, 4, sh) or >>
+    order.put_u32_bytes($&buf, 8, dw) or >>
+    order.put_u32_bytes($&buf, 12, dh) or >>
+    << buf
+}
+
+fn (hiz &HizPyramid3D) record_build_from(depth_tex &gpu.Texture, encoder $&gpu.CommandEncoder) int {
+    // Pass 0: depth2d -> mips[0]
+    p0 := hiz_params_bytes(hiz.source_width, hiz.source_height, hiz.mip_widths[0], hiz.mip_heights[0]) or >>
+    tw0 := [gpu.write_texture(&hiz.mips[0], 0, 0, true)]
+    bw_empty := []gpu.StorageBufferWrite{}
+    $pass0 := encoder.begin_compute_with_resources(&tw0, &bw_empty) or >>
+    pass0.pipeline(&hiz.pipelines[0]) or >>
+    pass0.sampler(0, depth_tex, &hiz.samplers[0]) or >>
+    pass0.uniform(0, &p0) or >>
+    pass0.dispatch((hiz.mip_widths[0] + 7) / 8, (hiz.mip_heights[0] + 7) / 8, 1) or >>
+    pass0.end() or >>
+
+    // Passes 1..K-1: mips[lvl-1] -> mips[lvl]
+    for lvl in 1:hiz.mips.len {
+        sw := hiz.mip_widths[lvl - 1]
+        sh := hiz.mip_heights[lvl - 1]
+        dw := hiz.mip_widths[lvl]
+        dh := hiz.mip_heights[lvl]
+        pl := hiz_params_bytes(sw, sh, dw, dh) or >>
+        tw := [gpu.write_texture(&hiz.mips[lvl], 0, 0, true)]
+        $pass := encoder.begin_compute_with_resources(&tw, &bw_empty) or >>
+        pass.pipeline(&hiz.pipelines[1]) or >>
+        prev := lvl - 1
+        pass.sampler(0, &hiz.mips[prev], &hiz.samplers[0]) or >>
+        pass.uniform(0, &pl) or >>
+        pass.dispatch((dw + 7) / 8, (dh + 7) / 8, 1) or >>
+        pass.end() or >>
+    }
+    << 0
+}
+
+// Builds Hi-Z min-depth pyramid from Device3D's current DEPTH32_FLOAT target.
+// Works both mid-frame (pauses/resumes render pass with zero CPU stall) and between frames.
+pub fn (hiz $&HizPyramid3D) build_from_device(device $&Device3D) int {
+    device.alive() or >>
+    if !device.is_gpu() { >> errors.new("nexus 3D: Hi-Z build requires GPU backend") }
+    if hiz.closed || !hiz.owner.matches(device) { >> errors.new("nexus 3D: closed or foreign Hi-Z pyramid") }
+    if hiz.source_width != device.target_width * device.render_scale ||
+        hiz.source_height != device.target_height * device.render_scale {
+        >> errors.new("nexus 3D: Hi-Z pyramid resolution mismatch; recreate after resize")
+    }
+    if device.targets.len < 2 { >> errors.new("nexus 3D: device depth target unavailable") }
+
+    if device.active {
+        if device.sealed { >> errors.new("nexus 3D: cannot build Hi-Z after frame readback/seal") }
+        device.pause_render_pass() or >>
+        enc := $&device.encoders[0]
+        hiz.record_build_from(&device.targets[1], enc) or(err){
+            device.abandon_frame()
+            >> err
+        }
+        device.resume_render_pass() or >>
+        hiz.ready = true
+        << 0
+    }
+
+    dev := device.gpu_device() or >>
+    $enc := dev.command_encoder() or >>
+    hiz.record_build_from(&device.targets[1], $&enc) or >>
+    $fence := enc.submit() or >>
+    fence.wait() or >>
+    fence.close() or >>
+    hiz.ready = true
+    << 0
+}
+
+pub fn (hiz &HizPyramid3D) level_count() int { << hiz.mips.len }
+
+pub fn (hiz &HizPyramid3D) is_ready() bool { << hiz.ready }
+
+pub fn (hiz &HizPyramid3D) level_size(level int) []int {
+    if level < 0 || level >= hiz.mips.len { >> errors.new("nexus 3D: invalid Hi-Z mip level") }
+    << [hiz.mip_widths[level], hiz.mip_heights[level]]
+}
+
+pub fn (hiz $&HizPyramid3D) close() int {
+    if hiz.closed { << 0 }
+    for i in 0:hiz.pipelines.len {
+        p := $&hiz.pipelines[i]
+        p.close() or >>
+    }
+    for i in 0:hiz.samplers.len {
+        s := $&hiz.samplers[i]
+        s.close() or >>
+    }
+    for i in 0:hiz.mips.len {
+        m := $&hiz.mips[i]
+        m.close() or >>
+    }
+    hiz.pipelines = []gpu.ComputePipeline{}
+    hiz.samplers = []gpu.Sampler{}
+    hiz.mips = []gpu.Texture{}
+    hiz.ready = false
+    hiz.closed = true
+    << 0
+}
+
+fn (hiz $&HizPyramid3D) drop() {
+    hiz.close() or (err) { << }
+}
+
+struct IndirectMeshEntry {
+    data meshes.MeshData3D
+    vertex_offset int
+    first_index int
+    index_count int
+    bounds fm.Aabb3
+}
+
+struct IndirectInstanceEntry {
+    mesh_id int
+    material_id int
+    world fm.Mat4
+}
+
+pub struct IndirectScene3D {
+    owner DeviceRef3D
+    compute []gpu.ComputePipeline
+    pipelines []gpu.GraphicsPipeline
+    buffers []gpu.Buffer
+    meshes []IndirectMeshEntry
+    materials []Material3D
+    instances []IndirectInstanceEntry
+    total_vertices int
+    total_indices int
+    committed bool
+    instances_dirty bool
+    culled bool
+    closed bool
+}
+
+pub fn (device &Device3D) indirect_scene(program &IndirectProgram3D) IndirectScene3D {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: create indirect scene outside a frame") }
+    if !device.is_gpu() { >> errors.new("nexus 3D: indirect scene requires GPU backend") }
+    dev := device.gpu_device() or >>
+    if (dev.shader_formats() & program.format) == 0 || program.entrypoint.len == 0 ||
+        program.cull.len == 0 || program.vertex.len == 0 || program.fragment.len == 0 {
+        >> errors.new("nexus 3D: invalid or unsupported indirect shaders")
+    }
+
+    cdesc := gpu.ComputeResourcesDesc{
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 8,
+        read_textures: 0,
+        read_buffers: 1,
+        write_textures: 0,
+        write_buffers: 2,
+        uniform_sizes: [208],
+        threads_x: 64,
+        threads_y: 1,
+        threads_z: 1
+    }
+    $cull_pipe := dev.compute_pipeline_with_resources(&cdesc, &program.cull) or >>
+
+    vs_desc := gpu.ShaderResourcesDesc{
+        stage: gpu.VERTEX,
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 0,
+        storage_textures: 0,
+        storage_buffers: 1,
+        uniform_sizes: [128]
+    }
+    fs_desc := gpu.ShaderResourcesDesc{
+        stage: gpu.FRAGMENT,
+        format: program.format,
+        entrypoint: program.entrypoint + "",
+        samplers: 0,
+        storage_textures: 0,
+        storage_buffers: 4,
+        uniform_sizes: [80]
+    }
+    $vs := dev.shader_with_resources(&vs_desc, &program.vertex) or >>
+    $fs := dev.shader_with_resources(&fs_desc, &program.fragment) or >>
+
+    $pdesc := mesh_pipeline()
+    pdesc.cull = gpu.CULL_BACK
+    $p_back := dev.graphics_pipeline(&vs, &fs, &pdesc) or >>
+    pdesc.cull = gpu.CULL_NONE
+    $p_none := dev.graphics_pipeline(&vs, &fs, &pdesc) or >>
+    vs.close() or >>
+    fs.close() or >>
+
+    << IndirectScene3D{
+        owner: device.reference(),
+        compute: [cull_pipe],
+        pipelines: [p_back, p_none],
+        buffers: []gpu.Buffer{},
+        meshes: []IndirectMeshEntry{},
+        materials: []Material3D{},
+        instances: []IndirectInstanceEntry{},
+        total_vertices: 0,
+        total_indices: 0,
+        committed: false,
+        instances_dirty: false,
+        culled: false,
+        closed: false
+    }
+}
+
+fn clone_mesh_data(src &meshes.MeshData3D) meshes.MeshData3D {
+    $out := meshes.new_mesh_data_3d()
+    for i in 0:src.vertices.len {
+        v := &src.vertices[i]
+        if v.has_tangent {
+            out.vertex_tangent(v.position, v.color, v.normal, v.uv, v.tangent) or >>
+        } else if v.has_uv {
+            out.vertex_lit_uv(v.position, v.color, v.normal, v.uv) or >>
+        } else {
+            out.vertex_lit(v.position, v.color, v.normal) or >>
+        }
+    }
+    for i in 0:(src.indices.len / 3) {
+        out.triangle(src.indices[i * 3], src.indices[i * 3 + 1], src.indices[i * 3 + 2]) or >>
+    }
+    out.validate() or >>
+    << out
+}
+
+pub fn (scene $&IndirectScene3D) add_mesh(data &meshes.MeshData3D) int {
+    if scene.closed || scene.committed {
+        >> errors.new("nexus 3D: cannot add meshes to closed or already committed indirect scene")
+    }
+    data.validate() or >>
+    if scene.total_vertices + data.vertices.len > 1048576 || scene.total_indices + data.indices.len > 4194304 {
+        >> errors.new("nexus 3D: indirect mega-buffer vertex or index budget exceeded")
+    }
+    raw_bounds := data.bounds() or >>
+    qbounds := quantized_bounds(raw_bounds) or >>
+    copy := clone_mesh_data(data) or >>
+    id := scene.meshes.len
+    scene.meshes.push(IndirectMeshEntry{
+        data: copy,
+        vertex_offset: scene.total_vertices,
+        first_index: scene.total_indices,
+        index_count: data.indices.len,
+        bounds: qbounds
+    })
+    scene.total_vertices += data.vertices.len
+    scene.total_indices += data.indices.len
+    << id
+}
+
+pub fn (scene $&IndirectScene3D) add_material(material &Material3D) int {
+    if scene.closed || scene.committed {
+        >> errors.new("nexus 3D: cannot add materials to closed or committed indirect scene")
+    }
+    material.validate() or >>
+    if scene.materials.len >= MAX_INDIRECT_MATERIALS {
+        >> errors.new("nexus 3D: indirect material table exceeds 256 limit")
+    }
+    id := scene.materials.len
+    scene.materials.push(material.clone_material())
+    << id
+}
+
+pub fn (scene $&IndirectScene3D) add_instance(mesh_id int, material_id int, world fm.Mat4) int {
+    if scene.closed || scene.committed {
+        >> errors.new("nexus 3D: add instances before commit")
+    }
+    if mesh_id < 0 || mesh_id >= scene.meshes.len {
+        >> errors.new("nexus 3D: invalid indirect mesh id")
+    }
+    if material_id < 0 || material_id >= scene.materials.len {
+        >> errors.new("nexus 3D: invalid indirect material id")
+    }
+    if !world.is_affine() {
+        >> errors.new("nexus 3D: indirect instance transform must be finite affine")
+    }
+    if scene.instances.len >= MAX_INDIRECT_INSTANCES {
+        >> errors.new("nexus 3D: indirect instance count exceeds 4096 limit")
+    }
+    _ := world.affine_inverse() or >>
+    id := scene.instances.len
+    scene.instances.push(IndirectInstanceEntry{mesh_id: mesh_id, material_id: material_id, world: world})
+    << id
+}
+
+pub fn (scene $&IndirectScene3D) set_instance_transform(instance_id int, world fm.Mat4) int {
+    if scene.closed { >> errors.new("nexus 3D: closed indirect scene") }
+    if instance_id < 0 || instance_id >= scene.instances.len {
+        >> errors.new("nexus 3D: indirect instance id out of range")
+    }
+    if !world.is_affine() {
+        >> errors.new("nexus 3D: indirect instance transform must be finite affine")
+    }
+    _ := world.affine_inverse() or >>
+    inst := $&scene.instances[instance_id]
+    inst.world = world
+    scene.instances_dirty = true
+    << 0
+}
+
+fn (scene &IndirectScene3D) pack_instances_bytes() []u8 {
+    order := binary.little_endian()
+    $bytes := zero_bytes(scene.instances.len * 176)
+    for i in 0:scene.instances.len {
+        inst := &scene.instances[i]
+        mid := inst.mesh_id
+        m := &scene.meshes[mid]
+        inv_t := (inst.world.affine_inverse() or >>).transposed()
+        base := i * 176
+
+        mw := matrix_words(inst.world) or >>
+        for j in 0:16 { order.put_u32_bytes($&bytes, base + j * 4, mw[j]) or >> }
+
+        nw := matrix_words(inv_t) or >>
+        for j in 0:16 { order.put_u32_bytes($&bytes, base + 64 + j * 4, nw[j]) or >> }
+
+        $orient := 1.0
+        if (inst.world.determinant_sign() or >>) < 0 { orient = -1.0 }
+        lo := m.bounds.minimum
+        hi := m.bounds.maximum
+        bvals := [lo.x, lo.y, lo.z, orient, hi.x, hi.y, hi.z, 0.0]
+        for j in 0:8 { put_scalar($&bytes, base + 128 + j * 4, bvals[j]) or >> }
+
+        order.put_u32_bytes($&bytes, base + 160, m.index_count) or >>
+        order.put_u32_bytes($&bytes, base + 164, m.first_index) or >>
+        order.put_u32_bytes($&bytes, base + 168, m.vertex_offset) or >>
+        order.put_u32_bytes($&bytes, base + 172, inst.material_id) or >>
+    }
+    << bytes
+}
+
+pub fn (scene $&IndirectScene3D) commit(device &Device3D) int {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: commit indirect scene outside a frame") }
+    if scene.closed || !scene.owner.matches(device) { >> errors.new("nexus 3D: closed or foreign indirect scene") }
+    if scene.committed { >> errors.new("nexus 3D: indirect scene already committed") }
+    if scene.meshes.len == 0 || scene.materials.len == 0 || scene.instances.len == 0 {
+        >> errors.new("nexus 3D: indirect scene needs at least 1 mesh, 1 material and 1 instance")
+    }
+
+    vb_bytes_len := scene.total_vertices * 64
+    ib_bytes_len := scene.total_indices * 4
+    inst_bytes_len := scene.instances.len * 176
+    mat_bytes_len := scene.materials.len * 80
+    cmd_bytes_len := scene.instances.len * 20
+    res_bytes_len := scene.instances.len * 4
+
+    dev := device.gpu_device() or >>
+    stats := dev.stats() or >>
+    total_size := vb_bytes_len + ib_bytes_len + inst_bytes_len + mat_bytes_len + cmd_bytes_len + res_bytes_len
+    if stats.buffer_count + 6 > 1024 || total_size > 67108864 - stats.buffer_bytes {
+        >> errors.new("nexus 3D: indirect scene exceeds 1024-buffer or 64 MiB budget")
+    }
+
+    $vb_bytes := zero_bytes(vb_bytes_len)
+    $ib_bytes := zero_bytes(ib_bytes_len)
+    order := binary.little_endian()
+    for mi in 0:scene.meshes.len {
+        entry := &scene.meshes[mi]
+        $m_vb := zero_bytes(entry.data.vertices.len * 64)
+        for v in 0:entry.data.vertices.len {
+            vert := &entry.data.vertices[v]
+            vals := [vert.position.x, vert.position.y, vert.position.z,
+                f64((vert.color >> 24) & 255) / 255.0, f64((vert.color >> 16) & 255) / 255.0,
+                f64((vert.color >> 8) & 255) / 255.0, f64(vert.color & 255) / 255.0,
+                vert.normal.x, vert.normal.y, vert.normal.z, vert.uv.x, vert.uv.y,
+                vert.tangent.x, vert.tangent.y, vert.tangent.z, vert.tangent.w]
+            for j in 0:16 { put_scalar($&m_vb, v * 64 + j * 4, vals[j]) or >> }
+        }
+        vbase := entry.vertex_offset * 64
+        for b in 0:m_vb.len { vb_bytes[vbase + b] = m_vb[b] }
+
+        ibase := entry.first_index * 4
+        for k in 0:entry.data.indices.len {
+            order.put_u32_bytes($&ib_bytes, ibase + k * 4, entry.data.indices[k]) or >>
+        }
+    }
+
+    $mat_words := []int{}
+    for i in 0:scene.materials.len {
+        mw := material_words(&scene.materials[i], 1.0) or >>
+        for w in mw { mat_words.push(w) }
+    }
+    mat_bytes := word_bytes(&mat_words) or >>
+    inst_bytes := scene.pack_instances_bytes() or >>
+
+    $vb := dev.buffer(vb_bytes_len, gpu.BUFFER_VERTEX) or >>
+    $ib := dev.buffer(ib_bytes_len, gpu.BUFFER_INDEX) or >>
+    $inst_buf := dev.buffer(inst_bytes_len, gpu.BUFFER_COMPUTE_STORAGE_READ | gpu.BUFFER_GRAPHICS_STORAGE_READ) or >>
+    $mat_buf := dev.buffer(mat_bytes_len, gpu.BUFFER_GRAPHICS_STORAGE_READ) or >>
+    $cmd_buf := dev.buffer(cmd_bytes_len, gpu.BUFFER_INDIRECT | gpu.BUFFER_COMPUTE_STORAGE_WRITE) or >>
+    $res_buf := dev.buffer(res_bytes_len, gpu.BUFFER_COMPUTE_STORAGE_WRITE) or >>
+
+    $u0 := dev.upload(&vb, 0, &vb_bytes) or >>
+    u0.close() or >>
+    $u1 := dev.upload(&ib, 0, &ib_bytes) or >>
+    u1.close() or >>
+    $u2 := dev.upload(&inst_buf, 0, &inst_bytes) or >>
+    u2.close() or >>
+    $u3 := dev.upload(&mat_buf, 0, &mat_bytes) or >>
+    u3.close() or >>
+
+    scene.buffers = [vb, ib, inst_buf, mat_buf, cmd_buf, res_buf]
+    scene.committed = true
+    scene.instances_dirty = false
+    scene.culled = false
+    << 0
+}
+
+pub fn (scene $&IndirectScene3D) sync_instances(device &Device3D) int {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: sync_instances must run outside a frame") }
+    if scene.closed || !scene.committed || !scene.owner.matches(device) {
+        >> errors.new("nexus 3D: closed, uncommitted or foreign indirect scene")
+    }
+    if !scene.instances_dirty { << 0 }
+    inst_bytes := scene.pack_instances_bytes() or >>
+    dev := device.gpu_device() or >>
+    $up := dev.upload(&scene.buffers[2], 0, &inst_bytes) or >>
+    up.close() or >>
+    scene.instances_dirty = false
+    << 0
+}
+
+fn build_cull_params_bytes(
+    instance_count int,
+    view_projection fm.Mat4,
+    hiz_enabled bool,
+    mip_widths &[]int,
+    mip_heights &[]int,
+    depth_epsilon f64
+) []u8 {
+    $words := []int{}
+    for w in matrix_words(view_projection) or >> { words.push(w) }
+    $hiz_flag := 0.0
+    $levels := 1
+    if hiz_enabled {
+        hiz_flag = 1.0
+        levels = mip_widths.len
+    }
+    for v in [f64(instance_count), hiz_flag, f64(levels), depth_epsilon] {
+        words.push(scalar_word(v) or >>)
+    }
+    for k in 0:8 {
+        $mw := 1.0
+        $mh := 1.0
+        if hiz_enabled && mip_widths.len > 0 {
+            $clamped := k
+            if clamped >= mip_widths.len { clamped = mip_widths.len - 1 }
+            mw = f64(mip_widths[clamped])
+            mh = f64(mip_heights[clamped])
+        }
+        for v in [mw, mh, 0.0, 0.0] { words.push(scalar_word(v) or >>) }
+    }
+    << word_bytes(&words) or >>
+}
+
+fn (scene &IndirectScene3D) record_cull_dispatch(
+    device &Device3D,
+    encoder $&gpu.CommandEncoder,
+    param_bytes &[]u8
+) int {
+    tw_empty := []gpu.StorageTextureWrite{}
+    bw := [gpu.write_buffer(&scene.buffers[4], false), gpu.write_buffer(&scene.buffers[5], false)]
+    $pass := encoder.begin_compute_with_resources(&tw_empty, &bw) or >>
+    pass.pipeline(&scene.compute[0]) or >>
+    pass.read_buffer(0, &scene.buffers[2]) or >>
+    for k in 0:8 {
+        pass.sampler(k, &device.whites[0], &device.white_samplers[0]) or >>
+    }
+    pass.uniform(0, param_bytes) or >>
+    groups := (scene.instances.len + 63) / 64
+    pass.dispatch(groups, 1, 1) or >>
+    pass.end() or >>
+    << 0
+}
+
+pub fn (scene $&IndirectScene3D) cull(device $&Device3D, view_projection fm.Mat4) int {
+    device.alive() or >>
+    if scene.closed || !scene.committed || !scene.owner.matches(device) {
+        >> errors.new("nexus 3D: closed, uncommitted or foreign indirect scene")
+    }
+    if !view_projection.is_finite() { >> errors.new("nexus 3D: invalid cull view-projection") }
+    if scene.instances_dirty {
+        if device.active { >> errors.new("nexus 3D: call sync_instances before device.begin when transforms changed") }
+        scene.sync_instances(device) or >>
+    }
+    empty_w := []int{}
+    empty_h := []int{}
+    param_bytes := build_cull_params_bytes(scene.instances.len, view_projection, false, &empty_w, &empty_h, 0.0) or >>
+    if device.active {
+        if device.sealed { >> errors.new("nexus 3D: cannot run indirect cull after frame seal") }
+        device.pause_render_pass() or >>
+        enc := $&device.encoders[0]
+        scene.record_cull_dispatch(device, enc, &param_bytes) or(err){
+            device.abandon_frame()
+            >> err
+        }
+        device.resume_render_pass() or >>
+    } else {
+        dev := device.gpu_device() or >>
+        $enc := dev.command_encoder() or >>
+        scene.record_cull_dispatch(device, $&enc, &param_bytes) or >>
+        $fence := enc.submit() or >>
+        fence.wait() or >>
+        fence.close() or >>
+    }
+    scene.culled = true
+    << 0
+}
+
+pub fn (scene $&IndirectScene3D) cull_with_hiz(
+    device $&Device3D,
+    hiz &HizPyramid3D,
+    view_projection fm.Mat4,
+    depth_epsilon f64
+) int {
+    device.alive() or >>
+    if scene.closed || !scene.committed || !scene.owner.matches(device) {
+        >> errors.new("nexus 3D: closed, uncommitted or foreign indirect scene")
+    }
+    if hiz.closed || !hiz.owner.matches(device) || !hiz.ready {
+        >> errors.new("nexus 3D: closed, foreign or unbuilt Hi-Z pyramid")
+    }
+    if !view_projection.is_finite() || !fm.finite(depth_epsilon) || depth_epsilon < 0.0 || depth_epsilon > 0.1 {
+        >> errors.new("nexus 3D: invalid cull view-projection or depth epsilon")
+    }
+    if scene.instances_dirty {
+        if device.active { >> errors.new("nexus 3D: call sync_instances before device.begin when transforms changed") }
+        scene.sync_instances(device) or >>
+    }
+    param_bytes := build_cull_params_bytes(scene.instances.len, view_projection, true, &hiz.mip_widths, &hiz.mip_heights, depth_epsilon) or >>
+
+    // Bind directly using hiz reference without wrapping owning struct into a temporary slice.
+    if device.active {
+        if device.sealed { >> errors.new("nexus 3D: cannot run indirect cull after frame seal") }
+        device.pause_render_pass() or >>
+        enc := $&device.encoders[0]
+        scene.record_cull_with_hiz_ref(device, enc, &param_bytes, hiz) or(err){
+            device.abandon_frame()
+            >> err
+        }
+        device.resume_render_pass() or >>
+    } else {
+        dev := device.gpu_device() or >>
+        $enc := dev.command_encoder() or >>
+        scene.record_cull_with_hiz_ref(device, $&enc, &param_bytes, hiz) or >>
+        $fence := enc.submit() or >>
+        fence.wait() or >>
+        fence.close() or >>
+    }
+    scene.culled = true
+    << 0
+}
+
+fn (scene &IndirectScene3D) record_cull_with_hiz_ref(
+    device &Device3D,
+    encoder $&gpu.CommandEncoder,
+    param_bytes &[]u8,
+    hiz &HizPyramid3D
+) int {
+    tw_empty := []gpu.StorageTextureWrite{}
+    bw := [gpu.write_buffer(&scene.buffers[4], false), gpu.write_buffer(&scene.buffers[5], false)]
+    $pass := encoder.begin_compute_with_resources(&tw_empty, &bw) or >>
+    pass.pipeline(&scene.compute[0]) or >>
+    pass.read_buffer(0, &scene.buffers[2]) or >>
+    for k in 0:8 {
+        $clamped := k
+        if clamped >= hiz.mips.len { clamped = hiz.mips.len - 1 }
+        pass.sampler(k, &hiz.mips[clamped], &hiz.samplers[0]) or >>
+    }
+    pass.uniform(0, param_bytes) or >>
+    groups := (scene.instances.len + 63) / 64
+    pass.dispatch(groups, 1, 1) or >>
+    pass.end() or >>
+    << 0
+}
+
+// Emits ONE GPU draw_indexed_indirect covering ALL visible instances in the batch!
+pub fn (scene &IndirectScene3D) draw(
+    device $&Device3D,
+    clustered &ClusteredRenderer3D,
+    view fm.Mat4,
+    view_projection fm.Mat4,
+    two_sided bool
+) int {
+    device.drawing() or >>
+    if scene.closed || !scene.committed || !scene.culled || !scene.owner.matches(device) {
+        >> errors.new("nexus 3D: indirect scene must be committed and culled before draw")
+    }
+    if clustered.closed || !clustered.owner.matches(device) || !clustered.ready {
+        >> errors.new("nexus 3D: indirect draw requires a binned ClusteredRenderer3D")
+    }
+    if !view.is_affine() || !view_projection.is_finite() {
+        >> errors.new("nexus 3D: invalid view or view-projection matrix")
+    }
+
+    $vw := []int{}
+    for w in matrix_words(view_projection) or >> { vw.push(w) }
+    for w in matrix_words(view) or >> { vw.push(w) }
+    vert_bytes := word_bytes(&vw) or >>
+    frag_bytes := clustered.lighting_uniform_bytes() or >>
+
+    pass := $&device.passes[0]
+    if two_sided {
+        pass.pipeline(&scene.pipelines[1]) or >>
+    } else {
+        pass.pipeline(&scene.pipelines[0]) or >>
+    }
+    pass.vertex_buffer(0, &scene.buffers[0], 0) or >>
+    pass.index_buffer(&scene.buffers[1], 0, gpu.INDEX32) or >>
+    pass.uniform(gpu.VERTEX, 0, &vert_bytes) or >>
+    pass.storage_buffer(gpu.VERTEX, 0, &scene.buffers[2]) or >>
+    pass.uniform(gpu.FRAGMENT, 0, &frag_bytes) or >>
+    pass.storage_buffer(gpu.FRAGMENT, 0, &scene.buffers[3]) or >>
+    pass.storage_buffer(gpu.FRAGMENT, 1, &clustered.buffers[0]) or >>
+    pass.storage_buffer(gpu.FRAGMENT, 2, &clustered.buffers[1]) or >>
+    pass.storage_buffer(gpu.FRAGMENT, 3, &clustered.buffers[2]) or >>
+    pass.draw_indexed_indirect(&scene.buffers[4], 0, scene.instances.len) or >>
+
+    device.cached = false
+    device.draw_count += 1
+    device.lit_draws += 1
+    << scene.instances.len
+}
+
+pub fn (scene &IndirectScene3D) readback_cull_results(device &Device3D) []int {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: readback_cull_results must run outside a frame") }
+    if scene.closed || !scene.committed || !scene.culled || !scene.owner.matches(device) {
+        >> errors.new("nexus 3D: indirect scene must be committed and culled before readback")
+    }
+    dev := device.gpu_device() or >>
+    n := scene.instances.len
+    $rb := dev.download(&scene.buffers[5], 0, n * 4) or >>
+    rb.wait() or >>
+    $raw := zero_bytes(n * 4)
+    rb.read($&raw) or >>
+    rb.close() or >>
+    order := binary.little_endian()
+    $out := []int{}
+    for i in 0:n {
+        out.push(order.get_u32_bytes(&raw, i * 4) or >>)
+    }
+    << out
+}
+
+pub fn (scene &IndirectScene3D) instance_count() int { << scene.instances.len }
+
+pub fn (scene &IndirectScene3D) mesh_count() int { << scene.meshes.len }
+
+pub fn (scene $&IndirectScene3D) close() int {
+    if scene.closed { << 0 }
+    for i in 0:scene.compute.len {
+        c := $&scene.compute[i]
+        c.close() or >>
+    }
+    for i in 0:scene.pipelines.len {
+        p := $&scene.pipelines[i]
+        p.close() or >>
+    }
+    for i in 0:scene.buffers.len {
+        b := $&scene.buffers[i]
+        b.close() or >>
+    }
+    scene.compute = []gpu.ComputePipeline{}
+    scene.pipelines = []gpu.GraphicsPipeline{}
+    scene.buffers = []gpu.Buffer{}
+    scene.committed = false
+    scene.culled = false
+    scene.closed = true
+    << 0
+}
+
+fn (scene $&IndirectScene3D) drop() {
+    scene.close() or (err) { << }
+}
