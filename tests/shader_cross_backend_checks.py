@@ -90,7 +90,7 @@ def main() -> int:
                 expanded_msl = tmp_path / f'{shader}.metal'
                 expanded_msl.write_text(msl_text, encoding='utf-8')
                 res = subprocess.run(
-                    ['xcrun', 'metal', '-x', 'metal', '-std=metal2.4', '-fsyntax-only', str(expanded_msl)],
+                    ['xcrun', 'metal', '-x', 'metal', '-std=macos-metal2.4', '-fsyntax-only', str(expanded_msl)],
                     capture_output=True, text=True
                 )
                 if res.returncode != 0:
