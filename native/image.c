@@ -1,3 +1,8 @@
+#ifdef _WIN32
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#endif
 // CPU PNG transport only. No video/audio initialization, windows or GPU APIs.
 #include <SDL3/SDL.h>
 #include "xu_native.h"

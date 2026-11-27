@@ -179,9 +179,26 @@ def run_check(xu_bin: str, env: dict[str, str]) -> None:
 def run_test(xu_bin: str, env: dict[str, str]) -> None:
     build_dir = ROOT / "build"
     build_dir.mkdir(parents=True, exist_ok=True)
+    run_step([sys.executable, "tests/make_glb_fixtures.py"], env, "Generate GLB fixtures")
+    run_step([sys.executable, "tests/make_audio_fixtures.py"], env, "Generate audio fixtures")
+    scriptc_bin = build_dir / exe_name("xu-nexus-script")
+    run_step([xu_bin, "build", "cmd/scriptc/main.xu", "-o", str(scriptc_bin)], env, "build scriptc for fixture")
+    run_step(
+        [
+            sys.executable,
+            "tools/build_script_scene.py",
+            "--project",
+            "examples/scene_scripts/project.json",
+            "--output",
+            "build/scene-scripts/world.xuscene",
+            "--tool",
+            str(scriptc_bin),
+        ],
+        env,
+        "Generate scene-script fixture",
+    )
     for py_iso in ("tests/layer_headless_checks.py", "tests/canvas_isolation.py", "tests/scene_process_checks.py"):
         run_step([sys.executable, py_iso], env, py_iso)
-    run_step([sys.executable, "tests/make_audio_fixtures.py"], env, "Generate audio fixtures")
 
     for src, out_stem, extra_args, extra_env in HEADLESS_TESTS:
         out_bin = build_dir / exe_name(out_stem)

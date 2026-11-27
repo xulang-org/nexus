@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix='xu-nexus-canvas-') as directory:
     shutil.copyfile(ROOT/'tests/canvas_checks.xu', target/'checks/main.xu')
     for absent in ('native', 'platform', 'rendering', 'assets', 'formats', 'script', 'internal'):
         assert not (target/absent).exists(), absent
-    binary = target/'canvas-checks'
+    binary = target / ('canvas-checks.exe' if os.name == 'nt' else 'canvas-checks')
     subprocess.run([os.environ.get('XU', 'xu'), 'build', str(target/'checks/main.xu'), '-o', str(binary)], cwd=target, check=True, timeout=60)
     env = os.environ | {'XU_SDL_LIBRARY': '/nonexistent/canvas-no-sdl', 'XU_NEXUS_SDL_LIBRARY': '/nonexistent/canvas-no-sdl', 'SDL_VIDEODRIVER': 'nonexistent'}
     subprocess.run([str(binary)], cwd=target, env=env, check=True, timeout=60)

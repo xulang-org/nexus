@@ -1,3 +1,8 @@
+#ifdef _WIN32
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#endif
 // Runtime-loaded TapSDK v4 C ABI adapter (CN & Global; Android / iOS / PC).
 // Never vendors proprietary TapTap SDK headers or binaries.
 #define _POSIX_C_SOURCE 200809L
@@ -17,6 +22,7 @@ typedef void *taptap_lib_t;
 #endif
 
 #define API(name) XU_NATIVE_SYMBOL(xu_nexus_taptap_native_##name)
+_Static_assert(sizeof(xu_int) == sizeof(int64_t), "xu_int must match int64_t");
 
 typedef int (*fn_t_restart)(const char *client_id);
 typedef int (*fn_t_init)(const char *client_id, const char *client_token, int region, int target_platform);
@@ -276,7 +282,7 @@ xu_int API(poll_events)(const xu_i64_span_mut *events_out) {
     if (!require_init()) return -1;
     if (!events_out || !events_out->data || events_out->len <= 0) return fail("invalid events span");
     if (!p_poll) return 0;
-    int n = p_poll(events_out->data, (int)events_out->len);
+    int n = p_poll((int64_t *)(void *)events_out->data, (int)events_out->len);
     return n < 0 ? 0 : (xu_int)n;
 }
 

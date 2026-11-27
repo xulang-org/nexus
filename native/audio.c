@@ -1,3 +1,8 @@
+#ifdef _WIN32
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#endif
 // Audio device transport only. Mixing, resampling and playback state live in Xu.
 #define SDL_MAIN_HANDLED
 #include <SDL3/SDL.h>

@@ -1,3 +1,8 @@
+#ifdef _WIN32
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#endif
 // Runtime-loaded Console SDK adapter (Xbox GDK / PlayStation SDK / Nintendo Switch).
 // Never vendors proprietary vendor headers or redistributables.
 #define _POSIX_C_SOURCE 200809L
@@ -18,6 +23,7 @@ typedef void *console_lib_t;
 #endif
 
 #define API(name) XU_NATIVE_SYMBOL(xu_nexus_console_native_##name)
+_Static_assert(sizeof(xu_int) == sizeof(int64_t), "xu_int must match int64_t");
 
 typedef int (*fn_c_init)(int platform_id);
 typedef void (*fn_c_void)(void);
@@ -250,7 +256,7 @@ xu_int API(shutdown)(void) {
 xu_int API(poll_events)(const xu_i64_span_mut *out) {
     if (!require_init()) return -1;
     if (!p_poll_events || !out || !out->data || out->len <= 0) return 0;
-    return (xu_int)p_poll_events(out->data, (int)out->len);
+    return (xu_int)p_poll_events((int64_t *)(void *)out->data, (int)out->len);
 }
 
 xu_int API(lifecycle_state)(void) {
@@ -375,7 +381,7 @@ xu_int API(set_haptics)(xu_int pad_idx, double low_f, double high_f, double lt, 
     if (!require_init()) return -1;
     if (!params || !params->data || params->len < 11) return fail("haptics requires 11-int parameter span");
     if (!p_set_haptics) return 0;
-    return p_set_haptics((int)pad_idx, low_f, high_f, lt, rt, params->data, (int)params->len) == 0
+    return p_set_haptics((int)pad_idx, low_f, high_f, lt, rt, (const int64_t *)(const void *)params->data, (int)params->len) == 0
         ? 0 : fail("set_haptics failed");
 }
 

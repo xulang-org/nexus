@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory(prefix='xu-nexus-headless-') as temporary:
     shutil.copyfile(ROOT / 'tests/layer_headless_checks.xu', check)
     assert not (target / 'native').exists()
     tool = os.environ.get('XU', 'xu')
-    binary = target / 'headless'
+    binary = target / ('headless.exe' if os.name == 'nt' else 'headless')
     subprocess.run([tool, 'build', str(check), '-o', str(binary)], cwd=target, check=True, timeout=60)
     environment = os.environ.copy()
     environment['XU_NEXUS_SDL_LIBRARY'] = '/nonexistent/layer-test-no-sdl'

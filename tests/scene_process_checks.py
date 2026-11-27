@@ -19,7 +19,7 @@ with tempfile.TemporaryDirectory(prefix='xu-nexus-scene-isolation-') as director
     shutil.copyfile(root / 'tests/scene_process_cli.xu', check / 'main.xu')
     sdk = next(line for line in (root / 'xu.xun').read_text().splitlines() if line.startswith('xu:'))
     (check / 'xu.xun').write_text('module: example/scene_isolation\nversion: !ver 0.1.0\n' + sdk + '\nrequire:\n  "github.com/xulang-org/nexus": file:..\n')
-    binary = target / 'scene-cli'
+    binary = target / ('scene-cli.exe' if os.name == 'nt' else 'scene-cli')
     subprocess.run([os.environ.get('XU','xu'), 'build', str(check / 'main.xu'), '-o', str(binary)], cwd=target, check=True, timeout=60)
     assert not (target / 'rendering').exists() and not (target / 'platform').exists()
     environment = dict(os.environ, XU_NEXUS_SDL_LIBRARY='/nonexistent/scene-no-sdl', SDL_VIDEODRIVER='nonexistent')

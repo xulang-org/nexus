@@ -1,3 +1,8 @@
+#ifdef _WIN32
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#endif
 // Dynamic Steamworks C-ABI bridge. libsteam_api is loaded at runtime, never vendored.
 #define _POSIX_C_SOURCE 200809L
 #include "xu_native.h"
