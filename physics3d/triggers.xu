@@ -1,0 +1,155 @@
+@"github.com/xulang-org/nexus/physics3d"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+
+pub const TRIGGER_ENTER = 1
+pub const TRIGGER_STAY = 2
+pub const TRIGGER_EXIT = 3
+
+pub struct TriggerEvent3D {
+    pub actor_id int
+    pub trigger_id int
+    pub kind int
+}
+
+pub struct TriggerTracker3D {
+    actor_triggers map[int][]int
+    actor_ids []int
+}
+
+pub fn new_trigger_tracker_3d() TriggerTracker3D {
+    << TriggerTracker3D{actor_triggers: map[int][]int{}, actor_ids: []int{}}
+}
+
+fn sort_unique_ints(values &[]int) []int {
+    if values.len == 0 { << []int{} }
+    $tmp := []int{}
+    for i in 0:values.len {
+        tmp.push(values[i])
+    }
+    for i in 1:tmp.len {
+        k := tmp[i]
+        $j := i - 1
+        while j >= 0 && tmp[j] > k {
+            tmp[j + 1] = tmp[j]
+            j -= 1
+        }
+        tmp[j + 1] = k
+    }
+    $out := []int{}
+    for i in 0:tmp.len {
+        if out.len == 0 || tmp[i] != out[out.len - 1] {
+            out.push(tmp[i])
+        }
+    }
+    << out
+}
+
+pub fn (t $&TriggerTracker3D) update_actor(actor_id int, active_triggers &[]int) []TriggerEvent3D {
+    if actor_id < 0 {
+        >> errors.new("nexus physics3d: trigger actor_id must be non-negative")
+    }
+    cur := sort_unique_ints(active_triggers)
+    $prev := []int{}
+    if t.actor_triggers.has(actor_id) {
+        prev_ref := &t.actor_triggers[actor_id]
+        for pv in prev_ref {
+            prev.push(pv)
+        }
+    }
+    $events := []TriggerEvent3D{}
+    $pi := 0
+    $ci := 0
+    while pi < prev.len && ci < cur.len {
+        pv := prev[pi]
+        cv := cur[ci]
+        if pv < cv {
+            events.push(TriggerEvent3D{actor_id: actor_id, trigger_id: pv, kind: TRIGGER_EXIT})
+            pi += 1
+        } else if cv < pv {
+            events.push(TriggerEvent3D{actor_id: actor_id, trigger_id: cv, kind: TRIGGER_ENTER})
+            ci += 1
+        } else {
+            events.push(TriggerEvent3D{actor_id: actor_id, trigger_id: cv, kind: TRIGGER_STAY})
+            pi += 1
+            ci += 1
+        }
+    }
+    while pi < prev.len {
+        events.push(TriggerEvent3D{actor_id: actor_id, trigger_id: prev[pi], kind: TRIGGER_EXIT})
+        pi += 1
+    }
+    while ci < cur.len {
+        events.push(TriggerEvent3D{actor_id: actor_id, trigger_id: cur[ci], kind: TRIGGER_ENTER})
+        ci += 1
+    }
+
+    m := $&t.actor_triggers
+    if cur.len == 0 {
+        if m.has(actor_id) {
+            m.delete(actor_id)
+            $kept := []int{}
+            for aid in t.actor_ids {
+                if aid != actor_id { kept.push(aid) }
+            }
+            t.actor_ids = kept
+        }
+        << events
+    }
+    if !m.has(actor_id) {
+        t.actor_ids.push(actor_id)
+    }
+    m[actor_id] = cur
+    << events
+}
+
+pub fn (t $&TriggerTracker3D) update_box(actor_id int, world &StaticWorld3D, body fm.Aabb3, mask int) []TriggerEvent3D {
+    overlaps := world.overlap_triggers(body, mask) or >>
+    << t.update_actor(actor_id, &overlaps) or >>
+}
+
+pub fn (t $&TriggerTracker3D) update_capsule(actor_id int, world &CapsuleWorld3D, body Capsule3D, mask int) []TriggerEvent3D {
+    overlaps := world.overlap_capsule_triggers(body, mask) or >>
+    << t.update_actor(actor_id, &overlaps) or >>
+}
+
+pub fn (t $&TriggerTracker3D) remove_actor(actor_id int) []TriggerEvent3D {
+    if actor_id < 0 {
+        >> errors.new("nexus physics3d: trigger actor_id must be non-negative")
+    }
+    empty := []int{}
+    << t.update_actor(actor_id, &empty) or >>
+}
+
+pub fn (t &TriggerTracker3D) is_inside(actor_id int, trigger_id int) bool {
+    if !t.actor_triggers.has(actor_id) { << false }
+    list := &t.actor_triggers[actor_id]
+    for tid in list {
+        if tid == trigger_id { << true }
+    }
+    << false
+}
+
+pub fn (t &TriggerTracker3D) active_for_actor(actor_id int) []int {
+    if !t.actor_triggers.has(actor_id) { << []int{} }
+    src := &t.actor_triggers[actor_id]
+    $out := []int{}
+    for tid in src { out.push(tid) }
+    << out
+}
+
+pub fn (t &TriggerTracker3D) occupants_of(trigger_id int) []int {
+    $out := []int{}
+    for aid in t.actor_ids {
+        if !t.actor_triggers.has(aid) { -> }
+        list := &t.actor_triggers[aid]
+        for tid in list {
+            if tid == trigger_id {
+                out.push(aid)
+                <-
+            }
+        }
+    }
+    << sort_unique_ints(&out)
+}

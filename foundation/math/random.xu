@@ -1,0 +1,328 @@
+@"github.com/xulang-org/nexus/foundation/math"
+
+#errors
+#math
+
+pub struct Rng {
+    s0 int
+    s1 int
+    s2 int
+    s3 int
+}
+
+fn rng_mix32(v int) int {
+    $h := v & 0xFFFFFFFF
+    h = ((h ^ (h >> 16)) * 0x45d9f3b) & 0xFFFFFFFF
+    h = ((h ^ (h >> 16)) * 0x45d9f3b) & 0xFFFFFFFF
+    h = (h ^ (h >> 16)) & 0xFFFFFFFF
+    << h
+}
+
+fn rotl32(x int, k int) int {
+    u := x & 0xFFFFFFFF
+    if k <= 0 { << u }
+    << (((u << k) & 0xFFFFFFFF) | (u >> (32 - k))) & 0xFFFFFFFF
+}
+
+pub fn new_rng(seed int) Rng {
+    $a := rng_mix32(seed ^ 0x9E3779B9)
+    $b := rng_mix32(a ^ 0x85EBCA6B)
+    $c := rng_mix32(b ^ 0xC2B2AE35)
+    $d := rng_mix32(c ^ 0x27D4EB2F)
+    if (a | b | c | d) == 0 {
+        a = 1
+    }
+    << Rng{s0: a, s1: b, s2: c, s3: d}
+}
+
+pub fn rng_from_state(s0 int, s1 int, s2 int, s3 int) Rng {
+    a := s0 & 0xFFFFFFFF
+    b := s1 & 0xFFFFFFFF
+    c := s2 & 0xFFFFFFFF
+    d := s3 & 0xFFFFFFFF
+    if (a | b | c | d) == 0 {
+        >> errors.new("nexus random: PRNG state cannot be all zero")
+    }
+    << Rng{s0: a, s1: b, s2: c, s3: d}
+}
+
+pub fn (r &Rng) state() []int {
+    << [r.s0 & 0xFFFFFFFF, r.s1 & 0xFFFFFFFF, r.s2 & 0xFFFFFFFF, r.s3 & 0xFFFFFFFF]
+}
+
+pub fn (r $&Rng) next_u32() int {
+    result := (rotl32((r.s0 + r.s3) & 0xFFFFFFFF, 7) + r.s0) & 0xFFFFFFFF
+    t := (r.s1 << 9) & 0xFFFFFFFF
+    r.s2 = (r.s2 ^ r.s0) & 0xFFFFFFFF
+    r.s3 = (r.s3 ^ r.s1) & 0xFFFFFFFF
+    r.s1 = (r.s1 ^ r.s2) & 0xFFFFFFFF
+    r.s0 = (r.s0 ^ r.s3) & 0xFFFFFFFF
+    r.s2 = (r.s2 ^ t) & 0xFFFFFFFF
+    r.s3 = rotl32(r.s3, 11)
+    << result
+}
+
+pub fn (r $&Rng) fork(stream_id int) Rng {
+    a := rng_mix32(r.next_u32() ^ stream_id)
+    b := rng_mix32(r.next_u32() ^ rng_mix32(stream_id + 0x9E3779B9))
+    c := rng_mix32(r.next_u32() ^ (a + 0x85EBCA6B))
+    $d := rng_mix32(r.next_u32() ^ (b + 0xC2B2AE35))
+    if (a | b | c | d) == 0 {
+        d = 1
+    }
+    << Rng{s0: a, s1: b, s2: c, s3: d}
+}
+
+pub fn (r $&Rng) next_f64() f64 {
+    hi := r.next_u32() >> 5
+    lo := r.next_u32() >> 6
+    << (f64(hi) * 67108864.0 + f64(lo)) / 9007199254740992.0
+}
+
+pub fn (r $&Rng) range_int(min_inc int, max_exc int) int {
+    if max_exc <= min_inc {
+        >> errors.new("nexus random: range_int requires min_inc < max_exc")
+    }
+    span := max_exc - min_inc
+    if span <= 0 || span > 0x7FFFFFFF {
+        >> errors.new("nexus random: range_int span out of 31-bit bounds")
+    }
+    if span == 1 { << min_inc }
+    limit := (0x100000000 / span) * span
+    for _ in 0:128 {
+        v := r.next_u32()
+        if v < limit {
+            << min_inc + (v % span)
+        }
+    }
+    << min_inc + (r.next_u32() % span)
+}
+
+pub fn (r $&Rng) range_f64(min_val f64, max_val f64) f64 {
+    if !finite(min_val) || !finite(max_val) || max_val < min_val {
+        >> errors.new("nexus random: invalid range_f64 bounds")
+    }
+    << min_val + (max_val - min_val) * r.next_f64()
+}
+
+pub fn (r $&Rng) chance(prob f64) bool {
+    if !finite(prob) || prob < 0.0 || prob > 1.0 {
+        >> errors.new("nexus random: chance probability must be in [0, 1]")
+    }
+    if prob <= 0.0 { << false }
+    if prob >= 1.0 { << true }
+    << r.next_f64() < prob
+}
+
+pub fn (r $&Rng) sign() f64 {
+    if (r.next_u32() & 1) == 0 { << -1.0 }
+    << 1.0
+}
+
+pub fn (r $&Rng) normal(mean f64, stddev f64) f64 {
+    if !finite(mean) || !finite(stddev) || stddev < 0.0 {
+        >> errors.new("nexus random: normal requires finite mean and non-negative stddev")
+    }
+    if stddev == 0.0 { << mean }
+    $u1 := r.next_f64()
+    if u1 < 1e-12 { u1 = 1e-12 }
+    u2 := r.next_f64()
+    mag := math.sqrt(-2.0 * math.log(u1))
+    z := mag * math.cos(2.0 * math.pi() * u2)
+    << mean + stddev * z
+}
+
+pub fn (r $&Rng) exponential(rate f64) f64 {
+    if !finite(rate) || rate <= 0.0 {
+        >> errors.new("nexus random: exponential rate must be positive")
+    }
+    $u := r.next_f64()
+    if u < 1e-12 { u = 1e-12 }
+    << -math.log(u) / rate
+}
+
+pub fn (r $&Rng) vec2_on_unit_circle() Vec2 {
+    ang := r.next_f64() * 2.0 * math.pi()
+    << vec2(math.cos(ang), math.sin(ang))
+}
+
+pub fn (r $&Rng) vec2_in_unit_circle() Vec2 {
+    ang := r.next_f64() * 2.0 * math.pi()
+    rad := math.sqrt(r.next_f64())
+    << vec2(rad * math.cos(ang), rad * math.sin(ang))
+}
+
+pub fn (r $&Rng) vec3_on_unit_sphere() Vec3 {
+    z := r.next_f64() * 2.0 - 1.0
+    ang := r.next_f64() * 2.0 * math.pi()
+    rxy := math.sqrt(math.max(0.0, 1.0 - z * z))
+    << vec3(rxy * math.cos(ang), rxy * math.sin(ang), z)
+}
+
+pub fn (r $&Rng) vec3_in_unit_sphere() Vec3 {
+    dir := r.vec3_on_unit_sphere()
+    rad := math.cbrt(r.next_f64())
+    << dir.scaled(rad)
+}
+
+pub fn (r $&Rng) vec3_in_cone(axis Vec3, half_angle_rad f64) Vec3 {
+    n := axis.normalized() or >>
+    if !finite(half_angle_rad) || half_angle_rad < 0.0 || half_angle_rad > math.pi() {
+        >> errors.new("nexus random: cone half-angle must be in [0, pi]")
+    }
+    if half_angle_rad == 0.0 { << n }
+    $ref_up := vec3(0.0, 1.0, 0.0)
+    if math.abs(n.y) > 0.9 {
+        ref_up = vec3(1.0, 0.0, 0.0)
+    }
+    u := ref_up.cross(n).normalized() or >>
+    v := n.cross(u)
+    cos_min := math.cos(half_angle_rad)
+    cos_theta := 1.0 - r.next_f64() * (1.0 - cos_min)
+    sin_theta := math.sqrt(math.max(0.0, 1.0 - cos_theta * cos_theta))
+    phi := r.next_f64() * 2.0 * math.pi()
+    dir := u.scaled(math.cos(phi) * sin_theta).add(v.scaled(math.sin(phi) * sin_theta)).add(n.scaled(cos_theta))
+    << dir.normalized() or >>
+}
+
+pub fn (r $&Rng) weighted_pick(weights &[]f64) int {
+    if weights.len == 0 {
+        >> errors.new("nexus random: weighted_pick requires non-empty weights")
+    }
+    $total := 0.0
+    for i in 0:weights.len {
+        w := weights[i]
+        if !finite(w) || w < 0.0 {
+            >> errors.new("nexus random: weight must be finite and non-negative")
+        }
+        total += w
+    }
+    if total <= 0.0 {
+        >> errors.new("nexus random: total weight must be positive")
+    }
+    threshold := r.next_f64() * total
+    $acc := 0.0
+    $last_pos := 0
+    for i in 0:weights.len {
+        w := weights[i]
+        if w > 0.0 { last_pos = i }
+        acc += w
+        if acc > threshold && w > 0.0 {
+            << i
+        }
+    }
+    << last_pos
+}
+
+pub fn (r $&Rng) shuffle_ints(items $&[]int) {
+    if items.len < 2 { << }
+    $i := items.len - 1
+    while i > 0 {
+        j := r.range_int(0, i + 1) or (err) {
+            _ := err
+            <<
+        }
+        tmp := items[i]
+        items[i] = items[j]
+        items[j] = tmp
+        i -= 1
+    }
+}
+
+pub fn (r $&Rng) sample_indices(total int, count int) []int {
+    if total < 0 || count < 0 || count > total || total > 1000000 {
+        >> errors.new("nexus random: sample_indices invalid total or count")
+    }
+    if count == 0 { << []int{} }
+    $pool := []int{}
+    for i in 0:total { pool.push(i) }
+    $out := []int{}
+    for i in 0:count {
+        j := r.range_int(i, total) or >>
+        tmp := pool[i]
+        pool[i] = pool[j]
+        pool[j] = tmp
+        out.push(pool[i])
+    }
+    << out
+}
+
+pub fn (r $&Rng) poisson_disk_2d(width f64, height f64, min_dist f64, k_attempts int, max_points int) []Vec2 {
+    if !finite(width) || !finite(height) || !finite(min_dist) ||
+        width <= 0.0 || height <= 0.0 || min_dist <= 0.0 {
+        >> errors.new("nexus random: poisson_disk_2d requires positive width, height, and min_dist")
+    }
+    if k_attempts < 1 || k_attempts > 128 || max_points < 1 || max_points > 16384 {
+        >> errors.new("nexus random: poisson_disk_2d k_attempts or max_points out of budget")
+    }
+    cell := min_dist / math.sqrt(2.0)
+    cols := int(width / cell) + 1
+    rows := int(height / cell) + 1
+    if cols <= 0 || rows <= 0 || cols > 4096 || rows > 4096 || cols * rows > 1048576 {
+        >> errors.new("nexus random: poisson_disk_2d grid exceeds budget")
+    }
+    $grid := []int{}
+    for _ in 0:(cols * rows) { grid.push(-1) }
+    $samples := []Vec2{}
+    $active := []int{}
+
+    p0 := vec2(r.next_f64() * width, r.next_f64() * height)
+    gx0 := int(p0.x / cell)
+    gy0 := int(p0.y / cell)
+    samples.push(p0)
+    active.push(0)
+    $active_len := 1
+    grid[gy0 * cols + gx0] = 0
+
+    min_d2 := min_dist * min_dist
+    while active_len > 0 && samples.len < max_points {
+        a_slot := r.range_int(0, active_len) or >>
+        center := samples[active[a_slot]]
+        $found := false
+        for _ in 0:k_attempts {
+            ang := r.next_f64() * 2.0 * math.pi()
+            rad := min_dist * (1.0 + r.next_f64())
+            cand := vec2(center.x + rad * math.cos(ang), center.y + rad * math.sin(ang))
+            if cand.x < 0.0 || cand.x >= width || cand.y < 0.0 || cand.y >= height { -> }
+            gx := int(cand.x / cell)
+            gy := int(cand.y / cell)
+            $ok := true
+            $ny := gy - 2
+            while ny <= gy + 2 && ok {
+                if ny >= 0 && ny < rows {
+                    $nx := gx - 2
+                    while nx <= gx + 2 && ok {
+                        if nx >= 0 && nx < cols {
+                            si := grid[ny * cols + nx]
+                            if si >= 0 {
+                                if samples[si].distance_sq(cand) < min_d2 {
+                                    ok = false
+                                }
+                            }
+                        }
+                        nx += 1
+                    }
+                }
+                ny += 1
+            }
+            if ok {
+                idx := samples.len
+                samples.push(cand)
+                if active_len < active.len {
+                    active[active_len] = idx
+                } else {
+                    active.push(idx)
+                }
+                active_len += 1
+                grid[gy * cols + gx] = idx
+                found = true
+                <-
+            }
+        }
+        if !found {
+            active[a_slot] = active[active_len - 1]
+            active_len -= 1
+        }
+    }
+    << samples
+}

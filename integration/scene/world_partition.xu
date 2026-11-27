@@ -263,3 +263,315 @@ pub fn (wp $&WorldPartitionGrid) reload_cell_tree(
     wp.mark_cell_loaded(cx, cz)
     << registry.rebind_world(wid + "", cell_tree, prune_retired) or >>
 }
+
+pub struct PartitionStreamBudget {
+    pub max_loads_per_tick int
+    pub max_unloads_per_tick int
+    pub io_byte_budget_per_tick int
+}
+
+pub struct PartitionStreamTick {
+    pub dispatch_loads []PartitionCellCoord
+    pub dispatch_unloads []PartitionCellCoord
+    pub cancelled_loads []PartitionCellCoord
+    pub pending_loads int
+    pub in_flight_loads int
+}
+
+pub struct PartitionStreamingScheduler {
+    cell_size f64
+    load_radius int
+    unload_radius int
+    budget PartitionStreamBudget
+    loaded map[string]bool
+    loaded_coords []PartitionCellCoord
+    in_flight map[string]bool
+    in_flight_coords []PartitionCellCoord
+    queued map[string]bool
+    queued_coords []PartitionCellCoord
+    cell_io_bytes map[string]int
+}
+
+pub fn new_partition_streaming_scheduler(
+    cell_size f64,
+    load_radius int,
+    unload_radius int,
+    budget PartitionStreamBudget
+) PartitionStreamingScheduler {
+    if !fm.finite(cell_size) || cell_size < 1.0 || cell_size > 100000.0 {
+        >> errors.new("nexus partition: cell_size must be in [1.0, 100000.0]")
+    }
+    if load_radius < 0 || unload_radius <= load_radius || unload_radius > 16 {
+        >> errors.new("nexus partition: requires 0 <= load_radius < unload_radius <= 16")
+    }
+    if budget.max_loads_per_tick < 1 || budget.max_unloads_per_tick < 1 || budget.io_byte_budget_per_tick < 1 {
+        >> errors.new("nexus partition: stream budget counts and io bytes must be >= 1")
+    }
+    << PartitionStreamingScheduler{
+        cell_size: cell_size,
+        load_radius: load_radius,
+        unload_radius: unload_radius,
+        budget: budget,
+        loaded: map[string]bool{},
+        loaded_coords: []PartitionCellCoord{},
+        in_flight: map[string]bool{},
+        in_flight_coords: []PartitionCellCoord{},
+        queued: map[string]bool{},
+        queued_coords: []PartitionCellCoord{},
+        cell_io_bytes: map[string]int{}
+    }
+}
+
+pub fn (s $&PartitionStreamingScheduler) set_cell_io_bytes(cx int, cz int, bytes int) int {
+    if bytes < 1 || bytes > 1073741824 {
+        >> errors.new("nexus partition: cell io bytes must be in [1, 1 GiB]")
+    }
+    key := cell_world_id(cx, cz)
+    cm := $&s.cell_io_bytes
+    cm[key + ""] = bytes
+    << 0
+}
+
+fn (s &PartitionStreamingScheduler) cell_cost(cx int, cz int) int {
+    key := cell_world_id(cx, cz)
+    if s.cell_io_bytes.has(key + "") {
+        << s.cell_io_bytes[key + ""]
+    }
+    << 1
+}
+
+fn (s &PartitionStreamingScheduler) min_cell_anchor_dist2(cx int, cz int, anchors &[]fm.Vec3) f64 {
+    ccx := (f64(cx) + 0.5) * s.cell_size
+    ccz := (f64(cz) + 0.5) * s.cell_size
+    $best := 1e30
+    for i in 0:anchors.len {
+        dx := ccx - anchors[i].x
+        dz := ccz - anchors[i].z
+        d2 := dx * dx + dz * dz
+        if d2 < best { best = d2 }
+    }
+    << best
+}
+
+pub fn (s $&PartitionStreamingScheduler) update_and_schedule(anchors &[]fm.Vec3) PartitionStreamTick {
+    if anchors.len == 0 || anchors.len > 64 {
+        >> errors.new("nexus partition: anchors count must be in 1..64")
+    }
+    $anchor_cells := []PartitionCellCoord{}
+    for i in 0:anchors.len {
+        pos := anchors[i]
+        if !pos.is_finite() {
+            >> errors.new("nexus partition: non-finite world position")
+        }
+        anchor_cells.push(PartitionCellCoord{
+            cx: floor_div_coord(pos.x, s.cell_size),
+            cz: floor_div_coord(pos.z, s.cell_size)
+        })
+    }
+
+    lr2 := s.load_radius * s.load_radius
+    ur2 := s.unload_radius * s.unload_radius
+
+    // 1. Cancel queued or in-flight loads that moved outside unload_radius from all anchors.
+    $cancelled := []PartitionCellCoord{}
+    $next_queued := []PartitionCellCoord{}
+    qm := $&s.queued
+    for coord in s.queued_coords {
+        $min_d2 := 1000000000
+        for ac in anchor_cells {
+            dx := coord.cx - ac.cx
+            dz := coord.cz - ac.cz
+            d2 := dx * dx + dz * dz
+            if d2 < min_d2 { min_d2 = d2 }
+        }
+        if min_d2 > ur2 {
+            k := cell_world_id(coord.cx, coord.cz)
+            if qm.has(k + "") { qm.delete(k + "") }
+            cancelled.push(coord)
+        } else {
+            next_queued.push(coord)
+        }
+    }
+    s.queued_coords = next_queued
+
+    $next_flight := []PartitionCellCoord{}
+    fm_map := $&s.in_flight
+    for coord in s.in_flight_coords {
+        $min_d2 := 1000000000
+        for ac in anchor_cells {
+            dx := coord.cx - ac.cx
+            dz := coord.cz - ac.cz
+            d2 := dx * dx + dz * dz
+            if d2 < min_d2 { min_d2 = d2 }
+        }
+        if min_d2 > ur2 {
+            k := cell_world_id(coord.cx, coord.cz)
+            if fm_map.has(k + "") { fm_map.delete(k + "") }
+            cancelled.push(coord)
+        } else {
+            next_flight.push(coord)
+        }
+    }
+    s.in_flight_coords = next_flight
+
+    // 2. Enqueue missing cells within load_radius.
+    for ac in anchor_cells {
+        $dz := -s.load_radius
+        while dz <= s.load_radius {
+            $dx := -s.load_radius
+            while dx <= s.load_radius {
+                if dx * dx + dz * dz <= lr2 {
+                    cx := ac.cx + dx
+                    cz := ac.cz + dz
+                    k := cell_world_id(cx, cz)
+                    if !s.loaded.has(k + "") && !s.in_flight.has(k + "") && !s.queued.has(k + "") {
+                        qm[k + ""] = true
+                        s.queued_coords.push(PartitionCellCoord{cx: cx, cz: cz})
+                    }
+                }
+                dx += 1
+            }
+            dz += 1
+        }
+    }
+
+    // 3. Sort queued_coords by distance squared to nearest anchor ascending, then cx/cz.
+    for i in 1:s.queued_coords.len {
+        cur := s.queued_coords[i]
+        cd2 := s.min_cell_anchor_dist2(cur.cx, cur.cz, anchors)
+        $j := i - 1
+        while j >= 0 {
+            prev := s.queued_coords[j]
+            pd2 := s.min_cell_anchor_dist2(prev.cx, prev.cz, anchors)
+            if pd2 > cd2 + 1e-9 || (pd2 >= cd2 - 1e-9 && (prev.cx > cur.cx || (prev.cx == cur.cx && prev.cz > cur.cz))) {
+                s.queued_coords[j + 1] = prev
+                j -= 1
+            } else {
+                <-
+            }
+        }
+        s.queued_coords[j + 1] = cur
+    }
+
+    $dispatched_loads := []PartitionCellCoord{}
+    $remaining_queued := []PartitionCellCoord{}
+    $used_bytes := 0
+    for coord in s.queued_coords {
+        cost := s.cell_cost(coord.cx, coord.cz)
+        can_count := dispatched_loads.len < s.budget.max_loads_per_tick
+        can_bytes := used_bytes + cost <= s.budget.io_byte_budget_per_tick || (dispatched_loads.len == 0 && s.in_flight_coords.len == 0)
+        if can_count && can_bytes {
+            k := cell_world_id(coord.cx, coord.cz)
+            if qm.has(k + "") { qm.delete(k + "") }
+            fm_map[k + ""] = true
+            s.in_flight_coords.push(coord)
+            dispatched_loads.push(coord)
+            used_bytes += cost
+        } else {
+            remaining_queued.push(coord)
+        }
+    }
+    s.queued_coords = remaining_queued
+
+    // 4. Select loaded cells strictly outside unload_radius (farthest first) up to max_unloads_per_tick.
+    $unload_cands := []PartitionCellCoord{}
+    $unload_d2 := []f64{}
+    for coord in s.loaded_coords {
+        $min_d2 := 1000000000
+        for ac in anchor_cells {
+            dx := coord.cx - ac.cx
+            dz := coord.cz - ac.cz
+            d2 := dx * dx + dz * dz
+            if d2 < min_d2 { min_d2 = d2 }
+        }
+        if min_d2 > ur2 {
+            unload_cands.push(coord)
+            unload_d2.push(s.min_cell_anchor_dist2(coord.cx, coord.cz, anchors))
+        }
+    }
+    for i in 1:unload_cands.len {
+        cc := unload_cands[i]
+        cd := unload_d2[i]
+        $j := i - 1
+        while j >= 0 && unload_d2[j] < cd {
+            unload_cands[j + 1] = unload_cands[j]
+            unload_d2[j + 1] = unload_d2[j]
+            j -= 1
+        }
+        unload_cands[j + 1] = cc
+        unload_d2[j + 1] = cd
+    }
+    $dispatched_unloads := []PartitionCellCoord{}
+    $limit_un := s.budget.max_unloads_per_tick
+    if unload_cands.len < limit_un { limit_un = unload_cands.len }
+    for i in 0:limit_un {
+        dispatched_unloads.push(unload_cands[i])
+    }
+
+    << PartitionStreamTick{
+        dispatch_loads: dispatched_loads,
+        dispatch_unloads: dispatched_unloads,
+        cancelled_loads: cancelled,
+        pending_loads: s.queued_coords.len,
+        in_flight_loads: s.in_flight_coords.len
+    }
+}
+
+pub fn (s $&PartitionStreamingScheduler) complete_load(cx int, cz int) bool {
+    key := cell_world_id(cx, cz)
+    if !s.in_flight.has(key + "") { << false }
+    fm_map := $&s.in_flight
+    fm_map.delete(key + "")
+    $next_f := []PartitionCellCoord{}
+    for c in s.in_flight_coords {
+        if c.cx != cx || c.cz != cz { next_f.push(c) }
+    }
+    s.in_flight_coords = next_f
+    if !s.loaded.has(key + "") {
+        lm := $&s.loaded
+        lm[key + ""] = true
+        s.loaded_coords.push(PartitionCellCoord{cx: cx, cz: cz})
+    }
+    << true
+}
+
+pub fn (s $&PartitionStreamingScheduler) fail_load(cx int, cz int) bool {
+    key := cell_world_id(cx, cz)
+    if !s.in_flight.has(key + "") { << false }
+    fm_map := $&s.in_flight
+    fm_map.delete(key + "")
+    $next_f := []PartitionCellCoord{}
+    for c in s.in_flight_coords {
+        if c.cx != cx || c.cz != cz { next_f.push(c) }
+    }
+    s.in_flight_coords = next_f
+    if !s.queued.has(key + "") && !s.loaded.has(key + "") {
+        qm := $&s.queued
+        qm[key + ""] = true
+        s.queued_coords.push(PartitionCellCoord{cx: cx, cz: cz})
+    }
+    << true
+}
+
+pub fn (s $&PartitionStreamingScheduler) complete_unload(cx int, cz int) bool {
+    key := cell_world_id(cx, cz)
+    if !s.loaded.has(key + "") { << false }
+    lm := $&s.loaded
+    lm.delete(key + "")
+    $next_l := []PartitionCellCoord{}
+    for c in s.loaded_coords {
+        if c.cx != cx || c.cz != cz { next_l.push(c) }
+    }
+    s.loaded_coords = next_l
+    << true
+}
+
+pub fn (s &PartitionStreamingScheduler) is_loaded(cx int, cz int) bool {
+    key := cell_world_id(cx, cz)
+    << s.loaded.has(key + "")
+}
+
+pub fn (s &PartitionStreamingScheduler) loaded_count() int {
+    << s.loaded_coords.len
+}
+
