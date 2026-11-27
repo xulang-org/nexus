@@ -1,6 +1,6 @@
 # Nexus Engine
 
-Nexus Engine 是独立的 Xu 游戏引擎库，模块为 `github.com/xulang-org/nexus`，当前开发版本 `0.1.1-dev.16`。
+Nexus Engine 是独立的 Xu 游戏引擎库，模块为 `github.com/xulang-org/nexus`，当前开发版本 `0.1.1-dev.17`。
 场景树、可复用场景、变换、相机、图集动画、输入、时钟、碰撞、画布和精灵逻辑使用 Xu。
 3D 向量、矩阵、透视相机、网格构建、父子变换、材质参数和场景绘制同样使用 Xu。
 音频资源、重采样、声像、IMA ADPCM（`0x0011`）编解码、每总线 DSP 效果架（RBJ Biquad 低通/高通/带通滤波、回声延迟与 Schroeder/Moorer 立体声混响）、总线混音和节点播放状态也由 Xu 实现；设备提交使用独立音频 C ABI。
@@ -14,11 +14,11 @@ GLB 已支持受限 TRS 动画采样、双动画剪辑 TRS/SLERP 姿态融合（
 3D 已加入带法线/切线/UV 的金属度/粗糙度直接光材质、基础颜色/ORM/自发光/法线/独立 AO 纹理与 mipmap、单双面渲染、传统前向每网格 16 光源与新分簇前向着色（Clustered Forward `16×16×24`，最高 1024 动态光源）、Split-Sum GGX 环境光 IBL 烘焙（`EnvironmentIbl3D`：64×64 BRDF DFG LUT + 5 级预过滤环境贴图）、30-bit Morton 空间排序 Meshlet（`MeshletVisRenderer3D`：64 顶点/124 三角面簇 + 保守法线锥背面剔除 + Reverse-Z 7 级 `R32_FLOAT` Hi-Z 遮挡剔除 + `R32_UINT` Visibility Buffer 解耦计算着色，含解析屏幕空间重心/UV 梯度纹理采样与方向/级联阴影）、GPU `draw_indexed_indirect` 间接绘制、`RGBA16_FLOAT` 线性 HDR + L1 球谐 3D 辐照度探针网格（`IrradianceGrid3D`）、GTAO 环境光遮蔽（含双边滤波）、Hi-Z 加速屏幕空间反射（SSR）、多级 HDR Bloom、ACES Filmic 色调映射与 TAA 历史混合后处理管线，并由 `ModernPipeline3D`（`integration/rendering/three_d/modern_frame3d.xu`）统一串联静态 Meshlet VisBuffer、Split-Sum IBL 与 GPU 蒙皮网格单帧合成。
 3D 场景树与核心服务已加入脏标记拓扑 SoA 变换缓存（`SceneTree`）、静态三角面/AABB/斜坡 BVH、1D X-axis SAP 与增量式 SAH+AVL 平衡动态包围体树（`DynamicBvh3D`）、扩展位置动力学求解器（`XPBD`：15 轴动态 OBB 间互碰与静态三角面库仑摩擦/恢复求解、柔度距离/牵引约束、8×8 布料网格、刚体堆叠与 6 自由度四元数转动 `JointedWorld3D` 球铰链/摆锤/带伺服电机与限位铰链关节，配合 `SkeletonRagdoll3D` 与动画权重平滑融合并驱动 GPU 蒙皮骨骼布娃娃）、3D 导航网格与人群避障（`navigation`：斜率过滤、拓扑边缝合、`A*` 区域代价与 XZ Funnel 路径拉直 + RVO 互惠人群避障）、基于连续分块 SoA 与常驻协程工作池（`ecs.EcsWorkerPool`）的无锁并发 Archetype `ecs` 模块，以及后台解码 + 帧预算分片上传 + LRU 显存淘汰的异步资源流式管理器（`integration/streaming`）；场景序列化已升级到 v9（Environment / RigidBody3D / Joint3D / Terrain / ParticleEmitter3D / PrefabInstance 附件，同步接入 `cmd/project_editor` v9 组件检视器与 `cmd/project_viewport --modern` 视口管线）；所有 45 个 3D 着色器已提供 MSL / GLSL 450 / HLSL SM 6.0 三后端源码（本机未安装 MetalToolchain/`glslangValidator`/`dxc` 时 `shader-cross-backend-test` 完成全量奇偶校验、入口点与寄存器约定验证，实际 GPU 像素验证当前覆盖 macOS arm64 / Metal）；引擎整合层新增持久 UI 控件树与焦点/模态路由（`integration/ui/tree.xu`）、120 帧滚动 `FrameProfiler` + GPU/资源驻留 `EngineTelemetry`（`timing/profiler.xu`、`integration/diagnostics`）、HMAC-SHA256 签名资源包与防回滚原子热更新/回滚（`resources/bundle`、`integration/bundle`），并提供全功能 3D 沙盒示例 `examples/modern_sandbox`。完整 glTF 复杂材质扩展与真机跨平台图形驱动运行仍可按需继续扩展。
 
-当前使用 Xu **0.14.2-dev.2**（本地 `../xu-dev` 工具链，包含 Nexus 所需图形/计算存储缓冲区、计算采样器/读写存储纹理、`R32_UINT`、`draw_indexed_indirect` 及 ARM64 `f64` 索引移位/LICM 优化修复）。该 SDK 包含 Phone game 对象对原生导入的支持，并随生成工程导出原生归档与 C 桥接。编译器、标准库、native/phone 工具必须来自同一 SDK。两个移动示例此前使用 Xu 0.12.7-dev.1 在 Sony XQ-BE72（Android 13）上运行，并完成 iOS 应用构建。iPhone 8（iOS 16.7.16）的真机结果来自 Xu 0.12.5 构建。
+当前使用 Xu **0.14.2**（本地 `../xu-dev` 工具链，包含 Nexus 所需图形/计算存储缓冲区、计算采样器/读写存储纹理、`R32_UINT`、`draw_indexed_indirect` 及 ARM64 `f64` 索引移位/LICM 优化修复）。该 SDK 包含 Phone game 对象对原生导入的支持，并随生成工程导出原生归档与 C 桥接。编译器、标准库、native/phone 工具必须来自同一 SDK。两个移动示例此前使用 Xu 0.12.7-dev.1 在 Sony XQ-BE72（Android 13）上运行，并完成 iOS 应用构建。iPhone 8（iOS 16.7.16）的真机结果来自 Xu 0.12.5 构建。
 
 ## 构建所需的 Xu SDK
 
-使用 Xu **0.14.2-dev.2** 工具链（可直接复用已自举构建的 `../xu-dev`）：
+使用 Xu **0.14.2** 工具链（可直接复用已自举构建的 `../xu-dev`）：
 
 ```sh
 # 1. 若已将同一版本 SDK 安装到 ~/.xu 或设置 env，先激活环境：
@@ -33,7 +33,7 @@ export PATH="$NEXUS_XU_SDK/bin:$PATH"
 make sdk
 ```
 
-`make sdk` 应输出 `PASS: Xu SDK 0.14.2-dev.2`。已有同一版本 SDK 时，直接设置上述环境变量或执行 `source /path/to/xu/env.sh` 即可。
+`make sdk` 应输出 `PASS: Xu SDK 0.14.2`。已有同一版本 SDK 时，直接设置上述环境变量或执行 `source /path/to/xu/env.sh` 即可。
 
 核心引擎突破与专项测试目标：
 - `make prefab-runtime-test`：验证 `integration/scene/prefabs.xu` 递归多级嵌套 Prefab 实例化、SHA-256 校验、循环引用拦截与节点可见性/位置覆盖应用。
@@ -75,6 +75,12 @@ make sdk
 - `make developer-systems-r2-test`：验证面向游戏开发者的第二轮核心运行期能力（`foundation/math/random.xu` Xoshiro128++ 确定性随机数/分布/二维泊松盘采样；`formats/stl/encode.xu` 二进制与 ASCII STL 导出及无损往返；`physics3d/triggers.xu` `TriggerTracker3D` Enter/Stay/Exit 触发器状态机；`timing/jobs.xu` 分帧预算与 DAG 依赖任务队列 + `integration/scene/world_partition.xu` `PartitionStreamingScheduler` 多锚点限流流式调度器；以及 `input/contexts.xu` 分层输入上下文栈与同上下文按键冲突检测/互换重绑定）。
 - `make developer-systems-r3-test`：验证面向游戏开发者的第三轮核心系统（`navigation/tiles.xu` 多瓦片动态 NavMesh 分块重烘焙、边界传送门缝合与跨块 A*；`ai/bt/utility.xu` Utility AI 效用响应曲线/补偿评分/迟滞与冷却仲裁器；`resources/persistence/slots.xu` 多槽位手动+环形自动存档目录及 SHA-256 损坏自动降级恢复；`foundation/diagnostics/history.xu` 带窗口合并、原子事务组回滚与脏标记的通用 Undo/Redo 命令历史；以及 `foundation/spatial/quadtree.xu` 动态松散二维四叉树 `Quadtree2D` 矩形/圆形/2D 射线查询）。
 - `make developer-systems-r4-test`：验证面向游戏开发者的第四轮核心系统（`ecs/commands.xu` 可复用 `EntityTemplate` 与支持失效句柄容错的 FIFO `EcsCommandBuffer` 延迟批处理；`audio/mixer/cues.xu` 支持轮询/随机/无重复洗牌选音、音高增益抖动、冷却与声道抢占的 `AudioCueBank`；`animation/timeline/spring.xu` 极点安全二阶弹性阻尼器 `SpringF64`/`SpringVec2`/`SpringVec3` 与串并混排 `MotionSequence`；`networking/rpc.xu` 方向权威校验字节码 `RpcRegistry`、令牌桶 `PeerRateLimiter` 与 `PeerHeartbeatTracker`；以及 `scene/constraints.xu` `ConstraintSolver3D` 三维节点约束求解器与 `NodePool` 节点对象池）。
+
+## CI 与版本发布
+
+- `python3 tools/ci_run.py --modes all --sdl-include <SDL3/include>`：跨平台 CI 入口，涵盖架构/边界/跨后端着色器与版本身份契约检查（`contracts`）、5 个原生 `.xulib` 桥接构建（`native`）、各后端着色器生成（`shaders`）、核心入口静态检查（`check`）、无窗口/无 GPU 核心回归测试集（`test`）及 7 个发行 CLI/Studio 工具构建（`build-tools`）。
+- `python3 tools/check_release_identity.py`（或 `make release-identity-check`）：校验根 `xu.xun`、全仓子模块 `xu:`、`resources/project/mod.xu`、`README.md` 与 `RELEASES*.md` 版本一致性。
+- `.github/workflows/ci.yml` 在 `macos-arm64`、`macos-x64`、`linux-x64`、`linux-arm64` 与 `windows-x64` 五平台运行全量 CI；`.github/workflows/release.yml` 采用构建与发布隔离架构，在 Tag（`v*`）或手动触发时分平台构建工具与多平台原生 `.xulib` 归档，汇总校验 `SHA256SUMS` 与 `validation.json` 后发布 GitHub Release（发行记录见 [RELEASES.zh-CN.md](RELEASES.zh-CN.md) 与 [RELEASES.md](RELEASES.md)）。
 
 ## Phone 原生 2D / 3D 示例
 
@@ -279,7 +285,7 @@ PNG 文件上传、最近邻/线性采样、透明混合、GPU 裁剪、有序�
 
 ## 运行
 
-需要 **Xu 0.14.2-dev.2**、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
+需要 **Xu 0.14.2**、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
 默认通过 `pkg-config sdl3` 查找头文件；Windows 可显式传入包含 `SDL3/SDL.h` 的目录。
 桥接在运行时加载 SDL，不把 SDL 源码或二进制复制进本库。
 
@@ -332,7 +338,7 @@ make demo-glb-materials
 ./build/glb-materials --frames 120 --capture build/glb-materials.png
 ```
 
-`make sdk` 核对实际编译器版本。默认使用 PATH 中的 `xu`，也可用 `XU` 选择完整的 Xu 0.14.2-dev.2 SDK。
+`make sdk` 核对实际编译器版本。默认使用 PATH 中的 `xu`，也可用 `XU` 选择完整的 Xu 0.14.2 SDK。
 修复内容属于编译器：解析 native 模块、校验归档/目标/ABI、生成 C 调用适配和链接，调用所选 SDK 的配套工具，
 并为资源所有者及资源数组生成自动析构。标准库新增 `gpu/layout` 统一纹理格式、mip 链、行 pitch 与 mip offset 的受检计算，UI 图片上传与引擎 2D/3D 纹理共用；标准 `gpu` 已提供无窗口设备、缓冲区与异步传输、fence/读回、纹理/采样器、Shader/Pipeline 和离屏 render pass，以及 compact `[]u8` 借用 ABI。标准窗口/呈现已补齐，2D/3D 均已迁移标准事件、资源和绘制命令；PBR、场景和游戏预算仍在引擎。
 完整 SDK 的编译器、标准库和包搜索路径必须一致：
@@ -1768,7 +1774,7 @@ report := scripts.dispatch(&tree, host.DEFAULT_DISPATCH_LIMIT) or >>
 ```yaml
 module: example/my_game
 version: !ver 0.1.0
-xu: !ver 0.14.2-dev.2
+xu: !ver 0.14.2
 require:
   "github.com/xulang-org/nexus": file:/path/to/nexus
 ```

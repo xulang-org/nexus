@@ -48,7 +48,7 @@ static bool load_sdl(void) {
     const char *override = getenv("XU_NEXUS_SDL_AUDIO_LIBRARY");
 #ifdef _WIN32
     HMODULE library = LoadLibraryA(override && *override ? override : "SDL3.dll");
-#define FIND(name) GetProcAddress(library, #name)
+#define FIND(name) ((void *)GetProcAddress(library, #name))
 #define UNLOAD() FreeLibrary(library)
 #else
     void *library = NULL;

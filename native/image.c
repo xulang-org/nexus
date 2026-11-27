@@ -35,7 +35,7 @@ static bool load_codec(void) {
         if (!actual || actual>=length) {free(path);fail("PNG library path changed while loading");goto failed;}
     }
     HMODULE library=LoadLibraryW(path ? path : L"SDL3.dll");free(path);
-#define FIND(name) GetProcAddress(library,#name)
+#define FIND(name) ((void *)GetProcAddress(library,#name))
 #define UNLOAD() FreeLibrary(library)
 #else
     const char *override=getenv("XU_SDL_LIBRARY");

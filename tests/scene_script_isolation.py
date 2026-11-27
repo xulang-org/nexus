@@ -8,7 +8,7 @@ root=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='xu-scene-script-') as temporary:
  target=Path(temporary);shutil.copyfile(root/'xu.xun',target/'xu.xun')
  for package in ['scene','foundation/math', 'resources/camera','resources/scene','resources/lod','resources/lighting','resources/shadow',
-                 'resources/persistence','resources/sprite3d','resources/tilemap','formats/scene','internal/file_snapshot','integration/scene','integration/scene_script','script/bytecode','script/vm','script/host']:
+                 'resources/modeling','resources/persistence','resources/sprite3d','resources/tilemap','formats/scene','internal/file_snapshot','integration/scene','integration/scene_script','script/bytecode','script/vm','script/host']:
   shutil.copytree(root/package,target/package)
  check=target/'checks';check.mkdir();shutil.copyfile(root/'tests/scene_script_process_cli.xu',check/'main.xu')
  sdk=next(line for line in (root/'xu.xun').read_text().splitlines() if line.startswith('xu:'))
