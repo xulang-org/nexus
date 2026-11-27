@@ -1,0 +1,354 @@
+@"github.com/xulang-org/nexus/modeling"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+#errors
+#math
+
+pub struct CompiledPrimitive {
+    pub material_slot int
+    pub mesh meshes.MeshData3D
+}
+
+pub fn project_uv_box_all(m $&rm.EditableMesh, scale f64) int {
+    $all := []int{}
+    for i in 0:m.faces.len { all.push(i) }
+    << project_uv_box(m, &all, scale) or >>
+}
+
+fn safe_face_normal(m &rm.EditableMesh, fi int) fm.Vec3 {
+    << m.face_normal(fi) or (err) {
+        _ := err
+        << fm.vec3(0.0, 1.0, 0.0)
+    }
+}
+
+fn safe_normalized(v fm.Vec3, fallback fm.Vec3) fm.Vec3 {
+    << v.normalized() or (err) {
+        _ := err
+        << fallback
+    }
+}
+
+// World/local triplanar box UV projection for level whiteboxing.
+pub fn project_uv_box(m $&rm.EditableMesh, face_ids &[]int, scale f64) int {
+    if !fm.finite(scale) || scale <= 0.0 {
+        >> errors.new("nexus modeling: UV scale must be positive")
+    }
+    for i in 0:face_ids.len {
+        fi := face_ids[i]
+        if fi < 0 || fi >= m.faces.len {
+            >> errors.new("nexus modeling: face index out of range for UV projection")
+        }
+        fnorm := safe_face_normal(m, fi)
+        ax := math.abs(fnorm.x)
+        ay := math.abs(fnorm.y)
+        az := math.abs(fnorm.z)
+        for cid in m.faces[fi].corners {
+            p := m.vertices[m.corners[cid].vertex].position
+            $u := 0.0
+            $v := 0.0
+            if ay >= ax && ay >= az {
+                u = p.x * scale
+                v = p.z * scale
+            } else if ax >= az {
+                u = p.z * scale
+                v = -p.y * scale
+            } else {
+                u = p.x * scale
+                v = -p.y * scale
+            }
+            m.corners[cid].uv = fm.vec2(u, v)
+            m.corners[cid].has_uv = true
+        }
+    }
+    << 0
+}
+
+pub fn project_uv_planar(
+    m $&rm.EditableMesh,
+    face_ids &[]int,
+    axis_u fm.Vec3,
+    axis_v fm.Vec3,
+    scale f64
+) int {
+    if !fm.finite(scale) || scale <= 0.0 {
+        >> errors.new("nexus modeling: UV scale must be positive")
+    }
+    u_dir := axis_u.normalized() or >>
+    v_dir := axis_v.normalized() or >>
+    for i in 0:face_ids.len {
+        fi := face_ids[i]
+        if fi < 0 || fi >= m.faces.len {
+            >> errors.new("nexus modeling: face index out of range for planar UV")
+        }
+        for cid in m.faces[fi].corners {
+            p := m.vertices[m.corners[cid].vertex].position
+            m.corners[cid].uv = fm.vec2(p.dot(u_dir) * scale, p.dot(v_dir) * scale)
+            m.corners[cid].has_uv = true
+        }
+    }
+    << 0
+}
+
+pub fn compute_normals(m $&rm.EditableMesh) int {
+    m.validate() or >>
+    $face_normals := []fm.Vec3{}
+    for fi in 0:m.faces.len {
+        n := safe_face_normal(m, fi)
+        face_normals.push(n)
+    }
+    $smooth_acc := map[string]fm.Vec3{}
+    for fi in 0:m.faces.len {
+        f := &m.faces[fi]
+        if f.smoothing_group <= 0 { -> }
+        fnorm := face_normals[fi]
+        cnt := f.corners.len
+        if cnt < 3 { -> }
+        for i in 0:cnt {
+            $pi := i - 1
+            if pi < 0 { pi = cnt - 1 }
+            $ni := i + 1
+            if ni >= cnt { ni = 0 }
+            prev_p := m.vertices[m.corners[f.corners[pi]].vertex].position
+            cur_p := m.vertices[m.corners[f.corners[i]].vertex].position
+            next_p := m.vertices[m.corners[f.corners[ni]].vertex].position
+            e0 := prev_p.sub(cur_p).normalized_or_zero()
+            e1 := next_p.sub(cur_p).normalized_or_zero()
+            $ang := 1.0
+            if e0.length_sq() > 0.5 && e1.length_sq() > 0.5 {
+                ang = e0.angle_between(e1)
+                if ang < 0.001 { ang = 0.001 }
+            }
+            vid := m.corners[f.corners[i]].vertex
+            key := str(vid) + ":" + str(f.smoothing_group)
+            if smooth_acc.has(key) {
+                smooth_acc[key] = smooth_acc[key].add(fnorm.scaled(ang))
+            } else {
+                smooth_acc[key] = fnorm.scaled(ang)
+            }
+        }
+    }
+    for fi in 0:m.faces.len {
+        f := &m.faces[fi]
+        fnorm := face_normals[fi]
+        for cid in f.corners {
+            $n := fnorm
+            if f.smoothing_group > 0 {
+                key := str(m.corners[cid].vertex) + ":" + str(f.smoothing_group)
+                if smooth_acc.has(key) && smooth_acc[key].length_sq() > 1e-18 {
+                    n = safe_normalized(smooth_acc[key], fnorm)
+                }
+            }
+            m.corners[cid].normal = n
+            m.corners[cid].has_normal = true
+        }
+    }
+    << 0
+}
+
+fn try_generate_mikktspace(md $&meshes.MeshData3D) {
+    _ := md.generate_mikktspace_tangents() or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn triangulate_face_indices(m &rm.EditableMesh, face_id int) []int {
+    f := &m.faces[face_id]
+    n := f.corners.len
+    if n == 3 { << [0, 1, 2] }
+    if n < 3 { << []int{} }
+    fnorm := m.face_normal(face_id) or (err) {
+        _ := err
+        $fan := []int{}
+        for i in 1:(n - 1) {
+            fan.push(0)
+            fan.push(i)
+            fan.push(i + 1)
+        }
+        << fan
+    }
+    // Project vertices onto 2D orthonormal basis in the face plane for ear clipping.
+    $ref := fm.vec3(1.0, 0.0, 0.0)
+    if math.abs(fnorm.dot(ref)) > 0.9 { ref = fm.vec3(0.0, 1.0, 0.0) }
+    u_ax := fnorm.cross(ref).normalized_or_zero()
+    v_ax := fnorm.cross(u_ax).normalized_or_zero()
+    $pts := []fm.Vec2{}
+    $rem := []int{}
+    for i in 0:n {
+        p := m.vertices[m.corners[f.corners[i]].vertex].position
+        pts.push(fm.vec2(p.dot(u_ax), p.dot(v_ax)))
+        rem.push(i)
+    }
+    // Check signed area to ensure positive orientation for ear clipping.
+    $area2 := 0.0
+    for i in 0:n {
+        $ni := i + 1
+        if ni >= n { ni = 0 }
+        a := pts[i]
+        b := pts[ni]
+        area2 += a.x * b.y - b.x * a.y
+    }
+    $orient := 1.0
+    if area2 < 0.0 { orient = -1.0 }
+    $tris := []int{}
+    $guard := 0
+    while rem.len > 3 && guard < n * n + 8 {
+        guard += 1
+        $clipped := false
+        rc := rem.len
+        for i in 0:rc {
+            $pi := i - 1
+            if pi < 0 { pi = rc - 1 }
+            $ni := i + 1
+            if ni >= rc { ni = 0 }
+            ia := rem[pi]
+            ib := rem[i]
+            ic := rem[ni]
+            a := pts[ia]
+            b := pts[ib]
+            c := pts[ic]
+            cross := ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)) * orient
+            if cross <= 1e-12 { -> }
+            $contains := false
+            for j in 0:rc {
+                idx := rem[j]
+                if idx == ia || idx == ib || idx == ic { -> }
+                if point_in_tri_2d(pts[idx], a, b, c) {
+                    contains = true
+                    <-
+                }
+            }
+            if !contains {
+                tris.push(ia)
+                tris.push(ib)
+                tris.push(ic)
+                $next_rem := []int{}
+                for j in 0:rc {
+                    if j != i { next_rem.push(rem[j]) }
+                }
+                rem = next_rem
+                clipped = true
+                <-
+            }
+        }
+        if !clipped { <- }
+    }
+    if rem.len >= 3 {
+        for i in 1:(rem.len - 1) {
+            tris.push(rem[0])
+            tris.push(rem[i])
+            tris.push(rem[i + 1])
+        }
+    }
+    << tris
+}
+
+fn point_in_tri_2d(p fm.Vec2, a fm.Vec2, b fm.Vec2, c fm.Vec2) bool {
+    d1 := (p.x - b.x) * (a.y - b.y) - (a.x - b.x) * (p.y - b.y)
+    d2 := (p.x - c.x) * (b.y - c.y) - (b.x - c.x) * (p.y - c.y)
+    d3 := (p.x - a.x) * (c.y - a.y) - (c.x - a.x) * (p.y - a.y)
+    has_neg := (d1 < -1e-9) || (d2 < -1e-9) || (d3 < -1e-9)
+    has_pos := (d1 > 1e-9) || (d2 > 1e-9) || (d3 > 1e-9)
+    << !(has_neg && has_pos)
+}
+
+pub fn compile_to_primitives(src &rm.EditableMesh, generate_tangents bool) []CompiledPrimitive {
+    src.validate() or >>
+    if src.faces.len == 0 {
+        >> errors.new("nexus modeling: cannot compile empty EditableMesh")
+    }
+    $working := src.clone()
+    $needs_normals := false
+    for c in working.corners {
+        if !c.has_normal {
+            needs_normals = true
+            <-
+        }
+    }
+    if needs_normals {
+        compute_normals($&working) or >>
+    }
+    $slots := []int{}
+    $slot_seen := map[int]bool{}
+    for f in working.faces {
+        if !slot_seen.has(f.material_slot) {
+            slot_seen[f.material_slot] = true
+            slots.push(f.material_slot)
+        }
+    }
+    $out := []CompiledPrimitive{}
+    for slot in slots {
+        $md := meshes.new_mesh_data_3d()
+        $corner_to_vert := map[int]int{}
+        $all_uv := true
+        for fi in 0:working.faces.len {
+            f := &working.faces[fi]
+            if f.material_slot != slot { -> }
+            for cid in f.corners {
+                if !working.corners[cid].has_uv { all_uv = false }
+            }
+        }
+        for fi in 0:working.faces.len {
+            f := &working.faces[fi]
+            if f.material_slot != slot { -> }
+            tris := triangulate_face_indices(&working, fi)
+            for k in 0:(tris.len / 3) {
+                $tri_v := [0, 0, 0]
+                for c_ord in 0:3 {
+                    cid := f.corners[tris[k * 3 + c_ord]]
+                    if corner_to_vert.has(cid) {
+                        tri_v[c_ord] = corner_to_vert[cid]
+                    } else {
+                        c := &working.corners[cid]
+                        vid := c.vertex
+                        v := &working.vertices[vid]
+                        $col := v.color
+                        if (col % 256) != 255 { col = (col - (col % 256)) + 255 }
+                        $nv := 0
+                        if all_uv {
+                            nv = md.vertex_lit_uv(v.position, col, c.normal, c.uv) or >>
+                        } else {
+                            nv = md.vertex_lit(v.position, col, c.normal) or >>
+                        }
+                        corner_to_vert[cid] = nv
+                        tri_v[c_ord] = nv
+                    }
+                }
+                md.triangle(tri_v[0], tri_v[1], tri_v[2]) or >>
+            }
+        }
+        if generate_tangents && all_uv && md.triangle_count() > 0 {
+            try_generate_mikktspace($&md)
+        }
+        md.validate() or >>
+        out.push(CompiledPrimitive{material_slot: slot, mesh: md})
+    }
+    << out
+}
+
+pub fn compile_single_mesh(src &rm.EditableMesh, generate_tangents bool) meshes.MeshData3D {
+    prims := compile_to_primitives(src, generate_tangents) or >>
+    if prims.len == 1 { << ~prims[0].mesh }
+    $merged := meshes.new_mesh_data_3d()
+    for pi in 0:prims.len {
+        pr := &prims[pi]
+        base := merged.vertex_count()
+        for v in pr.mesh.vertices {
+            if v.has_tangent {
+                merged.vertex_tangent(v.position, v.color, v.normal, v.uv, v.tangent) or >>
+            } else if v.has_uv {
+                merged.vertex_lit_uv(v.position, v.color, v.normal, v.uv) or >>
+            } else {
+                merged.vertex_lit(v.position, v.color, v.normal) or >>
+            }
+        }
+        for i in 0:pr.mesh.triangle_count() {
+            merged.triangle(base + pr.mesh.indices[i * 3], base + pr.mesh.indices[i * 3 + 1], base + pr.mesh.indices[i * 3 + 2]) or >>
+        }
+    }
+    merged.validate() or >>
+    << merged
+}

@@ -1,0 +1,461 @@
+@"github.com/xulang-org/nexus/resources/modeling"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#encoding/json
+#errors
+#math
+#strconv
+#strings
+
+pub const MAX_EDITABLE_VERTICES = 65536
+pub const MAX_EDITABLE_CORNERS = 262144
+pub const MAX_EDITABLE_FACES = 65536
+pub const MAX_MATERIAL_SLOTS = 32
+pub const MAX_MODELING_JSON_BYTES = 8388608
+
+pub struct PolyVertex {
+    pub position fm.Vec3
+    pub color int
+}
+
+pub struct PolyCorner {
+    pub vertex int
+    pub uv fm.Vec2
+    pub has_uv bool
+    pub normal fm.Vec3
+    pub has_normal bool
+}
+
+pub struct PolyFace {
+    pub corners []int
+    pub material_slot int
+    pub smoothing_group int
+}
+
+pub struct PolyEdge {
+    pub v0 int
+    pub v1 int
+    pub faces []int
+}
+
+// Editable B-Rep / polygon mesh separating spatial vertices (shared across
+// incident faces) from per-face-corner attributes (UV seams and sharp normals).
+pub struct EditableMesh {
+    pub name string
+    pub vertices []PolyVertex
+    pub corners []PolyCorner
+    pub faces []PolyFace
+    pub material_slots []string
+}
+
+pub fn new_editable_mesh(name string) EditableMesh {
+    << EditableMesh{
+        name: name + "",
+        vertices: []PolyVertex{},
+        corners: []PolyCorner{},
+        faces: []PolyFace{},
+        material_slots: ["Default"]
+    }
+}
+
+pub fn (m &EditableMesh) clone() EditableMesh {
+    $verts := []PolyVertex{}
+    for v in m.vertices {
+        verts.push(PolyVertex{position: v.position, color: v.color})
+    }
+    $crns := []PolyCorner{}
+    for c in m.corners {
+        crns.push(PolyCorner{
+            vertex: c.vertex,
+            uv: c.uv,
+            has_uv: c.has_uv,
+            normal: c.normal,
+            has_normal: c.has_normal
+        })
+    }
+    $fcs := []PolyFace{}
+    for f in m.faces {
+        $fc := []int{}
+        for cid in f.corners { fc.push(cid) }
+        fcs.push(PolyFace{
+            corners: fc,
+            material_slot: f.material_slot,
+            smoothing_group: f.smoothing_group
+        })
+    }
+    $mats := []string{}
+    for ms in m.material_slots {
+        mats.push(ms + "")
+    }
+    << EditableMesh{
+        name: m.name + "",
+        vertices: verts,
+        corners: crns,
+        faces: fcs,
+        material_slots: mats
+    }
+}
+
+pub fn (m $&EditableMesh) add_vertex(position fm.Vec3, color int) int {
+    if m.vertices.len >= MAX_EDITABLE_VERTICES {
+        >> errors.new("nexus modeling: editable vertex budget exceeded")
+    }
+    if !position.is_finite() || math.abs(position.x) > 1000000000.0 ||
+        math.abs(position.y) > 1000000000.0 || math.abs(position.z) > 1000000000.0 {
+        >> errors.new("nexus modeling: vertex position non-finite or out of range")
+    }
+    if color < 0 || color > 4294967295 {
+        >> errors.new("nexus modeling: vertex color must be RGBA8")
+    }
+    idx := m.vertices.len
+    m.vertices.push(PolyVertex{position: position, color: color})
+    << idx
+}
+
+pub fn (m $&EditableMesh) add_corner(vertex int, uv fm.Vec2, has_uv bool, normal fm.Vec3, has_normal bool) int {
+    if m.corners.len >= MAX_EDITABLE_CORNERS {
+        >> errors.new("nexus modeling: editable corner budget exceeded")
+    }
+    if vertex < 0 || vertex >= m.vertices.len {
+        >> errors.new("nexus modeling: corner references invalid vertex")
+    }
+    if !fm.finite(uv.x) || !fm.finite(uv.y) || math.abs(uv.x) > 1000000.0 || math.abs(uv.y) > 1000000.0 {
+        >> errors.new("nexus modeling: invalid corner UV")
+    }
+    $n := fm.vec3(0.0, 0.0, 0.0)
+    if has_normal {
+        n = normal.normalized() or >>
+    }
+    idx := m.corners.len
+    m.corners.push(PolyCorner{
+        vertex: vertex,
+        uv: uv,
+        has_uv: has_uv,
+        normal: n,
+        has_normal: has_normal
+    })
+    << idx
+}
+
+pub fn (m $&EditableMesh) add_face(corner_ids []int, material_slot int, smoothing_group int) int {
+    if m.faces.len >= MAX_EDITABLE_FACES {
+        >> errors.new("nexus modeling: editable face budget exceeded")
+    }
+    if corner_ids.len < 3 {
+        >> errors.new("nexus modeling: face requires at least 3 corners")
+    }
+    if material_slot < 0 || material_slot >= MAX_MATERIAL_SLOTS {
+        >> errors.new("nexus modeling: invalid face material slot")
+    }
+    while m.material_slots.len <= material_slot {
+        m.material_slots.push("Material " + str(m.material_slots.len))
+    }
+    $seen_verts := map[int]bool{}
+    $copied := []int{}
+    for cid in corner_ids {
+        if cid < 0 || cid >= m.corners.len {
+            >> errors.new("nexus modeling: face references invalid corner")
+        }
+        vid := m.corners[cid].vertex
+        if seen_verts.has(vid) {
+            >> errors.new("nexus modeling: face has duplicate vertex")
+        }
+        seen_verts[vid] = true
+        copied.push(cid)
+    }
+    idx := m.faces.len
+    m.faces.push(PolyFace{
+        corners: copied,
+        material_slot: material_slot,
+        smoothing_group: smoothing_group
+    })
+    << idx
+}
+
+pub fn (m $&EditableMesh) add_polygon(
+    vert_ids []int,
+    uvs []fm.Vec2,
+    has_uv bool,
+    normal fm.Vec3,
+    has_normal bool,
+    material_slot int,
+    smoothing_group int
+) int {
+    if vert_ids.len < 3 {
+        >> errors.new("nexus modeling: polygon requires at least 3 vertices")
+    }
+    if has_uv && uvs.len != vert_ids.len {
+        >> errors.new("nexus modeling: polygon UV count must match vertex count")
+    }
+    $cids := []int{}
+    for i in 0:vert_ids.len {
+        $uv := fm.vec2(0.0, 0.0)
+        if has_uv { uv = uvs[i] }
+        cid := m.add_corner(vert_ids[i], uv, has_uv, normal, has_normal) or >>
+        cids.push(cid)
+    }
+    << m.add_face(cids, material_slot, smoothing_group) or >>
+}
+
+pub fn (m &EditableMesh) validate() int {
+    if m.vertices.len > MAX_EDITABLE_VERTICES || m.corners.len > MAX_EDITABLE_CORNERS ||
+        m.faces.len > MAX_EDITABLE_FACES || m.material_slots.len > MAX_MATERIAL_SLOTS {
+        >> errors.new("nexus modeling: editable mesh exceeds capacity limits")
+    }
+    for v in m.vertices {
+        if !v.position.is_finite() || math.abs(v.position.x) > 1000000000.0 ||
+            math.abs(v.position.y) > 1000000000.0 || math.abs(v.position.z) > 1000000000.0 ||
+            v.color < 0 || v.color > 4294967295 {
+            >> errors.new("nexus modeling: invalid editable vertex")
+        }
+    }
+    for c in m.corners {
+        if c.vertex < 0 || c.vertex >= m.vertices.len {
+            >> errors.new("nexus modeling: corner vertex index out of range")
+        }
+        if !fm.finite(c.uv.x) || !fm.finite(c.uv.y) {
+            >> errors.new("nexus modeling: non-finite corner UV")
+        }
+        if c.has_normal {
+            len := c.normal.length()
+            if !c.normal.is_finite() || math.abs(len - 1.0) > 0.001 {
+                >> errors.new("nexus modeling: corner normal must be unit length")
+            }
+        }
+    }
+    for f in m.faces {
+        if f.corners.len < 3 {
+            >> errors.new("nexus modeling: degenerate face with < 3 corners")
+        }
+        if f.material_slot < 0 || f.material_slot >= m.material_slots.len {
+            >> errors.new("nexus modeling: face material_slot out of range")
+        }
+        $seen := map[int]bool{}
+        for cid in f.corners {
+            if cid < 0 || cid >= m.corners.len {
+                >> errors.new("nexus modeling: face corner index out of range")
+            }
+            vid := m.corners[cid].vertex
+            if seen.has(vid) {
+                >> errors.new("nexus modeling: duplicate vertex within face")
+            }
+            seen[vid] = true
+        }
+    }
+    << 0
+}
+
+pub fn (m &EditableMesh) bounds() fm.Aabb3 {
+    if m.vertices.len == 0 {
+        << fm.aabb3(fm.vec3(0.0, 0.0, 0.0), fm.vec3(0.0, 0.0, 0.0)) or >>
+    }
+    $lo := m.vertices[0].position
+    $hi := lo
+    for i in 1:m.vertices.len {
+        p := m.vertices[i].position
+        lo = fm.min_vec3(lo, p)
+        hi = fm.max_vec3(hi, p)
+    }
+    << fm.aabb3(lo, hi) or >>
+}
+
+// Newell's polygon normal; resilient for arbitrary N-gons and non-planar quads.
+pub fn (m &EditableMesh) face_normal(face_id int) fm.Vec3 {
+    if face_id < 0 || face_id >= m.faces.len {
+        >> errors.new("nexus modeling: face index out of range")
+    }
+    f := &m.faces[face_id]
+    n := f.corners.len
+    if n < 3 {
+        >> errors.new("nexus modeling: degenerate face has < 3 corners")
+    }
+    $nx := 0.0
+    $ny := 0.0
+    $nz := 0.0
+    for i in 0:n {
+        $ni := i + 1
+        if ni >= n { ni = 0 }
+        p := m.vertices[m.corners[f.corners[i]].vertex].position
+        q := m.vertices[m.corners[f.corners[ni]].vertex].position
+        nx += (p.y - q.y) * (p.z + q.z)
+        ny += (p.z - q.z) * (p.x + q.x)
+        nz += (p.x - q.x) * (p.y + q.y)
+    }
+    raw := fm.vec3(nx, ny, nz)
+    if raw.length_sq() <= 1e-18 {
+        >> errors.new("nexus modeling: zero-area face has no normal")
+    }
+    << raw.normalized() or >>
+}
+
+pub fn (m &EditableMesh) face_centroid(face_id int) fm.Vec3 {
+    if face_id < 0 || face_id >= m.faces.len {
+        >> errors.new("nexus modeling: face index out of range")
+    }
+    f := &m.faces[face_id]
+    if f.corners.len == 0 {
+        >> errors.new("nexus modeling: empty face has no centroid")
+    }
+    $acc := fm.vec3(0.0, 0.0, 0.0)
+    for cid in f.corners {
+        acc = acc.add(m.vertices[m.corners[cid].vertex].position)
+    }
+    << acc.scaled(1.0 / f64(f.corners.len))
+}
+
+pub fn (m &EditableMesh) build_edges() []PolyEdge {
+    $edges := []PolyEdge{}
+    $index_by_key := map[string]int{}
+    for fi in 0:m.faces.len {
+        f := &m.faces[fi]
+        n := f.corners.len
+        if n < 2 { -> }
+        for i in 0:n {
+            $ni := i + 1
+            if ni >= n { ni = 0 }
+            va := m.corners[f.corners[i]].vertex
+            vb := m.corners[f.corners[ni]].vertex
+            $a := va
+            $b := vb
+            if b < a {
+                a = vb
+                b = va
+            }
+            key := str(a) + ":" + str(b)
+            if index_by_key.has(key) {
+                idx := index_by_key[key]
+                edges[idx].faces.push(fi)
+            } else {
+                index_by_key[key] = edges.len
+                edges.push(PolyEdge{v0: a, v1: b, faces: [fi]})
+            }
+        }
+    }
+    << edges
+}
+
+fn fmt_f64_json(v f64) string {
+    << strconv.format_float(v, 103, -1) or >>
+}
+
+pub fn (m &EditableMesh) encode_json() string {
+    m.validate() or >>
+    $out := strings.new_byte_builder(1024)
+    nm := m.name + ""
+    out.write_str("{\"format\":\"nexus.editable_mesh\",\"version\":1,\"name\":" + json.quote(&nm))
+    out.write_str(",\"material_slots\":[")
+    for i in 0:m.material_slots.len {
+        if i > 0 { out.write_str(",") }
+        s := m.material_slots[i] + ""
+        out.write_str(json.quote(&s))
+    }
+    out.write_str("],\"vertices\":[")
+    for i in 0:m.vertices.len {
+        if i > 0 { out.write_str(",") }
+        v := &m.vertices[i]
+        out.write_str("[" + fmt_f64_json(v.position.x) + "," + fmt_f64_json(v.position.y) + "," + fmt_f64_json(v.position.z) + "," + str(v.color) + "]")
+    }
+    out.write_str("],\"corners\":[")
+    for i in 0:m.corners.len {
+        if i > 0 { out.write_str(",") }
+        c := &m.corners[i]
+        $huv := 0
+        if c.has_uv { huv = 1 }
+        $hn := 0
+        if c.has_normal { hn = 1 }
+        out.write_str("[" + str(c.vertex) + "," + fmt_f64_json(c.uv.x) + "," + fmt_f64_json(c.uv.y) + "," + str(huv) + "," + fmt_f64_json(c.normal.x) + "," + fmt_f64_json(c.normal.y) + "," + fmt_f64_json(c.normal.z) + "," + str(hn) + "]")
+    }
+    out.write_str("],\"faces\":[")
+    for i in 0:m.faces.len {
+        if i > 0 { out.write_str(",") }
+        f := &m.faces[i]
+        out.write_str("{\"m\":" + str(f.material_slot) + ",\"s\":" + str(f.smoothing_group) + ",\"c\":[")
+        for j in 0:f.corners.len {
+            if j > 0 { out.write_str(",") }
+            out.write_str(str(f.corners[j]))
+        }
+        out.write_str("]}")
+    }
+    out.write_str("]}\n")
+    << out.to_string()
+}
+
+pub fn decode_editable_mesh_node(doc &json.Doc, root int) EditableMesh {
+    if root < 0 || !doc.is_dict(root) { >> errors.new("nexus modeling: expected JSON object") }
+    if (doc.as_string(doc.get(root, "format")) or >>) != "nexus.editable_mesh" ||
+        (doc.as_int(doc.get(root, "version")) or >>) != 1 {
+        >> errors.new("nexus modeling: unsupported EditableMesh format/version")
+    }
+    name := doc.as_string(doc.get(root, "name")) or >>
+    $mesh := new_editable_mesh(name)
+    mesh.material_slots = []string{}
+
+    slots_node := doc.get(root, "material_slots")
+    if slots_node < 0 || !doc.is_list(slots_node) || doc.count(slots_node) > MAX_MATERIAL_SLOTS {
+        >> errors.new("nexus modeling: invalid material_slots")
+    }
+    for i in 0:doc.count(slots_node) {
+        mesh.material_slots.push(doc.as_string(doc.at(slots_node, i)) or >>)
+    }
+
+    verts_node := doc.get(root, "vertices")
+    if verts_node < 0 || !doc.is_list(verts_node) || doc.count(verts_node) > MAX_EDITABLE_VERTICES {
+        >> errors.new("nexus modeling: invalid vertices")
+    }
+    for i in 0:doc.count(verts_node) {
+        row := doc.at(verts_node, i)
+        if !doc.is_list(row) || doc.count(row) != 4 { >> errors.new("nexus modeling: invalid vertex row") }
+        px := doc.as_f64(doc.at(row, 0)) or >>
+        py := doc.as_f64(doc.at(row, 1)) or >>
+        pz := doc.as_f64(doc.at(row, 2)) or >>
+        col := doc.as_int(doc.at(row, 3)) or >>
+        mesh.add_vertex(fm.vec3(px, py, pz), col) or >>
+    }
+
+    corners_node := doc.get(root, "corners")
+    if corners_node < 0 || !doc.is_list(corners_node) || doc.count(corners_node) > MAX_EDITABLE_CORNERS {
+        >> errors.new("nexus modeling: invalid corners")
+    }
+    for i in 0:doc.count(corners_node) {
+        row := doc.at(corners_node, i)
+        if !doc.is_list(row) || doc.count(row) != 8 { >> errors.new("nexus modeling: invalid corner row") }
+        vid := doc.as_int(doc.at(row, 0)) or >>
+        u := doc.as_f64(doc.at(row, 1)) or >>
+        v := doc.as_f64(doc.at(row, 2)) or >>
+        huv := (doc.as_int(doc.at(row, 3)) or >>) != 0
+        nx := doc.as_f64(doc.at(row, 4)) or >>
+        ny := doc.as_f64(doc.at(row, 5)) or >>
+        nz := doc.as_f64(doc.at(row, 6)) or >>
+        hn := (doc.as_int(doc.at(row, 7)) or >>) != 0
+        mesh.add_corner(vid, fm.vec2(u, v), huv, fm.vec3(nx, ny, nz), hn) or >>
+    }
+
+    faces_node := doc.get(root, "faces")
+    if faces_node < 0 || !doc.is_list(faces_node) || doc.count(faces_node) > MAX_EDITABLE_FACES {
+        >> errors.new("nexus modeling: invalid faces")
+    }
+    for i in 0:doc.count(faces_node) {
+        fnode := doc.at(faces_node, i)
+        if !doc.is_dict(fnode) { >> errors.new("nexus modeling: invalid face object") }
+        mat := doc.as_int(doc.get(fnode, "m")) or >>
+        sm := doc.as_int(doc.get(fnode, "s")) or >>
+        cnode := doc.get(fnode, "c")
+        if cnode < 0 || !doc.is_list(cnode) { >> errors.new("nexus modeling: invalid face corners") }
+        $cids := []int{}
+        for j in 0:doc.count(cnode) {
+            cids.push(doc.as_int(doc.at(cnode, j)) or >>)
+        }
+        mesh.add_face(cids, mat, sm) or >>
+    }
+    mesh.validate() or >>
+    << mesh
+}
+
+pub fn decode_editable_mesh_json(raw &string) EditableMesh {
+    if raw.len < 2 || raw.len > MAX_MODELING_JSON_BYTES {
+        >> errors.new("nexus modeling: EditableMesh JSON size outside limits")
+    }
+    doc := json.parse_max(raw, MAX_MODELING_JSON_BYTES)
+    if !doc.ok() { >> errors.new("nexus modeling JSON: " + doc.error()) }
+    << decode_editable_mesh_node(&doc, doc.root()) or >>
+}

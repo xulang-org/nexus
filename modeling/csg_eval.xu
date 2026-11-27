@@ -1,0 +1,424 @@
+@"github.com/xulang-org/nexus/modeling"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+#errors
+#math
+
+fn csg_eps() f64 { << 0.00001 }
+const MAX_CSG_POLYS = 16384
+const MAX_BSP_DEPTH = 96
+
+struct BspVertex {
+    pos fm.Vec3
+    uv fm.Vec2
+    color int
+}
+
+struct BspPoly {
+    verts []BspVertex
+    plane fm.Plane3D
+    material_slot int
+    smoothing_group int
+}
+
+struct BspNode {
+    has_plane bool
+    plane fm.Plane3D
+    coplanar []BspPoly
+    front int
+    back int
+}
+
+struct BspTree {
+    nodes []BspNode
+    root int
+}
+
+fn new_bsp_tree() BspTree {
+    << BspTree{nodes: []BspNode{}, root: -1}
+}
+
+fn (t $&BspTree) alloc_node() int {
+    id := t.nodes.len
+    t.nodes.push(BspNode{
+        has_plane: false,
+        plane: fm.Plane3D{normal: fm.vec3(0.0, 1.0, 0.0), d: 0.0},
+        coplanar: []BspPoly{},
+        front: -1,
+        back: -1
+    })
+    << id
+}
+
+fn clone_bsp_poly(p &BspPoly) BspPoly {
+    $vs := []BspVertex{}
+    for v in p.verts {
+        vs.push(BspVertex{pos: v.pos, uv: v.uv, color: v.color})
+    }
+    << BspPoly{verts: vs, plane: p.plane, material_slot: p.material_slot, smoothing_group: p.smoothing_group}
+}
+
+fn try_make_bsp_poly(verts []BspVertex, mat_slot int, sm int, dst $&[]BspPoly) {
+    p := make_bsp_poly(verts, mat_slot, sm) or (err) {
+        _ := err
+        <<
+    }
+    dst.push(p)
+}
+
+fn flip_bsp_poly(p &BspPoly) BspPoly {
+    $vs := []BspVertex{}
+    n := p.verts.len
+    for i in 0:n {
+        ri := n - 1 - i
+        v := &p.verts[ri]
+        vs.push(BspVertex{pos: v.pos, uv: v.uv, color: v.color})
+    }
+    pl := fm.Plane3D{normal: p.plane.normal.neg(), d: -p.plane.d}
+    << BspPoly{verts: vs, plane: pl, material_slot: p.material_slot, smoothing_group: p.smoothing_group}
+}
+
+fn make_bsp_poly(verts []BspVertex, material_slot int, smoothing_group int) BspPoly {
+    if verts.len < 3 {
+        >> errors.new("nexus CSG: degenerate polygon")
+    }
+    // Newell normal for robust plane fitting
+    $nx := 0.0
+    $ny := 0.0
+    $nz := 0.0
+    n := verts.len
+    for i in 0:n {
+        $ni := i + 1
+        if ni >= n { ni = 0 }
+        p := verts[i].pos
+        q := verts[ni].pos
+        nx += (p.y - q.y) * (p.z + q.z)
+        ny += (p.z - q.z) * (p.x + q.x)
+        nz += (p.x - q.x) * (p.y + q.y)
+    }
+    raw := fm.vec3(nx, ny, nz)
+    if raw.length_sq() <= 1e-18 {
+        >> errors.new("nexus CSG: zero-area polygon")
+    }
+    pl := fm.plane_from_point_normal(verts[0].pos, raw) or >>
+    << BspPoly{verts: verts, plane: pl, material_slot: material_slot, smoothing_group: smoothing_group}
+}
+
+fn lerp_bsp_vert(a &BspVertex, b &BspVertex, t f64) BspVertex {
+    << BspVertex{
+        pos: a.pos.lerp(b.pos, t),
+        uv: a.uv.lerp(b.uv, t),
+        color: a.color
+    }
+}
+
+fn split_polygon(
+    plane fm.Plane3D,
+    poly &BspPoly,
+    coplanar_front $&[]BspPoly,
+    coplanar_back $&[]BspPoly,
+    front $&[]BspPoly,
+    back $&[]BspPoly
+) {
+    // Classification bits: 0=coplanar, 1=front, 2=back, 3=spanning
+    $poly_type := 0
+    $types := []int{}
+    eps := csg_eps()
+    for v in poly.verts {
+        t := plane.signed_distance(v.pos)
+        $vt := 0
+        if t < -eps { vt = 2 }
+        else if t > eps { vt = 1 }
+        poly_type = poly_type | vt
+        types.push(vt)
+    }
+    if poly_type == 0 {
+        if plane.normal.dot(poly.plane.normal) > 0.0 {
+            coplanar_front.push(clone_bsp_poly(poly))
+        } else {
+            coplanar_back.push(clone_bsp_poly(poly))
+        }
+        <<
+    }
+    if poly_type == 1 {
+        front.push(clone_bsp_poly(poly))
+        <<
+    }
+    if poly_type == 2 {
+        back.push(clone_bsp_poly(poly))
+        <<
+    }
+    // Spanning: split into front and back fragments
+    $f_verts := []BspVertex{}
+    $b_verts := []BspVertex{}
+    n := poly.verts.len
+    for i in 0:n {
+        $j := i + 1
+        if j >= n { j = 0 }
+        ti := types[i]
+        tj := types[j]
+        vi := &poly.verts[i]
+        vj := &poly.verts[j]
+        if ti != 2 { f_verts.push(BspVertex{pos: vi.pos, uv: vi.uv, color: vi.color}) }
+        if ti != 1 { b_verts.push(BspVertex{pos: vi.pos, uv: vi.uv, color: vi.color}) }
+        if (ti | tj) == 3 {
+            da := plane.signed_distance(vi.pos)
+            db := plane.signed_distance(vj.pos)
+            denom := db - da
+            $t := 0.5
+            if math.abs(denom) > 1e-14 {
+                t = math.max(0.0, math.min(1.0, -da / denom))
+            }
+            mid := lerp_bsp_vert(vi, vj, t)
+            f_verts.push(mid)
+            b_verts.push(mid)
+        }
+    }
+    try_make_bsp_poly(f_verts, poly.material_slot, poly.smoothing_group, front)
+    try_make_bsp_poly(b_verts, poly.material_slot, poly.smoothing_group, back)
+}
+
+fn (t $&BspTree) build_into(node_idx int, polys &[]BspPoly, depth int) int {
+    if polys.len == 0 { << node_idx }
+    if depth >= MAX_BSP_DEPTH || t.nodes.len >= MAX_CSG_POLYS * 2 {
+        >> errors.new("nexus CSG: BSP depth or node budget exceeded")
+    }
+    $nid := node_idx
+    if nid < 0 { nid = t.alloc_node() }
+    if !t.nodes[nid].has_plane {
+        t.nodes[nid].plane = polys[0].plane
+        t.nodes[nid].has_plane = true
+    }
+    pl := t.nodes[nid].plane
+    $front_list := []BspPoly{}
+    $back_list := []BspPoly{}
+    for i in 0:polys.len {
+        split_polygon(pl, &polys[i], $&t.nodes[nid].coplanar, $&t.nodes[nid].coplanar, $&front_list, $&back_list)
+    }
+    if front_list.len > 0 {
+        f_child := t.build_into(t.nodes[nid].front, &front_list, depth + 1) or >>
+        t.nodes[nid].front = f_child
+    }
+    if back_list.len > 0 {
+        b_child := t.build_into(t.nodes[nid].back, &back_list, depth + 1) or >>
+        t.nodes[nid].back = b_child
+    }
+    << nid
+}
+
+fn (t &BspTree) clip_polygons(node_idx int, polys &[]BspPoly) []BspPoly {
+    if node_idx < 0 || !t.nodes[node_idx].has_plane {
+        $copied := []BspPoly{}
+        for i in 0:polys.len { copied.push(clone_bsp_poly(&polys[i])) }
+        << copied
+    }
+    node := &t.nodes[node_idx]
+    $front := []BspPoly{}
+    $back := []BspPoly{}
+    for i in 0:polys.len {
+        split_polygon(node.plane, &polys[i], $&front, $&back, $&front, $&back)
+    }
+    if node.front >= 0 {
+        front = t.clip_polygons(node.front, &front)
+    }
+    if node.back >= 0 {
+        back = t.clip_polygons(node.back, &back)
+    } else {
+        back = []BspPoly{}
+    }
+    for p in back { front.push(clone_bsp_poly(&p)) }
+    << front
+}
+
+fn (t $&BspTree) clip_node_to(node_idx int, other &BspTree) {
+    if node_idx < 0 { << }
+    t.nodes[node_idx].coplanar = other.clip_polygons(other.root, &t.nodes[node_idx].coplanar)
+    if t.nodes[node_idx].front >= 0 { t.clip_node_to(t.nodes[node_idx].front, other) }
+    if t.nodes[node_idx].back >= 0 { t.clip_node_to(t.nodes[node_idx].back, other) }
+}
+
+fn (t $&BspTree) invert_node(node_idx int) {
+    if node_idx < 0 { << }
+    $flipped := []BspPoly{}
+    $ci := 0
+    while ci < t.nodes[node_idx].coplanar.len {
+        nd := &t.nodes[node_idx]
+        flipped.push(flip_bsp_poly(&nd.coplanar[ci]))
+        ci += 1
+    }
+    t.nodes[node_idx].coplanar = flipped
+    if t.nodes[node_idx].has_plane {
+        pl := t.nodes[node_idx].plane
+        t.nodes[node_idx].plane = fm.Plane3D{normal: pl.normal.neg(), d: -pl.d}
+    }
+    if t.nodes[node_idx].front >= 0 { t.invert_node(t.nodes[node_idx].front) }
+    if t.nodes[node_idx].back >= 0 { t.invert_node(t.nodes[node_idx].back) }
+    tmp := t.nodes[node_idx].front
+    t.nodes[node_idx].front = t.nodes[node_idx].back
+    t.nodes[node_idx].back = tmp
+}
+
+fn (t &BspTree) collect_polygons(node_idx int, out $&[]BspPoly) int {
+    if node_idx < 0 { << 0 }
+    if out.len + t.nodes[node_idx].coplanar.len > MAX_CSG_POLYS {
+        >> errors.new("nexus CSG: output polygon budget exceeded")
+    }
+    $ci := 0
+    while ci < t.nodes[node_idx].coplanar.len {
+        nd := &t.nodes[node_idx]
+        out.push(clone_bsp_poly(&nd.coplanar[ci]))
+        ci += 1
+    }
+    if t.nodes[node_idx].front >= 0 { t.collect_polygons(t.nodes[node_idx].front, out) or >> }
+    if t.nodes[node_idx].back >= 0 { t.collect_polygons(t.nodes[node_idx].back, out) or >> }
+    << 0
+}
+
+fn editable_to_bsp(m &rm.EditableMesh) BspTree {
+    $polys := []BspPoly{}
+    for f in m.faces {
+        $verts := []BspVertex{}
+        for cid in f.corners {
+            c := &m.corners[cid]
+            vid := c.vertex
+            v := &m.vertices[vid]
+            verts.push(BspVertex{pos: v.position, uv: c.uv, color: v.color})
+        }
+        p := make_bsp_poly(verts, f.material_slot, f.smoothing_group) or (err) {
+            _ := err
+            ->
+        }
+        polys.push(p)
+    }
+    $tree := new_bsp_tree()
+    root_id := tree.build_into(-1, &polys, 0) or >>
+    tree.root = root_id
+    << tree
+}
+
+fn bsp_to_editable(name string, polys &[]BspPoly) rm.EditableMesh {
+    $m := rm.new_editable_mesh(name)
+    eps := 1e-5
+    inv_eps := 1.0 / eps
+    $buckets := map[string][]int{}
+    for idx in 0:polys.len {
+        p := &polys[idx]
+        if p.verts.len < 3 { -> }
+        $vids := []int{}
+        $uvs := []fm.Vec2{}
+        for v in p.verts {
+            qx := int(math.round_to_even(v.pos.x * inv_eps))
+            qy := int(math.round_to_even(v.pos.y * inv_eps))
+            qz := int(math.round_to_even(v.pos.z * inv_eps))
+            key := str(qx) + ":" + str(qy) + ":" + str(qz)
+            $found := -1
+            for dx in -1:2 {
+                if found >= 0 { <- }
+                for dy in -1:2 {
+                    if found >= 0 { <- }
+                    for dz in -1:2 {
+                        nkey := str(qx + dx) + ":" + str(qy + dy) + ":" + str(qz + dz)
+                        if buckets.has(nkey) {
+                            for cand in buckets[nkey] {
+                                if m.vertices[cand].position.distance_sq(v.pos) <= eps * eps {
+                                    found = cand
+                                    <-
+                                }
+                            }
+                            if found >= 0 { <- }
+                        }
+                    }
+                }
+            }
+            if found < 0 {
+                found = m.add_vertex(v.pos, v.color) or >>
+                if buckets.has(key) {
+                    buckets[key].push(found)
+                } else {
+                    buckets[key] = [found]
+                }
+            }
+            // Deduplicate consecutive collapsed vertices inside polygon
+            if vids.len == 0 || vids[vids.len - 1] != found {
+                $dup_poly := false
+                for existing in vids {
+                    if existing == found { dup_poly = true }
+                }
+                if !dup_poly {
+                    vids.push(found)
+                    uvs.push(v.uv)
+                }
+            }
+        }
+        if vids.len >= 3 {
+            m.add_polygon(~vids, ~uvs, true, p.plane.normal, true, p.material_slot, p.smoothing_group) or >>
+        }
+    }
+    if m.faces.len == 0 {
+        >> errors.new("nexus CSG: boolean result collapsed to empty mesh")
+    }
+    compute_normals($&m) or >>
+    << m
+}
+
+fn csg_boolean(a_in $&BspTree, b_in $&BspTree, op int) int {
+    if op == rm.CSG_OP_UNION {
+        a_in.clip_node_to(a_in.root, b_in)
+        b_in.clip_node_to(b_in.root, a_in)
+        b_in.invert_node(b_in.root)
+        b_in.clip_node_to(b_in.root, a_in)
+        b_in.invert_node(b_in.root)
+        $b_polys := []BspPoly{}
+        b_in.collect_polygons(b_in.root, $&b_polys) or >>
+        a_in.root = a_in.build_into(a_in.root, &b_polys, 0) or >>
+        << 0
+    }
+    if op == rm.CSG_OP_SUBTRACT {
+        a_in.invert_node(a_in.root)
+        a_in.clip_node_to(a_in.root, b_in)
+        b_in.clip_node_to(b_in.root, a_in)
+        b_in.invert_node(b_in.root)
+        b_in.clip_node_to(b_in.root, a_in)
+        b_in.invert_node(b_in.root)
+        $b_polys := []BspPoly{}
+        b_in.collect_polygons(b_in.root, $&b_polys) or >>
+        a_in.root = a_in.build_into(a_in.root, &b_polys, 0) or >>
+        a_in.invert_node(a_in.root)
+        << 0
+    }
+    if op == rm.CSG_OP_INTERSECT {
+        a_in.invert_node(a_in.root)
+        b_in.clip_node_to(b_in.root, a_in)
+        b_in.invert_node(b_in.root)
+        a_in.clip_node_to(a_in.root, b_in)
+        b_in.clip_node_to(b_in.root, a_in)
+        $b_polys := []BspPoly{}
+        b_in.collect_polygons(b_in.root, $&b_polys) or >>
+        a_in.root = a_in.build_into(a_in.root, &b_polys, 0) or >>
+        a_in.invert_node(a_in.root)
+        << 0
+    }
+    >> errors.new("nexus CSG: unsupported boolean operation")
+}
+
+// Evaluates a sequential CSG brush list into a single welded EditableMesh.
+pub fn evaluate_csg_tree(name string, tree &rm.CsgTree) rm.EditableMesh {
+    tree.validate() or >>
+    if tree.brushes.len == 0 {
+        >> errors.new("nexus CSG: cannot evaluate empty CsgTree")
+    }
+    first := generate_brush_mesh(&tree.brushes[0]) or >>
+    $acc := editable_to_bsp(&first) or >>
+    for i in 1:tree.brushes.len {
+        bmesh := generate_brush_mesh(&tree.brushes[i]) or >>
+        $rhs := editable_to_bsp(&bmesh) or >>
+        csg_boolean($&acc, $&rhs, tree.brushes[i].op) or >>
+    }
+    $out_polys := []BspPoly{}
+    acc.collect_polygons(acc.root, $&out_polys) or >>
+    if out_polys.len == 0 {
+        >> errors.new("nexus CSG: boolean result is empty")
+    }
+    << bsp_to_editable(name, &out_polys) or >>
+}

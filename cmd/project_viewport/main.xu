@@ -5,6 +5,7 @@ data #"github.com/xulang-org/nexus/resources/lighting"
 resource #"github.com/xulang-org/nexus/resources/scene"
 canvas #"github.com/xulang-org/nexus/resources/canvas"
 ui_bridge #"github.com/xulang-org/nexus/integration/ui"
+imod #"github.com/xulang-org/nexus/integration/modeling"
 files #"github.com/xulang-org/nexus/integration/scene"
 models3d #"github.com/xulang-org/nexus/integration/scene_render"
 scene_lights #"github.com/xulang-org/nexus/integration/lighting"
@@ -73,11 +74,16 @@ struct Options { path string
     check_local bool
     modern bool
     capture string
+    live_connect string
+    live_script string
+    whitebox_out string
+    whitebox_shape string
     snap SnapSteps }
 
 fn options() Options {
     args := os.args()
     $config := Options{path: "", output: "", meta_out: "", select_node: -1, check_node: "", check_also: "", check_local: false, modern: false, capture: "",
+        live_connect: "", live_script: "", whitebox_out: "", whitebox_shape: "",
         snap: SnapSteps{move: 0.25, rotate: 15.0, scale: 10.0}}
     $i := 1
     while i < args.len {
@@ -102,6 +108,10 @@ fn options() Options {
         else if args[i] == "--check-node" { config.check_node = value }
         else if args[i] == "--check-also" { config.check_also = value }
         else if args[i] == "--capture" { config.capture = value }
+        else if args[i] == "--live-connect" { config.live_connect = value }
+        else if args[i] == "--live-script" { config.live_script = value }
+        else if args[i] == "--whitebox-out" { config.whitebox_out = value }
+        else if args[i] == "--whitebox" { config.whitebox_shape = value }
         else if args[i] == "--snap-move" {
             config.snap.move = snap_option(&value, "--snap-move", 0.0001, 1000000.0) or >>
         } else if args[i] == "--snap-rotate" {
@@ -120,8 +130,16 @@ fn options() Options {
     if config.meta_out.len > 0 {
         config.meta_out = filepath.abs(&config.meta_out) or >>
     }
+    if config.live_script.len > 0 {
+        config.live_script = filepath.abs(&config.live_script) or >>
+    }
+    if config.whitebox_out.len > 0 {
+        config.whitebox_out = filepath.abs(&config.whitebox_out) or >>
+    }
     if config.path == config.output { >> errors.new("viewport output cannot replace its input scene") }
-    if config.capture.len > 0 && config.check_node.len == 0 { >> errors.new("viewport capture requires --check-node") }
+    if config.capture.len > 0 && config.check_node.len == 0 && config.live_script.len == 0 && config.live_connect.len == 0 {
+        >> errors.new("viewport capture requires --check-node or --live-*")
+    }
     if config.check_also.len > 0 && config.check_node.len == 0 { >> errors.new("--check-also requires --check-node") }
     if config.check_local && config.check_also.len == 0 { >> errors.new("--check-local requires --check-also") }
     << config
@@ -410,6 +428,14 @@ fn is_apply_key(event &events.Event) bool {
 
 fn handle_event(editor $&EditorView, tree $&scene.SceneTree, world $&world3d.Scene3D,
     picker &models3d.ScenePicker3D, event &events.Event, size fm.Vec2, point fm.Vec2) int {
+    $dummy_wb := empty_whitebox_host() or >>
+    dummy_live := empty_live_channel()
+    << handle_event_live(editor, tree, world, picker, $&dummy_wb, &dummy_live, event, size, point) or >>
+}
+
+fn handle_event_live(editor $&EditorView, tree $&scene.SceneTree, world $&world3d.Scene3D,
+    picker &models3d.ScenePicker3D, wb $&WhiteboxHost, live_ch &LiveChannel,
+    event &events.Event, size fm.Vec2, point fm.Vec2) int {
     if event.kind == events.EVENT_CLOSE_REQUESTED {
         editor.outcome = CANCEL
         << 0
@@ -428,9 +454,36 @@ fn handle_event(editor $&EditorView, tree $&scene.SceneTree, world $&world3d.Sce
             else { editor.outcome = CANCEL }
         } else if !editor.dragging {
             if has_mod && event.physical_key == events.KEY_Z {
-                if has_shift { perform_redo(editor, tree) or >> }
-                else { perform_undo(editor, tree) or >> }
+                if wb.active && wb.session.mode != imod.EDIT_MODE_OBJECT {
+                    s := $&wb.session
+                    if has_shift { _ := s.redo() }
+                    else { _ := s.undo() }
+                    emit_whitebox_event(live_ch, wb)
+                } else {
+                    if has_shift { perform_redo(editor, tree) or >> }
+                    else { perform_undo(editor, tree) or >> }
+                }
             } else if !has_mod {
+                if event.physical_key == events.KEY_TAB && wb.active {
+                    wb.session.mode = (wb.session.mode + 1) % 4
+                }
+                if event.physical_key == events.KEY_B && has_shift && !wb.active {
+                    spawn_whitebox_shape(wb, "box", fm.vec3(2.0, 2.0, 2.0)) or >>
+                    emit_whitebox_event(live_ch, wb)
+                }
+                if wb.active && wb.session.mode != imod.EDIT_MODE_OBJECT {
+                    if event.physical_key == events.KEY_X && wb.session.selected_faces.len > 0 {
+                        try_wb_extrude(wb, 0.5)
+                        emit_whitebox_event(live_ch, wb)
+                    }
+                    if event.physical_key == events.KEY_I && wb.session.selected_faces.len > 0 {
+                        try_wb_inset(wb, 0.25, 0.0)
+                        emit_whitebox_event(live_ch, wb)
+                    }
+                    if event.physical_key == events.KEY_U {
+                        try_wb_box_uv(wb, 1.0)
+                    }
+                }
                 if event.physical_key == events.KEY_1 || event.physical_key == events.KEY_W { editor.mode = GIZMO_MOVE }
                 if event.physical_key == events.KEY_2 || event.physical_key == events.KEY_E { editor.mode = GIZMO_ROTATE }
                 if event.physical_key == events.KEY_3 || event.physical_key == events.KEY_R { editor.mode = GIZMO_SCALE }
@@ -511,12 +564,20 @@ fn handle_event(editor $&EditorView, tree $&scene.SceneTree, world $&world3d.Sce
                     << 0
                 }
             }
+            if wb.active && wb.session.mode != imod.EDIT_MODE_OBJECT {
+                vr := frame.ray(point) or >>
+                world := wb.world
+                s := $&wb.session
+                _ := s.pick_subobject(world, fm.ray3d(vr.origin, vr.direction) or >>, 0.25, toggle)
+                << 0
+            }
             $selected := select_at(picker, world, tree, frame, point) or >>
             if selected == 0 {
                 nm := pick_nonmesh_node(editor, tree, frame, point)
                 if nm > 0 { selected = nm }
             }
             editor.selection = selection_after(&editor.selection, selected, toggle)
+            emit_selection_event(live_ch, editor)
         }
     } else if event.kind == events.EVENT_POINTER_MOVE {
         if editor.dragging {
@@ -535,6 +596,7 @@ fn handle_event(editor $&EditorView, tree $&scene.SceneTree, world $&world3d.Sce
             editor.dragging = false
             snap := clone_snapshot(&editor.pre_drag_snap)
             push_undo_snapshot(editor, &snap)
+            emit_transform_event(live_ch, editor, tree)
         }
         if editor.navigation == event.button { editor.navigation = 0 }
     }
@@ -566,12 +628,18 @@ fn hud_panel(hud $&ui_bridge.UiFrame, label &string, y f64, width f64, ink int) 
     << 0
 }
 
-fn record_tools(hud $&ui_bridge.UiFrame, editor &EditorView, size fm.Vec2) int {
+fn record_tools(hud $&ui_bridge.UiFrame, editor &EditorView, wb &WhiteboxHost, size fm.Vec2) int {
     hud.begin() or >>
     if size.x < 96.0 || size.y < 72.0 { << 0 }
     $mode := "[1/W] Move"
     if editor.mode == GIZMO_ROTATE { mode = "[2/E] Rotate" }
     else if editor.mode == GIZMO_SCALE { mode = "[3/R] Scale" }
+    if wb.active {
+        if wb.session.mode == imod.EDIT_MODE_VERTEX { mode = "[Tab] WB:Vertex" }
+        else if wb.session.mode == imod.EDIT_MODE_EDGE { mode = "[Tab] WB:Edge" }
+        else if wb.session.mode == imod.EDIT_MODE_FACE { mode = "[Tab] WB:Face" }
+        else { mode = "[Tab] WB:Object" }
+    }
     $space := "World"
     if editor.local_axes { space = "Local" }
     $snap := "Snap off"
@@ -595,7 +663,11 @@ fn record_tools(hud $&ui_bridge.UiFrame, editor &EditorView, size fm.Vec2) int {
     hud_panel(hud, &label, 16.0, size.x, EDITOR_TEXT) or >>
     if size.y >= 128.0 {
         $guide := "Enter Apply | Esc Cancel | H Hide | Del Delete"
-        if size.x >= 720.0 { guide = guide + " | Cmd+Z Undo | F Frame | Right Orbit | Mid Pan" }
+        if wb.active {
+            guide = "Enter Apply | Tab SubObj | X Extrude | I Inset | U BoxUV | Cmd+Z Undo"
+        } else if size.x >= 720.0 {
+            guide = guide + " | Cmd+Z Undo | F Frame | Right Orbit | Mid Pan"
+        }
         hud_panel(hud, &guide, size.y - 56.0, size.x, EDITOR_MUTED) or >>
     }
     << 0
@@ -697,14 +769,24 @@ fn gather_view_lights(slights &scene_lights.SceneLights3D, tree &scene.SceneTree
 }
 
 fn draw_view(device $&ren.Device3D, overlay $&ren2.Overlay2D, hud $&ui_bridge.UiFrame, world $&world3d.Scene3D,
-    modern $&ViewportModernHost, slights &scene_lights.SceneLights3D, tree &scene.SceneTree, editor &EditorView, frame CameraFrame, capture string) int {
+    modern $&ViewportModernHost, slights &scene_lights.SceneLights3D, scene_mods &imod.SceneModeling3D, tree &scene.SceneTree, editor &EditorView,
+    wb $&WhiteboxHost, frame CameraFrame, capture string) int {
     world.select_lods(tree, frame.position) or >>
+    if wb.active {
+        wb_mat := wb.material
+        wb_s := $&wb.session
+        _ := wb_s.sync_gpu(device, wb_mat, &[]ren.Material3D{}, true) or >>
+    }
     if modern.enabled && modern.pipelines.len > 0 {
         lights_list := gather_view_lights(slights, tree, editor.use_scene_lights) or >>
         $opaque_refs := []ren.MeshRef3D{}
         $opaque_worlds := []fm.Mat4{}
         $opaque_mats := []ren.Material3D{}
         _ := world.collect_visible_draws(tree, frame.projection, $&opaque_refs, $&opaque_worlds, $&opaque_mats) or >>
+        _ := scene_mods.collect_draws(tree, &editor.tree_ids, $&opaque_refs, $&opaque_worlds, $&opaque_mats) or >>
+        if wb.active {
+            _ := wb.session.collect_draws(wb.world, $&opaque_refs, $&opaque_worlds, $&opaque_mats) or >>
+        }
         amb := modern.ambient
         exp := modern.exposure
         pp := modern.pp_cfg
@@ -716,12 +798,17 @@ fn draw_view(device $&ren.Device3D, overlay $&ren2.Overlay2D, hud $&ui_bridge.Ui
             gather_view_lights(slights, tree, editor.use_scene_lights) or >>) or >>
         device.begin(EDITOR_CANVAS) or >>
         world.draw_lit(device, tree, frame.projection, &lighting) or >>
+        _ := scene_mods.draw_lit(device, tree, &editor.tree_ids, frame.projection, &lighting) or >>
+        if wb.active {
+            _ := wb.session.draw_lit(device, wb.world, frame.projection, &lighting) or >>
+        }
     }
     if capture.len > 0 { device.capture(capture) or >> }
     $batch := canvas.new_batch()
     if editor.show_grid {
         draw_xz_grid($&batch, frame) or >>
     }
+    draw_whitebox_overlay($&batch, wb, frame) or >>
     draw_nonmesh_markers($&batch, tree, editor, frame) or >>
     for i in 0:editor.selection.len {
         node := editor.selection[i]
@@ -744,7 +831,7 @@ fn draw_view(device $&ren.Device3D, overlay $&ren2.Overlay2D, hud $&ui_bridge.Ui
     }
     overlay.clear() or >>
     overlay.submit(&batch) or >>
-    record_tools(hud, editor, frame.size) or >>
+    record_tools(hud, editor, wb, frame.size) or >>
     hud.flush_overlay(device.present_session() or >>, overlay) or >>
     $present := device.begin_present_frame() or >>
     if present.has_image() {
@@ -857,6 +944,7 @@ fn run() int {
     $world := world3d.new_scene_3d(&device) or >>
     root := models.instantiate($&world, $&tree, parent, name + "") or >>
     picker := models.picker(&tree, root) or >>
+    $scene_mods := imod.prepare_scene_modeling(&device, &doc_meta) or >>
 
     $slights := scene_lights.new_scene_lights_3d()
     if doc_meta.light_count() > 0 {
@@ -871,6 +959,14 @@ fn run() int {
     for i in 0:doc_meta.surface_count() {
         sf := doc_meta.surface(i) or >>
         has_surf[sf.node] = true
+    }
+    for i in 0:doc_meta.editable_mesh_count() {
+        em := doc_meta.editable_mesh(i) or >>
+        has_surf[em.node] = true
+    }
+    for i in 0:doc_meta.csg_tree_count() {
+        cs := doc_meta.csg_tree(i) or >>
+        has_surf[cs.node] = true
     }
     $has_light := map[int]bool{}
     for i in 0:doc_meta.light_count() {
@@ -971,22 +1067,82 @@ fn run() int {
         tree_ids: tree_ids, doc_by_tree_id: doc_by_tree_id, node_meta: node_meta,
         deleted_docs: map[int]bool{}, pre_drag_snap: empty_snapshot(),
         undo_stack: []ViewportSnapshot{}, redo_stack: []ViewportSnapshot{}}
+    $wb := empty_whitebox_host() or >>
+    if config.whitebox_shape.len > 0 {
+        spawn_whitebox_shape($&wb, config.whitebox_shape + "", fm.vec3(2.0, 2.0, 2.0)) or >>
+    }
+    $live_ch := empty_live_channel()
+    if config.live_connect.len > 0 {
+        live_ch = connect_live_host(config.live_connect + "") or >>
+        emit_ready_event(&live_ch, gpu_info.backend_name(device.backend() or >>))
+    }
+    $script_lines := []string{}
+    $script_cursor := 0
+    if config.live_script.len > 0 {
+        sraw := snapshot.read(config.live_script + "", snapshot.MAX_BYTES) or >>
+        for raw_ln in strings.split(&sraw, "\n") {
+            ln := strings.trim_space(&raw_ln)
+            if ln.len > 0 { script_lines.push(ln) }
+        }
+    }
+
     $redraw := true
+    $wb_emit_pending := false
+    $pending_capture := config.capture + ""
     while editor.outcome == EDITING {
         window.pump() or >>
         state := (device.window() or >>).state() or >>
         size := frame_size(state)
+        if live_ch.connected {
+            $draining := true
+            while draining {
+                select {
+                    cmd_line := <-live_ch.incoming {
+                        if apply_live_command(&cmd_line, $&editor, $&tree, $&wb, $&pending_capture) {
+                            redraw = true
+                            wb_emit_pending = true
+                            if pending_capture.len > 0 || editor.outcome != EDITING {
+                                draining = false
+                            }
+                        }
+                    }
+                    else { draining = false }
+                }
+            }
+        }
+        if script_cursor < script_lines.len {
+            cmd_line := script_lines[script_cursor] + ""
+            script_cursor += 1
+            if apply_live_command(&cmd_line, $&editor, $&tree, $&wb, $&pending_capture) {
+                redraw = true
+                wb_emit_pending = true
+            }
+        }
         for i in 0:256 {
             event := device.poll() or >>
             if event.kind == events.EVENT_NONE { <- }
-            if config.check_node.len == 0 {
-                handle_event($&editor, $&tree, $&world, &picker, &event, size, event_point(state, &event)) or >>
+            if config.check_node.len == 0 && config.live_script.len == 0 {
+                handle_event_live($&editor, $&tree, $&world, &picker, $&wb, &live_ch, &event, size, event_point(state, &event)) or >>
             }
             if editor.outcome != EDITING { <- }
             if event.kind != events.EVENT_POINTER_MOVE || editor.dragging || editor.navigation != 0 { redraw = true }
         }
-        if editor.outcome != EDITING { <- }
-        if state.minimized || !redraw || size.x < 1.0 || size.y < 1.0 {
+        if editor.outcome != EDITING {
+            if (pending_capture.len > 0 || (wb_emit_pending && live_ch.connected && wb.active)) && size.x >= 1.0 && size.y >= 1.0 {
+                frame := camera_frame(editor.orbit, size) or >>
+                draw_view($&device, $&overlay, $&hud, $&world, $&modern, &slights, &scene_mods, &tree, &editor, $&wb, frame, pending_capture + "") or >>
+                if pending_capture.len > 0 {
+                    emit_captured_event(&live_ch, pending_capture + "")
+                    pending_capture = ""
+                }
+                if wb_emit_pending {
+                    emit_whitebox_event(&live_ch, &wb)
+                    wb_emit_pending = false
+                }
+            }
+            <-
+        }
+        if state.minimized || (!redraw && pending_capture.len == 0) || size.x < 1.0 || size.y < 1.0 {
             sleep_ns(8000000)
             ->
         }
@@ -997,17 +1153,33 @@ fn run() int {
             check_edit($&editor, $&tree, $&world, &picker, root, size, config.check_node + "") or >>
         }
         frame := camera_frame(editor.orbit, size) or >>
-        draw_view($&device, $&overlay, $&hud, $&world, $&modern, &slights, &tree, &editor, frame, config.capture + "") or >>
+        draw_view($&device, $&overlay, $&hud, $&world, $&modern, &slights, &scene_mods, &tree, &editor, $&wb, frame, pending_capture + "") or >>
+        if pending_capture.len > 0 {
+            emit_captured_event(&live_ch, pending_capture + "")
+            pending_capture = ""
+        }
+        if wb_emit_pending {
+            emit_whitebox_event(&live_ch, &wb)
+            wb_emit_pending = false
+        }
         redraw = false
     }
     if editor.outcome == APPLY {
         captured := models.capture(&tree, root) or >>
         files.save(config.output + "", &captured) or >>
         write_viewport_meta(&config, &editor) or >>
+        export_whitebox_glb(&wb, config.whitebox_out + "") or >>
+        emit_live_event(&live_ch, "{\"event\":\"closed\",\"outcome\":\"apply\"}")
+    } else {
+        emit_live_event(&live_ch, "{\"event\":\"closed\",\"outcome\":\"cancel\"}")
     }
+    live_ch.close_live()
+    wb_sess := $&wb.session
+    _ := wb_sess.close()
     if modern.enabled && modern.pipelines.len > 0 {
         ($&modern.pipelines[0]).close()
     }
+    scene_mods.close() or >>
     models.close() or >>
     overlay.close() or >>
     device.close() or >>

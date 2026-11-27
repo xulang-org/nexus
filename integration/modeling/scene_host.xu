@@ -1,0 +1,158 @@
+@"github.com/xulang-org/nexus/integration/modeling"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+mod #"github.com/xulang-org/nexus/modeling"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+light_data #"github.com/xulang-org/nexus/resources/lighting"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+rs #"github.com/xulang-org/nexus/resources/scene"
+scene #"github.com/xulang-org/nexus/scene"
+#errors
+
+struct SceneModelEntry {
+    node_idx int
+    is_csg bool
+    session EditableModelSession
+}
+
+pub struct SceneModeling3D {
+    entries []SceneModelEntry
+    closed bool
+}
+
+fn default_studio_mat3d() ren.Material3D {
+    da := rm.default_material_asset("WhiteboxDefault")
+    << material_asset_to_3d(&da) or >>
+}
+
+fn build_slot_materials(
+    node_idx int,
+    slot_count int,
+    ov_map &map[string]ren.Material3D,
+    fallback ren.Material3D
+) []ren.Material3D {
+    $count := slot_count
+    if count < 1 { count = 1 }
+    $out := []ren.Material3D{}
+    for s in 0:rm.MAX_MATERIAL_SLOTS {
+        k := str(node_idx) + ":" + str(s)
+        if s >= count && !ov_map.has(k + "") {
+            ->
+        }
+        while out.len < s { out.push(fallback) }
+        if ov_map.has(k + "") {
+            out.push(ov_map[k + ""])
+        } else {
+            out.push(fallback)
+        }
+    }
+    << out
+}
+
+pub fn prepare_scene_modeling(device &ren.Device3D, doc &rs.Document) SceneModeling3D {
+    fallback := default_studio_mat3d() or >>
+    $ov_map := map[string]ren.Material3D{}
+    for i in 0:doc.material_override_count() {
+        ov := doc.material_override(i) or >>
+        mat := material_asset_to_3d(&ov.material) or >>
+        ov_map[str(ov.node) + ":" + str(ov.slot)] = mat
+    }
+    $entries := []SceneModelEntry{}
+    for i in 0:doc.editable_mesh_count() {
+        att := doc.editable_mesh(i) or >>
+        $sess := new_editable_session(att.mesh.clone()) or >>
+        slot_mats := build_slot_materials(att.node, sess.mesh.material_slots.len, &ov_map, fallback)
+        $def_m := fallback
+        if slot_mats.len > 0 { def_m = slot_mats[0] }
+        _ := sess.sync_gpu(device, def_m, &slot_mats, true) or (err) {
+            _ := sess.close()
+            close_entries($&entries)
+            >> err
+        }
+        entries.push(SceneModelEntry{node_idx: att.node, is_csg: false, session: sess})
+    }
+    for i in 0:doc.csg_tree_count() {
+        att := doc.csg_tree(i) or >>
+        mesh := mod.evaluate_csg_tree("Csg_" + str(att.node), &att.tree) or (err) {
+            close_entries($&entries)
+            >> err
+        }
+        $sess := new_editable_session(mesh) or >>
+        slot_mats := build_slot_materials(att.node, sess.mesh.material_slots.len, &ov_map, fallback)
+        $def_m := fallback
+        if slot_mats.len > 0 { def_m = slot_mats[0] }
+        _ := sess.sync_gpu(device, def_m, &slot_mats, true) or (err) {
+            _ := sess.close()
+            close_entries($&entries)
+            >> err
+        }
+        entries.push(SceneModelEntry{node_idx: att.node, is_csg: true, session: sess})
+    }
+    << SceneModeling3D{entries: entries, closed: false}
+}
+
+fn close_entries(entries $&[]SceneModelEntry) {
+    for i in 0:entries.len {
+        e := $&entries[i]
+        s := $&e.session
+        _ := s.close()
+    }
+}
+
+pub fn (host &SceneModeling3D) entry_count() int { << host.entries.len }
+
+pub fn (host &SceneModeling3D) draw_lit(
+    device $&ren.Device3D,
+    tree &scene.SceneTree,
+    tree_ids &[]int,
+    view_proj fm.Mat4,
+    lighting &light_data.Environment3D
+) int {
+    if host.closed { >> errors.new("nexus modeling: closed SceneModeling3D host") }
+    $tris := 0
+    for i in 0:host.entries.len {
+        e := &host.entries[i]
+        if e.node_idx < 0 || e.node_idx >= tree_ids.len { -> }
+        nid := tree_ids[e.node_idx]
+        info := tree.node_info(nid) or (err) {
+            _ := err
+            ->
+        }
+        if !info.visible { -> }
+        world := tree.global_transform_3d(nid) or >>
+        tris += e.session.draw_lit(device, world, view_proj, lighting) or >>
+    }
+    << tris
+}
+
+pub fn (host &SceneModeling3D) collect_draws(
+    tree &scene.SceneTree,
+    tree_ids &[]int,
+    out_refs $&[]ren.MeshRef3D,
+    out_worlds $&[]fm.Mat4,
+    out_mats $&[]ren.Material3D
+) int {
+    if host.closed { >> errors.new("nexus modeling: closed SceneModeling3D host") }
+    $count := 0
+    for i in 0:host.entries.len {
+        e := &host.entries[i]
+        if e.node_idx < 0 || e.node_idx >= tree_ids.len { -> }
+        nid := tree_ids[e.node_idx]
+        info := tree.node_info(nid) or (err) {
+            _ := err
+            ->
+        }
+        if !info.visible { -> }
+        world := tree.global_transform_3d(nid) or >>
+        count += e.session.collect_draws(world, out_refs, out_worlds, out_mats) or >>
+    }
+    << count
+}
+
+pub fn (host $&SceneModeling3D) close() int {
+    if host.closed { << 0 }
+    close_entries($&host.entries)
+    host.entries = []SceneModelEntry{}
+    host.closed = true
+    << 0
+}

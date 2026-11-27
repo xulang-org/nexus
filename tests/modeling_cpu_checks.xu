@@ -1,0 +1,346 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+mod #"github.com/xulang-org/nexus/modeling"
+imod #"github.com/xulang-org/nexus/integration/modeling"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+physics3d #"github.com/xulang-org/nexus/physics3d"
+#math
+
+fn near(a f64, b f64) bool { << math.abs(a - b) < 0.0001 }
+
+fn vec3_near(a fm.Vec3, b fm.Vec3) bool {
+    << near(a.x, b.x) && near(a.y, b.y) && near(a.z, b.z)
+}
+
+fn check(cond bool, label string) {
+    if !cond {
+        eprintln("FAIL: " + label)
+        <<< 1
+    }
+}
+
+fn rejects_mesh_decode(raw string) bool {
+    rm.decode_editable_mesh_json(&raw) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn rejects_mesh_validate(m &rm.EditableMesh) bool {
+    m.validate() or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn rejects_csg_eval(tree &rm.CsgTree) bool {
+    mod.evaluate_csg_tree("Bad", tree) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn rejects_bevel_width(m $&rm.EditableMesh, w f64) bool {
+    mod.bevel_edges(m, &[0], &[1], w) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn rejects_mat_validate(ma &rm.MaterialAsset) bool {
+    ma.validate() or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn rejects_zero_box() bool {
+    _ := mod.box_editable(fm.vec3(0.0, 1.0, 1.0), 4294967295, 0) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn test_data_roundtrip() int {
+    b := mod.box_editable(fm.vec3(2.0, 2.0, 2.0), 4294967295, 0) or >>
+    b.validate() or >>
+    check(b.vertices.len == 8 && b.faces.len == 6 && b.corners.len == 24, "box editable counts")
+    bb := b.bounds() or >>
+    check(vec3_near(bb.minimum, fm.vec3(-1.0, -1.0, -1.0)) && vec3_near(bb.maximum, fm.vec3(1.0, 1.0, 1.0)), "box bounds")
+    check(vec3_near(b.face_normal(4) or >>, fm.vec3(0.0, 1.0, 0.0)), "top face +Y normal")
+    check(vec3_near(b.face_centroid(4) or >>, fm.vec3(0.0, 1.0, 0.0)), "top face centroid")
+    edges := b.build_edges()
+    check(edges.len == 12, "box has 12 edges")
+    for e in edges {
+        check(e.faces.len == 2, "box edge manifold")
+    }
+
+    mesh_json := b.encode_json()
+    b_dec := rm.decode_editable_mesh_json(&mesh_json) or >>
+    b_dec.validate() or >>
+    check(b_dec.vertices.len == b.vertices.len && b_dec.corners.len == b.corners.len && b_dec.faces.len == b.faces.len, "EditableMesh JSON roundtrip counts")
+    for i in 0:b.vertices.len {
+        check(vec3_near(b_dec.vertices[i].position, b.vertices[i].position), "EditableMesh JSON vertex parity")
+    }
+
+    // Invalid EditableMesh rejections
+    $bad_nan := b.clone()
+    bad_nan.vertices[0].position.x = math.nan()
+    check(rejects_mesh_validate(&bad_nan), "reject NaN vertex")
+    $bad_idx := b.clone()
+    bad_idx.corners[0].vertex = 999
+    check(rejects_mesh_validate(&bad_idx), "reject out-of-range corner vertex")
+    $bad_poly := rm.new_editable_mesh("BadPoly")
+    _ := bad_poly.add_vertex(fm.vec3(0.0, 0.0, 0.0), 4294967295) or >>
+    _ := bad_poly.add_vertex(fm.vec3(1.0, 0.0, 0.0), 4294967295) or >>
+    c0 := bad_poly.add_corner(0, fm.vec2(0.0, 0.0), true, fm.vec3(0.0, 1.0, 0.0), true) or >>
+    c1 := bad_poly.add_corner(1, fm.vec2(1.0, 0.0), true, fm.vec3(0.0, 1.0, 0.0), true) or >>
+    bad_poly.faces.push(rm.PolyFace{corners: [c0, c1], material_slot: 0, smoothing_group: 0})
+    check(rejects_mesh_validate(&bad_poly), "reject <3-corner face")
+    check(rejects_mesh_decode("{corrupt json"), "reject corrupt mesh JSON")
+
+    // CsgTree JSON roundtrip & rejections
+    $tree := rm.new_csg_tree()
+    br0 := rm.default_csg_brush(1, rm.CSG_SHAPE_BOX, rm.CSG_OP_UNION)
+    $br1 := rm.default_csg_brush(2, rm.CSG_SHAPE_CYLINDER, rm.CSG_OP_SUBTRACT)
+    br1.transform = fm.translation_3d(fm.vec3(0.5, 0.0, 0.0))
+    tree.brushes.push(br0)
+    tree.brushes.push(br1)
+    tree.validate() or >>
+    t_json := tree.encode_json()
+    t_dec := rm.decode_csg_tree_json(&t_json) or >>
+    t_dec.validate() or >>
+    check(t_dec.brushes.len == 2 && t_dec.brushes[1].op == rm.CSG_OP_SUBTRACT, "CsgTree JSON roundtrip")
+    $bad_tree := rm.new_csg_tree()
+    $bad_br := rm.default_csg_brush(1, 99, rm.CSG_OP_UNION)
+    bad_tree.brushes.push(bad_br)
+    check(rejects_csg_eval(&bad_tree), "reject invalid CsgBrush shape")
+
+    // MaterialAsset JSON roundtrip & rejections
+    $mat := rm.default_material_asset("WhiteboxTrim")
+    mat.base_color = fm.vec3(0.75, 0.45, 0.25)
+    mat.metallic = 0.65
+    mat.roughness = 0.32
+    mat.clearcoat = 0.4
+    mat.sheen_color = fm.vec3(0.2, 0.3, 0.4)
+    mat.alpha_mode = rm.ALPHA_MASK
+    mat.alpha_cutoff = 0.45
+    mat.base_texture_uid = "0123456789abcdef0123456789abcdef"
+    mat.validate() or >>
+    mat_json := mat.encode_json()
+    mat_dec := rm.decode_material_asset_json(&mat_json) or >>
+    mat_dec.validate() or >>
+    check(near(mat_dec.metallic, 0.65) && mat_dec.alpha_mode == rm.ALPHA_MASK && mat_dec.base_texture_uid == mat.base_texture_uid, "MaterialAsset JSON roundtrip")
+
+    $bad_m1 := rm.default_material_asset("BadMet")
+    bad_m1.metallic = 1.5
+    check(rejects_mat_validate(&bad_m1), "reject out-of-range metallic")
+    $bad_m2 := rm.default_material_asset("BadUid")
+    bad_m2.base_texture_uid = "not-32-hex"
+    check(rejects_mat_validate(&bad_m2), "reject invalid base_texture_uid")
+    << 0
+}
+
+fn test_generators() int {
+    gen_list := [
+        mod.box_editable(fm.vec3(2.0, 2.0, 2.0), 4294967295, 0) or >>,
+        mod.wedge_editable(fm.vec3(2.0, 2.0, 2.0), 4294967295, 0) or >>,
+        mod.stair_editable(fm.vec3(2.0, 2.0, 3.0), 6, 4294967295, 0) or >>,
+        mod.cylinder_editable(1.0, 1.0, 2.0, 16, 4294967295, 0) or >>,
+        mod.cylinder_editable(0.0, 1.0, 2.0, 12, 4294967295, 0) or >>,
+        mod.arch_editable(fm.vec3(2.4, 2.6, 1.2), 0.35, 10, 4294967295, 0) or >>,
+        mod.sphere_editable(1.0, 12, 8, 4294967295, 0) or >>
+    ]
+    for i in 0:gen_list.len {
+        em := &gen_list[i]
+        em.validate() or >>
+        cm := mod.compile_single_mesh(em, true) or >>
+        cm.validate() or >>
+        check(cm.vertex_count() > 0 && cm.triangle_count() >= 4, "generator compiled mesh positive tris")
+    }
+
+    raw_box := meshes.box_mesh_3d(fm.vec3(2.0, 2.0, 2.0), 4294967295) or >>
+    welded := mod.from_mesh_data("WeldedBox", &raw_box, 0.0001) or >>
+    welded.validate() or >>
+    check(raw_box.vertex_count() == 24 && welded.vertices.len == 8 && welded.faces.len == 12, "from_mesh_data welds 24->8 verts")
+
+    check(rejects_zero_box(), "reject zero-dimension box")
+    << 0
+}
+
+fn test_topology_ops() int {
+    // Extrude +Y top face (face 4) by 1.0
+    $m := mod.box_editable(fm.vec3(2.0, 2.0, 2.0), 4294967295, 0) or >>
+    _ := mod.extrude_faces($&m, &[4], 1.0) or >>
+    m.validate() or >>
+    check(m.faces.len == 10, "extrude adds 4 side quads (6->10)")
+    eb := m.bounds() or >>
+    check(near(eb.maximum.y, 2.0), "extrude raises +Y bound to 2.0")
+
+    // Inset top face
+    _ := mod.inset_faces($&m, &[4], 0.25, 0.1) or >>
+    m.validate() or >>
+    check(m.faces.len == 14, "inset adds 4 bridge quads (10->14)")
+
+    // Bevel manifold edge on fresh box
+    $bv := mod.box_editable(fm.vec3(2.0, 2.0, 2.0), 4294967295, 0) or >>
+    check(rejects_bevel_width($&bv, 10.0), "reject oversized bevel width")
+    _ := mod.bevel_edges($&bv, &[4], &[5], 0.15) or >>
+    bv.validate() or >>
+    check(bv.faces.len > 6, "bevel adds chamfer geometry")
+
+    // Translate, scale, flip normal, slot split, smoothing, UV projection, compile_to_primitives
+    $op := mod.box_editable(fm.vec3(2.0, 2.0, 2.0), 4294967295, 0) or >>
+    mod.translate_faces($&op, &[4], fm.vec3(0.0, 0.5, 0.0)) or >>
+    check(near((op.bounds() or >>).maximum.y, 1.5), "translate_faces lifts top vertices")
+    mod.translate_vertices($&op, &[0, 1, 2, 3], fm.vec3(0.0, -0.5, 0.0)) or >>
+    mod.scale_vertices($&op, &[4, 5, 6, 7], fm.vec3(0.0, 1.5, 0.0), fm.vec3(0.5, 1.0, 0.5)) or >>
+    mod.flip_face_normals($&op, &[4]) or >>
+    check((op.face_normal(4) or >>).y < -0.5, "flip_face_normals reverses +Y normal")
+    mod.flip_face_normals($&op, &[4]) or >>
+    mod.set_face_material_slot($&op, &[4, 5], 1) or >>
+    mod.set_face_smoothing_group($&op, &[0, 1, 2, 3], 1) or >>
+    mod.project_uv_planar($&op, &[4], fm.vec3(1.0, 0.0, 0.0), fm.vec3(0.0, 0.0, 1.0), 0.5) or >>
+    prims := mod.compile_to_primitives(&op, true) or >>
+    check(prims.len == 2, "2 material slots compile to 2 primitives")
+    for i in 0:prims.len {
+        prims[i].mesh.validate() or >>
+        check(prims[i].mesh.vertices[0].has_tangent, "compiled primitive has MikkTSpace tangents")
+    }
+    single := mod.compile_single_mesh(&op, true) or >>
+    single.validate() or >>
+    check(single.triangle_count() == 12, "compile_single_mesh keeps all 12 box tris")
+
+    // Merge two top vertices (4, 5) at threshold=0 and verify mesh stays valid
+    $mg := mod.box_editable(fm.vec3(2.0, 2.0, 2.0), 4294967295, 0) or >>
+    merged := mod.merge_vertices($&mg, &[4, 5], 0.0) or >>
+    check(merged == 1, "merge_vertices welds 1 vertex")
+    mg.validate() or >>
+    << 0
+}
+
+fn make_box_brush(id int, op int, size fm.Vec3, pos fm.Vec3) rm.CsgBrush {
+    $br := rm.default_csg_brush(id, rm.CSG_SHAPE_BOX, op)
+    br.size = size
+    br.transform = fm.translation_3d(pos)
+    << br
+}
+
+fn test_csg() int {
+    // Union: two overlapping 2x2x2 boxes -> [-1, 2] on X
+    $ut := rm.new_csg_tree()
+    ut.brushes.push(make_box_brush(1, rm.CSG_OP_UNION, fm.vec3(2.0, 2.0, 2.0), fm.vec3(0.0, 0.0, 0.0)))
+    ut.brushes.push(make_box_brush(2, rm.CSG_OP_UNION, fm.vec3(2.0, 2.0, 2.0), fm.vec3(1.0, 0.0, 0.0)))
+    um := mod.evaluate_csg_tree("UnionBox", &ut) or >>
+    um.validate() or >>
+    ub := um.bounds() or >>
+    check(near(ub.minimum.x, -1.0) && near(ub.maximum.x, 2.0), "CSG union X bounds [-1, 2]")
+    uc := mod.compile_single_mesh(&um, true) or >>
+    uc.validate() or >>
+
+    // Subtract: 2x2x2 box minus central 0.8x0.8x4.0 Z tunnel + physics raycast verification
+    $st := rm.new_csg_tree()
+    st.brushes.push(make_box_brush(1, rm.CSG_OP_UNION, fm.vec3(2.0, 2.0, 2.0), fm.vec3(0.0, 0.0, 0.0)))
+    st.brushes.push(make_box_brush(2, rm.CSG_OP_SUBTRACT, fm.vec3(0.8, 0.8, 4.0), fm.vec3(0.0, 0.0, 0.0)))
+    sm := mod.evaluate_csg_tree("TunnelBox", &st) or >>
+    sm.validate() or >>
+    $sess := imod.new_editable_session(sm) or >>
+    tris := sess.build_collision_triangles(fm.identity_3d(), 1) or >>
+    check(tris.len > 12, "subtracted CSG produces collision triangles")
+    hole_hit := physics3d.raycast_triangles(fm.vec3(0.0, 0.0, 5.0), fm.vec3(0.0, 0.0, -1.0), 20.0, &tris) or >>
+    check(hole_hit.collider < 0, "ray through subtracted CSG tunnel misses geometry")
+    wall_hit := physics3d.raycast_triangles(fm.vec3(0.75, 0.0, 5.0), fm.vec3(0.0, 0.0, -1.0), 20.0, &tris) or >>
+    check(wall_hit.collider >= 0 && near(wall_hit.point.z, 1.0), "ray into solid frame hits front face z=1")
+    _ := sess.close()
+
+    // Intersect: overlap on X=[0, 1]
+    $it := rm.new_csg_tree()
+    it.brushes.push(make_box_brush(1, rm.CSG_OP_UNION, fm.vec3(2.0, 2.0, 2.0), fm.vec3(0.0, 0.0, 0.0)))
+    it.brushes.push(make_box_brush(2, rm.CSG_OP_INTERSECT, fm.vec3(2.0, 2.0, 2.0), fm.vec3(1.0, 0.0, 0.0)))
+    im := mod.evaluate_csg_tree("IntersectBox", &it) or >>
+    im.validate() or >>
+    ib := im.bounds() or >>
+    check(near(ib.minimum.x, 0.0) && near(ib.maximum.x, 1.0) && near(ib.maximum.y, 1.0), "CSG intersect X bounds [0, 1]")
+
+    // Reject empty and disjoint intersect
+    empty_t := rm.new_csg_tree()
+    check(rejects_csg_eval(&empty_t), "reject empty CsgTree")
+    $disjoint := rm.new_csg_tree()
+    disjoint.brushes.push(make_box_brush(1, rm.CSG_OP_UNION, fm.vec3(2.0, 2.0, 2.0), fm.vec3(0.0, 0.0, 0.0)))
+    disjoint.brushes.push(make_box_brush(2, rm.CSG_OP_INTERSECT, fm.vec3(2.0, 2.0, 2.0), fm.vec3(10.0, 0.0, 0.0)))
+    check(rejects_csg_eval(&disjoint), "reject disjoint CSG intersection")
+    << 0
+}
+
+fn test_picking_and_session() int {
+    world := fm.translation_3d(fm.vec3(5.0, 0.0, 0.0))
+    box := mod.box_editable(fm.vec3(2.0, 2.0, 2.0), 4294967295, 0) or >>
+    $sess := imod.new_editable_session(box) or >>
+
+    // Pick top (+Y) face via Pick API and Session API
+    top_ray := fm.ray3d(fm.vec3(5.0, 4.0, 0.0), fm.vec3(0.0, -1.0, 0.0)) or >>
+    fhit := mod.pick_face(&sess.mesh, world, top_ray)
+    check(fhit.hit && fhit.face_id == 4, "pick_face selects +Y face 4")
+    miss_ray := fm.ray3d(fm.vec3(20.0, 4.0, 0.0), fm.vec3(0.0, -1.0, 0.0)) or >>
+    check(!mod.pick_face(&sess.mesh, world, miss_ray).hit, "pick_face misses outside bounds")
+
+    // Vertex and Edge pick around top-right-front corner (6, 1, 1) in world space
+    vr := fm.ray3d(fm.vec3(6.02, 4.0, 1.02), fm.vec3(0.0, -1.0, 0.0)) or >>
+    vhit := mod.pick_vertex(&sess.mesh, world, vr, 0.2)
+    check(vhit.hit && vhit.vertex_id == 5, "pick_vertex selects vertex 5 at (1,1,1) local")
+    er := fm.ray3d(fm.vec3(5.0, 4.0, 1.02), fm.vec3(0.0, -1.0, 0.0)) or >>
+    ehit := mod.pick_edge(&sess.mesh, world, er, 0.2)
+    check(ehit.hit && ((ehit.v0 == 4 && ehit.v1 == 5) || (ehit.v0 == 5 && ehit.v1 == 4)), "pick_edge selects top-front edge (4,5)")
+
+    // Marquee enclosing translated box [2..8, -3..3, -3..3]
+    fr := fm.Frustum3D{planes: [
+        fm.plane_from_coeffs(1.0, 0.0, 0.0, -2.0) or >>,
+        fm.plane_from_coeffs(-1.0, 0.0, 0.0, 8.0) or >>,
+        fm.plane_from_coeffs(0.0, 1.0, 0.0, 3.0) or >>,
+        fm.plane_from_coeffs(0.0, -1.0, 0.0, 3.0) or >>,
+        fm.plane_from_coeffs(0.0, 0.0, 1.0, 3.0) or >>,
+        fm.plane_from_coeffs(0.0, 0.0, -1.0, 3.0) or >>
+    ]}
+    m_verts := mod.marquee_vertices(&sess.mesh, world, &fr)
+    check(m_verts.len == 8, "marquee_vertices captures all 8 box vertices")
+
+    // Session subobject pick + extrude + undo + redo + debug wireframe + close
+    sess.mode = imod.EDIT_MODE_FACE
+    check(sess.pick_subobject(world, top_ray, 0.2, false), "session pick_subobject selects face")
+    check(sess.selected_faces.len == 1 && sess.selected_faces[0] == 4, "session selected face 4")
+    _ := sess.apply_extrude(0.75) or >>
+    check(sess.mesh.faces.len == 10, "session apply_extrude increases face count")
+    check(sess.undo() && sess.mesh.faces.len == 6, "session undo restores 6 faces")
+    check(sess.redo() && sess.mesh.faces.len == 10, "session redo restores 10 faces")
+
+    $dbg := meshes.new_debug_draw_3d(0.01) or >>
+    sess.build_debug_wireframe($&dbg, world, 4294967295, 4294901760, 4278255360) or >>
+    check(dbg.segment_count() > 12, "build_debug_wireframe emits wireframe + normal arrow segments")
+    _ := sess.close()
+    << 0
+}
+
+fn run_all() int {
+    test_data_roundtrip() or >>
+    test_generators() or >>
+    test_topology_ops() or >>
+    test_csg() or >>
+    test_picking_and_session() or >>
+    println("PASS: modeling_cpu_checks (data JSON, 6 generators, ops, CSG booleans, picking, undo/redo, physics3d raycast)")
+    << 0
+}
+
+fn main() int {
+    << run_all() or (err) {
+        eprintln("FAIL: " + err.msg())
+        << 1
+    }
+}

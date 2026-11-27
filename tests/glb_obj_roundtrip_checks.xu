@@ -1,0 +1,275 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+mod #"github.com/xulang-org/nexus/modeling"
+gltf #"github.com/xulang-org/nexus/formats/gltf"
+obj #"github.com/xulang-org/nexus/formats/obj"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+project #"github.com/xulang-org/nexus/integration/project"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#math
+#os
+#os/exec
+#path/filepath
+#strings
+
+fn near(a f64, b f64) bool { << math.abs(a - b) < 0.0002 }
+
+fn vec3_near(a fm.Vec3, b fm.Vec3) bool {
+    << near(a.x, b.x) && near(a.y, b.y) && near(a.z, b.z)
+}
+
+fn check(cond bool, label string) {
+    if !cond {
+        eprintln("FAIL: " + label)
+        <<< 1
+    }
+}
+
+fn copy_file(src string, dst string) int {
+    raw := snapshot.read(src, snapshot.MAX_BYTES) or >>
+    snapshot.write_atomic(dst, &raw) or >>
+    << 0
+}
+
+fn must_ok(bin &string, args &[]string, label string) string {
+    $cmd := exec.command(*bin + "")
+    for i in 0:args.len {
+        cmd.args.push(args[i] + "")
+    }
+    out := cmd.combined_output() or (err) {
+        eprintln("FAIL [" + label + "]: " + err.msg())
+        <<< 1
+    }
+    << out
+}
+
+fn png_1x1_bytes() []u8 {
+    raw := [
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
+        0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196,
+        137, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 248, 15, 4, 0,
+        9, 251, 3, 253, 251, 94, 107, 43, 0, 0, 0, 0, 73, 69, 78, 68,
+        174, 66, 96, 130
+    ]
+    $out := []u8{}
+    for b in raw { out.push(u8(b)) }
+    << out
+}
+
+fn rejects_glb_spec(spec &gltf.GlbExportSpec) bool {
+    _ := gltf.encode_glb(spec) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn rejects_obj_encode(m &meshes.MeshData3D) bool {
+    _ := obj.encode(m) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn rejects_export_glb(proj string, rel string, raw &string, val string) bool {
+    _ := project.export_glb_bytes_to_project(proj, rel, raw, val) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn rejects_export_obj(proj string, rel string, raw &string) bool {
+    _ := project.export_obj_bytes_to_project(proj, rel, raw) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn run_checks(cli_bin string, val_bin string) int {
+    // 1. Build extruded + inset whitebox mesh & verify single-mesh GLB roundtrip
+    $em := mod.box_editable(fm.vec3(2.0, 2.0, 2.0), 4294967295, 0) or >>
+    _ := mod.extrude_faces($&em, &[4], 0.8) or >>
+    _ := mod.inset_faces($&em, &[4], 0.25, 0.2) or >>
+    compiled := mod.compile_single_mesh(&em, true) or >>
+    compiled.validate() or >>
+
+    $mat0 := gltf.default_material()
+    mat0.base = fm.vec3(0.7, 0.5, 0.3)
+    mat0.metallic = 0.4
+    mat0.roughness = 0.55
+
+    glb_single := gltf.encode_mesh_glb("ExtrudedBox", &compiled, mat0) or >>
+    dec_single := gltf.decode_glb_geometry(&glb_single) or >>
+    check(dec_single.mesh_count() == 1 && dec_single.primitive_count() == 1, "single GLB mesh & primitive count")
+    check((dec_single.vertex_count(0) or >>) == compiled.vertex_count(), "single GLB vertex count parity")
+    check((dec_single.index_count(0) or >>) == compiled.indices.len, "single GLB index count parity")
+    check(dec_single.has_normals(0) or >>, "single GLB preserves normals")
+    check(dec_single.has_uvs(0) or >>, "single GLB preserves UVs")
+    check(dec_single.has_tangents(0) or >>, "single GLB preserves tangents")
+    for vi in 0:compiled.vertex_count() {
+        check(vec3_near(dec_single.position(0, vi) or >>, compiled.vertices[vi].position), "single GLB vertex position parity")
+        check(vec3_near(dec_single.normal(0, vi) or >>, compiled.vertices[vi].normal), "single GLB normal parity")
+        uv_d := dec_single.uv(0, vi) or >>
+        check(near(uv_d.x, compiled.vertices[vi].uv.x) && near(uv_d.y, compiled.vertices[vi].uv.y), "single GLB UV parity")
+        tan_d := dec_single.tangent(0, vi) or >>
+        check(vec3_near(tan_d.xyz(), compiled.vertices[vi].tangent.xyz()) && near(tan_d.w, compiled.vertices[vi].tangent.w), "single GLB tangent parity")
+    }
+    for ii in 0:compiled.indices.len {
+        check((dec_single.index(0, ii) or >>) == compiled.indices[ii], "single GLB index parity")
+    }
+
+    // 2. Multi-primitive GLB roundtrip (2 material slots)
+    $multi_em := mod.box_editable(fm.vec3(2.0, 2.0, 2.0), 4294967295, 0) or >>
+    mod.set_face_material_slot($&multi_em, &[4, 5], 1) or >>
+    prims := mod.compile_to_primitives(&multi_em, true) or >>
+    check(prims.len == 2, "two slots yield two primitives")
+    g_prims := [
+        gltf.GlbExportPrimitive{mesh: ~prims[0].mesh, material: 0},
+        gltf.GlbExportPrimitive{mesh: ~prims[1].mesh, material: 1}
+    ]
+    $mat1 := gltf.default_material()
+    mat1.base = fm.vec3(0.2, 0.6, 0.85)
+    mat1.metallic = 0.8
+    mat1.roughness = 0.25
+    glb_multi := gltf.encode_primitives_glb("TwoSlotBox", &g_prims, &[mat0, mat1]) or >>
+    dec_multi := gltf.decode_glb_geometry(&glb_multi) or >>
+    check(dec_multi.primitive_count() == 2 && dec_multi.material_count() == 2, "multi GLB primitives & materials")
+    check((dec_multi.primitive_material(0) or >>) == 0 && (dec_multi.primitive_material(1) or >>) == 1, "multi GLB material assignment")
+    rmat1 := dec_multi.material(1) or >>
+    check(vec3_near(rmat1.base, fm.vec3(0.2, 0.6, 0.85)) && near(rmat1.metallic, 0.8), "multi GLB material factor parity")
+
+    // 3. Full encode_glb hierarchy (parent/child TRS) + embedded 1x1 PNG texture & sampler
+    s_box := mod.compile_single_mesh(&(mod.box_editable(fm.vec3(1.0, 1.0, 1.0), 4294967295, 0) or >>), true) or >>
+    $tex_mat := gltf.default_material()
+    tex_mat.base_texture = 0
+    tex_mat.metallic = 0.1
+    tex_mat.roughness = 0.8
+    $child_node := gltf.default_export_node("Child", 0, 0)
+    child_node.translation = fm.vec3(2.0, 1.0, -0.5)
+    child_node.rotation = fm.vec4(0.0, 0.0, math.sqrt(0.5), math.sqrt(0.5))
+    child_node.scale = fm.vec3(1.0, 1.5, 1.0)
+    spec := gltf.GlbExportSpec{
+        generator: "Nexus Roundtrip Test",
+        meshes: [gltf.GlbExportMesh{name: "UnitBox", primitives: [gltf.GlbExportPrimitive{mesh: s_box, material: 0}]}],
+        nodes: [gltf.default_export_node("Root", -1, 0), child_node],
+        materials: [tex_mat],
+        images: [gltf.GlbExportImage{mime: "image/png", bytes: png_1x1_bytes()}],
+        textures: [gltf.TextureDescription{image: 0, sampler: 0}],
+        samplers: [gltf.default_sampler()]
+    }
+    glb_hier := gltf.encode_glb(&spec) or >>
+    dec_hier := gltf.decode_glb_geometry(&glb_hier) or >>
+    check(dec_hier.node_count() == 2 && (dec_hier.node_parent(1) or >>) == 0, "GLB hierarchy parent/child preserved")
+    check(dec_hier.image_count() == 1 && dec_hier.texture_count() == 1, "GLB embedded image & texture preserved")
+    check((dec_hier.material(0) or >>).base_texture == 0, "GLB material base_texture index preserved")
+    nt1 := dec_hier.node_transform(1) or >>
+    check(vec3_near(nt1.c3.xyz(), fm.vec3(2.0, 1.0, -0.5)), "GLB child translation preserved")
+
+    // 4. GLB encode rejection checks
+    empty_spec := gltf.GlbExportSpec{
+        generator: "Empty",
+        meshes: []gltf.GlbExportMesh{},
+        nodes: [gltf.default_export_node("Root", -1, 0)],
+        materials: []gltf.MaterialDescription{},
+        images: []gltf.GlbExportImage{},
+        textures: []gltf.TextureDescription{},
+        samplers: []gltf.SamplerDescription{}
+    }
+    check(rejects_glb_spec(&empty_spec), "reject GLB spec with empty meshes")
+    bad_mesh_node := gltf.GlbExportSpec{
+        generator: "BadMeshIdx",
+        meshes: [gltf.GlbExportMesh{name: "M", primitives: [gltf.GlbExportPrimitive{mesh: ~compiled, material: -1}]}],
+        nodes: [gltf.default_export_node("Root", -1, 5)],
+        materials: []gltf.MaterialDescription{},
+        images: []gltf.GlbExportImage{},
+        textures: []gltf.TextureDescription{},
+        samplers: []gltf.SamplerDescription{}
+    }
+    check(rejects_glb_spec(&bad_mesh_node), "reject GLB spec with out-of-range mesh index")
+    $bad_quat_node := gltf.default_export_node("Root", -1, 0)
+    bad_quat_node.rotation = fm.vec4(0.0, 0.0, 0.0, 0.0)
+    bad_quat_spec := gltf.GlbExportSpec{
+        generator: "BadQuat",
+        meshes: [gltf.GlbExportMesh{name: "M", primitives: [gltf.GlbExportPrimitive{mesh: ~compiled, material: -1}]}],
+        nodes: [bad_quat_node],
+        materials: []gltf.MaterialDescription{},
+        images: []gltf.GlbExportImage{},
+        textures: []gltf.TextureDescription{},
+        samplers: []gltf.SamplerDescription{}
+    }
+    check(rejects_glb_spec(&bad_quat_spec), "reject GLB spec with zero quaternion")
+
+    // 5. OBJ encode & decode roundtrip
+    obj_raw := obj.encode(&compiled) or >>
+    obj_dec := obj.decode(&obj_raw) or >>
+    obj_dec.validate() or >>
+    check(obj_dec.triangle_count() == compiled.triangle_count(), "OBJ triangle count parity")
+    b_src := compiled.bounds() or >>
+    b_obj := obj_dec.bounds() or >>
+    check(vec3_near(b_src.minimum, b_obj.minimum) && vec3_near(b_src.maximum, b_obj.maximum), "OBJ decoded bounds parity")
+    empty_mesh := meshes.new_mesh_data_3d()
+    check(rejects_obj_encode(&empty_mesh), "reject empty mesh in obj.encode")
+
+    // 6. integration/project export, UID registration/reuse, validation & CLI build
+    work_dir := "build/modeling-export-test"
+    _ := os.remove_all(work_dir + "") or (err) {
+        _ := err
+        0
+    }
+    os.mkdir_all(work_dir + "/assets/models") or >>
+    proj_json := filepath.abs(&(work_dir + "/project.json")) or >>
+    world_dst := work_dir + "/assets/world.xuscene"
+    copy_file("examples/scene_assets/project.json", proj_json + "") or >>
+    copy_file("examples/scene_assets/assets/world.xuscene", world_dst + "") or >>
+    copy_file("examples/scene_assets/assets/panels.glb", work_dir + "/assets/panels.glb") or >>
+
+    exp1 := project.export_glb_bytes_to_project(proj_json + "", "assets/models/whitebox.glb", &glb_multi, val_bin + "") or >>
+    check(exp1.uid.len == 32 && !exp1.reused && exp1.primitive_count == 2, "export GLB creates 32-hex UID & writes 2 prims")
+    loaded1 := project.load_project(proj_json + "") or >>
+    check(loaded1.find_asset_uid_by_rel(&"assets/models/whitebox.glb") == exp1.uid, "project.json records exported GLB UID")
+
+    exp2 := project.export_glb_bytes_to_project(proj_json + "", "assets/models/whitebox.glb", &glb_single, val_bin + "") or >>
+    check(exp2.reused && exp2.uid == exp1.uid && exp2.primitive_count == 1, "re-export reuses existing GLB UID cleanly")
+
+    obj_dest := project.export_obj_bytes_to_project(proj_json + "", "assets/models/whitebox.obj", &obj_raw) or >>
+    obj_disk := snapshot.read(obj_dest + "", snapshot.MAX_BYTES) or >>
+    obj_disk_dec := obj.decode(&obj_disk) or >>
+    check(obj_disk_dec.triangle_count() == compiled.triangle_count(), "exported OBJ on disk decodes cleanly")
+
+    // Export rejections
+    check(rejects_export_glb(proj_json + "", "../escape.glb", &glb_single, val_bin + ""), "reject path traversal on GLB export")
+    check(rejects_export_glb(proj_json + "", "assets/bad.txt", &glb_single, val_bin + ""), "reject non-.glb extension")
+    bad_glb := "not-a-glb-stream"
+    check(rejects_export_glb(proj_json + "", "assets/models/bad.glb", &bad_glb, val_bin + ""), "reject corrupt GLB bytes")
+    check(rejects_export_obj(proj_json + "", "assets/models/wrong.glb", &obj_raw), "reject non-.obj extension")
+
+    // Validate with nexus-project-validate and package with nexus-project build
+    _ := must_ok(&val_bin, &["glb", exp2.resolved + ""], "validate exported GLB")
+    _ := must_ok(&val_bin, &["scene", world_dst + ""], "validate project scene")
+    dist_dir := work_dir + "/dist"
+    _ := must_ok(&cli_bin, &["build", proj_json + "", "--output", dist_dir + "", "--validator", val_bin + ""], "nexus-project build with exported asset")
+
+    println("PASS: glb_obj_roundtrip_checks (GLB single/multi/hierarchy+tex, OBJ roundtrip, project UID export & build)")
+    << 0
+}
+
+fn main() int {
+    args := os.args()
+    $cli_bin := "build/nexus-project"
+    $val_bin := "build/nexus-project-validate"
+    $i := 1
+    while i + 1 < args.len {
+        if args[i] == "--project-cli" { cli_bin = args[i + 1] + "" }
+        else if args[i] == "--validator" { val_bin = args[i + 1] + "" }
+        i += 2
+    }
+    << run_checks(cli_bin, val_bin) or (err) {
+        eprintln("FAIL: " + err.msg())
+        << 1
+    }
+}

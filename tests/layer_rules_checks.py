@@ -260,3 +260,18 @@ for source in ('foundation/diagnostics/log.xu', 'foundation/diagnostics/cvar.xu'
     rejects(changed(source, 'nexus_audio_native'), 'native audio import must stay')
     rejects(changed(source, module + '/scene'), 'forbidden layer dependency')
 print('PASS: foundation diagnostics, events, and spatial stay pure CPU foundation with zero OS, GPU, native, or scene dependencies')
+
+for source in ('resources/modeling/editable_mesh.xu', 'resources/modeling/csg.xu', 'resources/modeling/material.xu'):
+    rejects(changed(source, 'os'), 'forbidden external import')
+    rejects(changed(source, 'gpu'), 'forbidden external import')
+    rejects(changed(source, 'nexus_audio_native'), 'native audio import must stay')
+    rejects(changed(source, module + '/scene'), 'forbidden dependency')
+for source in ('modeling/compile.xu', 'modeling/csg_eval.xu', 'modeling/generators.xu', 'modeling/ops.xu', 'modeling/pick.xu'):
+    rejects(changed(source, 'os'), 'forbidden external import')
+    rejects(changed(source, 'gpu'), 'forbidden external import')
+    rejects(changed(source, 'nexus_audio_native'), 'native audio import must stay')
+    rejects(changed(source, module + '/scene'), 'forbidden layer dependency')
+rejects(changed('integration/modeling/mod.xu', 'os'), 'forbidden external import')
+rejects(changed('integration/modeling/mod.xu', 'gpu'), 'forbidden external import')
+rejects(changed('integration/modeling/mod.xu', 'nexus_audio_native'), 'native audio import must stay')
+print('PASS: resources/modeling, modeling, and integration/modeling respect CPU/OS/GPU/native/scene boundaries')

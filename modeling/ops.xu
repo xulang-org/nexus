@@ -1,0 +1,649 @@
+@"github.com/xulang-org/nexus/modeling"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+#errors
+#math
+
+fn unique_selected_verts(m &rm.EditableMesh, face_ids &[]int) []int {
+    $seen := map[int]bool{}
+    $verts := []int{}
+    for idx in 0:face_ids.len {
+        fi := face_ids[idx]
+        if fi < 0 || fi >= m.faces.len {
+            >> errors.new("nexus modeling: face index out of range")
+        }
+        for cid in m.faces[fi].corners {
+            vid := m.corners[cid].vertex
+            if !seen.has(vid) {
+                seen[vid] = true
+                verts.push(vid)
+            }
+        }
+    }
+    << verts
+}
+
+pub fn translate_vertices(m $&rm.EditableMesh, vert_ids &[]int, delta fm.Vec3) int {
+    if !delta.is_finite() {
+        >> errors.new("nexus modeling: non-finite vertex translation")
+    }
+    $seen := map[int]bool{}
+    for idx in 0:vert_ids.len {
+        vid := vert_ids[idx]
+        if vid < 0 || vid >= m.vertices.len {
+            >> errors.new("nexus modeling: vertex index out of range")
+        }
+        if seen.has(vid) { -> }
+        seen[vid] = true
+        m.vertices[vid].position = m.vertices[vid].position.add(delta)
+    }
+    compute_normals(m) or >>
+    << 0
+}
+
+pub fn translate_faces(m $&rm.EditableMesh, face_ids &[]int, delta fm.Vec3) int {
+    verts := unique_selected_verts(m, face_ids) or >>
+    << translate_vertices(m, &verts, delta) or >>
+}
+
+pub fn scale_vertices(m $&rm.EditableMesh, vert_ids &[]int, pivot fm.Vec3, scale fm.Vec3) int {
+    if !pivot.is_finite() || !scale.is_finite() {
+        >> errors.new("nexus modeling: non-finite scale parameters")
+    }
+    $seen := map[int]bool{}
+    for idx in 0:vert_ids.len {
+        vid := vert_ids[idx]
+        if vid < 0 || vid >= m.vertices.len {
+            >> errors.new("nexus modeling: vertex index out of range")
+        }
+        if seen.has(vid) { -> }
+        seen[vid] = true
+        rel := m.vertices[vid].position.sub(pivot)
+        m.vertices[vid].position = pivot.add(rel.mul_components(scale))
+    }
+    compute_normals(m) or >>
+    << 0
+}
+
+struct BoundaryEdge {
+    a int
+    b int
+    mat_slot int
+}
+
+// Region face extrude: creates duplicate vertices translated along average
+// selection normal, updates selected faces, and stitches boundary side quads.
+pub fn extrude_faces(m $&rm.EditableMesh, face_ids &[]int, distance f64) []int {
+    if !fm.finite(distance) {
+        >> errors.new("nexus modeling: non-finite extrude distance")
+    }
+    if face_ids.len == 0 {
+        >> errors.new("nexus modeling: extrude requires at least one face")
+    }
+    $sel := map[int]bool{}
+    $unique_faces := []int{}
+    $avg_n := fm.vec3(0.0, 0.0, 0.0)
+    for idx in 0:face_ids.len {
+        fi := face_ids[idx]
+        if fi < 0 || fi >= m.faces.len {
+            >> errors.new("nexus modeling: extrude face index out of range")
+        }
+        if sel.has(fi) { -> }
+        sel[fi] = true
+        unique_faces.push(fi)
+        n := safe_face_normal(m, fi)
+        avg_n = avg_n.add(n)
+    }
+    if avg_n.length_sq() <= 1e-18 {
+        avg_n = fm.vec3(0.0, 1.0, 0.0)
+    } else {
+        avg_n = avg_n.normalized() or >>
+    }
+
+    // Count undirected edges within selected region to find outer boundary edges.
+    $edge_count := map[string]int{}
+    $dir_edges := []BoundaryEdge{}
+    for idx in 0:unique_faces.len {
+        fi := unique_faces[idx]
+        f := &m.faces[fi]
+        n := f.corners.len
+        if n < 3 { -> }
+        for i in 0:n {
+            $ni := i + 1
+            if ni >= n { ni = 0 }
+            va := m.corners[f.corners[i]].vertex
+            vb := m.corners[f.corners[ni]].vertex
+            $lo := va
+            $hi := vb
+            if hi < lo {
+                lo = vb
+                hi = va
+            }
+            key := str(lo) + ":" + str(hi)
+            if edge_count.has(key) {
+                edge_count[key] = edge_count[key] + 1
+            } else {
+                edge_count[key] = 1
+            }
+            dir_edges.push(BoundaryEdge{a: va, b: vb, mat_slot: f.material_slot})
+        }
+    }
+
+    // Allocate extruded vertices.
+    $ext_map := map[int]int{}
+    delta := avg_n.scaled(distance)
+    for idx in 0:unique_faces.len {
+        fi := unique_faces[idx]
+        cids := ~m.faces[fi].corners
+        for cid in cids {
+            vid := m.corners[cid].vertex
+            if !ext_map.has(vid) {
+                orig_pos := m.vertices[vid].position
+                orig_col := m.vertices[vid].color
+                ext_map[vid] = m.add_vertex(orig_pos.add(delta), orig_col) or >>
+            }
+        }
+    }
+
+    // Rebind selected faces to fresh corners referencing extruded vertices.
+    for idx in 0:unique_faces.len {
+        fi := unique_faces[idx]
+        cids := ~m.faces[fi].corners
+        $next_corners := []int{}
+        for cid in cids {
+            c_vert := m.corners[cid].vertex
+            c_uv := m.corners[cid].uv
+            c_has_uv := m.corners[cid].has_uv
+            c_norm := m.corners[cid].normal
+            new_v := ext_map[c_vert]
+            new_cid := m.add_corner(new_v, c_uv, c_has_uv, c_norm, false) or >>
+            next_corners.push(new_cid)
+        }
+        m.faces[fi].corners = next_corners
+    }
+
+    // Stitch side quads on boundary edges.
+    $new_faces := []int{}
+    for be in dir_edges {
+        $lo := be.a
+        $hi := be.b
+        if hi < lo {
+            lo = be.b
+            hi = be.a
+        }
+        key := str(lo) + ":" + str(hi)
+        if edge_count[key] == 1 {
+            ea := ext_map[be.a]
+            eb := ext_map[be.b]
+            pa := m.vertices[be.a].position
+            pb := m.vertices[be.b].position
+            pea := m.vertices[ea].position
+            side_n := pb.sub(pa).cross(pea.sub(pa)).normalized_or_zero()
+            uvs := [fm.vec2(0.0, 1.0), fm.vec2(1.0, 1.0), fm.vec2(1.0, 0.0), fm.vec2(0.0, 0.0)]
+            sf := m.add_polygon([be.a, be.b, eb, ea], uvs, true, side_n, side_n.length_sq() > 0.5, be.mat_slot, 0) or >>
+            new_faces.push(sf)
+        }
+    }
+    if new_faces.len > 0 {
+        project_uv_box(m, &new_faces, 1.0) or >>
+    }
+    compute_normals(m) or >>
+    << unique_faces
+}
+
+// Per-face inset: contracts each selected face toward its centroid and bridges
+// outer corners to inner ring with quad faces.
+pub fn inset_faces(m $&rm.EditableMesh, face_ids &[]int, amount f64, depth f64) []int {
+    if !fm.finite(amount) || amount <= 0.0 || amount >= 0.99 || !fm.finite(depth) {
+        >> errors.new("nexus modeling: inset amount must be in (0, 0.99) and depth finite")
+    }
+    if face_ids.len == 0 {
+        >> errors.new("nexus modeling: inset requires at least one face")
+    }
+    $seen := map[int]bool{}
+    $unique_faces := []int{}
+    $ring_faces := []int{}
+    for idx in 0:face_ids.len {
+        fi := face_ids[idx]
+        if fi < 0 || fi >= m.faces.len {
+            >> errors.new("nexus modeling: inset face index out of range")
+        }
+        if seen.has(fi) { -> }
+        seen[fi] = true
+        unique_faces.push(fi)
+        center := m.face_centroid(fi) or >>
+        fnorm := m.face_normal(fi) or >>
+        face_corners := ~m.faces[fi].corners
+        mat_slot := m.faces[fi].material_slot
+        sm_group := m.faces[fi].smoothing_group
+        n := face_corners.len
+        if n < 3 {
+            >> errors.new("nexus modeling: degenerate face in inset")
+        }
+        $outer_v := []int{}
+        $outer_uv := []fm.Vec2{}
+        $has_uv := true
+        $inner_v := []int{}
+        $inner_uv := []fm.Vec2{}
+        $uv_sum := fm.vec2(0.0, 0.0)
+        for cid in face_corners {
+            c := &m.corners[cid]
+            outer_v.push(c.vertex)
+            outer_uv.push(c.uv)
+            if !c.has_uv { has_uv = false }
+            uv_sum = uv_sum.add(c.uv)
+        }
+        uv_c := uv_sum.scaled(1.0 / f64(n))
+        for i in 0:n {
+            ov := outer_v[i]
+            vpos := m.vertices[ov].position
+            vcol := m.vertices[ov].color
+            pos := vpos.lerp(center, amount).add(fnorm.scaled(depth))
+            inner_v.push(m.add_vertex(pos, vcol) or >>)
+            inner_uv.push(outer_uv[i].lerp(uv_c, amount))
+        }
+        // Rebind original face to inner ring
+        $inner_cids := []int{}
+        for i in 0:n {
+            inner_cids.push(m.add_corner(inner_v[i], inner_uv[i], has_uv, fnorm, true) or >>)
+        }
+        m.faces[fi].corners = inner_cids
+        // Create bridge quads around perimeter
+        for i in 0:n {
+            $ni := i + 1
+            if ni >= n { ni = 0 }
+            quvs := [outer_uv[i], outer_uv[ni], inner_uv[ni], inner_uv[i]]
+            rf := m.add_polygon([outer_v[i], outer_v[ni], inner_v[ni], inner_v[i]], quvs, has_uv, fnorm, false, mat_slot, sm_group) or >>
+            ring_faces.push(rf)
+        }
+    }
+    compute_normals(m) or >>
+    << unique_faces
+}
+
+fn edge_key(a int, b int) string {
+    if a < b { << str(a) + ":" + str(b) }
+    << str(b) + ":" + str(a)
+}
+
+fn add_welded_split_vertex(m $&rm.EditableMesh, created $&[]int, pos fm.Vec3, col int) int {
+    for idx in 0:created.len {
+        cv := created[idx]
+        if m.vertices[cv].position.distance_sq(pos) <= 1e-14 {
+            << cv
+        }
+    }
+    vid := m.add_vertex(pos, col) or >>
+    created.push(vid)
+    << vid
+}
+
+// Single-segment edge bevel/chamfer along selected manifold edges.
+pub fn bevel_edges(m $&rm.EditableMesh, edge_v0 &[]int, edge_v1 &[]int, width f64) []int {
+    if edge_v0.len != edge_v1.len || edge_v0.len == 0 {
+        >> errors.new("nexus modeling: bevel_edges requires matching non-empty edge endpoint lists")
+    }
+    if !fm.finite(width) || width <= 0.0001 {
+        >> errors.new("nexus modeling: bevel width must be positive")
+    }
+    $bevel_set := map[string]bool{}
+    for i in 0:edge_v0.len {
+        a := edge_v0[i]
+        b := edge_v1[i]
+        if a < 0 || b < 0 || a >= m.vertices.len || b >= m.vertices.len || a == b {
+            >> errors.new("nexus modeling: invalid bevel edge vertex")
+        }
+        bevel_set[edge_key(a, b)] = true
+    }
+
+    // Check which vertices touch at least one beveled edge, and verify edge lengths.
+    edges := m.build_edges()
+    $edge_faces := map[string][]int{}
+    $beveled_verts := map[int]bool{}
+    $bevel_degree := map[int]int{}
+    $vert_faces := map[int][]int{}
+    $bevel_vids := []int{}
+    for e in edges {
+        k := edge_key(e.v0, e.v1)
+        edge_faces[k] = ~e.faces
+        if bevel_set.has(k) {
+            if e.faces.len != 2 {
+                >> errors.new("nexus modeling: bevel requires manifold edges with 2 incident faces")
+            }
+            len := m.vertices[e.v0].position.distance(m.vertices[e.v1].position)
+            if width * 2.1 >= len {
+                >> errors.new("nexus modeling: bevel width exceeds edge length")
+            }
+            beveled_verts[e.v0] = true
+            beveled_verts[e.v1] = true
+            if bevel_degree.has(e.v0) { bevel_degree[e.v0] = bevel_degree[e.v0] + 1 } else { bevel_degree[e.v0] = 1 }
+            if bevel_degree.has(e.v1) { bevel_degree[e.v1] = bevel_degree[e.v1] + 1 } else { bevel_degree[e.v1] = 1 }
+        }
+    }
+    for k, _ in bevel_set {
+        if !edge_faces.has(k) {
+            >> errors.new("nexus modeling: bevel edge does not exist in mesh")
+        }
+    }
+    for fi in 0:m.faces.len {
+        for cid in m.faces[fi].corners {
+            vid := m.corners[cid].vertex
+            if !beveled_verts.has(vid) { -> }
+            if vert_faces.has(vid) {
+                vert_faces[vid].push(fi)
+            } else {
+                vert_faces[vid] = [fi]
+                bevel_vids.push(vid)
+            }
+        }
+    }
+
+    // For every (face, corner) touching a beveled vertex, create welded split vertex
+    // slid inward along adjacent edges inside that face.
+    $split_vert := map[string]int{} // "face:orig_vid" -> new_vid
+    $created_verts := []int{}
+    $face_count := m.faces.len
+    for fi in 0:face_count {
+        face_corners := ~m.faces[fi].corners
+        n := face_corners.len
+        if n < 3 { -> }
+        $new_cids := []int{}
+        for i in 0:n {
+            fcid := face_corners[i]
+            vid := m.corners[fcid].vertex
+            cuv := m.corners[fcid].uv
+            chu := m.corners[fcid].has_uv
+            cn := m.corners[fcid].normal
+            if !beveled_verts.has(vid) {
+                new_cids.push(fcid)
+                ->
+            }
+            $pi := i - 1
+            if pi < 0 { pi = n - 1 }
+            $ni := i + 1
+            if ni >= n { ni = 0 }
+            v_prev := m.corners[face_corners[pi]].vertex
+            v_next := m.corners[face_corners[ni]].vertex
+            b_prev := bevel_set.has(edge_key(v_prev, vid))
+            b_next := bevel_set.has(edge_key(vid, v_next))
+            p := m.vertices[vid].position
+            vcol := m.vertices[vid].color
+            if !b_prev && !b_next && bevel_degree[vid] == 1 {
+                d_prev := m.vertices[v_prev].position.sub(p).normalized_or_zero()
+                d_next := m.vertices[v_next].position.sub(p).normalized_or_zero()
+                sv_prev := add_welded_split_vertex(m, $&created_verts, p.add(d_prev.scaled(width)), vcol) or >>
+                sv_next := add_welded_split_vertex(m, $&created_verts, p.add(d_next.scaled(width)), vcol) or >>
+                new_cids.push(m.add_corner(sv_prev, cuv, chu, cn, false) or >>)
+                new_cids.push(m.add_corner(sv_next, cuv, chu, cn, false) or >>)
+                ->
+            }
+            $offset := fm.vec3(0.0, 0.0, 0.0)
+            if b_prev && b_next {
+                d0 := m.vertices[v_prev].position.sub(p).normalized_or_zero()
+                d1 := m.vertices[v_next].position.sub(p).normalized_or_zero()
+                offset = d0.add(d1).scaled(width)
+            } else if b_prev {
+                d1 := m.vertices[v_next].position.sub(p).normalized_or_zero()
+                offset = d1.scaled(width)
+            } else if b_next {
+                d0 := m.vertices[v_prev].position.sub(p).normalized_or_zero()
+                offset = d0.scaled(width)
+            }
+            sv := add_welded_split_vertex(m, $&created_verts, p.add(offset), vcol) or >>
+            split_vert[str(fi) + ":" + str(vid)] = sv
+            new_cid := m.add_corner(sv, cuv, chu, cn, false) or >>
+            new_cids.push(new_cid)
+        }
+        m.faces[fi].corners = new_cids
+    }
+
+    // Build chamfer quads for every beveled edge.
+    $chamfer_faces := []int{}
+    for k, _ in bevel_set {
+        if !edge_faces.has(k) { -> }
+        flist := ~edge_faces[k]
+        if flist.len != 2 { -> }
+        f0 := flist[0]
+        f1 := flist[1]
+        // Find endpoints matching edge key in f0's original winding
+        $ea := -1
+        $eb := -1
+        for i in 0:edge_v0.len {
+            if edge_key(edge_v0[i], edge_v1[i]) == k {
+                ea = edge_v0[i]
+                eb = edge_v1[i]
+                <-
+            }
+        }
+        v_f0_a := split_vert[str(f0) + ":" + str(ea)]
+        v_f0_b := split_vert[str(f0) + ":" + str(eb)]
+        v_f1_a := split_vert[str(f1) + ":" + str(ea)]
+        v_f1_b := split_vert[str(f1) + ":" + str(eb)]
+        n0 := safe_face_normal(m, f0)
+        n1 := safe_face_normal(m, f1)
+        avg_n := n0.add(n1).normalized_or_zero()
+        // Check quad winding against avg_n
+        p0 := m.vertices[v_f0_a].position
+        p1 := m.vertices[v_f0_b].position
+        p2 := m.vertices[v_f1_b].position
+        cand_n := p1.sub(p0).cross(p2.sub(p0)).normalized_or_zero()
+        $qverts := [v_f0_a, v_f0_b, v_f1_b, v_f1_a]
+        if cand_n.dot(avg_n) < 0.0 {
+            qverts = [v_f0_b, v_f0_a, v_f1_a, v_f1_b]
+        }
+        uvs := [fm.vec2(0.0, 1.0), fm.vec2(1.0, 1.0), fm.vec2(1.0, 0.0), fm.vec2(0.0, 0.0)]
+        f0_slot := m.faces[f0].material_slot
+        cf := m.add_polygon(qverts, uvs, true, avg_n, false, f0_slot, 0) or >>
+        chamfer_faces.push(cf)
+    }
+
+    // Build corner cap polygons for vertices where multiple beveled edges meet.
+    for vid in bevel_vids {
+        if bevel_degree[vid] < 2 { -> }
+        flist := ~vert_faces[vid]
+        $unique_sv := []int{}
+        $seen_sv := map[int]bool{}
+        for fi in flist {
+            key_fv := str(fi) + ":" + str(vid)
+            if !split_vert.has(key_fv) { -> }
+            sv := split_vert[key_fv]
+            // Deduplicate coincident split vertices
+            $dup := false
+            for existing in unique_sv {
+                if m.vertices[existing].position.distance_sq(m.vertices[sv].position) <= 1e-10 {
+                    dup = true
+                    <-
+                }
+            }
+            if !dup && !seen_sv.has(sv) {
+                seen_sv[sv] = true
+                unique_sv.push(sv)
+            }
+        }
+        if unique_sv.len >= 3 {
+            // Order corner cap vertices CCW around outward vertex normal.
+            $vn := fm.vec3(0.0, 0.0, 0.0)
+            for fi in flist {
+                fnorm := safe_face_normal(m, fi)
+                vn = vn.add(fnorm)
+            }
+            vn = vn.normalized_or_zero()
+            if vn.length_sq() > 0.5 {
+                $centroid := fm.vec3(0.0, 0.0, 0.0)
+                for sv in unique_sv { centroid = centroid.add(m.vertices[sv].position) }
+                centroid = centroid.scaled(1.0 / f64(unique_sv.len))
+                $ref := fm.vec3(1.0, 0.0, 0.0)
+                if math.abs(vn.dot(ref)) > 0.9 { ref = fm.vec3(0.0, 1.0, 0.0) }
+                u_ax := vn.cross(ref).normalized_or_zero()
+                v_ax := vn.cross(u_ax).normalized_or_zero()
+                // Simple insertion sort by polar angle
+                $angles := []f64{}
+                for sv in unique_sv {
+                    d := m.vertices[sv].position.sub(centroid)
+                    angles.push(math.atan2(d.dot(v_ax), d.dot(u_ax)))
+                }
+                for a_i in 1:unique_sv.len {
+                    $j := a_i
+                    while j > 0 && angles[j - 1] > angles[j] {
+                        ta := angles[j]
+                        angles[j] = angles[j - 1]
+                        angles[j - 1] = ta
+                        ts := unique_sv[j]
+                        unique_sv[j] = unique_sv[j - 1]
+                        unique_sv[j - 1] = ts
+                        j -= 1
+                    }
+                }
+                $cuvs := []fm.Vec2{}
+                for _ in 0:unique_sv.len { cuvs.push(fm.vec2(0.5, 0.5)) }
+                cap_f0 := flist[0]
+                cap_slot := m.faces[cap_f0].material_slot
+                cf := m.add_polygon(~unique_sv, cuvs, true, vn, false, cap_slot, 0) or >>
+                chamfer_faces.push(cf)
+            }
+        }
+    }
+    if chamfer_faces.len > 0 {
+        project_uv_box(m, &chamfer_faces, 1.0) or >>
+    }
+    compute_normals(m) or >>
+    << chamfer_faces
+}
+
+pub fn flip_face_normals(m $&rm.EditableMesh, face_ids &[]int) int {
+    for idx in 0:face_ids.len {
+        fi := face_ids[idx]
+        if fi < 0 || fi >= m.faces.len {
+            >> errors.new("nexus modeling: flip face index out of range")
+        }
+        cids := &m.faces[fi].corners
+        $rev := []int{}
+        for i in 0:cids.len {
+            cid := cids[cids.len - 1 - i]
+            if m.corners[cid].has_normal {
+                m.corners[cid].normal = m.corners[cid].normal.neg()
+            }
+            rev.push(cid)
+        }
+        m.faces[fi].corners = rev
+    }
+    compute_normals(m) or >>
+    << 0
+}
+
+pub fn set_face_material_slot(m $&rm.EditableMesh, face_ids &[]int, slot int) int {
+    if slot < 0 || slot >= rm.MAX_MATERIAL_SLOTS {
+        >> errors.new("nexus modeling: material slot out of range")
+    }
+    while m.material_slots.len <= slot {
+        m.material_slots.push("Material " + str(m.material_slots.len))
+    }
+    for idx in 0:face_ids.len {
+        fi := face_ids[idx]
+        if fi < 0 || fi >= m.faces.len {
+            >> errors.new("nexus modeling: face index out of range")
+        }
+        m.faces[fi].material_slot = slot
+    }
+    << 0
+}
+
+pub fn set_face_smoothing_group(m $&rm.EditableMesh, face_ids &[]int, group int) int {
+    if group < 0 {
+        >> errors.new("nexus modeling: smoothing group must be non-negative")
+    }
+    for idx in 0:face_ids.len {
+        fi := face_ids[idx]
+        if fi < 0 || fi >= m.faces.len {
+            >> errors.new("nexus modeling: face index out of range")
+        }
+        m.faces[fi].smoothing_group = group
+    }
+    compute_normals(m) or >>
+    << 0
+}
+
+// Welds vertices within threshold distance by collapsing into target cluster
+// centroid and pruning degenerate faces (< 3 unique vertices).
+pub fn merge_vertices(m $&rm.EditableMesh, vert_ids &[]int, threshold f64) int {
+    if !fm.finite(threshold) || threshold < 0.0 {
+        >> errors.new("nexus modeling: merge threshold must be non-negative")
+    }
+    if vert_ids.len < 2 { << 0 }
+    // Compute merged centroid for explicitly selected vertices if threshold == 0,
+    // or cluster selected vertices within threshold.
+    $remap := map[int]int{}
+    $merged := 0
+    if threshold == 0.0 {
+        $acc := fm.vec3(0.0, 0.0, 0.0)
+        $target := -1
+        for idx in 0:vert_ids.len {
+            vid := vert_ids[idx]
+            if vid < 0 || vid >= m.vertices.len {
+                >> errors.new("nexus modeling: vertex index out of range")
+            }
+            if target < 0 { target = vid }
+            acc = acc.add(m.vertices[vid].position)
+        }
+        m.vertices[target].position = acc.scaled(1.0 / f64(vert_ids.len))
+        for idx in 0:vert_ids.len {
+            vid := vert_ids[idx]
+            if vid != target {
+                remap[vid] = target
+                merged += 1
+            }
+        }
+    } else {
+        t2 := threshold * threshold
+        $kept := []int{}
+        for idx in 0:vert_ids.len {
+            vid := vert_ids[idx]
+            if vid < 0 || vid >= m.vertices.len {
+                >> errors.new("nexus modeling: vertex index out of range")
+            }
+            p := m.vertices[vid].position
+            $found := -1
+            for kv in kept {
+                if m.vertices[kv].position.distance_sq(p) <= t2 {
+                    found = kv
+                    <-
+                }
+            }
+            if found >= 0 {
+                remap[vid] = found
+                merged += 1
+            } else {
+                kept.push(vid)
+            }
+        }
+    }
+    if merged == 0 { << 0 }
+    for ci in 0:m.corners.len {
+        v := m.corners[ci].vertex
+        if remap.has(v) { m.corners[ci].vertex = remap[v] }
+    }
+    // Filter out faces that became degenerate (< 3 distinct vertices).
+    $kept_faces := []rm.PolyFace{}
+    for f in m.faces {
+        $seen := map[int]bool{}
+        $clean := []int{}
+        for cid in f.corners {
+            vid := m.corners[cid].vertex
+            if !seen.has(vid) {
+                seen[vid] = true
+                clean.push(cid)
+            }
+        }
+        if clean.len >= 3 {
+            kept_faces.push(rm.PolyFace{
+                corners: ~clean,
+                material_slot: f.material_slot,
+                smoothing_group: f.smoothing_group
+            })
+        }
+    }
+    m.faces = kept_faces
+    compute_normals(m) or >>
+    << merged
+}

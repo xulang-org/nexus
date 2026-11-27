@@ -1,0 +1,579 @@
+@"github.com/xulang-org/nexus/formats/gltf"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+#encoding/json
+#errors
+#math
+#strconv
+#strings
+
+pub struct GlbExportPrimitive {
+    pub mesh meshes.MeshData3D
+    pub material int
+}
+
+pub struct GlbExportMesh {
+    pub name string
+    pub primitives []GlbExportPrimitive
+}
+
+pub struct GlbExportNode {
+    pub name string
+    pub parent int
+    pub mesh int
+    pub translation fm.Vec3
+    pub rotation fm.Vec4
+    pub scale fm.Vec3
+}
+
+pub struct GlbExportImage {
+    pub mime string
+    pub bytes []u8
+}
+
+pub struct GlbExportSpec {
+    pub generator string
+    pub meshes []GlbExportMesh
+    pub nodes []GlbExportNode
+    pub materials []MaterialDescription
+    pub images []GlbExportImage
+    pub textures []TextureDescription
+    pub samplers []SamplerDescription
+}
+
+pub fn default_export_node(name string, parent int, mesh int) GlbExportNode {
+    << GlbExportNode{
+        name: name + "",
+        parent: parent,
+        mesh: mesh,
+        translation: fm.vec3(0.0, 0.0, 0.0),
+        rotation: fm.vec4(0.0, 0.0, 0.0, 1.0),
+        scale: fm.vec3(1.0, 1.0, 1.0)
+    }
+}
+
+fn write_u16_le(sb $&strings.ByteBuilder, v int) {
+    sb.write_byte(v & 255)
+    sb.write_byte((v >> 8) & 255)
+}
+
+fn write_u32_le(sb $&strings.ByteBuilder, v int) {
+    sb.write_byte(v & 255)
+    sb.write_byte((v >> 8) & 255)
+    sb.write_byte((v >> 16) & 255)
+    sb.write_byte((v >> 24) & 255)
+}
+
+fn write_f32_le(sb $&strings.ByteBuilder, val f64) int {
+    if !fm.finite(val) || math.abs(val) > 1000000000.0 {
+        >> errors.new("nexus GLB encode: scalar value non-finite or outside +/-1e9")
+    }
+    bits := math.float32_bits(val)
+    write_u32_le(sb, bits)
+    << 0
+}
+
+fn pad_4_zero(sb $&strings.ByteBuilder) {
+    while (sb.len % 4) != 0 {
+        sb.write_byte(0)
+    }
+}
+
+fn fmt_num(v f64) string {
+    << strconv.format_float(v, 103, -1) or >>
+}
+
+fn f32_rounded(v f64) f64 {
+    bits := math.float32_bits(v)
+    if (bits & 2147483647) == 0 { << 0.0 }
+    << math.float32_from_bits(bits)
+}
+
+struct EncodedView {
+    byte_offset int
+    byte_length int
+    byte_stride int
+    target int
+}
+
+struct EncodedAccessor {
+    view int
+    byte_offset int
+    component_type int
+    normalized bool
+    count int
+    kind string
+    has_bounds bool
+    min_v fm.Vec3
+    max_v fm.Vec3
+}
+
+struct EncodedPrimJson {
+    pos_acc int
+    norm_acc int
+    uv_acc int
+    col_acc int
+    tan_acc int
+    idx_acc int
+    mat_idx int
+}
+
+// Encodes a full GlbExportSpec into a binary GLB 2.0 stream compatible with decode_glb_geometry.
+pub fn encode_glb(spec &GlbExportSpec) string {
+    if spec.meshes.len < 1 || spec.meshes.len > 256 {
+        >> errors.new("nexus GLB encode: mesh count must be in 1..256")
+    }
+    if spec.nodes.len < 1 || spec.nodes.len > MAX_ASSET_NODES {
+        >> errors.new("nexus GLB encode: node count must be in 1..1024")
+    }
+    if spec.materials.len > 128 || spec.images.len > 32 || spec.textures.len > 64 || spec.samplers.len > 64 {
+        >> errors.new("nexus GLB encode: material/image/texture/sampler count exceeds profile")
+    }
+    for tx in spec.textures {
+        if tx.image < 0 || tx.image >= spec.images.len || tx.sampler < -1 || tx.sampler >= spec.samplers.len {
+            >> errors.new("nexus GLB encode: texture references out-of-range image or sampler")
+        }
+    }
+    for mt in spec.materials {
+        if mt.base_texture < -1 || mt.base_texture >= spec.textures.len ||
+            mt.metallic_roughness_texture < -1 || mt.metallic_roughness_texture >= spec.textures.len ||
+            mt.normal_texture < -1 || mt.normal_texture >= spec.textures.len ||
+            mt.occlusion_texture < -1 || mt.occlusion_texture >= spec.textures.len ||
+            mt.emission_texture < -1 || mt.emission_texture >= spec.textures.len {
+            >> errors.new("nexus GLB encode: material references out-of-range texture")
+        }
+    }
+
+    $bin := strings.new_byte_builder(4096)
+    $views := []EncodedView{}
+    $accessors := []EncodedAccessor{}
+    $mesh_prims := [][]EncodedPrimJson{}
+    $total_verts := 0
+    $total_indices := 0
+    $total_prims := 0
+
+    for m in spec.meshes {
+        if m.primitives.len < 1 || m.primitives.len > MAX_PRIMITIVES {
+            >> errors.new("nexus GLB encode: mesh primitive count outside 1..1024")
+        }
+        $prims_json := []EncodedPrimJson{}
+        for pr in m.primitives {
+            if total_prims >= MAX_PRIMITIVES {
+                >> errors.new("nexus GLB encode: total primitive budget exceeded")
+            }
+            total_prims += 1
+            pr.mesh.validate() or >>
+            vc := pr.mesh.vertex_count()
+            ic := pr.mesh.indices.len
+            if vc > MAX_ASSET_VERTICES - total_verts || ic > MAX_ASSET_INDICES - total_indices {
+                >> errors.new("nexus GLB encode: vertex or index budget exceeded")
+            }
+            total_verts += vc
+            total_indices += ic
+            if pr.material >= spec.materials.len || pr.material < -1 {
+                >> errors.new("nexus GLB encode: primitive material index out of range")
+            }
+
+            $has_normals := true
+            $has_uvs := true
+            $has_tangents := true
+            for v in pr.mesh.vertices {
+                if v.normal.dot(v.normal) < 0.5 { has_normals = false }
+                if !v.has_uv { has_uvs = false }
+                if !v.has_tangent { has_tangents = false }
+                if (v.color % 256) != 255 {
+                    >> errors.new("nexus GLB encode: opaque vertex alpha (255) is required")
+                }
+            }
+            if has_tangents && (!has_normals || !has_uvs) { has_tangents = false }
+
+            // Compute stride and per-attribute offsets (all 4-byte aligned).
+            $off_pos := 0
+            $stride := 12
+            $off_norm := -1
+            if has_normals {
+                off_norm = stride
+                stride += 12
+            }
+            $off_uv := -1
+            if has_uvs {
+                off_uv = stride
+                stride += 8
+            }
+            off_col := stride
+            stride += 4
+            $off_tan := -1
+            if has_tangents {
+                off_tan = stride
+                stride += 16
+            }
+
+            pad_4_zero($&bin)
+            v_view_off := bin.len
+            $min_p := fm.vec3(1e30, 1e30, 1e30)
+            $max_p := fm.vec3(-1e30, -1e30, -1e30)
+            for v in pr.mesh.vertices {
+                px := f32_rounded(v.position.x)
+                py := f32_rounded(v.position.y)
+                pz := f32_rounded(v.position.z)
+                min_p = fm.vec3(math.min(min_p.x, px), math.min(min_p.y, py), math.min(min_p.z, pz))
+                max_p = fm.vec3(math.max(max_p.x, px), math.max(max_p.y, py), math.max(max_p.z, pz))
+                write_f32_le($&bin, px) or >>
+                write_f32_le($&bin, py) or >>
+                write_f32_le($&bin, pz) or >>
+                if has_normals {
+                    write_f32_le($&bin, v.normal.x) or >>
+                    write_f32_le($&bin, v.normal.y) or >>
+                    write_f32_le($&bin, v.normal.z) or >>
+                }
+                if has_uvs {
+                    write_f32_le($&bin, v.uv.x) or >>
+                    write_f32_le($&bin, v.uv.y) or >>
+                }
+                bin.write_byte((v.color >> 24) & 255)
+                bin.write_byte((v.color >> 16) & 255)
+                bin.write_byte((v.color >> 8) & 255)
+                bin.write_byte(255)
+                if has_tangents {
+                    write_f32_le($&bin, v.tangent.x) or >>
+                    write_f32_le($&bin, v.tangent.y) or >>
+                    write_f32_le($&bin, v.tangent.z) or >>
+                    write_f32_le($&bin, v.tangent.w) or >>
+                }
+            }
+            v_view_len := bin.len - v_view_off
+            v_view_idx := views.len
+            views.push(EncodedView{byte_offset: v_view_off, byte_length: v_view_len, byte_stride: stride, target: 34962})
+
+            pos_acc := accessors.len
+            accessors.push(EncodedAccessor{
+                view: v_view_idx, byte_offset: off_pos, component_type: 5126, normalized: false,
+                count: vc, kind: "VEC3", has_bounds: true, min_v: min_p, max_v: max_p
+            })
+            $norm_acc := -1
+            if has_normals {
+                norm_acc = accessors.len
+                accessors.push(EncodedAccessor{
+                    view: v_view_idx, byte_offset: off_norm, component_type: 5126, normalized: false,
+                    count: vc, kind: "VEC3", has_bounds: false, min_v: min_p, max_v: max_p
+                })
+            }
+            $uv_acc := -1
+            if has_uvs {
+                uv_acc = accessors.len
+                accessors.push(EncodedAccessor{
+                    view: v_view_idx, byte_offset: off_uv, component_type: 5126, normalized: false,
+                    count: vc, kind: "VEC2", has_bounds: false, min_v: min_p, max_v: max_p
+                })
+            }
+            col_acc := accessors.len
+            accessors.push(EncodedAccessor{
+                view: v_view_idx, byte_offset: off_col, component_type: 5121, normalized: true,
+                count: vc, kind: "VEC4", has_bounds: false, min_v: min_p, max_v: max_p
+            })
+            $tan_acc := -1
+            if has_tangents {
+                tan_acc = accessors.len
+                accessors.push(EncodedAccessor{
+                    view: v_view_idx, byte_offset: off_tan, component_type: 5126, normalized: false,
+                    count: vc, kind: "VEC4", has_bounds: false, min_v: min_p, max_v: max_p
+                })
+            }
+
+            // Indices bufferView (stride = 0, target = 34963)
+            pad_4_zero($&bin)
+            i_view_off := bin.len
+            use_u16 := vc < 65535
+            $idx_comp := 5125
+            if use_u16 {
+                idx_comp = 5123
+                for idx in pr.mesh.indices {
+                    write_u16_le($&bin, idx)
+                }
+            } else {
+                for idx in pr.mesh.indices {
+                    write_u32_le($&bin, idx)
+                }
+            }
+            i_view_len := bin.len - i_view_off
+            i_view_idx := views.len
+            views.push(EncodedView{byte_offset: i_view_off, byte_length: i_view_len, byte_stride: 0, target: 34963})
+            idx_acc := accessors.len
+            accessors.push(EncodedAccessor{
+                view: i_view_idx, byte_offset: 0, component_type: idx_comp, normalized: false,
+                count: ic, kind: "SCALAR", has_bounds: false, min_v: min_p, max_v: max_p
+            })
+
+            prims_json.push(EncodedPrimJson{
+                pos_acc: pos_acc, norm_acc: norm_acc, uv_acc: uv_acc, col_acc: col_acc,
+                tan_acc: tan_acc, idx_acc: idx_acc, mat_idx: pr.material
+            })
+        }
+        mesh_prims.push(prims_json)
+    }
+
+    // Embedded images (stride = 0, target = 0)
+    $img_views := []int{}
+    $img_bytes := 0
+    for img in spec.images {
+        if img.mime != "image/png" && img.mime != "image/jpeg" {
+            >> errors.new("nexus GLB encode: image mime must be image/png or image/jpeg")
+        }
+        if img.bytes.len < 1 || img.bytes.len > 8388608 - img_bytes {
+            >> errors.new("nexus GLB encode: embedded image empty or exceeds 8 MiB budget")
+        }
+        img_bytes += img.bytes.len
+        pad_4_zero($&bin)
+        voff := bin.len
+        for b in img.bytes { bin.write_byte(int(b)) }
+        vidx := views.len
+        views.push(EncodedView{byte_offset: voff, byte_length: img.bytes.len, byte_stride: 0, target: 0})
+        img_views.push(vidx)
+    }
+
+    bin_byte_length := bin.len
+    if bin_byte_length < 1 || bin_byte_length > MAX_BIN_BYTES {
+        >> errors.new("nexus GLB encode: binary chunk size outside 1..8 MiB")
+    }
+    pad_4_zero($&bin)
+    if bin.len > MAX_BIN_BYTES {
+        >> errors.new("nexus GLB encode: padded binary chunk exceeds 8 MiB")
+    }
+
+    // Build node children lists & verify parent links
+    $children_by_node := [][]int{}
+    $roots := []int{}
+    for _ in 0:spec.nodes.len { children_by_node.push([]int{}) }
+    for ni in 0:spec.nodes.len {
+        nd := &spec.nodes[ni]
+        if nd.mesh < -1 || nd.mesh >= spec.meshes.len {
+            >> errors.new("nexus GLB encode: node mesh index out of range")
+        }
+        if nd.parent < -1 || nd.parent >= spec.nodes.len || nd.parent == ni {
+            >> errors.new("nexus GLB encode: invalid node parent index")
+        }
+        if nd.parent >= 0 {
+            children_by_node[nd.parent].push(ni)
+        } else {
+            roots.push(ni)
+        }
+        qlen := nd.rotation.x * nd.rotation.x + nd.rotation.y * nd.rotation.y +
+            nd.rotation.z * nd.rotation.z + nd.rotation.w * nd.rotation.w
+        if !nd.translation.is_finite() || !nd.scale.is_finite() || !nd.rotation.is_finite() || math.abs(qlen - 1.0) > 0.0001 {
+            >> errors.new("nexus GLB encode: invalid node TRS")
+        }
+    }
+    if roots.len == 0 {
+        >> errors.new("nexus GLB encode: node hierarchy requires at least one root")
+    }
+
+    // Construct glTF 2.0 JSON chunk
+    $js := strings.new_byte_builder(2048)
+    $gen := spec.generator + ""
+    if gen.len == 0 { gen = "Nexus Modeling" }
+    js.write_str("{\"asset\":{\"version\":\"2.0\",\"minVersion\":\"2.0\",\"generator\":" + json.quote(&gen) + "}")
+    js.write_str(",\"buffers\":[{\"byteLength\":" + str(bin_byte_length) + "}]")
+
+    js.write_str(",\"bufferViews\":[")
+    for i in 0:views.len {
+        if i > 0 { js.write_str(",") }
+        vw := &views[i]
+        js.write_str("{\"buffer\":0,\"byteOffset\":" + str(vw.byte_offset) + ",\"byteLength\":" + str(vw.byte_length))
+        if vw.byte_stride > 0 { js.write_str(",\"byteStride\":" + str(vw.byte_stride)) }
+        if vw.target > 0 { js.write_str(",\"target\":" + str(vw.target)) }
+        js.write_str("}")
+    }
+    js.write_str("]")
+
+    js.write_str(",\"accessors\":[")
+    for i in 0:accessors.len {
+        if i > 0 { js.write_str(",") }
+        ac := &accessors[i]
+        kt := ac.kind + ""
+        js.write_str("{\"bufferView\":" + str(ac.view) + ",\"byteOffset\":" + str(ac.byte_offset) +
+            ",\"componentType\":" + str(ac.component_type) + ",\"count\":" + str(ac.count) +
+            ",\"type\":" + json.quote(&kt))
+        if ac.normalized { js.write_str(",\"normalized\":true") }
+        if ac.has_bounds {
+            js.write_str(",\"min\":[" + fmt_num(ac.min_v.x) + "," + fmt_num(ac.min_v.y) + "," + fmt_num(ac.min_v.z) + "]")
+            js.write_str(",\"max\":[" + fmt_num(ac.max_v.x) + "," + fmt_num(ac.max_v.y) + "," + fmt_num(ac.max_v.z) + "]")
+        }
+        js.write_str("}")
+    }
+    js.write_str("]")
+
+    if spec.images.len > 0 {
+        js.write_str(",\"images\":[")
+        for i in 0:spec.images.len {
+            if i > 0 { js.write_str(",") }
+            mm := spec.images[i].mime + ""
+            js.write_str("{\"bufferView\":" + str(img_views[i]) + ",\"mimeType\":" + json.quote(&mm) + "}")
+        }
+        js.write_str("]")
+    }
+    if spec.samplers.len > 0 {
+        js.write_str(",\"samplers\":[")
+        for i in 0:spec.samplers.len {
+            if i > 0 { js.write_str(",") }
+            sp := &spec.samplers[i]
+            js.write_str("{\"minFilter\":" + str(sp.min_filter) + ",\"magFilter\":" + str(sp.mag_filter) +
+                ",\"wrapS\":" + str(sp.wrap_u) + ",\"wrapT\":" + str(sp.wrap_v) + "}")
+        }
+        js.write_str("]")
+    }
+    if spec.textures.len > 0 {
+        js.write_str(",\"textures\":[")
+        for i in 0:spec.textures.len {
+            if i > 0 { js.write_str(",") }
+            tx := &spec.textures[i]
+            js.write_str("{\"source\":" + str(tx.image))
+            if tx.sampler >= 0 { js.write_str(",\"sampler\":" + str(tx.sampler)) }
+            js.write_str("}")
+        }
+        js.write_str("]")
+    }
+    if spec.materials.len > 0 {
+        js.write_str(",\"materials\":[")
+        for i in 0:spec.materials.len {
+            if i > 0 { js.write_str(",") }
+            mt := &spec.materials[i]
+            js.write_str("{\"alphaMode\":\"OPAQUE\",\"doubleSided\":" + str(mt.double_sided))
+            js.write_str(",\"pbrMetallicRoughness\":{\"baseColorFactor\":[" +
+                fmt_num(mt.base.x) + "," + fmt_num(mt.base.y) + "," + fmt_num(mt.base.z) + "," + fmt_num(mt.alpha) +
+                "],\"metallicFactor\":" + fmt_num(mt.metallic) + ",\"roughnessFactor\":" + fmt_num(mt.roughness))
+            if mt.base_texture >= 0 {
+                js.write_str(",\"baseColorTexture\":{\"index\":" + str(mt.base_texture) + "}")
+            }
+            if mt.metallic_roughness_texture >= 0 {
+                js.write_str(",\"metallicRoughnessTexture\":{\"index\":" + str(mt.metallic_roughness_texture) + "}")
+            }
+            js.write_str("}")
+            if mt.emission.x > 0.0 || mt.emission.y > 0.0 || mt.emission.z > 0.0 {
+                js.write_str(",\"emissiveFactor\":[" + fmt_num(mt.emission.x) + "," + fmt_num(mt.emission.y) + "," + fmt_num(mt.emission.z) + "]")
+            }
+            if mt.emission_texture >= 0 {
+                js.write_str(",\"emissiveTexture\":{\"index\":" + str(mt.emission_texture) + "}")
+            }
+            if mt.normal_texture >= 0 {
+                js.write_str(",\"normalTexture\":{\"index\":" + str(mt.normal_texture) + ",\"scale\":" + fmt_num(mt.normal_scale) + "}")
+            }
+            if mt.occlusion_texture >= 0 {
+                js.write_str(",\"occlusionTexture\":{\"index\":" + str(mt.occlusion_texture) + ",\"strength\":" + fmt_num(mt.occlusion_strength) + "}")
+            }
+            js.write_str("}")
+        }
+        js.write_str("]")
+    }
+
+    js.write_str(",\"meshes\":[")
+    for mi in 0:spec.meshes.len {
+        if mi > 0 { js.write_str(",") }
+        mn := spec.meshes[mi].name + ""
+        js.write_str("{\"name\":" + json.quote(&mn) + ",\"primitives\":[")
+        plist := &mesh_prims[mi]
+        for pi in 0:plist.len {
+            if pi > 0 { js.write_str(",") }
+            pj := &plist[pi]
+            js.write_str("{\"mode\":4,\"attributes\":{\"POSITION\":" + str(pj.pos_acc))
+            if pj.norm_acc >= 0 { js.write_str(",\"NORMAL\":" + str(pj.norm_acc)) }
+            if pj.uv_acc >= 0 { js.write_str(",\"TEXCOORD_0\":" + str(pj.uv_acc)) }
+            js.write_str(",\"COLOR_0\":" + str(pj.col_acc))
+            if pj.tan_acc >= 0 { js.write_str(",\"TANGENT\":" + str(pj.tan_acc)) }
+            js.write_str("},\"indices\":" + str(pj.idx_acc))
+            if pj.mat_idx >= 0 { js.write_str(",\"material\":" + str(pj.mat_idx)) }
+            js.write_str("}")
+        }
+        js.write_str("]}")
+    }
+    js.write_str("]")
+
+    js.write_str(",\"nodes\":[")
+    for ni in 0:spec.nodes.len {
+        if ni > 0 { js.write_str(",") }
+        nd := &spec.nodes[ni]
+        nn := nd.name + ""
+        js.write_str("{\"name\":" + json.quote(&nn))
+        if nd.mesh >= 0 { js.write_str(",\"mesh\":" + str(nd.mesh)) }
+        ch := &children_by_node[ni]
+        if ch.len > 0 {
+            js.write_str(",\"children\":[")
+            for ci in 0:ch.len {
+                if ci > 0 { js.write_str(",") }
+                js.write_str(str(ch[ci]))
+            }
+            js.write_str("]")
+        }
+        js.write_str(",\"translation\":[" + fmt_num(nd.translation.x) + "," + fmt_num(nd.translation.y) + "," + fmt_num(nd.translation.z) + "]")
+        js.write_str(",\"rotation\":[" + fmt_num(nd.rotation.x) + "," + fmt_num(nd.rotation.y) + "," + fmt_num(nd.rotation.z) + "," + fmt_num(nd.rotation.w) + "]")
+        js.write_str(",\"scale\":[" + fmt_num(nd.scale.x) + "," + fmt_num(nd.scale.y) + "," + fmt_num(nd.scale.z) + "]")
+        js.write_str("}")
+    }
+    js.write_str("]")
+
+    js.write_str(",\"scenes\":[{\"name\":\"Scene\",\"nodes\":[")
+    for ri in 0:roots.len {
+        if ri > 0 { js.write_str(",") }
+        js.write_str(str(roots[ri]))
+    }
+    js.write_str("]}],\"scene\":0}")
+
+    while (js.len % 4) != 0 {
+        js.write_byte(32)
+    }
+    if js.len > MAX_JSON_BYTES {
+        >> errors.new("nexus GLB encode: JSON chunk exceeds 512 KiB limit")
+    }
+
+    total_len := 12 + 8 + js.len + 8 + bin.len
+    if total_len > MAX_GLB_BYTES {
+        >> errors.new("nexus GLB encode: total GLB exceeds 16 MiB limit")
+    }
+
+    $hdr := strings.new_byte_builder(32)
+    write_u32_le($&hdr, 1179937895) // "glTF"
+    write_u32_le($&hdr, 2)          // version 2
+    write_u32_le($&hdr, total_len)
+    write_u32_le($&hdr, js.len)
+    write_u32_le($&hdr, 1313821514) // "JSON"
+
+    $bin_hdr := strings.new_byte_builder(16)
+    write_u32_le($&bin_hdr, bin.len)
+    write_u32_le($&bin_hdr, 5130562) // "BIN\0"
+
+    raw := hdr.to_string() + js.to_string() + bin_hdr.to_string() + bin.to_string()
+    // Verify encoded artifact passes Nexus strict GLB decoder before returning.
+    _ := decode_glb_geometry(&raw) or >>
+    << raw
+}
+
+pub fn encode_mesh_glb(name string, m &meshes.MeshData3D, material MaterialDescription) string {
+    prim := GlbExportPrimitive{mesh: ~m, material: 0}
+    << encode_primitives_glb(name, &[prim], &[material]) or >>
+}
+
+pub fn encode_primitives_glb(
+    name string,
+    primitives &[]GlbExportPrimitive,
+    materials &[]MaterialDescription
+) string {
+    $copied_prims := []GlbExportPrimitive{}
+    for i in 0:primitives.len {
+        p := &primitives[i]
+        copied_prims.push(GlbExportPrimitive{mesh: ~p.mesh, material: p.material})
+    }
+    $copied_mats := []MaterialDescription{}
+    for i in 0:materials.len {
+        copied_mats.push(materials[i])
+    }
+    spec := GlbExportSpec{
+        generator: "Nexus Modeling",
+        meshes: [GlbExportMesh{name: name + "", primitives: copied_prims}],
+        nodes: [default_export_node(name + "", -1, 0)],
+        materials: copied_mats,
+        images: []GlbExportImage{},
+        textures: []TextureDescription{},
+        samplers: []SamplerDescription{}
+    }
+    << encode_glb(&spec) or >>
+}
