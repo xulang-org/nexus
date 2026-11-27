@@ -1,0 +1,302 @@
+@"github.com/xulang-org/nexus/ai/bt"
+
+#errors
+#math
+#strings
+
+pub const CURVE_LINEAR = 0
+pub const CURVE_QUADRATIC = 1
+pub const CURVE_LOGISTIC = 2
+pub const CURVE_STEP = 3
+pub const CURVE_INVERSE = 4
+
+pub struct UtilityConsideration {
+    pub name string
+    pub bb_key string
+    pub min_val f64
+    pub max_val f64
+    pub curve int
+    pub slope f64
+    pub exponent f64
+    pub offset_x f64
+    pub offset_y f64
+    pub invert bool
+}
+
+pub struct UtilityScoreBreakdown {
+    pub action_name string
+    pub score f64
+    pub raw_product f64
+    pub on_cooldown bool
+    pub cooldown_left f64
+    pub consideration_scores []f64
+}
+
+pub struct UtilityDecision {
+    pub found bool
+    pub action_name string
+    pub score f64
+    pub candidates []UtilityScoreBreakdown
+}
+
+struct UtilityActionDef {
+    name string
+    base_weight f64
+    cooldown f64
+    hysteresis_bonus f64
+    cooldown_left f64
+    considerations []UtilityConsideration
+}
+
+pub struct UtilityReasoner {
+    actions []UtilityActionDef
+    by_name map[string]int
+    last_action string
+}
+
+fn clamp01(v f64) f64 {
+    if v != v { << 0.0 }
+    if v < 0.0 { << 0.0 }
+    if v > 1.0 { << 1.0 }
+    << v
+}
+
+pub fn eval_response_curve(
+    x f64,
+    curve int,
+    slope f64,
+    exponent f64,
+    offset_x f64,
+    offset_y f64,
+    invert bool
+) f64 {
+    if math.is_nan(x) || math.is_inf(x) ||
+        math.is_nan(slope) || math.is_inf(slope) ||
+        math.is_nan(exponent) || math.is_inf(exponent) ||
+        math.is_nan(offset_x) || math.is_inf(offset_x) ||
+        math.is_nan(offset_y) || math.is_inf(offset_y) {
+        >> errors.new("nexus utility: non-finite response curve parameter")
+    }
+    cx := clamp01(x)
+    $sx := cx - offset_x
+    $raw := 0.0
+    if curve == CURVE_LINEAR {
+        raw = slope * sx + offset_y
+    } else if curve == CURVE_QUADRATIC {
+        if sx < 0.0 { sx = 0.0 }
+        $p := exponent
+        if p <= 0.0 { p = 1.0 }
+        raw = slope * math.pow_f64(sx, p) + offset_y
+    } else if curve == CURVE_LOGISTIC {
+        $k := slope
+        if math.abs(k) < 1e-6 { k = 1.0 }
+        $arg := -10.0 * k * (sx - 0.5)
+        if arg > 60.0 { arg = 60.0 }
+        if arg < -60.0 { arg = -60.0 }
+        raw = 1.0 / (1.0 + math.exp(arg)) + offset_y
+    } else if curve == CURVE_STEP {
+        $thresh := 0.5 + offset_x
+        $hi := slope + offset_y
+        if hi <= 0.0 { hi = 1.0 + offset_y }
+        if cx >= thresh { raw = hi } else { raw = offset_y }
+    } else if curve == CURVE_INVERSE {
+        $p := exponent
+        if p <= 0.0 { p = 1.0 }
+        $d := math.max(0.05, 1.0 - clamp01(sx))
+        raw = slope * (1.0 - math.pow_f64(d, p)) + offset_y
+    } else {
+        >> errors.new("nexus utility: invalid curve type " + str(curve))
+    }
+    $out := clamp01(raw)
+    if invert {
+        out = 1.0 - out
+    }
+    << out
+}
+
+pub fn new_utility_reasoner() UtilityReasoner {
+    << UtilityReasoner{
+        actions: []UtilityActionDef{},
+        by_name: map[string]int{},
+        last_action: ""
+    }
+}
+
+pub fn (u $&UtilityReasoner) add_action(
+    name string,
+    base_weight f64,
+    cooldown f64,
+    hysteresis_bonus f64
+) int {
+    trimmed := strings.trim_space(&name)
+    if trimmed.len == 0 {
+        >> errors.new("nexus utility: action name must be non-empty")
+    }
+    if u.by_name.has(trimmed + "") {
+        >> errors.new("nexus utility: duplicate utility action '" + trimmed + "'")
+    }
+    if math.is_nan(base_weight) || math.is_inf(base_weight) || base_weight <= 0.0 ||
+        math.is_nan(cooldown) || math.is_inf(cooldown) || cooldown < 0.0 ||
+        math.is_nan(hysteresis_bonus) || math.is_inf(hysteresis_bonus) || hysteresis_bonus < 0.0 {
+        >> errors.new("nexus utility: invalid weight, cooldown, or hysteresis_bonus")
+    }
+    idx := u.actions.len
+    u.actions.push(UtilityActionDef{
+        name: trimmed + "",
+        base_weight: base_weight,
+        cooldown: cooldown,
+        hysteresis_bonus: hysteresis_bonus,
+        cooldown_left: 0.0,
+        considerations: []UtilityConsideration{}
+    })
+    u.by_name[trimmed + ""] = idx
+    << idx
+}
+
+pub fn (u $&UtilityReasoner) add_consideration(action_name string, c UtilityConsideration) int {
+    if !u.by_name.has(action_name + "") {
+        >> errors.new("nexus utility: unknown action '" + action_name + "'")
+    }
+    if math.is_nan(c.min_val) || math.is_inf(c.min_val) ||
+        math.is_nan(c.max_val) || math.is_inf(c.max_val) || c.max_val <= c.min_val {
+        >> errors.new("nexus utility: consideration requires finite min_val < max_val")
+    }
+    _ := eval_response_curve(0.5, c.curve, c.slope, c.exponent, c.offset_x, c.offset_y, c.invert) or >>
+    idx := u.by_name[action_name + ""]
+    u.actions[idx].considerations.push(c)
+    << u.actions[idx].considerations.len - 1
+}
+
+pub fn (u $&UtilityReasoner) tick_cooldowns(dt f64) int {
+    if math.is_nan(dt) || math.is_inf(dt) || dt < 0.0 {
+        >> errors.new("nexus utility: tick_cooldowns dt must be finite and >= 0")
+    }
+    for i in 0:u.actions.len {
+        if u.actions[i].cooldown_left > 0.0 {
+            next := u.actions[i].cooldown_left - dt
+            if next <= 0.0 { u.actions[i].cooldown_left = 0.0 }
+            else { u.actions[i].cooldown_left = next }
+        }
+    }
+    << 0
+}
+
+fn clone_breakdown(b &UtilityScoreBreakdown) UtilityScoreBreakdown {
+    $cs := []f64{}
+    for v in b.consideration_scores { cs.push(v) }
+    << UtilityScoreBreakdown{
+        action_name: b.action_name + "",
+        score: b.score,
+        raw_product: b.raw_product,
+        on_cooldown: b.on_cooldown,
+        cooldown_left: b.cooldown_left,
+        consideration_scores: cs
+    }
+}
+
+pub fn (u &UtilityReasoner) evaluate(bb &Blackboard, current_action string) UtilityDecision {
+    $cands := []UtilityScoreBreakdown{}
+    $order := []int{}
+
+    for i in 0:u.actions.len {
+        act := &u.actions[i]
+        if act.cooldown_left > 0.0 {
+            cands.push(UtilityScoreBreakdown{
+                action_name: act.name + "",
+                score: 0.0,
+                raw_product: 0.0,
+                on_cooldown: true,
+                cooldown_left: act.cooldown_left,
+                consideration_scores: []f64{}
+            })
+            order.push(i)
+            ->
+        }
+        $cscores := []f64{}
+        $prod := 1.0
+        span_guard := 1e-12
+        for ci in 0:act.considerations.len {
+            c := &act.considerations[ci]
+            raw_v := bb.get_f64(c.bb_key + "", c.min_val)
+            denom := c.max_val - c.min_val
+            $nx := 0.0
+            if denom > span_guard {
+                nx = (raw_v - c.min_val) / denom
+            }
+            cs := eval_response_curve(nx, c.curve, c.slope, c.exponent, c.offset_x, c.offset_y, c.invert) or >>
+            cscores.push(cs)
+            prod = prod * cs
+        }
+        $comp := prod
+        n := act.considerations.len
+        if n >= 2 && prod > 0.0 {
+            mod_f := 1.0 - 1.0 / f64(n)
+            comp = prod + (1.0 - prod) * mod_f * prod
+        }
+        $final_score := comp * act.base_weight
+        if current_action.len > 0 && act.name == current_action && final_score > 0.0 {
+            final_score = final_score + act.hysteresis_bonus
+        }
+        cands.push(UtilityScoreBreakdown{
+            action_name: act.name + "",
+            score: final_score,
+            raw_product: prod,
+            on_cooldown: false,
+            cooldown_left: 0.0,
+            consideration_scores: cscores
+        })
+        order.push(i)
+    }
+
+    for i in 1:order.len {
+        cur_ord := order[i]
+        cur_score := cands[cur_ord].score
+        $j := i - 1
+        while j >= 0 {
+            prev_ord := order[j]
+            prev_score := cands[prev_ord].score
+            if prev_score < cur_score - 1e-12 ||
+                (math.abs(prev_score - cur_score) <= 1e-12 && prev_ord > cur_ord) {
+                order[j + 1] = prev_ord
+                j -= 1
+            } else {
+                <-
+            }
+        }
+        order[j + 1] = cur_ord
+    }
+
+    $sorted_cands := []UtilityScoreBreakdown{}
+    for ord in order {
+        sorted_cands.push(clone_breakdown(&cands[ord]))
+    }
+
+    if sorted_cands.len > 0 && sorted_cands[0].score > 0.0 {
+        << UtilityDecision{
+            found: true,
+            action_name: sorted_cands[0].action_name + "",
+            score: sorted_cands[0].score,
+            candidates: sorted_cands
+        }
+    }
+    << UtilityDecision{
+        found: false,
+        action_name: "",
+        score: 0.0,
+        candidates: sorted_cands
+    }
+}
+
+pub fn (u $&UtilityReasoner) select_and_commit(bb &Blackboard) UtilityDecision {
+    dec := u.evaluate(bb, u.last_action + "") or >>
+    if dec.found {
+        u.last_action = dec.action_name + ""
+        if u.by_name.has(dec.action_name + "") {
+            idx := u.by_name[dec.action_name + ""]
+            if u.actions[idx].cooldown > 0.0 {
+                u.actions[idx].cooldown_left = u.actions[idx].cooldown
+            }
+        }
+    }
+    << dec
+}

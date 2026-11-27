@@ -2,7 +2,7 @@ XU ?= xu
 PYTHON ?= python3
 export XU
 
-.PHONY: developer-systems-r2-test modeling-test developer-ergonomics-test detail-optimizations-r3-test detail-optimizations-r2-test detail-optimizations-test gameplay-test gameplay-components-test gameplay-integration-test effects-detail-test combined-audio-effects-test combined-2d-25d-effects-gpu-test combined-3d-effects-gpu-test combined-gameplay-effects-test project-scaffold-test spatial-audio-test gamepad-test i18n-test anim-serialize-budget-test taptap-data-test taptap-test taptap-native-test native-taptap console-data-test console-test console-native-test native-console steam-data-test steam-test steam-native-test native-steam prefab-runtime-test ai-bt-nav-test input-replay-timing-test timeline-test project-bundle-cli-test ui-tree-test profiler-test bundle-test shader-cross-backend-test scene-v9-test scene-soa-test ecs-parallel-test navigation-test networking-test audio-dsp-test script-aot-test script-host-coroutines-test physics3d-joints-ragdoll-test physics3d-advanced-test gpu-skinning-test skeletal-animation-test particles-vfx-gpu-test terrain-foliage-gpu-test decals-atmosphere-gpu-test ddgi-gi-gpu-test engine-integration-gpu-test all-modern-tests clustered-lighting-gpu-test indirect-cull-hiz-gpu-test hdr-postprocess-gpu-test meshlet-visbuffer-gpu-test transparent-pbr-gpu-test streaming-lru-gpu-test xacp-test lighting-demo-test demo-lighting lighting-core-test lighting-gpu-test gpu-failure-test present-fallback-test text-2d-test ui-hud-test demo-ui-hud mesh-shaders canvas-shaders native-image window-input-smoke gpu-surface-smoke sdk gpu-compute-smoke native-probe gpu-offscreen-smoke gpu-transfer-smoke check-core test-core mesh-core-test audio-core-test audio-device-test native native-audio audio-fixtures audio-test audio-smoke demo-audio demo-audio-stream demo-audio-seek check layers test demo demo2d demo3d demo-glb demo-script demo-materials demo-textures3d demo-mipmaps3d demo-material-maps demo-normal_maps demo-generated-tangents demo-glb-materials smoke gpu-smoke gpu3d-smoke image-fixtures glb-fixtures script-tool script-fixtures script-live-smoke glb-material-fixtures scene-fixtures demo-scene-file scene-asset-fixtures demo-scene-assets scene-audio-fixtures demo-scene-audio demo-scene-av scene-script-assets scene-script-fixtures demo-scene-scripts
+.PHONY: developer-systems-r3-test developer-systems-r2-test modeling-test developer-ergonomics-test detail-optimizations-r3-test detail-optimizations-r2-test detail-optimizations-test gameplay-test gameplay-components-test gameplay-integration-test effects-detail-test combined-audio-effects-test combined-2d-25d-effects-gpu-test combined-3d-effects-gpu-test combined-gameplay-effects-test project-scaffold-test spatial-audio-test gamepad-test i18n-test anim-serialize-budget-test taptap-data-test taptap-test taptap-native-test native-taptap console-data-test console-test console-native-test native-console steam-data-test steam-test steam-native-test native-steam prefab-runtime-test ai-bt-nav-test input-replay-timing-test timeline-test project-bundle-cli-test ui-tree-test profiler-test bundle-test shader-cross-backend-test scene-v9-test scene-soa-test ecs-parallel-test navigation-test networking-test audio-dsp-test script-aot-test script-host-coroutines-test physics3d-joints-ragdoll-test physics3d-advanced-test gpu-skinning-test skeletal-animation-test particles-vfx-gpu-test terrain-foliage-gpu-test decals-atmosphere-gpu-test ddgi-gi-gpu-test engine-integration-gpu-test all-modern-tests clustered-lighting-gpu-test indirect-cull-hiz-gpu-test hdr-postprocess-gpu-test meshlet-visbuffer-gpu-test transparent-pbr-gpu-test streaming-lru-gpu-test xacp-test lighting-demo-test demo-lighting lighting-core-test lighting-gpu-test gpu-failure-test present-fallback-test text-2d-test ui-hud-test demo-ui-hud mesh-shaders canvas-shaders native-image window-input-smoke gpu-surface-smoke sdk gpu-compute-smoke native-probe gpu-offscreen-smoke gpu-transfer-smoke check-core test-core mesh-core-test audio-core-test audio-device-test native native-audio audio-fixtures audio-test audio-smoke demo-audio demo-audio-stream demo-audio-seek check layers test demo demo2d demo3d demo-glb demo-script demo-materials demo-textures3d demo-mipmaps3d demo-material-maps demo-normal_maps demo-generated-tangents demo-glb-materials smoke gpu-smoke gpu3d-smoke image-fixtures glb-fixtures script-tool script-fixtures script-live-smoke glb-material-fixtures scene-fixtures demo-scene-file scene-asset-fixtures demo-scene-assets scene-audio-fixtures demo-scene-audio demo-scene-av scene-script-assets scene-script-fixtures demo-scene-scripts
 xacp-test: sdk
 	mkdir -p build
 	$(XU) build tests/xacp_checks.xu -o build/xacp-tests
@@ -75,6 +75,7 @@ check: layers native canvas-shaders mesh-shaders
 	$(XU) check tests/glb_obj_roundtrip_checks.xu
 	$(XU) check tests/modeling_gpu_checks.xu
 	$(XU) check tests/studio_ui_checks.xu
+	$(XU) check tests/developer_systems_r3_checks.xu
 	$(XU) check examples/script_reload/main.xu
 	$(XU) check examples/materials/main.xu
 	$(XU) check examples/textures3d/main.xu
@@ -983,7 +984,7 @@ engine-integration-gpu-test: layers mesh-shaders
 	$(XU) build tests/engine_full_integration_gpu_checks.xu -o build/engine-integration-gpu-checks
 	./build/engine-integration-gpu-checks
 
-all-modern-tests: developer-systems-r2-test modeling-test modern-sandbox-test developer-ergonomics-test detail-optimizations-r3-test detail-optimizations-r2-test detail-optimizations-test mikktspace-gpu-test lighting-2d-gpu-test audio-async-music-test physics2d-platformer-test persistent-entities-test gameplay-test effects-detail-test project-scaffold-test steam-test steam-native-test console-test console-native-test taptap-test taptap-native-test engine-integration-gpu-test ddgi-gi-gpu-test physics3d-advanced-test networking-test decals-atmosphere-gpu-test terrain-foliage-gpu-test script-host-coroutines-test particles-vfx-gpu-test skeletal-animation-test transparent-pbr-gpu-test
+all-modern-tests: developer-systems-r3-test developer-systems-r2-test modeling-test modern-sandbox-test developer-ergonomics-test detail-optimizations-r3-test detail-optimizations-r2-test detail-optimizations-test mikktspace-gpu-test lighting-2d-gpu-test audio-async-music-test physics2d-platformer-test persistent-entities-test gameplay-test effects-detail-test project-scaffold-test steam-test steam-native-test console-test console-native-test taptap-test taptap-native-test engine-integration-gpu-test ddgi-gi-gpu-test physics3d-advanced-test networking-test decals-atmosphere-gpu-test terrain-foliage-gpu-test script-host-coroutines-test particles-vfx-gpu-test skeletal-animation-test transparent-pbr-gpu-test
 	@echo "ALL MODERN ENGINE TESTS PASSED"
 
 console-data-test: sdk
@@ -1161,6 +1162,11 @@ developer-systems-r2-test: layers sdk
 	mkdir -p build
 	$(XU) build tests/developer_systems_r2_checks.xu -o build/developer-systems-r2-checks
 	./build/developer-systems-r2-checks
+
+developer-systems-r3-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/developer_systems_r3_checks.xu -o build/developer-systems-r3-checks
+	./build/developer-systems-r3-checks
 
 modeling-test: layers sdk canvas-shaders mesh-shaders project-validator project-viewport
 	mkdir -p build

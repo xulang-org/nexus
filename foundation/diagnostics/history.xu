@@ -1,0 +1,284 @@
+@"github.com/xulang-org/nexus/foundation/diagnostics"
+
+#errors
+#strings
+
+pub struct CommandRecord {
+    pub id int
+    pub label string
+    pub merge_key string
+    pub timestamp_ms int
+    pub before_payload string
+    pub after_payload string
+}
+
+pub struct TransactionBatch {
+    pub id int
+    pub label string
+    pub commands []CommandRecord
+}
+
+pub struct CommandHistory {
+    max_entries int
+    merge_window_ms int
+    next_batch_id int
+    next_cmd_id int
+    saved_batch_id int
+    dirty_untracked bool
+    in_group bool
+    group_label string
+    group_commands []CommandRecord
+    undo_stack []TransactionBatch
+    redo_stack []TransactionBatch
+}
+
+pub fn new_command_history(max_entries int, merge_window_ms int) CommandHistory {
+    if max_entries < 1 || max_entries > 4096 {
+        >> errors.new("nexus diagnostics: command history max_entries must be in 1..4096")
+    }
+    if merge_window_ms < 0 {
+        >> errors.new("nexus diagnostics: command history merge_window_ms must be >= 0")
+    }
+    << CommandHistory{
+        max_entries: max_entries,
+        merge_window_ms: merge_window_ms,
+        next_batch_id: 1,
+        next_cmd_id: 1,
+        saved_batch_id: 0,
+        dirty_untracked: false,
+        in_group: false,
+        group_label: "",
+        group_commands: []CommandRecord{},
+        undo_stack: []TransactionBatch{},
+        redo_stack: []TransactionBatch{}
+    }
+}
+
+fn (h &CommandHistory) top_batch_id() int {
+    if h.undo_stack.len == 0 { << 0 }
+    << h.undo_stack[h.undo_stack.len - 1].id
+}
+
+fn clone_cmd(c &CommandRecord) CommandRecord {
+    << CommandRecord{
+        id: c.id,
+        label: c.label + "",
+        merge_key: c.merge_key + "",
+        timestamp_ms: c.timestamp_ms,
+        before_payload: c.before_payload + "",
+        after_payload: c.after_payload + ""
+    }
+}
+
+fn clone_batch(b &TransactionBatch) TransactionBatch {
+    $cmds := []CommandRecord{}
+    for i in 0:b.commands.len {
+        cmds.push(clone_cmd(&b.commands[i]))
+    }
+    << TransactionBatch{id: b.id, label: b.label + "", commands: cmds}
+}
+
+fn (h $&CommandHistory) trim_undo_capacity() {
+    if h.undo_stack.len <= h.max_entries { << }
+    drop := h.undo_stack.len - h.max_entries
+    $kept := []TransactionBatch{}
+    for i in 0:h.undo_stack.len {
+        if i < drop {
+            if h.undo_stack[i].id == h.saved_batch_id {
+                h.dirty_untracked = true
+            }
+        } else {
+            kept.push(clone_batch(&h.undo_stack[i]))
+        }
+    }
+    h.undo_stack = kept
+}
+
+pub fn (h $&CommandHistory) push(
+    label string,
+    merge_key string,
+    timestamp_ms int,
+    before_payload string,
+    after_payload string
+) int {
+    if timestamp_ms < 0 {
+        >> errors.new("nexus diagnostics: command timestamp_ms must be >= 0")
+    }
+    cid := h.next_cmd_id
+    h.next_cmd_id += 1
+    rec := CommandRecord{
+        id: cid,
+        label: label + "",
+        merge_key: merge_key + "",
+        timestamp_ms: timestamp_ms,
+        before_payload: before_payload + "",
+        after_payload: after_payload + ""
+    }
+    if h.in_group {
+        h.group_commands.push(rec)
+        << cid
+    }
+
+    // Any new undoable edit invalidates the redo branch.
+    if h.redo_stack.len > 0 {
+        for rb in h.redo_stack {
+            if rb.id == h.saved_batch_id {
+                h.dirty_untracked = true
+            }
+        }
+        h.redo_stack = []TransactionBatch{}
+    }
+
+    if merge_key.len > 0 && h.undo_stack.len > 0 {
+        top_idx := h.undo_stack.len - 1
+        top := $&h.undo_stack[top_idx]
+        if top.id != h.saved_batch_id && top.commands.len == 1 {
+            prev := $&top.commands[0]
+            if prev.merge_key == merge_key &&
+                timestamp_ms >= prev.timestamp_ms &&
+                timestamp_ms - prev.timestamp_ms <= h.merge_window_ms {
+                prev.after_payload = after_payload + ""
+                prev.timestamp_ms = timestamp_ms
+                prev.label = label + ""
+                top.label = label + ""
+                << cid
+            }
+        }
+    }
+
+    bid := h.next_batch_id
+    h.next_batch_id += 1
+    h.undo_stack.push(TransactionBatch{
+        id: bid,
+        label: label + "",
+        commands: [rec]
+    })
+    h.trim_undo_capacity()
+    << cid
+}
+
+pub fn (h $&CommandHistory) begin_group(label string) int {
+    if h.in_group {
+        >> errors.new("nexus diagnostics: nested command transaction groups are unsupported")
+    }
+    h.in_group = true
+    h.group_label = label + ""
+    h.group_commands = []CommandRecord{}
+    << 0
+}
+
+pub fn (h $&CommandHistory) commit_group() int {
+    if !h.in_group {
+        >> errors.new("nexus diagnostics: no active command transaction group")
+    }
+    h.in_group = false
+    if h.group_commands.len == 0 {
+        h.group_label = ""
+        << 0
+    }
+    if h.redo_stack.len > 0 {
+        for rb in h.redo_stack {
+            if rb.id == h.saved_batch_id {
+                h.dirty_untracked = true
+            }
+        }
+        h.redo_stack = []TransactionBatch{}
+    }
+    bid := h.next_batch_id
+    h.next_batch_id += 1
+    $cmds := []CommandRecord{}
+    for i in 0:h.group_commands.len { cmds.push(clone_cmd(&h.group_commands[i])) }
+    h.undo_stack.push(TransactionBatch{
+        id: bid,
+        label: h.group_label + "",
+        commands: cmds
+    })
+    h.group_label = ""
+    h.group_commands = []CommandRecord{}
+    h.trim_undo_capacity()
+    << bid
+}
+
+pub fn (h $&CommandHistory) rollback_group() []CommandRecord {
+    if !h.in_group {
+        >> errors.new("nexus diagnostics: no active command transaction group")
+    }
+    $rev := []CommandRecord{}
+    $i := h.group_commands.len - 1
+    while i >= 0 {
+        rev.push(clone_cmd(&h.group_commands[i]))
+        i -= 1
+    }
+    h.in_group = false
+    h.group_label = ""
+    h.group_commands = []CommandRecord{}
+    << rev
+}
+
+pub fn (h &CommandHistory) can_undo() bool { << !h.in_group && h.undo_stack.len > 0 }
+pub fn (h &CommandHistory) can_redo() bool { << !h.in_group && h.redo_stack.len > 0 }
+pub fn (h &CommandHistory) undo_count() int { << h.undo_stack.len }
+pub fn (h &CommandHistory) redo_count() int { << h.redo_stack.len }
+
+pub fn (h &CommandHistory) undo_label() string {
+    if h.undo_stack.len == 0 { << "" }
+    << h.undo_stack[h.undo_stack.len - 1].label + ""
+}
+
+pub fn (h &CommandHistory) redo_label() string {
+    if h.redo_stack.len == 0 { << "" }
+    << h.redo_stack[h.redo_stack.len - 1].label + ""
+}
+
+pub fn (h $&CommandHistory) undo() TransactionBatch {
+    if h.in_group {
+        >> errors.new("nexus diagnostics: cannot undo while transaction group is open")
+    }
+    if h.undo_stack.len == 0 {
+        >> errors.new("nexus diagnostics: undo stack empty")
+    }
+    last_idx := h.undo_stack.len - 1
+    batch := clone_batch(&h.undo_stack[last_idx])
+    $next_u := []TransactionBatch{}
+    for i in 0:last_idx { next_u.push(clone_batch(&h.undo_stack[i])) }
+    h.undo_stack = next_u
+    h.redo_stack.push(clone_batch(&batch))
+    << batch
+}
+
+pub fn (h $&CommandHistory) redo() TransactionBatch {
+    if h.in_group {
+        >> errors.new("nexus diagnostics: cannot redo while transaction group is open")
+    }
+    if h.redo_stack.len == 0 {
+        >> errors.new("nexus diagnostics: redo stack empty")
+    }
+    last_idx := h.redo_stack.len - 1
+    batch := clone_batch(&h.redo_stack[last_idx])
+    $next_r := []TransactionBatch{}
+    for i in 0:last_idx { next_r.push(clone_batch(&h.redo_stack[i])) }
+    h.redo_stack = next_r
+    h.undo_stack.push(clone_batch(&batch))
+    h.trim_undo_capacity()
+    << batch
+}
+
+pub fn (h $&CommandHistory) mark_saved() {
+    h.saved_batch_id = h.top_batch_id()
+    h.dirty_untracked = false
+}
+
+pub fn (h &CommandHistory) is_dirty() bool {
+    if h.dirty_untracked { << true }
+    << h.top_batch_id() != h.saved_batch_id
+}
+
+pub fn (h $&CommandHistory) clear() {
+    h.in_group = false
+    h.group_label = ""
+    h.group_commands = []CommandRecord{}
+    h.undo_stack = []TransactionBatch{}
+    h.redo_stack = []TransactionBatch{}
+    h.saved_batch_id = 0
+    h.dirty_untracked = false
+}
