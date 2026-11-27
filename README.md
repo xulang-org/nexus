@@ -71,6 +71,7 @@ make sdk
 - `make detail-optimizations-r2-test`：验证第二轮细节增强（13-Tap Jimenez Karis Bloom 下采样、Reverse-Z 线性深度缩放 GTAO 双边滤波、IGN 抖动 SSR + 距离/迎角平滑淡出、Soft Two-Bone IK 渐近缓冲伸展与上肢扭转对齐、以及无序依赖 Crowd RVO 右行规避与卡死自动重寻路）。
 - `make detail-optimizations-r3-test`：验证第三轮引擎深水区能力（3D PBR 多重散射能量补偿、可选 PCSS 接触硬化软阴影、GPU/软件像素一致 2D 屏幕空间泛光与纯 CPU `Skeleton2D`/`SkinnedMesh2D` 2D 骨骼蒙皮变形、状态机惯性平滑过渡与步态相位同步组、`RigidBody3D` 6-DOF 四元数旋转/滚动摩擦扭矩与休眠唤醒、`WorldPartitionGrid` 滞回流式卸载与持久化迁移，以及弱网输入冗余窗口恢复与自适应 RTT/Jitter 缓冲）。
 - `make developer-ergonomics-test`：验证面向应用程序开发的完整工具链与人机工学底座（`foundation/math` 完整 2D/3D 几何/四元数/`Mat4.inverse`/31 种缓动与弧长样条、`Ray3D`/`Plane3D`/`Sphere3D`/`Frustum3D` 解析相交与 Perlin/fBm 噪声；`foundation/color` Hex/HSV/IEC sRGB↔Linear 与预处理混合；`foundation/diagnostics` 环形日志与 CVar/控制台指令注册表；`foundation/events` 优先级与前缀订阅事件总线；`foundation/spatial` 2D/3D 空间哈希去重与最近邻查询；`scene` 节点分组/元数据/路径/克隆/全局坐标与 `Camera3D` 屏幕↔世界拾取；`input` 鼠标按键/滚轮/Modifier 组合键与蓄力按住时长；`timing/timers`、`animation/timeline` 补间管理；`resources/canvas` 2D 矢量与调试图元、`resources/mesh` 3D 程序化几何体与 `DebugDraw3D`；以及 `ecs` 动态组件迁移/自定义稀疏存储与 `physics2d`/`physics3d` 扩展碰撞查询）。
+- `make modeling-test`：验证 3D 建模与白盒编辑全链路（`resources/modeling` `EditableMesh` B-Rep/`CsgTree`/`MaterialAsset` 校验与 JSON 往返；`modeling` 原生白盒生成器、流形倒角/挤出/内插/合并/CSG 布尔求值/次物体拾取；`formats/gltf/encode_glb.xu` 与 `formats/obj/encode.xu` 导出往返及工程 UID 复用；`integration/modeling` Metal GPU 实时重载与 Physics3D 三角碰撞；以及 `cmd/project_viewport` `--live-script` 与 `--live-connect` TCP 实时白盒命令、截屏和 GLB 导出验证）。
 
 ## Phone 原生 2D / 3D 示例
 
@@ -1858,14 +1859,16 @@ make benchmark-course benchmark-webgl
 
 | XACP 操作 | 对应能力 | 说明 |
 | --- | --- | --- |
-| `xacp.hello` | 握手与能力协商 | 返回 `view_state \| control_input \| step_exec \| pause_resume` 权限集与目标信息 |
-| `proc.status` | 运行健康探测 | 返回引擎运行状态、已用时钟及节点统计 |
-| `ui.tree` | 场景树序列化 | 递归导出 `SceneTree` 层级结构（节点 ID、名称、类型、可见性、全局坐标与仿射变换） |
-| `ui.input` | 虚拟输入注入 | 将虚拟按键、指针位移等事件无损映射并注入到 `InputMap` |
-| `ui.act` | 仿真行为控制 | 支持 `pause` / `unpause` 等系统动作 |
-| `nexus.step` | 逐帧步进控制 | 支持暂停状态下推进 `N` 物理帧后重新挂起，用于精准逐帧仿真与评测 |
-| `nexus.state` | 引擎指标快照 | 查询当前帧序号、节点总数、暂停状态与调试计数 |
-| `ui.screenshot` | 渲染周期同步截图 | 配合 GPU 渲染生命周期在 `present()` 前捕获当前画面，支持 Base64 返回或路径回传 |
+| `xacp.hello` | 握手与能力协商 | 校验 `XU_XACP_TOKEN` 与跨连接 Nonce 防重放，返回权限集与目标信息 |
+| `proc.status` | 运行健康探测 | 返回进程 PID 与 `OPEN` 状态 |
+| `proc.output` | 日志与输出分页 | 分页读取受控环形输出缓冲或 `foundation/diagnostics.Logger` 日志流 |
+| `ui.tree` | 场景与 UI 树序列化 | 支持 `scope`（`scene`/`ui`/`all`）、`node` 子树过滤、`focused_only`、`revision` 与路径脱敏 |
+| `ui.input` | 全量虚拟输入注入 | 支持键盘、`pointer_move`/`pointer_down`/`pointer_up`、`scroll` 与修饰键，返回消费动作列表 |
+| `ui.act` | 仿真与控件行为控制 | 支持 `pause`/`unpause` 及 UI 控件 `focus`/`click`/`set_checked`/`set_text`/`set_value` |
+| `nexus.step` | 逐帧步进控制 | 支持暂停状态下推进 `N` 物理帧，支持 `wait: !b true` 在步进完成后再回包 |
+| `nexus.state` | 引擎指标快照 | 查询帧号、`revision`、节点计数、鼠标坐标；接入 `poll_full` 后含 `FrameProfiler` FPS/耗时与日志数 |
+| `nexus.cvar` | 运行时调试控制台 | 接入 `poll_full` 后可直接执行 `CVarRegistry` 查询/赋值/命令 |
+| `ui.screenshot` | 渲染周期同步截图 | 在 `present()` 前捕获画面，支持 Base64 帧预算检查、文件路径回传及 `reject_screenshot` 错误反馈 |
 
 ### 快速启用
 
@@ -1874,8 +1877,9 @@ make benchmark-course benchmark-webgl
 # 启用默认 XACP 控制端口（127.0.0.1:19876）
 ./build/arena --xacp-tcp
 
-# 或自定义端口
+# 或自定义端口，并使用 xu xacp call 一键探针查询
 ./build/arena --xacp-port 20000
+xu xacp call 20000 nexus.state
 ```
 
 在自定义游戏中接入：
@@ -1885,18 +1889,26 @@ xacp #"github.com/xulang-org/nexus/xacp"
 // 1. 初始化控制实例（例如监听 19876）
 $ctrl := xacp.attach_tcp(19876)
 
-// 2. 在游戏主循环中轮询
+// 2. 在游戏主循环中轮询（或使用 ctrl.poll_full 接入 Logger/CVar/FrameProfiler）
 while !quit {
     input.begin_frame()
     if ctrl.is_open() {
-        ctrl.poll($&tree, $&input)
+        ctrl.set_frame(frame_number)
+        for _ in 0:8 {
+            if !ctrl.poll($&tree, $&input) { <- }
+        }
         if ctrl.screenshot_requested() {
             shot_path := "build/shot.png"
-            renderer.capture(shot_path + "") or >>
-            ctrl.fulfill_screenshot(renderer.width() or >>, renderer.height() or >>, shot_path)
+            renderer.capture(shot_path + "") or (err) {
+                ctrl.reject_screenshot("capture failed: " + err.msg())
+            }
+            if ctrl.screenshot_requested() {
+                ctrl.fulfill_screenshot(renderer.width() or >>, renderer.height() or >>, shot_path)
+            }
         }
     }
     // ... 原有事件轮询、物理步进与渲染流程 ...
+    if ctrl.is_open() { _ := ctrl.complete_step_if_done(tree.paused) }
 }
 ```
 

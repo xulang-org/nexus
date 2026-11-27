@@ -1,7 +1,9 @@
 @"github.com/xulang-org/nexus/xacp"
 
+diag #"github.com/xulang-org/nexus/foundation/diagnostics"
 scene #"github.com/xulang-org/nexus/scene"
 controls #"github.com/xulang-org/nexus/input"
+timing #"github.com/xulang-org/nexus/timing"
 #encoding/xun
 #encoding/base64
 #os
@@ -13,7 +15,10 @@ pub const KEY_A = 4
 pub const KEY_D = 7
 pub const KEY_S = 22
 pub const KEY_W = 26
+pub const KEY_ENTER = 40
 pub const KEY_ESCAPE = 41
+pub const KEY_BACKSPACE = 42
+pub const KEY_TAB = 43
 pub const KEY_SPACE = 44
 pub const KEY_RIGHT = 79
 pub const KEY_LEFT = 80
@@ -56,22 +61,127 @@ fn serialize_float(v f64) string {
     << text
 }
 
+fn read_num_f64(d &xun.Doc, node int, fallback f64) f64 {
+    if node < 0 { << fallback }
+    tag := d.tag(node)
+    if tag == "i" {
+        << f64(d.as_int(node))
+    }
+    << d.as_f64(node)
+}
+
 fn map_key_code(key_node int, scan_node int, d &xun.Doc) int {
     if scan_node >= 0 {
         code := d.as_int(scan_node)
-        if code > 0 { << code }
+        if code > 0 && code < 512 { << code }
     }
     if key_node >= 0 {
         k := d.as_int(key_node)
-        if k == 119 || k == 87 { << KEY_W } // 'w' or 'W'
-        if k == 97 || k == 65 { << KEY_A }   // 'a' or 'A'
-        if k == 115 || k == 83 { << KEY_S } // 's' or 'S'
-        if k == 100 || k == 68 { << KEY_D } // 'd' or 'D'
-        if k == 32 { << KEY_SPACE }         // Space
-        if k == 27 { << KEY_ESCAPE }        // Esc
-        if k >= 0 && k < 512 { << k }
+        if k >= 97 && k <= 122 { << 4 + (k - 97) }
+        if k >= 65 && k <= 90 { << 4 + (k - 65) }
+        if k >= 49 && k <= 57 { << 30 + (k - 49) }
+        if k == 48 { << 39 }
+        if k == 13 || k == 10 { << KEY_ENTER }
+        if k == 27 { << KEY_ESCAPE }
+        if k == 8 { << KEY_BACKSPACE }
+        if k == 9 { << KEY_TAB }
+        if k == 32 { << KEY_SPACE }
+        if k > 0 && k < 512 { << k }
     }
     << 0
+}
+
+fn bool_text(v bool) string {
+    if v { << "true" }
+    << "false"
+}
+
+fn append_str(out $&strings.Builder, s string) {
+    out.write_string(&s)
+}
+
+fn dispatch_core(ctrl $&GameControl, job &GameJob, doc &xun.Doc, args int, tree $&scene.SceneTree, input $&controls.InputMap) GameReply {
+    if job.op == "ui.tree" {
+        $tree_data := ctrl.handle_tree(&*tree, doc, args) or (err) {
+            << GameReply{ok: false, err_code: "adapter_error", err_msg: err.msg(), data: ""}
+        }
+        << GameReply{ok: true, err_code: "", err_msg: "", data: tree_data}
+    }
+
+    if job.op == "ui.screenshot" {
+        ctrl.has_screenshot_job = true
+        ctrl.screenshot_job = GameJob{
+            id: job.id,
+            op: job.op + "",
+            body: job.body + "",
+            permissions: job.permissions,
+            reply: job.reply
+        }
+        << GameReply{ok: true, err_code: "deferred", err_msg: "", data: ""}
+    }
+
+    if job.op == "ui.input" {
+        res := ctrl.handle_input(input, doc, args) or (err) {
+            << GameReply{ok: false, err_code: "adapter_error", err_msg: err.msg(), data: ""}
+        }
+        << GameReply{ok: true, err_code: "", err_msg: "", data: res}
+    }
+
+    if job.op == "ui.act" {
+        res := ctrl.handle_act(tree, doc, args) or (err) {
+            << GameReply{ok: false, err_code: "adapter_error", err_msg: err.msg(), data: ""}
+        }
+        << GameReply{ok: true, err_code: "", err_msg: "", data: res}
+    }
+
+    if job.op == "nexus.step" {
+        $frames := 1
+        $wait := false
+        if args >= 0 {
+            fn_node := doc.get(args, "frames")
+            if fn_node >= 0 {
+                frames = doc.as_int(fn_node)
+                if frames <= 0 { frames = 1 }
+            }
+            wait_node := doc.get(args, "wait")
+            if wait_node >= 0 {
+                wait = doc.as_bool(wait_node)
+            }
+        }
+        ctrl.steps_remaining = frames
+        ctrl.bump_revision()
+        if wait {
+            ctrl.has_step_job = true
+            ctrl.step_job = GameJob{
+                id: job.id,
+                op: job.op + "",
+                body: job.body + "",
+                permissions: job.permissions,
+                reply: job.reply
+            }
+            << GameReply{ok: true, err_code: "deferred", err_msg: "", data: ""}
+        }
+        res := "  frames: !i " + str(frames) +
+            "\n  frame_number: !i " + str(ctrl.frame_number) +
+            "\n  paused: !b " + bool_text(tree.paused) + "\n"
+        << GameReply{ok: true, err_code: "", err_msg: "", data: res}
+    }
+
+    if job.op == "nexus.state" {
+        res := ctrl.handle_state_base(&*tree, &*input) or (err) {
+            << GameReply{ok: false, err_code: "adapter_error", err_msg: err.msg(), data: ""}
+        }
+        << GameReply{ok: true, err_code: "", err_msg: "", data: res}
+    }
+
+    if job.op == "proc.output" {
+        res := ctrl.handle_proc_output_ring(doc, args) or (err) {
+            << GameReply{ok: false, err_code: "adapter_error", err_msg: err.msg(), data: ""}
+        }
+        << GameReply{ok: true, err_code: "", err_msg: "", data: res}
+    }
+
+    << GameReply{ok: false, err_code: "not_implemented", err_msg: "unsupported nexus operation: " + job.op, data: ""}
 }
 
 pub fn (ctrl $&GameControl) dispatch_job(job &GameJob, tree $&scene.SceneTree, input $&controls.InputMap) GameReply {
@@ -81,128 +191,161 @@ pub fn (ctrl $&GameControl) dispatch_job(job &GameJob, tree $&scene.SceneTree, i
     }
     root := doc.root()
     args := doc.get(root, "args")
+    << dispatch_core(ctrl, job, &doc, args, tree, input)
+}
 
-    if job.op == "ui.tree" {
-        $tree_data := ctrl.handle_tree(&*tree, &doc, args) or (err) {
+pub fn (ctrl $&GameControl) dispatch_job_full(job &GameJob, tree $&scene.SceneTree, input $&controls.InputMap, logger $&diag.Logger, cvars $&diag.CVarRegistry, profiler $&timing.FrameProfiler) GameReply {
+    doc := xun.parse(&job.body)
+    if !doc.ok() {
+        << GameReply{ok: false, err_code: "frame_error", err_msg: "failed to parse XUN body", data: ""}
+    }
+    root := doc.root()
+    args := doc.get(root, "args")
+
+    if job.op == "proc.output" {
+        res := ctrl.handle_proc_output_full(&doc, args, logger) or (err) {
             << GameReply{ok: false, err_code: "adapter_error", err_msg: err.msg(), data: ""}
         }
-        << GameReply{ok: true, err_code: "", err_msg: "", data: tree_data}
+        << GameReply{ok: true, err_code: "", err_msg: "", data: res}
     }
 
-    if job.op == "ui.screenshot" {
-        // Screenshot needs rendering sync, so we defer it to fulfill_screenshot
-        ctrl.has_screenshot_job = true
-        ctrl.screenshot_job = GameJob{
-            id: job.id,
-            op: job.op + "",
-            body: job.body + "",
-            permissions: job.permissions,
-            reply: job.reply
-        }
-        // Return dummy reply indicating queued
-        << GameReply{ok: true, err_code: "deferred", err_msg: "", data: ""}
-    }
-
-    if job.op == "ui.input" {
-        ctrl.handle_input(input, &doc, args) or (err) {
+    if job.op == "nexus.cvar" {
+        res := handle_cvar(&doc, args, cvars) or (err) {
             << GameReply{ok: false, err_code: "adapter_error", err_msg: err.msg(), data: ""}
         }
-        << GameReply{ok: true, err_code: "", err_msg: "", data: "  actions: []\n"}
-    }
-
-    if job.op == "ui.act" {
-        ctrl.handle_act(tree, &doc, args) or (err) {
-            << GameReply{ok: false, err_code: "adapter_error", err_msg: err.msg(), data: ""}
-        }
-        << GameReply{ok: true, err_code: "", err_msg: "", data: "  actions: []\n"}
-    }
-
-    if job.op == "nexus.step" {
-        $frames := 1
-        if args >= 0 {
-            fn_node := doc.get(args, "frames")
-            if fn_node >= 0 {
-                frames = doc.as_int(fn_node)
-                if frames <= 0 { frames = 1 }
-            }
-        }
-        ctrl.steps_remaining = frames
-        $paused_str := "false"
-        if tree.paused { paused_str = "true" }
-        res := "  frames: !i " + str(frames) + "\n  paused: !b " + paused_str + "\n"
         << GameReply{ok: true, err_code: "", err_msg: "", data: res}
     }
 
     if job.op == "nexus.state" {
-        $paused_str := "false"
-        if tree.paused { paused_str = "true" }
-        all_nodes := tree.subtree(tree.root()) or (err) {
+        base := ctrl.handle_state_base(&*tree, &*input) or (err) {
             << GameReply{ok: false, err_code: "adapter_error", err_msg: err.msg(), data: ""}
         }
-        res := "  paused: !b " + paused_str + "\n" +
-            "  node_count: !i " + str(all_nodes.len) + "\n" +
-            "  root_id: !i " + str(tree.root()) + "\n" +
-            "  steps_remaining: !i " + str(ctrl.steps_remaining) + "\n" +
-            "  canvas_width: !i " + str(ctrl.resolved_width()) + "\n" +
-            "  canvas_height: !i " + str(ctrl.resolved_height()) + "\n"
-        << GameReply{ok: true, err_code: "", err_msg: "", data: res}
+        s := profiler.summary()
+        extra := "  profiler_frames: !i " + str(s.frame_count) +
+            "\n  fps: !f " + serialize_float(s.fps) +
+            "\n  avg_ms: !f " + serialize_float(s.avg_ms) +
+            "\n  p95_ms: !f " + serialize_float(s.p95_ms) +
+            "\n  log_count: !i " + str(logger.buffered_count()) + "\n"
+        << GameReply{ok: true, err_code: "", err_msg: "", data: base + extra}
     }
 
-    << GameReply{ok: false, err_code: "not_implemented", err_msg: "unsupported nexus operation: " + job.op, data: ""}
+    << dispatch_core(ctrl, job, &doc, args, tree, input)
+}
+
+fn (ctrl &GameControl) handle_state_base(tree &scene.SceneTree, input &controls.InputMap) string {
+    all_nodes := tree.subtree(tree.root()) or >>
+    pos := input.mouse_position()
+    << "  paused: !b " + bool_text(tree.paused) + "\n" +
+        "  node_count: !i " + str(all_nodes.len) + "\n" +
+        "  ui_node_count: !i " + str(ctrl.ui_nodes.len) + "\n" +
+        "  root_id: !i " + str(tree.root()) + "\n" +
+        "  frame_number: !i " + str(ctrl.frame_number) + "\n" +
+        "  revision: !i " + str(ctrl.revision) + "\n" +
+        "  steps_remaining: !i " + str(ctrl.steps_remaining) + "\n" +
+        "  canvas_width: !i " + str(ctrl.resolved_width()) + "\n" +
+        "  canvas_height: !i " + str(ctrl.resolved_height()) + "\n" +
+        "  mouse_x: !f " + serialize_float(pos.x) + "\n" +
+        "  mouse_y: !f " + serialize_float(pos.y) + "\n"
+}
+
+fn ui_node_in_subtree(nodes &[]UiNodeSnapshot, root_id int, id int) bool {
+    if root_id <= 0 { << true }
+    $cur := id
+    $steps := 0
+    while cur > 0 && steps <= nodes.len {
+        if cur == root_id { << true }
+        $parent := -1
+        $found := false
+        for i in 0:nodes.len {
+            if nodes[i].id == cur {
+                parent = nodes[i].parent
+                found = true
+                <-
+            }
+        }
+        if !found { << false }
+        cur = parent
+        steps += 1
+    }
+    << false
+}
+
+struct TreeEntry {
+    id int
+    kind_num int
+    dim int
+    node_kind string
+    parent int
+    x f64
+    y f64
+    z f64
+    width f64
+    height f64
+    visible bool
+    enabled bool
+    focusable bool
+    focused bool
+    checked bool
+    value f64
+    text string
+    path string
+    has_ui_fields bool
+}
+
+fn try_scene_subtree(tree &scene.SceneTree, root int) []int {
+    << tree.subtree(root) or (err) { << []int{} }
 }
 
 fn (ctrl &GameControl) handle_tree(tree &scene.SceneTree, doc &xun.Doc, args int) string {
     $start := 0
     $max_rows := 512
+    $scope := "scene"
+    $root_node := -1
+    $focused_only := false
+    $include_hidden := true
     if args >= 0 {
         start_node := doc.get(args, "start")
         if start_node >= 0 {
             start = doc.as_int(start_node)
-            if start < 0 { start = 0 }
+            if start < 0 { >> errors.new("xacp: start must be non-negative") }
         }
         max_node := doc.get(args, "max_table_rows")
         if max_node >= 0 {
             max_rows = doc.as_int(max_node)
             if max_rows <= 0 || max_rows > 1024 { max_rows = 512 }
         }
+        scope_node := doc.get(args, "scope")
+        if scope_node >= 0 {
+            scope = doc.text(scope_node)
+            if scope != "scene" && scope != "ui" && scope != "all" {
+                >> errors.new("xacp: invalid ui.tree scope: " + scope)
+            }
+        }
+        node_arg := doc.get(args, "node")
+        if node_arg >= 0 { root_node = doc.as_int(node_arg) }
+        foc_arg := doc.get(args, "focused_only")
+        if foc_arg >= 0 { focused_only = doc.as_bool(foc_arg) }
+        hid_arg := doc.get(args, "include_hidden")
+        if hid_arg >= 0 { include_hidden = doc.as_bool(hid_arg) }
     }
 
-    node_ids := tree.subtree(tree.root()) or >>
-    total := node_ids.len
-
-    $count := total - start
-    if count < 0 { count = 0 }
-    if count > max_rows { count = max_rows }
-
-    next_start := start + count
-    $truncated := "false"
-    if next_start < total { truncated = "true" }
-
-    $out := strings.builder()
-    out.write_string(&"  redacted: !b false\n")
-    out.write_string(&"  win: !i 1\n  generation: !i 1\n")
-    out.write_string(&"  start: !i ")
-    out.write_string(&str(start))
-    out.write_string(&"\n  count: !i ")
-    out.write_string(&str(count))
-    out.write_string(&"\n  total: !i ")
-    out.write_string(&str(total))
-    out.write_string(&"\n  truncated: !b ")
-    out.write_string(&truncated)
-    out.write_string(&"\n  next_start: !i ")
-    out.write_string(&str(next_start))
-    out.write_string(&"\n")
-
-    if count == 0 {
-        out.write_string(&"  nodes: []\n")
-    } else {
-        out.write_string(&"  nodes:\n")
+    $entries := []TreeEntry{}
+    if scope == "scene" || scope == "all" {
+        $scene_root := tree.root()
+        if root_node > 0 { scene_root = root_node }
+        $node_ids := []int{}
+        if scope == "scene" {
+            node_ids = tree.subtree(scene_root) or >>
+        } else {
+            node_ids = try_scene_subtree(tree, scene_root)
+        }
         w_px := f64(ctrl.resolved_width())
         h_px := f64(ctrl.resolved_height())
-
-        for i in start:start + count {
-            nid := node_ids[i]
+        for nid in node_ids {
             info := tree.node_info(nid) or >>
+            is_vis := tree.is_visible(nid)
+            if !include_hidden && !is_vis { -> }
+            if focused_only { -> }
             $nx := 0.0
             $ny := 0.0
             $nz := 0.0
@@ -222,46 +365,110 @@ fn (ctrl &GameControl) handle_tree(tree &scene.SceneTree, doc &xun.Doc, args int
                 ndim = 3
                 kind_name = "Node3D"
             }
-            is_vis := tree.is_visible(nid)
-            $vis_str := "false"
-            if is_vis { vis_str = "true" }
             can_proc := tree.can_process(nid)
-            $proc_str := "false"
-            if can_proc { proc_str = "true" }
-
             $nw := 32.0
             $nh := 32.0
             if nid == tree.root() {
                 nw = w_px
                 nh = h_px
             }
+            npath := tree.node_path(nid) or (err) { << "" }
+            safe_name := redact_paths(&info.name)
+            entries.push(TreeEntry{
+                id: nid,
+                kind_num: 1,
+                dim: ndim,
+                node_kind: kind_name,
+                parent: info.parent,
+                x: nx, y: ny, z: nz,
+                width: nw, height: nh,
+                visible: is_vis,
+                enabled: can_proc,
+                focusable: false,
+                focused: false,
+                checked: false,
+                value: 0.0,
+                text: safe_name,
+                path: redact_paths(&npath),
+                has_ui_fields: false
+            })
+        }
+    }
 
-            out.write_string(&"    - id: !i ")
-            out.write_string(&str(nid))
-            out.write_string(&"\n      kind: !i 1\n      dim: !i ")
-            out.write_string(&str(ndim))
-            out.write_string(&"\n      node_kind: \"")
-            out.write_string(&kind_name)
-            out.write_string(&"\"\n      parent: !i ")
-            out.write_string(&str(info.parent))
-            out.write_string(&"\n      x: !f ")
-            out.write_string(&serialize_float(nx))
-            out.write_string(&"\n      y: !f ")
-            out.write_string(&serialize_float(ny))
-            out.write_string(&"\n      z: !f ")
-            out.write_string(&serialize_float(nz))
-            out.write_string(&"\n      width: !f ")
-            out.write_string(&serialize_float(nw))
-            out.write_string(&"\n      height: !f ")
-            out.write_string(&serialize_float(nh))
-            out.write_string(&"\n      visible: !b ")
-            out.write_string(&vis_str)
-            out.write_string(&"\n      enabled: !b ")
-            out.write_string(&proc_str)
-            out.write_string(&"\n      focusable: !b false\n      focused: !b false\n      text: ")
-            quoted_name := quote_xun_string(&info.name)
-            out.write_string(&quoted_name)
-            out.write_string(&"\n")
+    if scope == "ui" || scope == "all" {
+        for i in 0:ctrl.ui_nodes.len {
+            u := &ctrl.ui_nodes[i]
+            if root_node > 0 && !ui_node_in_subtree(&ctrl.ui_nodes, root_node, u.id) { -> }
+            if !include_hidden && !u.visible { -> }
+            if focused_only && !u.focused { -> }
+            safe_label := redact_paths(&u.label)
+            entries.push(TreeEntry{
+                id: u.id,
+                kind_num: 2,
+                dim: 2,
+                node_kind: u.kind + "",
+                parent: u.parent,
+                x: u.x, y: u.y, z: 0.0,
+                width: u.width, height: u.height,
+                visible: u.visible,
+                enabled: u.enabled,
+                focusable: u.focusable,
+                focused: u.focused,
+                checked: u.checked,
+                value: u.value,
+                text: safe_label,
+                path: "",
+                has_ui_fields: true
+            })
+        }
+    }
+
+    total := entries.len
+    if start > total { >> errors.new("xacp: ui.tree start exceeds node count") }
+    $count := total - start
+    if count > max_rows { count = max_rows }
+    next_start := start + count
+    truncated := next_start < total
+
+    $out := strings.builder()
+    append_str($&out, "  redacted: !b false\n")
+    append_str($&out, "  win: !i 1\n  generation: !i 1\n  revision: !i " + str(ctrl.revision) + "\n")
+    append_str($&out, "  scope: " + quote_xun_string(&scope) + "\n")
+    append_str($&out, "  start: !i " + str(start) + "\n  count: !i " + str(count) +
+        "\n  total: !i " + str(total) + "\n  truncated: !b " + bool_text(truncated) +
+        "\n  next_start: !i " + str(next_start) + "\n")
+
+    if count == 0 {
+        append_str($&out, "  nodes: []\n")
+    } else {
+        append_str($&out, "  nodes:\n")
+        for i in start:start + count {
+            e := &entries[i]
+            append_str($&out, "    - id: !i " + str(e.id) +
+                "\n      kind: !i " + str(e.kind_num) +
+                "\n      dim: !i " + str(e.dim) +
+                "\n      node_kind: " + quote_xun_string(&e.node_kind) +
+                "\n      parent: !i " + str(e.parent) +
+                "\n      x: !f " + serialize_float(e.x) +
+                "\n      y: !f " + serialize_float(e.y) +
+                "\n      z: !f " + serialize_float(e.z) +
+                "\n      width: !f " + serialize_float(e.width) +
+                "\n      height: !f " + serialize_float(e.height) +
+                "\n      visible: !b " + bool_text(e.visible) +
+                "\n      enabled: !b " + bool_text(e.enabled) +
+                "\n      focusable: !b " + bool_text(e.focusable) +
+                "\n      focused: !b " + bool_text(e.focused) +
+                "\n      text: " + quote_xun_string(&e.text) + "\n")
+            if e.path.len > 0 {
+                append_str($&out, "      path: " + quote_xun_string(&e.path) + "\n")
+            }
+            if e.has_ui_fields {
+                append_str($&out, "      checked: !b " + bool_text(e.checked) +
+                    "\n      value: !f " + serialize_float(e.value) + "\n")
+            }
+            if out.length() > MAX_FRAME_BYTES - 256 {
+                >> errors.new("xacp: ui.tree response exceeds frame limit")
+            }
         }
     }
     << out.text()
@@ -287,7 +494,7 @@ pub fn (ctrl $&GameControl) fulfill_screenshot(w int, h int, path string) int {
 
     if mode == "file" {
         content := os.read(path + "") or (err) {
-            ctrl.screenshot_job.reply <- GameReply{ok: false, err_code: "file_unavailable", err_msg: err.msg(), data: ""}
+            ctrl.screenshot_job.reply <- GameReply{ok: false, err_code: "file_unavailable", err_msg: redact_paths(&err.msg()), data: ""}
             << 0
         }
         res := "  redacted: !b false\n" +
@@ -305,10 +512,15 @@ pub fn (ctrl $&GameControl) fulfill_screenshot(w int, h int, path string) int {
     }
 
     content := os.read(path) or (err) {
-        ctrl.screenshot_job.reply <- GameReply{ok: false, err_code: "file_unavailable", err_msg: err.msg(), data: ""}
+        ctrl.screenshot_job.reply <- GameReply{ok: false, err_code: "file_unavailable", err_msg: redact_paths(&err.msg()), data: ""}
         << 0
     }
     content_len := content.len
+    b64_est := ((content_len + 2) / 3) * 4
+    if b64_est + 512 > MAX_FRAME_BYTES {
+        ctrl.screenshot_job.reply <- GameReply{ok: false, err_code: "screenshot_too_large", err_msg: "screenshot exceeds frame limit; use mode=file", data: ""}
+        << 0
+    }
     b64 := base64.encode_to_string(content)
     res := "  redacted: !b false\n" +
         "  width: !f " + serialize_float(f64(w)) + "\n" +
@@ -326,45 +538,278 @@ pub fn (ctrl $&GameControl) fulfill_screenshot(w int, h int, path string) int {
 pub fn (ctrl $&GameControl) reject_screenshot(reason string) int {
     if !ctrl.has_screenshot_job { << 0 }
     ctrl.has_screenshot_job = false
-    ctrl.screenshot_job.reply <- GameReply{ok: false, err_code: "adapter_error", err_msg: reason, data: ""}
+    ctrl.screenshot_job.reply <- GameReply{ok: false, err_code: "adapter_error", err_msg: redact_paths(&reason), data: ""}
     << 0
 }
 
-fn (ctrl &GameControl) handle_input(input $&controls.InputMap, doc &xun.Doc, args int) int {
-    if args < 0 { << 0 }
+fn (ctrl $&GameControl) handle_input(input $&controls.InputMap, doc &xun.Doc, args int) string {
+    if args < 0 { << "  applied: !i 0\n  actions: []\n" }
     steps := doc.get(args, "steps")
-    if steps < 0 { << 0 }
+    if steps < 0 { << "  applied: !i 0\n  actions: []\n" }
     step_count := doc.count(steps)
+    $applied := 0
+    $actions_out := strings.builder()
     for i in 0:step_count {
         step := doc.at(steps, i)
         ev_node := doc.get(step, "ev")
         if ev_node < 0 { -> }
         ev := doc.text(ev_node)
-        key_node := doc.get(step, "key")
-        scan_node := doc.get(step, "scan")
-        code := map_key_code(key_node, scan_node, &*doc)
-        if code > 0 {
-            if ev == "key_down" {
-                input.feed_key(code, true) or >>
-            } else if ev == "key_up" {
-                input.feed_key(code, false) or >>
+        mod_node := doc.get(step, "modifiers")
+        if mod_node >= 0 {
+            input.feed_modifiers(doc.as_int(mod_node))
+        }
+        $step_ok := false
+        $kind_code := 0
+        $val := 0.0
+        if ev == "key_down" || ev == "key_up" {
+            key_node := doc.get(step, "key")
+            scan_node := doc.get(step, "scan")
+            code := map_key_code(key_node, scan_node, doc)
+            if code > 0 {
+                input.feed_key(code, ev == "key_down") or >>
+                step_ok = true
+                kind_code = 1
+                val = f64(code)
             }
+        } else if ev == "pointer_move" {
+            px := read_num_f64(doc, doc.get(step, "x"), 0.0)
+            py := read_num_f64(doc, doc.get(step, "y"), 0.0)
+            dx := read_num_f64(doc, doc.get(step, "dx"), 0.0)
+            dy := read_num_f64(doc, doc.get(step, "dy"), 0.0)
+            input.feed_pointer_move(px, py, dx, dy) or >>
+            step_ok = true
+            kind_code = 2
+            val = px
+        } else if ev == "pointer_down" || ev == "pointer_up" {
+            $btn := controls.MOUSE_BUTTON_LEFT
+            btn_node := doc.get(step, "button")
+            if btn_node >= 0 { btn = doc.as_int(btn_node) }
+            $clicks := 1
+            clk_node := doc.get(step, "click_count")
+            if clk_node >= 0 { clicks = doc.as_int(clk_node) }
+            px := read_num_f64(doc, doc.get(step, "x"), input.mouse_position().x)
+            py := read_num_f64(doc, doc.get(step, "y"), input.mouse_position().y)
+            input.feed_pointer_button(btn, ev == "pointer_down", clicks, px, py) or >>
+            step_ok = true
+            kind_code = 3
+            val = f64(btn)
+        } else if ev == "pointer_scroll" || ev == "scroll" {
+            dx := read_num_f64(doc, doc.get(step, "dx"), 0.0)
+            dy := read_num_f64(doc, doc.get(step, "dy"), 0.0)
+            input.feed_wheel(dx, dy) or >>
+            step_ok = true
+            kind_code = 4
+            val = dy
+        }
+        if step_ok {
+            applied += 1
+            append_str($&actions_out, "    - id: !i " + str(applied) +
+                "\n      kind: !i " + str(kind_code) +
+                "\n      ev: " + quote_xun_string(&ev) +
+                "\n      consumed: !b true" +
+                "\n      value: !f " + serialize_float(val) + "\n")
         }
     }
-    << 0
+    if applied > 0 { ctrl.bump_revision() }
+    pos := input.mouse_position()
+    $res := "  applied: !i " + str(applied) +
+        "\n  mouse_x: !f " + serialize_float(pos.x) +
+        "\n  mouse_y: !f " + serialize_float(pos.y) + "\n"
+    if applied == 0 {
+        << res + "  actions: []\n"
+    }
+    << res + "  actions:\n" + actions_out.text()
 }
 
-fn (ctrl &GameControl) handle_act(tree $&scene.SceneTree, doc &xun.Doc, args int) int {
-    if args < 0 { << 0 }
+fn find_ui_node_index(ctrl &GameControl, id int) int {
+    for i in 0:ctrl.ui_nodes.len {
+        if ctrl.ui_nodes[i].id == id { << i }
+    }
+    << -1
+}
+
+fn (ctrl $&GameControl) handle_act(tree $&scene.SceneTree, doc &xun.Doc, args int) string {
+    if args < 0 { >> errors.new("xacp: ui.act requires args") }
     act_node := doc.get(args, "act")
-    if act_node < 0 { << 0 }
+    if act_node < 0 { >> errors.new("xacp: ui.act requires act") }
     act := doc.text(act_node)
-    if act == "pause" || act == "toggle_pause" {
-        tree.paused = !tree.paused
-    } else if act == "unpause" || act == "resume" {
-        tree.paused = false
+
+    if act == "pause" || act == "toggle_pause" || act == "unpause" || act == "resume" {
+        if act == "pause" || act == "toggle_pause" {
+            tree.paused = !tree.paused
+        } else {
+            tree.paused = false
+        }
+        ctrl.bump_revision()
+        $val := 0.0
+        if tree.paused { val = 1.0 }
+        << "  actions:\n" +
+            "    - id: !i " + str(tree.root()) + "\n" +
+            "      kind: !i 1\n" +
+            "      act: " + quote_xun_string(&act) + "\n" +
+            "      consumed: !b true\n" +
+            "      paused: !b " + bool_text(tree.paused) + "\n" +
+            "      value: !f " + serialize_float(val) + "\n"
+    }
+
+    node_arg := doc.get(args, "node")
+    if node_arg < 0 { >> errors.new("xacp: ui.act requires node for " + act) }
+    node_id := doc.as_int(node_arg)
+    idx := find_ui_node_index(ctrl, node_id)
+    if idx < 0 { >> errors.new("xacp: ui.act target node not found: " + str(node_id)) }
+    if !ctrl.ui_nodes[idx].enabled { >> errors.new("xacp: ui.act target node is disabled") }
+
+    $req := UiActionRequest{node_id: node_id, act: act + "", text: "", checked: ctrl.ui_nodes[idx].checked, value: ctrl.ui_nodes[idx].value}
+    $action_kind := 0
+    if act == "focus" {
+        if !ctrl.ui_nodes[idx].focusable { >> errors.new("xacp: ui.act target node is not focusable") }
+        for i in 0:ctrl.ui_nodes.len {
+            ctrl.ui_nodes[i].focused = (i == idx)
+        }
+        action_kind = 4
+    } else if act == "click" {
+        if ctrl.ui_nodes[idx].kind == "UiToggle" || ctrl.ui_nodes[idx].kind == "toggle" {
+            ctrl.ui_nodes[idx].checked = !ctrl.ui_nodes[idx].checked
+            req.checked = ctrl.ui_nodes[idx].checked
+            action_kind = 2
+        } else {
+            action_kind = 1
+        }
+        if ctrl.ui_nodes[idx].focusable {
+            for i in 0:ctrl.ui_nodes.len {
+                ctrl.ui_nodes[i].focused = (i == idx)
+            }
+        }
+    } else if act == "set_checked" {
+        chk_arg := doc.get(args, "checked")
+        if chk_arg < 0 { >> errors.new("xacp: set_checked requires checked") }
+        chk := doc.as_bool(chk_arg)
+        ctrl.ui_nodes[idx].checked = chk
+        req.checked = chk
+        action_kind = 2
+    } else if act == "set_text" {
+        txt_arg := doc.get(args, "text")
+        if txt_arg < 0 { >> errors.new("xacp: set_text requires text") }
+        txt := doc.text(txt_arg)
+        ctrl.ui_nodes[idx].label = txt + ""
+        req.text = txt + ""
+        action_kind = 5
+    } else if act == "set_value" {
+        val_arg := doc.get(args, "value")
+        if val_arg < 0 { >> errors.new("xacp: set_value requires value") }
+        v := read_num_f64(doc, val_arg, 0.0)
+        ctrl.ui_nodes[idx].value = v
+        req.value = v
+        action_kind = 3
     } else {
         >> errors.new("unsupported ui.act action: " + act)
     }
-    << 0
+
+    ctrl.pending_ui_actions.push(req)
+    ctrl.bump_revision()
+    << "  actions:\n" +
+        "    - id: !i " + str(node_id) + "\n" +
+        "      kind: !i " + str(action_kind) + "\n" +
+        "      act: " + quote_xun_string(&act) + "\n" +
+        "      consumed: !b true\n" +
+        "      checked: !b " + bool_text(ctrl.ui_nodes[idx].checked) + "\n" +
+        "      value: !f " + serialize_float(ctrl.ui_nodes[idx].value) + "\n"
+}
+
+fn format_output_page(stream &string, buf &string, base int, requested int, max_bytes int) string {
+    total := base + buf.len
+    if requested < 0 { >> errors.new("xacp: since must be non-negative") }
+    if requested > total { >> errors.new("xacp: since beyond end of stream") }
+    $since := requested
+    if since < base { since = base }
+    dropped := since - requested
+    start_off := since - base
+    $avail := buf.len - start_off
+    if avail < 0 { avail = 0 }
+    $count := avail
+    if count > max_bytes { count = max_bytes }
+    $chunk := ""
+    if count > 0 { chunk = buf[start_off:start_off + count] }
+    next_since := since + count
+    truncated := next_since < total
+    << "  stream: " + *stream +
+        "\n  since: !i " + str(since) +
+        "\n  count: !i " + str(count) +
+        "\n  total: !i " + str(total) +
+        "\n  base: !i " + str(base) +
+        "\n  dropped: !i " + str(dropped) +
+        "\n  truncated: !b " + bool_text(truncated) +
+        "\n  next_since: !i " + str(next_since) +
+        "\n  data: " + quote_xun_string(&chunk) + "\n"
+}
+
+struct OutputArgs {
+    stream string
+    since int
+    max_bytes int
+}
+
+fn parse_output_args(doc &xun.Doc, args int) OutputArgs {
+    if args < 0 { >> errors.new("xacp: proc.output requires args") }
+    stream_node := doc.get(args, "stream")
+    if stream_node < 0 { >> errors.new("xacp: proc.output requires stream") }
+    stream := doc.text(stream_node)
+    if stream != "stdout" && stream != "stderr" && stream != "log" {
+        >> errors.new("xacp: invalid proc.output stream: " + stream)
+    }
+    $since := 0
+    since_node := doc.get(args, "since")
+    if since_node >= 0 { since = doc.as_int(since_node) }
+    $max_bytes := 4096
+    max_node := doc.get(args, "max_bytes")
+    if max_node >= 0 {
+        max_bytes = doc.as_int(max_node)
+        if max_bytes <= 0 || max_bytes > 524288 { max_bytes = 4096 }
+    }
+    << OutputArgs{stream: stream + "", since: since, max_bytes: max_bytes}
+}
+
+fn (ctrl &GameControl) handle_proc_output_ring(doc &xun.Doc, args int) string {
+    parsed := parse_output_args(doc, args) or >>
+    if parsed.stream == "stderr" {
+        << format_output_page(&parsed.stream, &ctrl.output_stderr, ctrl.output_stderr_base, parsed.since, parsed.max_bytes) or >>
+    }
+    << format_output_page(&parsed.stream, &ctrl.output_stdout, ctrl.output_stdout_base, parsed.since, parsed.max_bytes) or >>
+}
+
+fn build_logger_text(logger &diag.Logger) string {
+    entries := logger.recent(-1)
+    if entries.len == 0 { << "" }
+    $b := strings.builder()
+    for i in 0:entries.len {
+        line := diag.format_entry(&entries[i]) + "\n"
+        append_str($&b, line)
+    }
+    << b.text()
+}
+
+fn (ctrl &GameControl) handle_proc_output_full(doc &xun.Doc, args int, logger &diag.Logger) string {
+    parsed := parse_output_args(doc, args) or >>
+    if parsed.stream == "stderr" {
+        << format_output_page(&parsed.stream, &ctrl.output_stderr, ctrl.output_stderr_base, parsed.since, parsed.max_bytes) or >>
+    }
+    if parsed.stream == "log" || ctrl.output_stdout.len == 0 {
+        log_buf := build_logger_text(logger)
+        if parsed.stream == "log" || log_buf.len > 0 {
+            << format_output_page(&parsed.stream, &log_buf, 0, parsed.since, parsed.max_bytes) or >>
+        }
+    }
+    << format_output_page(&parsed.stream, &ctrl.output_stdout, ctrl.output_stdout_base, parsed.since, parsed.max_bytes) or >>
+}
+
+fn handle_cvar(doc &xun.Doc, args int, cvars $&diag.CVarRegistry) string {
+    if args < 0 { >> errors.new("xacp: nexus.cvar requires args") }
+    cmd_node := doc.get(args, "cmd")
+    if cmd_node < 0 { >> errors.new("xacp: nexus.cvar requires cmd") }
+    cmd := doc.text(cmd_node)
+    res := cvars.exec_line(cmd)
+    safe_out := redact_paths(&res.output)
+    << "  exec_ok: !b " + bool_text(res.ok) +
+        "\n  is_command: !b " + bool_text(res.is_command) +
+        "\n  output: " + quote_xun_string(&safe_out) + "\n"
 }

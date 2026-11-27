@@ -173,7 +173,10 @@ fn run() int {
     while !quit && (config.frames == 0 || frame_number < config.frames) {
         input.begin_frame()
         if ctrl.is_open() {
-            ctrl.poll($&tree, $&input)
+            ctrl.set_frame(frame_number)
+            for _ in 0:8 {
+                if !ctrl.poll($&tree, $&input) { <- }
+            }
         }
         window.pump() or >>
         for event_index in 0:256 {
@@ -231,6 +234,7 @@ fn run() int {
             }
         }
         tree.flush_free() or >>
+        if ctrl.is_open() { _ := ctrl.complete_step_if_done(tree.paused) }
         width := renderer.width() or >>
         height := renderer.height() or >>
         if width < 1 || height < 1 { sleep_ns(10000000)
@@ -263,9 +267,7 @@ fn run() int {
         renderer.submit(&batch) or >>
         renderer.submit_texture(&sprite_batch, &texture) or >>
         if ctrl.is_open() && ctrl.screenshot_requested() {
-            shot_path := "build/arena_xacp.png"
-            renderer.capture(shot_path + "") or >>
-            ctrl.fulfill_screenshot(width, height, shot_path)
+            capture_xacp_shot($&renderer, $&ctrl, width, height, "build/arena_xacp.png")
         }
         if config.capture.len > 0 && frame_number + 1 == config.frames { renderer.capture(config.capture + "") or >> }
         renderer.present() or >>
@@ -276,6 +278,13 @@ fn run() int {
     renderer.close() or >>
     println("Finished " + str(frame_number) + " frames; score " + str(score))
     << 0
+}
+fn capture_xacp_shot(renderer $&ren.Renderer2D, ctrl $&xacp.GameControl, width int, height int, shot_path string) {
+    renderer.capture(shot_path + "") or (err) {
+        _ := ctrl.reject_screenshot("capture failed: " + err.msg())
+        <<
+    }
+    _ := ctrl.fulfill_screenshot(width, height, shot_path)
 }
 fn main() int { << run() or (err) { eprintln(err.msg())
     << 1 } }

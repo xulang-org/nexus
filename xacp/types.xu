@@ -3,6 +3,8 @@
 #errors
 #time
 
+pub const OUTPUT_RING_CAP = 65536
+
 pub struct GameReply {
     pub ok bool
     pub err_code string
@@ -18,8 +20,34 @@ pub struct GameJob {
     pub reply chan GameReply
 }
 
+pub struct UiNodeSnapshot {
+    pub id int
+    pub parent int
+    pub kind string
+    pub label string
+    pub x f64
+    pub y f64
+    pub width f64
+    pub height f64
+    pub visible bool
+    pub enabled bool
+    pub focusable bool
+    pub focused bool
+    pub checked bool
+    pub value f64
+}
+
+pub struct UiActionRequest {
+    pub node_id int
+    pub act string
+    pub text string
+    pub checked bool
+    pub value f64
+}
+
 pub struct GameControl {
     pub jobs chan GameJob
+    pub busy chan int
     pub done chan int
     pub stop chan int
     pub stopped bool
@@ -29,14 +57,28 @@ pub struct GameControl {
     pub port int
     pub canvas_width int
     pub canvas_height int
+    pub frame_number int
+    pub revision int
     pub has_screenshot_job bool
     pub screenshot_job GameJob
+    pub has_step_job bool
+    pub step_job GameJob
+    pub ui_nodes []UiNodeSnapshot
+    pub pending_ui_actions []UiActionRequest
+    pub output_stdout string
+    pub output_stderr string
+    pub output_stdout_base int
+    pub output_stderr_base int
 }
 
 pub fn inactive() GameControl {
     dummy_reply := chan GameReply{cap: 1}
+    dummy_step_reply := chan GameReply{cap: 1}
+    busy := chan int{cap: 1}
+    busy <- 1
     << GameControl{
         jobs: chan GameJob{cap: 1},
+        busy: busy,
         done: chan int{cap: 1},
         stop: chan int{cap: 1},
         stopped: true,
@@ -46,8 +88,18 @@ pub fn inactive() GameControl {
         port: 0,
         canvas_width: 960,
         canvas_height: 640,
+        frame_number: 0,
+        revision: 1,
         has_screenshot_job: false,
-        screenshot_job: GameJob{id: 0, op: "", body: "", permissions: 0, reply: dummy_reply}
+        screenshot_job: GameJob{id: 0, op: "", body: "", permissions: 0, reply: dummy_reply},
+        has_step_job: false,
+        step_job: GameJob{id: 0, op: "", body: "", permissions: 0, reply: dummy_step_reply},
+        ui_nodes: []UiNodeSnapshot{},
+        pending_ui_actions: []UiActionRequest{},
+        output_stdout: "",
+        output_stderr: "",
+        output_stdout_base: 0,
+        output_stderr_base: 0
     }
 }
 
@@ -70,18 +122,103 @@ pub fn (ctrl &GameControl) resolved_height() int {
     << 640
 }
 
+pub fn (ctrl $&GameControl) set_frame(frame int) {
+    if frame >= 0 { ctrl.frame_number = frame }
+}
+
+pub fn (ctrl $&GameControl) bump_revision() {
+    ctrl.revision = ctrl.revision + 1
+}
+
+pub fn (ctrl $&GameControl) clear_ui_nodes() {
+    if ctrl.ui_nodes.len > 0 {
+        ctrl.ui_nodes = []UiNodeSnapshot{}
+        ctrl.revision = ctrl.revision + 1
+    }
+}
+
+pub fn (ctrl $&GameControl) register_ui_node(node UiNodeSnapshot) {
+    ctrl.ui_nodes.push(UiNodeSnapshot{
+        id: node.id,
+        parent: node.parent,
+        kind: node.kind + "",
+        label: node.label + "",
+        x: node.x,
+        y: node.y,
+        width: node.width,
+        height: node.height,
+        visible: node.visible,
+        enabled: node.enabled,
+        focusable: node.focusable,
+        focused: node.focused,
+        checked: node.checked,
+        value: node.value
+    })
+    ctrl.revision = ctrl.revision + 1
+}
+
+pub fn (ctrl $&GameControl) drain_ui_actions() []UiActionRequest {
+    if ctrl.pending_ui_actions.len == 0 { << []UiActionRequest{} }
+    $out := []UiActionRequest{}
+    for i in 0:ctrl.pending_ui_actions.len {
+        a := &ctrl.pending_ui_actions[i]
+        out.push(UiActionRequest{
+            node_id: a.node_id,
+            act: a.act + "",
+            text: a.text + "",
+            checked: a.checked,
+            value: a.value
+        })
+    }
+    ctrl.pending_ui_actions = []UiActionRequest{}
+    << out
+}
+
+struct RingAppend {
+    buf string
+    base int
+}
+
+fn append_ring(buf string, base int, text &string) RingAppend {
+    if text.len == 0 { << RingAppend{buf: buf, base: base} }
+    $next := buf + *text
+    $next_base := base
+    if next.len > OUTPUT_RING_CAP {
+        drop := next.len - OUTPUT_RING_CAP
+        next = next[drop:next.len]
+        next_base = base + drop
+    }
+    << RingAppend{buf: next, base: next_base}
+}
+
+pub fn (ctrl $&GameControl) log_output(stream string, text string) {
+    if text.len == 0 { << }
+    if stream == "stderr" {
+        res := append_ring(ctrl.output_stderr, ctrl.output_stderr_base, &text)
+        ctrl.output_stderr = res.buf
+        ctrl.output_stderr_base = res.base
+        <<
+    }
+    res := append_ring(ctrl.output_stdout, ctrl.output_stdout_base, &text)
+    ctrl.output_stdout = res.buf
+    ctrl.output_stdout_base = res.base
+}
+
 pub fn (ctrl $&GameControl) close() {
     ctrl.active = false
     ctrl.reject_screenshot("xacp: control closed")
+    ctrl.reject_step("xacp: control closed")
     if !ctrl.stopped {
         ctrl.stopped = true
         ctrl.stop <- 1
+        tok := <-ctrl.busy
         select {
             pending := <-ctrl.jobs {
                 pending.reply <- GameReply{ok: false, err_code: "closed", err_msg: "xacp control closed", data: ""}
             }
             else {}
         }
+        ctrl.busy <- tok
         timer := time.new_timer(200 * time.millisecond())
         select {
             _ := <-ctrl.done {
@@ -106,6 +243,24 @@ pub fn (ctrl $&GameControl) consume_step() bool {
         << true
     }
     << false
+}
+
+pub fn (ctrl $&GameControl) complete_step_if_done(paused bool) bool {
+    if !ctrl.has_step_job || ctrl.steps_remaining > 0 { << false }
+    ctrl.has_step_job = false
+    $paused_str := "false"
+    if paused { paused_str = "true" }
+    res := "  completed: !b true\n  frame_number: !i " + str(ctrl.frame_number) +
+        "\n  steps_remaining: !i 0\n  paused: !b " + paused_str + "\n"
+    ctrl.step_job.reply <- GameReply{ok: true, err_code: "", err_msg: "", data: res}
+    << true
+}
+
+pub fn (ctrl $&GameControl) reject_step(reason string) int {
+    if !ctrl.has_step_job { << 0 }
+    ctrl.has_step_job = false
+    ctrl.step_job.reply <- GameReply{ok: false, err_code: "adapter_error", err_msg: reason, data: ""}
+    << 0
 }
 
 pub fn (ctrl &GameControl) screenshot_requested() bool {
