@@ -1,0 +1,237 @@
+@"github.com/xulang-org/nexus/timing"
+
+#encoding/json
+#errors
+#math
+#strconv
+#strings
+
+pub struct ScopeBudget {
+    pub name string
+    pub max_avg_ms f64
+    pub max_peak_ms f64
+}
+
+pub struct PerfBudget {
+    pub profile_name string
+    pub max_avg_ms f64
+    pub max_p95_ms f64
+    pub max_p99_ms f64
+    pub min_samples int
+    pub max_regression_ratio f64
+    pub scope_budgets []ScopeBudget
+}
+
+pub struct PerfViolation {
+    pub metric string
+    pub actual f64
+    pub limit f64
+    pub message string
+}
+
+pub struct PerfGateReport {
+    pub profile_name string
+    pub passed bool
+    pub frame_count int
+    pub summary ProfilerSummary
+    pub violations []PerfViolation
+}
+
+pub fn budget_desktop_60fps() PerfBudget {
+    << PerfBudget{
+        profile_name: "desktop_60fps",
+        max_avg_ms: 14.0,
+        max_p95_ms: 16.67,
+        max_p99_ms: 20.0,
+        min_samples: 10,
+        max_regression_ratio: 0.10,
+        scope_budgets: []ScopeBudget{}
+    }
+}
+
+pub fn budget_console_120fps() PerfBudget {
+    << PerfBudget{
+        profile_name: "console_120fps",
+        max_avg_ms: 7.0,
+        max_p95_ms: 8.33,
+        max_p99_ms: 10.5,
+        min_samples: 10,
+        max_regression_ratio: 0.10,
+        scope_budgets: []ScopeBudget{}
+    }
+}
+
+pub fn budget_switch_handheld_30fps() PerfBudget {
+    << PerfBudget{
+        profile_name: "switch_handheld_30fps",
+        max_avg_ms: 29.0,
+        max_p95_ms: 33.33,
+        max_p99_ms: 38.0,
+        min_samples: 10,
+        max_regression_ratio: 0.12,
+        scope_budgets: []ScopeBudget{}
+    }
+}
+
+pub fn budget_mobile_60fps() PerfBudget {
+    << PerfBudget{
+        profile_name: "mobile_60fps",
+        max_avg_ms: 14.5,
+        max_p95_ms: 16.67,
+        max_p99_ms: 22.0,
+        min_samples: 10,
+        max_regression_ratio: 0.12,
+        scope_budgets: []ScopeBudget{}
+    }
+}
+
+fn validate_budget(b &PerfBudget) int {
+    if b.profile_name.len == 0 || b.min_samples < 1 ||
+        math.is_nan(b.max_avg_ms) || math.is_inf(b.max_avg_ms) || b.max_avg_ms <= 0.0 ||
+        math.is_nan(b.max_p95_ms) || math.is_inf(b.max_p95_ms) || b.max_p95_ms <= 0.0 ||
+        math.is_nan(b.max_p99_ms) || math.is_inf(b.max_p99_ms) || b.max_p99_ms <= 0.0 ||
+        math.is_nan(b.max_regression_ratio) || math.is_inf(b.max_regression_ratio) || b.max_regression_ratio <= 0.0 {
+        >> errors.new("nexus perf gate: invalid PerfBudget threshold")
+    }
+    for i in 0:b.scope_budgets.len {
+        sb := &b.scope_budgets[i]
+        if sb.name.len == 0 || sb.max_avg_ms <= 0.0 || sb.max_peak_ms <= 0.0 ||
+            math.is_nan(sb.max_avg_ms) || math.is_nan(sb.max_peak_ms) {
+            >> errors.new("nexus perf gate: invalid scope budget for " + sb.name)
+        }
+    }
+    << 0
+}
+
+pub fn evaluate_perf_gate(profiler &FrameProfiler, budget &PerfBudget) PerfGateReport {
+    validate_budget(budget) or >>
+    sum := profiler.summary()
+    $violations := []PerfViolation{}
+    if sum.frame_count < budget.min_samples {
+        violations.push(PerfViolation{
+            metric: "min_samples",
+            actual: f64(sum.frame_count),
+            limit: f64(budget.min_samples),
+            message: "insufficient frames captured"
+        })
+    }
+    if sum.avg_ms > budget.max_avg_ms {
+        violations.push(PerfViolation{
+            metric: "avg_ms",
+            actual: sum.avg_ms,
+            limit: budget.max_avg_ms,
+            message: "average frame time exceeded budget"
+        })
+    }
+    if sum.p95_ms > budget.max_p95_ms {
+        violations.push(PerfViolation{
+            metric: "p95_ms",
+            actual: sum.p95_ms,
+            limit: budget.max_p95_ms,
+            message: "p95 frame time exceeded budget"
+        })
+    }
+    if sum.p99_ms > budget.max_p99_ms {
+        violations.push(PerfViolation{
+            metric: "p99_ms",
+            actual: sum.p99_ms,
+            limit: budget.max_p99_ms,
+            message: "p99 frame time exceeded budget"
+        })
+    }
+    for i in 0:budget.scope_budgets.len {
+        sb := &budget.scope_budgets[i]
+        sc := profiler.scope_stats(sb.name + "")
+        if sc.samples > 0 {
+            if sc.avg_ms > sb.max_avg_ms {
+                violations.push(PerfViolation{
+                    metric: "scope:" + sb.name + ":avg_ms",
+                    actual: sc.avg_ms,
+                    limit: sb.max_avg_ms,
+                    message: "scope average ms exceeded budget"
+                })
+            }
+            if sc.max_ms > sb.max_peak_ms {
+                violations.push(PerfViolation{
+                    metric: "scope:" + sb.name + ":peak_ms",
+                    actual: sc.max_ms,
+                    limit: sb.max_peak_ms,
+                    message: "scope peak ms exceeded budget"
+                })
+            }
+        }
+    }
+    << PerfGateReport{
+        profile_name: budget.profile_name + "",
+        passed: violations.len == 0,
+        frame_count: sum.frame_count,
+        summary: sum,
+        violations: violations
+    }
+}
+
+pub fn evaluate_perf_regression(profiler &FrameProfiler, baseline &ProfilerSummary, budget &PerfBudget) PerfGateReport {
+    $rep := evaluate_perf_gate(profiler, budget) or >>
+    $v := []PerfViolation{}
+    for i in 0:rep.violations.len {
+        pv := &rep.violations[i]
+        v.push(PerfViolation{metric: pv.metric + "", actual: pv.actual, limit: pv.limit, message: pv.message + ""})
+    }
+    if baseline.p95_ms > 0.001 && rep.summary.p95_ms > baseline.p95_ms * (1.0 + budget.max_regression_ratio) {
+        lim := baseline.p95_ms * (1.0 + budget.max_regression_ratio)
+        v.push(PerfViolation{
+            metric: "regression_p95_ms",
+            actual: rep.summary.p95_ms,
+            limit: lim,
+            message: "p95 regressed beyond baseline tolerance"
+        })
+    }
+    if baseline.avg_ms > 0.001 && rep.summary.avg_ms > baseline.avg_ms * (1.0 + budget.max_regression_ratio) {
+        lim := baseline.avg_ms * (1.0 + budget.max_regression_ratio)
+        v.push(PerfViolation{
+            metric: "regression_avg_ms",
+            actual: rep.summary.avg_ms,
+            limit: lim,
+            message: "avg regressed beyond baseline tolerance"
+        })
+    }
+    << PerfGateReport{
+        profile_name: rep.profile_name + "",
+        passed: v.len == 0,
+        frame_count: rep.frame_count,
+        summary: rep.summary,
+        violations: v
+    }
+}
+
+fn fmt_g(v f64) string {
+    << strconv.format_float(v, 102, 3) or (err) {
+        _ := err.msg()
+        << "0.000"
+    }
+}
+
+pub fn encode_gate_report_json(report &PerfGateReport) string {
+    $b := strings.new_byte_builder(512)
+    pname := report.profile_name + ""
+    $p_s := "false"
+    if report.passed { p_s = "true" }
+    b.write_str("{\n")
+    b.write_str("  \"profile_name\": " + json.quote(&pname) + ",\n")
+    b.write_str("  \"passed\": " + p_s + ",\n")
+    b.write_str("  \"frame_count\": " + str(report.frame_count) + ",\n")
+    b.write_str("  \"avg_ms\": " + fmt_g(report.summary.avg_ms) + ",\n")
+    b.write_str("  \"p95_ms\": " + fmt_g(report.summary.p95_ms) + ",\n")
+    b.write_str("  \"p99_ms\": " + fmt_g(report.summary.p99_ms) + ",\n")
+    b.write_str("  \"violations\": [")
+    for i in 0:report.violations.len {
+        if i > 0 { b.write_str(", ") }
+        v := &report.violations[i]
+        m_s := v.metric + ""
+        msg_s := v.message + ""
+        b.write_str("{\"metric\": " + json.quote(&m_s) + ", \"actual\": " + fmt_g(v.actual) +
+            ", \"limit\": " + fmt_g(v.limit) + ", \"message\": " + json.quote(&msg_s) + "}")
+    }
+    b.write_str("]\n}\n")
+    << b.to_string()
+}

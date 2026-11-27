@@ -1,0 +1,601 @@
+@"github.com/xulang-org/nexus/gameplay"
+
+#encoding/json
+#errors
+#math
+#strings
+
+pub const INV_FORMAT = "nexus.inventory"
+pub const INV_VERSION = 1
+
+pub const ITEM_CONSUMABLE = 0
+pub const ITEM_WEAPON = 1
+pub const ITEM_ARMOR = 2
+pub const ITEM_ACCESSORY = 3
+pub const ITEM_MATERIAL = 4
+pub const ITEM_QUEST = 5
+
+pub const RARITY_COMMON = 0
+pub const RARITY_UNCOMMON = 1
+pub const RARITY_RARE = 2
+pub const RARITY_EPIC = 3
+pub const RARITY_LEGENDARY = 4
+
+pub const EQUIP_NONE = -1
+pub const EQUIP_MAIN_HAND = 0
+pub const EQUIP_OFF_HAND = 1
+pub const EQUIP_HEAD = 2
+pub const EQUIP_CHEST = 3
+pub const EQUIP_LEGS = 4
+pub const EQUIP_ACCESSORY_1 = 5
+pub const EQUIP_ACCESSORY_2 = 6
+pub const EQUIP_SLOT_COUNT = 7
+
+pub struct ItemDef {
+    pub id string
+    pub name_key string
+    pub category int
+    pub rarity int
+    pub max_stack int
+    pub weight f64
+    pub equip_slot int
+    pub modifiers []StatModifier
+}
+
+pub struct ItemStack {
+    pub item_id string
+    pub count int
+}
+
+pub struct ItemRegistry {
+    defs []ItemDef
+}
+
+pub fn new_item_registry() ItemRegistry {
+    << ItemRegistry{defs: []ItemDef{}}
+}
+
+fn clone_item_mods(src &[]StatModifier) []StatModifier {
+    $out := []StatModifier{}
+    for i in 0:src.len {
+        m := &src[i]
+        out.push(StatModifier{
+            id: m.id + "",
+            source: m.source + "",
+            stat: m.stat + "",
+            op: m.op,
+            value: m.value,
+            priority: m.priority
+        })
+    }
+    << out
+}
+
+pub fn (reg $&ItemRegistry) register(def ItemDef) int {
+    if def.id.len == 0 || def.max_stack < 1 || def.weight < 0.0 ||
+        def.equip_slot < EQUIP_NONE || def.equip_slot >= EQUIP_SLOT_COUNT {
+        >> errors.new("nexus gameplay: invalid ItemDef")
+    }
+    for i in 0:reg.defs.len {
+        if reg.defs[i].id == def.id {
+            reg.defs[i] = def
+            << i
+        }
+    }
+    reg.defs.push(def)
+    << reg.defs.len - 1
+}
+
+fn item_idx(reg &ItemRegistry, id &string) int {
+    for i in 0:reg.defs.len {
+        if reg.defs[i].id == *id { << i }
+    }
+    << -1
+}
+
+pub fn (reg &ItemRegistry) has(id string) bool {
+    << item_idx(reg, &id) >= 0
+}
+
+pub fn (reg &ItemRegistry) get(id string) ItemDef {
+    idx := item_idx(reg, &id)
+    if idx < 0 { >> errors.new("nexus gameplay: unknown item_id " + id) }
+    d := &reg.defs[idx]
+    << ItemDef{
+        id: d.id + "",
+        name_key: d.name_key + "",
+        category: d.category,
+        rarity: d.rarity,
+        max_stack: d.max_stack,
+        weight: d.weight,
+        equip_slot: d.equip_slot,
+        modifiers: clone_item_mods(&d.modifiers)
+    }
+}
+
+pub struct Inventory {
+    pub capacity int
+    pub max_weight f64
+    pub gold int
+    pub slots []ItemStack
+}
+
+pub fn new_inventory(capacity int, max_weight f64) Inventory {
+    if capacity < 1 || capacity > 4096 || max_weight < 0.0 || math.is_nan(max_weight) || math.is_inf(max_weight) {
+        >> errors.new("nexus gameplay: invalid inventory capacity or max_weight")
+    }
+    $slots := []ItemStack{}
+    for _ in 0:capacity {
+        slots.push(ItemStack{item_id: "", count: 0})
+    }
+    << Inventory{capacity: capacity, max_weight: max_weight, gold: 0, slots: slots}
+}
+
+pub fn (inv &Inventory) total_weight(reg &ItemRegistry) f64 {
+    $sum := 0.0
+    for i in 0:inv.slots.len {
+        sl := &inv.slots[i]
+        if sl.count > 0 && sl.item_id.len > 0 {
+            idx := item_idx(reg, &sl.item_id)
+            if idx >= 0 {
+                sum += reg.defs[idx].weight * f64(sl.count)
+            }
+        }
+    }
+    << sum
+}
+
+// Adds up to `count` items respecting max_stack and max_weight; returns overflow count not added.
+pub fn (inv $&Inventory) add_item(reg &ItemRegistry, item_id string, count int) int {
+    if count < 0 { >> errors.new("nexus gameplay: add_item count cannot be negative") }
+    if count == 0 { << 0 }
+    d_idx := item_idx(reg, &item_id)
+    if d_idx < 0 { >> errors.new("nexus gameplay: unknown item_id " + item_id) }
+    def := &reg.defs[d_idx]
+
+    $can_add := count
+    if inv.max_weight > 0.0 && def.weight > 0.0 {
+        avail_w := math.max(0.0, inv.max_weight - inv.total_weight(reg))
+        max_by_w := int(math.floor((avail_w + 1e-9) / def.weight))
+        if max_by_w < can_add { can_add = max_by_w }
+    }
+    $rem := can_add
+    $overflow := count - can_add
+
+    // 1. Top up existing partial stacks.
+    for i in 0:inv.slots.len {
+        if rem <= 0 { <- }
+        sl := $&inv.slots[i]
+        if sl.item_id == item_id && sl.count > 0 && sl.count < def.max_stack {
+            space := def.max_stack - sl.count
+            take := gp_min_int(space, rem)
+            sl.count += take
+            rem -= take
+        }
+    }
+    // 2. Fill empty slots.
+    for i in 0:inv.slots.len {
+        if rem <= 0 { <- }
+        sl := $&inv.slots[i]
+        if sl.count == 0 || sl.item_id.len == 0 {
+            take := gp_min_int(def.max_stack, rem)
+            sl.item_id = item_id + ""
+            sl.count = take
+            rem -= take
+        }
+    }
+    << overflow + rem
+}
+
+pub fn (inv $&Inventory) remove_item(item_id string, count int) int {
+    if count < 0 { >> errors.new("nexus gameplay: remove_item count cannot be negative") }
+    if count == 0 { << 0 }
+    $need := count
+    $removed := 0
+    for i in 0:inv.slots.len {
+        if need <= 0 { <- }
+        sl := $&inv.slots[i]
+        if sl.item_id == item_id && sl.count > 0 {
+            take := gp_min_int(sl.count, need)
+            sl.count -= take
+            need -= take
+            removed += take
+            if sl.count == 0 { sl.item_id = "" }
+        }
+    }
+    << removed
+}
+
+pub fn (inv &Inventory) count_of(item_id string) int {
+    $sum := 0
+    for i in 0:inv.slots.len {
+        if inv.slots[i].item_id == item_id {
+            sum += inv.slots[i].count
+        }
+    }
+    << sum
+}
+
+pub fn (inv &Inventory) has_item(item_id string, min_count int) bool {
+    << inv.count_of(item_id) >= min_count
+}
+
+pub fn (inv $&Inventory) split_slot(slot_idx int, split_count int) int {
+    if slot_idx < 0 || slot_idx >= inv.slots.len {
+        >> errors.new("nexus gameplay: split_slot index out of range")
+    }
+    if split_count <= 0 || split_count >= inv.slots[slot_idx].count {
+        >> errors.new("nexus gameplay: split_count must be strictly between 0 and slot count")
+    }
+    for i in 0:inv.slots.len {
+        if inv.slots[i].count == 0 || inv.slots[i].item_id.len == 0 {
+            src_id := inv.slots[slot_idx].item_id + ""
+            inv.slots[slot_idx].count -= split_count
+            inv.slots[i] = ItemStack{item_id: src_id, count: split_count}
+            << i
+        }
+    }
+    >> errors.new("nexus gameplay: no empty slot available for split")
+}
+
+pub fn (inv $&Inventory) swap_slots(a int, b int) int {
+    if a < 0 || a >= inv.slots.len || b < 0 || b >= inv.slots.len {
+        >> errors.new("nexus gameplay: swap_slots index out of range")
+    }
+    if a == b { << 0 }
+    sa := ItemStack{item_id: inv.slots[a].item_id + "", count: inv.slots[a].count}
+    sb := ItemStack{item_id: inv.slots[b].item_id + "", count: inv.slots[b].count}
+    inv.slots[a] = sb
+    inv.slots[b] = sa
+    << 0
+}
+
+fn gp_str_less(a &string, b &string) bool {
+    n := gp_min_int(a.len, b.len)
+    for i in 0:n {
+        if a[i] != b[i] { << a[i] < b[i] }
+    }
+    << a.len < b.len
+}
+
+fn slot_precedes(reg &ItemRegistry, a &ItemStack, b &ItemStack) bool {
+    a_empty := a.count <= 0 || a.item_id.len == 0
+    b_empty := b.count <= 0 || b.item_id.len == 0
+    if a_empty != b_empty { << !a_empty }
+    if a_empty && b_empty { << false }
+    ia := item_idx(reg, &a.item_id)
+    ib := item_idx(reg, &b.item_id)
+    if ia >= 0 && ib >= 0 {
+        da := &reg.defs[ia]
+        db := &reg.defs[ib]
+        if da.rarity != db.rarity { << da.rarity > db.rarity }
+        if da.category != db.category { << da.category < db.category }
+    }
+    if a.item_id != b.item_id { << gp_str_less(&a.item_id, &b.item_id) }
+    << a.count > b.count
+}
+
+fn safe_swap_slots(inv $&Inventory, a int, b int) int {
+    << inv.swap_slots(a, b) or (err) {
+        _ := err.msg()
+        << 0
+    }
+}
+
+pub fn (inv $&Inventory) sort_by_rarity(reg &ItemRegistry) {
+    n := inv.slots.len
+    for i in 0:n {
+        $best := i
+        for j in (i + 1):n {
+            if slot_precedes(reg, &inv.slots[j], &inv.slots[best]) {
+                best = j
+            }
+        }
+        if best != i {
+            _ := safe_swap_slots(inv, i, best)
+        }
+    }
+}
+
+pub fn encode_inventory_json(inv &Inventory) string {
+    $b := strings.new_byte_builder(512)
+    fmt_s := INV_FORMAT + ""
+    b.write_str("{\n")
+    b.write_str("  \"format\": " + json.quote(&fmt_s) + ",\n")
+    b.write_str("  \"version\": " + str(INV_VERSION) + ",\n")
+    b.write_str("  \"capacity\": " + str(inv.capacity) + ",\n")
+    b.write_str("  \"max_weight\": " + gp_f64_str(inv.max_weight) + ",\n")
+    b.write_str("  \"gold\": " + str(inv.gold) + ",\n")
+    b.write_str("  \"slots\": [")
+    $first := true
+    for i in 0:inv.slots.len {
+        sl := &inv.slots[i]
+        if sl.count > 0 && sl.item_id.len > 0 {
+            if !first { b.write_str(", ") }
+            first = false
+            iid := sl.item_id + ""
+            b.write_str("{\"slot\": " + str(i) + ", \"item_id\": " + json.quote(&iid) + ", \"count\": " + str(sl.count) + "}")
+        }
+    }
+    b.write_str("]\n}\n")
+    << b.to_string()
+}
+
+pub fn decode_inventory_json(raw &string) Inventory {
+    if raw.len < 2 || raw.len > 4194304 {
+        >> errors.new("nexus gameplay: inventory JSON size out of bounds")
+    }
+    doc := json.parse_max(raw, 4194304)
+    if !doc.ok() { >> errors.new("nexus gameplay inventory JSON: " + doc.error()) }
+    root := doc.root()
+    if !doc.is_dict(root) || !doc.has(root, "format") || !doc.has(root, "version") ||
+        !doc.has(root, "capacity") || !doc.has(root, "slots") {
+        >> errors.new("nexus gameplay: missing required inventory JSON fields")
+    }
+    fmt_s := doc.as_string(doc.get(root, "format")) or >>
+    ver := doc.as_int(doc.get(root, "version")) or >>
+    if fmt_s != INV_FORMAT || ver != INV_VERSION {
+        >> errors.new("nexus gameplay: unsupported inventory format or version")
+    }
+    cap := doc.as_int(doc.get(root, "capacity")) or >>
+    $mw := 0.0
+    if doc.has(root, "max_weight") { mw = doc.as_f64(doc.get(root, "max_weight")) or >> }
+    $inv := new_inventory(cap, mw) or >>
+    if doc.has(root, "gold") { inv.gold = doc.as_int(doc.get(root, "gold")) or >> }
+    slots_arr := doc.get(root, "slots")
+    if !doc.is_list(slots_arr) { >> errors.new("nexus gameplay: slots must be JSON list") }
+    for i in 0:doc.count(slots_arr) {
+        node := doc.at(slots_arr, i)
+        idx := doc.as_int(doc.get(node, "slot")) or >>
+        iid := doc.as_string(doc.get(node, "item_id")) or >>
+        cnt := doc.as_int(doc.get(node, "count")) or >>
+        if idx < 0 || idx >= inv.capacity || cnt < 1 {
+            >> errors.new("nexus gameplay: invalid inventory slot entry")
+        }
+        inv.slots[idx] = ItemStack{item_id: iid + "", count: cnt}
+    }
+    << inv
+}
+
+// =========================================================================
+// Equipment Loadout (atomic stat modifier binding & inventory swaps)
+// =========================================================================
+
+pub struct EquipmentLoadout {
+    slots []string
+}
+
+pub fn new_equipment_loadout() EquipmentLoadout {
+    $s := []string{}
+    for _ in 0:EQUIP_SLOT_COUNT { s.push("") }
+    << EquipmentLoadout{slots: s}
+}
+
+pub fn (eq &EquipmentLoadout) equipped_in(slot int) string {
+    if slot < 0 || slot >= EQUIP_SLOT_COUNT {
+        >> errors.new("nexus gameplay: invalid equipment slot")
+    }
+    << eq.slots[slot] + ""
+}
+
+pub fn (eq &EquipmentLoadout) apply_to_stats(reg &ItemRegistry, stats $&StatSheet) int {
+    for slot in 0:EQUIP_SLOT_COUNT {
+        src_key := "equip:" + str(slot)
+        _ := stats.remove_by_source(src_key + "")
+        iid := eq.slots[slot] + ""
+        if iid.len > 0 {
+            d_idx := item_idx(reg, &iid)
+            if d_idx >= 0 {
+                mods := &reg.defs[d_idx].modifiers
+                for mi in 0:mods.len {
+                    m := &mods[mi]
+                    _ := stats.add_modifier(StatModifier{
+                        id: src_key + ":" + m.id + ":" + str(mi),
+                        source: src_key + "",
+                        stat: m.stat + "",
+                        op: m.op,
+                        value: m.value,
+                        priority: m.priority
+                    }) or >>
+                }
+            }
+        }
+    }
+    << 0
+}
+
+pub fn (eq $&EquipmentLoadout) equip_from_inventory(
+    inv $&Inventory,
+    reg &ItemRegistry,
+    stats $&StatSheet,
+    item_id string,
+    slot_override int
+) string {
+    d_idx := item_idx(reg, &item_id)
+    if d_idx < 0 { >> errors.new("nexus gameplay: unknown equipment item " + item_id) }
+    def := &reg.defs[d_idx]
+    if def.equip_slot == EQUIP_NONE {
+        >> errors.new("nexus gameplay: item is not equippable")
+    }
+    $target_slot := def.equip_slot
+    if slot_override != EQUIP_NONE {
+        is_acc := (def.equip_slot == EQUIP_ACCESSORY_1 || def.equip_slot == EQUIP_ACCESSORY_2) &&
+            (slot_override == EQUIP_ACCESSORY_1 || slot_override == EQUIP_ACCESSORY_2)
+        if slot_override != def.equip_slot && !is_acc {
+            >> errors.new("nexus gameplay: item cannot be equipped into target slot")
+        }
+        target_slot = slot_override
+    }
+    if !inv.has_item(item_id + "", 1) {
+        >> errors.new("nexus gameplay: item not found in inventory: " + item_id)
+    }
+    prev := eq.slots[target_slot] + ""
+    _ := inv.remove_item(item_id + "", 1) or >>
+    if prev.len > 0 {
+        ov := inv.add_item(reg, prev + "", 1) or >>
+        if ov > 0 {
+            // Rollback equip if inventory weight limit blocks swapping previous item back.
+            _ := inv.add_item(reg, item_id + "", 1) or >>
+            >> errors.new("nexus gameplay: insufficient inventory capacity to swap equipped item")
+        }
+    }
+    eq.slots[target_slot] = item_id + ""
+    eq.apply_to_stats(reg, stats) or >>
+    << prev
+}
+
+pub fn (eq $&EquipmentLoadout) unequip_to_inventory(
+    inv $&Inventory,
+    reg &ItemRegistry,
+    stats $&StatSheet,
+    slot int
+) string {
+    if slot < 0 || slot >= EQUIP_SLOT_COUNT {
+        >> errors.new("nexus gameplay: invalid equipment slot")
+    }
+    prev := eq.slots[slot] + ""
+    if prev.len == 0 { << "" }
+    ov := inv.add_item(reg, prev + "", 1) or >>
+    if ov > 0 {
+        >> errors.new("nexus gameplay: inventory full, cannot unequip item")
+    }
+    eq.slots[slot] = ""
+    eq.apply_to_stats(reg, stats) or >>
+    << prev
+}
+
+// =========================================================================
+// Weighted Loot Table with Deterministic Pity Guarantee
+// =========================================================================
+
+pub struct LootEntry {
+    pub item_id string
+    pub min_count int
+    pub max_count int
+    pub weight f64
+    pub guaranteed bool
+    pub is_rare_pity bool
+}
+
+pub struct LootTable {
+    pub id string
+    pub rolls int
+    pub pity_threshold int
+    pub misses_since_rare int
+    entries []LootEntry
+}
+
+pub fn new_loot_table(id string, rolls int, pity_threshold int) LootTable {
+    if id.len == 0 || rolls < 0 || pity_threshold < 0 {
+        >> errors.new("nexus gameplay: invalid LootTable parameters")
+    }
+    << LootTable{
+        id: id,
+        rolls: rolls,
+        pity_threshold: pity_threshold,
+        misses_since_rare: 0,
+        entries: []LootEntry{}
+    }
+}
+
+pub fn (lt $&LootTable) add_entry(entry LootEntry) int {
+    if entry.item_id.len == 0 || entry.min_count < 1 || entry.max_count < entry.min_count ||
+        (!entry.guaranteed && entry.weight <= 0.0) {
+        >> errors.new("nexus gameplay: invalid LootEntry")
+    }
+    lt.entries.push(entry)
+    << lt.entries.len - 1
+}
+
+fn safe_range_roll(rng $&GameplayRng, lo int, hi int) int {
+    << rng.range_int(lo, hi) or (err) {
+        _ := err.msg()
+        << lo
+    }
+}
+
+fn push_drop(out $&[]ItemStack, entry &LootEntry, rng $&GameplayRng) {
+    cnt := safe_range_roll(rng, entry.min_count, entry.max_count)
+    out.push(ItemStack{item_id: entry.item_id + "", count: cnt})
+}
+
+pub fn (lt $&LootTable) roll(rng $&GameplayRng) []ItemStack {
+    $out := []ItemStack{}
+    $got_rare := false
+
+    // 1. Emit guaranteed entries.
+    for i in 0:lt.entries.len {
+        e := &lt.entries[i]
+        if e.guaranteed {
+            push_drop($&out, e, rng)
+            if e.is_rare_pity { got_rare = true }
+        }
+    }
+
+    // 2. Compute non-guaranteed weighted pool & pity pool.
+    $total_w := 0.0
+    $pity_w := 0.0
+    for i in 0:lt.entries.len {
+        e := &lt.entries[i]
+        if !e.guaranteed {
+            total_w += e.weight
+            if e.is_rare_pity { pity_w += e.weight }
+        }
+    }
+
+    if lt.pity_threshold > 0 && pity_w > 0.0 && lt.misses_since_rare + 1 >= lt.pity_threshold && !got_rare {
+        // Force a rare pity roll!
+        target := rng.next_f64() * pity_w
+        $acc := 0.0
+        for i in 0:lt.entries.len {
+            e := &lt.entries[i]
+            if !e.guaranteed && e.is_rare_pity {
+                acc += e.weight
+                if acc >= target || i + 1 == lt.entries.len {
+                    push_drop($&out, e, rng)
+                    got_rare = true
+                    <-
+                }
+            }
+        }
+        $extra := gp_max_int(0, lt.rolls - 1)
+        for _ in 0:extra {
+            if total_w <= 0.0 { <- }
+            r := rng.next_f64() * total_w
+            $a := 0.0
+            for i in 0:lt.entries.len {
+                e := &lt.entries[i]
+                if !e.guaranteed {
+                    a += e.weight
+                    if a >= r {
+                        push_drop($&out, e, rng)
+                        <-
+                    }
+                }
+            }
+        }
+    } else if total_w > 0.0 {
+        for _ in 0:lt.rolls {
+            r := rng.next_f64() * total_w
+            $acc := 0.0
+            for i in 0:lt.entries.len {
+                e := &lt.entries[i]
+                if !e.guaranteed {
+                    acc += e.weight
+                    if acc >= r {
+                        push_drop($&out, e, rng)
+                        if e.is_rare_pity { got_rare = true }
+                        <-
+                    }
+                }
+            }
+        }
+    }
+
+    if got_rare {
+        lt.misses_since_rare = 0
+    } else {
+        lt.misses_since_rare += 1
+    }
+    << out
+}

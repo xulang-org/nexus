@@ -46,7 +46,12 @@ fn material_description(asset &gltf.GlbGeometry, index int) gltf.MaterialDescrip
 }
 pub fn upload_model(device &ren.Device3D, asset &gltf.GlbGeometry) GlbModel3D {
     check_static_model(asset) or >>
-    << upload_material_model(device,asset) or >>
+    << upload_material_model_mode(device, asset, false) or >>
+}
+
+pub fn upload_model_with_mikktspace(device &ren.Device3D, asset &gltf.GlbGeometry) GlbModel3D {
+    check_static_model(asset) or >>
+    << upload_material_model_mode(device, asset, true) or >>
 }
 fn check_static_model(asset &gltf.GlbGeometry) int {
     if asset.skin_count()>0 { >> errors.new("nexus GPU: skinned GLB requires upload_animated and explicit pose sampling") }
@@ -57,6 +62,10 @@ fn needs_uvs(description &gltf.MaterialDescription) bool {
         description.normal_texture >= 0 || description.occlusion_texture >= 0 || description.emission_texture >= 0
 }
 fn material_slots(asset &gltf.GlbGeometry) []int {
+    << material_slots_mode(asset, false) or >>
+}
+
+fn material_slots_mode(asset &gltf.GlbGeometry, auto_mikktspace bool) []int {
     if asset.primitive_count() < 1 { >> errors.new("nexus GPU: GLB has no primitives") }
     $slots := []int{}
     // Capability checks precede PNG decoding and every GPU resource allocation.
@@ -67,7 +76,7 @@ fn material_slots(asset &gltf.GlbGeometry) []int {
         if needs_uvs(&description) && !(asset.has_uvs(i) or >>) {
             >> errors.new("nexus GPU: PBR GLB maps require TEXCOORD_0")
         }
-        if description.normal_texture >= 0 && !(asset.has_tangents(i) or >>) { >> errors.new("nexus GPU: PBR GLB normal map requires authored tangents") }
+        if description.normal_texture >= 0 && !auto_mikktspace && !(asset.has_tangents(i) or >>) { >> errors.new("nexus GPU: PBR GLB normal map requires authored tangents") }
         slots.push(material_index + 1)
     }
     << slots
@@ -134,9 +143,13 @@ pub fn validate_static_model(asset &gltf.GlbGeometry) []StaticPrimitive3D {
     }
     << primitives
 }
-fn upload_material_model(device &ren.Device3D,asset &gltf.GlbGeometry) GlbModel3D {
+fn upload_material_model(device &ren.Device3D, asset &gltf.GlbGeometry) GlbModel3D {
+    << upload_material_model_mode(device, asset, false) or >>
+}
+
+fn upload_material_model_mode(device &ren.Device3D, asset &gltf.GlbGeometry, auto_mikktspace bool) GlbModel3D {
     device.backend() or >>
-    primitive_materials := material_slots(asset) or >>
+    primitive_materials := material_slots_mode(asset, auto_mikktspace) or >>
     $cache := texture_plan(asset) or >>
     $textures := []ren.Texture3D{}
     $decoded_pixels := 0
@@ -183,7 +196,7 @@ fn upload_material_model(device &ren.Device3D,asset &gltf.GlbGeometry) GlbModel3
         materials.push(material)
     }
     $meshes := []ren.Mesh3D{}
-    for i in 0:asset.primitive_count() { meshes.push(upload_primitive(device, asset, i) or >>) }
+    for i in 0:asset.primitive_count() { meshes.push(upload_primitive_with_mikktspace(device, asset, i, auto_mikktspace) or >>) }
     << GlbModel3D{source_hash: asset.content_hash(), meshes: meshes, textures: textures, materials: materials, primitive_materials: primitive_materials, closed: false}
 }
 fn decode_model_image(asset &gltf.GlbGeometry,index int,raw &[]int,limit int) images.ImageRGBA8 {

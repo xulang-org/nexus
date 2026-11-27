@@ -1,0 +1,515 @@
+@"github.com/xulang-org/nexus/gameplay"
+
+#encoding/json
+#errors
+#strings
+
+pub const QUEST_FORMAT = "nexus.quests"
+pub const QUEST_VERSION = 1
+
+pub const QUEST_LOCKED = 0
+pub const QUEST_AVAILABLE = 1
+pub const QUEST_ACTIVE = 2
+pub const QUEST_READY = 3
+pub const QUEST_COMPLETED = 4
+pub const QUEST_FAILED = 5
+
+pub const OBJ_KILL = 0
+pub const OBJ_COLLECT = 1
+pub const OBJ_REACH = 2
+pub const OBJ_TALK = 3
+pub const OBJ_CUSTOM = 4
+
+pub struct QuestObjective {
+    pub id string
+    pub desc_key string
+    pub kind int
+    pub target_id string
+    pub required int
+    pub current int
+    pub optional bool
+}
+
+pub struct QuestReward {
+    pub xp int
+    pub gold int
+    pub items []ItemStack
+}
+
+pub struct QuestDef {
+    pub id string
+    pub title_key string
+    pub prereq_ids []string
+    pub objectives []QuestObjective
+    pub reward QuestReward
+}
+
+struct QuestEntry {
+    def QuestDef
+    state int
+}
+
+pub struct QuestJournal {
+    quests []QuestEntry
+}
+
+pub fn new_quest_journal() QuestJournal {
+    << QuestJournal{quests: []QuestEntry{}}
+}
+
+fn clone_str_arr(src &[]string) []string {
+    $out := []string{}
+    for i in 0:src.len { out.push(src[i] + "") }
+    << out
+}
+
+fn clone_objs(src &[]QuestObjective) []QuestObjective {
+    $out := []QuestObjective{}
+    for i in 0:src.len {
+        o := &src[i]
+        out.push(QuestObjective{
+            id: o.id + "",
+            desc_key: o.desc_key + "",
+            kind: o.kind,
+            target_id: o.target_id + "",
+            required: o.required,
+            current: o.current,
+            optional: o.optional
+        })
+    }
+    << out
+}
+
+fn clone_stacks(src &[]ItemStack) []ItemStack {
+    $out := []ItemStack{}
+    for i in 0:src.len {
+        s := &src[i]
+        out.push(ItemStack{item_id: s.item_id + "", count: s.count})
+    }
+    << out
+}
+
+fn clone_reward(r &QuestReward) QuestReward {
+    << QuestReward{xp: r.xp, gold: r.gold, items: clone_stacks(&r.items)}
+}
+
+fn clone_quest_def(d &QuestDef) QuestDef {
+    << QuestDef{
+        id: d.id + "",
+        title_key: d.title_key + "",
+        prereq_ids: clone_str_arr(&d.prereq_ids),
+        objectives: clone_objs(&d.objectives),
+        reward: clone_reward(&d.reward)
+    }
+}
+
+fn quest_idx(q &QuestJournal, id &string) int {
+    for i in 0:q.quests.len {
+        if q.quests[i].def.id == *id { << i }
+    }
+    << -1
+}
+
+fn prereqs_met(q &QuestJournal, prereqs &[]string) bool {
+    for pi in 0:prereqs.len {
+        qi := quest_idx(q, &prereqs[pi])
+        if qi < 0 || q.quests[qi].state != QUEST_COMPLETED {
+            << false
+        }
+    }
+    << true
+}
+
+fn refresh_locked_quests(q $&QuestJournal) {
+    for i in 0:q.quests.len {
+        if q.quests[i].state == QUEST_LOCKED {
+            if prereqs_met(q, &q.quests[i].def.prereq_ids) {
+                q.quests[i].state = QUEST_AVAILABLE
+            }
+        }
+    }
+}
+
+fn all_required_done(objs &[]QuestObjective) bool {
+    for i in 0:objs.len {
+        o := &objs[i]
+        if !o.optional && o.current < o.required {
+            << false
+        }
+    }
+    << true
+}
+
+pub fn (q $&QuestJournal) register(def &QuestDef) int {
+    if def.id.len == 0 || def.objectives.len == 0 {
+        >> errors.new("nexus gameplay: quest id and objectives must be non-empty")
+    }
+    for i in 0:def.objectives.len {
+        if def.objectives[i].id.len == 0 || def.objectives[i].required < 1 {
+            >> errors.new("nexus gameplay: invalid quest objective")
+        }
+    }
+    $state := QUEST_AVAILABLE
+    if def.prereq_ids.len > 0 && !prereqs_met(q, &def.prereq_ids) {
+        state = QUEST_LOCKED
+    }
+    existing := quest_idx(q, &def.id)
+    if existing >= 0 {
+        q.quests[existing] = QuestEntry{def: clone_quest_def(def), state: state}
+        refresh_locked_quests(q)
+        << existing
+    }
+    q.quests.push(QuestEntry{def: clone_quest_def(def), state: state})
+    refresh_locked_quests(q)
+    << q.quests.len - 1
+}
+
+pub fn (q $&QuestJournal) accept(quest_id string) int {
+    idx := quest_idx(q, &quest_id)
+    if idx < 0 { >> errors.new("nexus gameplay: unknown quest " + quest_id) }
+    if q.quests[idx].state != QUEST_AVAILABLE {
+        >> errors.new("nexus gameplay: quest is not available to accept: " + quest_id)
+    }
+    q.quests[idx].state = QUEST_ACTIVE
+    if all_required_done(&q.quests[idx].def.objectives) {
+        q.quests[idx].state = QUEST_READY
+    }
+    << 0
+}
+
+pub fn (q $&QuestJournal) notify_event(kind int, target_id string, amount int) []string {
+    $newly_ready := []string{}
+    if amount <= 0 { << newly_ready }
+    for qi in 0:q.quests.len {
+        qe := $&q.quests[qi]
+        if qe.state != QUEST_ACTIVE { -> }
+        $changed := false
+        for oi in 0:qe.def.objectives.len {
+            ob := $&qe.def.objectives[oi]
+            if ob.kind == kind && ob.target_id == target_id && ob.current < ob.required {
+                $next := ob.current + amount
+                if next > ob.required { next = ob.required }
+                ob.current = next
+                changed = true
+            }
+        }
+        if changed && all_required_done(&qe.def.objectives) {
+            qe.state = QUEST_READY
+            newly_ready.push(qe.def.id + "")
+        }
+    }
+    << newly_ready
+}
+
+pub fn (q $&QuestJournal) complete(quest_id string) QuestReward {
+    idx := quest_idx(q, &quest_id)
+    if idx < 0 { >> errors.new("nexus gameplay: unknown quest " + quest_id) }
+    if q.quests[idx].state != QUEST_READY {
+        >> errors.new("nexus gameplay: quest is not ready to complete: " + quest_id)
+    }
+    q.quests[idx].state = QUEST_COMPLETED
+    rew := clone_reward(&q.quests[idx].def.reward)
+    refresh_locked_quests(q)
+    << rew
+}
+
+pub fn (q $&QuestJournal) fail(quest_id string) int {
+    idx := quest_idx(q, &quest_id)
+    if idx < 0 { >> errors.new("nexus gameplay: unknown quest " + quest_id) }
+    st := q.quests[idx].state
+    if st != QUEST_ACTIVE && st != QUEST_READY {
+        >> errors.new("nexus gameplay: only active/ready quest can fail: " + quest_id)
+    }
+    q.quests[idx].state = QUEST_FAILED
+    << 0
+}
+
+pub fn (q &QuestJournal) state_of(quest_id string) int {
+    idx := quest_idx(q, &quest_id)
+    if idx < 0 { << -1 }
+    << q.quests[idx].state
+}
+
+pub fn (q &QuestJournal) objective_progress(quest_id string, obj_id string) int {
+    idx := quest_idx(q, &quest_id)
+    if idx < 0 { << -1 }
+    objs := &q.quests[idx].def.objectives
+    for i in 0:objs.len {
+        if objs[i].id == obj_id { << objs[i].current }
+    }
+    << -1
+}
+
+pub fn encode_journal_json(q &QuestJournal) string {
+    $b := strings.new_byte_builder(512)
+    fmt_s := QUEST_FORMAT + ""
+    b.write_str("{\n")
+    b.write_str("  \"format\": " + json.quote(&fmt_s) + ",\n")
+    b.write_str("  \"version\": " + str(QUEST_VERSION) + ",\n")
+    b.write_str("  \"quests\": [")
+    for i in 0:q.quests.len {
+        if i > 0 { b.write_str(", ") }
+        qe := &q.quests[i]
+        qid := qe.def.id + ""
+        b.write_str("{\"id\": " + json.quote(&qid) + ", \"state\": " + str(qe.state) + ", \"objectives\": [")
+        for oi in 0:qe.def.objectives.len {
+            if oi > 0 { b.write_str(", ") }
+            ob := &qe.def.objectives[oi]
+            oid := ob.id + ""
+            b.write_str("{\"id\": " + json.quote(&oid) + ", \"current\": " + str(ob.current) + "}")
+        }
+        b.write_str("]}")
+    }
+    b.write_str("]\n}\n")
+    << b.to_string()
+}
+
+pub fn decode_journal_json(raw &string, defs &[]QuestDef) QuestJournal {
+    if raw.len < 2 || raw.len > 4194304 {
+        >> errors.new("nexus gameplay: journal JSON size out of bounds")
+    }
+    doc := json.parse_max(raw, 4194304)
+    if !doc.ok() { >> errors.new("nexus gameplay journal JSON: " + doc.error()) }
+    root := doc.root()
+    if !doc.is_dict(root) || !doc.has(root, "format") || !doc.has(root, "version") || !doc.has(root, "quests") {
+        >> errors.new("nexus gameplay: missing required journal JSON fields")
+    }
+    fmt_s := doc.as_string(doc.get(root, "format")) or >>
+    ver := doc.as_int(doc.get(root, "version")) or >>
+    if fmt_s != QUEST_FORMAT || ver != QUEST_VERSION {
+        >> errors.new("nexus gameplay: unsupported journal format or version")
+    }
+
+    $q := new_quest_journal()
+    for i in 0:defs.len {
+        _ := q.register(&defs[i]) or >>
+    }
+    arr := doc.get(root, "quests")
+    if !doc.is_list(arr) { >> errors.new("nexus gameplay: quests must be JSON list") }
+    for i in 0:doc.count(arr) {
+        qn := doc.at(arr, i)
+        qid := doc.as_string(doc.get(qn, "id")) or >>
+        st := doc.as_int(doc.get(qn, "state")) or >>
+        qi := quest_idx(&q, &qid)
+        if qi < 0 { -> }
+        if st < QUEST_LOCKED || st > QUEST_FAILED {
+            >> errors.new("nexus gameplay: invalid quest state in JSON")
+        }
+        q.quests[qi].state = st
+        if doc.has(qn, "objectives") {
+            oarr := doc.get(qn, "objectives")
+            if doc.is_list(oarr) {
+                for oi in 0:doc.count(oarr) {
+                    on := doc.at(oarr, oi)
+                    oid := doc.as_string(doc.get(on, "id")) or >>
+                    cur := doc.as_int(doc.get(on, "current")) or >>
+                    for k in 0:q.quests[qi].def.objectives.len {
+                        if q.quests[qi].def.objectives[k].id == oid {
+                            q.quests[qi].def.objectives[k].current = cur
+                        }
+                    }
+                }
+            }
+        }
+    }
+    << q
+}
+
+// =========================================================================
+// Branching Dialogue Graph
+// =========================================================================
+
+pub const DCOND_NONE = 0
+pub const DCOND_FLAG_TRUE = 1
+pub const DCOND_FLAG_FALSE = 2
+pub const DCOND_HAS_ITEM = 3
+pub const DCOND_STAT_GE = 4
+pub const DCOND_QUEST_STATE = 5
+
+pub const DEFF_SET_FLAG = 0
+pub const DEFF_CLEAR_FLAG = 1
+pub const DEFF_START_QUEST = 2
+pub const DEFF_ADVANCE_TALK = 3
+pub const DEFF_GIVE_ITEM = 4
+pub const DEFF_TAKE_ITEM = 5
+pub const DEFF_ADD_GOLD = 6
+
+pub struct DialogueCondition {
+    pub kind int
+    pub key string
+    pub threshold f64
+    pub int_val int
+}
+
+pub fn cond_none() DialogueCondition {
+    << DialogueCondition{kind: DCOND_NONE, key: "", threshold: 0.0, int_val: 0}
+}
+
+pub struct DialogueEffect {
+    pub kind int
+    pub key string
+    pub amount int
+}
+
+pub struct DialogueChoice {
+    pub text_key string
+    pub next_node string
+    pub condition DialogueCondition
+    pub effects []DialogueEffect
+}
+
+pub struct DialogueNode {
+    pub id string
+    pub speaker_key string
+    pub text_key string
+    pub choices []DialogueChoice
+    pub on_enter []DialogueEffect
+}
+
+pub struct DialogueTransition {
+    pub next_node string
+    pub ended bool
+    pub effects []DialogueEffect
+}
+
+pub struct DialogueGraph {
+    pub id string
+    nodes []DialogueNode
+}
+
+pub fn new_dialogue_graph(id string) DialogueGraph {
+    if id.len == 0 { >> errors.new("nexus gameplay: dialogue graph id cannot be empty") }
+    << DialogueGraph{id: id, nodes: []DialogueNode{}}
+}
+
+pub fn (g $&DialogueGraph) add_node(node DialogueNode) int {
+    if node.id.len == 0 { >> errors.new("nexus gameplay: dialogue node id cannot be empty") }
+    for i in 0:g.nodes.len {
+        if g.nodes[i].id == node.id {
+            g.nodes[i] = node
+            << i
+        }
+    }
+    g.nodes.push(node)
+    << g.nodes.len - 1
+}
+
+fn dnode_idx(g &DialogueGraph, node_id &string) int {
+    for i in 0:g.nodes.len {
+        if g.nodes[i].id == *node_id { << i }
+    }
+    << -1
+}
+
+fn has_flag(flags &[]string, key &string) bool {
+    for i in 0:flags.len {
+        if flags[i] == *key { << true }
+    }
+    << false
+}
+
+fn eval_dialogue_cond(
+    cond &DialogueCondition,
+    flags &[]string,
+    stats &StatSheet,
+    inv &Inventory,
+    journal &QuestJournal
+) bool {
+    if cond.kind == DCOND_NONE { << true }
+    if cond.kind == DCOND_FLAG_TRUE { << has_flag(flags, &cond.key) }
+    if cond.kind == DCOND_FLAG_FALSE { << !has_flag(flags, &cond.key) }
+    if cond.kind == DCOND_HAS_ITEM {
+        req := cond.int_val
+        if req <= 0 { << inv.has_item(cond.key + "", 1) }
+        << inv.has_item(cond.key + "", req)
+    }
+    if cond.kind == DCOND_STAT_GE {
+        << stats.get_or(cond.key + "", -1e18) >= cond.threshold
+    }
+    if cond.kind == DCOND_QUEST_STATE {
+        << journal.state_of(cond.key + "") == cond.int_val
+    }
+    << false
+}
+
+fn clone_effects(src &[]DialogueEffect) []DialogueEffect {
+    $out := []DialogueEffect{}
+    for i in 0:src.len {
+        e := &src[i]
+        out.push(DialogueEffect{kind: e.kind, key: e.key + "", amount: e.amount})
+    }
+    << out
+}
+
+pub fn (g &DialogueGraph) node_text_key(node_id string) string {
+    idx := dnode_idx(g, &node_id)
+    if idx < 0 { >> errors.new("nexus gameplay: unknown dialogue node " + node_id) }
+    << g.nodes[idx].text_key + ""
+}
+
+pub fn (g &DialogueGraph) node_speaker_key(node_id string) string {
+    idx := dnode_idx(g, &node_id)
+    if idx < 0 { >> errors.new("nexus gameplay: unknown dialogue node " + node_id) }
+    << g.nodes[idx].speaker_key + ""
+}
+
+pub fn (g &DialogueGraph) choice_text_key(node_id string, choice_idx int) string {
+    idx := dnode_idx(g, &node_id)
+    if idx < 0 { >> errors.new("nexus gameplay: unknown dialogue node " + node_id) }
+    if choice_idx < 0 || choice_idx >= g.nodes[idx].choices.len {
+        >> errors.new("nexus gameplay: dialogue choice index out of range")
+    }
+    << g.nodes[idx].choices[choice_idx].text_key + ""
+}
+
+pub fn (g &DialogueGraph) available_choices(
+    node_id string,
+    flags &[]string,
+    stats &StatSheet,
+    inv &Inventory,
+    journal &QuestJournal
+) []int {
+    idx := dnode_idx(g, &node_id)
+    if idx < 0 { >> errors.new("nexus gameplay: unknown dialogue node " + node_id) }
+    $out := []int{}
+    choices := &g.nodes[idx].choices
+    for i in 0:choices.len {
+        if eval_dialogue_cond(&choices[i].condition, flags, stats, inv, journal) {
+            out.push(i)
+        }
+    }
+    << out
+}
+
+pub fn (g &DialogueGraph) select_choice(
+    node_id string,
+    choice_idx int,
+    flags &[]string,
+    stats &StatSheet,
+    inv &Inventory,
+    journal &QuestJournal
+) DialogueTransition {
+    idx := dnode_idx(g, &node_id)
+    if idx < 0 { >> errors.new("nexus gameplay: unknown dialogue node " + node_id) }
+    choices := &g.nodes[idx].choices
+    if choice_idx < 0 || choice_idx >= choices.len {
+        >> errors.new("nexus gameplay: dialogue choice index out of range")
+    }
+    ch := &choices[choice_idx]
+    if !eval_dialogue_cond(&ch.condition, flags, stats, inv, journal) {
+        >> errors.new("nexus gameplay: dialogue choice condition not satisfied")
+    }
+    $effs := clone_effects(&ch.effects)
+    next_id := ch.next_node + ""
+    $ended := next_id.len == 0
+    if !ended {
+        nidx := dnode_idx(g, &next_id)
+        if nidx >= 0 {
+            enter_eff := clone_effects(&g.nodes[nidx].on_enter)
+            for i in 0:enter_eff.len {
+                effs.push(enter_eff[i])
+            }
+        }
+    }
+    << DialogueTransition{next_node: next_id, ended: ended, effects: effs}
+}

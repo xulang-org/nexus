@@ -1,6 +1,7 @@
 @"github.com/xulang-org/nexus/integration/project"
 
 resource #"github.com/xulang-org/nexus/resources/scene"
+rp #"github.com/xulang-org/nexus/resources/project"
 node_files #"github.com/xulang-org/nexus/integration/scene"
 scene_fmt #"github.com/xulang-org/nexus/formats/scene"
 snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
@@ -26,6 +27,37 @@ pub struct Project {
     pub directory string
     pub scenes []Entry
     pub assets []Entry
+    pub has_meta bool
+    pub meta rp.ProjectMeta
+    pub has_paths bool
+    pub paths rp.ProjectPaths
+    pub has_platforms bool
+    pub platforms rp.ProjectPlatformConfigs
+}
+
+pub fn make_project(path string, directory string, scenes []Entry, assets []Entry) Project {
+    << Project{
+        path: path,
+        directory: directory,
+        scenes: scenes,
+        assets: assets,
+        has_meta: false,
+        meta: rp.empty_meta(),
+        has_paths: false,
+        paths: rp.empty_paths(),
+        has_platforms: false,
+        platforms: rp.empty_platforms()
+    }
+}
+
+pub fn (project &Project) entry_scene_key() string {
+    if project.has_meta && project.meta.entry_scene.len > 0 {
+        << project.meta.entry_scene + ""
+    }
+    if project.scenes.len > 0 {
+        << project.scenes[0].key + ""
+    }
+    << ""
 }
 
 pub fn dict_unique_keys(doc &json.Doc, obj int, label &string) []string {
@@ -224,9 +256,16 @@ fn load_project_with_relocating(path string, allow_missing_uid string) Project {
     }
     root := doc.root()
     root_keys := dict_unique_keys(&doc, root, &"project root") or >>
-    if root_keys.len != 4 || !doc.has(root, "format") || !doc.has(root, "version") ||
+    if !doc.has(root, "format") || !doc.has(root, "version") ||
         !doc.has(root, "assets") || !doc.has(root, "scenes") {
         >> errors.new("nexus project: invalid project manifest fields (expected format, version, assets, scenes)")
+    }
+    for ki in 0:root_keys.len {
+        rk := root_keys[ki] + ""
+        if rk != "format" && rk != "version" && rk != "meta" && rk != "paths" && rk != "platforms" &&
+            rk != "assets" && rk != "scenes" {
+            >> errors.new("nexus project: unknown project manifest field '" + rk + "'")
+        }
     }
     format := doc.as_string(doc.get(root, "format")) or >>
     if format != FORMAT {
@@ -235,6 +274,27 @@ fn load_project_with_relocating(path string, allow_missing_uid string) Project {
     version := doc.as_int(doc.get(root, "version")) or >>
     if version != VERSION {
         >> errors.new("nexus project: unsupported version " + str(version))
+    }
+
+    $has_meta := false
+    $meta := rp.empty_meta()
+    if doc.has(root, "meta") {
+        has_meta = true
+        meta = rp.decode_meta_node(&doc, doc.get(root, "meta")) or >>
+    }
+
+    $has_paths := false
+    $paths := rp.empty_paths()
+    if doc.has(root, "paths") {
+        has_paths = true
+        paths = rp.decode_paths_node(&doc, doc.get(root, "paths")) or >>
+    }
+
+    $has_platforms := false
+    $platforms := rp.empty_platforms()
+    if doc.has(root, "platforms") {
+        has_platforms = true
+        platforms = rp.decode_platforms_node(&doc, doc.get(root, "platforms")) or >>
     }
 
     assets_node := doc.get(root, "assets")
@@ -270,12 +330,48 @@ fn load_project_with_relocating(path string, allow_missing_uid string) Project {
     if scenes.len == 0 {
         >> errors.new("nexus project: project manifest must declare at least one scene")
     }
-    << Project{path: abs_path, directory: directory, scenes: scenes, assets: assets}
+    if has_meta && meta.entry_scene.len > 0 {
+        $entry_found := false
+        for si in 0:scenes.len {
+            if scenes[si].key == meta.entry_scene {
+                entry_found = true
+                <-
+            }
+        }
+        if !entry_found {
+            >> errors.new("nexus project: entry_scene '" + meta.entry_scene + "' not declared in scenes")
+        }
+    }
+    << Project{
+        path: abs_path,
+        directory: directory,
+        scenes: scenes,
+        assets: assets,
+        has_meta: has_meta,
+        meta: meta,
+        has_paths: has_paths,
+        paths: paths,
+        has_platforms: has_platforms,
+        platforms: platforms
+    }
 }
 
 pub fn save_project_manifest(project &Project) int {
     $out := strings.new_byte_builder(1024)
-    out.write_str("{\n  \"format\": \"nexus.project\",\n  \"version\": 1,\n  \"assets\": {")
+    out.write_str("{\n  \"format\": \"nexus.project\",\n  \"version\": 1,")
+    if project.has_meta {
+        meta_json := rp.encode_meta_json(&project.meta, "  ") or >>
+        out.write_str("\n  \"meta\": " + meta_json + ",")
+    }
+    if project.has_paths {
+        paths_json := rp.encode_paths_json(&project.paths, "  ") or >>
+        out.write_str("\n  \"paths\": " + paths_json + ",")
+    }
+    if project.has_platforms {
+        plats_json := rp.encode_platforms_json(&project.platforms, "  ") or >>
+        out.write_str("\n  \"platforms\": " + plats_json + ",")
+    }
+    out.write_str("\n  \"assets\": {")
     for i in 0:project.assets.len {
         if i > 0 { out.write_str(",") }
         a := project.assets[i]
@@ -393,7 +489,11 @@ pub fn create_scene(project_path string, raw_key string, raw_root_name string) s
     if project.scene_index(&key) >= 0 {
         >> errors.new("nexus project: scene '" + key + "' already exists")
     }
-    rel := relative_file(&("assets/" + key)) or >>
+    $scene_dir := "assets"
+    if project.has_paths && project.paths.scenes.len > 0 {
+        scene_dir = project.paths.scenes + ""
+    }
+    rel := relative_file(&(scene_dir + "/" + key)) or >>
     dest := resolve_project_path(&project.directory, &rel, false) or >>
     if path_exists(dest + "") {
         >> errors.new("nexus project: destination file already exists: " + rel)
@@ -523,7 +623,15 @@ pub fn rename_scene(project_path string, old_key string, raw_new_key string) str
     ensure_parent_dir(&dest) or >>
     os.rename(old_resolved + "", dest + "") or >>
     project.scenes[idx] = Entry{key: new_key + "", path: next_rel, resolved: dest + ""}
+    $old_entry := ""
+    $changed_entry := false
+    if project.has_meta && project.meta.entry_scene == old_key {
+        old_entry = project.meta.entry_scene + ""
+        project.meta.entry_scene = new_key + ""
+        changed_entry = true
+    }
     save_project_manifest(&project) or (err) {
+        if changed_entry { project.meta.entry_scene = old_entry }
         _ := os.rename(dest + "", old_resolved + "")
         >> err
     }
@@ -561,6 +669,9 @@ pub fn delete_scene(project_path string, target_key string) int {
     $project := load_project(project_path) or >>
     if project.scenes.len <= 1 {
         >> errors.new("nexus project: cannot delete the last scene in a project")
+    }
+    if project.has_meta && project.meta.entry_scene == target_key {
+        >> errors.new("nexus project: cannot delete active entry_scene '" + target_key + "'")
     }
     idx := project.scene_index(&target_key)
     if idx < 0 {

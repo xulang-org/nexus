@@ -10,6 +10,7 @@ pub const BILLBOARD_Y_AXIS = 2
 
 pub const ALPHA_MODE_OPAQUE = 0
 pub const ALPHA_MODE_CUTOUT = 1
+pub const ALPHA_MODE_BLEND = 2
 
 pub const MAX_SPRITES_3D = 4096
 
@@ -22,6 +23,7 @@ pub struct Sprite3D {
     pub billboard int
     pub alpha_mode int
     pub alpha_cutoff f64
+    pub opacity f64
     pub double_sided bool
     pub cast_shadow bool
     pub shaded bool
@@ -39,6 +41,7 @@ pub fn sprite_3d(size fm.Vec2) Sprite3D {
         billboard: BILLBOARD_Y_AXIS,
         alpha_mode: ALPHA_MODE_CUTOUT,
         alpha_cutoff: 0.5,
+        opacity: 1.0,
         double_sided: true,
         cast_shadow: true,
         shaded: true,
@@ -69,17 +72,27 @@ pub fn (spec &Sprite3D) validate() int {
     if spec.billboard < BILLBOARD_DISABLED || spec.billboard > BILLBOARD_Y_AXIS {
         >> errors.new("nexus sprite3d: unsupported billboard mode")
     }
-    if spec.alpha_mode != ALPHA_MODE_OPAQUE && spec.alpha_mode != ALPHA_MODE_CUTOUT {
+    if spec.alpha_mode != ALPHA_MODE_OPAQUE && spec.alpha_mode != ALPHA_MODE_CUTOUT &&
+        spec.alpha_mode != ALPHA_MODE_BLEND {
         >> errors.new("nexus sprite3d: unsupported alpha mode")
     }
     if !fm.finite(spec.alpha_cutoff) || spec.alpha_cutoff < 0.0 || spec.alpha_cutoff > 1.0 {
         >> errors.new("nexus sprite3d: alpha cutoff must be finite and in 0...1")
+    }
+    if !fm.finite(spec.opacity) || spec.opacity < 0.0 || spec.opacity > 1.0 {
+        >> errors.new("nexus sprite3d: opacity must be finite and in 0...1")
     }
     if spec.alpha_mode == ALPHA_MODE_CUTOUT && spec.alpha_cutoff <= 0.0 {
         >> errors.new("nexus sprite3d: cutout mode requires alpha cutoff > 0")
     }
     if spec.alpha_mode == ALPHA_MODE_OPAQUE && spec.alpha_cutoff != 0.0 {
         >> errors.new("nexus sprite3d: opaque mode requires alpha cutoff == 0")
+    }
+    if spec.alpha_mode == ALPHA_MODE_BLEND && spec.alpha_cutoff != 0.0 {
+        >> errors.new("nexus sprite3d: blend mode requires alpha cutoff == 0")
+    }
+    if spec.alpha_mode != ALPHA_MODE_BLEND && spec.opacity != 1.0 {
+        >> errors.new("nexus sprite3d: opaque/cutout modes require opacity == 1.0")
     }
     if !spec.tint.is_finite() || spec.tint.x < 0.0 || spec.tint.y < 0.0 || spec.tint.z < 0.0 ||
         spec.tint.x > 1.0 || spec.tint.y > 1.0 || spec.tint.z > 1.0 {
@@ -93,6 +106,10 @@ pub fn (spec &Sprite3D) effective_alpha_cutoff() f64 {
     << 0.0
 }
 
+pub fn (spec &Sprite3D) is_alpha_blended() bool {
+    << spec.alpha_mode == ALPHA_MODE_BLEND
+}
+
 pub fn (spec &Sprite3D) clone() Sprite3D {
     << Sprite3D{
         size: spec.size,
@@ -101,6 +118,7 @@ pub fn (spec &Sprite3D) clone() Sprite3D {
         billboard: spec.billboard,
         alpha_mode: spec.alpha_mode,
         alpha_cutoff: spec.alpha_cutoff,
+        opacity: spec.opacity,
         double_sided: spec.double_sided,
         cast_shadow: spec.cast_shadow,
         shaded: spec.shaded,
@@ -134,6 +152,7 @@ pub fn (spec &Sprite3D) with_billboard(mode int) Sprite3D {
 
 pub fn (spec &Sprite3D) with_alpha_cutout(cutoff f64) Sprite3D {
     $next := spec.clone()
+    next.opacity = 1.0
     if cutoff == 0.0 {
         next.alpha_mode = ALPHA_MODE_OPAQUE
         next.alpha_cutoff = 0.0
@@ -141,6 +160,23 @@ pub fn (spec &Sprite3D) with_alpha_cutout(cutoff f64) Sprite3D {
         next.alpha_mode = ALPHA_MODE_CUTOUT
         next.alpha_cutoff = cutoff
     }
+    next.validate() or >>
+    << next
+}
+
+pub fn (spec &Sprite3D) with_alpha_blend(opacity f64) Sprite3D {
+    $next := spec.clone()
+    next.alpha_mode = ALPHA_MODE_BLEND
+    next.alpha_cutoff = 0.0
+    next.opacity = opacity
+    next.cast_shadow = false
+    next.validate() or >>
+    << next
+}
+
+pub fn (spec &Sprite3D) with_opacity(opacity f64) Sprite3D {
+    $next := spec.clone()
+    next.opacity = opacity
     next.validate() or >>
     << next
 }

@@ -26,6 +26,14 @@ struct Voice {
     fade_position int
     fade_stop bool
     fade_hold bool
+    pitch_milli int
+    itd_frames int
+    gain_l_milli int
+    gain_r_milli int
+    lpf_alpha_l f64
+    lpf_alpha_r f64
+    lpf_state_l f64
+    lpf_state_r f64
 }
 struct Bus { parent int
     gain int
@@ -54,13 +62,16 @@ pub struct MixBlock {
     frames int
     fade_positions []int
     dsp_next []BusDsp
+    lpf_l []f64
+    lpf_r []f64
     pub underruns int
 }
 pub fn new_mixer(rate int, capacity int) Mixer {
     if rate < 8000 || rate > 192000 || capacity < 1 || capacity > MAX_VOICES { >> errors.new("nexus mixer: invalid sample rate or capacity") }
     $voices := []Voice{}
     for i in 0:capacity { voices.push(Voice{generation: 0, allocated: false, playing: false, clip: 0, bus: 0, phase: 0,
-        gain: 1000, pan: 0, paused: false, looping: false, fade_start: 1000, fade_target: 1000, fade_total: 0, fade_position: 0, fade_stop: false, fade_hold: false}) }
+        gain: 1000, pan: 0, paused: false, looping: false, fade_start: 1000, fade_target: 1000, fade_total: 0, fade_position: 0, fade_stop: false, fade_hold: false,
+        pitch_milli: 1000, itd_frames: 0, gain_l_milli: -1, gain_r_milli: -1, lpf_alpha_l: 1.0, lpf_alpha_r: 1.0, lpf_state_l: 0.0, lpf_state_r: 0.0}) }
     $streams := []PcmStream{}
     for i in 0:MAX_STREAMS { streams.push(empty_stream(0)) }
     << Mixer{rate: rate, voices: voices, buses: [Bus{parent: -1, gain: 1000, muted: false, paused: false, name: "Master", dsp: default_bus_dsp()}],
@@ -135,7 +146,8 @@ fn (mixer $&Mixer) allocate(source int, bus int, volume f64, pan f64, looping bo
             generation := mixer.voices[i].generation + 1
             if generation > 1000000000 { >> errors.new("nexus mixer: voice generation exhausted") }
             mixer.voices[i] = Voice{generation: generation, allocated: true, playing: true, clip: source, bus: bus, phase: phase,
-                gain: gain, pan: balance, paused: false, looping: looping, fade_start: gain, fade_target: gain, fade_total: 0, fade_position: 0, fade_stop: false, fade_hold: false}
+                gain: gain, pan: balance, paused: false, looping: looping, fade_start: gain, fade_target: gain, fade_total: 0, fade_position: 0, fade_stop: false, fade_hold: false,
+                pitch_milli: 1000, itd_frames: 0, gain_l_milli: -1, gain_r_milli: -1, lpf_alpha_l: 1.0, lpf_alpha_r: 1.0, lpf_state_l: 0.0, lpf_state_r: 0.0}
             mixer.revision = mixer.revision + 1
             << generation * MAX_VOICES + i + 1
         }
@@ -185,6 +197,97 @@ pub fn (mixer $&Mixer) set_pan(id int, pan f64) int {
     mixer.revision = mixer.revision + 1
     << 0
 }
+fn clamp_mix(v f64, lo f64, hi f64) f64 {
+    << math.max(lo, math.min(hi, v))
+}
+
+fn one_pole_alpha(cutoff_hz f64, rate int) f64 {
+    if math.is_nan(cutoff_hz) || math.is_inf(cutoff_hz) || cutoff_hz < 20.0 {
+        >> errors.new("nexus mixer: invalid LPF cutoff frequency")
+    }
+    if cutoff_hz >= f64(rate) * 0.45 { << 1.0 }
+    rc := 1.0 / (6.283185307179586 * cutoff_hz)
+    dt := 1.0 / f64(rate)
+    << clamp_mix(dt / (rc + dt), 0.005, 1.0)
+}
+
+pub fn (mixer $&Mixer) set_pitch(id int, pitch f64) int {
+    index := mixer.voice_index(id) or >>
+    if math.is_nan(pitch) || math.is_inf(pitch) || pitch < 0.25 || pitch > 4.0 {
+        >> errors.new("nexus mixer: pitch out of valid range 0.25..4.0")
+    }
+    mixer.voices[index].pitch_milli = int(math.round_to_even(pitch * 1000.0))
+    mixer.revision = mixer.revision + 1
+    << 0
+}
+
+pub fn (mixer $&Mixer) set_voice_lowpass(id int, cutoff_left_hz f64, cutoff_right_hz f64) int {
+    index := mixer.voice_index(id) or >>
+    al := one_pole_alpha(cutoff_left_hz, mixer.rate) or >>
+    ar := one_pole_alpha(cutoff_right_hz, mixer.rate) or >>
+    mixer.voices[index].lpf_alpha_l = al
+    mixer.voices[index].lpf_alpha_r = ar
+    mixer.revision = mixer.revision + 1
+    << 0
+}
+
+pub fn (mixer $&Mixer) set_binaural(id int, itd_frames int, left_gain f64, right_gain f64, cutoff_left_hz f64, cutoff_right_hz f64) int {
+    index := mixer.voice_index(id) or >>
+    if itd_frames < -48 || itd_frames > 48 {
+        >> errors.new("nexus mixer: ITD frames out of range -48..48")
+    }
+    if math.is_nan(left_gain) || math.is_inf(left_gain) || left_gain < 0.0 || left_gain > 2.0 ||
+        math.is_nan(right_gain) || math.is_inf(right_gain) || right_gain < 0.0 || right_gain > 2.0 {
+        >> errors.new("nexus mixer: binaural gain out of range 0.0..2.0")
+    }
+    al := one_pole_alpha(cutoff_left_hz, mixer.rate) or >>
+    ar := one_pole_alpha(cutoff_right_hz, mixer.rate) or >>
+    v := $&mixer.voices[index]
+    v.itd_frames = itd_frames
+    v.gain_l_milli = int(math.round_to_even(left_gain * 1000.0))
+    v.gain_r_milli = int(math.round_to_even(right_gain * 1000.0))
+    v.lpf_alpha_l = al
+    v.lpf_alpha_r = ar
+    mixer.revision = mixer.revision + 1
+    << 0
+}
+
+pub fn (mixer $&Mixer) apply_spatial_3d(id int, res &Spatial3DResult) int {
+    index := mixer.voice_index(id) or >>
+    gain := control(res.volume, 0.0, 4.0) or >>
+    pan := control(res.pan, -1.0, 1.0) or >>
+    if math.is_nan(res.pitch) || math.is_inf(res.pitch) || res.pitch < 0.25 || res.pitch > 4.0 {
+        >> errors.new("nexus mixer: spatial pitch out of range")
+    }
+    if res.itd_frames < -48 || res.itd_frames > 48 {
+        >> errors.new("nexus mixer: spatial ITD out of range")
+    }
+    al := one_pole_alpha(res.lpf_cutoff_left_hz, mixer.rate) or >>
+    ar := one_pole_alpha(res.lpf_cutoff_right_hz, mixer.rate) or >>
+    gl := clamp_mix(res.left_gain, 0.0, 2.0)
+    gr := clamp_mix(res.right_gain, 0.0, 2.0)
+    v := $&mixer.voices[index]
+    fade_active := v.fade_total > 0 && v.fade_position < v.fade_total
+    v.pan = pan
+    if !fade_active {
+        v.gain = gain
+        v.fade_total = 0
+        v.fade_position = 0
+        v.fade_stop = false
+        v.fade_hold = false
+    } else if !v.fade_stop {
+        v.gain = gain
+    }
+    v.pitch_milli = int(math.round_to_even(res.pitch * 1000.0))
+    v.itd_frames = res.itd_frames
+    v.gain_l_milli = int(math.round_to_even(gl * 1000.0))
+    v.gain_r_milli = int(math.round_to_even(gr * 1000.0))
+    v.lpf_alpha_l = al
+    v.lpf_alpha_r = ar
+    mixer.revision = mixer.revision + 1
+    << 0
+}
+
 fn (mixer &Mixer) any_bus_dsp_active() bool {
     for i in 0:mixer.buses.len {
         if mixer.buses[i].dsp.active() { << true }
@@ -206,7 +309,7 @@ fn (mixer &Mixer) state_stamp() string {
     for i in 0:mixer.voices.len {
         v := &mixer.voices[i]
         stamp = stamp + ":v" + str(v.generation) + "," + str(flag(v.allocated)) + "," + str(flag(v.playing)) + "," + str(v.clip) + "," + str(v.bus) + "," +
-            str(v.phase) + "," + str(v.gain) + "," + str(v.pan) + "," + str(flag(v.paused)) + "," + str(flag(v.looping)) + "," + str(v.fade_start) + "," + str(v.fade_target) + "," + str(v.fade_total) + "," + str(v.fade_position) + "," + str(flag(v.fade_stop)) + "," + str(flag(v.fade_hold))
+            str(v.phase) + "," + str(v.gain) + "," + str(v.pan) + "," + str(flag(v.paused)) + "," + str(flag(v.looping)) + "," + str(v.fade_start) + "," + str(v.fade_target) + "," + str(v.fade_total) + "," + str(v.fade_position) + "," + str(flag(v.fade_stop)) + "," + str(flag(v.fade_hold)) + "," + str(v.pitch_milli) + "," + str(v.itd_frames) + "," + str(v.gain_l_milli) + "," + str(v.gain_r_milli)
     }
     << stamp
 }
@@ -230,7 +333,37 @@ struct VoiceRenderOutcome {
     phase int
     active bool
     fade_position int
+    lpf_l f64
+    lpf_r f64
     underrun bool
+}
+fn (mixer &Mixer) sample_clip_at_phase(
+    source &SourceInfo,
+    clip_id int,
+    raw_phase int,
+    looping bool,
+    rate int,
+    channel int
+) f64 {
+    period := source.frames * rate
+    if period <= 0 || rate <= 0 { << 0.0 }
+    $ph := raw_phase
+    if ph < 0 {
+        if !looping { << 0.0 }
+        ph = ((ph % period) + period) % period
+    } else if ph >= period {
+        if !looping { << 0.0 }
+        ph = wrap_phase(ph, period)
+    }
+    at := ph / rate
+    weight := f64(ph % rate) / f64(rate)
+    $next := at + 1
+    if next >= source.frames {
+        if looping { next = 0 } else { next = at }
+    }
+    a := mixer.source_sample(clip_id, at, channel) or >>
+    b := mixer.source_sample(clip_id, next, channel) or >>
+    << f64(a) + f64(b - a) * weight
 }
 fn (mixer &Mixer) mix_voice_into(
     voice &Voice,
@@ -247,9 +380,20 @@ fn (mixer &Mixer) mix_voice_into(
     $phase := voice.phase
     $active := true
     $fade_position := voice.fade_position
+    $lpf_l := voice.lpf_state_l
+    $lpf_r := voice.lpf_state_r
     $underrun := false
-    balance_left := 1.0 - math.max(f64(voice.pan) / 1000.0, 0.0)
-    balance_right := 1.0 + math.min(f64(voice.pan) / 1000.0, 0.0)
+    $balance_left := 1.0 - math.max(f64(voice.pan) / 1000.0, 0.0)
+    $balance_right := 1.0 + math.min(f64(voice.pan) / 1000.0, 0.0)
+    if voice.gain_l_milli >= 0 && voice.gain_r_milli >= 0 {
+        balance_left = f64(voice.gain_l_milli) / 1000.0
+        balance_right = f64(voice.gain_r_milli) / 1000.0
+    }
+    $step := source.rate
+    if voice.pitch_milli != 1000 {
+        step = int(math.round_to_even(f64(source.rate) * f64(voice.pitch_milli) / 1000.0))
+        if step < 1 { step = 1 }
+    }
     for frame in 0:frames {
         if !source.streaming && phase >= period {
             if voice.looping { phase = wrap_phase(phase, period)
@@ -272,18 +416,33 @@ fn (mixer &Mixer) mix_voice_into(
         }
         a := mixer.source_sample(voice.clip, at, 0) or >>
         b := mixer.source_sample(voice.clip, next, 0) or >>
-        l := f64(a) + f64(b - a) * weight
+        $l := f64(a) + f64(b - a) * weight
         $r := l
         if source.channels == 2 {
             c := mixer.source_sample(voice.clip, at, 1) or >>
             d := mixer.source_sample(voice.clip, next, 1) or >>
             r = f64(c) + f64(d - c) * weight
         }
+        if voice.itd_frames > 0 && !source.streaming {
+            l = mixer.sample_clip_at_phase(&source, voice.clip, phase - voice.itd_frames * step, voice.looping, rate, 0) or >>
+        } else if voice.itd_frames < 0 && !source.streaming {
+            $ch_r := 0
+            if source.channels == 2 { ch_r = 1 }
+            r = mixer.sample_clip_at_phase(&source, voice.clip, phase - (-voice.itd_frames) * step, voice.looping, rate, ch_r) or >>
+        }
+        if voice.lpf_alpha_l < 0.999999 {
+            lpf_l = lpf_l + voice.lpf_alpha_l * (l - lpf_l)
+            l = lpf_l
+        }
+        if voice.lpf_alpha_r < 0.999999 {
+            lpf_r = lpf_r + voice.lpf_alpha_r * (r - lpf_r)
+            r = lpf_r
+        }
         if !voice.fade_hold && fade_position < voice.fade_total { fade_position = fade_position + 1 }
         gain := bus_gain * gain_at(voice, fade_position) / 1000.0
         left[frame] = left[frame] + l * gain * balance_left
         right[frame] = right[frame] + r * gain * balance_right
-        phase = phase + source.rate
+        phase = phase + step
         if voice.fade_stop && voice.fade_total > 0 && fade_position >= voice.fade_total {
             active = false
             <-
@@ -291,7 +450,7 @@ fn (mixer &Mixer) mix_voice_into(
     }
     if !source.streaming && voice.looping { phase = wrap_phase(phase, period)
     } else if source.eof && phase >= period { active = false }
-    << VoiceRenderOutcome{phase: phase, active: active, fade_position: fade_position, underrun: underrun}
+    << VoiceRenderOutcome{phase: phase, active: active, fade_position: fade_position, lpf_l: lpf_l, lpf_r: lpf_r, underrun: underrun}
 }
 pub fn (mixer &Mixer) prepare(frames int) MixBlock {
     mixer.valid() or >>
@@ -302,6 +461,8 @@ pub fn (mixer &Mixer) prepare(frames int) MixBlock {
     $phases := []int{}
     $playing := []bool{}
     $fade_positions := []int{}
+    $lpf_l := []f64{}
+    $lpf_r := []f64{}
     $underruns := 0
     $samples := []int{}
     $dsp_next := []BusDsp{}
@@ -318,6 +479,8 @@ pub fn (mixer &Mixer) prepare(frames int) MixBlock {
             $phase := voice.phase
             $active := voice.playing
             $fade_position := voice.fade_position
+            $vl := voice.lpf_state_l
+            $vr := voice.lpf_state_r
             if active {
                 state := mixer.bus_state(voice.bus)
                 if !voice.paused && !state.paused {
@@ -325,12 +488,16 @@ pub fn (mixer &Mixer) prepare(frames int) MixBlock {
                     phase = out.phase
                     active = out.active
                     fade_position = out.fade_position
+                    vl = out.lpf_l
+                    vr = out.lpf_r
                     if out.underrun { underruns += 1 }
                 }
             }
             phases.push(phase)
             playing.push(active)
             fade_positions.push(fade_position)
+            lpf_l.push(vl)
+            lpf_r.push(vr)
         }
         for i in 0:frames {
             samples.push(quantize(left[i]))
@@ -355,6 +522,8 @@ pub fn (mixer &Mixer) prepare(frames int) MixBlock {
             $phase := voice.phase
             $active := voice.playing
             $fade_position := voice.fade_position
+            $vl := voice.lpf_state_l
+            $vr := voice.lpf_state_r
             if active {
                 state := mixer.bus_state(voice.bus)
                 if !voice.paused && !state.paused {
@@ -363,12 +532,16 @@ pub fn (mixer &Mixer) prepare(frames int) MixBlock {
                     phase = out.phase
                     active = out.active
                     fade_position = out.fade_position
+                    vl = out.lpf_l
+                    vr = out.lpf_r
                     if out.underrun { underruns += 1 }
                 }
             }
             phases.push(phase)
             playing.push(active)
             fade_positions.push(fade_position)
+            lpf_l.push(vl)
+            lpf_r.push(vr)
         }
         // Topological fold from child buses up to Master (parent index strictly < child index).
         $rev := mixer.buses.len - 1
@@ -394,7 +567,7 @@ pub fn (mixer &Mixer) prepare(frames int) MixBlock {
         }
     }
     << MixBlock{samples: samples, stamp: mixer.state_stamp(), phases: phases, playing: playing, frames: frames,
-        fade_positions: fade_positions, dsp_next: dsp_next, underruns: underruns}
+        fade_positions: fade_positions, dsp_next: dsp_next, lpf_l: lpf_l, lpf_r: lpf_r, underruns: underruns}
 }
 pub fn (block &MixBlock) frame_count() int { << block.frames }
 pub fn (mixer $&Mixer) commit(block &MixBlock) int {
@@ -403,7 +576,9 @@ pub fn (mixer $&Mixer) commit(block &MixBlock) int {
         block.playing.len != mixer.voices.len || block.fade_positions.len != mixer.voices.len || block.stamp != mixer.state_stamp() { >> errors.new("nexus mixer: stale or foreign mix block") }
     for i in 0:mixer.voices.len { mixer.voices[i].phase = block.phases[i]
         mixer.voices[i].playing = block.playing[i]
-        mixer.voices[i].fade_position = block.fade_positions[i] }
+        mixer.voices[i].fade_position = block.fade_positions[i]
+        if block.lpf_l.len == mixer.voices.len { mixer.voices[i].lpf_state_l = block.lpf_l[i] }
+        if block.lpf_r.len == mixer.voices.len { mixer.voices[i].lpf_state_r = block.lpf_r[i] } }
     if block.dsp_next.len == mixer.buses.len {
         for b in 0:mixer.buses.len {
             mixer.buses[b].dsp = clone_bus_dsp(&block.dsp_next[b])

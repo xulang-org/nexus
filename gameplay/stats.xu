@@ -1,0 +1,607 @@
+@"github.com/xulang-org/nexus/gameplay"
+
+#encoding/json
+#errors
+#math
+#strings
+
+pub const STATS_FORMAT = "nexus.stats"
+pub const STATS_VERSION = 1
+
+pub const MOD_FLAT = 0
+pub const MOD_PERCENT_ADD = 1
+pub const MOD_PERCENT_MULT = 2
+pub const MOD_OVERRIDE = 3
+
+pub const STACK_REFRESH = 0
+pub const STACK_INTENSITY = 1
+pub const STACK_DURATION = 2
+pub const STACK_INDEPENDENT = 3
+
+pub const STATUS_CAT_BUFF = 0
+pub const STATUS_CAT_DEBUFF = 1
+pub const STATUS_CAT_CONTROL = 2
+
+pub const TAG_STUNNED = "stunned"
+pub const TAG_SILENCED = "silenced"
+pub const TAG_ROOTED = "rooted"
+pub const TAG_INVULNERABLE = "invulnerable"
+pub const TAG_SLOWED = "slowed"
+
+pub struct StatDef {
+    pub name string
+    pub base f64
+    pub min_val f64
+    pub max_val f64
+}
+
+pub struct StatModifier {
+    pub id string
+    pub source string
+    pub stat string
+    pub op int
+    pub value f64
+    pub priority int
+}
+
+// Attribute sheet supporting Flat -> PercentAdd -> PercentMult -> Override stacking,
+// clamped output ranges, source-scoped bulk removal, and JSON persistence.
+pub struct StatSheet {
+    defs []StatDef
+    mods []StatModifier
+    cached []f64
+    dirty bool
+}
+
+pub fn new_stat_sheet() StatSheet {
+    << StatSheet{
+        defs: []StatDef{},
+        mods: []StatModifier{},
+        cached: []f64{},
+        dirty: false
+    }
+}
+
+fn find_stat_idx(s &StatSheet, name &string) int {
+    for i in 0:s.defs.len {
+        if s.defs[i].name == *name { << i }
+    }
+    << -1
+}
+
+fn validate_finite_f64(v f64, msg string) int {
+    if math.is_nan(v) || math.is_inf(v) {
+        >> errors.new(msg)
+    }
+    << 0
+}
+
+pub fn (s $&StatSheet) define(name string, base f64, min_val f64, max_val f64) int {
+    if name.len == 0 {
+        >> errors.new("nexus gameplay: stat name cannot be empty")
+    }
+    validate_finite_f64(base, "nexus gameplay: stat base must be finite") or >>
+    validate_finite_f64(min_val, "nexus gameplay: stat min_val must be finite") or >>
+    validate_finite_f64(max_val, "nexus gameplay: stat max_val must be finite") or >>
+    if min_val > max_val {
+        >> errors.new("nexus gameplay: stat min_val exceeds max_val")
+    }
+    idx := find_stat_idx(s, &name)
+    if idx >= 0 {
+        s.defs[idx] = StatDef{name: name, base: base, min_val: min_val, max_val: max_val}
+        s.dirty = true
+        << idx
+    }
+    s.defs.push(StatDef{name: name, base: base, min_val: min_val, max_val: max_val})
+    s.cached.push(gp_clamp(base, min_val, max_val))
+    s.dirty = true
+    << s.defs.len - 1
+}
+
+pub fn (s $&StatSheet) set_base(name string, base f64) int {
+    validate_finite_f64(base, "nexus gameplay: stat base must be finite") or >>
+    idx := find_stat_idx(s, &name)
+    if idx < 0 {
+        >> errors.new("nexus gameplay: undefined stat " + name)
+    }
+    s.defs[idx].base = base
+    s.dirty = true
+    << 0
+}
+
+pub fn (s &StatSheet) base_value(name string) f64 {
+    idx := find_stat_idx(s, &name)
+    if idx < 0 {
+        >> errors.new("nexus gameplay: undefined stat " + name)
+    }
+    << s.defs[idx].base
+}
+
+pub fn (s &StatSheet) has_stat(name string) bool {
+    << find_stat_idx(s, &name) >= 0
+}
+
+pub fn (s $&StatSheet) add_modifier(mod StatModifier) int {
+    if mod.id.len == 0 || mod.stat.len == 0 {
+        >> errors.new("nexus gameplay: modifier id and stat must be non-empty")
+    }
+    if mod.op < MOD_FLAT || mod.op > MOD_OVERRIDE {
+        >> errors.new("nexus gameplay: invalid modifier op")
+    }
+    validate_finite_f64(mod.value, "nexus gameplay: modifier value must be finite") or >>
+    for i in 0:s.mods.len {
+        if s.mods[i].id == mod.id {
+            s.mods[i] = mod
+            s.dirty = true
+            << i
+        }
+    }
+    s.mods.push(mod)
+    s.dirty = true
+    << s.mods.len - 1
+}
+
+pub fn (s $&StatSheet) remove_modifier(id string) bool {
+    $kept := []StatModifier{}
+    $removed := false
+    for i in 0:s.mods.len {
+        m := &s.mods[i]
+        if !removed && m.id == id {
+            removed = true
+        } else {
+            kept.push(StatModifier{
+                id: m.id + "",
+                source: m.source + "",
+                stat: m.stat + "",
+                op: m.op,
+                value: m.value,
+                priority: m.priority
+            })
+        }
+    }
+    if !removed { << false }
+    s.mods = kept
+    s.dirty = true
+    << true
+}
+
+pub fn (s $&StatSheet) remove_by_source(source string) int {
+    $kept := []StatModifier{}
+    $removed := 0
+    for i in 0:s.mods.len {
+        m := &s.mods[i]
+        if m.source == source {
+            removed += 1
+        } else {
+            kept.push(StatModifier{
+                id: m.id + "",
+                source: m.source + "",
+                stat: m.stat + "",
+                op: m.op,
+                value: m.value,
+                priority: m.priority
+            })
+        }
+    }
+    if removed == 0 { << 0 }
+    s.mods = kept
+    s.dirty = true
+    << removed
+}
+
+fn eval_stat_at(s &StatSheet, idx int) f64 {
+    def := &s.defs[idx]
+    $flat := 0.0
+    $pct_add := 0.0
+    $pct_mult := 1.0
+    $has_override := false
+    $ov_val := 0.0
+    $ov_prio := -2147483647
+
+    for i in 0:s.mods.len {
+        m := &s.mods[i]
+        if m.stat != def.name { -> }
+        if m.op == MOD_FLAT {
+            flat += m.value
+        } else if m.op == MOD_PERCENT_ADD {
+            pct_add += m.value
+        } else if m.op == MOD_PERCENT_MULT {
+            pct_mult *= m.value
+        } else if m.op == MOD_OVERRIDE {
+            if !has_override || m.priority >= ov_prio {
+                has_override = true
+                ov_prio = m.priority
+                ov_val = m.value
+            }
+        }
+    }
+    $val := (def.base + flat) * (1.0 + pct_add) * pct_mult
+    if has_override {
+        val = ov_val
+    }
+    << gp_clamp(val, def.min_val, def.max_val)
+}
+
+pub fn (s &StatSheet) get(name string) f64 {
+    idx := find_stat_idx(s, &name)
+    if idx < 0 {
+        >> errors.new("nexus gameplay: undefined stat " + name)
+    }
+    << eval_stat_at(s, idx)
+}
+
+pub fn (s &StatSheet) get_or(name string, fallback f64) f64 {
+    idx := find_stat_idx(s, &name)
+    if idx < 0 { << fallback }
+    << eval_stat_at(s, idx)
+}
+
+pub fn (s &StatSheet) clone() StatSheet {
+    $out := new_stat_sheet()
+    for i in 0:s.defs.len {
+        d := &s.defs[i]
+        out.defs.push(StatDef{name: d.name + "", base: d.base, min_val: d.min_val, max_val: d.max_val})
+        out.cached.push(d.base)
+    }
+    for i in 0:s.mods.len {
+        m := &s.mods[i]
+        out.mods.push(StatModifier{
+            id: m.id + "",
+            source: m.source + "",
+            stat: m.stat + "",
+            op: m.op,
+            value: m.value,
+            priority: m.priority
+        })
+    }
+    out.dirty = true
+    << out
+}
+
+pub fn encode_stats_json(s &StatSheet) string {
+    $b := strings.new_byte_builder(512)
+    fmt_s := STATS_FORMAT + ""
+    b.write_str("{\n")
+    b.write_str("  \"format\": " + json.quote(&fmt_s) + ",\n")
+    b.write_str("  \"version\": " + str(STATS_VERSION) + ",\n")
+    b.write_str("  \"defs\": [")
+    for i in 0:s.defs.len {
+        if i > 0 { b.write_str(", ") }
+        d := &s.defs[i]
+        nm := d.name + ""
+        b.write_str("{\"name\": " + json.quote(&nm) +
+            ", \"base\": " + gp_f64_str(d.base) +
+            ", \"min_val\": " + gp_f64_str(d.min_val) +
+            ", \"max_val\": " + gp_f64_str(d.max_val) + "}")
+    }
+    b.write_str("],\n  \"mods\": [")
+    for i in 0:s.mods.len {
+        if i > 0 { b.write_str(", ") }
+        m := &s.mods[i]
+        mid := m.id + ""
+        msrc := m.source + ""
+        mst := m.stat + ""
+        b.write_str("{\"id\": " + json.quote(&mid) +
+            ", \"source\": " + json.quote(&msrc) +
+            ", \"stat\": " + json.quote(&mst) +
+            ", \"op\": " + str(m.op) +
+            ", \"value\": " + gp_f64_str(m.value) +
+            ", \"priority\": " + str(m.priority) + "}")
+    }
+    b.write_str("]\n}\n")
+    << b.to_string()
+}
+
+pub fn decode_stats_json(raw &string) StatSheet {
+    if raw.len < 2 || raw.len > 4194304 {
+        >> errors.new("nexus gameplay: stats JSON size out of bounds")
+    }
+    doc := json.parse_max(raw, 4194304)
+    if !doc.ok() { >> errors.new("nexus gameplay stats JSON: " + doc.error()) }
+    root := doc.root()
+    if !doc.is_dict(root) || !doc.has(root, "format") || !doc.has(root, "version") || !doc.has(root, "defs") {
+        >> errors.new("nexus gameplay: missing required stats JSON fields")
+    }
+    fmt_s := doc.as_string(doc.get(root, "format")) or >>
+    ver := doc.as_int(doc.get(root, "version")) or >>
+    if fmt_s != STATS_FORMAT || ver != STATS_VERSION {
+        >> errors.new("nexus gameplay: unsupported stats format or version")
+    }
+    $sheet := new_stat_sheet()
+    defs := doc.get(root, "defs")
+    if !doc.is_list(defs) { >> errors.new("nexus gameplay: defs must be JSON list") }
+    for i in 0:doc.count(defs) {
+        node := doc.at(defs, i)
+        nm := doc.as_string(doc.get(node, "name")) or >>
+        base := doc.as_f64(doc.get(node, "base")) or >>
+        mn := doc.as_f64(doc.get(node, "min_val")) or >>
+        mx := doc.as_f64(doc.get(node, "max_val")) or >>
+        _ := sheet.define(nm + "", base, mn, mx) or >>
+    }
+    if doc.has(root, "mods") {
+        mods := doc.get(root, "mods")
+        if !doc.is_list(mods) { >> errors.new("nexus gameplay: mods must be JSON list") }
+        for i in 0:doc.count(mods) {
+            mn := doc.at(mods, i)
+            mid := doc.as_string(doc.get(mn, "id")) or >>
+            msrc := doc.as_string(doc.get(mn, "source")) or >>
+            mst := doc.as_string(doc.get(mn, "stat")) or >>
+            mop := doc.as_int(doc.get(mn, "op")) or >>
+            mval := doc.as_f64(doc.get(mn, "value")) or >>
+            mprio := doc.as_int(doc.get(mn, "priority")) or >>
+            _ := sheet.add_modifier(StatModifier{
+                id: mid + "", source: msrc + "", stat: mst + "",
+                op: mop, value: mval, priority: mprio
+            }) or >>
+        }
+    }
+    << sheet
+}
+
+// =========================================================================
+// Buff / Debuff / Control Status Manager
+// =========================================================================
+
+pub struct StatusSpec {
+    pub id string
+    pub category int
+    pub stack_policy int
+    pub max_stacks int
+    pub duration f64
+    pub max_duration f64
+    pub tick_interval f64
+    pub tick_damage f64
+    pub tick_heal f64
+    pub damage_element int
+    pub tags []string
+    pub modifiers []StatModifier
+}
+
+pub struct StatusTickEvent {
+    pub effect_id string
+    pub stacks int
+    pub damage f64
+    pub heal f64
+    pub element int
+}
+
+struct ActiveStatus {
+    instance_key string
+    spec StatusSpec
+    stacks int
+    remaining f64
+    tick_accum f64
+}
+
+pub struct StatusManager {
+    active []ActiveStatus
+    next_instance int
+}
+
+pub fn new_status_manager() StatusManager {
+    << StatusManager{active: []ActiveStatus{}, next_instance: 1}
+}
+
+fn clone_tags(src &[]string) []string {
+    $out := []string{}
+    for i in 0:src.len { out.push(src[i] + "") }
+    << out
+}
+
+fn clone_mods(src &[]StatModifier) []StatModifier {
+    $out := []StatModifier{}
+    for i in 0:src.len {
+        m := &src[i]
+        out.push(StatModifier{
+            id: m.id + "",
+            source: m.source + "",
+            stat: m.stat + "",
+            op: m.op,
+            value: m.value,
+            priority: m.priority
+        })
+    }
+    << out
+}
+
+fn clone_spec(src &StatusSpec) StatusSpec {
+    << StatusSpec{
+        id: src.id + "",
+        category: src.category,
+        stack_policy: src.stack_policy,
+        max_stacks: src.max_stacks,
+        duration: src.duration,
+        max_duration: src.max_duration,
+        tick_interval: src.tick_interval,
+        tick_damage: src.tick_damage,
+        tick_heal: src.tick_heal,
+        damage_element: src.damage_element,
+        tags: clone_tags(&src.tags),
+        modifiers: clone_mods(&src.modifiers)
+    }
+}
+
+fn sync_status_modifiers(st &ActiveStatus, stats $&StatSheet) int {
+    src_key := "status:" + st.instance_key
+    _ := stats.remove_by_source(src_key + "")
+    for i in 0:st.spec.modifiers.len {
+        m := &st.spec.modifiers[i]
+        $val := m.value
+        if m.op == MOD_FLAT || m.op == MOD_PERCENT_ADD {
+            val = m.value * f64(st.stacks)
+        } else if m.op == MOD_PERCENT_MULT {
+            $acc := 1.0
+            for _ in 0:st.stacks { acc *= m.value }
+            val = acc
+        }
+        _ := stats.add_modifier(StatModifier{
+            id: src_key + ":" + m.id + ":" + str(i),
+            source: src_key + "",
+            stat: m.stat + "",
+            op: m.op,
+            value: val,
+            priority: m.priority
+        }) or >>
+    }
+    << 0
+}
+
+pub fn (m $&StatusManager) apply(spec &StatusSpec, stats $&StatSheet) int {
+    if spec.id.len == 0 {
+        >> errors.new("nexus gameplay: status id cannot be empty")
+    }
+    if spec.category < STATUS_CAT_BUFF || spec.category > STATUS_CAT_CONTROL {
+        >> errors.new("nexus gameplay: invalid status category")
+    }
+    if spec.stack_policy < STACK_REFRESH || spec.stack_policy > STACK_INDEPENDENT {
+        >> errors.new("nexus gameplay: invalid status stack_policy")
+    }
+    validate_finite_f64(spec.duration, "nexus gameplay: status duration must be finite") or >>
+    if spec.duration <= 0.0 || spec.max_stacks < 1 {
+        >> errors.new("nexus gameplay: status duration and max_stacks must be positive")
+    }
+    $max_dur := spec.max_duration
+    if max_dur <= 0.0 { max_dur = spec.duration }
+
+    if spec.stack_policy != STACK_INDEPENDENT {
+        for i in 0:m.active.len {
+            if m.active[i].spec.id == spec.id {
+                st := $&m.active[i]
+                if spec.stack_policy == STACK_REFRESH {
+                    st.remaining = spec.duration
+                } else if spec.stack_policy == STACK_INTENSITY {
+                    if st.stacks < spec.max_stacks {
+                        st.stacks += 1
+                    }
+                    st.remaining = spec.duration
+                } else if spec.stack_policy == STACK_DURATION {
+                    st.remaining = math.min(max_dur, st.remaining + spec.duration)
+                }
+                sync_status_modifiers(st, stats) or >>
+                << st.stacks
+            }
+        }
+    }
+
+    inst_key := spec.id + "#" + str(m.next_instance)
+    m.next_instance += 1
+    entry := ActiveStatus{
+        instance_key: inst_key,
+        spec: clone_spec(spec),
+        stacks: 1,
+        remaining: spec.duration,
+        tick_accum: 0.0
+    }
+    m.active.push(entry)
+    last_i := m.active.len - 1
+    sync_status_modifiers(&m.active[last_i], stats) or >>
+    << 1
+}
+
+pub fn (m $&StatusManager) step(dt f64, stats $&StatSheet) []StatusTickEvent {
+    validate_finite_f64(dt, "nexus gameplay: status step dt must be finite") or >>
+    if dt < 0.0 {
+        >> errors.new("nexus gameplay: status step dt must be non-negative")
+    }
+    $events := []StatusTickEvent{}
+    if dt == 0.0 { << events }
+
+    $kept := []ActiveStatus{}
+    for i in 0:m.active.len {
+        st := $&m.active[i]
+        used_dt := math.min(dt, st.remaining)
+        st.remaining -= dt
+        if st.spec.tick_interval > 0.0 {
+            st.tick_accum += used_dt
+            while st.tick_accum + 1e-9 >= st.spec.tick_interval {
+                st.tick_accum -= st.spec.tick_interval
+                if st.tick_accum < 0.0 { st.tick_accum = 0.0 }
+                if st.spec.tick_damage > 0.0 || st.spec.tick_heal > 0.0 {
+                    events.push(StatusTickEvent{
+                        effect_id: st.spec.id + "",
+                        stacks: st.stacks,
+                        damage: st.spec.tick_damage * f64(st.stacks),
+                        heal: st.spec.tick_heal * f64(st.stacks),
+                        element: st.spec.damage_element
+                    })
+                }
+            }
+        }
+        if st.remaining > 1e-9 {
+            kept.push(ActiveStatus{
+                instance_key: st.instance_key + "",
+                spec: clone_spec(&st.spec),
+                stacks: st.stacks,
+                remaining: st.remaining,
+                tick_accum: st.tick_accum
+            })
+        } else {
+            _ := stats.remove_by_source("status:" + st.instance_key)
+        }
+    }
+    m.active = kept
+    << events
+}
+
+pub fn (m $&StatusManager) dispel_category(category int, max_count int, stats $&StatSheet) int {
+    $removed := 0
+    $kept := []ActiveStatus{}
+    for i in 0:m.active.len {
+        st := &m.active[i]
+        can_remove := st.spec.category == category && (max_count <= 0 || removed < max_count)
+        if can_remove {
+            removed += 1
+            _ := stats.remove_by_source("status:" + st.instance_key)
+        } else {
+            kept.push(ActiveStatus{
+                instance_key: st.instance_key + "",
+                spec: clone_spec(&st.spec),
+                stacks: st.stacks,
+                remaining: st.remaining,
+                tick_accum: st.tick_accum
+            })
+        }
+    }
+    m.active = kept
+    << removed
+}
+
+pub fn (m $&StatusManager) clear_all(stats $&StatSheet) int {
+    n := m.active.len
+    for i in 0:m.active.len {
+        _ := stats.remove_by_source("status:" + m.active[i].instance_key)
+    }
+    m.active = []ActiveStatus{}
+    << n
+}
+
+pub fn (m &StatusManager) has_effect(id string) bool {
+    for i in 0:m.active.len {
+        if m.active[i].spec.id == id { << true }
+    }
+    << false
+}
+
+pub fn (m &StatusManager) stack_count(id string) int {
+    $sum := 0
+    for i in 0:m.active.len {
+        if m.active[i].spec.id == id {
+            sum += m.active[i].stacks
+        }
+    }
+    << sum
+}
+
+pub fn (m &StatusManager) has_tag(tag string) bool {
+    for i in 0:m.active.len {
+        tags := &m.active[i].spec.tags
+        for ti in 0:tags.len {
+            if tags[ti] == tag { << true }
+        }
+    }
+    << false
+}
+
+pub fn (m &StatusManager) active_count() int {
+    << m.active.len
+}

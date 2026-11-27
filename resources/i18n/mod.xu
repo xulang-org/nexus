@@ -1,0 +1,535 @@
+@"github.com/xulang-org/nexus/resources/i18n"
+
+#encoding/json
+#errors
+#strconv
+#strings
+
+pub const I18N_FORMAT = "nexus.i18n"
+pub const I18N_VERSION = 1
+
+fn ascii_lower(s &string) string {
+    $b := strings.new_byte_builder(s.len + 1)
+    for i in 0:s.len {
+        c := s[i] & 255
+        if c >= 65 && c <= 90 { b.write_byte(int(c + 32)) }
+        else { b.write_byte(int(c)) }
+    }
+    << b.to_string()
+}
+
+fn ascii_upper(s &string) string {
+    $b := strings.new_byte_builder(s.len + 1)
+    for i in 0:s.len {
+        c := s[i] & 255
+        if c >= 97 && c <= 122 { b.write_byte(int(c - 32)) }
+        else { b.write_byte(int(c)) }
+    }
+    << b.to_string()
+}
+
+fn ascii_title_first(s &string) string {
+    $b := strings.new_byte_builder(s.len + 1)
+    for i in 0:s.len {
+        c := s[i] & 255
+        if i == 0 {
+            if c >= 97 && c <= 122 { b.write_byte(int(c - 32)) }
+            else { b.write_byte(int(c)) }
+        } else {
+            if c >= 65 && c <= 90 { b.write_byte(int(c + 32)) }
+            else { b.write_byte(int(c)) }
+        }
+    }
+    << b.to_string()
+}
+
+fn is_ascii_alpha(s &string) bool {
+    if s.len == 0 { << false }
+    for i in 0:s.len {
+        c := s[i] & 255
+        if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) { << false }
+    }
+    << true
+}
+
+pub fn normalize_locale(raw &string) string {
+    trimmed := strings.trim_space(raw)
+    if trimmed.len == 0 || trimmed.len > 64 {
+        >> errors.new("nexus i18n: locale identifier must be 1..64 bytes")
+    }
+    slashed := strings.replace_all(&trimmed, "_", "-")
+    parts := strings.split(&slashed, "-")
+    $out := []string{}
+    for i in 0:parts.len {
+        seg := parts[i] + ""
+        if seg.len == 0 || seg.len > 16 {
+            >> errors.new("nexus i18n: invalid locale subtag in: " + trimmed)
+        }
+        for k in 0:seg.len {
+            c := seg[k] & 255
+            if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57)) {
+                >> errors.new("nexus i18n: illegal character in locale: " + trimmed)
+            }
+        }
+        if i == 0 {
+            out.push(ascii_lower(&seg))
+        } else if seg.len == 4 && is_ascii_alpha(&seg) {
+            out.push(ascii_title_first(&seg))
+        } else if seg.len == 2 && is_ascii_alpha(&seg) {
+            out.push(ascii_upper(&seg))
+        } else {
+            out.push(ascii_lower(&seg))
+        }
+    }
+    << strings.join(out, "-")
+}
+
+fn push_unique_s(out $&[]string, v string) {
+    for i in 0:out.len {
+        if out[i] == v { << }
+    }
+    out.push(v)
+}
+
+fn normalize_or_empty(raw &string) string {
+    v := normalize_locale(raw) or (err) {
+        _ := err.msg()
+        << ""
+    }
+    << v
+}
+
+pub fn locale_fallback_chain(locale &string, default_locale &string) []string {
+    $out := []string{}
+    norm := normalize_or_empty(locale)
+    if norm.len > 0 {
+        parts := strings.split(&norm, "-")
+        $n := parts.len
+        while n >= 1 {
+            $prefix := []string{}
+            for i in 0:n { prefix.push(parts[i] + "") }
+            push_unique_s($&out, strings.join(prefix, "-"))
+            n -= 1
+        }
+    }
+    def := normalize_or_empty(default_locale)
+    if def.len > 0 {
+        parts_d := strings.split(&def, "-")
+        $nd := parts_d.len
+        while nd >= 1 {
+            $pd := []string{}
+            for i in 0:nd { pd.push(parts_d[i] + "") }
+            push_unique_s($&out, strings.join(pd, "-"))
+            nd -= 1
+        }
+    }
+    << out
+}
+
+pub fn is_rtl_locale(locale &string) bool {
+    norm := normalize_or_empty(locale)
+    if norm.len == 0 { << false }
+    parts := strings.split(&norm, "-")
+    lang := parts[0] + ""
+    << lang == "ar" || lang == "he" || lang == "fa" || lang == "ur"
+}
+
+pub fn plural_category(locale &string, count int) string {
+    $norm := normalize_or_empty(locale)
+    if norm.len == 0 { norm = "en" }
+    parts := strings.split(&norm, "-")
+    lang := parts[0] + ""
+    if count == 0 && (lang == "en" || lang == "fr" || lang == "de") {
+        << "zero"
+    }
+    if lang == "zh" || lang == "ja" || lang == "ko" {
+        << "other"
+    }
+    if count == 1 || count == -1 {
+        << "one"
+    }
+    << "other"
+}
+
+pub fn format_template(tmpl &string, params &map[string]string) string {
+    $b := strings.new_byte_builder(tmpl.len + 16)
+    $i := 0
+    n := tmpl.len
+    while i < n {
+        c := tmpl[i] & 255
+        if c == 123 { // '{'
+            if i + 1 < n && (tmpl[i + 1] & 255) == 123 {
+                b.write_byte(123)
+                i += 2
+                ->
+            }
+            $end := -1
+            $j := i + 1
+            while j < n {
+                if (tmpl[j] & 255) == 125 {
+                    end = j
+                    <-
+                }
+                if (tmpl[j] & 255) == 123 {
+                    >> errors.new("nexus i18n: unescaped '{' inside placeholder")
+                }
+                j += 1
+            }
+            if end < 0 {
+                >> errors.new("nexus i18n: unclosed '{' in template")
+            }
+            $pname := ""
+            for k in (i + 1):end {
+                pname = pname + string_from_byte(int(tmpl[k] & 255))
+            }
+            if pname.len == 0 {
+                >> errors.new("nexus i18n: empty '{}' placeholder")
+            }
+            if !params.has(pname + "") {
+                >> errors.new("nexus i18n: missing template parameter: " + pname)
+            }
+            pval := &params[pname]
+            b.write_str(pval + "")
+            i = end + 1
+        } else if c == 125 { // '}'
+            if i + 1 < n && (tmpl[i + 1] & 255) == 125 {
+                b.write_byte(125)
+                i += 2
+                ->
+            }
+            >> errors.new("nexus i18n: unmatched '}' in template")
+        } else {
+            b.write_byte(int(c))
+            i += 1
+        }
+    }
+    << b.to_string()
+}
+
+pub struct StringCatalog {
+    default_locale string
+    locales_list []string
+    keys_list []string
+    entries map[string]string
+    plurals map[string]string
+}
+
+pub fn new_catalog(default_locale string) StringCatalog {
+    norm := normalize_locale(&default_locale) or >>
+    << StringCatalog{
+        default_locale: norm + "",
+        locales_list: [norm + ""],
+        keys_list: []string{},
+        entries: map[string]string{},
+        plurals: map[string]string{}
+    }
+}
+
+fn entry_k(locale &string, key &string) string {
+    << locale + "\n" + key
+}
+
+fn plural_k(locale &string, key &string, cat &string) string {
+    << locale + "\n" + key + "\n" + cat
+}
+
+pub fn (c $&StringCatalog) set_entry(locale string, key string, value string) int {
+    norm := normalize_locale(&locale) or >>
+    if key.len == 0 || key.len > 128 {
+        >> errors.new("nexus i18n: key length must be 1..128 bytes")
+    }
+    push_unique_s($&c.locales_list, norm + "")
+    push_unique_s($&c.keys_list, key + "")
+    ek := entry_k(&norm, &key)
+    c.entries[ek + ""] = value + ""
+    << 0
+}
+
+pub fn (c $&StringCatalog) set_plural(locale string, key string, category string, value string) int {
+    norm := normalize_locale(&locale) or >>
+    if key.len == 0 || key.len > 128 {
+        >> errors.new("nexus i18n: key length must be 1..128 bytes")
+    }
+    if category != "zero" && category != "one" && category != "other" {
+        >> errors.new("nexus i18n: plural category must be zero, one, or other")
+    }
+    push_unique_s($&c.locales_list, norm + "")
+    push_unique_s($&c.keys_list, key + "")
+    pk := plural_k(&norm, &key, &category)
+    c.plurals[pk + ""] = value + ""
+    << 0
+}
+
+pub fn (c &StringCatalog) default_loc() string { << c.default_locale + "" }
+
+pub fn (c &StringCatalog) locales() []string {
+    $out := []string{}
+    for i in 0:c.locales_list.len { out.push(c.locales_list[i] + "") }
+    << out
+}
+
+pub fn (c &StringCatalog) keys() []string {
+    $out := []string{}
+    for i in 0:c.keys_list.len { out.push(c.keys_list[i] + "") }
+    << out
+}
+
+pub fn (c &StringCatalog) has_entry(locale string, key string) bool {
+    norm := normalize_or_empty(&locale)
+    if norm.len == 0 { << false }
+    ek := entry_k(&norm, &key)
+    << c.entries.has(ek + "")
+}
+
+pub fn (c &StringCatalog) get_entry(locale string, key string) string {
+    norm := normalize_locale(&locale) or >>
+    ek := entry_k(&norm, &key)
+    if !c.entries.has(ek + "") {
+        >> errors.new("nexus i18n: entry not found: " + norm + "/" + key)
+    }
+    << c.entries[ek] + ""
+}
+
+pub fn (c &StringCatalog) resolve(locale string, key string) string {
+    chain := locale_fallback_chain(&locale, &c.default_locale)
+    for i in 0:chain.len {
+        loc := chain[i] + ""
+        ek := entry_k(&loc, &key)
+        if c.entries.has(ek + "") {
+            << c.entries[ek] + ""
+        }
+    }
+    << ""
+}
+
+pub fn (c &StringCatalog) resolve_plural(locale string, key string, count int) string {
+    chain := locale_fallback_chain(&locale, &c.default_locale)
+    for i in 0:chain.len {
+        loc := chain[i] + ""
+        cat := plural_category(&loc, count)
+        pk := plural_k(&loc, &key, &cat)
+        if c.plurals.has(pk + "") {
+            << c.plurals[pk] + ""
+        }
+        other_cat := "other"
+        pk_other := plural_k(&loc, &key, &other_cat)
+        if c.plurals.has(pk_other + "") {
+            << c.plurals[pk_other] + ""
+        }
+        ek := entry_k(&loc, &key)
+        if c.entries.has(ek + "") {
+            << c.entries[ek] + ""
+        }
+    }
+    << ""
+}
+
+pub fn encode_catalog_json(c &StringCatalog) string {
+    $b := strings.new_byte_builder(1024)
+    fmt_s := I18N_FORMAT + ""
+    def_s := c.default_locale + ""
+    b.write_str("{\n")
+    b.write_str("  \"format\": " + json.quote(&fmt_s) + ",\n")
+    b.write_str("  \"version\": " + str(I18N_VERSION) + ",\n")
+    b.write_str("  \"default_locale\": " + json.quote(&def_s) + ",\n")
+    b.write_str("  \"locales\": {\n")
+    for li in 0:c.locales_list.len {
+        loc := c.locales_list[li] + ""
+        if li > 0 { b.write_str(",\n") }
+        b.write_str("    " + json.quote(&loc) + ": {\n")
+        b.write_str("      \"entries\": {")
+        $first_e := true
+        for ki in 0:c.keys_list.len {
+            key := c.keys_list[ki] + ""
+            ek := entry_k(&loc, &key)
+            if c.entries.has(ek + "") {
+                if !first_e { b.write_str(", ") }
+                first_e = false
+                val := c.entries[ek] + ""
+                k_q := key + ""
+                b.write_str(json.quote(&k_q) + ": " + json.quote(&val))
+            }
+        }
+        b.write_str("},\n      \"plurals\": {")
+        $first_p := true
+        cats := ["zero", "one", "other"]
+        for ki in 0:c.keys_list.len {
+            key := c.keys_list[ki] + ""
+            $has_any := false
+            for ci in 0:cats.len {
+                cat := cats[ci] + ""
+                pk := plural_k(&loc, &key, &cat)
+                if c.plurals.has(pk + "") { has_any = true }
+            }
+            if has_any {
+                if !first_p { b.write_str(", ") }
+                first_p = false
+                k_q := key + ""
+                b.write_str(json.quote(&k_q) + ": {")
+                $first_c := true
+                for ci in 0:cats.len {
+                    cat := cats[ci] + ""
+                    pk := plural_k(&loc, &key, &cat)
+                    if c.plurals.has(pk + "") {
+                        if !first_c { b.write_str(", ") }
+                        first_c = false
+                        val := c.plurals[pk] + ""
+                        cq := cat + ""
+                        b.write_str(json.quote(&cq) + ": " + json.quote(&val))
+                    }
+                }
+                b.write_str("}")
+            }
+        }
+        b.write_str("}\n    }")
+    }
+    b.write_str("\n  }\n}\n")
+    << b.to_string()
+}
+
+pub fn decode_catalog_json(raw &string) StringCatalog {
+    if raw.len < 2 || raw.len > 4194304 {
+        >> errors.new("nexus i18n: catalog JSON size out of bounds")
+    }
+    doc := json.parse_max(raw, 4194304)
+    if !doc.ok() { >> errors.new("nexus i18n JSON: " + doc.error()) }
+    root := doc.root()
+    if !doc.is_dict(root) || !doc.has(root, "format") || !doc.has(root, "version") ||
+        !doc.has(root, "default_locale") || !doc.has(root, "locales") {
+        >> errors.new("nexus i18n: missing required catalog JSON fields")
+    }
+    fmt_s := doc.as_string(doc.get(root, "format")) or >>
+    ver := doc.as_int(doc.get(root, "version")) or >>
+    if fmt_s != I18N_FORMAT || ver != I18N_VERSION {
+        >> errors.new("nexus i18n: unsupported catalog format or version")
+    }
+    def_loc := doc.as_string(doc.get(root, "default_locale")) or >>
+    $cat := new_catalog(def_loc) or >>
+    locs := doc.get(root, "locales")
+    if !doc.is_dict(locs) { >> errors.new("nexus i18n: locales must be JSON object") }
+    loc_count := doc.count(locs)
+    for i in 0:loc_count {
+        loc_node := doc.at(locs, i)
+        loc_name := doc.key(loc_node)
+        if !doc.is_dict(loc_node) { >> errors.new("nexus i18n: locale block must be object") }
+        if doc.has(loc_node, "entries") {
+            ents := doc.get(loc_node, "entries")
+            if !doc.is_dict(ents) { >> errors.new("nexus i18n: entries must be object") }
+            for ei in 0:doc.count(ents) {
+                enode := doc.at(ents, ei)
+                ekey := doc.key(enode)
+                eval := doc.as_string(enode) or >>
+                cat.set_entry(loc_name + "", ekey + "", eval + "") or >>
+            }
+        }
+        if doc.has(loc_node, "plurals") {
+            pls := doc.get(loc_node, "plurals")
+            if !doc.is_dict(pls) { >> errors.new("nexus i18n: plurals must be object") }
+            for pi in 0:doc.count(pls) {
+                pobj := doc.at(pls, pi)
+                pkey := doc.key(pobj)
+                if !doc.is_dict(pobj) { >> errors.new("nexus i18n: plural entry must be object") }
+                for ci in 0:doc.count(pobj) {
+                    cnode := doc.at(pobj, ci)
+                    cname := doc.key(cnode)
+                    cval := doc.as_string(cnode) or >>
+                    cat.set_plural(loc_name + "", pkey + "", cname + "", cval + "") or >>
+                }
+            }
+        }
+    }
+    << cat
+}
+
+fn clone_str_row(src &[]string) []string {
+    $out := []string{}
+    for i in 0:src.len { out.push(src[i] + "") }
+    << out
+}
+
+fn parse_csv_rows(raw &string) [][]string {
+    $rows := [][]string{}
+    $row := []string{}
+    $field := strings.new_byte_builder(64)
+    $in_quote := false
+    $i := 0
+    n := raw.len
+    while i < n {
+        c := raw[i] & 255
+        if in_quote {
+            if c == 34 { // '"'
+                if i + 1 < n && (raw[i + 1] & 255) == 34 {
+                    field.write_byte(34)
+                    i += 2
+                    ->
+                }
+                in_quote = false
+                i += 1
+            } else {
+                field.write_byte(int(c))
+                i += 1
+            }
+        } else {
+            if c == 34 {
+                if field.len > 0 { >> errors.new("nexus i18n: unexpected quote in unquoted CSV field") }
+                in_quote = true
+                i += 1
+            } else if c == 44 { // ','
+                row.push(field.to_string())
+                field = strings.new_byte_builder(64)
+                i += 1
+            } else if c == 13 {
+                if i + 1 < n && (raw[i + 1] & 255) == 10 { i += 1 }
+                row.push(field.to_string())
+                rows.push(clone_str_row(&row))
+                row = []string{}
+                field = strings.new_byte_builder(64)
+                i += 1
+            } else if c == 10 {
+                row.push(field.to_string())
+                rows.push(clone_str_row(&row))
+                row = []string{}
+                field = strings.new_byte_builder(64)
+                i += 1
+            } else {
+                field.write_byte(int(c))
+                i += 1
+            }
+        }
+    }
+    if in_quote { >> errors.new("nexus i18n: unterminated CSV quote") }
+    if field.len > 0 || row.len > 0 {
+        row.push(field.to_string())
+        rows.push(clone_str_row(&row))
+    }
+    << rows
+}
+
+pub fn decode_catalog_csv(raw &string, default_locale string) StringCatalog {
+    rows := parse_csv_rows(raw) or >>
+    if rows.len == 0 || rows[0].len < 2 || rows[0][0] != "key" {
+        >> errors.new("nexus i18n: CSV header must start with 'key,<locale>...'")
+    }
+    $locs := []string{}
+    for c_idx in 1:rows[0].len {
+        loc_raw := rows[0][c_idx] + ""
+        locs.push(normalize_locale(&loc_raw) or >>)
+    }
+    $cat := new_catalog(default_locale) or >>
+    for r_idx in 1:rows.len {
+        row := &rows[r_idx]
+        if row.len == 1 && row[0].len == 0 { -> }
+        if row.len != rows[0].len {
+            >> errors.new("nexus i18n: CSV column count mismatch on row " + str(r_idx + 1))
+        }
+        k := row[0] + ""
+        if k.len == 0 { >> errors.new("nexus i18n: empty CSV key on row " + str(r_idx + 1)) }
+        for c_idx in 1:row.len {
+            val := row[c_idx] + ""
+            if val.len > 0 {
+                cat.set_entry(locs[c_idx - 1] + "", k + "", val + "") or >>
+            }
+        }
+    }
+    << cat
+}

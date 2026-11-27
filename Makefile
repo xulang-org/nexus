@@ -2,7 +2,7 @@ XU ?= xu
 PYTHON ?= python3
 export XU
 
-.PHONY: taptap-data-test taptap-test taptap-native-test native-taptap console-data-test console-test console-native-test native-console steam-data-test steam-test steam-native-test native-steam prefab-runtime-test ai-bt-nav-test input-replay-timing-test timeline-test project-bundle-cli-test ui-tree-test profiler-test bundle-test shader-cross-backend-test scene-v9-test scene-soa-test ecs-parallel-test navigation-test networking-test audio-dsp-test script-aot-test script-host-coroutines-test physics3d-joints-ragdoll-test physics3d-advanced-test gpu-skinning-test skeletal-animation-test particles-vfx-gpu-test terrain-foliage-gpu-test decals-atmosphere-gpu-test ddgi-gi-gpu-test engine-integration-gpu-test all-modern-tests clustered-lighting-gpu-test indirect-cull-hiz-gpu-test hdr-postprocess-gpu-test meshlet-visbuffer-gpu-test transparent-pbr-gpu-test streaming-lru-gpu-test xacp-test lighting-demo-test demo-lighting lighting-core-test lighting-gpu-test gpu-failure-test present-fallback-test text-2d-test ui-hud-test demo-ui-hud mesh-shaders canvas-shaders native-image window-input-smoke gpu-surface-smoke sdk gpu-compute-smoke native-probe gpu-offscreen-smoke gpu-transfer-smoke check-core test-core mesh-core-test audio-core-test audio-device-test native native-audio audio-fixtures audio-test audio-smoke demo-audio demo-audio-stream demo-audio-seek check layers test demo demo2d demo3d demo-glb demo-script demo-materials demo-textures3d demo-mipmaps3d demo-material-maps demo-normal_maps demo-generated-tangents demo-glb-materials smoke gpu-smoke gpu3d-smoke image-fixtures glb-fixtures script-tool script-fixtures script-live-smoke glb-material-fixtures scene-fixtures demo-scene-file scene-asset-fixtures demo-scene-assets scene-audio-fixtures demo-scene-audio demo-scene-av scene-script-assets scene-script-fixtures demo-scene-scripts
+.PHONY: gameplay-test gameplay-components-test gameplay-integration-test effects-detail-test combined-audio-effects-test combined-2d-25d-effects-gpu-test combined-3d-effects-gpu-test combined-gameplay-effects-test project-scaffold-test spatial-audio-test gamepad-test i18n-test anim-serialize-budget-test taptap-data-test taptap-test taptap-native-test native-taptap console-data-test console-test console-native-test native-console steam-data-test steam-test steam-native-test native-steam prefab-runtime-test ai-bt-nav-test input-replay-timing-test timeline-test project-bundle-cli-test ui-tree-test profiler-test bundle-test shader-cross-backend-test scene-v9-test scene-soa-test ecs-parallel-test navigation-test networking-test audio-dsp-test script-aot-test script-host-coroutines-test physics3d-joints-ragdoll-test physics3d-advanced-test gpu-skinning-test skeletal-animation-test particles-vfx-gpu-test terrain-foliage-gpu-test decals-atmosphere-gpu-test ddgi-gi-gpu-test engine-integration-gpu-test all-modern-tests clustered-lighting-gpu-test indirect-cull-hiz-gpu-test hdr-postprocess-gpu-test meshlet-visbuffer-gpu-test transparent-pbr-gpu-test streaming-lru-gpu-test xacp-test lighting-demo-test demo-lighting lighting-core-test lighting-gpu-test gpu-failure-test present-fallback-test text-2d-test ui-hud-test demo-ui-hud mesh-shaders canvas-shaders native-image window-input-smoke gpu-surface-smoke sdk gpu-compute-smoke native-probe gpu-offscreen-smoke gpu-transfer-smoke check-core test-core mesh-core-test audio-core-test audio-device-test native native-audio audio-fixtures audio-test audio-smoke demo-audio demo-audio-stream demo-audio-seek check layers test demo demo2d demo3d demo-glb demo-script demo-materials demo-textures3d demo-mipmaps3d demo-material-maps demo-normal_maps demo-generated-tangents demo-glb-materials smoke gpu-smoke gpu3d-smoke image-fixtures glb-fixtures script-tool script-fixtures script-live-smoke glb-material-fixtures scene-fixtures demo-scene-file scene-asset-fixtures demo-scene-assets scene-audio-fixtures demo-scene-audio demo-scene-av scene-script-assets scene-script-fixtures demo-scene-scripts
 xacp-test: sdk
 	mkdir -p build
 	$(XU) build tests/xacp_checks.xu -o build/xacp-tests
@@ -216,7 +216,7 @@ check-core: layers sdk
 
 # Pure Xu validation stays usable while a compiler/platform backend is incomplete.
 # The aggregate check/test/gpu targets still fail on real device build failures.
-test-core: taptap-data-test console-data-test steam-data-test prefab-runtime-test ai-bt-nav-test input-replay-timing-test timeline-test project-bundle-cli-test ui-tree-test profiler-test bundle-test shader-cross-backend-test scene-v9-test scene-soa-test ecs-parallel-test navigation-test audio-dsp-test script-aot-test 25d-core-test shadow-core-test gltf-animation-test mesh-format-core-test lod-core-test frustum-core-test physics3d-test scene-lighting-test lighting-core-test check-core mesh-core-test glb-fixtures glb-material-fixtures script-fixtures audio-core-test scene-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
+test-core: physics2d-platformer-test audio-async-music-test persistent-entities-test gameplay-components-test gameplay-integration-test combined-audio-effects-test spatial-audio-test gamepad-test i18n-test anim-serialize-budget-test taptap-data-test console-data-test steam-data-test prefab-runtime-test ai-bt-nav-test input-replay-timing-test timeline-test project-bundle-cli-test ui-tree-test profiler-test bundle-test shader-cross-backend-test scene-v9-test scene-soa-test ecs-parallel-test navigation-test audio-dsp-test script-aot-test 25d-core-test shadow-core-test gltf-animation-test mesh-format-core-test lod-core-test frustum-core-test physics3d-test scene-lighting-test lighting-core-test check-core mesh-core-test glb-fixtures glb-material-fixtures script-fixtures audio-core-test scene-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
 	mkdir -p build
 	$(PYTHON) tests/layer_rules_checks.py
 	$(PYTHON) tests/layer_headless_checks.py
@@ -253,7 +253,7 @@ test-core: taptap-data-test console-data-test steam-data-test prefab-runtime-tes
 	$(XU) build tests/audio_scene_checks.xu -o build/audio-scene-tests
 	./build/audio-scene-tests
 
-test: canvas-memory-test phone-input-test phone-viewport-test phone-pinch-test phone-app-test phone-3d-budget-test phone-frame-test phone-state-test phone-audio-test jpeg-test test-core project-test native audio-device-test image-fixtures
+test: canvas-memory-test phone-input-test phone-viewport-test phone-pinch-test phone-app-test phone-3d-budget-test phone-frame-test phone-state-test phone-audio-test jpeg-test test-core project-test project-scaffold-test native audio-device-test image-fixtures
 	$(XU) build tests/scene_audio_checks.xu -o build/scene-audio-tests
 	XU_NEXUS_SDL_LIBRARY=/nonexistent XU_NEXUS_SDL_AUDIO_LIBRARY=/nonexistent ./build/scene-audio-tests
 	$(XU) build tests/scene_audio_output_checks.xu -o build/scene-audio-output-tests
@@ -592,7 +592,7 @@ script-live-smoke: mesh-shaders canvas-shaders native script-tool
 	$(XU) build examples/script_reload/main.xu -o build/script-reload
 	$(PYTHON) tests/script_live_checks.py
 
-gpu-smoke: 25d-gpu-test present-fallback-test text-2d-test ui-hud-test scene-camera-gpu-test scene-lod-gpu-test physics3d-gpu-test physics3d-joints-ragdoll-test project-gpu-test project-picking-test character-course-test shadow-gpu-test render-quality-test gltf-animation-gpu-test gpu-skinning-test clustered-lighting-gpu-test indirect-cull-hiz-gpu-test hdr-postprocess-gpu-test meshlet-visbuffer-gpu-test streaming-lru-gpu-test model-format-gpu-test lod-gpu-test lod-demo-test frustum-gpu-test scene-lighting-services-test lighting-demo-test lighting-gpu-test mesh-shaders canvas-shaders gpu-offscreen-smoke gpu-compute-smoke gpu-surface-smoke window-input-smoke native glb-fixtures glb-material-fixtures image-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
+gpu-smoke: combined-2d-25d-effects-gpu-test combined-3d-effects-gpu-test 25d-gpu-test present-fallback-test text-2d-test ui-hud-test scene-camera-gpu-test scene-lod-gpu-test physics3d-gpu-test physics3d-joints-ragdoll-test project-gpu-test project-picking-test character-course-test shadow-gpu-test render-quality-test gltf-animation-gpu-test gpu-skinning-test clustered-lighting-gpu-test indirect-cull-hiz-gpu-test hdr-postprocess-gpu-test meshlet-visbuffer-gpu-test streaming-lru-gpu-test model-format-gpu-test lod-gpu-test lod-demo-test frustum-gpu-test scene-lighting-services-test lighting-demo-test lighting-gpu-test mesh-shaders canvas-shaders gpu-offscreen-smoke gpu-compute-smoke gpu-surface-smoke window-input-smoke native glb-fixtures glb-material-fixtures image-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
 	mkdir -p build
 	$(XU) build tests/gpu_smoke.xu -o build/gpu-smoke
 	./build/gpu-smoke
@@ -977,7 +977,7 @@ engine-integration-gpu-test: layers mesh-shaders
 	$(XU) build tests/engine_full_integration_gpu_checks.xu -o build/engine-integration-gpu-checks
 	./build/engine-integration-gpu-checks
 
-all-modern-tests: modern-sandbox-test steam-test steam-native-test console-test console-native-test taptap-test taptap-native-test engine-integration-gpu-test ddgi-gi-gpu-test physics3d-advanced-test networking-test decals-atmosphere-gpu-test terrain-foliage-gpu-test script-host-coroutines-test particles-vfx-gpu-test skeletal-animation-test transparent-pbr-gpu-test
+all-modern-tests: modern-sandbox-test mikktspace-gpu-test lighting-2d-gpu-test audio-async-music-test physics2d-platformer-test persistent-entities-test gameplay-test effects-detail-test project-scaffold-test steam-test steam-native-test console-test console-native-test taptap-test taptap-native-test engine-integration-gpu-test ddgi-gi-gpu-test physics3d-advanced-test networking-test decals-atmosphere-gpu-test terrain-foliage-gpu-test script-host-coroutines-test particles-vfx-gpu-test skeletal-animation-test transparent-pbr-gpu-test
 	@echo "ALL MODERN ENGINE TESTS PASSED"
 
 console-data-test: sdk
@@ -1043,3 +1043,89 @@ networking-test: sdk
 	mkdir -p build
 	$(XU) build tests/networking_multiplayer_checks.xu -o build/networking-multiplayer-checks
 	./build/networking-multiplayer-checks
+
+spatial-audio-test: sdk
+	mkdir -p build
+	$(XU) build tests/spatial_audio_checks.xu -o build/spatial-audio-checks
+	./build/spatial-audio-checks
+
+gamepad-test: sdk
+	mkdir -p build
+	$(XU) build tests/gamepad_input_checks.xu -o build/gamepad-input-checks
+	./build/gamepad-input-checks
+
+i18n-test: sdk
+	mkdir -p build
+	$(XU) build tests/i18n_checks.xu -o build/i18n-checks
+	./build/i18n-checks
+
+anim-serialize-budget-test: sdk
+	mkdir -p build
+	$(XU) build tests/anim_serialize_budget_checks.xu -o build/anim-serialize-budget-checks
+	./build/anim-serialize-budget-checks
+
+project-scaffold-test: layers sdk project-cli project-validator
+	mkdir -p build
+	$(XU) build tests/project_scaffold_checks.xu -o build/project-scaffold-checks
+	./build/project-scaffold-checks --project-cli build/nexus-project --validator build/nexus-project-validate --xu "$(XU)"
+
+combined-audio-effects-test: sdk
+	mkdir -p build
+	$(XU) build tests/combined_audio_effects_checks.xu -o build/combined-audio-effects-checks
+	./build/combined-audio-effects-checks
+
+combined-2d-25d-effects-gpu-test: sdk mesh-shaders canvas-shaders native-image
+	mkdir -p build
+	$(XU) build tests/combined_2d_25d_effects_gpu_checks.xu -o build/combined-2d-25d-effects-gpu-checks
+	./build/combined-2d-25d-effects-gpu-checks
+
+combined-3d-effects-gpu-test: layers mesh-shaders canvas-shaders
+	mkdir -p build
+	$(XU) build tests/combined_3d_effects_gpu_checks.xu -o build/combined-3d-effects-gpu-checks
+	./build/combined-3d-effects-gpu-checks
+
+combined-gameplay-effects-test: native-steam native-console native-taptap
+	mkdir -p build
+	$(XU) build tests/combined_gameplay_effects_checks.xu -o build/combined-gameplay-effects-checks
+	XU_NEXUS_STEAM_LIBRARY=/nonexistent/no-steam XU_NEXUS_XBOX_DRIVER=/nonexistent/no-xbox XU_NEXUS_PS_DRIVER=/nonexistent/no-ps XU_NEXUS_SWITCH_DRIVER=/nonexistent/no-switch XU_NEXUS_TAPTAP_LIBRARY=/nonexistent/no-taptap ./build/combined-gameplay-effects-checks
+
+effects-detail-test: combined-audio-effects-test combined-2d-25d-effects-gpu-test combined-3d-effects-gpu-test combined-gameplay-effects-test
+	@echo "ALL COMBINED EFFECTS DETAIL TESTS PASSED"
+
+gameplay-components-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/gameplay_components_checks.xu -o build/gameplay-components-checks
+	./build/gameplay-components-checks
+
+gameplay-integration-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/gameplay_integration_checks.xu -o build/gameplay-integration-checks
+	./build/gameplay-integration-checks
+
+gameplay-test: gameplay-components-test gameplay-integration-test
+	@echo "ALL GAMEPLAY COMPONENT TESTS PASSED"
+
+persistent-entities-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/persistent_entities_checks.xu -o build/persistent-entities-checks
+	./build/persistent-entities-checks
+
+lighting-2d-gpu-test: layers sdk canvas-shaders mesh-shaders
+	mkdir -p build
+	$(XU) build tests/lighting_2d_gpu_checks.xu -o build/lighting-2d-gpu-checks
+	./build/lighting-2d-gpu-checks
+
+mikktspace-gpu-test: layers sdk mesh-shaders glb-material-fixtures
+	mkdir -p build
+	$(XU) build tests/mikktspace_gpu_checks.xu -o build/mikktspace-gpu-checks
+	./build/mikktspace-gpu-checks
+
+audio-async-music-test: layers sdk audio-core-test
+	mkdir -p build
+	$(XU) build tests/audio_async_music_checks.xu -o build/audio-async-music-checks
+	./build/audio-async-music-checks
+
+physics2d-platformer-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/physics2d_platformer_checks.xu -o build/physics2d-platformer-checks
+	./build/physics2d-platformer-checks

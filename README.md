@@ -60,6 +60,13 @@ make sdk
 - `make hdr-postprocess-gpu-test`：验证 `RGBA16_FLOAT` HDR MRT、3D `IrradianceGrid3D` SH 探针、GTAO 环境光遮蔽、Hi-Z SSR 反射、Bloom、ACES 与 TAA 后处理链路。
 - `make meshlet-visbuffer-gpu-test`：验证 Meshlet（64v/124t + 保守法线锥剔除 + Reverse-Z Hi-Z）+ Split-Sum IBL + `R32_UINT` Visibility Buffer（含解析屏幕空间 UV 梯度纹理采样与方向阴影）与 `ModernPipeline3D` 统一单帧渲染（macOS Arm64 / Metal）。
 - `make streaming-lru-gpu-test`：验证后台协程解码、优先级调度、每帧预算分片上传与 LRU 显存淘汰恢复。
+- `make effects-detail-test`：汇总运行 `combined-audio-effects-test`（ADPCM + Spatial 2.0 多普勒/声学遮挡/HRTF + Bus DSP/Reverb + active fade 保持与 1×1024/4×256 bit-exact）、`combined-2d-25d-effects-gpu-test`（视差 + 纹理瓦片地图 + Y-Sort + 2D 粒子/拖尾 + 裁剪框像素精度 + 2.5D Metal 深度排序）、`combined-3d-effects-gpu-test`（`ModernPipeline3D` 全链路 GTAO+SSR+Bloom+TAA+ACES、`reset_taa()` 无重影切镜、贴花+体积雾+排序透明+深度拒绝+前向 HDR GPU 粒子+Clearcoat/Sheen 与 90% 安全区 `Overlay2D` HUD 合成）及 `combined-gameplay-effects-test`（手柄输入缓冲 + 顿帧慢动作耦合 + IK/Morph/Timeline/Ragdoll + Switch 掌机/底座切换 + `FrameProfiler` 回归门禁）。
+- `make gameplay-test`：运行 `gameplay` 与 `integration/gameplay` 游戏核心组件测试（属性表与 Buff/Debuff 状态栈、血量/护盾/韧性/暴击抗性/Hitbox 伤害结算与多充能连招技能、背包负重/排序/装备词条同步与保底掉落表、前置任务链与条件分支对话、2D/3D 弹簧臂防穿墙相机与 Trauma 震屏、波次刷怪/FSM 状态锁/面向交互触发，以及与 `SceneTree`/`ScaledClock`/`Physics3D`/`Mixer`/`vfx`/`i18n` 的全链路联调）。
+- `make lighting-2d-gpu-test`：验证 `resources/lighting2d`（动态点/聚/方向 2D 光照、遮挡物线段硬/软阴影、2D 法线贴图、可见性多边形）、`rendering/two_d` Metal GPU 与无头软件像素一致性，以及 `Sprite3D` `ALPHA_MODE_BLEND` 前向与 HDR 后向前深度排序透明混合（macOS Arm64 / Metal）。
+- `make persistent-entities-test`：验证 `resources/persistence` 与 `integration/scene/persistent.xu`（`EntityGuid`、跨世界解析/迁移 `transfer_entity_world`、重载重绑与已销毁实体裁剪 `rebind_world`、SHA-256 存档信封与 `SaveMigrationChain` 多跳版本迁移 `v1 -> v3`）。
+- `make mikktspace-gpu-test`：验证 `resources/mesh/mikktspace.xu` 与 `integration/gltf_render`（镜像 UV 接缝拆分、对抗法线/共线退化兜底、`upload_model_with_mikktspace` 对无切线法线贴图 GLB 在 Metal GPU 上的正常着色）。
+- `make audio-async-music-test`：验证 `integration/audio_stream/async_pool.xu`（多协程后台解码池、乱序分块重排、`seek_frames` 代际屏障、48MB 大 WAV 寻址与无缝循环）及 `audio/mixer/music_director.xu`（拍/小节量化多轨 `MusicDirector` 与空间 `AmbientZoneMixer` 优先级闪避）。
+- `make physics2d-platformer-test`：验证 `physics2d/world2d.xu`（层级过滤射线检测、单向穿透平台、`Enter`/`Stay`/`Exit` 触发器生命周期，及包含土狼时间、跳跃缓存、松键变速跳与蹬墙滑/蹬墙跳的 `PlatformerController2D`）。
 
 ## Phone 原生 2D / 3D 示例
 
@@ -1250,6 +1257,38 @@ GLB 表面、音频、脚本和 2D/3D 相机可保存到场景文件，实例覆
 以及跨设备、关闭模型、后部节点失效时不覆盖前部旧材质、保存调整路径与失败保留旧文件的检查。
 本轮实机仍为 macOS arm64 / Metal，Vulkan/D3D12 待各自平台验收。
 
+## 用户游戏项目结构（Standard Game Project Layout）
+
+使用 Nexus 开发独立游戏推荐采用官方标准工程布局，通过 `nexus-project init`、`doctor` 与 `layout` 一键创建、体检并衔接多平台发布：
+
+```text
+<my_game>/
+├── xu.xun                  # Xu 模块清单（require github.com/xulang-org/nexus）
+├── project.json            # nexus.project v1 主清单（可选 meta / paths / platforms + assets / scenes）
+├── .gitignore              # 忽略 build/、.nexus/、*.xubc
+├── src/                    # 游戏源码（main.xu 入口与 src/game/ 模块）
+├── scenes/                 # .xuscene 场景（create_scene 自动落入此目录）
+├── prefabs/                # 可复用 .xuscene Prefab 模板
+├── assets/                 # models/、textures/、audio/、animations/、shaders/
+├── scripts/                # XuScript (.xus) 与 .schema.json
+├── locales/                # strings.json（nexus.i18n v1 多语言目录）
+├── config/                 # input_bindings.json、perf_budgets.json、platform_mapping.json
+├── platforms/              # steam.json、xbox.json、playstation.json、switch.json、taptap.json、mobile/、miniprogram/
+├── tests/                  # 游戏测试与性能预算回归
+└── build/ & .nexus/        # [Git 忽略] 构建产物、generations/ 与编辑器缓存
+```
+
+```sh
+make project-cli project-validator
+./build/nexus-project layout
+./build/nexus-project init ./my_game --name "Star Odyssey" --id com.studio.starodyssey --template 3d --locale zh-CN --platforms all --nexus-path "$(pwd)"
+./build/nexus-project doctor ./my_game/project.json --strict
+(cd ./my_game && xu check src/main.xu && xu build src/main.xu -o build/game && ./build/game --smoke)
+./build/nexus-project steam-stage ./my_game/project.json --output ./my_game/build/stage-steam
+```
+
+仅包含 `format`、`version`、`assets`、`scenes` 4 个字段的最小工程清单（如本仓库 `examples/*`）保持 100% 向后兼容。完整结构、字段与协作规范见 [GAME_PROJECT_STRUCTURE.zh-CN.md](docs/GAME_PROJECT_STRUCTURE.zh-CN.md)，自动化验收入口 `make project-scaffold-test`。
+
 ## 项目资源索引与场景编辑
 
 `project.json` 使用 `format: "nexus.project"`、`version: 1`、`assets` 与 `scenes`。资产表把固定的 128 位 UID 映射到项目内 GLB 或 PNG 路径。场景表把输出文件名映射到项目内的 `.xuscene` 源文件。网格表面、瓦片和 Sprite3D 图集可通过 UID 引用资产。多个场景可以复用同一 UID。
@@ -2430,4 +2469,15 @@ Nexus 为 **TapTap 中国区（CN）与国际区（Global）**的 **Android / iO
 
 ```sh
 make native-taptap taptap-data-test taptap-test taptap-native-test
+```
+
+## 核心子系统强化（Spatial Audio 2.0 / 多手柄 / 本地化 i18n / 性能门槛 / ASM 序列化）
+
+- **3D 空间音频 2.0 (`audio/mixer`)**：在 `spatial.xu` 与 `mod.xu` 中实现反平方/指数/线性三种衰减模型、多普勒频移、多 AABB 声学遮挡率计算、Woodworth 球面头模双耳 ITD/ILD 与耳背滚降，并在混音器中支持逐音轨浮点音高、样本级双耳延迟与单极点 IIR 头影遮挡低通滤波器。
+- **多手柄热插拔与输入缓冲 (`input/gamepad.xu`)**：`GamepadManager` 支持 4 路手柄连接/断开事件、Xbox/PlayStation/Switch/Steam Deck 模板同步至 `InputMap`、径向死区与幂曲线整形，以及支持土狼时间与出招搓招序列匹配的 `InputBuffer`。
+- **多语言本地化 (`resources/i18n` + `i18n`)**：支持 BCP-47 语言标签规范化与回退链（如 `zh-Hans-CN -> zh-Hans -> zh -> en-US -> en`）、RTL 检测、单复数词、参数模板插值、JSON/RFC-4180 CSV 目录编解码与运行时热切换。
+- **性能回归门槛 (`timing/budget.xu`) & 状态机序列化 (`animation/skeletal/serialize.xu`)**：提供 4 档平台性能预算（Desktop 60 / Console 120 / Switch Handheld 30 / Mobile 60）及相对基线 `p95`/`avg` 回归判定，以及完整覆盖 1D/2D 混合空间、转换条件、事件与 Root Motion 的骨骼动画状态机 JSON 编解码。
+
+```sh
+make spatial-audio-test gamepad-test i18n-test anim-serialize-budget-test
 ```

@@ -1,0 +1,480 @@
+@"github.com/xulang-org/nexus/gameplay"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub struct WaveSpawnRule {
+    pub enemy_type string
+    pub count int
+    pub interval f64
+    pub boss bool
+}
+
+pub struct WaveDef {
+    pub name string
+    pub start_delay f64
+    pub max_concurrent int
+    pub rules []WaveSpawnRule
+}
+
+pub struct SpawnInstruction {
+    pub wave_index int
+    pub enemy_type string
+    pub spawn_point_index int
+    pub boss bool
+}
+
+struct RuleRuntime {
+    rule WaveSpawnRule
+    spawned int
+    timer f64
+}
+
+struct WaveRuntime {
+    name string
+    start_delay f64
+    max_concurrent int
+    rules []RuleRuntime
+}
+
+// Multi-wave encounter director with start delays, concurrent enemy caps,
+// per-rule spawn intervals, round-robin spawn points, and wave clear tracking.
+pub struct WaveDirector {
+    spawn_point_count int
+    waves []WaveRuntime
+    active_wave int
+    delay_left f64
+    alive int
+    killed_total int
+    next_spawn_pt int
+    running bool
+    cleared bool
+}
+
+pub fn new_wave_director(spawn_point_count int) WaveDirector {
+    if spawn_point_count < 1 {
+        >> errors.new("nexus gameplay: WaveDirector requires at least 1 spawn point")
+    }
+    << WaveDirector{
+        spawn_point_count: spawn_point_count,
+        waves: []WaveRuntime{},
+        active_wave: 0,
+        delay_left: 0.0,
+        alive: 0,
+        killed_total: 0,
+        next_spawn_pt: 0,
+        running: false,
+        cleared: false
+    }
+}
+
+pub fn (w $&WaveDirector) add_wave(def WaveDef) int {
+    if def.start_delay < 0.0 || def.max_concurrent < 1 || def.rules.len == 0 {
+        >> errors.new("nexus gameplay: invalid WaveDef")
+    }
+    $r_list := []RuleRuntime{}
+    for i in 0:def.rules.len {
+        r := &def.rules[i]
+        if r.enemy_type.len == 0 || r.count < 1 || r.interval < 0.0 {
+            >> errors.new("nexus gameplay: invalid WaveSpawnRule")
+        }
+        r_list.push(RuleRuntime{
+            rule: WaveSpawnRule{
+                enemy_type: r.enemy_type + "",
+                count: r.count,
+                interval: r.interval,
+                boss: r.boss
+            },
+            spawned: 0,
+            timer: 0.0
+        })
+    }
+    w.waves.push(WaveRuntime{
+        name: def.name + "",
+        start_delay: def.start_delay,
+        max_concurrent: def.max_concurrent,
+        rules: r_list
+    })
+    << w.waves.len - 1
+}
+
+pub fn (w $&WaveDirector) start() int {
+    if w.waves.len == 0 {
+        >> errors.new("nexus gameplay: cannot start WaveDirector with no waves")
+    }
+    w.active_wave = 0
+    w.delay_left = w.waves[0].start_delay
+    w.alive = 0
+    w.killed_total = 0
+    w.running = true
+    w.cleared = false
+    << 0
+}
+
+fn wave_spawns_done(wr &WaveRuntime) bool {
+    for i in 0:wr.rules.len {
+        if wr.rules[i].spawned < wr.rules[i].rule.count {
+            << false
+        }
+    }
+    << true
+}
+
+fn maybe_advance_wave(w $&WaveDirector) {
+    if !w.running || w.cleared || w.active_wave >= w.waves.len { << }
+    if w.delay_left > 0.0 || w.alive != 0 { << }
+    aw := w.active_wave
+    if !wave_spawns_done(&w.waves[aw]) { << }
+    if w.active_wave + 1 >= w.waves.len {
+        w.cleared = true
+        w.running = false
+    } else {
+        w.active_wave += 1
+        w.delay_left = w.waves[w.active_wave].start_delay
+    }
+}
+
+pub fn (w $&WaveDirector) notify_enemy_killed() {
+    if w.alive > 0 {
+        w.alive -= 1
+    }
+    w.killed_total += 1
+    maybe_advance_wave(w)
+}
+
+pub fn (w $&WaveDirector) step(dt f64) []SpawnInstruction {
+    $out := []SpawnInstruction{}
+    if !w.running || w.cleared || dt < 0.0 || w.active_wave >= w.waves.len {
+        << out
+    }
+    if w.delay_left > 0.0 {
+        w.delay_left -= dt
+        if w.delay_left > 0.0 { << out }
+    }
+
+    aw := w.active_wave
+    wr := $&w.waves[aw]
+    for i in 0:wr.rules.len {
+        rr := $&wr.rules[i]
+        if rr.spawned >= rr.rule.count { -> }
+        if rr.spawned > 0 {
+            rr.timer -= dt
+        }
+        while rr.spawned < rr.rule.count && rr.timer <= 1e-9 && w.alive < wr.max_concurrent {
+            pt := w.next_spawn_pt % w.spawn_point_count
+            w.next_spawn_pt += 1
+            w.alive += 1
+            rr.spawned += 1
+            out.push(SpawnInstruction{
+                wave_index: w.active_wave,
+                enemy_type: rr.rule.enemy_type + "",
+                spawn_point_index: pt,
+                boss: rr.rule.boss
+            })
+            if rr.rule.interval <= 0.0 {
+                rr.timer = 0.0
+            } else {
+                rr.timer += rr.rule.interval
+            }
+        }
+    }
+
+    maybe_advance_wave(w)
+    << out
+}
+
+pub fn (w &WaveDirector) current_wave() int { << w.active_wave }
+pub fn (w &WaveDirector) alive_count() int { << w.alive }
+pub fn (w &WaveDirector) is_cleared() bool { << w.cleared }
+pub fn (w &WaveDirector) total_killed() int { << w.killed_total }
+
+// =========================================================================
+// Gameplay Finite State Machine (State Lockout + Allowed Edges + History)
+// =========================================================================
+
+pub struct FsmTransition {
+    pub from_state string
+    pub to_state string
+    pub at_time f64
+}
+
+struct FsmStateConfig {
+    name string
+    min_duration f64
+}
+
+struct FsmAllowedEdge {
+    from_state string
+    to_state string
+}
+
+pub struct GameplayFsm {
+    current_state string
+    prev_state string
+    elapsed_in_state f64
+    total_time f64
+    configs []FsmStateConfig
+    edges []FsmAllowedEdge
+    history []FsmTransition
+}
+
+pub fn new_gameplay_fsm(initial_state string) GameplayFsm {
+    if initial_state.len == 0 {
+        >> errors.new("nexus gameplay: initial FSM state cannot be empty")
+    }
+    << GameplayFsm{
+        current_state: initial_state,
+        prev_state: "",
+        elapsed_in_state: 0.0,
+        total_time: 0.0,
+        configs: []FsmStateConfig{},
+        edges: []FsmAllowedEdge{},
+        history: []FsmTransition{}
+    }
+}
+
+pub fn (f $&GameplayFsm) register_state(name string, min_duration f64) int {
+    if name.len == 0 || min_duration < 0.0 || math.is_nan(min_duration) || math.is_inf(min_duration) {
+        >> errors.new("nexus gameplay: invalid FSM state config")
+    }
+    for i in 0:f.configs.len {
+        if f.configs[i].name == name {
+            f.configs[i].min_duration = min_duration
+            << i
+        }
+    }
+    f.configs.push(FsmStateConfig{name: name, min_duration: min_duration})
+    << f.configs.len - 1
+}
+
+pub fn (f $&GameplayFsm) allow_transition(from_state string, to_state string) int {
+    if from_state.len == 0 || to_state.len == 0 {
+        >> errors.new("nexus gameplay: FSM edge state names cannot be empty")
+    }
+    f.edges.push(FsmAllowedEdge{from_state: from_state, to_state: to_state})
+    << f.edges.len - 1
+}
+
+fn state_min_dur(f &GameplayFsm, name &string) f64 {
+    for i in 0:f.configs.len {
+        if f.configs[i].name == *name { << f.configs[i].min_duration }
+    }
+    << 0.0
+}
+
+fn edge_permitted(f &GameplayFsm, from_s &string, to_s &string) bool {
+    $has_rules_for_from := false
+    for i in 0:f.edges.len {
+        if f.edges[i].from_state == *from_s {
+            has_rules_for_from = true
+            if f.edges[i].to_state == *to_s { << true }
+        }
+    }
+    // If explicit edges were declared from `from_s`, enforce the allowlist; otherwise open.
+    << !has_rules_for_from
+}
+
+pub fn (f $&GameplayFsm) try_transition(to_state string) bool {
+    if to_state.len == 0 || to_state == f.current_state { << false }
+    min_d := state_min_dur(f, &f.current_state)
+    if f.elapsed_in_state + 1e-9 < min_d {
+        << false
+    }
+    if !edge_permitted(f, &f.current_state, &to_state) {
+        << false
+    }
+    f.history.push(FsmTransition{
+        from_state: f.current_state + "",
+        to_state: to_state + "",
+        at_time: f.total_time
+    })
+    f.prev_state = f.current_state + ""
+    f.current_state = to_state
+    f.elapsed_in_state = 0.0
+    << true
+}
+
+pub fn (f $&GameplayFsm) force_transition(to_state string) int {
+    if to_state.len == 0 {
+        >> errors.new("nexus gameplay: target FSM state cannot be empty")
+    }
+    if to_state == f.current_state { << 0 }
+    f.history.push(FsmTransition{
+        from_state: f.current_state + "",
+        to_state: to_state + "",
+        at_time: f.total_time
+    })
+    f.prev_state = f.current_state + ""
+    f.current_state = to_state
+    f.elapsed_in_state = 0.0
+    << 0
+}
+
+pub fn (f $&GameplayFsm) step(dt f64) {
+    if dt <= 0.0 || math.is_nan(dt) || math.is_inf(dt) { << }
+    f.elapsed_in_state += dt
+    f.total_time += dt
+}
+
+pub fn (f &GameplayFsm) current() string { << f.current_state + "" }
+pub fn (f &GameplayFsm) previous() string { << f.prev_state + "" }
+pub fn (f &GameplayFsm) state_elapsed() f64 { << f.elapsed_in_state }
+pub fn (f &GameplayFsm) total_elapsed() f64 { << f.total_time }
+pub fn (f &GameplayFsm) history_count() int { << f.history.len }
+
+// =========================================================================
+// Proximity + Facing Interactable Trigger Registry (Hold-to-Interact + Cooldown)
+// =========================================================================
+
+pub struct Interactable {
+    pub id string
+    pub prompt_key string
+    pub position fm.Vec3
+    pub radius f64
+    pub hold_duration f64
+    pub cooldown f64
+    pub priority int
+    pub one_shot bool
+    pub enabled bool
+}
+
+pub struct InteractSelection {
+    pub found bool
+    pub id string
+    pub prompt_key string
+    pub distance f64
+    pub hold_progress f64
+    pub triggered bool
+}
+
+struct InteractRuntime {
+    item Interactable
+    hold_elapsed f64
+    cooldown_left f64
+}
+
+pub struct InteractableRegistry {
+    items []InteractRuntime
+    active_id string
+}
+
+pub fn new_interactable_registry() InteractableRegistry {
+    << InteractableRegistry{items: []InteractRuntime{}, active_id: ""}
+}
+
+pub fn (r $&InteractableRegistry) register(item Interactable) int {
+    if item.id.len == 0 || item.radius <= 0.0 || item.hold_duration < 0.0 || item.cooldown < 0.0 {
+        >> errors.new("nexus gameplay: invalid Interactable fields")
+    }
+    for i in 0:r.items.len {
+        if r.items[i].item.id == item.id {
+            r.items[i] = InteractRuntime{item: item, hold_elapsed: 0.0, cooldown_left: 0.0}
+            << i
+        }
+    }
+    r.items.push(InteractRuntime{item: item, hold_elapsed: 0.0, cooldown_left: 0.0})
+    << r.items.len - 1
+}
+
+pub fn (r $&InteractableRegistry) set_enabled(id string, enabled bool) int {
+    for i in 0:r.items.len {
+        if r.items[i].item.id == id {
+            r.items[i].item.enabled = enabled
+            if !enabled { r.items[i].hold_elapsed = 0.0 }
+            << 0
+        }
+    }
+    >> errors.new("nexus gameplay: unknown interactable " + id)
+}
+
+fn safe_unit_fwd(v fm.Vec3) fm.Vec3 {
+    << v.normalized() or (err) {
+        _ := err.msg()
+        << fm.vec3(0.0, 0.0, 1.0)
+    }
+}
+
+pub fn (r $&InteractableRegistry) step(
+    player_pos fm.Vec3,
+    player_forward fm.Vec3,
+    min_facing_dot f64,
+    interact_held bool,
+    dt f64
+) InteractSelection {
+    $fwd := fm.vec3(0.0, 0.0, 1.0)
+    if player_forward.dot(player_forward) > 1e-12 {
+        fwd = safe_unit_fwd(player_forward)
+    }
+
+    $best_idx := -1
+    $best_prio := -2147483647
+    $best_dist := 1e18
+
+    for i in 0:r.items.len {
+        ir := $&r.items[i]
+        if ir.cooldown_left > 0.0 && dt > 0.0 {
+            ir.cooldown_left = math.max(0.0, ir.cooldown_left - dt)
+        }
+        if !ir.item.enabled || ir.cooldown_left > 0.0 { -> }
+        to_item := ir.item.position.sub(player_pos)
+        dist := to_item.length()
+        if dist > ir.item.radius { -> }
+        $dot := 1.0
+        if dist > 1e-6 {
+            dot = to_item.scaled(1.0 / dist).dot(fwd)
+        }
+        if dot < min_facing_dot { -> }
+        if best_idx < 0 || ir.item.priority > best_prio || (ir.item.priority == best_prio && dist < best_dist) {
+            best_idx = i
+            best_prio = ir.item.priority
+            best_dist = dist
+        }
+    }
+
+    // Reset hold progress on non-selected interactables.
+    for i in 0:r.items.len {
+        if i != best_idx {
+            r.items[i].hold_elapsed = 0.0
+        }
+    }
+
+    if best_idx < 0 {
+        r.active_id = ""
+        << InteractSelection{found: false, id: "", prompt_key: "", distance: 0.0, hold_progress: 0.0, triggered: false}
+    }
+
+    sel := $&r.items[best_idx]
+    r.active_id = sel.item.id + ""
+    $triggered := false
+    $prog := 0.0
+    if interact_held {
+        if sel.item.hold_duration <= 0.0 {
+            triggered = true
+            prog = 1.0
+        } else {
+            sel.hold_elapsed += math.max(0.0, dt)
+            prog = gp_clamp(sel.hold_elapsed / sel.item.hold_duration, 0.0, 1.0)
+            if sel.hold_elapsed + 1e-9 >= sel.item.hold_duration {
+                triggered = true
+                sel.hold_elapsed = 0.0
+            }
+        }
+    } else {
+        sel.hold_elapsed = 0.0
+    }
+
+    if triggered {
+        if sel.item.cooldown > 0.0 { sel.cooldown_left = sel.item.cooldown }
+        if sel.item.one_shot { sel.item.enabled = false }
+    }
+
+    << InteractSelection{
+        found: true,
+        id: sel.item.id + "",
+        prompt_key: sel.item.prompt_key + "",
+        distance: best_dist,
+        hold_progress: prog,
+        triggered: triggered
+    }
+}

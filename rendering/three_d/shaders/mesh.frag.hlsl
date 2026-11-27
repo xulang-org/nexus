@@ -41,10 +41,15 @@ float4 main(float4 color : TEXCOORD0,float3 world : TEXCOORD1,float3 normal : TE
         base *= base_texel.rgb;
         alpha *= base_texel.a;
     }
-    if (p.surface.w > 0.0) clip(alpha - p.surface.w);
+    float out_alpha = 1.0;
+    if (p.surface.w < -0.5) {
+        out_alpha = clamp(alpha * (-p.surface.w - 1.0), 0.0, 1.0);
+    } else if (p.surface.w > 0.0) {
+        clip(alpha - p.surface.w);
+    }
     if (p.surface.z > 1.5) {
         float3 clamped = saturate(base);
-        return float4(srgb_channel(clamped.x), srgb_channel(clamped.y), srgb_channel(clamped.z), 1.0);
+        return float4(srgb_channel(clamped.x), srgb_channel(clamped.y), srgb_channel(clamped.z), out_alpha);
     }
     float3 orm = float3(1.0, 1.0, 1.0);
     if ((mask & 2) != 0) orm = orm_texture.Sample(orm_sampler, sample_uv).rgb;
@@ -75,5 +80,5 @@ float4 main(float4 color : TEXCOORD0,float3 world : TEXCOORD1,float3 normal : TE
         linear_color += source_direct(base, metallic, roughness, shading_normal, world, l.eye_exposure.xyz,
             l.sources[offset], l.sources[offset+1], l.sources[offset+2], l.sources[offset+3]) * visibility;
     }
-    return float4(finish_lighting(linear_color,l.eye_exposure.w),1.0);
+    return float4(finish_lighting(linear_color,l.eye_exposure.w),out_alpha);
 }

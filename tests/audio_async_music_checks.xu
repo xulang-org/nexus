@@ -1,0 +1,161 @@
+@main
+
+#math
+
+assets #"github.com/xulang-org/nexus/assets/audio"
+fm #"github.com/xulang-org/nexus/foundation/math"
+mix #"github.com/xulang-org/nexus/audio/mixer"
+music #"github.com/xulang-org/nexus/integration/audio_stream"
+
+fn check_async_audio_pool_and_seek() int {
+    cfg := music.AsyncAudioConfig{worker_count: 3, chunk_frames: 512, max_inflight_chunks: 4}
+    $pool := music.open_pool(cfg)
+    $mixer := mix.new_mixer(48000, 8) or >>
+
+    // 1. Async multi-worker chunk decode + feed + sample fidelity against pcm16.wav.
+    $ref_reader := assets.open_wav_reader("build/audio-fixtures/pcm16.wav") or >>
+    ref_rate := ref_reader.sample_rate()
+    ref_channels := ref_reader.channel_count()
+    ref_total := ref_reader.frame_count()
+    ref_samples := ref_reader.read_frames(0, ref_total) or >>
+    rref := $&ref_reader
+    rref.close() or >>
+    assert(ref_rate > 0 && ref_total > 0)
+
+    $mixer_small := mix.new_mixer(ref_rate, 4) or >>
+    h_small := pool.open_stream($&mixer_small, "build/audio-fixtures/pcm16.wav", 4096, false) or >>
+    fed_small := pool.wait_and_pump($&mixer_small, ref_total, 32) or >>
+    assert(fed_small >= ref_total)
+
+    src_small := pool.source_id(h_small) or >>
+    info_small := mixer_small.stream_info(src_small) or >>
+    assert(info_small.eof && info_small.written_frames == ref_total)
+
+    v_small := mixer_small.play_stream(src_small, 0, 1.0, 0.0) or >>
+    rendered := mixer_small.render(ref_total) or >>
+    assert(rendered[0] == ref_samples[0])
+    if ref_total >= 2 {
+        if ref_channels == 1 {
+            assert(rendered[2] == ref_samples[1])
+        } else if ref_samples.len >= 4 {
+            assert(rendered[2] == ref_samples[2])
+        }
+    }
+    assert(!(mixer_small.is_playing(v_small) or >>))
+    pool.close_stream($&mixer_small, h_small) or >>
+
+    // 2. Large 48MB stereo stream + async seek generation barrier to tail frames 11,999,990..12,000,000.
+    h_large := pool.open_stream($&mixer, "build/audio-fixtures/large.wav", 4096, false) or >>
+    pool.wait_and_pump($&mixer, 1024, 32) or >>
+    src_large := pool.source_id(h_large) or >>
+    v_large := mixer.play_stream(src_large, 0, 1.0, 0.0) or >>
+
+    gen_before := pool.generation(h_large) or >>
+    target_seek := 11999998
+    assert((pool.seek_frames($&mixer, h_large, target_seek) or >>) == target_seek)
+    assert((pool.generation(h_large) or >>) == gen_before + 1)
+
+    fed_tail := pool.wait_and_pump($&mixer, 2, 32) or >>
+    assert(fed_tail == 2)
+    tail_pcm := mixer.render(2) or >>
+    // audio_stream_checks verifies large.wav end[0]==1000, end[3]==-2000 (right ch frame 11,999,999).
+    assert(tail_pcm[0] == 1000 && tail_pcm[3] == -2000)
+    assert(!(mixer.is_playing(v_large) or >>))
+
+    // 3. Looping wrap-around across chunk boundaries.
+    h_loop := pool.open_stream($&mixer, "build/audio-fixtures/pcm16.wav", 4096, true) or >>
+    want_loop := ref_total * 2 + 128
+    fed_loop := pool.wait_and_pump($&mixer, want_loop, 64) or >>
+    assert(fed_loop >= want_loop)
+    assert(pool.stats().completed_chunks >= 3)
+
+    pool.close($&mixer) or >>
+    assert(pool.stats().active_streams == 0)
+    << 0
+}
+
+fn check_music_director_and_ambient_zones() int {
+    $mixer := mix.new_mixer(48000, 8) or >>
+    // Open lightweight streams to drive Mixer stem & zone voices without extra asset files.
+    s_pad := mixer.open_stream(48000, 1, 64) or >>
+    s_drm := mixer.open_stream(48000, 1, 64) or >>
+    s_led := mixer.open_stream(48000, 1, 64) or >>
+    buf := [1000, 1000, 1000, 1000]
+    mixer.feed_stream(s_pad, &buf, false) or >>
+    mixer.feed_stream(s_drm, &buf, false) or >>
+    mixer.feed_stream(s_led, &buf, false) or >>
+    v_pad := mixer.play_stream(s_pad, 0, 1.0, 0.0) or >>
+    v_drm := mixer.play_stream(s_drm, 0, 0.0, 0.0) or >>
+    v_led := mixer.play_stream(s_led, 0, 0.0, 0.0) or >>
+
+    // MusicDirector at 120 BPM (2 beats/sec), 4 beats/bar.
+    $dir := mix.new_music_director(120.0, 4) or >>
+    dir.add_stem("pad", v_pad, 1.0) or >>
+    dir.add_stem("drums", v_drm, 0.8) or >>
+    dir.add_stem("lead", v_led, 0.5) or >>
+    dir.define_state("explore", &[1.0, 0.0, 0.0]) or >>
+    dir.define_state("combat", &[0.5, 1.0, 1.0]) or >>
+
+    dir.set_state_immediate($&mixer, "explore") or >>
+    assert(dir.active_state() == "explore")
+    assert(math.abs((mixer.volume(v_pad) or >>) - 1.0) < 0.001)
+    assert(math.abs((mixer.volume(v_drm) or >>) - 0.0) < 0.001)
+
+    // Queue transition on next BEAT (beat 1.0 = 0.5s at 120 BPM) with 0.5s crossfade.
+    dir.request_transition("combat", mix.QUANTIZE_BEAT, 0.5) or >>
+    t0 := dir.update($&mixer, 0.25) or >>
+    assert(t0 == 0 && dir.active_state() == "explore" && dir.queued_state() == "combat")
+
+    // Cross beat 1.0 -> triggers transition cleanly and finishes 0.5s fade.
+    t1 := dir.update($&mixer, 0.25) or >>
+    assert(t1 == 1 && dir.active_state() == "combat" && dir.queued_state() == "")
+    dir.update($&mixer, 0.5) or >>
+    assert(math.abs((mixer.volume(v_pad) or >>) - 0.5) < 0.001)
+    assert(math.abs((mixer.volume(v_drm) or >>) - 0.8) < 0.001)
+    assert(math.abs((mixer.volume(v_led) or >>) - 0.5) < 0.001)
+
+    // Queue BAR-quantized return to explore -> waits until beat 4.0.
+    dir.request_transition("explore", mix.QUANTIZE_BAR, 0.0) or >>
+    assert((dir.update($&mixer, 0.5) or >>) == 0)
+    assert((dir.update($&mixer, 0.5) or >>) == 1)
+    assert(dir.active_state() == "explore")
+    assert(dir.transition_count() == 3)
+
+    // AmbientZoneMixer: overlapping forest (prio 1) and boss_arena (prio 10, duck 0.25).
+    s_forest := mixer.open_stream(48000, 1, 64) or >>
+    s_boss := mixer.open_stream(48000, 1, 64) or >>
+    v_forest := mixer.play_stream(s_forest, 0, 0.0, 0.0) or >>
+    v_boss := mixer.play_stream(s_boss, 0, 0.0, 0.0) or >>
+
+    $amb := mix.new_ambient_zone_mixer()
+    amb.add_zone("forest", v_forest, fm.vec2(0.0, 0.0), 50.0, 150.0, 1, 1.0, 0.8) or >>
+    amb.add_zone("boss_arena", v_boss, fm.vec2(0.0, 0.0), 10.0, 30.0, 10, 0.9, 0.25) or >>
+
+    // Outside boss arena (x = 40): only forest active at full weight 1.0.
+    amb.update($&mixer, fm.vec2(40.0, 0.0)) or >>
+    assert(amb.dominant_zone() == "forest")
+    assert(math.abs((amb.zone_volume("forest") or >>) - 1.0) < 0.001)
+    assert(math.abs((amb.zone_volume("boss_arena") or >>) - 0.0) < 0.001)
+
+    // Inside boss inner radius (x = 5): boss takes priority and ducks forest to 0.25!
+    amb.update($&mixer, fm.vec2(5.0, 0.0)) or >>
+    assert(amb.dominant_zone() == "boss_arena")
+    assert(math.abs((amb.zone_volume("boss_arena") or >>) - 0.9) < 0.001)
+    assert(math.abs((mixer.volume(v_forest) or >>) - 0.25) < 0.001)
+
+    << 0
+}
+
+fn run() int {
+    check_async_audio_pool_and_seek() or >>
+    check_music_director_and_ambient_zones() or >>
+    println("PASS: audio_async_music_checks (Multi-Coroutine AsyncAudioPool + Seek Generation Barrier + Beat/Bar MusicDirector + Ducking AmbientZones)")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

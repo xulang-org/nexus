@@ -217,3 +217,39 @@ rejects(changed('resources/taptap/mod.xu', 'nexus_taptap_native'), 'native tapta
 rejects(changed('taptap/mod.xu', 'nexus_taptap_native'), 'native taptap import must stay')
 rejects(changed('integration/platform_services/mod.xu', 'nexus_taptap_native'), 'native taptap import must stay')
 print('PASS: taptap packages respect native bridge and OS/GPU isolation')
+
+rejects(changed('resources/i18n/mod.xu', 'os'), 'forbidden external import')
+rejects(changed('resources/i18n/mod.xu', 'gpu'), 'forbidden external import')
+rejects(changed('resources/i18n/mod.xu', 'nexus_audio_native'), 'native audio import must stay')
+rejects(changed('i18n/mod.xu', 'gpu'), 'forbidden external import')
+print('PASS: i18n data and service packages stay independent of OS, GPU, and native bridges')
+
+rejects(changed('resources/project/mod.xu', 'os'), 'forbidden external import')
+rejects(changed('resources/project/mod.xu', 'gpu'), 'forbidden external import')
+rejects(changed('resources/project/mod.xu', 'nexus_audio_native'), 'native audio import must stay')
+rejects(changed('resources/project/mod.xu', module + '/scene'), 'forbidden dependency')
+print('PASS: resources/project schema package stays pure CPU data with zero OS, GPU, native, or scene dependencies')
+
+for source in ('gameplay/stats.xu', 'gameplay/combat.xu', 'gameplay/inventory.xu', 'gameplay/quest.xu', 'gameplay/camera_rig.xu', 'gameplay/spawner.xu'):
+    rejects(changed(source, 'os'), 'forbidden external import')
+    rejects(changed(source, 'gpu'), 'forbidden external import')
+    rejects(changed(source, 'nexus_audio_native'), 'native audio import must stay')
+    rejects(changed(source, module + '/scene'), 'forbidden layer dependency')
+rejects(changed('integration/gameplay/mod.xu', 'os'), 'forbidden external import')
+rejects(changed('integration/gameplay/mod.xu', 'gpu'), 'forbidden external import')
+rejects(changed('integration/gameplay/mod.xu', 'nexus_audio_native'), 'native audio import must stay')
+print('PASS: gameplay service and integration/gameplay packages respect OS, GPU, scene, and native boundaries')
+
+for source in ('resources/lighting2d/mod.xu', 'resources/lighting2d/shadow2d.xu'):
+    rejects(changed(source, 'os'), 'forbidden external import')
+    rejects(changed(source, 'gpu'), 'forbidden external import')
+    rejects(changed(source, 'nexus_audio_native'), 'native audio import must stay')
+    rejects(changed(source, module + '/scene'), 'forbidden dependency')
+print('PASS: resources/lighting2d stays pure CPU data with zero OS, GPU, native, or scene dependencies')
+
+for source in ('resources/persistence/guid.xu', 'resources/persistence/migration.xu'):
+    rejects(changed(source, 'os'), 'forbidden external import')
+    rejects(changed(source, 'gpu'), 'forbidden external import')
+    rejects(changed(source, 'nexus_audio_native'), 'native audio import must stay')
+    rejects(changed(source, module + '/scene'), 'forbidden dependency')
+print('PASS: resources/persistence stays pure CPU data with zero OS, GPU, native, or scene dependencies')

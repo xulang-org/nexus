@@ -1,0 +1,337 @@
+@main
+
+rp #"github.com/xulang-org/nexus/resources/project"
+proj #"github.com/xulang-org/nexus/integration/project"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#encoding/json
+#errors
+#os
+#os/exec
+#path/filepath
+#strings
+
+struct Config {
+    project_cli string
+    validator string
+    xu_bin string
+}
+
+struct CmdResult {
+    ok bool
+    output string
+}
+
+fn check(cond bool, msg string) int {
+    if !cond {
+        >> errors.new("project_scaffold_checks: " + msg)
+    }
+    << 0
+}
+
+fn parse_args(argv []string) Config {
+    $cfg := Config{
+        project_cli: "build/nexus-project",
+        validator: "build/nexus-project-validate",
+        xu_bin: "xu"
+    }
+    $i := 1
+    while i < argv.len {
+        arg := argv[i] + ""
+        if arg == "--project-cli" && i + 1 < argv.len {
+            cfg.project_cli = argv[i + 1] + ""
+            i = i + 2
+        } else if arg == "--validator" && i + 1 < argv.len {
+            cfg.validator = argv[i + 1] + ""
+            i = i + 2
+        } else if arg == "--xu" && i + 1 < argv.len {
+            cfg.xu_bin = argv[i + 1] + ""
+            i = i + 2
+        } else {
+            >> errors.new("unexpected arg: " + arg)
+        }
+    }
+    << cfg
+}
+
+fn run_cmd(bin &string, args &[]string) CmdResult {
+    $cmd := exec.command(*bin + "")
+    for i in 0:args.len {
+        cmd.args.push(args[i] + "")
+    }
+    out := cmd.combined_output() or (err) {
+        << CmdResult{ok: false, output: err.msg()}
+    }
+    << CmdResult{ok: true, output: out}
+}
+
+fn run_cmd_in_dir(dir &string, bin &string, args &[]string) CmdResult {
+    $cmd := exec.command(*bin + "")
+    cmd.dir = *dir + ""
+    for i in 0:args.len {
+        cmd.args.push(args[i] + "")
+    }
+    out := cmd.combined_output() or (err) {
+        << CmdResult{ok: false, output: err.msg()}
+    }
+    << CmdResult{ok: true, output: out}
+}
+
+fn must_cmd(bin &string, args &[]string, label string) string {
+    res := run_cmd(bin, args)
+    if !res.ok {
+        >> errors.new("project_scaffold_checks: " + label + " failed: " + res.output)
+    }
+    << res.output
+}
+
+fn path_exists(path string) bool {
+    _ := os.stat(path + "") or (err) {
+        _ := err.msg()
+        << false
+    }
+    << true
+}
+
+fn try_bad_platform_list(raw string) bool {
+    _ := rp.parse_platform_list(&raw) or (err) {
+        _ := err.msg()
+        << false
+    }
+    << true
+}
+
+fn try_bad_project_id(raw string) bool {
+    _ := rp.validate_project_id(&raw) or (err) {
+        _ := err.msg()
+        << false
+    }
+    << true
+}
+
+fn try_delete_scene(proj_path string, key string) bool {
+    _ := proj.delete_scene(proj_path + "", key + "") or (err) {
+        _ := err.msg()
+        << false
+    }
+    << true
+}
+
+fn run_pure_data_tests() int {
+    check(rp.slugify_identifier(&"Star Odyssey 2!") == "star_odyssey_2", "slugify") or >>
+    check(rp.slugify_identifier(&"2026 Hero") == "game_2026_hero", "slugify numeric prefix") or >>
+    check(rp.default_project_id(&"Star Odyssey") == "com.nexus.star_odyssey", "default_project_id") or >>
+    check(!try_bad_project_id("nodot"), "id without dot rejected") or >>
+    check(!try_bad_project_id("com..bad"), "double dot id rejected") or >>
+
+    all_plats := rp.parse_platform_list(&"all") or >>
+    check(all_plats.len == 5, "all expands to 5 platforms") or >>
+    aliased := rp.parse_platform_list(&"steam,ps,ns,steam") or >>
+    check(aliased.len == 3 && aliased[1] == "playstation" && aliased[2] == "switch", "aliases & dedup") or >>
+    none_plats := rp.parse_platform_list(&"none") or >>
+    check(none_plats.len == 0, "none yields empty") or >>
+    check(!try_bad_platform_list("steam,atari"), "unknown platform rejected") or >>
+
+    meta := rp.default_meta("My Game", "", rp.TEMPLATE_3D, "en-US")
+    pb := rp.generate_default_perf_budgets_json(&meta.template)
+    rp.validate_perf_budgets_json(&pb) or >>
+    pm := rp.generate_default_platform_mapping_json()
+    rp.validate_platform_mapping_json(&pm) or >>
+    check(strings.contains(&rp.format_layout_spec(), "scenes/main.xuscene"), "layout spec contains main.xuscene") or >>
+    << 0
+}
+
+fn abs_or_raw(p &string) string {
+    << filepath.abs(p) or (err) {
+        _ := err.msg()
+        << *p + ""
+    }
+}
+
+fn run_in_temp(cfg &Config, root string) int {
+    cli_bin := filepath.abs(&cfg.project_cli) or >>
+    val_bin := filepath.abs(&cfg.validator) or >>
+    xu_bin := abs_or_raw(&cfg.xu_bin)
+    cwd := os.getwd() or >>
+
+    // 1. CLI layout command
+    layout_out := must_cmd(&cli_bin, &["layout"], "layout")
+    check(strings.contains(&layout_out, "project.json") &&
+        strings.contains(&layout_out, "src/") &&
+        strings.contains(&layout_out, "main.xu") &&
+        strings.contains(&layout_out, "platforms/"), "layout output complete: " + layout_out) or >>
+
+    // 2. Scaffold 3D project with all 5 platforms
+    game3d := filepath.join([root + "", "star_odyssey"])
+    init3d := must_cmd(&cli_bin, &[
+        "init", game3d + "",
+        "--name", "Star Odyssey",
+        "--id", "com.studio.starodyssey",
+        "--template", "3d",
+        "--locale", "zh-CN",
+        "--platforms", "all",
+        "--nexus-path", cwd + ""
+    ], "init 3d")
+    check(strings.contains(&init3d, "INITIALIZED"), "init output header") or >>
+
+    // Verify re-init without --force is rejected
+    dup_res := run_cmd(&cli_bin, &["init", game3d + "", "--name", "Star Odyssey"])
+    check(!dup_res.ok, "duplicate init without --force rejected") or >>
+
+    proj3d := filepath.join([game3d + "", "project.json"])
+    required_files := [
+        "xu.xun",
+        "project.json",
+        ".gitignore",
+        "README.md",
+        "src/main.xu",
+        "src/game/config.xu",
+        "scenes/main.xuscene",
+        "locales/strings.json",
+        "config/input_bindings.json",
+        "config/perf_budgets.json",
+        "config/platform_mapping.json",
+        "platforms/steam.json",
+        "platforms/xbox.json",
+        "platforms/playstation.json",
+        "platforms/switch.json",
+        "platforms/taptap.json"
+    ]
+    for i in 0:required_files.len {
+        f := filepath.join([game3d + "", required_files[i] + ""])
+        check(path_exists(f), "missing generated file: " + required_files[i]) or >>
+    }
+
+    // 3. Doctor pass & JSON report
+    doc_out := must_cmd(&cli_bin, &["doctor", proj3d + ""], "doctor text")
+    check(strings.contains(&doc_out, "DOCTOR PASS") && strings.contains(&doc_out, "errors=0"), "doctor text pass: " + doc_out) or >>
+    doc_json := must_cmd(&cli_bin, &["doctor", proj3d + "", "--json"], "doctor json")
+    parsed_doc := json.parse_max(&doc_json, 262144)
+    check(parsed_doc.ok() && (parsed_doc.as_bool(parsed_doc.get(parsed_doc.root(), "passed")) or >>), "doctor json passed") or >>
+
+    // 4. Validate 5 platform configs via CLI
+    _ := must_cmd(&cli_bin, &["steam-validate", filepath.join([game3d + "", "platforms/steam.json"])], "steam-validate")
+    _ := must_cmd(&cli_bin, &["xbox-validate", filepath.join([game3d + "", "platforms/xbox.json"])], "xbox-validate")
+    _ := must_cmd(&cli_bin, &["ps-validate", filepath.join([game3d + "", "platforms/playstation.json"])], "ps-validate")
+    _ := must_cmd(&cli_bin, &["switch-validate", filepath.join([game3d + "", "platforms/switch.json"])], "switch-validate")
+    _ := must_cmd(&cli_bin, &["taptap-validate", filepath.join([game3d + "", "platforms/taptap.json"])], "taptap-validate")
+
+    // 5. Auto-resolved staging for all 5 platforms WITHOUT explicit --steam/--xbox/--ps/--switch/--taptap flags
+    stage_steam := filepath.join([root + "", "stage_steam"])
+    _ := must_cmd(&cli_bin, &["steam-stage", proj3d + "", "--output", stage_steam + ""], "steam-stage auto")
+    check(path_exists(filepath.join([stage_steam + "", "content/locales/strings.json"])), "steam stage includes locales") or >>
+    check(path_exists(filepath.join([stage_steam + "", "content/config/input_bindings.json"])), "steam stage includes input_bindings") or >>
+    check(path_exists(filepath.join([stage_steam + "", "scripts/app_build_480.vdf"])), "steam stage generates app VDF") or >>
+
+    stage_xbox := filepath.join([root + "", "stage_xbox"])
+    _ := must_cmd(&cli_bin, &["xbox-stage", proj3d + "", "--output", stage_xbox + ""], "xbox-stage auto")
+    check(path_exists(filepath.join([stage_xbox + "", "content/MicrosoftGame.config"])), "xbox stage MicrosoftGame.config") or >>
+
+    stage_ps := filepath.join([root + "", "stage_ps"])
+    _ := must_cmd(&cli_bin, &["ps-stage", proj3d + "", "--output", stage_ps + ""], "ps-stage auto")
+    check(path_exists(filepath.join([stage_ps + "", "package.gp5"])), "ps stage package.gp5") or >>
+
+    stage_sw := filepath.join([root + "", "stage_switch"])
+    _ := must_cmd(&cli_bin, &["switch-stage", proj3d + "", "--output", stage_sw + ""], "switch-stage auto")
+    check(path_exists(filepath.join([stage_sw + "", "meta/application.nmeta"])), "switch stage application.nmeta") or >>
+
+    stage_tap := filepath.join([root + "", "stage_taptap"])
+    _ := must_cmd(&cli_bin, &["taptap-stage", proj3d + "", "--output", stage_tap + ""], "taptap-stage auto")
+    check(path_exists(filepath.join([stage_tap + "", "taptap/taptap_sdk_config.json"])), "taptap stage sdk config") or >>
+
+    // 6. Bundle pack & verify on scaffolded project
+    bundle_out := filepath.join([root + "", "bundle_out"])
+    pack_out := must_cmd(&cli_bin, &[
+        "bundle-pack", proj3d + "",
+        "--output", bundle_out + "",
+        "--bundle-id", "star_odyssey_v1",
+        "--sequence", "1",
+        "--key", "scaffold-secret"
+    ], "bundle-pack")
+    check(strings.contains(&pack_out, "PACKED star_odyssey_v1"), "bundle-pack ok") or >>
+    ver_out := must_cmd(&cli_bin, &["bundle-verify", bundle_out + "", "--key", "scaffold-secret"], "bundle-verify")
+    check(strings.contains(&ver_out, "VERIFIED star_odyssey_v1"), "bundle-verify ok") or >>
+
+    // 7. Cook project generation via nexus-project build
+    pub_out := filepath.join([root + "", "published"])
+    bld_out := must_cmd(&cli_bin, &["build", proj3d + "", "--output", pub_out + "", "--validator", val_bin + ""], "nexus-project build")
+    check(strings.contains(&bld_out, "rebuilt=0 reused=0"), "empty assets build clean") or >>
+
+    // 8. Real Xu check, build, and smoke execution inside scaffolded user game!
+    chk_res := run_cmd_in_dir(&game3d, &xu_bin, &["check", "src/main.xu"])
+    check(chk_res.ok, "generated game xu check failed: " + chk_res.output) or >>
+    game_bin := filepath.join([game3d + "", "build/star_odyssey_demo"])
+    os.mkdir_all(filepath.join([game3d + "", "build"])) or >>
+    bld_game := run_cmd_in_dir(&game3d, &xu_bin, &["build", "src/main.xu", "-o", game_bin + ""])
+    check(bld_game.ok, "generated game xu build failed: " + bld_game.output) or >>
+    smoke_res := run_cmd_in_dir(&game3d, &game_bin, &["--smoke"])
+    check(smoke_res.ok && strings.contains(&smoke_res.output, "READY Star Odyssey") && strings.contains(&smoke_res.output, "scene=main.xuscene"),
+        "generated game smoke run failed: " + smoke_res.output) or >>
+
+    // 9. Create, rename, and entry_scene protection while preserving meta/paths/platforms
+    k2 := proj.create_scene(proj3d + "", "level_02", "Level02") or >>
+    check(k2 == "level_02.xuscene", "create_scene returns key") or >>
+    check(path_exists(filepath.join([game3d + "", "scenes/level_02.xuscene"])), "create_scene uses paths.scenes") or >>
+    check(!try_delete_scene(proj3d + "", "main.xuscene"), "delete active entry_scene rejected") or >>
+    renamed := proj.rename_scene(proj3d + "", "main.xuscene", "title.xuscene") or >>
+    check(renamed == "title.xuscene", "rename_scene updates key") or >>
+    reloaded := proj.load_project(proj3d + "") or >>
+    check(reloaded.has_meta && reloaded.meta.entry_scene == "title.xuscene", "rename updates entry_scene") or >>
+    check(reloaded.has_paths && reloaded.has_platforms, "create/rename preserves paths & platforms") or >>
+
+    // 10. Negative doctor checks
+    game2d := filepath.join([root + "", "pixel_quest"])
+    _ := must_cmd(&cli_bin, &["init", game2d + "", "--name", "Pixel Quest", "--template", "2d", "--platforms", "steam,xbox"], "init 2d")
+    proj2d := filepath.join([game2d + "", "project.json"])
+    _ := must_cmd(&cli_bin, &["doctor", proj2d + ""], "doctor 2d clean")
+
+    // Break locales/strings.json
+    loc_file := filepath.join([game2d + "", "locales/strings.json"])
+    loc_bak := snapshot.read(loc_file + "", 1048576) or >>
+    snapshot.write_atomic(loc_file + "", &"{broken") or >>
+    bad_loc := run_cmd(&cli_bin, &["doctor", proj2d + ""])
+    check(!bad_loc.ok && strings.contains(&bad_loc.output, "PROJ-006"), "doctor catches broken i18n: " + bad_loc.output) or >>
+    snapshot.write_atomic(loc_file + "", &loc_bak) or >>
+
+    // Break config/input_bindings.json
+    inp_file := filepath.join([game2d + "", "config/input_bindings.json"])
+    inp_bak := snapshot.read(inp_file + "", 1048576) or >>
+    snapshot.write_atomic(inp_file + "", &"{\"format\":\"bad\"}") or >>
+    bad_inp := run_cmd(&cli_bin, &["doctor", proj2d + ""])
+    check(!bad_inp.ok && strings.contains(&bad_inp.output, "PROJ-007"), "doctor catches broken input: " + bad_inp.output) or >>
+    snapshot.write_atomic(inp_file + "", &inp_bak) or >>
+
+    // Break platforms/xbox.json
+    xbox_file := filepath.join([game2d + "", "platforms/xbox.json"])
+    snapshot.write_atomic(xbox_file + "", &"{\"format\":\"nexus.xbox\",\"version\":1,\"store_id\":\"BAD\"}") or >>
+    bad_xbox := run_cmd(&cli_bin, &["doctor", proj2d + ""])
+    check(!bad_xbox.ok && strings.contains(&bad_xbox.output, "PROJ-011"), "doctor catches broken xbox config: " + bad_xbox.output) or >>
+
+    // Also test 25d & blank templates initialize cleanly
+    _ := must_cmd(&cli_bin, &["init", filepath.join([root + "", "hd2d_game"]), "--name", "HD2D", "--template", "25d", "--platforms", "none"], "init 25d")
+    _ := must_cmd(&cli_bin, &["doctor", filepath.join([root + "", "hd2d_game/project.json"])], "doctor 25d")
+    _ := must_cmd(&cli_bin, &["init", filepath.join([root + "", "blank_game"]), "--name", "Blank", "--template", "blank", "--platforms", "none"], "init blank")
+    _ := must_cmd(&cli_bin, &["doctor", filepath.join([root + "", "blank_game/project.json"])], "doctor blank")
+
+    << 0
+}
+
+fn run(argv []string) int {
+    cfg := parse_args(argv) or >>
+    run_pure_data_tests() or >>
+    root := os.mkdir_temp("", "nexus-scaffold-") or >>
+    _ := run_in_temp(&cfg, root + "") or (err) {
+        _ := os.remove_all(root + "")
+        >> err
+    }
+    os.remove_all(root + "") or >>
+    println("PASS: project_scaffold_checks")
+    << 0
+}
+
+fn main() int {
+    run(os.args()) or (err) {
+        eprintln("FAIL: " + err.msg())
+        << 1
+    }
+    << 0
+}

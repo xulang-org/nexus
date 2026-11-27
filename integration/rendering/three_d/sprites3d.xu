@@ -32,6 +32,8 @@ fn apply_sprite_material(material &ren.Material3D, spec &sprite_data.Sprite3D) r
     next = next.with_uv_region(spec.region) or >>
     next = next.with_uv_flip(spec.flip_x, spec.flip_y) or >>
     next = next.with_shaded(spec.shaded) or >>
+    next = next.with_alpha(spec.opacity) or >>
+    next = next.with_alpha_blend(spec.is_alpha_blended()) or >>
     << next
 }
 
@@ -189,12 +191,68 @@ pub fn (sprites &SceneSprites3D) shadow_casters(tree &nexus.SceneTree, camera_wo
     for node in order {
         if !sprites.bindings.has(node) || !(tree.is_visible(node) or >>) { -> }
         binding := &sprites.bindings[node]
-        if !binding.spec.cast_shadow { -> }
+        if !binding.spec.cast_shadow || binding.spec.is_alpha_blended() { -> }
         node_world := tree.global_transform_3d(node) or >>
         world := binding.spec.quad_world_matrix(node_world, camera_world) or >>
         casters.push(ren.shadow_caster_material(quad, world, &binding.material) or >>)
     }
     << casters
+}
+
+fn sprite_sort_comes_before(ia int, da f64, ib int, db f64) bool {
+    diff := da - db
+    if diff > 1e-6 { << true }
+    if diff < -1e-6 { << false }
+    << ia < ib
+}
+
+fn sort_transparent_sprites(depths &[]f64) []int {
+    n := depths.len
+    $order := []int{}
+    $scratch := []int{}
+    for i in 0:n {
+        order.push(i)
+        scratch.push(i)
+    }
+    $width := 1
+    while width < n {
+        $left := 0
+        while left < n {
+            $mid := left + width
+            if mid > n { mid = n }
+            $right := left + width * 2
+            if right > n { right = n }
+            $li := left
+            $ri := mid
+            $out := left
+            while li < mid && ri < right {
+                ia := order[li]
+                ib := order[ri]
+                if sprite_sort_comes_before(ia, depths[ia], ib, depths[ib]) {
+                    scratch[out] = ia
+                    li += 1
+                } else {
+                    scratch[out] = ib
+                    ri += 1
+                }
+                out += 1
+            }
+            while li < mid {
+                scratch[out] = order[li]
+                li += 1
+                out += 1
+            }
+            while ri < right {
+                scratch[out] = order[ri]
+                ri += 1
+                out += 1
+            }
+            for k in left:right { order[k] = scratch[k] }
+            left += width * 2
+        }
+        width = width * 2
+    }
+    << order
 }
 
 pub fn (sprites &SceneSprites3D) draw_lit(device $&ren.Device3D, tree &nexus.SceneTree,
@@ -227,6 +285,11 @@ fn (sprites &SceneSprites3D) draw_lit_with_shadow(device $&ren.Device3D, tree &n
     $triangles := 0
     $culled_instances := 0
     $culled_triangles := 0
+    $blend_nodes := []int{}
+    $blend_worlds := []fm.Mat4{}
+    $blend_depths := []f64{}
+    $view := fm.identity_3d()
+    $have_view := false
     for node in order {
         if !sprites.bindings.has(node) || !(tree.is_visible(node) or >>) { -> }
         binding := &sprites.bindings[node]
@@ -237,7 +300,75 @@ fn (sprites &SceneSprites3D) draw_lit_with_shadow(device $&ren.Device3D, tree &n
             culled_triangles += quad.triangle_count()
             ->
         }
+        if binding.spec.is_alpha_blended() {
+            if !have_view {
+                view = camera_world.affine_inverse() or >>
+                have_view = true
+            }
+            center := world.transform(fm.vec4(0.5, 0.5, 0.0, 1.0)).xyz()
+            vpos := view.transform(fm.vec4(center.x, center.y, center.z, 1.0))
+            blend_nodes.push(node)
+            blend_worlds.push(world)
+            blend_depths.push(-vpos.z)
+            ->
+        }
         count := device.draw_material_shadowed_reference(quad, world, view_projection, &binding.material, lighting, shadow) or >>
+        instances += 1
+        triangles += count
+    }
+    if blend_nodes.len > 0 {
+        sorted := sort_transparent_sprites(&blend_depths)
+        for sidx in sorted {
+            bnode := blend_nodes[sidx]
+            bbind := &sprites.bindings[bnode]
+            count := device.draw_material_shadowed_reference(quad, blend_worlds[sidx], view_projection, &bbind.material, lighting, shadow) or >>
+            instances += 1
+            triangles += count
+        }
+    }
+    << SceneDraw3D{
+        instances: instances,
+        triangles: triangles,
+        culled_instances: culled_instances,
+        culled_triangles: culled_triangles,
+        lod_instances: 0,
+        lod_triangles_saved: 0
+    }
+}
+
+// Draws visible non-alpha-blended sprites (opaque and cutout) into an active HdrTarget3D.
+pub fn (sprites &SceneSprites3D) draw_opaque_into_hdr(
+    device &ren.Device3D,
+    hdr $&ren.HdrTarget3D,
+    clustered &ren.ClusteredRenderer3D,
+    tree &nexus.SceneTree,
+    camera_world fm.Mat4,
+    view fm.Mat4,
+    view_projection fm.Mat4
+) SceneDraw3D {
+    sprites.require_open() or >>
+    if !sprites.owner.matches(device) { >> errors.new("nexus sprite3d: sprite scene belongs to another device") }
+    if !camera_world.is_affine() || !view.is_affine() || !view_projection.is_finite() {
+        >> errors.new("nexus sprite3d: invalid camera transforms for HDR sprite pass")
+    }
+    quad := sprites.quad_ref() or >>
+    order := tree.subtree(tree.root()) or >>
+    $instances := 0
+    $triangles := 0
+    $culled_instances := 0
+    $culled_triangles := 0
+    for node in order {
+        if !sprites.bindings.has(node) || !(tree.is_visible(node) or >>) { -> }
+        binding := &sprites.bindings[node]
+        if binding.spec.is_alpha_blended() { -> }
+        node_world := tree.global_transform_3d(node) or >>
+        world := binding.spec.quad_world_matrix(node_world, camera_world) or >>
+        if !(sprites.owner.material_in_view(quad, world, view_projection, &binding.material) or >>) {
+            culled_instances += 1
+            culled_triangles += quad.triangle_count()
+            ->
+        }
+        count := hdr.draw_clustered(device, clustered, quad, world, view, view_projection, &binding.material) or >>
         instances += 1
         triangles += count
     }
@@ -249,6 +380,30 @@ fn (sprites &SceneSprites3D) draw_lit_with_shadow(device $&ren.Device3D, tree &n
         lod_instances: 0,
         lod_triangles_saved: 0
     }
+}
+
+// Submits visible ALPHA_MODE_BLEND Sprite3D instances into a TransparentQueue3D for back-to-front HDR alpha blending.
+pub fn (sprites &SceneSprites3D) enqueue_transparent(
+    tree &nexus.SceneTree,
+    camera_world fm.Mat4,
+    queue $&ren.TransparentQueue3D,
+    order_bias f64
+) int {
+    sprites.require_open() or >>
+    if !camera_world.is_affine() { >> errors.new("nexus sprite3d: invalid camera transform") }
+    quad := sprites.quad_ref() or >>
+    order := tree.subtree(tree.root()) or >>
+    $added := 0
+    for node in order {
+        if !sprites.bindings.has(node) || !(tree.is_visible(node) or >>) { -> }
+        binding := &sprites.bindings[node]
+        if !binding.spec.is_alpha_blended() { -> }
+        node_world := tree.global_transform_3d(node) or >>
+        world := binding.spec.quad_world_matrix(node_world, camera_world) or >>
+        queue.submit(quad, world, binding.material, order_bias) or >>
+        added += 1
+    }
+    << added
 }
 
 fn close_sprite_quad(quad $&ren.Mesh3D) string {

@@ -1,0 +1,303 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+pcm #"github.com/xulang-org/nexus/resources/audio"
+wav #"github.com/xulang-org/nexus/formats/wav"
+mix #"github.com/xulang-org/nexus/audio/mixer"
+#errors
+#math
+
+fn make_harmonic_clip_via_adpcm(rate int, frames int) pcm.Clip {
+    tau := 6.283185307179586
+    $samples := []int{}
+    for i in 0:frames {
+        t := f64(i) / f64(rate)
+        // Combine 440 Hz fundamental + 5200 Hz crisp upper harmonic so LPF occlusion contrast is sharp.
+        v := int(math.round_to_even((math.sin(tau * 440.0 * t) * 0.55 + math.sin(tau * 5200.0 * t) * 0.45) * 14000.0))
+        samples.push(v)
+    }
+    raw := pcm.pcm16(rate, 1, samples) or >>
+    adpcm_bytes := wav.encode_ima_adpcm_wav(&raw) or >>
+    << wav.decode(&adpcm_bytes) or >>
+}
+
+fn make_tone_mono(rate int, frames int, freq_hz f64, amp f64) pcm.Clip {
+    tau := 6.283185307179586
+    $samples := []int{}
+    for i in 0:frames {
+        t := f64(i) / f64(rate)
+        samples.push(int(math.round_to_even(math.sin(tau * freq_hz * t) * amp)))
+    }
+    << pcm.pcm16(rate, 1, samples) or >>
+}
+
+fn ch_rms(samples &[]int, ch int) f64 {
+    frames := samples.len / 2
+    if frames <= 0 { << 0.0 }
+    $sum2 := 0.0
+    for f in 0:frames {
+        v := f64(samples[f * 2 + ch])
+        sum2 += v * v
+    }
+    << math.sqrt(sum2 / f64(frames))
+}
+
+fn stereo_hf_diff_ratio(samples &[]int) f64 {
+    frames := samples.len / 2
+    if frames < 2 { << 0.0 }
+    $sum_tot := 0.0
+    $sum_diff := 0.0
+    for f in 1:frames {
+        m_prev := 0.5 * f64(samples[(f - 1) * 2] + samples[(f - 1) * 2 + 1])
+        m_curr := 0.5 * f64(samples[f * 2] + samples[f * 2 + 1])
+        d := m_curr - m_prev
+        sum_tot += m_curr * m_curr
+        sum_diff += d * d
+    }
+    if sum_tot <= 1.0 { << 0.0 }
+    << math.sqrt(sum_diff / sum_tot)
+}
+
+fn zero_crossings_mono(samples &[]int) int {
+    frames := samples.len / 2
+    $zc := 0
+    for f in 1:frames {
+        p := samples[(f - 1) * 2] + samples[(f - 1) * 2 + 1]
+        c := samples[f * 2] + samples[f * 2 + 1]
+        if (p < 0 && c >= 0) || (p >= 0 && c < 0) { zc += 1 }
+    }
+    << zc
+}
+
+fn assert_samples_in_range(samples &[]int) int {
+    for i in 0:samples.len {
+        s := samples[i]
+        if s < -32768 || s > 32767 {
+            >> errors.new("combined_audio_effects: sample out of PCM16 bounds: " + str(s))
+        }
+    }
+    << 0
+}
+
+fn build_configured_spatial_dsp_mixer() mix.Mixer {
+    rate := 48000
+    clip := make_harmonic_clip_via_adpcm(rate, 4096) or >>
+    $mx := mix.new_mixer(rate, 16) or >>
+    c_id := mx.add_clip(clip) or >>
+    sfx := mx.add_bus(0, "SFX", 0.9) or >>
+    mx.enable_bus_highpass(sfx, 180.0, 0.707) or >>
+    mx.enable_bus_delay(sfx, 0.015, 0.45, 0.40) or >>
+    mx.enable_bus_reverb(sfx, 0.78, 0.30, 0.35) or >>
+    vid := mx.play(c_id, sfx, 1.0, 0.0, true) or >>
+
+    $sp := mix.default_spatial_3d_params(
+        fm.vec3(5.0, 0.0, -3.0),
+        fm.vec3(0.0, 0.0, 0.0),
+        fm.vec3(1.0, 0.0, 0.0),
+        fm.vec3(0.0, 0.0, -1.0)
+    )
+    sp.source_velocity = fm.vec3(-35.0, 0.0, 22.0) // Approaching listener -> pitch > 1.0 + right ILD/ITD
+    sp.sample_rate = rate
+    sp.enable_hrtf = true
+    sres := mix.spatial_3d_advanced(&sp)
+    mx.apply_spatial_3d(vid, &sres) or >>
+    << mx
+}
+
+fn test_adpcm_spatial_occlusion_and_dsp_tail() int {
+    rate := 48000
+    // Compare Clear vs Occluded through full chain (ADPCM -> Spatial 2.0 + Doppler + HRTF -> Bus HP+Delay+Reverb).
+    $mx_clear := mix.new_mixer(rate, 16) or >>
+    c_clr := mx_clear.add_clip(make_harmonic_clip_via_adpcm(rate, 4096) or >>) or >>
+    bus_clr := mx_clear.add_bus(0, "SFX", 1.0) or >>
+    mx_clear.enable_bus_highpass(bus_clr, 120.0, 0.707) or >>
+    mx_clear.enable_bus_delay(bus_clr, 0.02, 0.40, 0.30) or >>
+    mx_clear.enable_bus_reverb(bus_clr, 0.72, 0.25, 0.30) or >>
+
+    $sp_clr := mix.default_spatial_3d_params(
+        fm.vec3(6.0, 0.0, -6.0),
+        fm.vec3(0.0, 0.0, 0.0),
+        fm.vec3(1.0, 0.0, 0.0),
+        fm.vec3(0.0, 0.0, -1.0)
+    )
+    sp_clr.source_velocity = fm.vec3(-28.0, 0.0, 28.0) // Approaching
+    sp_clr.sample_rate = rate
+    res_clr := mix.spatial_3d_advanced(&sp_clr)
+    v_clr := mx_clear.play(c_clr, bus_clr, 1.0, 0.0, true) or >>
+    mx_clear.apply_spatial_3d(v_clr, &res_clr) or >>
+    out_clr := mx_clear.render(2048) or >>
+    assert_samples_in_range(&out_clr) or >>
+
+    // Right ear receives higher energy than left ear even through shared bus Delay/Reverb!
+    rms_clr_l := ch_rms(&out_clr, 0)
+    rms_clr_r := ch_rms(&out_clr, 1)
+    assert(rms_clr_r > rms_clr_l * 1.15)
+    hf_clr := stereo_hf_diff_ratio(&out_clr)
+
+    // Same setup WITH thick AcousticBox concrete wall between source and listener!
+    $mx_occ := mix.new_mixer(rate, 16) or >>
+    c_occ := mx_occ.add_clip(make_harmonic_clip_via_adpcm(rate, 4096) or >>) or >>
+    bus_occ := mx_occ.add_bus(0, "SFX", 1.0) or >>
+    mx_occ.enable_bus_highpass(bus_occ, 120.0, 0.707) or >>
+    mx_occ.enable_bus_delay(bus_occ, 0.02, 0.40, 0.30) or >>
+    mx_occ.enable_bus_reverb(bus_occ, 0.72, 0.25, 0.30) or >>
+    $sp_occ := sp_clr
+    sp_occ.boxes = [mix.AcousticBox{min: fm.vec3(1.5, -2.0, -4.0), max: fm.vec3(4.5, 2.0, -2.0), absorption: 0.78}]
+    res_occ := mix.spatial_3d_advanced(&sp_occ)
+    v_occ := mx_occ.play(c_occ, bus_occ, 1.0, 0.0, true) or >>
+    mx_occ.apply_spatial_3d(v_occ, &res_occ) or >>
+    out_occ := mx_occ.render(2048) or >>
+    assert_samples_in_range(&out_occ) or >>
+
+    rms_occ_r := ch_rms(&out_occ, 1)
+    hf_occ := stereo_hf_diff_ratio(&out_occ)
+    assert(rms_occ_r < rms_clr_r * 0.55)
+    assert(hf_occ < hf_clr * 0.75)
+
+    // Stop dry voice -> reverb & delay ring smoothly without sudden clipping.
+    mx_clear.stop(v_clr) or >>
+    tail1 := mx_clear.render(2048) or >>
+    tail2 := mx_clear.render(2048) or >>
+    assert_samples_in_range(&tail1) or >>
+    assert_samples_in_range(&tail2) or >>
+    t1_rms := ch_rms(&tail1, 1)
+    t2_rms := ch_rms(&tail2, 1)
+    assert(t1_rms > 80.0 && t2_rms < t1_rms)
+
+    // Doppler approaching vs receding through full DSP chain -> higher zero-crossings on approach.
+    $mx_app := mix.new_mixer(rate, 8) or >>
+    c_app := mx_app.add_clip(make_tone_mono(rate, 4096, 800.0, 12000.0) or >>) or >>
+    b_app := mx_app.add_bus(0, "SFX", 1.0) or >>
+    mx_app.enable_bus_reverb(b_app, 0.65, 0.3, 0.25) or >>
+    $sp_app := mix.default_spatial_3d_params(fm.vec3(0.0, 0.0, -8.0), fm.vec3(0.0, 0.0, 0.0), fm.vec3(1.0, 0.0, 0.0), fm.vec3(0.0, 0.0, -1.0))
+    sp_app.source_velocity = fm.vec3(0.0, 0.0, 70.0) // moving toward listener
+    sp_app.sample_rate = rate
+    v_app := mx_app.play(c_app, b_app, 1.0, 0.0, true) or >>
+    s_app := mix.spatial_3d_advanced(&sp_app)
+    mx_app.apply_spatial_3d(v_app, &s_app) or >>
+    pcm_app := mx_app.render(2048) or >>
+
+    $mx_rec := mix.new_mixer(rate, 8) or >>
+    c_rec := mx_rec.add_clip(make_tone_mono(rate, 4096, 800.0, 12000.0) or >>) or >>
+    b_rec := mx_rec.add_bus(0, "SFX", 1.0) or >>
+    mx_rec.enable_bus_reverb(b_rec, 0.65, 0.3, 0.25) or >>
+    $sp_rec := sp_app
+    sp_rec.source_velocity = fm.vec3(0.0, 0.0, -70.0) // moving away
+    v_rec := mx_rec.play(c_rec, b_rec, 1.0, 0.0, true) or >>
+    s_rec := mix.spatial_3d_advanced(&sp_rec)
+    mx_rec.apply_spatial_3d(v_rec, &s_rec) or >>
+    pcm_rec := mx_rec.render(2048) or >>
+    assert(zero_crossings_mono(&pcm_app) > zero_crossings_mono(&pcm_rec) + 15)
+    << 0
+}
+
+fn test_block_boundary_bit_exactness() int {
+    $mx_one := build_configured_spatial_dsp_mixer() or >>
+    $mx_four := build_configured_spatial_dsp_mixer() or >>
+
+    one_shot := mx_one.render(1024) or >>
+    $chunked := []int{}
+    for _ in 0:4 {
+        blk := mx_four.render(256) or >>
+        for s in blk { chunked.push(s) }
+    }
+    assert(one_shot.len == chunked.len && one_shot.len == 2048)
+    $max_diff := 0
+    for i in 0:one_shot.len {
+        $d := one_shot[i] - chunked[i]
+        if d < 0 { d = -d }
+        if d > max_diff { max_diff = d }
+    }
+    assert(max_diff == 0)
+    << 0
+}
+
+fn test_spatial_tracking_during_active_fade() int {
+    rate := 48000
+    $mx := mix.new_mixer(rate, 8) or >>
+    cid := mx.add_clip(make_tone_mono(rate, 4096, 700.0, 14000.0) or >>) or >>
+    vid := mx.play(cid, 0, 1.0, 0.0, true) or >>
+    // Fade to 0 over 1024 frames and auto-stop!
+    mx.fade_volume(vid, 0.0, 1024, true) or >>
+
+    $rms_first := 0.0
+    $rms_late := 0.0
+    $first_r_dom := false
+    $late_l_dom := false
+    for b in 0:8 {
+        // Sweep source X from +8m (right) across center to -8m (left) while fade progresses.
+        x := 8.0 - f64(b) * 2.2
+        $sp := mix.default_spatial_3d_params(fm.vec3(x, 0.0, -4.0), fm.vec3(0.0, 0.0, 0.0), fm.vec3(1.0, 0.0, 0.0), fm.vec3(0.0, 0.0, -1.0))
+        sp.sample_rate = rate
+        sres := mix.spatial_3d_advanced(&sp)
+        // Regression check: per-frame apply_spatial_3d must NOT reset fade_total/fade_position/fade_stop!
+        mx.apply_spatial_3d(vid, &sres) or >>
+        blk := mx.render(128) or >>
+        rl := ch_rms(&blk, 0)
+        rr := ch_rms(&blk, 1)
+        if b == 0 {
+            rms_first = rl + rr
+            first_r_dom = rr > rl * 1.15
+        }
+        if b == 6 {
+            late_l_dom = rl > rr * 1.15
+            rms_late = rl + rr
+        }
+    }
+    assert(first_r_dom && late_l_dom)
+    assert(rms_late > 10.0 && rms_late < rms_first * 0.45)
+
+    // Render 1 more block -> fade_stop has deactivated the voice!
+    _ := mx.render(128) or >>
+    p_end := mx.is_playing(vid) or >>
+    assert(!p_end)
+    << 0
+}
+
+fn test_bus_ducking_and_pause_isolation() int {
+    rate := 48000
+    $mx := mix.new_mixer(rate, 8) or >>
+    c_bgm := mx.add_clip(make_tone_mono(rate, 4096, 300.0, 12000.0) or >>) or >>
+    c_sfx := mx.add_clip(make_tone_mono(rate, 4096, 2200.0, 12000.0) or >>) or >>
+    music_bus := mx.add_bus(0, "Music", 1.0) or >>
+    sfx_bus := mx.add_bus(0, "SFX", 1.0) or >>
+    mx.enable_bus_reverb(sfx_bus, 0.75, 0.2, 0.45) or >>
+
+    v_bgm := mx.play(c_bgm, music_bus, 1.0, 0.0, true) or >>
+    full_bgm := mx.render(512) or >>
+    mx.set_bus_volume(music_bus, 0.25) or >>
+    ducked_bgm := mx.render(512) or >>
+    assert(ch_rms(&ducked_bgm, 0) < ch_rms(&full_bgm, 0) * 0.35)
+
+    mx.stop(v_bgm) or >>
+    v_sfx := mx.play(c_sfx, sfx_bus, 1.0, 0.0, true) or >>
+    sfx_active := mx.render(512) or >>
+    assert(ch_rms(&sfx_active, 0) > 2000.0)
+
+    // Pause SFX bus -> zero SFX energy leaked while Music resumes independently.
+    mx.pause_bus(sfx_bus, true) or >>
+    sfx_paused := mx.render(512) or >>
+    assert(ch_rms(&sfx_paused, 0) < 1.0 && ch_rms(&sfx_paused, 1) < 1.0)
+
+    mx.pause_bus(sfx_bus, false) or >>
+    sfx_resumed := mx.render(512) or >>
+    p_sfx := mx.is_playing(v_sfx) or >>
+    assert(ch_rms(&sfx_resumed, 0) > 2000.0 && p_sfx)
+    << 0
+}
+
+fn run() int {
+    test_adpcm_spatial_occlusion_and_dsp_tail() or >>
+    test_block_boundary_bit_exactness() or >>
+    test_spatial_tracking_during_active_fade() or >>
+    test_bus_ducking_and_pause_isolation() or >>
+    println("PASS: combined_audio_effects_checks (ADPCM+Spatial2.0+Occlusion+Doppler+Biquad/Delay/Reverb, 0-diff block split, fade tracking, bus duck/pause)")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+}

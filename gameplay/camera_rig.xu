@@ -1,0 +1,397 @@
+@"github.com/xulang-org/nexus/gameplay"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub struct CameraShakeSample {
+    pub offset fm.Vec3
+    pub roll_rad f64
+    pub trauma f64
+}
+
+// Trauma-based (trauma^2) deterministic harmonic shake + directional recoil punch.
+pub struct CameraShake {
+    pub trauma f64
+    pub decay_rate f64
+    pub frequency f64
+    pub max_offset_xy f64
+    pub max_offset_z f64
+    pub max_roll_rad f64
+    pub phase f64
+    punch_offset fm.Vec3
+    punch_decay f64
+}
+
+pub fn new_camera_shake(
+    max_offset_xy f64,
+    max_offset_z f64,
+    max_roll_rad f64,
+    decay_rate f64,
+    frequency f64
+) CameraShake {
+    if max_offset_xy < 0.0 || max_offset_z < 0.0 || max_roll_rad < 0.0 ||
+        decay_rate <= 0.0 || frequency <= 0.0 {
+        >> errors.new("nexus gameplay: invalid CameraShake parameters")
+    }
+    << CameraShake{
+        trauma: 0.0,
+        decay_rate: decay_rate,
+        frequency: frequency,
+        max_offset_xy: max_offset_xy,
+        max_offset_z: max_offset_z,
+        max_roll_rad: max_roll_rad,
+        phase: 0.0,
+        punch_offset: fm.vec3(0.0, 0.0, 0.0),
+        punch_decay: 14.0
+    }
+}
+
+pub fn (s $&CameraShake) add_trauma(amount f64) {
+    if amount <= 0.0 || math.is_nan(amount) || math.is_inf(amount) { << }
+    s.trauma = gp_clamp(s.trauma + amount, 0.0, 1.0)
+}
+
+fn safe_unit_3(v fm.Vec3, fallback fm.Vec3) fm.Vec3 {
+    << v.normalized() or (err) {
+        _ := err.msg()
+        << fallback
+    }
+}
+
+pub fn (s $&CameraShake) punch(dir fm.Vec3, strength f64) {
+    if strength <= 0.0 || math.is_nan(strength) || math.is_inf(strength) { << }
+    if dir.dot(dir) <= 1e-12 { << }
+    unit := safe_unit_3(dir, fm.vec3(0.0, 0.0, 0.0))
+    s.punch_offset = s.punch_offset.add(unit.scaled(strength))
+}
+
+pub fn (s $&CameraShake) step(dt f64) CameraShakeSample {
+    if dt > 0.0 && !math.is_nan(dt) && !math.is_inf(dt) {
+        s.phase += dt * s.frequency * 6.283185307179586
+        s.trauma = math.max(0.0, s.trauma - s.decay_rate * dt)
+        p_atten := math.exp(-s.punch_decay * dt)
+        s.punch_offset = s.punch_offset.scaled(p_atten)
+    }
+    mag := s.trauma * s.trauma
+    ox := math.sin(s.phase * 1.13 + 0.4) * s.max_offset_xy * mag
+    oy := math.cos(s.phase * 1.47 + 1.1) * s.max_offset_xy * mag
+    oz := math.sin(s.phase * 0.89 + 2.3) * s.max_offset_z * mag
+    roll := math.sin(s.phase * 1.71 + 0.7) * s.max_roll_rad * mag
+    << CameraShakeSample{
+        offset: fm.vec3(ox, oy, oz).add(s.punch_offset),
+        roll_rad: roll,
+        trauma: s.trauma
+    }
+}
+
+// =========================================================================
+// 2D Follow Camera (Deadzone + Velocity Look-Ahead + Bounds Clamp + Shake)
+// =========================================================================
+
+pub struct FollowCamera2DState {
+    pub position fm.Vec2
+    pub roll_rad f64
+}
+
+pub struct FollowCamera2D {
+    pub focus fm.Vec2
+    pub deadzone fm.Vec2
+    pub look_ahead f64
+    pub smooth_speed f64
+    pub has_bounds bool
+    pub bounds fm.Rect2
+    pub viewport_size fm.Vec2
+    look_offset fm.Vec2
+    shake CameraShake
+}
+
+pub fn new_follow_camera_2d(
+    initial fm.Vec2,
+    deadzone fm.Vec2,
+    look_ahead f64,
+    smooth_speed f64
+) FollowCamera2D {
+    if deadzone.x < 0.0 || deadzone.y < 0.0 || look_ahead < 0.0 || smooth_speed <= 0.0 {
+        >> errors.new("nexus gameplay: invalid FollowCamera2D parameters")
+    }
+    << FollowCamera2D{
+        focus: initial,
+        deadzone: deadzone,
+        look_ahead: look_ahead,
+        smooth_speed: smooth_speed,
+        has_bounds: false,
+        bounds: fm.rect2(0.0, 0.0, 0.0, 0.0),
+        viewport_size: fm.vec2(0.0, 0.0),
+        look_offset: fm.vec2(0.0, 0.0),
+        shake: new_camera_shake(8.0, 0.0, 0.04, 1.8, 12.0) or >>
+    }
+}
+
+pub fn (c $&FollowCamera2D) set_bounds(bounds fm.Rect2, viewport_size fm.Vec2) int {
+    if bounds.size.x <= 0.0 || bounds.size.y <= 0.0 || viewport_size.x <= 0.0 || viewport_size.y <= 0.0 {
+        >> errors.new("nexus gameplay: FollowCamera2D bounds and viewport must be positive")
+    }
+    c.has_bounds = true
+    c.bounds = bounds
+    c.viewport_size = viewport_size
+    << 0
+}
+
+pub fn (c $&FollowCamera2D) add_trauma(amount f64) {
+    sh := $&c.shake
+    sh.add_trauma(amount)
+}
+
+pub fn (c &FollowCamera2D) shake_trauma() f64 { << c.shake.trauma }
+
+pub fn (c $&FollowCamera2D) step(target_pos fm.Vec2, target_vel fm.Vec2, dt f64) FollowCamera2DState {
+    alpha := 1.0 - math.exp(-c.smooth_speed * math.max(0.0, dt))
+    desired_look := target_vel.scaled(c.look_ahead)
+    c.look_offset = fm.vec2(
+        c.look_offset.x + (desired_look.x - c.look_offset.x) * alpha,
+        c.look_offset.y + (desired_look.y - c.look_offset.y) * alpha
+    )
+
+    desired := target_pos.add(c.look_offset)
+    $dx := desired.x - c.focus.x
+    $dy := desired.y - c.focus.y
+    $goal_x := c.focus.x
+    $goal_y := c.focus.y
+    if dx > c.deadzone.x {
+        goal_x = desired.x - c.deadzone.x
+    } else if dx < -c.deadzone.x {
+        goal_x = desired.x + c.deadzone.x
+    }
+    if dy > c.deadzone.y {
+        goal_y = desired.y - c.deadzone.y
+    } else if dy < -c.deadzone.y {
+        goal_y = desired.y + c.deadzone.y
+    }
+
+    c.focus = fm.vec2(
+        c.focus.x + (goal_x - c.focus.x) * alpha,
+        c.focus.y + (goal_y - c.focus.y) * alpha
+    )
+
+    if c.has_bounds {
+        half_vw := c.viewport_size.x * 0.5
+        half_vh := c.viewport_size.y * 0.5
+        min_x := c.bounds.position.x + half_vw
+        max_x := c.bounds.position.x + c.bounds.size.x - half_vw
+        min_y := c.bounds.position.y + half_vh
+        max_y := c.bounds.position.y + c.bounds.size.y - half_vh
+        if min_x <= max_x {
+            c.focus.x = gp_clamp(c.focus.x, min_x, max_x)
+        } else {
+            c.focus.x = c.bounds.position.x + c.bounds.size.x * 0.5
+        }
+        if min_y <= max_y {
+            c.focus.y = gp_clamp(c.focus.y, min_y, max_y)
+        } else {
+            c.focus.y = c.bounds.position.y + c.bounds.size.y * 0.5
+        }
+    }
+
+    sh := $&c.shake
+    s := sh.step(dt)
+    << FollowCamera2DState{
+        position: fm.vec2(c.focus.x + s.offset.x, c.focus.y + s.offset.y),
+        roll_rad: s.roll_rad
+    }
+}
+
+// =========================================================================
+// 3D Orbit + SpringArm Occlusion Camera + Lock-On + Shake
+// =========================================================================
+
+pub struct OrbitCamera3DPose {
+    pub eye fm.Vec3
+    pub target fm.Vec3
+    pub up fm.Vec3
+    pub arm_distance f64
+    pub occluded bool
+}
+
+pub struct OrbitCamera3D {
+    pub yaw f64
+    pub pitch f64
+    pub min_pitch f64
+    pub max_pitch f64
+    pub target_distance f64
+    pub current_distance f64
+    pub pivot_offset fm.Vec3
+    pub probe_radius f64
+    pub pull_in_speed f64
+    pub pull_out_speed f64
+    pub lock_on_active bool
+    pub lock_on_target fm.Vec3
+    shake CameraShake
+}
+
+pub fn new_orbit_camera_3d(distance f64, pivot_offset fm.Vec3) OrbitCamera3D {
+    if distance <= 0.2 || math.is_nan(distance) || math.is_inf(distance) {
+        >> errors.new("nexus gameplay: OrbitCamera3D distance must exceed 0.2")
+    }
+    << OrbitCamera3D{
+        yaw: 0.0,
+        pitch: 0.28,
+        min_pitch: -1.15,
+        max_pitch: 1.25,
+        target_distance: distance,
+        current_distance: distance,
+        pivot_offset: pivot_offset,
+        probe_radius: 0.22,
+        pull_in_speed: 35.0,
+        pull_out_speed: 6.0,
+        lock_on_active: false,
+        lock_on_target: fm.vec3(0.0, 0.0, 0.0),
+        shake: new_camera_shake(0.18, 0.12, 0.03, 2.2, 16.0) or >>
+    }
+}
+
+pub fn (c $&OrbitCamera3D) add_input(delta_yaw f64, delta_pitch f64) {
+    c.yaw += delta_yaw
+    c.pitch = gp_clamp(c.pitch + delta_pitch, c.min_pitch, c.max_pitch)
+}
+
+pub fn (c $&OrbitCamera3D) set_lock_on(active bool, target fm.Vec3) {
+    c.lock_on_active = active
+    c.lock_on_target = target
+}
+
+pub fn (c $&OrbitCamera3D) add_trauma(amount f64) {
+    sh := $&c.shake
+    sh.add_trauma(amount)
+}
+
+pub fn (c $&OrbitCamera3D) punch(dir fm.Vec3, strength f64) {
+    sh := $&c.shake
+    sh.punch(dir, strength)
+}
+
+pub fn (c &OrbitCamera3D) shake_trauma() f64 { << c.shake.trauma }
+
+fn ray_slab_hit_t(origin fm.Vec3, dir fm.Vec3, box_min fm.Vec3, box_max fm.Vec3) f64 {
+    $tmin := 0.0
+    $tmax := 1e18
+
+    // X axis
+    if math.abs(dir.x) < 1e-12 {
+        if origin.x < box_min.x || origin.x > box_max.x { << -1.0 }
+    } else {
+        inv := 1.0 / dir.x
+        $t0 := (box_min.x - origin.x) * inv
+        $t1 := (box_max.x - origin.x) * inv
+        if t0 > t1 {
+            tmp := t0
+            t0 = t1
+            t1 = tmp
+        }
+        tmin = math.max(tmin, t0)
+        tmax = math.min(tmax, t1)
+        if tmin > tmax { << -1.0 }
+    }
+
+    // Y axis
+    if math.abs(dir.y) < 1e-12 {
+        if origin.y < box_min.y || origin.y > box_max.y { << -1.0 }
+    } else {
+        inv := 1.0 / dir.y
+        $t0 := (box_min.y - origin.y) * inv
+        $t1 := (box_max.y - origin.y) * inv
+        if t0 > t1 {
+            tmp := t0
+            t0 = t1
+            t1 = tmp
+        }
+        tmin = math.max(tmin, t0)
+        tmax = math.min(tmax, t1)
+        if tmin > tmax { << -1.0 }
+    }
+
+    // Z axis
+    if math.abs(dir.z) < 1e-12 {
+        if origin.z < box_min.z || origin.z > box_max.z { << -1.0 }
+    } else {
+        inv := 1.0 / dir.z
+        $t0 := (box_min.z - origin.z) * inv
+        $t1 := (box_max.z - origin.z) * inv
+        if t0 > t1 {
+            tmp := t0
+            t0 = t1
+            t1 = tmp
+        }
+        tmin = math.max(tmin, t0)
+        tmax = math.min(tmax, t1)
+        if tmin > tmax { << -1.0 }
+    }
+
+    << tmin
+}
+
+pub fn (c $&OrbitCamera3D) step(
+    anchor fm.Vec3,
+    blockers &[]fm.Aabb3,
+    dt f64
+) OrbitCamera3DPose {
+    pivot := anchor.add(c.pivot_offset)
+    $look_target := pivot
+    if c.lock_on_active {
+        to_lock := c.lock_on_target.sub(pivot)
+        horiz := math.sqrt(to_lock.x * to_lock.x + to_lock.z * to_lock.z)
+        if horiz > 1e-5 {
+            // Camera sits behind player looking toward lock-on target -> arm dir is opposite horizontal vector.
+            c.yaw = math.atan2(-to_lock.x, -to_lock.z)
+        }
+        look_target = pivot.add(to_lock.scaled(0.35))
+    }
+
+    cp := math.cos(c.pitch)
+    arm_dir := safe_unit_3(fm.vec3(
+        math.sin(c.yaw) * cp,
+        math.sin(c.pitch),
+        math.cos(c.yaw) * cp
+    ), fm.vec3(0.0, 0.25, 1.0))
+
+    $desired_dist := c.target_distance
+    $occluded := false
+    pad := fm.vec3(c.probe_radius, c.probe_radius, c.probe_radius)
+    for i in 0:blockers.len {
+        b := &blockers[i]
+        bmin := b.minimum.sub(pad)
+        bmax := b.maximum.add(pad)
+        t := ray_slab_hit_t(pivot, arm_dir, bmin, bmax)
+        if t >= 0.0 && t < desired_dist {
+            desired_dist = math.max(0.25, t - 0.05)
+            occluded = true
+        }
+    }
+
+    step_dt := math.max(0.0, dt)
+    if desired_dist < c.current_distance {
+        if c.pull_in_speed <= 0.0 {
+            c.current_distance = desired_dist
+        } else {
+            in_alpha := 1.0 - math.exp(-c.pull_in_speed * step_dt)
+            c.current_distance += (desired_dist - c.current_distance) * in_alpha
+            if c.current_distance > desired_dist && occluded && step_dt > 0.008 {
+                c.current_distance = desired_dist
+            }
+        }
+    } else {
+        out_alpha := 1.0 - math.exp(-c.pull_out_speed * step_dt)
+        c.current_distance += (desired_dist - c.current_distance) * out_alpha
+    }
+
+    sh := $&c.shake
+    smp := sh.step(dt)
+    eye := pivot.add(arm_dir.scaled(c.current_distance)).add(smp.offset)
+    << OrbitCamera3DPose{
+        eye: eye,
+        target: look_target.add(smp.offset.scaled(0.35)),
+        up: fm.vec3(0.0, 1.0, 0.0),
+        arm_distance: c.current_distance,
+        occluded: occluded
+    }
+}

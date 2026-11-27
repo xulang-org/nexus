@@ -41,10 +41,15 @@ void main() {
         base *= base_texel.rgb;
         alpha *= base_texel.a;
     }
-    if (p.surface.w > 0.0 && alpha < p.surface.w) discard;
+    float out_alpha = 1.0;
+    if (p.surface.w < -0.5) {
+        out_alpha = clamp(alpha * (-p.surface.w - 1.0), 0.0, 1.0);
+    } else if (p.surface.w > 0.0 && alpha < p.surface.w) {
+        discard;
+    }
     if (p.surface.z > 1.5) {
         vec3 clamped = clamp(base, vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0));
-        output_color = vec4(srgb_channel(clamped.x), srgb_channel(clamped.y), srgb_channel(clamped.z), 1.0);
+        output_color = vec4(srgb_channel(clamped.x), srgb_channel(clamped.y), srgb_channel(clamped.z), out_alpha);
         return;
     }
     vec3 orm = vec3(1.0, 1.0, 1.0);
@@ -76,5 +81,5 @@ void main() {
         linear_color += source_direct(base, metallic, roughness, shading_normal, world, l.eye_exposure.xyz,
             l.sources[offset], l.sources[offset+1], l.sources[offset+2], l.sources[offset+3]) * visibility;
     }
-    output_color=vec4(finish_lighting(linear_color,l.eye_exposure.w),1.0);
+    output_color=vec4(finish_lighting(linear_color,l.eye_exposure.w),out_alpha);
 }

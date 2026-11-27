@@ -2,6 +2,8 @@
 
 fm #"github.com/xulang-org/nexus/foundation/math"
 canvas #"github.com/xulang-org/nexus/resources/canvas"
+l2d #"github.com/xulang-org/nexus/resources/lighting2d"
+#errors
 #math
 
 fn clamp_i(value int, lo int, hi int) int {
@@ -331,4 +333,62 @@ fn soft_draw_sdf_batch(pixels $&[]u8, width int, height int,
         rect := batch.rect_at(i) or (err) { << }
         soft_draw_sdf_rect(pixels, width, height, min_x, min_y, max_x, max_y, rect)
     }
+}
+
+fn soft_apply_lighting_2d(
+    pixels $&[]u8,
+    width int,
+    height int,
+    env &l2d.LightEnvironment2D,
+    view_origin fm.Vec2,
+    view_size fm.Vec2,
+    layer_mask int,
+    has_normal_map bool,
+    normal_tex &[]u8,
+    normal_w int,
+    normal_h int,
+    normal_linear bool
+) int {
+    if width <= 0 || height <= 0 || pixels.len != width * height * 4 {
+        >> errors.new("nexus canvas: software lighting buffer length mismatch")
+    }
+    view_bounds := fm.rect2(view_origin.x, view_origin.y, view_size.x, view_size.y)
+    lights := env.visible_lights(view_bounds, layer_mask, l2d.MAX_GPU_LIGHTS_2D) or >>
+    occs := env.visible_occluders(view_bounds, layer_mask, l2d.MAX_GPU_OCCLUDERS_2D) or >>
+    $filtered := l2d.new_environment_2d(env.ambient) or >>
+    filtered.set_exposure(env.exposure) or >>
+    filtered.set_shadow_bias(env.shadow_bias) or >>
+    for i in 0:lights.len { filtered.add_light(lights[i]) or >> }
+    for i in 0:occs.len { filtered.add_occluder(occs[i]) or >> }
+
+    inv_w := 1.0 / f64(width)
+    inv_h := 1.0 / f64(height)
+    default_n := fm.vec3(0.0, 0.0, 1.0)
+    has_valid_norm := has_normal_map && normal_w > 0 && normal_h > 0 && normal_tex.len == normal_w * normal_h * 4
+
+    for py in 0:height {
+        v := (f64(py) + 0.5) * inv_h
+        wy := view_origin.y + v * view_size.y
+        for px in 0:width {
+            u := (f64(px) + 0.5) * inv_w
+            wx := view_origin.x + u * view_size.x
+            $n := default_n
+            if has_valid_norm {
+                nt := sample_texture_f(normal_tex, normal_w, normal_h, normal_linear, u, v)
+                raw := fm.vec3(nt[0] * 2.0 - 1.0, nt[1] * 2.0 - 1.0, nt[2] * 2.0 - 1.0)
+                if raw.length() > 1e-5 {
+                    n = raw.normalized() or >>
+                }
+            }
+            lit := l2d.evaluate_point_2d(&filtered, fm.vec2(wx, wy), n, layer_mask) or >>
+            idx := (py * width + px) * 4
+            r := u8_to_norm(pixels[idx]) * lit.x
+            g := u8_to_norm(pixels[idx + 1]) * lit.y
+            b := u8_to_norm(pixels[idx + 2]) * lit.z
+            pixels[idx] = byte_u8(r)
+            pixels[idx + 1] = byte_u8(g)
+            pixels[idx + 2] = byte_u8(b)
+        }
+    }
+    << 0
 }

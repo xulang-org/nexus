@@ -1,0 +1,524 @@
+@main
+
+// Metal GPU integration suite verifying simultaneous combined 3D rendering effects:
+// 1. ModernPipeline3D: GTAO + Hi-Z SSR + Bloom + TAA + ACES + sky non-bleed + mp.reset_taa() camera cut
+// 2. Unified composition: Projected Decals + Froxel Fog + Sorted Transparency +
+//    Depth-Rejected Rear Pane & Particles + Front Additive HDR GPU Particles w/ Bloom + Extended PBR (Clearcoat+Sheen)
+// 3. 3D + Overlay2D + UiControlTree + EngineTelemetry HUD compositing inside console 90% TV safe area.
+
+#errors
+#gpu
+#math
+#ui/layout
+widgets #ui/widgets
+#window
+fm #"github.com/xulang-org/nexus/foundation/math"
+mesh #"github.com/xulang-org/nexus/resources/mesh"
+lights #"github.com/xulang-org/nexus/resources/lighting"
+nexus #"github.com/xulang-org/nexus/scene"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+ren2 #"github.com/xulang-org/nexus/rendering/two_d"
+shd #"github.com/xulang-org/nexus/assets/shaders/three_d"
+shd2 #"github.com/xulang-org/nexus/assets/shaders/two_d"
+modern #"github.com/xulang-org/nexus/integration/rendering/three_d"
+ui_bridge #"github.com/xulang-org/nexus/integration/ui"
+vp_mod #"github.com/xulang-org/nexus/integration/viewport"
+diag #"github.com/xulang-org/nexus/integration/diagnostics"
+
+fn check(cond bool, msg string) int {
+    if !cond { >> errors.new("combined 3d gpu check failed: " + msg) }
+    << 0
+}
+
+fn ch_r(c int) int { << (c >> 24) & 255 }
+fn ch_g(c int) int { << (c >> 16) & 255 }
+fn ch_b(c int) int { << (c >> 8) & 255 }
+fn abs_i(v int) int { if v < 0 { << -v } << v }
+
+fn rgb_str(c int) string {
+    << "(" + str(ch_r(c)) + "," + str(ch_g(c)) + "," + str(ch_b(c)) + ")"
+}
+
+fn luma(c int) int {
+    << (ch_r(c) * 3 + ch_g(c) * 6 + ch_b(c)) / 10
+}
+
+fn box_mesh(hx f64, hy f64, hz f64, color int) mesh.MeshData3D {
+    $m := mesh.new_mesh_data_3d()
+    pts := [
+        fm.vec3(-hx, -hy, -hz), fm.vec3(hx, -hy, -hz), fm.vec3(hx, hy, -hz), fm.vec3(-hx, hy, -hz),
+        fm.vec3(-hx, -hy, hz), fm.vec3(hx, -hy, hz), fm.vec3(hx, hy, hz), fm.vec3(-hx, hy, hz)
+    ]
+    // Front (+Z)
+    nf := fm.vec3(0.0, 0.0, 1.0)
+    m.vertex_lit_uv(pts[4], color, nf, fm.vec2(0.0, 0.0)) or >>
+    m.vertex_lit_uv(pts[5], color, nf, fm.vec2(1.0, 0.0)) or >>
+    m.vertex_lit_uv(pts[6], color, nf, fm.vec2(1.0, 1.0)) or >>
+    m.vertex_lit_uv(pts[7], color, nf, fm.vec2(0.0, 1.0)) or >>
+    m.triangle(0, 1, 2) or >>
+    m.triangle(0, 2, 3) or >>
+    // Back (-Z)
+    nb := fm.vec3(0.0, 0.0, -1.0)
+    m.vertex_lit_uv(pts[1], color, nb, fm.vec2(0.0, 0.0)) or >>
+    m.vertex_lit_uv(pts[0], color, nb, fm.vec2(1.0, 0.0)) or >>
+    m.vertex_lit_uv(pts[3], color, nb, fm.vec2(1.0, 1.0)) or >>
+    m.vertex_lit_uv(pts[2], color, nb, fm.vec2(0.0, 1.0)) or >>
+    m.triangle(4, 5, 6) or >>
+    m.triangle(4, 6, 7) or >>
+    // Top (+Y)
+    nt := fm.vec3(0.0, 1.0, 0.0)
+    m.vertex_lit_uv(pts[3], color, nt, fm.vec2(0.0, 0.0)) or >>
+    m.vertex_lit_uv(pts[2], color, nt, fm.vec2(1.0, 0.0)) or >>
+    m.vertex_lit_uv(pts[6], color, nt, fm.vec2(1.0, 1.0)) or >>
+    m.vertex_lit_uv(pts[7], color, nt, fm.vec2(0.0, 1.0)) or >>
+    m.triangle(8, 9, 10) or >>
+    m.triangle(8, 10, 11) or >>
+    // Bottom (-Y)
+    nd := fm.vec3(0.0, -1.0, 0.0)
+    m.vertex_lit_uv(pts[4], color, nd, fm.vec2(0.0, 0.0)) or >>
+    m.vertex_lit_uv(pts[5], color, nd, fm.vec2(1.0, 0.0)) or >>
+    m.vertex_lit_uv(pts[1], color, nd, fm.vec2(1.0, 1.0)) or >>
+    m.vertex_lit_uv(pts[0], color, nd, fm.vec2(0.0, 1.0)) or >>
+    m.triangle(12, 13, 14) or >>
+    m.triangle(12, 14, 15) or >>
+    // Right (+X)
+    nr := fm.vec3(1.0, 0.0, 0.0)
+    m.vertex_lit_uv(pts[5], color, nr, fm.vec2(0.0, 0.0)) or >>
+    m.vertex_lit_uv(pts[1], color, nr, fm.vec2(1.0, 0.0)) or >>
+    m.vertex_lit_uv(pts[2], color, nr, fm.vec2(1.0, 1.0)) or >>
+    m.vertex_lit_uv(pts[6], color, nr, fm.vec2(0.0, 1.0)) or >>
+    m.triangle(16, 17, 18) or >>
+    m.triangle(16, 18, 19) or >>
+    // Left (-X)
+    nl := fm.vec3(-1.0, 0.0, 0.0)
+    m.vertex_lit_uv(pts[0], color, nl, fm.vec2(0.0, 0.0)) or >>
+    m.vertex_lit_uv(pts[4], color, nl, fm.vec2(1.0, 0.0)) or >>
+    m.vertex_lit_uv(pts[7], color, nl, fm.vec2(1.0, 1.0)) or >>
+    m.vertex_lit_uv(pts[3], color, nl, fm.vec2(0.0, 1.0)) or >>
+    m.triangle(20, 21, 22) or >>
+    m.triangle(20, 22, 23) or >>
+    m.validate() or >>
+    << m
+}
+
+fn quad_xy_lit(w f64, h f64, color int) mesh.MeshData3D {
+    $d := mesh.new_mesh_data_3d()
+    n := fm.vec3(0.0, 0.0, 1.0)
+    d.vertex_lit_uv(fm.vec3(-w, -h, 0.0), color, n, fm.vec2(0.0, 0.0)) or >>
+    d.vertex_lit_uv(fm.vec3(w, -h, 0.0), color, n, fm.vec2(1.0, 0.0)) or >>
+    d.vertex_lit_uv(fm.vec3(w, h, 0.0), color, n, fm.vec2(1.0, 1.0)) or >>
+    d.vertex_lit_uv(fm.vec3(-w, h, 0.0), color, n, fm.vec2(0.0, 1.0)) or >>
+    d.triangle(0, 1, 2) or >>
+    d.triangle(0, 2, 3) or >>
+    d.validate() or >>
+    << d
+}
+
+fn run_checks() int {
+    w := 256
+    h := 192
+    aspect := f64(w) / f64(h)
+    z_near := 0.25
+    z_far := 120.0
+
+    prog := shd.load_mesh("build/mesh-shaders") or >>
+    cprog := shd.load_clustered_program("build/mesh-shaders") or >>
+    iprog := shd.load_indirect_program("build/mesh-shaders") or >>
+    pprog := shd.load_postprocess_program("build/mesh-shaders") or >>
+    dprog := shd.load_decal_program("build/mesh-shaders") or >>
+    aprog := shd.load_atmosphere_program("build/mesh-shaders") or >>
+    vprog := shd.load_particle_program("build/mesh-shaders") or >>
+
+    opts := window.Options{
+        title: "Nexus Combined 3D GPU Checks",
+        width: w,
+        height: h,
+        resizable: false,
+        high_pixel_density: false,
+        hidden: true
+    }
+    $dev := ren.open_3d_window(opts, gpu.METAL, &prog) or >>
+    $mp := modern.new_modern_pipeline_3d(&dev, &cprog, &iprog, &pprog) or >>
+    $dren := dev.decal_renderer(&dprog) or >>
+    $aren := dev.atmosphere_renderer(&aprog) or >>
+
+    white := 4294967295
+    floor_cpu := box_mesh(12.0, 0.25, 12.0, white)
+    wall_cpu := box_mesh(4.5, 2.2, 0.25, white)
+    pillar_cpu := box_mesh(0.65, 1.6, 0.65, white)
+    beacon_cpu := box_mesh(0.7, 0.7, 0.25, white)
+    quad_cpu := quad_xy_lit(1.6, 1.4, white)
+
+    $floor_gpu := dev.upload(&floor_cpu) or >>
+    $wall_gpu := dev.upload(&wall_cpu) or >>
+    $pillar_gpu := dev.upload(&pillar_cpu) or >>
+    $beacon_gpu := dev.upload(&beacon_cpu) or >>
+    $quad_gpu := dev.upload(&quad_cpu) or >>
+
+    // Empty helpers when specific stages are disabled.
+    $empty_dq := ren.new_decal_queue_3d()
+    $empty_tq := ren.new_transparent_queue_3d()
+    empty_atm := ren.default_atmosphere_config_3d()
+    empty_irr_cpu := ren.irradiance_grid_3d(fm.vec3(0.0, 0.0, 0.0), fm.vec3(1.0, 1.0, 1.0), 1, 1, 1) or >>
+    $irr_gpu := empty_irr_cpu.upload(&dev) or >>
+    $ps := dev.gpu_particle_system(&vprog, 256, 777) or >>
+
+    sun := lights.directional(fm.vec3(0.25, 0.72, 0.65).normalized() or >>, fm.vec3(2.8, 2.6, 2.4)) or >>
+    pt := lights.point(fm.vec3(0.0, 1.6, 0.8), fm.vec3(5.0, 4.5, 4.0), 14.0) or >>
+    scene_lights := [sun, pt]
+
+    proj := nexus.perspective_3d(0.95, aspect, z_near, z_far) or >>
+
+    // =========================================================================
+    // Test 1: Simultaneous GTAO + Hi-Z SSR + Bloom + TAA + ACES & Camera-Cut reset_taa()
+    // =========================================================================
+    floor_m := ren.material_3d(fm.vec3(0.28, 0.30, 0.34), 0.10, 0.14, fm.vec3(0.0, 0.0, 0.0)) or >>
+    emissive_m := ren.material_3d(fm.vec3(0.95, 0.02, 0.02), 0.0, 0.70, fm.vec3(2.8, 0.05, 0.02)) or >>
+    blue_m := ren.material_3d(fm.vec3(0.12, 0.42, 0.95), 0.05, 0.40, fm.vec3(0.0, 0.0, 0.0)) or >>
+    sky_clear := (20 << 24) | (30 << 16) | (55 << 8) | 255
+
+    eye1 := fm.vec3(0.0, 1.5, 5.2)
+    view1 := nexus.look_at_3d(eye1, fm.vec3(0.0, 1.5, -1.5), fm.vec3(0.0, 1.0, 0.0)) or >>
+    mp.prepare_lights(&dev, fm.vec3(0.18, 0.20, 0.24), eye1, 1.0, &scene_lights, view1, proj, z_near, z_far) or >>
+
+    refs1 := [floor_gpu.reference(), pillar_gpu.reference(), beacon_gpu.reference()]
+    worlds1 := [
+        fm.translation_3d(fm.vec3(0.0, -0.25, -2.0)),
+        fm.translation_3d(fm.vec3(-2.4, 1.2, -1.5)),
+        fm.translation_3d(fm.vec3(0.0, 1.5, -1.5))
+    ]
+    mats1 := [floor_m, blue_m, emissive_m]
+
+    $pp_full := ren.post_process_defaults_3d()
+    pp_full.ao_enabled = true
+    pp_full.ssr_enabled = true
+    pp_full.bloom_enabled = true
+    pp_full.taa_enabled = true
+    pp_full.taa_blend = 0.85
+    pp_full.aces_tonemap = true
+    pp_full.exposure = 1.0
+
+    // Run 4 frames on View 1 so TAA history converges cleanly.
+    $px_v1_center := 0
+    $px_v1_sky := 0
+    for _ in 0:4 {
+        mp.render_unified_atmosphere_frame(
+            $&dev, &refs1, &worlds1, &mats1,
+            false, &dren, &empty_dq, false, &aren, &empty_atm,
+            false, &irr_gpu, 0.0, false, &empty_tq, false, &ps,
+            eye1, view1, proj, z_near, z_far, sky_clear, &pp_full
+        ) or >>
+        px_v1_center = dev.read_pixel(w / 2, h / 2) or >>
+        px_v1_sky = dev.read_pixel(w - 16, 12) or >>
+        dev.present() or >>
+    }
+    // View 1 center shows bright orange/red emissive beacon + sky must stay crisp bluish without bloom/AO smear.
+    check(ch_r(px_v1_center) > ch_b(px_v1_center) + 35, "View 1 emissive center should be bright warm got=" + rgb_str(px_v1_center)) or >>
+    check(ch_b(px_v1_sky) > ch_r(px_v1_sky) + 40 && ch_b(px_v1_sky) < 180, "View 1 sky pixel should stay clean sky clear got=" + rgb_str(px_v1_sky)) or >>
+
+    // Camera cut to View 2: green wall fills center! WITHOUT reset_taa(), TAA ghosting blends prior bright orange;
+    // WITH mp.reset_taa(), first frame after camera cut shows pure green cleanly.
+    green_wall_m := ren.material_3d(fm.vec3(0.08, 0.92, 0.14), 0.0, 0.75, fm.vec3(0.0, 0.0, 0.0)) or >>
+    refs_cut := [wall_gpu.reference()]
+    worlds_cut := [fm.translation_3d(fm.vec3(0.0, 1.5, -1.5))]
+    mats_cut := [green_wall_m]
+    eye_cut := fm.vec3(0.0, 1.5, 2.2)
+    view_cut := nexus.look_at_3d(eye_cut, fm.vec3(0.0, 1.5, -1.5), fm.vec3(0.0, 1.0, 0.0)) or >>
+
+    // Capture ground-truth 1-frame cut WITHOUT TAA enabled.
+    $pp_cut_ref := pp_full
+    pp_cut_ref.taa_enabled = false
+    mp.prepare_lights(&dev, fm.vec3(0.32, 0.34, 0.36), eye_cut, 1.0, &scene_lights, view_cut, proj, z_near, z_far) or >>
+    mp.render_unified_atmosphere_frame(
+        $&dev, &refs_cut, &worlds_cut, &mats_cut,
+        false, &dren, &empty_dq, false, &aren, &empty_atm,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &ps,
+        eye_cut, view_cut, proj, z_near, z_far, sky_clear, &pp_cut_ref
+    ) or >>
+    px_cut_truth := dev.read_pixel(w / 2, h / 2) or >>
+    dev.present() or >>
+
+    // Seed View 1 into TAA history again (3 frames) before calling reset_taa() and cutting to View 2!
+    mp.prepare_lights(&dev, fm.vec3(0.18, 0.20, 0.24), eye1, 1.0, &scene_lights, view1, proj, z_near, z_far) or >>
+    for _ in 0:3 {
+        mp.render_unified_atmosphere_frame(
+            $&dev, &refs1, &worlds1, &mats1,
+            false, &dren, &empty_dq, false, &aren, &empty_atm,
+            false, &irr_gpu, 0.0, false, &empty_tq, false, &ps,
+            eye1, view1, proj, z_near, z_far, sky_clear, &pp_full
+        ) or >>
+        dev.present() or >>
+    }
+
+    mp.reset_taa() or >>
+    mp.prepare_lights(&dev, fm.vec3(0.32, 0.34, 0.36), eye_cut, 1.0, &scene_lights, view_cut, proj, z_near, z_far) or >>
+    mp.render_unified_atmosphere_frame(
+        $&dev, &refs_cut, &worlds_cut, &mats_cut,
+        false, &dren, &empty_dq, false, &aren, &empty_atm,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &ps,
+        eye_cut, view_cut, proj, z_near, z_far, sky_clear, &pp_full
+    ) or >>
+    px_after_cut := dev.read_pixel(w / 2, h / 2) or >>
+    dev.present() or >>
+    check(ch_g(px_after_cut) > ch_r(px_after_cut) + 35, "post-reset_taa cut must render pure green got=" + rgb_str(px_after_cut)) or >>
+    check(abs_i(ch_r(px_after_cut) - ch_r(px_cut_truth)) <= 8 && abs_i(ch_g(px_after_cut) - ch_g(px_cut_truth)) <= 8,
+        "reset_taa cut=" + rgb_str(px_after_cut) + " vs truth=" + rgb_str(px_cut_truth)) or >>
+
+    // =========================================================================
+    // Test 2: Unified Composition:
+    // Decals + Froxel Fog + Sorted Glass + Depth-Rejected Rear Pane & Rear Particles +
+    // Front Additive HDR GPU Particles + Extended PBR (Clearcoat + Sheen)
+    // =========================================================================
+    eye2 := fm.vec3(0.0, 0.0, 3.0)
+    view2 := nexus.look_at_3d(eye2, fm.vec3(0.0, 0.0, -4.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+    mp.prepare_lights(&dev, fm.vec3(0.35, 0.35, 0.38), eye2, 1.0, &scene_lights, view2, proj, z_near, z_far) or >>
+
+    neutral_m := ren.material_3d(fm.vec3(0.45, 0.45, 0.45), 0.0, 0.80, fm.vec3(0.0, 0.0, 0.0)) or >>
+    blocker_m := ren.material_3d(fm.vec3(0.08, 0.08, 0.08), 0.0, 0.90, fm.vec3(0.0, 0.0, 0.0)) or >>
+    // Far blue beacon at z=-28 vs near orange beacon at z=-1.5 to verify Froxel distance fog attenuation.
+    far_mat := ren.material_3d(fm.vec3(0.10, 0.30, 1.0), 0.0, 0.5, fm.vec3(0.1, 0.3, 1.2)) or >>
+    // Clearcoat + Sheen comparison material.
+    coat_base := ren.material_3d(fm.vec3(0.12, 0.12, 0.14), 0.0, 0.92, fm.vec3(0.0, 0.0, 0.0)) or >>
+    coat_cc := coat_base.with_clearcoat(1.0, 0.25) or >>
+    coat_sheen := coat_cc.with_sheen(fm.vec3(1.0, 0.12, 1.0), 0.80) or >>
+
+    // Spawn particles strictly along left-blocker ray (px = 56):
+    // Part A: Particles placed BEHIND left opaque blocker (-2.63, 0.0, -3.8) with blocker at (-1.55, 0.0, -1.0) -> depth-rejected!
+    // Center: Wall at (0.0, 0.0, -4.0) + Green Decal projected on center + Blue Glass (-2.5) + Red Glass (-1.2, submitted out of order!)
+    // Far right: Fogged beacon at (8.2, -1.2, -16.0) -> pixel (208, 108).
+    // Upper right: Clearcoat+Sheen test panel at (1.45, 0.55, -1.0) -> pixel (196, 70) vs baseline matte panel.
+    $pe_back := ren.default_particle_emitter_3d(fm.vec3(-2.63, 0.0, -3.8))
+    pe_back.emitting = false
+    pe_back.shape = ren.PARTICLE_SHAPE_SPHERE
+    pe_back.shape_param0 = 0.05
+    pe_back.speed_min = 0.0
+    pe_back.speed_max = 0.05
+    pe_back.size_start_min = 0.65
+    pe_back.size_start_max = 0.65
+    pe_back.size_end_scale = 1.0
+    pe_back.gravity = fm.vec3(0.0, 0.0, 0.0)
+    pe_back.color_keys = [1.0, 0.25, 0.05, 1.0,  1.0, 0.25, 0.05, 1.0,  1.0, 0.25, 0.05, 1.0,  1.0, 0.25, 0.05, 1.0]
+    pe_back.emissive_scale = 10.0
+    pe_back.start_additive = 1.0
+    pe_back.end_additive = 1.0
+    pe_back.soft_distance = 0.0
+    pe_back.life_min = 2.0
+    pe_back.life_max = 2.0
+    ps.set_emitter(&pe_back) or >>
+    ps.burst(64) or >>
+    ps.step(&dev, 0.016) or >>
+
+    $dq2 := ren.new_decal_queue_3d()
+    decal_rot := fm.rotation_x(1.57079632679)
+    decal_w := fm.translation_3d(fm.vec3(0.0, 0.0, -3.9)).multiply(decal_rot).multiply(fm.scale_3d(fm.vec3(3.6, 1.0, 3.6)))
+    $d_green := ren.default_decal_3d(decal_w)
+    d_green.albedo = fm.vec3(0.05, 0.95, 0.12)
+    d_green.opacity = 0.95
+    d_green.edge_fade = 0.0
+    d_green.shape_mode = ren.DECAL_SHAPE_TEXTURED
+    dq2.submit(d_green) or >>
+
+    $atm := ren.default_atmosphere_config_3d()
+    atm.sky_enabled = true
+    atm.fog_enabled = true
+    atm.fog_density = 0.08
+    atm.fog_albedo = fm.vec3(0.75, 0.82, 0.92)
+    atm.fog_extinction_scale = 1.2
+    atm.fog_scattering_strength = 1.4
+
+    red_g := ren.material_3d(fm.vec3(0.95, 0.06, 0.06), 0.0, 0.85, fm.vec3(0.0, 0.0, 0.0)) or >>
+    red_ga := red_g.with_alpha(0.65) or >>
+    red_glass := red_ga.with_alpha_blend(true) or >>
+    blue_g := ren.material_3d(fm.vec3(0.06, 0.08, 0.96), 0.0, 0.85, fm.vec3(0.0, 0.0, 0.0)) or >>
+    blue_ga := blue_g.with_alpha(0.65) or >>
+    blue_glass := blue_ga.with_alpha_blend(true) or >>
+    rear_g := ren.material_3d(fm.vec3(0.10, 0.98, 0.10), 0.0, 0.85, fm.vec3(0.0, 0.0, 0.0)) or >>
+    rear_ga := rear_g.with_alpha(0.90) or >>
+    rear_glass := rear_ga.with_alpha_blend(true) or >>
+
+    // Transparent queue intentionally submits NEAR red first, FAR blue second, plus hidden rear pane behind blocker!
+    $tq_u := ren.new_transparent_queue_3d()
+    tq_u.submit(quad_gpu.reference(), fm.translation_3d(fm.vec3(0.0, 0.0, -1.2)).multiply(fm.scale_3d(fm.vec3(0.32, 0.32, 1.0))), red_glass, 0.0) or >>
+    tq_u.submit(quad_gpu.reference(), fm.translation_3d(fm.vec3(0.0, 0.0, -2.5)).multiply(fm.scale_3d(fm.vec3(0.38, 0.38, 1.0))), blue_glass, 0.0) or >>
+    // Hidden along same px=56 ray behind left blocker wall at z=-1.0:
+    tq_u.submit(quad_gpu.reference(), fm.translation_3d(fm.vec3(-2.40, 0.0, -3.2)).multiply(fm.scale_3d(fm.vec3(0.4, 0.4, 1.0))), rear_glass, 0.0) or >>
+
+    // Opaque scene: narrower center decal backdrop (-4.0), left blocker (-1.0), unobstructed far fogged beacon (8.2, -1.2, -16.0), near clearcoat/sheen tilted quad (1.55, 0.55, -1.0) -> (200, 70).
+    refs2 := [wall_gpu.reference(), wall_gpu.reference(), beacon_gpu.reference(), quad_gpu.reference()]
+    worlds2 := [
+        fm.translation_3d(fm.vec3(0.0, 0.0, -4.0)).multiply(fm.scale_3d(fm.vec3(0.48, 0.80, 1.0))),
+        fm.translation_3d(fm.vec3(-1.55, 0.0, -1.0)).multiply(fm.scale_3d(fm.vec3(0.28, 0.65, 1.0))),
+        fm.translation_3d(fm.vec3(8.2, -1.2, -16.0)).multiply(fm.scale_3d(fm.vec3(2.2, 2.2, 1.0))),
+        fm.translation_3d(fm.vec3(1.55, 0.55, -1.0)).multiply(fm.rotation_y(0.95)).multiply(fm.scale_3d(fm.vec3(0.55, 0.55, 1.0)))
+    ]
+    mats2 := [neutral_m, blocker_m, far_mat, coat_sheen]
+
+    $pp2 := ren.post_process_defaults_3d()
+    pp2.ao_enabled = true
+    pp2.ssr_enabled = true
+    pp2.bloom_enabled = true
+    pp2.bloom_threshold = 1.0
+    pp2.bloom_intensity = 0.85
+    pp2.taa_enabled = false
+    mp.reset_taa() or >>
+
+    mp.render_unified_atmosphere_frame(
+        $&dev, &refs2, &worlds2, &mats2,
+        true, &dren, &dq2, true, &aren, &atm,
+        false, &irr_gpu, 0.0, true, &tq_u, true, &ps,
+        eye2, view2, proj, z_near, z_far, 255, &pp2
+    ) or >>
+    // Screen center: red glass (over blue glass over green decal over wall) -> R > B.
+    px_center_glass := dev.read_pixel(w / 2, h / 2) or >>
+    // Slightly offset from red glass (+34px X) where green decal covers wall -> G > R.
+    px_decal_ring := dev.read_pixel(w / 2 + 34, h / 2) or >>
+    // Left blocker area: neutral grey (neither hidden rear green pane nor rear orange particles leak through opaque depth).
+    px_left_block := dev.read_pixel(w / 4 - 8, h / 2) or >>
+    // Sky region (far upper right): atmosphere Rayleigh/Mie sky should have non-black blue/horizon gradient.
+    px_sky2 := dev.read_pixel(w - 16, 14) or >>
+    // Far fogged beacon (unobstructed right): pale atmospheric fog wash.
+    px_far_fog := dev.read_pixel(208, 108) or >>
+    dev.present() or >>
+
+    check(ch_r(px_center_glass) > ch_b(px_center_glass) + 20, "sorted near red glass must dominate over far blue glass got=" + rgb_str(px_center_glass)) or >>
+    check(ch_g(px_decal_ring) > ch_r(px_decal_ring) + 25, "projected green decal must tint wall cleanly around glass got=" + rgb_str(px_decal_ring)) or >>
+    check(ch_g(px_left_block) <= ch_r(px_left_block) + 12 && ch_r(px_left_block) <= ch_b(px_left_block) + 12,
+        "opaque blocker must depth-reject both rear transparent pane and rear GPU particles got=" + rgb_str(px_left_block)) or >>
+    check(ch_b(px_sky2) > ch_r(px_sky2) && luma(px_sky2) > 30, "Rayleigh/Mie sky must fill unobstructed background got=" + rgb_str(px_sky2)) or >>
+    check(luma(px_far_fog) > 55 && ch_b(px_far_fog) >= ch_r(px_far_fog), "Froxel fog must scatter bright atmospheric haze at far distance got=" + rgb_str(px_far_fog)) or >>
+
+    // Part B: Front HDR additive GPU particles in front of blocker along same px=56 ray -> bright glow & bloom!
+    for _ in 0:90 { ps.step(&dev, 0.03) or >> }
+    $pe_front := ren.default_particle_emitter_3d(fm.vec3(-1.08, 0.0, 0.2))
+    pe_front.emitting = false
+    pe_front.shape = ren.PARTICLE_SHAPE_SPHERE
+    pe_front.shape_param0 = 0.05
+    pe_front.speed_min = 0.0
+    pe_front.speed_max = 0.05
+    pe_front.size_start_min = 0.75
+    pe_front.size_start_max = 0.75
+    pe_front.size_end_scale = 1.0
+    pe_front.gravity = fm.vec3(0.0, 0.0, 0.0)
+    pe_front.color_keys = [1.0, 0.0, 0.0, 1.0,  1.0, 0.0, 0.0, 1.0,  1.0, 0.0, 0.0, 1.0,  1.0, 0.0, 0.0, 1.0]
+    pe_front.emissive_scale = 1.8
+    pe_front.start_additive = 1.0
+    pe_front.end_additive = 1.0
+    pe_front.soft_distance = 0.0
+    pe_front.life_min = 2.0
+    pe_front.life_max = 2.0
+    ps.set_emitter(&pe_front) or >>
+    ps.burst(12) or >>
+    ps.step(&dev, 0.016) or >>
+
+    mp.render_unified_atmosphere_frame(
+        $&dev, &refs2, &worlds2, &mats2,
+        true, &dren, &dq2, true, &aren, &atm,
+        false, &irr_gpu, 0.0, true, &tq_u, true, &ps,
+        eye2, view2, proj, z_near, z_far, 255, &pp2
+    ) or >>
+    px_front_part := dev.read_pixel(w / 4 - 8, h / 2) or >>
+    dev.present() or >>
+    check(ch_r(px_front_part) > ch_b(px_front_part) + 20 && luma(px_front_part) > luma(px_left_block) + 50,
+        "front additive HDR GPU particles must glow brightly got=" + rgb_str(px_front_part) + " vs block=" + rgb_str(px_left_block)) or >>
+
+    // Clearcoat + Sheen specular & grazing rim verification vs matte baseline at identical grazing angle.
+    grazing_sun := lights.directional(fm.vec3(0.85, 0.12, 0.52).normalized() or >>, fm.vec3(3.2, 3.2, 3.2)) or >>
+    grazing_lights := [grazing_sun]
+    mp.prepare_lights(&dev, fm.vec3(0.18, 0.18, 0.20), eye2, 1.0, &grazing_lights, view2, proj, z_near, z_far) or >>
+    mats_matte := [neutral_m, blocker_m, far_mat, coat_base]
+    mp.render_unified_atmosphere_frame(
+        $&dev, &refs2, &worlds2, &mats_matte,
+        false, &dren, &empty_dq, true, &aren, &atm,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &ps,
+        eye2, view2, proj, z_near, z_far, 255, &pp2
+    ) or >>
+    px_matte := dev.read_pixel(200, 70) or >>
+    dev.present() or >>
+
+    mp.render_unified_atmosphere_frame(
+        $&dev, &refs2, &worlds2, &mats2,
+        false, &dren, &empty_dq, true, &aren, &atm,
+        false, &irr_gpu, 0.0, false, &empty_tq, false, &ps,
+        eye2, view2, proj, z_near, z_far, 255, &pp2
+    ) or >>
+    px_coated := dev.read_pixel(200, 70) or >>
+    dev.present() or >>
+    check(luma(px_coated) >= luma(px_matte) + 8,
+        "Clearcoat + Sheen PBR box coated=" + rgb_str(px_coated) + " vs matte=" + rgb_str(px_matte)) or >>
+
+    // =========================================================================
+    // Test 3: 3D ModernPipeline3D + Overlay2D + UiControlTree + EngineTelemetry HUD in 90% Safe Area
+    // =========================================================================
+    canvas_prog := shd2.load_canvas("build/canvas-shaders") or >>
+    sdf_prog := shd2.load_ui_sdf("build/canvas-shaders") or >>
+    text_prog := shd2.load_ui_text("build/canvas-shaders") or >>
+    $overlay := ren2.open_overlay(dev.present_session() or >>, &canvas_prog, &sdf_prog) or >>
+    overlay.enable_text(dev.present_session() or >>, &text_prog) or >>
+
+    styles := widgets.dark_styles()
+    $hud := ui_bridge.new_ui_frame(&styles) or >>
+    $ui_tree := ui_bridge.new_control_tree()
+    // Simulate 90% TV safe area via Viewport metrics (5% inset on each edge).
+    tv_vp := vp_mod.from_metrics(w, h, w, h, w / 20, h / 20, w * 9 / 10, h * 9 / 10) or >>
+    safe_x := tv_vp.safe_rect.position.x
+    safe_y := tv_vp.safe_rect.position.y
+    safe_w := tv_vp.safe_rect.size.x
+    safe_h := tv_vp.safe_rect.size.y
+    panel := ui_tree.add_panel(-1, layout.Rect{x: safe_x + 4.0, y: safe_y + 4.0, width: 112.0, height: 76.0},
+        ui_bridge.UI_LAYOUT_COLUMN, 6.0, 4.0) or >>
+    lbl := ui_tree.add_label(panel, layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 18.0}, "SAFE HUD") or >>
+    btn := ui_tree.add_button(panel, layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 24.0}, "Action", 1) or >>
+    ui_tree.compute_layout(safe_x + safe_w, safe_y + safe_h) or >>
+    pb := ui_tree.node_bounds(panel)
+    lb := ui_tree.node_bounds(lbl)
+    bb := ui_tree.node_bounds(btn)
+    check(pb.x >= safe_x && pb.y >= safe_y && pb.x + pb.width <= safe_x + safe_w, "HUD panel must stay inside 90% TV safe area") or >>
+    check(lb.y >= pb.y && bb.y >= lb.y && bb.y + bb.height <= pb.y + pb.height, "HUD children must fit inside panel bounds") or >>
+
+    $tel := diag.new_engine_telemetry()
+    tel.begin_frame()
+    tel.set_scene_counts(4, 4, 2)
+    tel.update_gpu(diag.sample_gpu_device(dev.gpu_device() or >>))
+
+    mp.render_unified_atmosphere_frame(
+        $&dev, &refs2, &worlds2, &mats2,
+        true, &dren, &dq2, true, &aren, &atm,
+        false, &irr_gpu, 0.0, true, &tq_u, true, &ps,
+        eye2, view2, proj, z_near, z_far, 255, &pp2
+    ) or >>
+
+    hud.begin() or >>
+    ui_tree.render($&hud) or >>
+    tel_rect := layout.Rect{x: safe_x + safe_w - 110.0, y: safe_y + 4.0, width: 106.0, height: 64.0}
+    tel.render_telemetry_hud($&hud, &tel_rect) or >>
+    overlay.clear() or >>
+    hud.flush_overlay(dev.present_session() or >>, $&overlay) or >>
+
+    $pf := dev.begin_present_frame() or >>
+    overlay.flush_gpu_frame(dev.gpu_device() or >>, $&pf, w, h, gpu.LOAD, 0) or >>
+    dev.finish_present_frame($&pf) or >>
+    _frame_ms := tel.end_frame()
+
+    overlay.close() or >>
+    ps.close() or >>
+    irr_gpu.close() or >>
+    aren.close() or >>
+    dren.close() or >>
+    mp.close() or >>
+    floor_gpu.close() or >>
+    wall_gpu.close() or >>
+    pillar_gpu.close() or >>
+    beacon_gpu.close() or >>
+    quad_gpu.close() or >>
+    dev.close() or >>
+    << 0
+}
+
+fn main() int {
+    run_checks() or (err) {
+        println("FAIL: " + err.msg())
+        << 1
+    }
+    println("PASS: combined_3d_effects_gpu_checks")
+    << 0
+}

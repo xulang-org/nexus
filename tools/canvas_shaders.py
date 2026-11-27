@@ -40,6 +40,7 @@ def prepare(backend, out_dir):
         ('ui_sdf', 'vert', 'vs_6_0'),
         ('ui_sdf', 'frag', 'ps_6_0'),
         ('ui_text', 'frag', 'ps_6_0'),
+        ('lighting_2d', 'frag', 'ps_6_0'),
     )
     for name, stage, profile in targets:
         output = out_dir / f'{name}.{stage}.bin'

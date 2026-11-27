@@ -1,0 +1,140 @@
+@main
+
+#math
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+p2 #"github.com/xulang-org/nexus/physics2d"
+
+fn check_raycast_and_triggers() int {
+    $world := p2.new_physics_world_2d()
+    // Layer 1: world solid wall; Layer 2: one-way / alternate layer; Layer 4: trigger.
+    w1 := world.add_solid(fm.rect2(100.0, 0.0, 20.0, 100.0), 1, 1) or >>
+    w2 := world.add_solid(fm.rect2(60.0, 0.0, 20.0, 100.0), 2, 2) or >>
+    ow := world.add_one_way_platform(fm.rect2(40.0, 50.0, 40.0, 8.0), 1, 1) or >>
+    trig := world.add_trigger(fm.rect2(20.0, 20.0, 20.0, 20.0), 4, 4) or >>
+
+    // Layer mask 1 skips layer-2 wall at x=60 and hits layer-1 wall at x=100.
+    h1 := world.raycast(fm.vec2(0.0, 30.0), fm.vec2(1.0, 0.0), 200.0, 1, false) or >>
+    assert(h1.hit && h1.collider_id == w1 && math.abs(h1.distance - 100.0) < 0.001)
+    assert(math.abs(h1.normal.x + 1.0) < 0.001)
+
+    // Layer mask 2 hits wall at x=60.
+    h2 := world.raycast(fm.vec2(0.0, 30.0), fm.vec2(1.0, 0.0), 200.0, 2, false) or >>
+    assert(h2.hit && h2.collider_id == w2 && math.abs(h2.distance - 60.0) < 0.001)
+
+    // Downward ray hits one-way only when include_one_way == true.
+    h_no_ow := world.raycast(fm.vec2(50.0, 0.0), fm.vec2(0.0, 1.0), 100.0, 1, false) or >>
+    assert(!h_no_ow.hit)
+    h_yes_ow := world.raycast(fm.vec2(50.0, 0.0), fm.vec2(0.0, 1.0), 100.0, 1, true) or >>
+    assert(h_yes_ow.hit && h_yes_ow.collider_id == ow && math.abs(h_yes_ow.distance - 50.0) < 0.001)
+
+    // Trigger Enter -> Stay -> Exit lifecycle.
+    ev_out := world.step_triggers(10, fm.rect2(0.0, 0.0, 10.0, 10.0), 4) or >>
+    assert(ev_out.len == 0)
+    ev_enter := world.step_triggers(10, fm.rect2(25.0, 25.0, 10.0, 10.0), 4) or >>
+    assert(ev_enter.len == 1 && ev_enter[0].trigger_id == trig && ev_enter[0].kind == p2.TRIGGER_ENTER)
+    ev_stay := world.step_triggers(10, fm.rect2(28.0, 25.0, 10.0, 10.0), 4) or >>
+    assert(ev_stay.len == 1 && ev_stay[0].kind == p2.TRIGGER_STAY)
+    ev_exit := world.step_triggers(10, fm.rect2(50.0, 50.0, 10.0, 10.0), 4) or >>
+    assert(ev_exit.len == 1 && ev_exit[0].kind == p2.TRIGGER_EXIT)
+    << 0
+}
+
+fn check_platformer_coyote_buffer_cut_oneway_wall() int {
+    $world := p2.new_physics_world_2d()
+    // Ground floor y=200..240 for x=0..150; high right wall x=220..260, y=-100..240;
+    // one-way platform at x=60..140, y=130..136.
+    world.add_solid(fm.rect2(0.0, 200.0, 150.0, 40.0), 1, 1) or >>
+    world.add_solid(fm.rect2(220.0, -100.0, 40.0, 340.0), 1, 1) or >>
+    world.add_one_way_platform(fm.rect2(60.0, 130.0, 80.0, 6.0), 1, 1) or >>
+
+    dt := 1.0 / 60.0
+    cfg := p2.default_platformer_config_2d()
+
+    // 1. Coyote time: step off ledge x > 150 and jump 3 frames (~0.05s < 0.12s) later.
+    $coyote := p2.new_platformer_controller_2d(fm.rect2(142.0, 180.0, 16.0, 20.0), cfg) or >>
+    coyote.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: false, drop_down: false}, dt) or >>
+    assert(coyote.on_floor)
+    for _i in 0:6 {
+        coyote.step(&world, 1, &p2.PlatformerInput2D{move_x: 1.0, jump_pressed: false, jump_held: false, drop_down: false}, dt) or >>
+    }
+    assert(!coyote.on_floor && coyote.coyote_timer > 0.0)
+    coyote.step(&world, 1, &p2.PlatformerInput2D{move_x: 1.0, jump_pressed: true, jump_held: true, drop_down: false}, dt) or >>
+    assert(coyote.jumped_from_coyote && coyote.velocity.y < -300.0)
+
+    // 2. Variable jump height (full hold vs early release) & jump buffer before landing.
+    $full := p2.new_platformer_controller_2d(fm.rect2(20.0, 180.0, 16.0, 20.0), cfg) or >>
+    full.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: false, drop_down: false}, dt) or >>
+    full.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: true, jump_held: true, drop_down: false}, dt) or >>
+    $apex_full := full.bounds.position.y
+    for _i in 0:30 {
+        full.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: true, drop_down: false}, dt) or >>
+        if full.bounds.position.y < apex_full { apex_full = full.bounds.position.y }
+    }
+
+    $short := p2.new_platformer_controller_2d(fm.rect2(20.0, 180.0, 16.0, 20.0), cfg) or >>
+    short.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: false, drop_down: false}, dt) or >>
+    short.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: true, jump_held: true, drop_down: false}, dt) or >>
+    $apex_short := short.bounds.position.y
+    for _i in 0:30 {
+        short.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: false, drop_down: false}, dt) or >>
+        if short.bounds.position.y < apex_short { apex_short = short.bounds.position.y }
+    }
+    // Lower Y means higher jump because +Y points down.
+    assert(apex_full < apex_short - 20.0)
+
+    // Jump buffer: press jump 3 frames before touching floor.
+    $buf := p2.new_platformer_controller_2d(fm.rect2(20.0, 174.0, 16.0, 20.0), cfg) or >>
+    buf.velocity.y = 180.0
+    buf.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: true, jump_held: true, drop_down: false}, dt) or >>
+    buf.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: true, drop_down: false}, dt) or >>
+    buf.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: true, drop_down: false}, dt) or >>
+    assert(buf.velocity.y < -300.0)
+
+    // 3. One-way platform: jump UP through y=130, land on y=130 on descent, then drop through.
+    $owp := p2.new_platformer_controller_2d(fm.rect2(80.0, 180.0, 16.0, 20.0), cfg) or >>
+    owp.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: false, drop_down: false}, dt) or >>
+    owp.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: true, jump_held: true, drop_down: false}, dt) or >>
+    $went_above_platform := false
+    $landed_on_oneway := false
+    for _i in 0:50 {
+        res := owp.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: true, drop_down: false}, dt) or >>
+        if owp.bounds.position.y + owp.bounds.size.y < 130.0 { went_above_platform = true }
+        if res.one_way_landed {
+            landed_on_oneway = true
+            <-
+        }
+    }
+    assert(went_above_platform && landed_on_oneway && math.abs(owp.bounds.position.y + owp.bounds.size.y - 130.0) < 0.1)
+
+    owp.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: false, drop_down: true}, dt) or >>
+    for _i in 0:10 {
+        owp.step(&world, 1, &p2.PlatformerInput2D{move_x: 0.0, jump_pressed: false, jump_held: false, drop_down: false}, dt) or >>
+    }
+    assert(owp.bounds.position.y + owp.bounds.size.y > 136.0)
+
+    // 4. Wall slide & wall jump against right wall at x=220.
+    $wall := p2.new_platformer_controller_2d(fm.rect2(204.0, 20.0, 16.0, 20.0), cfg) or >>
+    wall.velocity.y = 300.0
+    for _i in 0:5 {
+        wall.step(&world, 1, &p2.PlatformerInput2D{move_x: 1.0, jump_pressed: false, jump_held: false, drop_down: false}, dt) or >>
+    }
+    assert(wall.on_wall_right && wall.wall_sliding && wall.velocity.y <= cfg.wall_slide_speed + 0.001)
+    wall.step(&world, 1, &p2.PlatformerInput2D{move_x: 1.0, jump_pressed: true, jump_held: true, drop_down: false}, dt) or >>
+    assert(wall.wall_jumps == 1 && wall.velocity.x < 0.0 && wall.velocity.y < -300.0)
+    << 0
+}
+
+fn run() int {
+    check_raycast_and_triggers() or >>
+    check_platformer_coyote_buffer_cut_oneway_wall() or >>
+    println("PASS: physics2d_platformer_checks (Raycast Layers + Enter/Stay/Exit Triggers + One-Way Platforms + Coyote/Buffer/Cut/WallJump)")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}
