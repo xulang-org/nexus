@@ -117,6 +117,7 @@ def build_minimal_runtime(src_dir: Path, runtime_path: Path) -> None:
             "-DSDL_CAMERA=OFF",
             "-DSDL_DIALOG=OFF",
             "-DSDL_TRAY=OFF",
+            "-DSDL_UNIX_CONSOLE_BUILD=ON",
         ]
         subprocess.run(cfg_cmd, check=True)
         jobs = str(max(2, os.cpu_count() or 4))
