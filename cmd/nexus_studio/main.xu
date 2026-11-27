@@ -1,0 +1,810 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+data #"github.com/xulang-org/nexus/resources/lighting"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+rs #"github.com/xulang-org/nexus/resources/scene"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+ui_bridge #"github.com/xulang-org/nexus/integration/ui"
+mod #"github.com/xulang-org/nexus/modeling"
+imod #"github.com/xulang-org/nexus/integration/modeling"
+files #"github.com/xulang-org/nexus/integration/scene"
+models3d #"github.com/xulang-org/nexus/integration/scene_render"
+scene_lights #"github.com/xulang-org/nexus/integration/lighting"
+scene_lighting #"github.com/xulang-org/nexus/integration/scene_lighting"
+world3d #"github.com/xulang-org/nexus/integration/rendering/three_d"
+scene #"github.com/xulang-org/nexus/scene"
+mesh_shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+canvas_shaders #"github.com/xulang-org/nexus/assets/shaders/two_d"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+ren2 #"github.com/xulang-org/nexus/rendering/two_d"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+gpu_info #"github.com/xulang-org/nexus/platform/gpu"
+events #window/events
+layout #ui/layout
+widgets #ui/widgets
+draw #ui/draw
+#window
+#gpu
+#os
+#errors
+#math
+#path/filepath
+#encoding/json
+#strings
+#time
+
+fn parse_studio_options() StudioOptions {
+    args := os.args()
+    $cfg := StudioOptions{
+        scene_path: "",
+        project_path: "",
+        output_path: "",
+        export_glb_rel: "assets/models/studio_whitebox.glb",
+        validator_bin: "",
+        script_path: "",
+        capture_path: "",
+        capture_ui_path: ""
+    }
+    $i := 1
+    while i + 1 < args.len {
+        k := args[i] + ""
+        v := args[i + 1] + ""
+        if k == "--scene" { cfg.scene_path = v }
+        else if k == "--project" { cfg.project_path = v }
+        else if k == "--output" { cfg.output_path = v }
+        else if k == "--export-glb" { cfg.export_glb_rel = v }
+        else if k == "--validator" { cfg.validator_bin = v }
+        else if k == "--script" { cfg.script_path = v }
+        else if k == "--capture" { cfg.capture_path = v }
+        else if k == "--capture-ui" { cfg.capture_ui_path = v }
+        else { >> errors.new("unknown studio option: " + k) }
+        i += 2
+    }
+    if cfg.scene_path.len > 0 { cfg.scene_path = filepath.abs(&cfg.scene_path) or >> }
+    if cfg.project_path.len > 0 { cfg.project_path = filepath.abs(&cfg.project_path) or >> }
+    if cfg.output_path.len > 0 { cfg.output_path = filepath.abs(&cfg.output_path) or >> }
+    if cfg.validator_bin.len > 0 { cfg.validator_bin = filepath.abs(&cfg.validator_bin) or >> }
+    if cfg.script_path.len > 0 { cfg.script_path = filepath.abs(&cfg.script_path) or >> }
+    if cfg.capture_path.len > 0 { cfg.capture_path = filepath.abs(&cfg.capture_path) or >> }
+    if cfg.capture_ui_path.len > 0 { cfg.capture_ui_path = filepath.abs(&cfg.capture_ui_path) or >> }
+    << cfg
+}
+
+fn json_str_val(doc &json.Doc, obj int, key string, fallback string) string {
+    if !doc.has(obj, key + "") { << fallback }
+    << doc.as_string(doc.get(obj, key + "")) or (err) {
+        _ := err
+        << fallback
+    }
+}
+
+fn json_f64_val(doc &json.Doc, obj int, key string, fallback f64) f64 {
+    if !doc.has(obj, key + "") { << fallback }
+    << doc.as_f64(doc.get(obj, key + "")) or (err) {
+        _ := err
+        << fallback
+    }
+}
+
+fn json_vec3_val(doc &json.Doc, obj int, key string, fallback fm.Vec3) fm.Vec3 {
+    if !doc.has(obj, key + "") { << fallback }
+    arr := doc.get(obj, key + "")
+    if arr < 0 || !doc.is_list(arr) || doc.count(arr) != 3 { << fallback }
+    x := doc.as_f64(doc.at(arr, 0)) or (err) {
+        _ := err
+        << fallback
+    }
+    y := doc.as_f64(doc.at(arr, 1)) or (err) {
+        _ := err
+        << fallback
+    }
+    z := doc.as_f64(doc.at(arr, 2)) or (err) {
+        _ := err
+        << fallback
+    }
+    << fm.vec3(x, y, z)
+}
+
+fn ui_handle_synth_event(ui $&StudioUiHost, ev &events.Event) ui_bridge.UiTreeAction {
+    t := $&ui.tree
+    << t.handle_event(ev)
+}
+
+fn read_optional_file(path string) string {
+    << os.read(path + "") or (err) {
+        _ := err
+        << ""
+    }
+}
+
+fn try_load_studio_font(hud $&ui_bridge.UiFrame) int {
+    paths := [
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/SFNS.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+    ]
+    for i in 0:paths.len {
+        p := paths[i] + ""
+        raw := read_optional_file(p + "")
+        if raw.len < 256 { -> }
+        $bytes := []u8{}
+        for j in 0:raw.len { bytes.push(u8(raw[j] & 255)) }
+        _ := hud.add_ttf_bytes(&bytes, 0, 2) or (err) {
+            _ := err
+            << 0
+        }
+        << 1
+    }
+    << 0
+}
+
+fn dispatch_ui_action(act &ui_bridge.UiTreeAction, ui &StudioUiHost, st $&StudioState, cfg &StudioOptions) int {
+    if act.kind == ui_bridge.UI_ACTION_NONE { << 0 }
+    id := act.node_id
+    if act.kind == ui_bridge.UI_ACTION_CLICK {
+        if id == ui.ids.btn_layout {
+            if st.layout_mode == LAYOUT_SPLIT { st.layout_mode = LAYOUT_SINGLE }
+            else { st.layout_mode = LAYOUT_SPLIT }
+            st.status_msg = "Toggled viewport layout"
+        } else if id == ui.ids.btn_ortho_axis {
+            st.orbit.ortho_axis = (st.orbit.ortho_axis + 1) % 3
+            st.status_msg = "Switched orthographic axis"
+        } else if id == ui.ids.btn_toggle_grid {
+            st.show_grid = !st.show_grid
+            st.status_msg = "Toggled viewport grid"
+        } else if id == ui.ids.btn_toggle_wire {
+            st.show_wire = !st.show_wire
+            st.status_msg = "Toggled wireframe overlay"
+        } else if id == ui.ids.btn_save_v10 {
+            save_scene_v10(st, cfg.output_path + "") or >>
+        } else if id == ui.ids.btn_export_glb {
+            _ := export_glb_to_project(st, cfg.project_path + "", cfg.export_glb_rel + "", cfg.validator_bin + "") or >>
+        } else if id == ui.ids.btn_box { spawn_whitebox(st, "box", fm.vec3(2.0, 2.0, 2.0)) or >> }
+        else if id == ui.ids.btn_wedge { spawn_whitebox(st, "wedge", fm.vec3(2.0, 2.0, 2.0)) or >> }
+        else if id == ui.ids.btn_stair { spawn_whitebox(st, "stair", fm.vec3(2.0, 2.0, 3.0)) or >> }
+        else if id == ui.ids.btn_cyl { spawn_whitebox(st, "cylinder", fm.vec3(2.0, 2.0, 2.0)) or >> }
+        else if id == ui.ids.btn_arch { spawn_whitebox(st, "arch", fm.vec3(2.4, 2.4, 1.2)) or >> }
+        else if id == ui.ids.btn_csg_hollow { spawn_csg_hollow(st, fm.vec3(2.4, 2.4, 2.4), fm.vec3(1.0, 1.0, 4.0)) or >> }
+        else if id == ui.ids.btn_mode_obj {
+            st.wb.mode = imod.EDIT_MODE_OBJECT
+            st.status_msg = "Object selection mode"
+        } else if id == ui.ids.btn_mode_vert {
+            st.wb.mode = imod.EDIT_MODE_VERTEX
+            st.status_msg = "Vertex edit mode"
+        } else if id == ui.ids.btn_mode_edge {
+            st.wb.mode = imod.EDIT_MODE_EDGE
+            st.status_msg = "Edge edit mode"
+        } else if id == ui.ids.btn_mode_face {
+            st.wb.mode = imod.EDIT_MODE_FACE
+            st.status_msg = "Face edit mode"
+        } else if id == ui.ids.btn_extrude { apply_model_op(st, "extrude", 0.0, 0.7) or >> }
+        else if id == ui.ids.btn_inset { apply_model_op(st, "inset", 0.25, 0.15) or >> }
+        else if id == ui.ids.btn_bevel { apply_model_op(st, "bevel", 0.0, 0.14) or >> }
+        else if id == ui.ids.btn_box_uv { apply_model_op(st, "box_uv", 0.0, 1.0) or >> }
+        else if id == ui.ids.btn_undo { apply_model_op(st, "undo", 0.0, 0.0) or >> }
+        else if id == ui.ids.btn_redo { apply_model_op(st, "redo", 0.0, 0.0) or >> }
+        else {
+            for oi in 0:OUTLINER_SLOTS {
+                if id == outliner_btn_id(&ui.ids, oi) {
+                    select_outliner_row(st, oi) or >>
+                    <-
+                }
+            }
+        }
+        << 1
+    }
+    if act.kind == ui_bridge.UI_ACTION_SLIDE {
+        if id == ui.ids.sl_pos_x || id == ui.ids.sl_pos_y || id == ui.ids.sl_pos_z {
+            np := fm.vec3(
+                ui.tree.node_value(ui.ids.sl_pos_x) or >>,
+                ui.tree.node_value(ui.ids.sl_pos_y) or >>,
+                ui.tree.node_value(ui.ids.sl_pos_z) or >>
+            )
+            set_active_pos(st, np) or >>
+        } else {
+            met := ui.tree.node_value(ui.ids.sl_metallic) or >>
+            rgh := ui.tree.node_value(ui.ids.sl_roughness) or >>
+            col := fm.vec3(
+                ui.tree.node_value(ui.ids.sl_base_r) or >>,
+                ui.tree.node_value(ui.ids.sl_base_g) or >>,
+                ui.tree.node_value(ui.ids.sl_base_b) or >>
+            )
+            set_active_material(st, col, met, rgh) or >>
+        }
+        << 1
+    }
+    << 0
+}
+
+fn execute_script_line(
+    line &string,
+    ui $&StudioUiHost,
+    st $&StudioState,
+    lay &StudioLayout,
+    cfg &StudioOptions,
+    pending_cap $&string,
+    pending_cap_ui $&string
+) bool {
+    doc := json.parse_max(line, 1048576)
+    if !doc.ok() { >> errors.new("studio script JSON error: " + doc.error()) }
+    root := doc.root()
+    if !doc.is_dict(root) { >> errors.new("studio script line must be object") }
+    cmd := json_str_val(&doc, root, "cmd", "")
+    if cmd == "ui_click" {
+        target := json_str_val(&doc, root, "target", "")
+        ids := ui.ids
+        tid := resolve_ui_target_id(&ids, target + "")
+        if tid <= 0 { >> errors.new("studio: unknown ui_click target " + target) }
+        b := ui.tree.node_bounds(tid) or >>
+        cx := b.x + b.width * 0.5
+        cy := b.y + b.height * 0.5
+        $ev_down := events.empty()
+        ev_down.kind = events.EVENT_POINTER_DOWN
+        ev_down.button = events.BUTTON_LEFT
+        ev_down.x = cx
+        ev_down.y = cy
+        act_down := ui_handle_synth_event(ui, &ev_down)
+        if act_down.consumed { _ := dispatch_ui_action(&act_down, ui, st, cfg) or >> }
+        $ev_up := events.empty()
+        ev_up.kind = events.EVENT_POINTER_UP
+        ev_up.button = events.BUTTON_LEFT
+        ev_up.x = cx
+        ev_up.y = cy
+        act_up := ui_handle_synth_event(ui, &ev_up)
+        if act_up.consumed { _ := dispatch_ui_action(&act_up, ui, st, cfg) or >> }
+        << true
+    }
+    if cmd == "ui_slide" {
+        target := json_str_val(&doc, root, "target", "")
+        ids := ui.ids
+        tid := resolve_ui_target_id(&ids, target + "")
+        if tid <= 0 { >> errors.new("studio: unknown ui_slide target " + target) }
+        ratio := math.max(0.02, math.min(0.98, json_f64_val(&doc, root, "ratio", 0.5)))
+        b := ui.tree.node_bounds(tid) or >>
+        sx := b.x + b.width * ratio
+        sy := b.y + b.height * 0.5
+        $ev_down := events.empty()
+        ev_down.kind = events.EVENT_POINTER_DOWN
+        ev_down.button = events.BUTTON_LEFT
+        ev_down.x = sx
+        ev_down.y = sy
+        act_down := ui_handle_synth_event(ui, &ev_down)
+        if act_down.consumed { _ := dispatch_ui_action(&act_down, ui, st, cfg) or >> }
+        $ev_up := events.empty()
+        ev_up.kind = events.EVENT_POINTER_UP
+        ev_up.button = events.BUTTON_LEFT
+        ev_up.x = sx
+        ev_up.y = sy
+        _ := ui_handle_synth_event(ui, &ev_up)
+        << true
+    }
+    if cmd == "set_layout" {
+        m := json_str_val(&doc, root, "mode", "split")
+        if m == "single" { st.layout_mode = LAYOUT_SINGLE }
+        else { st.layout_mode = LAYOUT_SPLIT }
+        << true
+    }
+    if cmd == "set_ortho_axis" {
+        ax := json_str_val(&doc, root, "axis", "top")
+        if ax == "front" { st.orbit.ortho_axis = ORTHO_FRONT }
+        else if ax == "right" { st.orbit.ortho_axis = ORTHO_RIGHT }
+        else { st.orbit.ortho_axis = ORTHO_TOP }
+        << true
+    }
+    if cmd == "spawn_whitebox" {
+        shape := json_str_val(&doc, root, "shape", "box")
+        sz := json_vec3_val(&doc, root, "size", fm.vec3(2.0, 2.0, 2.0))
+        spawn_whitebox(st, shape, sz) or >>
+        << true
+    }
+    if cmd == "spawn_csg_hollow" {
+        sz := json_vec3_val(&doc, root, "size", fm.vec3(2.4, 2.4, 2.4))
+        hl := json_vec3_val(&doc, root, "hole", fm.vec3(1.0, 1.0, 4.0))
+        spawn_csg_hollow(st, sz, hl) or >>
+        << true
+    }
+    if cmd == "set_mode" {
+        m := json_str_val(&doc, root, "mode", "face")
+        if m == "object" { st.wb.mode = imod.EDIT_MODE_OBJECT }
+        else if m == "vertex" { st.wb.mode = imod.EDIT_MODE_VERTEX }
+        else if m == "edge" { st.wb.mode = imod.EDIT_MODE_EDGE }
+        else { st.wb.mode = imod.EDIT_MODE_FACE }
+        << true
+    }
+    if cmd == "pick_persp" || cmd == "pick_ortho" {
+        if !st.wb_active { << false }
+        $rect := lay.persp
+        $cam := build_persp_camera(st.orbit, rect) or >>
+        if cmd == "pick_ortho" {
+            if !lay.has_ortho { << false }
+            rect = lay.ortho
+            cam = build_ortho_camera(st.orbit, rect) or >>
+        }
+        $pt := fm.vec2(rect.x + rect.w * 0.5, rect.y + rect.h * 0.5)
+        if doc.has(root, "rel") {
+            rnode := doc.get(root, "rel")
+            if rnode >= 0 && doc.is_list(rnode) && doc.count(rnode) == 2 {
+                rx := doc.as_f64(doc.at(rnode, 0)) or >>
+                ry := doc.as_f64(doc.at(rnode, 1)) or >>
+                pt = fm.vec2(rect.x + rect.w * rx, rect.y + rect.h * ry)
+            }
+        }
+        world := active_world_matrix(st)
+        ray := cam.ray(pt, rect) or >>
+        s := $&st.wb
+        _ := s.pick_subobject(world, ray, 0.35, false)
+        << true
+    }
+    if cmd == "select_subobject" {
+        if !st.wb_active { << false }
+        arr := doc.get(root, "indices")
+        if arr < 0 || !doc.is_list(arr) { << false }
+        $idxs := []int{}
+        for i in 0:doc.count(arr) { idxs.push(doc.as_int(doc.at(arr, i)) or >>) }
+        if st.wb.mode == imod.EDIT_MODE_VERTEX { st.wb.selected_verts = ~idxs }
+        else if st.wb.mode == imod.EDIT_MODE_EDGE { st.wb.selected_edges = ~idxs }
+        else { st.wb.selected_faces = ~idxs }
+        << true
+    }
+    if cmd == "model_op" {
+        op := json_str_val(&doc, root, "op", "extrude")
+        amt := json_f64_val(&doc, root, "amount", 0.25)
+        val := json_f64_val(&doc, root, "value", 0.6)
+        apply_model_op(st, op, amt, val) or >>
+        << true
+    }
+    if cmd == "set_pos" {
+        p := json_vec3_val(&doc, root, "pos", fm.vec3(0.0, 0.0, 0.0))
+        set_active_pos(st, p) or >>
+        << true
+    }
+    if cmd == "set_material" {
+        base := json_vec3_val(&doc, root, "base", st.mat_asset.base_color)
+        met := json_f64_val(&doc, root, "metallic", st.mat_asset.metallic)
+        rgh := json_f64_val(&doc, root, "roughness", st.mat_asset.roughness)
+        set_active_material(st, base, met, rgh) or >>
+        << true
+    }
+    if cmd == "capture" {
+        *pending_cap = json_str_val(&doc, root, "path", "")
+        << true
+    }
+    if cmd == "capture_ui" {
+        *pending_cap_ui = json_str_val(&doc, root, "path", "")
+        << true
+    }
+    if cmd == "save_v10" {
+        out := json_str_val(&doc, root, "path", cfg.output_path + "")
+        save_scene_v10(st, out) or >>
+        << true
+    }
+    if cmd == "export_glb" {
+        rel := json_str_val(&doc, root, "rel", cfg.export_glb_rel + "")
+        _ := export_glb_to_project(st, cfg.project_path + "", rel, cfg.validator_bin + "") or >>
+        << true
+    }
+    if cmd == "quit" {
+        st.running = false
+        << true
+    }
+    >> errors.new("studio: unknown script command " + cmd)
+}
+
+fn gather_studio_lights(slights &scene_lights.SceneLights3D, tree &scene.SceneTree) []data.Light3D {
+    if slights.binding_count() > 0 {
+        gathered := slights.gather(tree) or (err) {
+            _ := err
+            << []data.Light3D{}
+        }
+        if gathered.len > 0 { << gathered }
+    }
+    sun := data.directional(fm.vec3(0.45, 0.75, 0.4), fm.vec3(2.6, 2.6, 2.5)) or >>
+    << [sun]
+}
+
+fn render_viewport_pass(
+    device $&ren.Device3D,
+    st &StudioState,
+    rect ViewportRect,
+    cam &StudioCamera
+) int {
+    rw := device.render_width()
+    rh := device.render_height()
+    $vx := int(math.round(rect.x))
+    $vy := int(math.round(rect.y))
+    $vw := int(math.round(rect.w))
+    $vh := int(math.round(rect.h))
+    if vx < 0 { vx = 0 }
+    if vy < 0 { vy = 0 }
+    if vx + vw > rw { vw = rw - vx }
+    if vy + vh > rh { vh = rh - vy }
+    if vw < 2 || vh < 2 { << 0 }
+
+    device.set_viewport(vx, vy, vw, vh) or >>
+    lights_list := gather_studio_lights(&st.slights, &st.tree) or >>
+    lighting := data.environment(fm.vec3(0.24, 0.25, 0.28), cam.position, 1.0, lights_list) or >>
+    if st.has_models {
+        st.world.draw_lit(device, &st.tree, cam.vp, &lighting) or >>
+    }
+    _ := st.scene_mods.draw_lit(device, &st.tree, &st.tree_ids, cam.vp, &lighting) or >>
+    if st.wb_active {
+        _ := st.wb.draw_lit(device, active_world_matrix(st), cam.vp, &lighting) or >>
+    }
+    << 0
+}
+
+fn draw_frame(
+    device $&ren.Device3D,
+    overlay $&ren2.Overlay2D,
+    hud $&ui_bridge.UiFrame,
+    ui &StudioUiHost,
+    st $&StudioState,
+    lay &StudioLayout,
+    capture_path string,
+    capture_ui_path string
+) int {
+    if st.wb_active {
+        wb_mat := st.mat3d
+        wb_s := $&st.wb
+        _ := wb_s.sync_gpu(device, wb_mat, &[]ren.Material3D{}, true) or >>
+    }
+
+    persp_cam := build_persp_camera(st.orbit, lay.persp) or >>
+    $ortho_cam := build_ortho_camera(st.orbit, lay.persp) or >>
+    if lay.has_ortho {
+        ortho_cam = build_ortho_camera(st.orbit, lay.ortho) or >>
+    }
+
+    device.begin(STUDIO_CANVAS) or >>
+    render_viewport_pass(device, st, lay.persp, &persp_cam) or >>
+    if lay.has_ortho {
+        render_viewport_pass(device, st, lay.ortho, &ortho_cam) or >>
+    }
+    device.reset_viewport() or >>
+    if capture_path.len > 0 {
+        device.capture(capture_path + "") or >>
+    }
+
+    $batch := canvas.new_batch()
+    draw_pane_grid($&batch, &persp_cam, lay.persp, st.orbit.ortho_axis, st.show_grid) or >>
+    if lay.has_ortho {
+        draw_pane_grid($&batch, &ortho_cam, lay.ortho, st.orbit.ortho_axis, st.show_grid) or >>
+        sx := lay.persp.x + lay.persp.w + 1.0
+        draw_studio_stroke($&batch, fm.vec2(sx, lay.persp.y), fm.vec2(sx, lay.persp.y + lay.persp.h), 2.0, STUDIO_DIVIDER) or >>
+    }
+    if st.wb_active {
+        wm := active_world_matrix(st)
+        draw_pane_whitebox($&batch, &st.wb, wm, &persp_cam, lay.persp, st.show_wire) or >>
+        if lay.has_ortho {
+            draw_pane_whitebox($&batch, &st.wb, wm, &ortho_cam, lay.ortho, st.show_wire) or >>
+        }
+    }
+
+    rows := list_outliner_rows(st)
+    hud.begin() or >>
+    _ := ui.tree.render(hud)
+    draw_studio_chrome_overlays(hud, ui, lay, st, &rows, &persp_cam) or >>
+
+    if capture_ui_path.len > 0 {
+        rw := device.render_width()
+        rh := device.render_height()
+        $px := device.read_pixels_rgba() or >>
+        $soft_ov := ren2.open_overlay_software()
+        soft_ov.submit(&batch) or >>
+        hud.flush_overlay_software($&soft_ov) or >>
+        soft_ov.flush_software($&px, rw, rh, false, 0) or >>
+        soft_ov.close() or >>
+        ren.write_rgba_png(&px, rw, rh, capture_ui_path + "") or >>
+    }
+
+    overlay.clear() or >>
+    overlay.submit(&batch) or >>
+    hud.flush_overlay(device.present_session() or >>, overlay) or >>
+    $present := device.begin_present_frame() or >>
+    if present.has_image() {
+        pw := present.width()
+        ph := present.height()
+        overlay.flush_gpu_frame(device.gpu_device() or >>, $&present, pw, ph, gpu.LOAD, 0) or >>
+    }
+    << device.finish_present_frame($&present) or >>
+}
+
+fn run() int {
+    cfg := parse_studio_options() or >>
+    mesh_program := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    canvas_program := canvas_shaders.load_canvas("build/canvas-shaders") or >>
+    sdf_program := canvas_shaders.load_ui_sdf("build/canvas-shaders") or >>
+    text_program := canvas_shaders.load_ui_text("build/canvas-shaders") or >>
+
+    opts := window.Options{
+        title: "Nexus 3D Modeling Studio",
+        width: 1280, height: 800, resizable: true, high_pixel_density: false, hidden: false
+    }
+    $device := ren.open_3d_window(opts, gpu.AUTO, &mesh_program) or >>
+    backend_str := gpu_info.backend_name(device.backend() or >>)
+    println("Studio GPU backend: " + backend_str)
+    $overlay := ren2.open_overlay(device.present_session() or >>, &canvas_program, &sdf_program) or >>
+    overlay.enable_text(device.present_session() or >>, &text_program) or >>
+    styles := widgets.dark_styles()
+    $hud := ui_bridge.new_ui_frame(&styles) or >>
+    _ := try_load_studio_font($&hud)
+
+    $doc := rs.make_document([rs.node(-1, "StudioWorld", rs.NODE_3D)]) or >>
+    $doc_for_models := rs.make_document([rs.node(-1, "StudioWorld", rs.NODE_3D)]) or >>
+    $tree := scene.new_scene_tree_3d("StudioWorld", 4097) or >>
+    $world := world3d.new_scene_3d(&device) or >>
+    $has_models := false
+    $dir := "."
+    if cfg.scene_path.len > 0 {
+        doc = files.load(cfg.scene_path + "") or >>
+        doc_for_models = files.load(cfg.scene_path + "") or >>
+        dir = filepath.dir(&cfg.scene_path)
+        has_models = true
+    }
+    $models := models3d.prepare_surfaces(&device, doc_for_models, dir + "") or >>
+    $slights := scene_lights.new_scene_lights_3d()
+    $root_tid := tree.root()
+    if has_models {
+        parent_tid := tree.root()
+        root_name := (doc.describe_node(0) or >>).name
+        root_tid = models.instantiate($&world, $&tree, parent_tid, root_name) or >>
+        if doc.light_count() > 0 {
+            scene_lighting.bind(&doc, $&slights, &tree, root_tid) or >>
+        }
+    }
+    tree_ids := tree.subtree(root_tid) or >>
+    $scene_mods := imod.prepare_scene_modeling(&device, &doc) or >>
+
+    empty_wb := rm.new_editable_mesh("Empty")
+    wb_sess := imod.new_editable_session(empty_wb) or >>
+    def_mat := rm.default_material_asset("Whitebox")
+    mat3d := imod.material_asset_to_3d(&def_mat) or >>
+
+    $st := StudioState{
+        running: true,
+        layout_mode: LAYOUT_SPLIT,
+        show_grid: true,
+        show_wire: true,
+        orbit: default_orbit_state(),
+        doc: doc,
+        tree: tree,
+        world: world,
+        models: models,
+        has_models: has_models,
+        scene_mods: scene_mods,
+        slights: slights,
+        root_tid: root_tid,
+        tree_ids: tree_ids,
+        selected_doc_node: -1,
+        wb_doc_node: -1,
+        wb_active: false,
+        wb_is_csg: false,
+        wb_csg: rm.new_csg_tree(),
+        wb: wb_sess,
+        mat_asset: def_mat,
+        mat3d: mat3d,
+        wb_pos: fm.vec3(0.0, 0.0, 0.0),
+        status_msg: "Ready",
+        backend_name: backend_str
+    }
+
+    $script_lines := []string{}
+    $script_cursor := 0
+    if cfg.script_path.len > 0 {
+        sraw := snapshot.read(cfg.script_path + "", snapshot.MAX_BYTES) or >>
+        for ln_raw in strings.split(&sraw, "\n") {
+            ln := strings.trim_space(&ln_raw)
+            if ln.len > 0 { script_lines.push(ln) }
+        }
+    }
+
+    init_lay := compute_studio_layout(1280.0, 800.0, st.layout_mode)
+    $router := ui_bridge.new_hud_router()
+    $bridge := ui_bridge.default_input_bridge()
+    $ui := build_studio_ui(&init_lay, $&router) or >>
+    $last_w := 1280.0
+    $last_h := 800.0
+    $last_layout_mode := st.layout_mode
+    $lay := init_lay
+    $pending_cap := cfg.capture_path + ""
+    $pending_cap_ui := cfg.capture_ui_path + ""
+    $redraw := true
+
+    while st.running {
+        window.pump() or >>
+        win_state := (device.window() or >>).state() or >>
+        ww := math.max(1.0, f64(win_state.width))
+        wh := math.max(1.0, f64(win_state.height))
+        if ww != last_w || wh != last_h || st.layout_mode != last_layout_mode {
+            last_w = ww
+            last_h = wh
+            last_layout_mode = st.layout_mode
+            lay = compute_studio_layout(ww, wh, st.layout_mode)
+            router = ui_bridge.new_hud_router()
+            ui = build_studio_ui(&lay, $&router) or >>
+            redraw = true
+        }
+
+        if script_cursor < script_lines.len {
+            ln := script_lines[script_cursor] + ""
+            script_cursor += 1
+            if execute_script_line(&ln, $&ui, $&st, &lay, &cfg, $&pending_cap, $&pending_cap_ui) or >> {
+                redraw = true
+            }
+        }
+
+        for _ in 0:128 {
+            ev := device.poll() or >>
+            if ev.kind == events.EVENT_NONE { <- }
+            if ev.kind == events.EVENT_CLOSE_REQUESTED {
+                st.running = false
+                <-
+            }
+            act := ui_handle_synth_event($&ui, &ev)
+            if act.consumed {
+                _ := dispatch_ui_action(&act, &ui, $&st, &cfg) or >>
+                redraw = true
+                ->
+            }
+            if ev.kind == events.EVENT_KEY_DOWN {
+                pk := ev.physical_key
+                if pk == events.KEY_1 {
+                    st.wb.mode = imod.EDIT_MODE_OBJECT
+                    st.status_msg = "Object mode"
+                    redraw = true
+                    ->
+                }
+                if pk == events.KEY_2 {
+                    st.wb.mode = imod.EDIT_MODE_VERTEX
+                    st.status_msg = "Vertex mode"
+                    redraw = true
+                    ->
+                }
+                if pk == events.KEY_3 {
+                    st.wb.mode = imod.EDIT_MODE_EDGE
+                    st.status_msg = "Edge mode"
+                    redraw = true
+                    ->
+                }
+                if pk == events.KEY_4 {
+                    st.wb.mode = imod.EDIT_MODE_FACE
+                    st.status_msg = "Face mode"
+                    redraw = true
+                    ->
+                }
+                if pk == events.KEY_G {
+                    st.show_grid = !st.show_grid
+                    redraw = true
+                    ->
+                }
+                if pk == events.KEY_W {
+                    st.show_wire = !st.show_wire
+                    redraw = true
+                    ->
+                }
+                if pk == events.KEY_O {
+                    st.orbit.ortho_axis = (st.orbit.ortho_axis + 1) % 3
+                    redraw = true
+                    ->
+                }
+                if pk == events.KEY_TAB {
+                    if st.layout_mode == LAYOUT_SPLIT { st.layout_mode = LAYOUT_SINGLE }
+                    else { st.layout_mode = LAYOUT_SPLIT }
+                    redraw = true
+                    ->
+                }
+                if st.wb_active {
+                    if pk == events.KEY_E {
+                        apply_model_op($&st, "extrude", 0.0, 0.7) or >>
+                        redraw = true
+                        ->
+                    }
+                    if pk == events.KEY_I {
+                        apply_model_op($&st, "inset", 0.25, 0.15) or >>
+                        redraw = true
+                        ->
+                    }
+                    if pk == events.KEY_B {
+                        apply_model_op($&st, "bevel", 0.0, 0.14) or >>
+                        redraw = true
+                        ->
+                    }
+                    if pk == events.KEY_U {
+                        apply_model_op($&st, "box_uv", 0.0, 1.0) or >>
+                        redraw = true
+                        ->
+                    }
+                    if pk == events.KEY_Z {
+                        apply_model_op($&st, "undo", 0.0, 0.0) or >>
+                        redraw = true
+                        ->
+                    }
+                    if pk == events.KEY_Y {
+                        apply_model_op($&st, "redo", 0.0, 0.0) or >>
+                        redraw = true
+                        ->
+                    }
+                }
+            }
+            dec := router.route_event($&bridge, &ev)
+            if dec.to_game && ev.kind == events.EVENT_POINTER_DOWN && ev.button == events.BUTTON_LEFT && st.wb_active {
+                pt := fm.vec2(ev.x, ev.y)
+                if lay.persp.contains(pt) {
+                    pcam := build_persp_camera(st.orbit, lay.persp) or >>
+                    wm := active_world_matrix(&st)
+                    s := $&st.wb
+                    _ := s.pick_subobject(wm, pcam.ray(pt, lay.persp) or >>, 0.35, false)
+                    redraw = true
+                } else if lay.has_ortho && lay.ortho.contains(pt) {
+                    ocam := build_ortho_camera(st.orbit, lay.ortho) or >>
+                    wm := active_world_matrix(&st)
+                    s := $&st.wb
+                    _ := s.pick_subobject(wm, ocam.ray(pt, lay.ortho) or >>, 0.35, false)
+                    redraw = true
+                }
+            } else if dec.to_game && ev.kind == events.EVENT_POINTER_MOVE && ev.buttons != 0 {
+                st.orbit.yaw -= ev.dx * 0.008
+                st.orbit.pitch = math.max(-1.48, math.min(1.48, st.orbit.pitch + ev.dy * 0.008))
+                redraw = true
+            }
+        }
+
+        if !st.running {
+            if (pending_cap.len > 0 || pending_cap_ui.len > 0) && !win_state.minimized {
+                rows := list_outliner_rows(&st)
+                _ := ui.sync_from_state(&st, &rows) or >>
+                draw_frame($&device, $&overlay, $&hud, &ui, $&st, &lay, pending_cap + "", pending_cap_ui + "") or >>
+                pending_cap = ""
+                pending_cap_ui = ""
+            }
+            <-
+        }
+        if win_state.minimized || (!redraw && pending_cap.len == 0 && pending_cap_ui.len == 0) {
+            time.sleep(8000000)
+            ->
+        }
+        if st.layout_mode != last_layout_mode {
+            last_layout_mode = st.layout_mode
+            lay = compute_studio_layout(ww, wh, st.layout_mode)
+            router = ui_bridge.new_hud_router()
+            ui = build_studio_ui(&lay, $&router) or >>
+        }
+        rows := list_outliner_rows(&st)
+        _ := ui.sync_from_state(&st, &rows) or >>
+        draw_frame($&device, $&overlay, $&hud, &ui, $&st, &lay, pending_cap + "", pending_cap_ui + "") or >>
+        pending_cap = ""
+        pending_cap_ui = ""
+        redraw = false
+    }
+
+    _ := close_wb($&st)
+    _ := close_scene_mods($&st)
+    _ := close_models($&st)
+    overlay.close() or >>
+    device.close() or >>
+    << 0
+}
+
+fn close_wb(st $&StudioState) int {
+    wb_s := $&st.wb
+    << wb_s.close()
+}
+
+fn close_scene_mods(st $&StudioState) int {
+    sm := $&st.scene_mods
+    << sm.close()
+}
+
+fn close_models(st $&StudioState) int {
+    ms := $&st.models
+    << ms.close()
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln("FAIL: " + err.msg())
+        << 1
+    }
+}

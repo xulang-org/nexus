@@ -46,6 +46,20 @@ pub struct UiNode {
     pub bg_color draw.Color
     pub border_color draw.Color
     pub fg_color draw.Color
+    pub hover_bg draw.Color
+    pub pressed_bg draw.Color
+    pub active_bg draw.Color
+    pub active_border draw.Color
+    pub active_fg draw.Color
+    pub accent_color draw.Color
+    pub radius f64
+    pub border_width f64
+    pub font_size f64
+    pub align_x f64
+    pub label_y_offset f64
+    pub active bool
+    pub slider_integrated bool
+    pub value_text string
 }
 
 pub struct UiTreeAction {
@@ -106,15 +120,28 @@ fn push_node(tree $&UiControlTree, parent int, kind int, layout_mode int, label 
     $bg := draw.rgba(26, 30, 38, 224)
     $border := draw.rgba(72, 84, 102, 230)
     $fg := draw.rgb(236, 240, 246)
-    if kind == UI_LABEL {
+    $rad := 6.0
+    $bw := 1.0
+    $fsize := 13.0
+    $ax := 0.0
+    if kind == UI_PANEL {
+        rad = 8.0
+    } else if kind == UI_LABEL {
         bg = draw.rgba(0, 0, 0, 0)
         border = draw.rgba(0, 0, 0, 0)
     } else if kind == UI_BUTTON {
         bg = draw.rgba(46, 56, 74, 240)
         border = draw.rgba(104, 126, 160, 245)
+        bw = 1.5
+        ax = 0.5
+    } else if kind == UI_SLIDER {
+        fsize = 12.0
     } else if kind == UI_MODAL {
         bg = draw.rgba(22, 26, 34, 245)
         border = draw.rgba(128, 164, 224, 255)
+        rad = 10.0
+        bw = 2.0
+        fsize = 14.0
     }
     tree.nodes.push(UiNode{
         id: id,
@@ -137,7 +164,21 @@ fn push_node(tree $&UiControlTree, parent int, kind int, layout_mode int, label 
         max_val: max_val,
         bg_color: bg,
         border_color: border,
-        fg_color: fg
+        fg_color: fg,
+        hover_bg: draw.rgba(60, 74, 98, 245),
+        pressed_bg: draw.rgba(34, 42, 58, 250),
+        active_bg: draw.rgb(46, 100, 214),
+        active_border: draw.rgb(92, 146, 248),
+        active_fg: draw.rgb(248, 250, 252),
+        accent_color: draw.rgb(92, 168, 255),
+        radius: rad,
+        border_width: bw,
+        font_size: fsize,
+        align_x: ax,
+        label_y_offset: 0.0,
+        active: false,
+        slider_integrated: false,
+        value_text: ""
     })
     << id
 }
@@ -203,6 +244,77 @@ pub fn (t $&UiControlTree) set_value(id int, v f64) int {
 pub fn (t $&UiControlTree) set_checked(id int, checked bool) int {
     idx := validate_node_id(t, id) or >>
     t.nodes[idx].checked = checked
+    << 0
+}
+
+pub fn (t $&UiControlTree) set_style(
+    id int,
+    bg draw.Color,
+    border draw.Color,
+    fg draw.Color,
+    radius f64,
+    border_width f64
+) int {
+    idx := validate_node_id(t, id) or >>
+    t.nodes[idx].bg_color = bg
+    t.nodes[idx].border_color = border
+    t.nodes[idx].fg_color = fg
+    t.nodes[idx].radius = math.max(0.0, radius)
+    t.nodes[idx].border_width = math.max(0.0, border_width)
+    << 0
+}
+
+pub fn (t $&UiControlTree) set_interactive_colors(
+    id int,
+    hover_bg draw.Color,
+    pressed_bg draw.Color,
+    active_bg draw.Color,
+    active_border draw.Color,
+    active_fg draw.Color
+) int {
+    idx := validate_node_id(t, id) or >>
+    t.nodes[idx].hover_bg = hover_bg
+    t.nodes[idx].pressed_bg = pressed_bg
+    t.nodes[idx].active_bg = active_bg
+    t.nodes[idx].active_border = active_border
+    t.nodes[idx].active_fg = active_fg
+    << 0
+}
+
+pub fn (t $&UiControlTree) set_accent(id int, accent draw.Color) int {
+    idx := validate_node_id(t, id) or >>
+    t.nodes[idx].accent_color = accent
+    << 0
+}
+
+pub fn (t $&UiControlTree) set_active(id int, active bool) int {
+    idx := validate_node_id(t, id) or >>
+    t.nodes[idx].active = active
+    << 0
+}
+
+pub fn (t $&UiControlTree) set_text_style(
+    id int,
+    font_size f64,
+    align_x f64,
+    label_y_offset f64
+) int {
+    idx := validate_node_id(t, id) or >>
+    t.nodes[idx].font_size = math.max(8.0, font_size)
+    t.nodes[idx].align_x = math.max(0.0, math.min(1.0, align_x))
+    t.nodes[idx].label_y_offset = label_y_offset
+    << 0
+}
+
+pub fn (t $&UiControlTree) set_value_text(id int, text string) int {
+    idx := validate_node_id(t, id) or >>
+    t.nodes[idx].value_text = text
+    << 0
+}
+
+pub fn (t $&UiControlTree) set_slider_integrated(id int, integrated bool) int {
+    idx := validate_node_id(t, id) or >>
+    t.nodes[idx].slider_integrated = integrated
     << 0
 }
 
@@ -616,42 +728,55 @@ fn render_node_self(t &UiControlTree, frame $&UiFrame, n &UiNode) int {
     $bg := n.bg_color
     $border := n.border_color
     $fg := n.fg_color
+    if n.active {
+        bg = n.active_bg
+        border = n.active_border
+        fg = n.active_fg
+    }
     if !n.enabled {
         bg = draw.rgba(30, 32, 36, 180)
         fg = draw.rgba(140, 146, 158, 220)
     } else if t.pressed_id == n.id {
-        bg = draw.rgba(34, 42, 58, 250)
-    } else if t.hovered_id == n.id {
-        bg = draw.rgba(60, 74, 98, 245)
+        bg = n.pressed_bg
+    } else if t.hovered_id == n.id && !n.active {
+        bg = n.hover_bg
     }
-    if t.focused_id == n.id {
+    if t.focused_id == n.id && !n.active {
         border = draw.rgb(122, 198, 255)
     }
     if n.kind == UI_PANEL {
-        frame.draw_panel(&r, 8.0, bg, border, 1.0) or >>
+        frame.draw_panel(&r, n.radius, bg, border, n.border_width) or >>
         << 0
     }
     if n.kind == UI_MODAL {
-        frame.draw_panel(&r, 10.0, bg, border, 2.0) or >>
+        frame.draw_panel(&r, n.radius, bg, border, n.border_width) or >>
         if n.label.len > 0 {
             hdr := layout.Rect{x: r.x + 12.0, y: r.y + 6.0, width: math.max(0.0, r.width - 24.0), height: 20.0}
-            frame.draw_label(&hdr, &n.label, fg, 14.0, 0.0, 0.5) or >>
+            frame.draw_label(&hdr, &n.label, fg, n.font_size, 0.0, 0.5) or >>
         }
         << 0
     }
     if n.kind == UI_LABEL {
-        frame.draw_label(&r, &n.label, fg, 13.0, 0.0, 0.5) or >>
+        frame.draw_label(&r, &n.label, fg, n.font_size, n.align_x, 0.5) or >>
         << 0
     }
     if n.kind == UI_BUTTON {
-        frame.draw_panel(&r, 6.0, bg, border, 1.5) or >>
+        frame.draw_panel(&r, n.radius, bg, border, n.border_width) or >>
         if n.label.len > 0 {
-            frame.draw_label(&r, &n.label, fg, 13.0, 0.5, 0.5) or >>
+            if n.label_y_offset != 0.0 {
+                lr := layout.Rect{x: r.x + 4.0, y: r.y + n.label_y_offset, width: math.max(0.0, r.width - 8.0), height: math.max(12.0, r.height - n.label_y_offset)}
+                frame.draw_label(&lr, &n.label, fg, n.font_size, n.align_x, 0.5) or >>
+            } else if n.align_x < 0.25 {
+                lr := layout.Rect{x: r.x + 8.0, y: r.y, width: math.max(0.0, r.width - 14.0), height: r.height}
+                frame.draw_label(&lr, &n.label, fg, n.font_size, n.align_x, 0.5) or >>
+            } else {
+                frame.draw_label(&r, &n.label, fg, n.font_size, n.align_x, 0.5) or >>
+            }
         }
         << 0
     }
     if n.kind == UI_TOGGLE {
-        frame.draw_panel(&r, 6.0, bg, border, 1.0) or >>
+        frame.draw_panel(&r, n.radius, bg, border, n.border_width) or >>
         pill_w := 30.0
         pill_h := math.min(16.0, math.max(8.0, r.height - 8.0))
         pill_x := r.x + 8.0
@@ -666,14 +791,40 @@ fn render_node_self(t &UiControlTree, frame $&UiFrame, n &UiNode) int {
             draw.rgb(245, 247, 250).value(), 0.0, 0) or >>
         if n.label.len > 0 {
             lbl_r := layout.Rect{x: pill_x + pill_w + 8.0, y: r.y, width: math.max(0.0, r.width - pill_w - 20.0), height: r.height}
-            frame.draw_label(&lbl_r, &n.label, fg, 13.0, 0.0, 0.5) or >>
+            frame.draw_label(&lbl_r, &n.label, fg, n.font_size, 0.0, 0.5) or >>
         }
         << 0
     }
     if n.kind == UI_SLIDER {
-        frame.draw_panel(&r, 6.0, bg, border, 1.0) or >>
+        frame.draw_panel(&r, n.radius, bg, border, n.border_width) or >>
         span := math.max(1e-9, n.max_val - n.min_val)
         ratio := math.max(0.0, math.min(1.0, (n.value - n.min_val) / span))
+        if n.slider_integrated {
+            inner_x := r.x + 1.0
+            inner_y := r.y + 1.0
+            inner_w := math.max(2.0, r.width - 2.0)
+            inner_h := math.max(4.0, r.height - 2.0)
+            fill_w := math.max(2.0, inner_w * ratio)
+            $fill_alpha := 48
+            if t.dragging_id == n.id || t.hovered_id == n.id { fill_alpha = 76 }
+            frame.record_sdf_rect(fm.rect2(inner_x, inner_y, fill_w, inner_h),
+                math.max(0.0, n.radius - 1.0), n.accent_color.with_alpha(fill_alpha).value(), 0.0, 0) or >>
+            // Crisp bottom progress hairline along fill extent (never collides with right value text).
+            frame.record_sdf_rect(fm.rect2(inner_x + 1.0, inner_y + inner_h - 2.0, math.max(2.0, fill_w - 2.0), 2.0),
+                1.0, n.accent_color.value(), 0.0, 0) or >>
+            // Small crisp circular axis/channel dot on left + label + right-aligned readout.
+            frame.record_sdf_circle(fm.vec2(r.x + 9.0, r.y + r.height * 0.5), 2.5,
+                n.accent_color.value(), 0.0, 0) or >>
+            if n.label.len > 0 {
+                lbl_r := layout.Rect{x: r.x + 16.0, y: r.y, width: math.max(0.0, r.width - 74.0), height: r.height}
+                frame.draw_label(&lbl_r, &n.label, fg, n.font_size, 0.0, 0.5) or >>
+            }
+            if n.value_text.len > 0 {
+                val_r := layout.Rect{x: r.x + 8.0, y: r.y, width: math.max(0.0, r.width - 16.0), height: r.height}
+                frame.draw_label(&val_r, &n.value_text, draw.rgb(240, 244, 250), n.font_size, 1.0, 0.5) or >>
+            }
+            << 0
+        }
         track_x := r.x + 8.0
         track_w := math.max(4.0, r.width - 16.0)
         track_y := r.y + r.height - 10.0
@@ -681,10 +832,10 @@ fn render_node_self(t &UiControlTree, frame $&UiFrame, n &UiNode) int {
             draw.rgb(62, 70, 84).value(), 0.0, 0) or >>
         fill_w := math.max(2.0, track_w * ratio)
         frame.record_sdf_rect(fm.rect2(track_x, track_y, fill_w, 4.0), 2.0,
-            draw.rgb(92, 168, 255).value(), 0.0, 0) or >>
+            n.accent_color.value(), 0.0, 0) or >>
         if n.label.len > 0 {
             lbl_r := layout.Rect{x: r.x + 8.0, y: r.y + 2.0, width: math.max(0.0, r.width - 16.0), height: math.max(12.0, r.height - 14.0)}
-            frame.draw_label(&lbl_r, &n.label, fg, 12.0, 0.0, 0.5) or >>
+            frame.draw_label(&lbl_r, &n.label, fg, n.font_size, 0.0, 0.5) or >>
         }
         << 0
     }

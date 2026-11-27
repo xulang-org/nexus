@@ -1,0 +1,214 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+rs #"github.com/xulang-org/nexus/resources/scene"
+codec #"github.com/xulang-org/nexus/formats/scene"
+mod #"github.com/xulang-org/nexus/modeling"
+#errors
+#math
+#strings
+
+fn check(cond bool, label string) {
+    if !cond {
+        eprintln("FAIL: " + label)
+        <<< 1
+    }
+}
+
+fn rejected_raw(raw &string) bool {
+    codec.decode(raw) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn rejected_attach(
+    doc &rs.Document,
+    ems []rs.EditableMeshAttachment,
+    csgs []rs.CsgTreeAttachment,
+    mats []rs.MaterialOverrideAttachment
+) bool {
+    rs.with_modeling_attachments(doc, ems, csgs, mats) or (err) {
+        _ := err
+        << true
+    }
+    << false
+}
+
+fn run() int {
+    // 1. Build a 4-node scene with v9 attachments + v10 editable mesh, CSG tree, and material overrides.
+    n0 := rs.node(-1, "World", rs.NODE_3D)
+    n1 := rs.node(0, "MeshNode", rs.NODE_3D)
+    n2 := rs.node(0, "CsgNode", rs.NODE_3D)
+    n3 := rs.node(0, "EnvNode", rs.NODE_3D)
+    base := rs.make_document([n0, n1, n2, n3]) or >>
+
+    $env := rs.default_environment_attachment(3)
+    env.exposure = 1.15
+    env.ssr_enabled = true
+
+    $rb := rs.default_rigid_body_3d(1)
+    rb.body_type = rs.BODY_STATIC
+    rb.shape_kind = rs.SHAPE_BOX
+    rb.mass = 0.0
+
+    doc9 := rs.with_modern_attachments(&base, []rs.ResourceReference{}, []rs.Surface{}, []rs.AudioBus{},
+        []rs.AudioEmitter{}, []rs.ScriptAttachment{}, []rs.ScriptConnection{},
+        []rs.LightAttachment{}, []rs.Sprite3DAttachment{}, []rs.TileMap2DAttachment{},
+        [env], [rb], []rs.Joint3DAttachment{}, []rs.TerrainAttachment{},
+        []rs.ParticleEmitter3DAttachment{}, []rs.PrefabInstanceAttachment{}) or >>
+
+    $mesh := mod.box_editable(fm.vec3(2.0, 2.0, 2.0), 4294967295, 0) or >>
+    _ := mod.extrude_faces($&mesh, &[0], 0.5) or >>
+    mod.project_uv_box_all($&mesh, 1.0) or >>
+    expected_v := mesh.vertices.len
+    expected_f := mesh.faces.len
+
+    $csg := rm.new_csg_tree()
+    $b0 := rm.default_csg_brush(1, rm.CSG_SHAPE_BOX, rm.CSG_OP_UNION)
+    b0.size = fm.vec3(3.0, 2.5, 3.0)
+    $b1 := rm.default_csg_brush(2, rm.CSG_SHAPE_BOX, rm.CSG_OP_SUBTRACT)
+    b1.size = fm.vec3(1.2, 1.2, 4.0)
+    csg.brushes.push(b0)
+    csg.brushes.push(b1)
+
+    $mat1 := rm.default_material_asset("CopperTrim")
+    mat1.base_color = fm.vec3(0.8, 0.3, 0.2)
+    mat1.metallic = 0.35
+    mat1.roughness = 0.42
+
+    $mat2 := rm.default_material_asset("StoneWall")
+    mat2.base_color = fm.vec3(0.55, 0.58, 0.6)
+    mat2.metallic = 0.0
+    mat2.roughness = 0.65
+
+    doc10 := rs.with_modeling_attachments(
+        &doc9,
+        [rs.editable_mesh_attachment(1, mesh)],
+        [rs.csg_tree_attachment(2, csg)],
+        [
+            rs.material_override_attachment(1, 0, mat1),
+            rs.material_override_attachment(2, 0, mat2)
+        ]
+    ) or >>
+
+    check(doc10.has_modeling_attachments(), "doc10 has_modeling_attachments")
+    check(doc10.editable_mesh_count() == 1, "doc10 editable_mesh_count")
+    check(doc10.csg_tree_count() == 1, "doc10 csg_tree_count")
+    check(doc10.material_override_count() == 2, "doc10 material_override_count")
+
+    raw10 := codec.encode(&doc10) or >>
+    check(strings.contains(&raw10, "\"version\":10"), "encoded JSON has version 10")
+    check(strings.contains(&raw10, "\"editable_meshes\""), "encoded JSON has editable_meshes")
+    check(strings.contains(&raw10, "\"csg_brushes\""), "encoded JSON has csg_brushes")
+    check(strings.contains(&raw10, "\"material_overrides\""), "encoded JSON has material_overrides")
+
+    dec10 := codec.decode(&raw10) or >>
+    reenc10 := codec.encode(&dec10) or >>
+    check(raw10 == reenc10, "Scene v10 encode->decode->encode deterministic byte parity")
+
+    check(dec10.editable_mesh_count() == 1, "decoded editable_mesh_count")
+    dec_em := dec10.editable_mesh(0) or >>
+    check(dec_em.node == 1, "decoded editable_mesh node")
+    check(dec_em.mesh.vertices.len == expected_v, "decoded vertex count parity")
+    check(dec_em.mesh.faces.len == expected_f, "decoded face count parity")
+
+    check(dec10.csg_tree_count() == 1, "decoded csg_tree_count")
+    dec_csg := dec10.csg_tree(0) or >>
+    check(dec_csg.node == 2 && dec_csg.tree.brushes.len == 2, "decoded csg brushes count")
+    check(dec_csg.tree.brushes[1].op == rm.CSG_OP_SUBTRACT, "decoded csg subtract brush")
+
+    check(dec10.material_override_count() == 2, "decoded material_override_count")
+    dec_m0 := dec10.material_override(0) or >>
+    dec_m1 := dec10.material_override(1) or >>
+    check(dec_m0.node == 1 && dec_m0.slot == 0, "decoded material override 0 target")
+    check(math.abs(dec_m0.material.metallic - 0.35) < 1e-9, "decoded material 0 metallic")
+    check(math.abs(dec_m0.material.roughness - 0.42) < 1e-9, "decoded material 0 roughness")
+    check(math.abs(dec_m0.material.base_color.x - 0.8) < 1e-9, "decoded material 0 base_color.x")
+    check(dec_m1.node == 2 && math.abs(dec_m1.material.roughness - 0.65) < 1e-9, "decoded material 1 roughness")
+
+    check(dec10.environment_count() == 1, "v9 environment preserved in v10")
+    check(math.abs((dec10.environment(0) or >>).exposure - 1.15) < 1e-9, "v9 exposure preserved")
+    check(dec10.rigid_body_3d_count() == 1, "v9 rigid_body_3d preserved in v10")
+
+    // Verify with_references preserves v10 attachments.
+    preserved := rs.with_references(&dec10, &dec10, []rs.ResourceReference{}) or >>
+    check(preserved.has_modeling_attachments(), "with_references preserves has_modeling_attachments")
+    check(preserved.editable_mesh_count() == 1 && preserved.csg_tree_count() == 1 && preserved.material_override_count() == 2,
+        "with_references preserves all v10 modeling attachments")
+
+    // 2. Verify v1 and v9 backward compatibility.
+    plain := rs.make_document([rs.node(-1, "PlainRoot", rs.NODE_3D)]) or >>
+    raw1 := codec.encode(&plain) or >>
+    check(strings.contains(&raw1, "\"version\":1"), "v1 scene remains version 1")
+    check(!strings.contains(&raw1, "\"editable_meshes\""), "v1 scene omits v10 keys")
+
+    raw9 := codec.encode(&doc9) or >>
+    check(strings.contains(&raw9, "\"version\":9"), "v9 scene remains version 9")
+    check(!strings.contains(&raw9, "\"editable_meshes\""), "v9 scene omits v10 keys")
+
+    // 3. Negative rejection cases.
+    bad_missing_em := strings.replace(&raw10, "\"editable_meshes\":", "\"bad_em\":", 1)
+    check(rejected_raw(&bad_missing_em), "reject v10 missing editable_meshes")
+
+    bad_missing_csg := strings.replace(&raw10, "\"csg_brushes\":", "\"bad_csg\":", 1)
+    check(rejected_raw(&bad_missing_csg), "reject v10 missing csg_brushes")
+
+    bad_missing_mat := strings.replace(&raw10, "\"material_overrides\":", "\"bad_mat\":", 1)
+    check(rejected_raw(&bad_missing_mat), "reject v10 missing material_overrides")
+
+    bad_v11 := strings.replace(&raw10, "\"version\":10", "\"version\":11", 1)
+    check(rejected_raw(&bad_v11), "reject unsupported version 11")
+
+    doc_2d := rs.make_document([rs.node(-1, "Root2D", rs.NODE_2D)]) or >>
+    box_small := mod.box_editable(fm.vec3(1.0, 1.0, 1.0), 4294967295, 0) or >>
+    check(rejected_attach(&doc_2d, [rs.editable_mesh_attachment(0, box_small)], []rs.CsgTreeAttachment{}, []rs.MaterialOverrideAttachment{}),
+        "reject EditableMeshAttachment on NODE_2D")
+
+    doc_3d := rs.make_document([rs.node(-1, "W", rs.NODE_3D), rs.node(0, "Obj", rs.NODE_3D)]) or >>
+    box_a := mod.box_editable(fm.vec3(1.0, 1.0, 1.0), 4294967295, 0) or >>
+    $csg_a := rm.new_csg_tree()
+    csg_a.brushes.push(rm.default_csg_brush(1, rm.CSG_SHAPE_BOX, rm.CSG_OP_UNION))
+    check(rejected_attach(&doc_3d, [rs.editable_mesh_attachment(1, box_a)], [rs.csg_tree_attachment(1, csg_a)], []rs.MaterialOverrideAttachment{}),
+        "reject both EditableMesh and CsgTree on same Node3D")
+
+    $huge_mesh := rm.new_editable_mesh("Huge")
+    for i in 0:(rs.MAX_INLINE_EDITABLE_VERTICES + 1) {
+        huge_mesh.vertices.push(rm.PolyVertex{position: fm.vec3(f64(i) * 0.01, 0.0, 0.0), color: 4294967295})
+    }
+    check(rejected_attach(&doc_3d, [rs.editable_mesh_attachment(1, huge_mesh)], []rs.CsgTreeAttachment{}, []rs.MaterialOverrideAttachment{}),
+        "reject inline EditableMesh exceeding 8192 vertices")
+
+    empty_csg := rm.new_csg_tree()
+    check(rejected_attach(&doc_3d, []rs.EditableMeshAttachment{}, [rs.csg_tree_attachment(1, empty_csg)], []rs.MaterialOverrideAttachment{}),
+        "reject empty CsgTreeAttachment")
+
+    m_ok := rm.default_material_asset("Ok")
+    check(rejected_attach(&doc_3d, []rs.EditableMeshAttachment{}, []rs.CsgTreeAttachment{}, [rs.material_override_attachment(1, -1, m_ok)]),
+        "reject negative material override slot")
+
+    m_dup1 := rm.default_material_asset("Dup1")
+    m_dup2 := rm.default_material_asset("Dup2")
+    check(rejected_attach(&doc_3d, []rs.EditableMeshAttachment{}, []rs.CsgTreeAttachment{}, [
+        rs.material_override_attachment(1, 0, m_dup1),
+        rs.material_override_attachment(1, 0, m_dup2)
+    ]), "reject duplicate material override (node, slot)")
+
+    $m_bad_met := rm.default_material_asset("BadMetallic")
+    m_bad_met.metallic = 2.0
+    check(rejected_attach(&doc_3d, []rs.EditableMeshAttachment{}, []rs.CsgTreeAttachment{}, [
+        rs.material_override_attachment(1, 0, m_bad_met)
+    ]), "reject out-of-range metallic=2.0")
+
+    println("PASS: scene_v10_modeling_checks")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln("FAIL: " + err.msg())
+        << 1
+    }
+}

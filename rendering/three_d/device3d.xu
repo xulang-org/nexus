@@ -44,6 +44,11 @@ pub struct Device3D {
     soft_pixels []u8
     soft_depth []f64
     pixels []u8
+    viewport_active bool
+    vp_x int
+    vp_y int
+    vp_w int
+    vp_h int
 }
 fn target_size(width int, height int) int {
     if width<1 || height<1 || width>4096 || height>4096 || width*height>4194304 {
@@ -130,7 +135,8 @@ fn init_3d_session(session present.Session, program &ShaderProgram3D, width int,
             pipelines: []gpu.GraphicsPipeline{},linear_samplers: []gpu.Sampler{},render_scale: 1,max_render_pixels: 4194304,
             encoders: []gpu.CommandEncoder{},passes: []gpu.RenderPass{},target_width: width,target_height: height,
             surface_format: 0,draw_count: 0,lit_draws: 0,light_candidates: 0,selected_lights: 0,device_id: dev_id,
-            active: false,sealed: false,closed: false,cached: false,soft_pixels: []u8{},soft_depth: []f64{},pixels: []u8{}}
+            active: false,sealed: false,closed: false,cached: false,soft_pixels: []u8{},soft_depth: []f64{},pixels: []u8{},
+            viewport_active: false,vp_x: 0,vp_y: 0,vp_w: 0,vp_h: 0}
         soft_resize_and_clear($&out,255) or >>
         << out
     }
@@ -179,7 +185,8 @@ fn init_3d_session(session present.Session, program &ShaderProgram3D, width int,
         pipelines: [pipeline,ccw,cw,copying,resolving,blend_none,blend_ccw,blend_cw],linear_samplers: [linear_sampler],render_scale: 1,max_render_pixels: 4194304,
         encoders: []gpu.CommandEncoder{},passes: []gpu.RenderPass{},target_width: sw,target_height: sh,
         surface_format: format,draw_count: 0,lit_draws: 0,light_candidates: 0,selected_lights: 0,device_id: 0,
-        active: false,sealed: false,closed: false,cached: false,soft_pixels: []u8{},soft_depth: []f64{},pixels: []u8{}}
+        active: false,sealed: false,closed: false,cached: false,soft_pixels: []u8{},soft_depth: []f64{},pixels: []u8{},
+        viewport_active: false,vp_x: 0,vp_y: 0,vp_w: 0,vp_h: 0}
 }
 // CPU submission counters for the current/last frame, not hardware timings or
 // fragment counts. Only successfully recorded material draws increment them.
@@ -329,6 +336,35 @@ pub fn (device $&Device3D) begin(background int) int {
     device.lit_draws = 0
     device.light_candidates = 0
     device.selected_lights = 0
+    device.viewport_active = false
+    << 0
+}
+pub fn (device $&Device3D) set_viewport(x int, y int, width int, height int) int {
+    device.recording() or >>
+    if x < 0 || y < 0 || width <= 0 || height <= 0 ||
+        x + width > device.target_width || y + height > device.target_height {
+        >> errors.new("nexus 3D: viewport rect out of render target bounds")
+    }
+    device.viewport_active = true
+    device.vp_x = x
+    device.vp_y = y
+    device.vp_w = width
+    device.vp_h = height
+    if device.is_gpu() && device.passes.len > 0 {
+        pass := &device.passes[0]
+        pass.viewport(x, y, width, height) or >>
+        pass.scissor(x, y, width, height) or >>
+    }
+    << 0
+}
+pub fn (device $&Device3D) reset_viewport() int {
+    device.recording() or >>
+    device.viewport_active = false
+    if device.is_gpu() && device.passes.len > 0 {
+        pass := &device.passes[0]
+        pass.viewport(0, 0, device.target_width, device.target_height) or >>
+        pass.scissor(0, 0, device.target_width, device.target_height) or >>
+    }
     << 0
 }
 fn (device $&Device3D) pause_render_pass() int {
@@ -352,6 +388,11 @@ fn (device $&Device3D) resume_render_pass() int {
     pass := encoder.begin_render(attachment,depth) or(err){ device.abandon_frame()
         >> err }
     device.passes = [pass]
+    if device.viewport_active {
+        rp := &device.passes[0]
+        rp.viewport(device.vp_x, device.vp_y, device.vp_w, device.vp_h) or >>
+        rp.scissor(device.vp_x, device.vp_y, device.vp_w, device.vp_h) or >>
+    }
     << 0
 }
 fn (device $&Device3D) seal() int {

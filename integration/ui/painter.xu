@@ -425,3 +425,40 @@ pub fn (frame $&UiFrame) flush_overlay(session &present.Session, overlay $&ren2.
     if active_clip != 0 { overlay.reset_clip() or >> }
     << 0
 }
+
+// Syncs Overlay2D's software R8 text mask and submits all recorded chunks for
+// CPU RGBA screenshot compositing.
+pub fn (frame $&UiFrame) flush_overlay_software(overlay $&ren2.Overlay2D) int {
+    validate_flush(frame) or >>
+    text_batches := build_frame_text_batches(frame) or >>
+    if frame.has_text {
+        overlay.sync_text_mask_software(frame.atlas.width, frame.atlas.height, true,
+            &frame.atlas.pixels, frame.atlas.revision) or >>
+    }
+    $active_clip := 0
+    $text_idx := 0
+    for i in 0:frame.chunks.len {
+        chunk := &frame.chunks[i]
+        if chunk.clip_idx != active_clip {
+            clip := frame.clips[chunk.clip_idx]
+            if clip.active { overlay.clip_rect(clip.rect) or >> }
+            else { overlay.reset_clip() or >> }
+            active_clip = chunk.clip_idx
+        }
+        if chunk.kind == CHUNK_SDF {
+            overlay.submit_sdf(&chunk.sdf) or >>
+        } else if chunk.kind == CHUNK_BATCH {
+            if chunk.batch.vertex_count() > 0 {
+                overlay.submit(&chunk.batch) or >>
+            }
+        } else {
+            tb := &text_batches[text_idx]
+            text_idx = text_idx + 1
+            if tb.vertex_count() > 0 {
+                overlay.submit_text(tb) or >>
+            }
+        }
+    }
+    if active_clip != 0 { overlay.reset_clip() or >> }
+    << 0
+}

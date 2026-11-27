@@ -64,15 +64,17 @@ check: layers native canvas-shaders mesh-shaders
 	$(XU) check cmd/scriptc/main.xu
 	$(XU) check cmd/project_validate/main.xu
 	$(XU) check cmd/project_viewport
+	$(XU) check cmd/nexus_studio
 	$(XU) check cmd/project
 	XU_UI_PACK=1 $(XU) check cmd/project_editor
 	$(XU) check cmd/tilemap_editor
 	$(XU) check tests/project_import_checks.xu
 	$(XU) check tests/project_editor_checks.xu
+	$(XU) check tests/scene_v10_modeling_checks.xu
 	$(XU) check tests/modeling_cpu_checks.xu
 	$(XU) check tests/glb_obj_roundtrip_checks.xu
 	$(XU) check tests/modeling_gpu_checks.xu
-	$(XU) check tests/developer_systems_r2_checks.xu
+	$(XU) check tests/studio_ui_checks.xu
 	$(XU) check examples/script_reload/main.xu
 	$(XU) check examples/materials/main.xu
 	$(XU) check examples/textures3d/main.xu
@@ -220,7 +222,7 @@ check-core: layers sdk
 
 # Pure Xu validation stays usable while a compiler/platform backend is incomplete.
 # The aggregate check/test/gpu targets still fail on real device build failures.
-test-core: modeling-cpu-test physics2d-platformer-test audio-async-music-test persistent-entities-test gameplay-components-test gameplay-integration-test combined-audio-effects-test spatial-audio-test gamepad-test i18n-test anim-serialize-budget-test taptap-data-test console-data-test steam-data-test prefab-runtime-test ai-bt-nav-test input-replay-timing-test timeline-test project-bundle-cli-test ui-tree-test profiler-test bundle-test shader-cross-backend-test scene-v9-test scene-soa-test ecs-parallel-test navigation-test audio-dsp-test script-aot-test 25d-core-test shadow-core-test gltf-animation-test mesh-format-core-test lod-core-test frustum-core-test physics3d-test scene-lighting-test lighting-core-test check-core mesh-core-test glb-fixtures glb-material-fixtures script-fixtures audio-core-test scene-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
+test-core: modeling-cpu-test scene-v10-test physics2d-platformer-test audio-async-music-test persistent-entities-test gameplay-components-test gameplay-integration-test combined-audio-effects-test spatial-audio-test gamepad-test i18n-test anim-serialize-budget-test taptap-data-test console-data-test steam-data-test prefab-runtime-test ai-bt-nav-test input-replay-timing-test timeline-test project-bundle-cli-test ui-tree-test profiler-test bundle-test shader-cross-backend-test scene-v9-test scene-soa-test ecs-parallel-test navigation-test audio-dsp-test script-aot-test 25d-core-test shadow-core-test gltf-animation-test mesh-format-core-test lod-core-test frustum-core-test physics3d-test scene-lighting-test lighting-core-test check-core mesh-core-test glb-fixtures glb-material-fixtures script-fixtures audio-core-test scene-fixtures scene-asset-fixtures scene-audio-fixtures scene-script-fixtures
 	mkdir -p build
 	$(PYTHON) tests/layer_rules_checks.py
 	$(PYTHON) tests/layer_headless_checks.py
@@ -1182,3 +1184,17 @@ modeling-gpu-test: layers sdk project-viewport project-cli project-validator
 	$(XU) build tests/modeling_gpu_checks.xu -o build/modeling-gpu-checks
 	./build/modeling-gpu-checks --viewport build/nexus-project-viewport --project-cli build/nexus-project --validator build/nexus-project-validate
 
+.PHONY: nexus-studio scene-v10-test studio-ui-test
+nexus-studio: layers sdk mesh-shaders canvas-shaders
+	mkdir -p build
+	$(XU) build cmd/nexus_studio -o build/nexus-studio
+
+scene-v10-test: layers sdk
+	mkdir -p build
+	$(XU) build tests/scene_v10_modeling_checks.xu -o build/scene-v10-modeling-checks
+	SDL_VIDEODRIVER=nonexistent XU_NEXUS_SDL_LIBRARY=/nonexistent/scene-v10-no-sdl ./build/scene-v10-modeling-checks
+
+studio-ui-test: layers sdk nexus-studio project-viewport project-validator project-cli
+	mkdir -p build
+	$(XU) build tests/studio_ui_checks.xu -o build/studio-ui-checks
+	./build/studio-ui-checks build/nexus-studio build/nexus-project-viewport build/nexus-project-validate build/nexus-project
