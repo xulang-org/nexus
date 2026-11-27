@@ -104,7 +104,7 @@ def exe_name(stem: str) -> str:
     return f"{stem}.exe" if platform.system() == "Windows" else stem
 
 
-def setup_env(xu_path: str | None) -> tuple[str, dict[str, str]]:
+def setup_env(xu_path: str | None, sdl_runtime: str | None) -> tuple[str, dict[str, str]]:
     env = os.environ.copy()
     xu_bin = xu_path or env.get("XU") or shutil.which("xu") or "xu"
     resolved = shutil.which(xu_bin) or xu_bin
@@ -122,6 +122,13 @@ def setup_env(xu_path: str | None) -> tuple[str, dict[str, str]]:
         env["PATH"] = str(p.resolve().parent) + os.pathsep + env.get("PATH", "")
         xu_bin = str(p.resolve())
     env["XU"] = xu_bin
+
+    if sdl_runtime:
+        rt = str(Path(sdl_runtime).resolve())
+        env["NEXUS_SDL3_RUNTIME"] = rt
+        env["XU_SDL_LIBRARY"] = rt
+        env["XU_NEXUS_SDL_LIBRARY"] = rt
+        env["XU_NEXUS_SDL_AUDIO_LIBRARY"] = rt
 
     if platform.system() == "Windows" and not shutil.which("dxc", path=env.get("PATH")):
         kits = Path("C:/Program Files (x86)/Windows Kits/10/bin")
@@ -243,6 +250,7 @@ def main() -> int:
     )
     parser.add_argument("--xu", help="Path to xu compiler executable")
     parser.add_argument("--sdl-include", help="Path to SDL3 include directory")
+    parser.add_argument("--sdl-runtime", help="Optional path to SDL3 shared library runtime")
     parser.add_argument("--out-dir", type=Path, default=ROOT / "build/release-tools", help="Output dir for build-tools")
     args = parser.parse_args()
 
@@ -252,7 +260,7 @@ def main() -> int:
     else:
         modes = raw_modes
 
-    xu_bin, env = setup_env(args.xu)
+    xu_bin, env = setup_env(args.xu, args.sdl_runtime)
     for mode in modes:
         if mode == "contracts":
             run_contracts(xu_bin if Path(xu_bin).is_file() else None, env)

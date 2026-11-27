@@ -14,11 +14,11 @@ struct Output {
     float4 border_color : TEXCOORD3;
 };
 Output main(Input input) {
-    Output out;
-    out.position = float4(input.pos.x / size.x * 2.0 - 1.0, 1.0 - input.pos.y / size.y * 2.0, 0.0, 1.0);
-    out.local_pos = input.local_pos;
-    out.params = input.params;
-    out.fill_color = input.fill_color;
-    out.border_color = input.border_color;
-    return out;
+    Output output;
+    output.position = float4(input.pos.x / size.x * 2.0 - 1.0, 1.0 - input.pos.y / size.y * 2.0, 0.0, 1.0);
+    output.local_pos = input.local_pos;
+    output.params = input.params;
+    output.fill_color = input.fill_color;
+    output.border_color = input.border_color;
+    return output;
 }
