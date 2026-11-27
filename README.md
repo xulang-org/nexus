@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/nexus_lockup_horizontal_dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="brand/nexus_lockup_horizontal_light.svg">
+    <img alt="Nexus Engine" src="brand/nexus_lockup_horizontal_light.svg" width="420">
+  </picture>
+</p>
+
 # Nexus Engine
 
 Nexus Engine 是独立的 Xu 游戏引擎库，模块为 `github.com/xulang-org/nexus`，当前开发版本 `0.1.2-dev.1`。
