@@ -18,7 +18,7 @@ snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
 fn print_help() {
     println("usage: nexus-project <command> [args]")
     println("  init <dir> --name <Name> [--id <com.studio.game>] [--module <mod>] [--template 3d|2d|25d|blank] [--locale <en-US>] [--platforms <all|none|csv>] [--nexus-path <path>] [--force]")
-    println("  doctor <project.json> [--json] [--strict]")
+    println("  doctor [project.json|dir] [--json] [--strict] [--fix] [--dry-run] [--toolchain] [--category <name>]")
     println("  layout")
     println("  build <project.json> --output <dir> [--validator <bin>]")
     println("  scene <name> --output <dir>")
@@ -362,14 +362,35 @@ fn println_block(text &string) {
     println(*text + "")
 }
 
+fn is_valid_doctor_category(cat &string) bool {
+    << *cat == "manifest" || *cat == "scene" || *cat == "asset" || *cat == "config" ||
+        *cat == "platform" || *cat == "budget" || *cat == "layout" || *cat == "toolchain"
+}
+
+fn resolve_doctor_target(raw &string) string {
+    $p := strings.trim_space(raw)
+    if p.len == 0 {
+        p = "project.json"
+    }
+    info := os.stat(p + "") or (err) {
+        _ := err.msg()
+        << p + ""
+    }
+    if info.is_dir {
+        << filepath.join([p + "", "project.json"])
+    }
+    << p + ""
+}
+
 fn run_doctor(args &[]string) int {
     if has_help_flag(args, 2) {
-        println("usage: nexus-project doctor <project.json> [--json] [--strict]")
+        println("usage: nexus-project doctor [project.json|dir] [--json] [--strict] [--fix] [--dry-run] [--toolchain] [--category <name>]")
         << 0
     }
     $project_path := ""
     $as_json := false
     $strict := false
+    $opts := proj.default_doctor_options()
     $i := 2
     while i < args.len {
         arg := args[i] + ""
@@ -379,6 +400,28 @@ fn run_doctor(args &[]string) int {
         } else if arg == "--strict" {
             strict = true
             i = i + 1
+        } else if arg == "--fix" {
+            opts.fix = true
+            i = i + 1
+        } else if arg == "--dry-run" {
+            opts.fix = true
+            opts.dry_run = true
+            i = i + 1
+        } else if arg == "--toolchain" {
+            opts.check_toolchain = true
+            i = i + 1
+        } else if arg == "--category" {
+            if i + 1 >= args.len {
+                >> errors.new("missing value for --category (expected manifest|scene|asset|config|platform|budget|layout|toolchain)")
+            }
+            cat := args[i + 1] + ""
+            if !is_valid_doctor_category(&cat) {
+                >> errors.new("unknown doctor category '" + cat + "' (expected manifest|scene|asset|config|platform|budget|layout|toolchain)")
+            }
+            opts.category_filter = cat
+            i = i + 2
+        } else if strings.has_prefix(&arg, "-") {
+            >> errors.new("unknown flag in doctor: " + arg)
         } else if project_path.len == 0 {
             project_path = arg
             i = i + 1
@@ -386,10 +429,8 @@ fn run_doctor(args &[]string) int {
             >> errors.new("unexpected argument in doctor: " + arg)
         }
     }
-    if project_path.len == 0 {
-        >> errors.new("usage: nexus-project doctor <project.json> [--json] [--strict]")
-    }
-    rep := proj.diagnose_project(project_path)
+    resolved_target := resolve_doctor_target(&project_path)
+    rep := proj.diagnose_project_with_options(resolved_target, &opts)
     if as_json {
         println_block(&proj.encode_doctor_report_json(&rep))
     } else {

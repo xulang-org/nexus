@@ -141,6 +141,18 @@ fn run_pure_data_tests() int {
 }
 
 fn abs_or_raw(p &string) string {
+    if !strings.contains(p, "/") && !strings.contains(p, "\\") {
+        found := exec.look_path(*p + "") or (err) {
+            _ := err.msg()
+            << ""
+        }
+        if found.len > 0 {
+            << filepath.abs(&found) or (err) {
+                _ := err.msg()
+                << found
+            }
+        }
+    }
     << filepath.abs(p) or (err) {
         _ := err.msg()
         << *p + ""
@@ -201,12 +213,20 @@ fn run_in_temp(cfg &Config, root string) int {
         check(path_exists(f), "missing generated file: " + required_files[i]) or >>
     }
 
-    // 3. Doctor pass & JSON report
+    // 3. Doctor pass, dir/cwd resolution, --toolchain & JSON report
     doc_out := must_cmd(&cli_bin, &["doctor", proj3d + ""], "doctor text")
     check(strings.contains(&doc_out, "DOCTOR PASS") && strings.contains(&doc_out, "errors=0"), "doctor text pass: " + doc_out) or >>
+    _ := must_cmd(&cli_bin, &["doctor", game3d + ""], "doctor dir arg")
+    cwd_doc := run_cmd_in_dir(&game3d, &cli_bin, &["doctor"])
+    check(cwd_doc.ok && strings.contains(&cwd_doc.output, "DOCTOR PASS"), "doctor default cwd project.json: " + cwd_doc.output) or >>
+    _ := must_cmd(&cli_bin, &["doctor", proj3d + "", "--toolchain"], "doctor toolchain")
     doc_json := must_cmd(&cli_bin, &["doctor", proj3d + "", "--json"], "doctor json")
     parsed_doc := json.parse_max(&doc_json, 262144)
     check(parsed_doc.ok() && (parsed_doc.as_bool(parsed_doc.get(parsed_doc.root(), "passed")) or >>), "doctor json passed") or >>
+    check((parsed_doc.as_int(parsed_doc.get(parsed_doc.root(), "schema_version")) or >>) == 1 &&
+        parsed_doc.has(parsed_doc.root(), "fixed_count") &&
+        parsed_doc.has(parsed_doc.root(), "dry_run") &&
+        parsed_doc.has(parsed_doc.root(), "fixes_applied"), "doctor json schema fields") or >>
 
     // 4. Validate 5 platform configs via CLI
     _ := must_cmd(&cli_bin, &["steam-validate", filepath.join([game3d + "", "platforms/steam.json"])], "steam-validate")
@@ -302,9 +322,120 @@ fn run_in_temp(cfg &Config, root string) int {
 
     // Break platforms/xbox.json
     xbox_file := filepath.join([game2d + "", "platforms/xbox.json"])
+    xbox_bak := snapshot.read(xbox_file + "", 1048576) or >>
     snapshot.write_atomic(xbox_file + "", &"{\"format\":\"nexus.xbox\",\"version\":1,\"store_id\":\"BAD\"}") or >>
     bad_xbox := run_cmd(&cli_bin, &["doctor", proj2d + ""])
     check(!bad_xbox.ok && strings.contains(&bad_xbox.output, "PROJ-011"), "doctor catches broken xbox config: " + bad_xbox.output) or >>
+    snapshot.write_atomic(xbox_file + "", &xbox_bak) or >>
+
+    // 11. Enhanced doctor checks on a clean game project (with valid --nexus-path)
+    deep_dir := filepath.join([root + "", "deep_checks"])
+    _ := must_cmd(&cli_bin, &[
+        "init", deep_dir + "",
+        "--name", "Deep Checks",
+        "--platforms", "steam,xbox",
+        "--nexus-path", cwd + ""
+    ], "init deep_checks")
+    deep_proj := filepath.join([deep_dir + "", "project.json"])
+    _ := must_cmd(&cli_bin, &["doctor", deep_proj + "", "--strict"], "deep_checks clean strict")
+
+    // PROJ-022: i18n key parity mismatch
+    deep_loc := filepath.join([deep_dir + "", "locales/strings.json"])
+    deep_loc_bak := snapshot.read(deep_loc + "", 1048576) or >>
+    parity_json := "{\n  \"format\": \"nexus.i18n\",\n  \"version\": 1,\n  \"default_locale\": \"en-US\",\n  \"locales\": {\n    \"en-US\": {\"entries\": {\"app.title\": \"Deep\", \"menu.extra\": \"Extra\"}, \"plurals\": {}},\n    \"zh-CN\": {\"entries\": {\"app.title\": \"深度\"}, \"plurals\": {}}\n  }\n}\n"
+    snapshot.write_atomic(deep_loc + "", &parity_json) or >>
+    parity_out := must_cmd(&cli_bin, &["doctor", deep_proj + ""], "doctor parity warn")
+    check(strings.contains(&parity_out, "PROJ-022"), "doctor catches i18n parity PROJ-022: " + parity_out) or >>
+    parity_strict := run_cmd(&cli_bin, &["doctor", deep_proj + "", "--strict"])
+    check(!parity_strict.ok, "doctor --strict fails on PROJ-022 warning") or >>
+    // --category filter: asset-only hides config warning PROJ-022
+    cat_out := must_cmd(&cli_bin, &["doctor", deep_proj + "", "--category", "asset"], "doctor --category asset")
+    check(!strings.contains(&cat_out, "PROJ-022") && strings.contains(&cat_out, "errors=0 warnings=0"), "doctor category asset excludes config warning: " + cat_out) or >>
+    snapshot.write_atomic(deep_loc + "", &deep_loc_bak) or >>
+
+    // --toolchain: xu.xun version mismatch triggers PROJ-024
+    deep_xun := filepath.join([deep_dir + "", "xu.xun"])
+    deep_xun_bak := snapshot.read(deep_xun + "", 65536) or >>
+    bad_xun := strings.replace_all(&deep_xun_bak, "!ver 0.14.2", "!ver 0.0.1")
+    snapshot.write_atomic(deep_xun + "", &bad_xun) or >>
+    tc_out := must_cmd(&cli_bin, &["doctor", deep_proj + "", "--toolchain"], "doctor --toolchain mismatch")
+    check(strings.contains(&tc_out, "PROJ-024"), "doctor --toolchain catches xu.xun mismatch: " + tc_out) or >>
+    snapshot.write_atomic(deep_xun + "", &deep_xun_bak) or >>
+
+    // PROJ-021: cross-platform ID mapping mismatch
+    deep_pm := filepath.join([deep_dir + "", "config/platform_mapping.json"])
+    deep_pm_bak := snapshot.read(deep_pm + "", 1048576) or >>
+    bad_pm := strings.replace_all(&deep_pm_bak, "\"ACH_FIRST_WIN\"", "\"ACH_UNKNOWN_ID\"")
+    snapshot.write_atomic(deep_pm + "", &bad_pm) or >>
+    bad_pm_res := run_cmd(&cli_bin, &["doctor", deep_proj + ""])
+    check(!bad_pm_res.ok && strings.contains(&bad_pm_res.output, "PROJ-021"), "doctor catches platform mapping mismatch PROJ-021: " + bad_pm_res.output) or >>
+    snapshot.write_atomic(deep_pm + "", &deep_pm_bak) or >>
+
+    // PROJ-017 (untracked asset on disk)
+    untracked_png := filepath.join([deep_dir + "", "assets/textures/untracked.png"])
+    $png_b := strings.new_byte_builder(32)
+    png_sig := [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]
+    for pi in 0:png_sig.len { png_b.write_byte(png_sig[pi]) }
+    png_bytes := png_b.to_string()
+    snapshot.write_atomic(untracked_png + "", &png_bytes) or >>
+    untracked_out := must_cmd(&cli_bin, &["doctor", deep_proj + ""], "doctor untracked asset")
+    check(strings.contains(&untracked_out, "PROJ-017"), "doctor catches untracked asset PROJ-017: " + untracked_out) or >>
+
+    // PROJ-016 (unused registered asset) + PROJ-019 (duplicate SHA-256)
+    dup_png := filepath.join([deep_dir + "", "assets/textures/dup.png"])
+    snapshot.write_atomic(dup_png + "", &png_bytes) or >>
+    _ := must_cmd(&cli_bin, &["register", deep_proj + "", "assets/textures/untracked.png"], "register untracked")
+    _ := must_cmd(&cli_bin, &["register", deep_proj + "", "assets/textures/dup.png"], "register dup")
+    unused_dup_out := must_cmd(&cli_bin, &["doctor", deep_proj + ""], "doctor unused + dup")
+    check(strings.contains(&unused_dup_out, "PROJ-016"), "doctor catches unused asset PROJ-016: " + unused_dup_out) or >>
+    check(strings.contains(&unused_dup_out, "PROJ-019"), "doctor catches duplicate sha256 PROJ-019: " + unused_dup_out) or >>
+
+    // Verify JSON issue schema includes category, hint, fixable
+    unused_json := must_cmd(&cli_bin, &["doctor", deep_proj + "", "--json"], "doctor unused json")
+    parsed_unused := json.parse_max(&unused_json, 262144)
+    check(parsed_unused.ok(), "doctor unused json parses") or >>
+    iss_arr := parsed_unused.get(parsed_unused.root(), "issues")
+    check(parsed_unused.count(iss_arr) >= 2 &&
+        parsed_unused.has(parsed_unused.at(iss_arr, 0), "category") &&
+        parsed_unused.has(parsed_unused.at(iss_arr, 0), "hint") &&
+        parsed_unused.has(parsed_unused.at(iss_arr, 0), "fixable"), "doctor json issue metadata") or >>
+
+    // PROJ-018: corrupt magic bytes in registered PNG
+    snapshot.write_atomic(dup_png + "", &"not-a-valid-png") or >>
+    corrupt_res := run_cmd(&cli_bin, &["doctor", deep_proj + ""])
+    check(!corrupt_res.ok && strings.contains(&corrupt_res.output, "PROJ-018"), "doctor catches corrupt PNG PROJ-018: " + corrupt_res.output) or >>
+
+    // --fix: auto-remediate missing .gitignore, prefabs/, and config/perf_budgets.json
+    fix_dir := filepath.join([root + "", "fix_checks"])
+    _ := must_cmd(&cli_bin, &["init", fix_dir + "", "--name", "Fix Checks", "--platforms", "none", "--nexus-path", cwd + ""], "init fix_checks")
+    fix_proj := filepath.join([fix_dir + "", "project.json"])
+    // --dry-run previews fixes without mutating disk; --fix applies them
+    os.remove(filepath.join([fix_dir + "", ".gitignore"])) or >>
+    os.remove_all(filepath.join([fix_dir + "", "prefabs"])) or >>
+    os.remove_all(filepath.join([fix_dir + "", "scripts"])) or >>
+    dry_json := must_cmd(&cli_bin, &["doctor", fix_proj + "", "--fix", "--dry-run", "--json"], "doctor --dry-run --json")
+    parsed_dry := json.parse_max(&dry_json, 262144)
+    check(parsed_dry.ok() &&
+        (parsed_dry.as_bool(parsed_dry.get(parsed_dry.root(), "dry_run")) or >>) &&
+        (parsed_dry.as_int(parsed_dry.get(parsed_dry.root(), "fixed_count")) or >>) >= 3 &&
+        (parsed_dry.as_bool(parsed_dry.get(parsed_dry.root(), "passed")) or >>), "doctor --dry-run reports planned fixes cleanly") or >>
+    check(!path_exists(filepath.join([fix_dir + "", ".gitignore"])) &&
+        !path_exists(filepath.join([fix_dir + "", "prefabs"])) &&
+        !path_exists(filepath.join([fix_dir + "", "scripts"])), "doctor --dry-run does not mutate disk") or >>
+
+    os.remove(filepath.join([fix_dir + "", "config/perf_budgets.json"])) or >>
+    pre_fix := run_cmd(&cli_bin, &["doctor", fix_proj + ""])
+    check(!pre_fix.ok && strings.contains(&pre_fix.output, "PROJ-008"), "pre-fix catches missing perf_budgets: " + pre_fix.output) or >>
+
+    fix_json := must_cmd(&cli_bin, &["doctor", fix_proj + "", "--fix", "--json"], "doctor --fix --json")
+    parsed_fix := json.parse_max(&fix_json, 262144)
+    check(parsed_fix.ok() && (parsed_fix.as_bool(parsed_fix.get(parsed_fix.root(), "passed")) or >>), "doctor --fix passed") or >>
+    check((parsed_fix.as_int(parsed_fix.get(parsed_fix.root(), "fixed_count")) or >>) >= 4, "doctor --fix fixed_count >= 4") or >>
+    check(path_exists(filepath.join([fix_dir + "", ".gitignore"])) &&
+        path_exists(filepath.join([fix_dir + "", "config/perf_budgets.json"])) &&
+        path_exists(filepath.join([fix_dir + "", "prefabs"])) &&
+        path_exists(filepath.join([fix_dir + "", "scripts"])), "doctor --fix restored missing files and dirs") or >>
+    _ := must_cmd(&cli_bin, &["doctor", fix_proj + "", "--strict"], "post-fix strict clean")
 
     // Also test 25d & blank templates initialize cleanly
     _ := must_cmd(&cli_bin, &["init", filepath.join([root + "", "hd2d_game"]), "--name", "HD2D", "--template", "25d", "--platforms", "none"], "init 25d")
