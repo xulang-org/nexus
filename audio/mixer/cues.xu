@@ -1,0 +1,437 @@
+@"github.com/xulang-org/nexus/audio/mixer"
+
+#errors
+#math
+
+pub const CUE_ROUND_ROBIN = 0
+pub const CUE_RANDOM = 1
+pub const CUE_SHUFFLE_NO_REPEAT = 2
+
+pub const STEAL_NONE = 0
+pub const STEAL_OLDEST = 1
+pub const STEAL_QUIETEST = 2
+
+pub struct AudioCueSpec {
+    pub clips []int
+    pub bus int
+    pub gain f64
+    pub gain_jitter f64
+    pub pitch f64
+    pub pitch_jitter f64
+    pub pan f64
+    pub looping bool
+    pub selection_mode int
+    pub cooldown_s f64
+    pub max_concurrent int
+    pub steal_policy int
+}
+
+pub fn default_cue_spec(clips []int, bus int) AudioCueSpec {
+    << AudioCueSpec{
+        clips: clips,
+        bus: bus,
+        gain: 1.0,
+        gain_jitter: 0.0,
+        pitch: 1.0,
+        pitch_jitter: 0.0,
+        pan: 0.0,
+        looping: false,
+        selection_mode: CUE_ROUND_ROBIN,
+        cooldown_s: 0.0,
+        max_concurrent: 0,
+        steal_policy: STEAL_OLDEST
+    }
+}
+
+pub struct CueTriggerResult {
+    pub triggered bool
+    pub voice_id int
+    pub clip_id int
+    pub gain f64
+    pub pitch f64
+    pub stolen_voice_id int
+    pub reject_reason string
+}
+
+struct CueActiveVoice {
+    voice_id int
+    seq int
+    gain f64
+}
+
+struct CueEntry {
+    name string
+    spec AudioCueSpec
+    rr_cursor int
+    shuffle_bag []int
+    last_clip int
+    has_triggered bool
+    last_trigger_s f64
+    voices []CueActiveVoice
+}
+
+pub struct AudioCueBank {
+    rng_state int
+    now_s f64
+    next_seq int
+    cues []CueEntry
+    by_name map[string]int
+}
+
+pub fn new_cue_bank(seed int) AudioCueBank {
+    $s := seed & 2147483647
+    if s == 0 { s = 135792468 }
+    << AudioCueBank{
+        rng_state: s,
+        now_s: 0.0,
+        next_seq: 1,
+        cues: []CueEntry{},
+        by_name: map[string]int{}
+    }
+}
+
+fn (bank $&AudioCueBank) next_rng() int {
+    bank.rng_state = (bank.rng_state * 1103515245 + 12345) & 2147483647
+    << bank.rng_state
+}
+
+fn (bank $&AudioCueBank) next_unit_signed() f64 {
+    r := bank.next_rng()
+    // Map [0, 2^31-1] to [-1.0, 1.0]
+    << (f64(r) / 1073741823.5) - 1.0
+}
+
+fn finite_cue(v f64) bool {
+    << !math.is_nan(v) && !math.is_inf(v)
+}
+
+fn clone_int_slice(src &[]int) []int {
+    $out := []int{}
+    for i in 0:src.len {
+        out.push(src[i])
+    }
+    << out
+}
+
+fn clone_cue_spec(spec &AudioCueSpec) AudioCueSpec {
+    << AudioCueSpec{
+        clips: clone_int_slice(&spec.clips),
+        bus: spec.bus,
+        gain: spec.gain,
+        gain_jitter: spec.gain_jitter,
+        pitch: spec.pitch,
+        pitch_jitter: spec.pitch_jitter,
+        pan: spec.pan,
+        looping: spec.looping,
+        selection_mode: spec.selection_mode,
+        cooldown_s: spec.cooldown_s,
+        max_concurrent: spec.max_concurrent,
+        steal_policy: spec.steal_policy
+    }
+}
+
+pub fn (bank $&AudioCueBank) register_cue(name string, spec AudioCueSpec) int {
+    if name.len == 0 {
+        >> errors.new("nexus audio cue: cue name cannot be empty")
+    }
+    if spec.clips.len == 0 {
+        >> errors.new("nexus audio cue: cue clips list cannot be empty")
+    }
+    if spec.selection_mode < CUE_ROUND_ROBIN || spec.selection_mode > CUE_SHUFFLE_NO_REPEAT {
+        >> errors.new("nexus audio cue: invalid selection_mode")
+    }
+    if spec.steal_policy < STEAL_NONE || spec.steal_policy > STEAL_QUIETEST {
+        >> errors.new("nexus audio cue: invalid steal_policy")
+    }
+    if !finite_cue(spec.gain) || spec.gain < 0.0 || !finite_cue(spec.gain_jitter) || spec.gain_jitter < 0.0 {
+        >> errors.new("nexus audio cue: invalid gain or gain_jitter")
+    }
+    if !finite_cue(spec.pitch) || spec.pitch <= 0.0 || !finite_cue(spec.pitch_jitter) || spec.pitch_jitter < 0.0 {
+        >> errors.new("nexus audio cue: invalid pitch or pitch_jitter")
+    }
+    if !finite_cue(spec.pan) || spec.pan < -1.0 || spec.pan > 1.0 {
+        >> errors.new("nexus audio cue: pan must be in [-1, 1]")
+    }
+    if !finite_cue(spec.cooldown_s) || spec.cooldown_s < 0.0 || spec.max_concurrent < 0 {
+        >> errors.new("nexus audio cue: invalid cooldown or max_concurrent")
+    }
+
+    entry := CueEntry{
+        name: name + "",
+        spec: clone_cue_spec(&spec),
+        rr_cursor: 0,
+        shuffle_bag: []int{},
+        last_clip: -1,
+        has_triggered: false,
+        last_trigger_s: 0.0,
+        voices: []CueActiveVoice{}
+    }
+    if bank.by_name.has(name) {
+        idx := bank.by_name[name]
+        bank.cues[idx] = entry
+        << idx
+    }
+    idx := bank.cues.len
+    bank.cues.push(entry)
+    bank.by_name[name] = idx
+    << idx
+}
+
+fn voice_is_playing(mixer &Mixer, id int) bool {
+    if !mixer.is_voice(id) { << false }
+    << mixer.is_playing(id) or (err) {
+        _ := err
+        << false
+    }
+}
+
+fn try_stop_voice(mixer $&Mixer, id int) int {
+    if !mixer.is_voice(id) { << -1 }
+    << mixer.stop(id) or (err) {
+        _ := err
+        << -1
+    }
+}
+
+fn try_set_pitch(mixer $&Mixer, id int, pitch f64) int {
+    if !mixer.is_voice(id) { << -1 }
+    << mixer.set_pitch(id, pitch) or (err) {
+        _ := err
+        << -1
+    }
+}
+
+fn (bank $&AudioCueBank) prune_cue_voices(mixer &Mixer, idx int) {
+    if bank.cues[idx].voices.len == 0 { << }
+    $kept := []CueActiveVoice{}
+    for i in 0:bank.cues[idx].voices.len {
+        v := bank.cues[idx].voices[i]
+        if voice_is_playing(mixer, v.voice_id) {
+            kept.push(v)
+        }
+    }
+    bank.cues[idx].voices = kept
+}
+
+pub fn (bank $&AudioCueBank) update(mixer &Mixer, dt f64) int {
+    if !finite_cue(dt) || dt < 0.0 {
+        >> errors.new("nexus audio cue: dt must be finite and >= 0")
+    }
+    bank.now_s += dt
+    $total := 0
+    for i in 0:bank.cues.len {
+        bank.prune_cue_voices(mixer, i)
+        total += bank.cues[i].voices.len
+    }
+    << total
+}
+
+pub fn (bank &AudioCueBank) active_count(mixer &Mixer, name string) int {
+    if !bank.by_name.has(name) { << 0 }
+    idx := bank.by_name[name]
+    $n := 0
+    for i in 0:bank.cues[idx].voices.len {
+        if voice_is_playing(mixer, bank.cues[idx].voices[i].voice_id) { n += 1 }
+    }
+    << n
+}
+
+fn (bank $&AudioCueBank) refill_shuffle_bag(idx int) {
+    $bag := clone_int_slice(&bank.cues[idx].spec.clips)
+    // Fisher-Yates shuffle
+    $i := bag.len - 1
+    while i > 0 {
+        span := i + 1
+        if span <= 1 { <- }
+        j := bank.next_rng() % span
+        tmp := bag[i]
+        bag[i] = bag[j]
+        bag[j] = tmp
+        i -= 1
+    }
+    // Avoid back-to-back repeats across bag boundaries when multiple distinct clips exist.
+    last_c := bank.cues[idx].last_clip
+    if bag.len > 1 && bag[0] == last_c {
+        for k in 1:bag.len {
+            if bag[k] != last_c {
+                tmp := bag[0]
+                bag[0] = bag[k]
+                bag[k] = tmp
+                <-
+            }
+        }
+    }
+    bank.cues[idx].shuffle_bag = bag
+}
+
+fn (bank $&AudioCueBank) select_clip(idx int) int {
+    n := bank.cues[idx].spec.clips.len
+    if n <= 0 { << -1 }
+    if n == 1 {
+        clip := bank.cues[idx].spec.clips[0]
+        bank.cues[idx].last_clip = clip
+        << clip
+    }
+    sel_mode := bank.cues[idx].spec.selection_mode
+    if sel_mode == CUE_ROUND_ROBIN {
+        if bank.cues[idx].rr_cursor >= n { bank.cues[idx].rr_cursor = 0 }
+        clip := bank.cues[idx].spec.clips[bank.cues[idx].rr_cursor]
+        bank.cues[idx].rr_cursor += 1
+        if bank.cues[idx].rr_cursor >= n { bank.cues[idx].rr_cursor = 0 }
+        bank.cues[idx].last_clip = clip
+        << clip
+    }
+    if sel_mode == CUE_RANDOM {
+        ridx := bank.next_rng() % n
+        clip := bank.cues[idx].spec.clips[ridx]
+        bank.cues[idx].last_clip = clip
+        << clip
+    }
+    // CUE_SHUFFLE_NO_REPEAT
+    if bank.cues[idx].shuffle_bag.len == 0 {
+        bank.refill_shuffle_bag(idx)
+    }
+    clip := bank.cues[idx].shuffle_bag[0]
+    $rest := []int{}
+    for i in 1:bank.cues[idx].shuffle_bag.len {
+        rest.push(bank.cues[idx].shuffle_bag[i])
+    }
+    bank.cues[idx].shuffle_bag = rest
+    bank.cues[idx].last_clip = clip
+    << clip
+}
+
+fn clamp_cue(v f64, lo f64, hi f64) f64 {
+    if v < lo { << lo }
+    if v > hi { << hi }
+    << v
+}
+
+pub fn (bank $&AudioCueBank) trigger(mixer $&Mixer, name string) CueTriggerResult {
+    if !bank.by_name.has(name) {
+        >> errors.new("nexus audio cue: unknown cue name")
+    }
+    idx := bank.by_name[name]
+
+    if bank.cues[idx].spec.clips.len == 0 {
+        << CueTriggerResult{
+            triggered: false,
+            voice_id: -1,
+            clip_id: -1,
+            gain: 0.0,
+            pitch: 1.0,
+            stolen_voice_id: -1,
+            reject_reason: "empty_clips"
+        }
+    }
+
+    cooldown_s := bank.cues[idx].spec.cooldown_s
+    if bank.cues[idx].has_triggered && cooldown_s > 0.0 {
+        if (bank.now_s - bank.cues[idx].last_trigger_s) < cooldown_s {
+            << CueTriggerResult{
+                triggered: false,
+                voice_id: -1,
+                clip_id: -1,
+                gain: 0.0,
+                pitch: 1.0,
+                stolen_voice_id: -1,
+                reject_reason: "cooldown"
+            }
+        }
+    }
+
+    bank.prune_cue_voices(mixer, idx)
+    $stolen_id := -1
+    max_conc := bank.cues[idx].spec.max_concurrent
+    steal_pol := bank.cues[idx].spec.steal_policy
+    if max_conc > 0 && bank.cues[idx].voices.len >= max_conc {
+        if steal_pol == STEAL_NONE {
+            << CueTriggerResult{
+                triggered: false,
+                voice_id: -1,
+                clip_id: -1,
+                gain: 0.0,
+                pitch: 1.0,
+                stolen_voice_id: -1,
+                reject_reason: "max_concurrent"
+            }
+        }
+        $victim_idx := 0
+        if steal_pol == STEAL_OLDEST {
+            $best_seq := bank.cues[idx].voices[0].seq
+            for i in 1:bank.cues[idx].voices.len {
+                if bank.cues[idx].voices[i].seq < best_seq {
+                    best_seq = bank.cues[idx].voices[i].seq
+                    victim_idx = i
+                }
+            }
+        } else {
+            // STEAL_QUIETEST (tie-break oldest sequence)
+            $best_gain := bank.cues[idx].voices[0].gain
+            $best_seq := bank.cues[idx].voices[0].seq
+            for i in 1:bank.cues[idx].voices.len {
+                cand := bank.cues[idx].voices[i]
+                if cand.gain < best_gain || (cand.gain == best_gain && cand.seq < best_seq) {
+                    best_gain = cand.gain
+                    best_seq = cand.seq
+                    victim_idx = i
+                }
+            }
+        }
+        stolen_id = bank.cues[idx].voices[victim_idx].voice_id
+        _ := try_stop_voice(mixer, stolen_id)
+        $kept := []CueActiveVoice{}
+        for i in 0:bank.cues[idx].voices.len {
+            if i != victim_idx { kept.push(bank.cues[idx].voices[i]) }
+        }
+        bank.cues[idx].voices = kept
+    }
+
+    spec_gain := bank.cues[idx].spec.gain
+    spec_gain_jitter := bank.cues[idx].spec.gain_jitter
+    spec_pitch := bank.cues[idx].spec.pitch
+    spec_pitch_jitter := bank.cues[idx].spec.pitch_jitter
+    spec_bus := bank.cues[idx].spec.bus
+    spec_pan := bank.cues[idx].spec.pan
+    spec_looping := bank.cues[idx].spec.looping
+
+    clip_id := bank.select_clip(idx)
+    g := clamp_cue(spec_gain + bank.next_unit_signed() * spec_gain_jitter, 0.0, 4.0)
+    p := clamp_cue(spec_pitch + bank.next_unit_signed() * spec_pitch_jitter, 0.25, 4.0)
+
+    vid := mixer.play(clip_id, spec_bus, g, spec_pan, spec_looping) or >>
+    _ := try_set_pitch(mixer, vid, p)
+
+    seq := bank.next_seq
+    bank.next_seq += 1
+    bank.cues[idx].voices.push(CueActiveVoice{voice_id: vid, seq: seq, gain: g})
+    bank.cues[idx].has_triggered = true
+    bank.cues[idx].last_trigger_s = bank.now_s
+
+    << CueTriggerResult{
+        triggered: true,
+        voice_id: vid,
+        clip_id: clip_id,
+        gain: g,
+        pitch: p,
+        stolen_voice_id: stolen_id,
+        reject_reason: ""
+    }
+}
+
+pub fn (bank $&AudioCueBank) stop_cue(mixer $&Mixer, name string) int {
+    if !bank.by_name.has(name) {
+        >> errors.new("nexus audio cue: unknown cue name")
+    }
+    idx := bank.by_name[name]
+    $stopped := 0
+    for i in 0:bank.cues[idx].voices.len {
+        v := bank.cues[idx].voices[i]
+        if voice_is_playing(mixer, v.voice_id) {
+            rc := try_stop_voice(mixer, v.voice_id)
+            if rc == 0 { stopped += 1 }
+        }
+    }
+    bank.cues[idx].voices = []CueActiveVoice{}
+    << stopped
+}

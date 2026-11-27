@@ -1,0 +1,542 @@
+@"github.com/xulang-org/nexus/animation/timeline"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const SEQ_WAIT = 0
+pub const SEQ_SCALAR = 1
+pub const SEQ_VEC3 = 2
+pub const SEQ_MARKER = 3
+
+pub struct SpringConfig {
+    pub frequency_hz f64
+    pub damping_ratio f64
+}
+
+pub fn spring_config(frequency_hz f64, damping_ratio f64) SpringConfig {
+    if !fm.finite(frequency_hz) || frequency_hz <= 0.0 {
+        >> errors.new("nexus timeline: spring frequency_hz must be finite and > 0")
+    }
+    if !fm.finite(damping_ratio) || damping_ratio < 0.0 {
+        >> errors.new("nexus timeline: spring damping_ratio must be finite and >= 0")
+    }
+    << SpringConfig{frequency_hz: frequency_hz, damping_ratio: damping_ratio}
+}
+
+struct SpringStep1D {
+    pos f64
+    vel f64
+}
+
+fn step_spring_1d(pos f64, target f64, vel f64, cfg SpringConfig, dt f64) SpringStep1D {
+    if !fm.finite(dt) || dt < 0.0 {
+        >> errors.new("nexus timeline: spring dt must be finite and >= 0")
+    }
+    if dt == 0.0 {
+        << SpringStep1D{pos: pos, vel: vel}
+    }
+    omega := 2.0 * math.pi() * cfg.frequency_hz
+    zeta := cfg.damping_ratio
+    y0 := pos - target
+    v0 := vel
+
+    if math.abs(zeta - 1.0) < 1e-6 {
+        // Critically damped closed form (strictly decaying exponential).
+        e := math.exp(-omega * dt)
+        k := v0 + omega * y0
+        next_y := e * (y0 + k * dt)
+        next_v := e * (v0 - omega * k * dt)
+        << SpringStep1D{pos: target + next_y, vel: next_v}
+    }
+
+    if zeta < 1.0 {
+        // Underdamped closed form.
+        omega_d := omega * math.sqrt(math.max(0.0, 1.0 - zeta * zeta))
+        e := math.exp(-zeta * omega * dt)
+        c := y0
+        s := (v0 + zeta * omega * y0) / omega_d
+        phase := omega_d * dt
+        cos_p := math.cos(phase)
+        sin_p := math.sin(phase)
+        next_y := e * (c * cos_p + s * sin_p)
+        next_v := e * ((s * omega_d - zeta * omega * c) * cos_p - (c * omega_d + zeta * omega * s) * sin_p)
+        << SpringStep1D{pos: target + next_y, vel: next_v}
+    }
+
+    // Overdamped closed form using strictly negative poles r1, r2 so exponentials stay in (0, 1].
+    root := math.sqrt(math.max(0.0, zeta * zeta - 1.0))
+    r1 := -omega * (zeta - root)
+    r2 := -omega * (zeta + root)
+    denom := r1 - r2
+    c1 := (v0 - r2 * y0) / denom
+    c2 := y0 - c1
+    e1 := math.exp(r1 * dt)
+    e2 := math.exp(r2 * dt)
+    next_y := c1 * e1 + c2 * e2
+    next_v := c1 * r1 * e1 + c2 * r2 * e2
+    << SpringStep1D{pos: target + next_y, vel: next_v}
+}
+
+pub struct SpringF64 {
+    pub value f64
+    pub target f64
+    pub velocity f64
+    pub config SpringConfig
+}
+
+pub fn new_spring_f64(initial f64, cfg SpringConfig) SpringF64 {
+    if !fm.finite(initial) {
+        >> errors.new("nexus timeline: non-finite initial spring value")
+    }
+    << SpringF64{value: initial, target: initial, velocity: 0.0, config: cfg}
+}
+
+pub fn (s $&SpringF64) set_target(target f64) int {
+    if !fm.finite(target) { >> errors.new("nexus timeline: non-finite spring target") }
+    s.target = target
+    << 0
+}
+
+pub fn (s $&SpringF64) snap(value f64) int {
+    if !fm.finite(value) { >> errors.new("nexus timeline: non-finite spring snap value") }
+    s.value = value
+    s.target = value
+    s.velocity = 0.0
+    << 0
+}
+
+pub fn (s $&SpringF64) impulse(delta_vel f64) int {
+    if !fm.finite(delta_vel) { >> errors.new("nexus timeline: non-finite spring impulse") }
+    s.velocity += delta_vel
+    << 0
+}
+
+pub fn (s $&SpringF64) step(dt f64) f64 {
+    res := step_spring_1d(s.value, s.target, s.velocity, s.config, dt) or >>
+    s.value = res.pos
+    s.velocity = res.vel
+    << s.value
+}
+
+pub fn (s &SpringF64) is_settled(pos_eps f64, vel_eps f64) bool {
+    << math.abs(s.value - s.target) <= pos_eps && math.abs(s.velocity) <= vel_eps
+}
+
+pub struct SpringVec2 {
+    pub value fm.Vec2
+    pub target fm.Vec2
+    pub velocity fm.Vec2
+    pub config SpringConfig
+}
+
+pub fn new_spring_vec2(initial fm.Vec2, cfg SpringConfig) SpringVec2 {
+    if !initial.is_finite() {
+        >> errors.new("nexus timeline: non-finite initial SpringVec2 value")
+    }
+    << SpringVec2{value: initial, target: initial, velocity: fm.vec2(0.0, 0.0), config: cfg}
+}
+
+pub fn (s $&SpringVec2) set_target(target fm.Vec2) int {
+    if !target.is_finite() { >> errors.new("nexus timeline: non-finite SpringVec2 target") }
+    s.target = target
+    << 0
+}
+
+pub fn (s $&SpringVec2) snap(value fm.Vec2) int {
+    if !value.is_finite() { >> errors.new("nexus timeline: non-finite SpringVec2 snap value") }
+    s.value = value
+    s.target = value
+    s.velocity = fm.vec2(0.0, 0.0)
+    << 0
+}
+
+pub fn (s $&SpringVec2) impulse(delta_vel fm.Vec2) int {
+    if !delta_vel.is_finite() { >> errors.new("nexus timeline: non-finite SpringVec2 impulse") }
+    s.velocity = s.velocity.add(delta_vel)
+    << 0
+}
+
+pub fn (s $&SpringVec2) step(dt f64) fm.Vec2 {
+    rx := step_spring_1d(s.value.x, s.target.x, s.velocity.x, s.config, dt) or >>
+    ry := step_spring_1d(s.value.y, s.target.y, s.velocity.y, s.config, dt) or >>
+    s.value = fm.vec2(rx.pos, ry.pos)
+    s.velocity = fm.vec2(rx.vel, ry.vel)
+    << s.value
+}
+
+pub fn (s &SpringVec2) is_settled(pos_eps f64, vel_eps f64) bool {
+    << s.value.distance(s.target) <= pos_eps && s.velocity.length() <= vel_eps
+}
+
+pub struct SpringVec3 {
+    pub value fm.Vec3
+    pub target fm.Vec3
+    pub velocity fm.Vec3
+    pub config SpringConfig
+}
+
+pub fn new_spring_vec3(initial fm.Vec3, cfg SpringConfig) SpringVec3 {
+    if !initial.is_finite() {
+        >> errors.new("nexus timeline: non-finite initial SpringVec3 value")
+    }
+    << SpringVec3{value: initial, target: initial, velocity: fm.vec3(0.0, 0.0, 0.0), config: cfg}
+}
+
+pub fn (s $&SpringVec3) set_target(target fm.Vec3) int {
+    if !target.is_finite() { >> errors.new("nexus timeline: non-finite SpringVec3 target") }
+    s.target = target
+    << 0
+}
+
+pub fn (s $&SpringVec3) snap(value fm.Vec3) int {
+    if !value.is_finite() { >> errors.new("nexus timeline: non-finite SpringVec3 snap value") }
+    s.value = value
+    s.target = value
+    s.velocity = fm.vec3(0.0, 0.0, 0.0)
+    << 0
+}
+
+pub fn (s $&SpringVec3) impulse(delta_vel fm.Vec3) int {
+    if !delta_vel.is_finite() { >> errors.new("nexus timeline: non-finite SpringVec3 impulse") }
+    s.velocity = s.velocity.add(delta_vel)
+    << 0
+}
+
+pub fn (s $&SpringVec3) step(dt f64) fm.Vec3 {
+    rx := step_spring_1d(s.value.x, s.target.x, s.velocity.x, s.config, dt) or >>
+    ry := step_spring_1d(s.value.y, s.target.y, s.velocity.y, s.config, dt) or >>
+    rz := step_spring_1d(s.value.z, s.target.z, s.velocity.z, s.config, dt) or >>
+    s.value = fm.vec3(rx.pos, ry.pos, rz.pos)
+    s.velocity = fm.vec3(rx.vel, ry.vel, rz.vel)
+    << s.value
+}
+
+pub fn (s &SpringVec3) is_settled(pos_eps f64, vel_eps f64) bool {
+    << s.value.distance(s.target) <= pos_eps && s.velocity.length() <= vel_eps
+}
+
+struct SeqItem {
+    kind int
+    start_t f64
+    duration f64
+    ease_kind int
+    from_s f64
+    to_s f64
+    from_v3 fm.Vec3
+    to_v3 fm.Vec3
+    marker string
+}
+
+pub struct MotionSequenceStepResult {
+    pub scalar f64
+    pub vec3 fm.Vec3
+    pub scalar_updated bool
+    pub vec3_updated bool
+    pub markers []string
+    pub loop_completed bool
+    pub finished bool
+    pub normalized_time f64
+}
+
+pub struct MotionSequence {
+    items []SeqItem
+    cursor f64
+    prev_start f64
+    total_duration f64
+    elapsed f64
+    extra_loops int
+    yoyo bool
+    playing bool
+    finished bool
+    completed_cycles int
+}
+
+pub fn new_motion_sequence() MotionSequence {
+    << MotionSequence{
+        items: []SeqItem{},
+        cursor: 0.0,
+        prev_start: 0.0,
+        total_duration: 0.0,
+        elapsed: 0.0,
+        extra_loops: 0,
+        yoyo: false,
+        playing: true,
+        finished: false,
+        completed_cycles: 0
+    }
+}
+
+fn validate_seq_duration(duration f64) int {
+    if !fm.finite(duration) || duration <= 0.0 {
+        >> errors.new("nexus timeline: sequence item duration must be finite and > 0")
+    }
+    << 0
+}
+
+pub fn (s $&MotionSequence) then_scalar(from f64, to f64, duration f64, ease_kind int) int {
+    _ := validate_seq_duration(duration) or >>
+    if !fm.finite(from) || !fm.finite(to) { >> errors.new("nexus timeline: non-finite scalar endpoints") }
+    start := s.cursor
+    s.items.push(SeqItem{
+        kind: SEQ_SCALAR,
+        start_t: start,
+        duration: duration,
+        ease_kind: ease_kind,
+        from_s: from,
+        to_s: to,
+        from_v3: fm.vec3(0.0, 0.0, 0.0),
+        to_v3: fm.vec3(0.0, 0.0, 0.0),
+        marker: ""
+    })
+    s.prev_start = start
+    s.cursor = start + duration
+    if s.cursor > s.total_duration { s.total_duration = s.cursor }
+    << s.items.len - 1
+}
+
+pub fn (s $&MotionSequence) join_scalar(from f64, to f64, duration f64, ease_kind int) int {
+    _ := validate_seq_duration(duration) or >>
+    if !fm.finite(from) || !fm.finite(to) { >> errors.new("nexus timeline: non-finite scalar endpoints") }
+    start := s.prev_start
+    s.items.push(SeqItem{
+        kind: SEQ_SCALAR,
+        start_t: start,
+        duration: duration,
+        ease_kind: ease_kind,
+        from_s: from,
+        to_s: to,
+        from_v3: fm.vec3(0.0, 0.0, 0.0),
+        to_v3: fm.vec3(0.0, 0.0, 0.0),
+        marker: ""
+    })
+    end_t := start + duration
+    if end_t > s.cursor { s.cursor = end_t }
+    if end_t > s.total_duration { s.total_duration = end_t }
+    << s.items.len - 1
+}
+
+pub fn (s $&MotionSequence) then_vec3(from fm.Vec3, to fm.Vec3, duration f64, ease_kind int) int {
+    _ := validate_seq_duration(duration) or >>
+    if !from.is_finite() || !to.is_finite() { >> errors.new("nexus timeline: non-finite vec3 endpoints") }
+    start := s.cursor
+    s.items.push(SeqItem{
+        kind: SEQ_VEC3,
+        start_t: start,
+        duration: duration,
+        ease_kind: ease_kind,
+        from_s: 0.0,
+        to_s: 0.0,
+        from_v3: from,
+        to_v3: to,
+        marker: ""
+    })
+    s.prev_start = start
+    s.cursor = start + duration
+    if s.cursor > s.total_duration { s.total_duration = s.cursor }
+    << s.items.len - 1
+}
+
+pub fn (s $&MotionSequence) join_vec3(from fm.Vec3, to fm.Vec3, duration f64, ease_kind int) int {
+    _ := validate_seq_duration(duration) or >>
+    if !from.is_finite() || !to.is_finite() { >> errors.new("nexus timeline: non-finite vec3 endpoints") }
+    start := s.prev_start
+    s.items.push(SeqItem{
+        kind: SEQ_VEC3,
+        start_t: start,
+        duration: duration,
+        ease_kind: ease_kind,
+        from_s: 0.0,
+        to_s: 0.0,
+        from_v3: from,
+        to_v3: to,
+        marker: ""
+    })
+    end_t := start + duration
+    if end_t > s.cursor { s.cursor = end_t }
+    if end_t > s.total_duration { s.total_duration = end_t }
+    << s.items.len - 1
+}
+
+pub fn (s $&MotionSequence) then_wait(duration f64) int {
+    _ := validate_seq_duration(duration) or >>
+    start := s.cursor
+    s.items.push(SeqItem{
+        kind: SEQ_WAIT,
+        start_t: start,
+        duration: duration,
+        ease_kind: 0,
+        from_s: 0.0,
+        to_s: 0.0,
+        from_v3: fm.vec3(0.0, 0.0, 0.0),
+        to_v3: fm.vec3(0.0, 0.0, 0.0),
+        marker: ""
+    })
+    s.prev_start = start
+    s.cursor = start + duration
+    if s.cursor > s.total_duration { s.total_duration = s.cursor }
+    << s.items.len - 1
+}
+
+pub fn (s $&MotionSequence) then_marker(name string) int {
+    start := s.cursor
+    s.items.push(SeqItem{
+        kind: SEQ_MARKER,
+        start_t: start,
+        duration: 0.0,
+        ease_kind: 0,
+        from_s: 0.0,
+        to_s: 0.0,
+        from_v3: fm.vec3(0.0, 0.0, 0.0),
+        to_v3: fm.vec3(0.0, 0.0, 0.0),
+        marker: name + ""
+    })
+    s.prev_start = start
+    << s.items.len - 1
+}
+
+pub fn (s $&MotionSequence) set_loops(extra_loops int, yoyo bool) int {
+    if extra_loops < -1 {
+        >> errors.new("nexus timeline: sequence extra_loops must be >= -1")
+    }
+    s.extra_loops = extra_loops
+    s.yoyo = yoyo
+    << 0
+}
+
+pub fn (s $&MotionSequence) play() { s.playing = true }
+pub fn (s $&MotionSequence) pause() { s.playing = false }
+pub fn (s $&MotionSequence) reset() {
+    s.elapsed = 0.0
+    s.completed_cycles = 0
+    s.finished = false
+    s.playing = true
+}
+
+pub fn (s &MotionSequence) duration() f64 { << s.total_duration }
+pub fn (s &MotionSequence) is_finished() bool { << s.finished }
+
+fn cycle_local_time(total_d f64, total_elapsed f64, cycle int, yoyo bool) f64 {
+    local := total_elapsed - f64(cycle) * total_d
+    $u := fm.clamp01(local / total_d)
+    if yoyo && (cycle % 2) == 1 {
+        u = 1.0 - u
+    }
+    << u * total_d
+}
+
+fn collect_markers(items &[]SeqItem, prev_t f64, next_t f64, include_start bool, reversed bool, out $&[]string) {
+    for i in 0:items.len {
+        it := &items[i]
+        if it.kind != SEQ_MARKER { -> }
+        t := it.start_t
+        if !reversed {
+            hit := (next_t >= t && prev_t < t) || (include_start && prev_t == t && next_t >= t)
+            if hit { out.push(it.marker + "") }
+        } else {
+            hit := (next_t <= t && prev_t > t) || (include_start && prev_t == t && next_t <= t)
+            if hit { out.push(it.marker + "") }
+        }
+    }
+}
+
+pub fn (s $&MotionSequence) step(dt f64) MotionSequenceStepResult {
+    if !fm.finite(dt) || dt < 0.0 {
+        >> errors.new("nexus timeline: sequence dt must be finite and >= 0")
+    }
+    $markers := []string{}
+    if s.total_duration <= 0.0 {
+        // Trigger zero-time markers once if not yet finished.
+        if !s.finished && s.playing {
+            for i in 0:s.items.len {
+                if s.items[i].kind == SEQ_MARKER {
+                    markers.push(s.items[i].marker + "")
+                }
+            }
+            s.finished = true
+        }
+        << MotionSequenceStepResult{
+            scalar: 0.0,
+            vec3: fm.vec3(0.0, 0.0, 0.0),
+            scalar_updated: false,
+            vec3_updated: false,
+            markers: markers,
+            loop_completed: s.finished,
+            finished: s.finished,
+            normalized_time: 1.0
+        }
+    }
+
+    prev_elapsed := s.elapsed
+    $loop_done := false
+    if s.playing && !s.finished && dt > 0.0 {
+        $next_elapsed := prev_elapsed + dt
+        if s.extra_loops >= 0 {
+            max_total := f64(s.extra_loops + 1) * s.total_duration
+            if next_elapsed >= max_total {
+                next_elapsed = max_total
+                s.finished = true
+            }
+        }
+        s.elapsed = next_elapsed
+
+        $scan_t := prev_elapsed
+        $scan_cycle := int(math.floor(scan_t / s.total_duration))
+        if s.finished && scan_cycle > s.extra_loops { scan_cycle = s.extra_loops }
+
+        while scan_t < next_elapsed {
+            cycle_end := f64(scan_cycle + 1) * s.total_duration
+            seg_end := math.min(next_elapsed, cycle_end)
+            rev := s.yoyo && (scan_cycle % 2) == 1
+            t0 := cycle_local_time(s.total_duration, scan_t, scan_cycle, s.yoyo)
+            t1 := cycle_local_time(s.total_duration, seg_end, scan_cycle, s.yoyo)
+            collect_markers(&s.items, t0, t1, scan_t == 0.0, rev, $&markers)
+            if seg_end >= cycle_end - 1e-12 {
+                s.completed_cycles += 1
+                loop_done = true
+            }
+            scan_t = seg_end
+            scan_cycle += 1
+            if seg_end >= next_elapsed - 1e-12 { <- }
+        }
+    }
+
+    $eval_cycle := int(math.floor(s.elapsed / s.total_duration))
+    if s.finished && s.extra_loops >= 0 && eval_cycle > s.extra_loops {
+        eval_cycle = s.extra_loops
+    }
+    eval_t := cycle_local_time(s.total_duration, s.elapsed, eval_cycle, s.yoyo)
+    norm_u := fm.clamp01(eval_t / s.total_duration)
+
+    $scalar := 0.0
+    $scalar_updated := false
+    $vec3 := fm.vec3(0.0, 0.0, 0.0)
+    $vec3_updated := false
+    for i in 0:s.items.len {
+        it := &s.items[i]
+        if it.kind == SEQ_SCALAR || it.kind == SEQ_VEC3 {
+            if eval_t >= it.start_t {
+                u := fm.clamp01((eval_t - it.start_t) / math.max(1e-12, it.duration))
+                w := fm.ease(it.ease_kind, u)
+                if it.kind == SEQ_SCALAR {
+                    scalar = fm.lerp(it.from_s, it.to_s, w)
+                    scalar_updated = true
+                } else {
+                    vec3 = it.from_v3.lerp(it.to_v3, w)
+                    vec3_updated = true
+                }
+            }
+        }
+    }
+
+    << MotionSequenceStepResult{
+        scalar: scalar,
+        vec3: vec3,
+        scalar_updated: scalar_updated,
+        vec3_updated: vec3_updated,
+        markers: markers,
+        loop_completed: loop_done,
+        finished: s.finished,
+        normalized_time: norm_u
+    }
+}
