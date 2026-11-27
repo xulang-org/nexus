@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='xu-nexus-canvas-') as directory:
     target = Path(directory)
     shutil.copyfile(ROOT/'xu.xun', target/'xu.xun')
-    for package in ('foundation/math', 'resources/camera', 'resources/canvas', 'resources/tilemap', 'scene', 'integration/rendering/two_d'):
+    for package in ('foundation/math', 'resources/camera', 'resources/canvas', 'resources/lighting2d', 'resources/tilemap', 'scene', 'integration/rendering/two_d'):
         shutil.copytree(ROOT/package, target/package)
     (target/'checks').mkdir()
     sdk = next(line for line in (ROOT/'xu.xun').read_text().splitlines() if line.startswith('xu:'))

@@ -1,0 +1,306 @@
+@"github.com/xulang-org/nexus/animation/timeline"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub const TWEEN_SCALAR = 0
+pub const TWEEN_VEC2 = 1
+pub const TWEEN_VEC3 = 2
+pub const TWEEN_COLOR = 3
+
+pub struct TweenHandle {
+    pub id int
+    pub generation int
+}
+
+pub struct TweenValue {
+    pub kind int
+    pub scalar f64
+    pub vec2 fm.Vec2
+    pub vec3 fm.Vec3
+    pub rgba int
+    pub progress f64
+    pub finished bool
+    pub tag string
+}
+
+struct TweenSlot {
+    alive bool
+    completed bool
+    generation int
+    paused bool
+    unscaled bool
+    kind int
+    ease_kind int
+    duration f64
+    delay f64
+    elapsed f64
+    loops int
+    yoyo bool
+    tag string
+    from_scalar f64
+    to_scalar f64
+    from_v2 fm.Vec2
+    to_v2 fm.Vec2
+    from_v3 fm.Vec3
+    to_v3 fm.Vec3
+    from_rgba int
+    to_rgba int
+}
+
+pub struct TweenManager {
+    slots []TweenSlot
+    free_ids []int
+}
+
+pub fn new_tween_manager() TweenManager {
+    << TweenManager{slots: []TweenSlot{}, free_ids: []int{}}
+}
+
+fn alloc_tween(m $&TweenManager, slot TweenSlot) TweenHandle {
+    if m.free_ids.len > 0 {
+        last := m.free_ids.len - 1
+        id := m.free_ids[last]
+        $nf := []int{}
+        for i in 0:last { nf.push(m.free_ids[i]) }
+        m.free_ids = nf
+        gen := m.slots[id].generation
+        $s := slot
+        s.generation = gen
+        m.slots[id] = s
+        << TweenHandle{id: id, generation: gen}
+    } else {
+        id := m.slots.len
+        $s := slot
+        s.generation = 1
+        m.slots.push(s)
+        << TweenHandle{id: id, generation: 1}
+    }
+}
+
+pub fn (m $&TweenManager) tween_scalar(from f64, to f64, duration f64, ease_kind int, tag string) TweenHandle {
+    if !fm.finite(from) || !fm.finite(to) || !fm.finite(duration) || duration <= 0.0 {
+        >> errors.new("nexus timeline: invalid scalar tween arguments")
+    }
+    << alloc_tween(m, TweenSlot{
+        alive: true, completed: false, generation: 1, paused: false, unscaled: false,
+        kind: TWEEN_SCALAR, ease_kind: ease_kind, duration: duration,
+        delay: 0.0, elapsed: 0.0, loops: 0, yoyo: false, tag: tag + "",
+        from_scalar: from, to_scalar: to,
+        from_v2: fm.vec2(0.0, 0.0), to_v2: fm.vec2(0.0, 0.0),
+        from_v3: fm.vec3(0.0, 0.0, 0.0), to_v3: fm.vec3(0.0, 0.0, 0.0),
+        from_rgba: 0, to_rgba: 0
+    })
+}
+
+pub fn (m $&TweenManager) tween_vec2(from fm.Vec2, to fm.Vec2, duration f64, ease_kind int, tag string) TweenHandle {
+    if !from.is_finite() || !to.is_finite() || !fm.finite(duration) || duration <= 0.0 {
+        >> errors.new("nexus timeline: invalid vec2 tween arguments")
+    }
+    << alloc_tween(m, TweenSlot{
+        alive: true, completed: false, generation: 1, paused: false, unscaled: false,
+        kind: TWEEN_VEC2, ease_kind: ease_kind, duration: duration,
+        delay: 0.0, elapsed: 0.0, loops: 0, yoyo: false, tag: tag + "",
+        from_scalar: 0.0, to_scalar: 0.0,
+        from_v2: from, to_v2: to,
+        from_v3: fm.vec3(0.0, 0.0, 0.0), to_v3: fm.vec3(0.0, 0.0, 0.0),
+        from_rgba: 0, to_rgba: 0
+    })
+}
+
+pub fn (m $&TweenManager) tween_vec3(from fm.Vec3, to fm.Vec3, duration f64, ease_kind int, tag string) TweenHandle {
+    if !from.is_finite() || !to.is_finite() || !fm.finite(duration) || duration <= 0.0 {
+        >> errors.new("nexus timeline: invalid vec3 tween arguments")
+    }
+    << alloc_tween(m, TweenSlot{
+        alive: true, completed: false, generation: 1, paused: false, unscaled: false,
+        kind: TWEEN_VEC3, ease_kind: ease_kind, duration: duration,
+        delay: 0.0, elapsed: 0.0, loops: 0, yoyo: false, tag: tag + "",
+        from_scalar: 0.0, to_scalar: 0.0,
+        from_v2: fm.vec2(0.0, 0.0), to_v2: fm.vec2(0.0, 0.0),
+        from_v3: from, to_v3: to,
+        from_rgba: 0, to_rgba: 0
+    })
+}
+
+pub fn (m $&TweenManager) tween_color(from_rgba int, to_rgba int, duration f64, ease_kind int, tag string) TweenHandle {
+    if !fm.finite(duration) || duration <= 0.0 {
+        >> errors.new("nexus timeline: invalid color tween arguments")
+    }
+    << alloc_tween(m, TweenSlot{
+        alive: true, completed: false, generation: 1, paused: false, unscaled: false,
+        kind: TWEEN_COLOR, ease_kind: ease_kind, duration: duration,
+        delay: 0.0, elapsed: 0.0, loops: 0, yoyo: false, tag: tag + "",
+        from_scalar: 0.0, to_scalar: 0.0,
+        from_v2: fm.vec2(0.0, 0.0), to_v2: fm.vec2(0.0, 0.0),
+        from_v3: fm.vec3(0.0, 0.0, 0.0), to_v3: fm.vec3(0.0, 0.0, 0.0),
+        from_rgba: from_rgba, to_rgba: to_rgba
+    })
+}
+
+pub fn (m &TweenManager) is_active(h TweenHandle) bool {
+    if h.id < 0 || h.id >= m.slots.len { << false }
+    tid := h.id
+    s := &m.slots[tid]
+    << s.alive && s.generation == h.generation
+}
+
+pub fn (m $&TweenManager) set_delay(h TweenHandle, delay f64) int {
+    if !m.is_active(h) || !fm.finite(delay) || delay < 0.0 {
+        >> errors.new("nexus timeline: invalid tween handle or delay")
+    }
+    m.slots[h.id].delay = delay
+    << 0
+}
+
+pub fn (m $&TweenManager) set_loops(h TweenHandle, extra_loops int, yoyo bool) int {
+    if !m.is_active(h) || extra_loops < -1 {
+        >> errors.new("nexus timeline: invalid tween handle or loop count")
+    }
+    m.slots[h.id].loops = extra_loops
+    m.slots[h.id].yoyo = yoyo
+    << 0
+}
+
+pub fn (m $&TweenManager) set_unscaled(h TweenHandle, unscaled bool) int {
+    if !m.is_active(h) { >> errors.new("nexus timeline: invalid tween handle") }
+    m.slots[h.id].unscaled = unscaled
+    << 0
+}
+
+pub fn (m $&TweenManager) pause(h TweenHandle) bool {
+    if !m.is_active(h) { << false }
+    m.slots[h.id].paused = true
+    << true
+}
+
+pub fn (m $&TweenManager) resume(h TweenHandle) bool {
+    if !m.is_active(h) { << false }
+    m.slots[h.id].paused = false
+    << true
+}
+
+pub fn (m $&TweenManager) cancel(h TweenHandle) bool {
+    if !m.is_active(h) { << false }
+    m.slots[h.id].alive = false
+    m.slots[h.id].generation = m.slots[h.id].generation + 1
+    m.free_ids.push(h.id)
+    << true
+}
+
+pub fn (m $&TweenManager) kill_by_tag(tag string) int {
+    if tag.len == 0 { << 0 }
+    $n := 0
+    for i in 0:m.slots.len {
+        if m.slots[i].alive && m.slots[i].tag == tag {
+            m.slots[i].alive = false
+            m.slots[i].generation = m.slots[i].generation + 1
+            m.free_ids.push(i)
+            n += 1
+        }
+    }
+    << n
+}
+
+pub fn (m &TweenManager) active_count() int {
+    $n := 0
+    for s in m.slots {
+        if s.alive { n += 1 }
+    }
+    << n
+}
+
+fn eval_tween_slot(s &TweenSlot, raw_u f64, finished bool) TweenValue {
+    u := fm.clamp01(raw_u)
+    w := fm.ease(s.ease_kind, u)
+    $sc := 0.0
+    $v2 := fm.vec2(0.0, 0.0)
+    $v3 := fm.vec3(0.0, 0.0, 0.0)
+    $rgba := 0
+    if s.kind == TWEEN_SCALAR {
+        sc = fm.lerp(s.from_scalar, s.to_scalar, w)
+    } else if s.kind == TWEEN_VEC2 {
+        v2 = s.from_v2.lerp(s.to_v2, w)
+    } else if s.kind == TWEEN_VEC3 {
+        v3 = s.from_v3.lerp(s.to_v3, w)
+    } else {
+        rgba = lerp_rgba(s.from_rgba, s.to_rgba, w)
+    }
+    << TweenValue{
+        kind: s.kind,
+        scalar: sc,
+        vec2: v2,
+        vec3: v3,
+        rgba: rgba,
+        progress: u,
+        finished: finished,
+        tag: s.tag + ""
+    }
+}
+
+pub fn (m &TweenManager) value(h TweenHandle) TweenValue {
+    if h.id < 0 || h.id >= m.slots.len {
+        >> errors.new("nexus timeline: unknown tween handle")
+    }
+    tid := h.id
+    s := &m.slots[tid]
+    if !s.alive {
+        if !s.completed || s.generation != h.generation + 1 {
+            >> errors.new("nexus timeline: cancelled or stale tween handle")
+        }
+        // Return final endpoint value when recently completed.
+        $end_u := 1.0
+        if s.yoyo && ((s.loops + 1) % 2) == 0 { end_u = 0.0 }
+        << eval_tween_slot(s, end_u, true)
+    }
+    if s.generation != h.generation {
+        >> errors.new("nexus timeline: stale tween handle")
+    }
+    if s.delay > 0.0 {
+        << eval_tween_slot(s, 0.0, false)
+    }
+    d := math.max(1e-9, s.duration)
+    raw_cycles := s.elapsed / d
+    cycle_idx := int(math.floor(raw_cycles))
+    $u := raw_cycles - f64(cycle_idx)
+    if s.elapsed >= d && u == 0.0 && cycle_idx > 0 { u = 1.0 }
+    if s.yoyo && (cycle_idx % 2) == 1 {
+        u = 1.0 - u
+    }
+    << eval_tween_slot(s, u, false)
+}
+
+pub fn (m $&TweenManager) step(scaled_dt f64, unscaled_dt f64) []TweenValue {
+    if !fm.finite(scaled_dt) || scaled_dt < 0.0 || !fm.finite(unscaled_dt) || unscaled_dt < 0.0 {
+        >> errors.new("nexus timeline: tween dt must be finite and non-negative")
+    }
+    $completed := []TweenValue{}
+    for i in 0:m.slots.len {
+        if !m.slots[i].alive || m.slots[i].paused { -> }
+        $dt := scaled_dt
+        if m.slots[i].unscaled { dt = unscaled_dt }
+        if dt <= 0.0 { -> }
+        if m.slots[i].delay > 0.0 {
+            if dt <= m.slots[i].delay {
+                m.slots[i].delay = m.slots[i].delay - dt
+                ->
+            }
+            dt = dt - m.slots[i].delay
+            m.slots[i].delay = 0.0
+        }
+        m.slots[i].elapsed = m.slots[i].elapsed + dt
+        if m.slots[i].loops < 0 { -> }
+        total_dur := m.slots[i].duration * f64(m.slots[i].loops + 1)
+        if m.slots[i].elapsed >= total_dur {
+            $end_u := 1.0
+            if m.slots[i].yoyo && ((m.slots[i].loops + 1) % 2) == 0 { end_u = 0.0 }
+            completed.push(eval_tween_slot(&m.slots[i], end_u, true))
+            m.slots[i].alive = false
+            m.slots[i].completed = true
+            m.slots[i].generation = m.slots[i].generation + 1
+            m.free_ids.push(i)
+        }
+    }
+    << completed
+}

@@ -253,3 +253,68 @@ pub fn move_and_slide(body fm.Aabb3, motion fm.Vec3, solids &[]fm.Aabb3) MotionR
     << MotionResult3D{bounds: bounds, travelled: bounds.minimum.sub(body.minimum), collisions: collisions,
         on_floor: floor, on_wall: wall, on_ceiling: ceiling}
 }
+
+pub fn raycast_all(origin fm.Vec3, direction fm.Vec3, distance f64, solids &[]fm.Aabb3) []RayHit3D {
+    if !fm.finite(distance) || distance <= 0.0 || !valid_point(origin) {
+        >> errors.new("nexus physics3d: invalid ray origin or distance")
+    }
+    motion := (direction.normalized() or >>).scaled(distance)
+    end := origin.add(motion)
+    if !valid_point(end) { >> errors.new("nexus physics3d: ray endpoint outside world bounds") }
+    check_solids(solids) or >>
+    point := fm.Aabb3{minimum: origin, maximum: origin}
+    $hits := []RayHit3D{}
+    for i in 0:solids.len {
+        solid := solids[i]
+        if solid.contains(origin) or >> {
+            hits.push(RayHit3D{collider: i, distance: 0.0, point: origin, normal: zero(), started_inside: true})
+            ->
+        }
+        candidate := cast_box(point, motion, solid, true)
+        if candidate.hit {
+            hits.push(RayHit3D{
+                collider: i,
+                distance: candidate.time * distance,
+                point: origin.add(motion.scaled(candidate.time)),
+                normal: candidate.normal,
+                started_inside: false
+            })
+        }
+    }
+    if hits.len > 1 {
+        for i in 0:(hits.len - 1) {
+            for j in (i + 1):hits.len {
+                if hits[j].distance < hits[i].distance {
+                    tmp := hits[i]
+                    hits[i] = hits[j]
+                    hits[j] = tmp
+                }
+            }
+        }
+    }
+    << hits
+}
+
+pub fn overlap_aabb(query fm.Aabb3, solids &[]fm.Aabb3) []int {
+    check_box(query) or >>
+    check_solids(solids) or >>
+    $ids := []int{}
+    for i in 0:solids.len {
+        if intersects_open(query, solids[i]) { ids.push(i) }
+    }
+    << ids
+}
+
+pub fn overlap_sphere(center fm.Vec3, radius f64, solids &[]fm.Aabb3) []int {
+    if !valid_point(center) || !fm.finite(radius) || radius < 0.0 {
+        >> errors.new("nexus physics3d: invalid overlap sphere parameters")
+    }
+    check_solids(solids) or >>
+    rsq := radius * radius
+    $ids := []int{}
+    for i in 0:solids.len {
+        dsq := solids[i].distance_squared(center) or >>
+        if dsq <= rsq { ids.push(i) }
+    }
+    << ids
+}

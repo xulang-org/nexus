@@ -70,6 +70,7 @@ make sdk
 - `make detail-optimizations-test`：验证五项底层质感深度优化（3D TAA Karis 亮度加权 YCoCg 方差裁剪 + Reverse-Z 深度膨胀 + IGN 蓝噪抖动去色带、2D 9-Tap 高斯半影 + Reinhard 压缩与 2D Blinn-Phong 高光 Metal/软件像素一致性、音频总线 Soft-Knee 限幅器/去非正规数/平滑斜坡、2D 移动平台同步与起跳动量继承/MTV/顶角挤压/微台阶抬升、MikkTSpace 散片顶点重合角自动焊接）。
 - `make detail-optimizations-r2-test`：验证第二轮细节增强（13-Tap Jimenez Karis Bloom 下采样、Reverse-Z 线性深度缩放 GTAO 双边滤波、IGN 抖动 SSR + 距离/迎角平滑淡出、Soft Two-Bone IK 渐近缓冲伸展与上肢扭转对齐、以及无序依赖 Crowd RVO 右行规避与卡死自动重寻路）。
 - `make detail-optimizations-r3-test`：验证第三轮引擎深水区能力（3D PBR 多重散射能量补偿、可选 PCSS 接触硬化软阴影、GPU/软件像素一致 2D 屏幕空间泛光与纯 CPU `Skeleton2D`/`SkinnedMesh2D` 2D 骨骼蒙皮变形、状态机惯性平滑过渡与步态相位同步组、`RigidBody3D` 6-DOF 四元数旋转/滚动摩擦扭矩与休眠唤醒、`WorldPartitionGrid` 滞回流式卸载与持久化迁移，以及弱网输入冗余窗口恢复与自适应 RTT/Jitter 缓冲）。
+- `make developer-ergonomics-test`：验证面向应用程序开发的完整工具链与人机工学底座（`foundation/math` 完整 2D/3D 几何/四元数/`Mat4.inverse`/31 种缓动与弧长样条、`Ray3D`/`Plane3D`/`Sphere3D`/`Frustum3D` 解析相交与 Perlin/fBm 噪声；`foundation/color` Hex/HSV/IEC sRGB↔Linear 与预处理混合；`foundation/diagnostics` 环形日志与 CVar/控制台指令注册表；`foundation/events` 优先级与前缀订阅事件总线；`foundation/spatial` 2D/3D 空间哈希去重与最近邻查询；`scene` 节点分组/元数据/路径/克隆/全局坐标与 `Camera3D` 屏幕↔世界拾取；`input` 鼠标按键/滚轮/Modifier 组合键与蓄力按住时长；`timing/timers`、`animation/timeline` 补间管理；`resources/canvas` 2D 矢量与调试图元、`resources/mesh` 3D 程序化几何体与 `DebugDraw3D`；以及 `ecs` 动态组件迁移/自定义稀疏存储与 `physics2d`/`physics3d` 扩展碰撞查询）。
 
 ## Phone 原生 2D / 3D 示例
 

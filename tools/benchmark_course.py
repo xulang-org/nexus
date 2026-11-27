@@ -6,14 +6,33 @@ import csv
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import platform
 import subprocess
-
-from project import atomic_write, published_scene
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def atomic_write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.tmp-', delete=False) as handle:
+        tmp = Path(handle.name)
+        handle.write(data)
+    os.replace(tmp, path)
+
+
+def published_scene(build, name):
+    cli = ROOT / "build/nexus-project"
+    if not cli.is_file():
+        subprocess.run(["make", "project-cli"], cwd=ROOT, check=True)
+    result = subprocess.run(
+        [str(cli), "scene", str(name), "--output", str(build)],
+        cwd=ROOT, check=True, capture_output=True, text=True,
+    )
+    return Path(result.stdout.strip())
 PHASES = ("frame", "simulation", "encoding", "present")
 
 

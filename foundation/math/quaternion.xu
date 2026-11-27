@@ -10,6 +10,7 @@ pub struct Quaternion {
     pub w f64
 }
 pub fn quaternion(x f64, y f64, z f64, w f64) Quaternion { << Quaternion{x: x, y: y, z: z, w: w} }
+pub fn quat_identity() Quaternion { << Quaternion{x: 0.0, y: 0.0, z: 0.0, w: 1.0} }
 pub fn (q Quaternion) normalized() Quaternion {
     if !finite(q.x) || !finite(q.y) || !finite(q.z) || !finite(q.w) { >> errors.new("nexus: non-finite quaternion") }
     scale := math.max(math.max(math.abs(q.x), math.abs(q.y)), math.max(math.abs(q.z), math.abs(q.w)))
@@ -21,6 +22,165 @@ pub fn (q Quaternion) normalized() Quaternion {
     length := math.sqrt(x * x + y * y + z * z + w * w)
     if length <= 0.0 { >> errors.new("nexus: invalid quaternion magnitude") }
     << quaternion(x / length, y / length, z / length, w / length)
+}
+pub fn (q Quaternion) dot(other Quaternion) f64 {
+    << q.x * other.x + q.y * other.y + q.z * other.z + q.w * other.w
+}
+pub fn (q Quaternion) conjugate() Quaternion {
+    << quaternion(-q.x, -q.y, -q.z, q.w)
+}
+pub fn (q Quaternion) inverse() Quaternion {
+    lsq := q.dot(q)
+    if !finite(lsq) || lsq <= 1e-18 { >> errors.new("nexus math: cannot invert zero or non-finite quaternion") }
+    inv := 1.0 / lsq
+    << quaternion(-q.x * inv, -q.y * inv, -q.z * inv, q.w * inv)
+}
+pub fn (q Quaternion) mul(other Quaternion) Quaternion {
+    << quaternion(
+        q.w * other.x + q.x * other.w + q.y * other.z - q.z * other.y,
+        q.w * other.y - q.x * other.z + q.y * other.w + q.z * other.x,
+        q.w * other.z + q.x * other.y - q.y * other.x + q.z * other.w,
+        q.w * other.w - q.x * other.x - q.y * other.y - q.z * other.z
+    )
+}
+pub fn (q Quaternion) rotate_vec3(v Vec3) Vec3 {
+    n := q.normalized() or >>
+    u := vec3(n.x, n.y, n.z)
+    t := u.cross(v).scaled(2.0)
+    << v.add(t.scaled(n.w)).add(u.cross(t))
+}
+pub fn quat_from_axis_angle(axis Vec3, radians f64) Quaternion {
+    if !finite(radians) { >> errors.new("nexus math: non-finite axis angle") }
+    a := axis.normalized() or >>
+    half := radians * 0.5
+    s := math.sin(half)
+    << quaternion(a.x * s, a.y * s, a.z * s, math.cos(half))
+}
+// Intrinsic Y-X-Z Euler angles: yaw around Y, then pitch around X, then roll around Z.
+pub fn quat_from_euler_yxz(pitch f64, yaw f64, roll f64) Quaternion {
+    if !finite(pitch) || !finite(yaw) || !finite(roll) {
+        >> errors.new("nexus math: Euler angles must be finite")
+    }
+    qy := quat_from_axis_angle(vec3(0.0, 1.0, 0.0), yaw) or >>
+    qx := quat_from_axis_angle(vec3(1.0, 0.0, 0.0), pitch) or >>
+    qz := quat_from_axis_angle(vec3(0.0, 0.0, 1.0), roll) or >>
+    << qy.mul(qx).mul(qz).normalized() or >>
+}
+pub fn (q Quaternion) to_euler_yxz() Vec3 {
+    m := q.rotation_matrix() or >>
+    sp := math.max(-1.0, math.min(1.0, -m.c2.y))
+    pitch := math.asin(sp)
+    $yaw := 0.0
+    $roll := 0.0
+    if math.abs(sp) < 0.999999 {
+        yaw = math.atan2(m.c2.x, m.c2.z)
+        roll = math.atan2(m.c0.y, m.c1.y)
+    } else {
+        yaw = math.atan2(-m.c0.z, m.c0.x)
+        roll = 0.0
+    }
+    << vec3(pitch, yaw, roll)
+}
+pub fn quat_from_to_rotation(from Vec3, to Vec3) Quaternion {
+    a := from.normalized() or >>
+    b := to.normalized() or >>
+    d := math.max(-1.0, math.min(1.0, a.dot(b)))
+    if d >= 0.999999 { << quat_identity() }
+    if d <= -0.999999 {
+        $ortho := vec3(1.0, 0.0, 0.0).cross(a)
+        if ortho.length_sq() <= 1e-6 {
+            ortho = vec3(0.0, 1.0, 0.0).cross(a)
+        }
+        ax := ortho.normalized() or >>
+        << quaternion(ax.x, ax.y, ax.z, 0.0)
+    }
+    c := a.cross(b)
+    q := quaternion(c.x, c.y, c.z, 1.0 + d)
+    << q.normalized() or >>
+}
+// Right-handed look rotation (-Z forward, +Y up, matching Camera3D).
+pub fn quat_look_rotation(forward Vec3, up Vec3) Quaternion {
+    fwd := forward.normalized() or >>
+    back := fwd.neg()
+    $right := up.cross(back).normalized_or_zero()
+    if right.length_sq() <= 1e-12 {
+        $alt := vec3(0.0, 0.0, 1.0)
+        if math.abs(back.z) > 0.9 { alt = vec3(1.0, 0.0, 0.0) }
+        right = alt.cross(back).normalized() or >>
+    }
+    u := back.cross(right)
+    // Columns: right (c0), u (c1), back (c2). Convert orthonormal 3x3 to quaternion.
+    m00 := right.x
+    m10 := right.y
+    m20 := right.z
+    m01 := u.x
+    m11 := u.y
+    m21 := u.z
+    m02 := back.x
+    m12 := back.y
+    m22 := back.z
+    trace := m00 + m11 + m22
+    $q := quat_identity()
+    if trace > 0.0 {
+        s := math.sqrt(trace + 1.0) * 2.0
+        if s > 1e-12 {
+            q = quaternion((m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25 * s)
+        }
+    } else if m00 > m11 && m00 > m22 {
+        s := math.sqrt(math.max(1e-12, 1.0 + m00 - m11 - m22)) * 2.0
+        q = quaternion(0.25 * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s)
+    } else if m11 > m22 {
+        s := math.sqrt(math.max(1e-12, 1.0 + m11 - m00 - m22)) * 2.0
+        q = quaternion((m01 + m10) / s, 0.25 * s, (m12 + m21) / s, (m02 - m20) / s)
+    } else {
+        s := math.sqrt(math.max(1e-12, 1.0 + m22 - m00 - m11)) * 2.0
+        q = quaternion((m02 + m20) / s, (m12 + m21) / s, 0.25 * s, (m10 - m01) / s)
+    }
+    << q.normalized() or >>
+}
+pub fn (q Quaternion) nlerp(other Quaternion, t f64) Quaternion {
+    a := q.normalized() or >>
+    $b := other.normalized() or >>
+    if a.dot(b) < 0.0 { b = quaternion(-b.x, -b.y, -b.z, -b.w) }
+    w := math.max(0.0, math.min(1.0, t))
+    res := quaternion(
+        a.x + (b.x - a.x) * w,
+        a.y + (b.y - a.y) * w,
+        a.z + (b.z - a.z) * w,
+        a.w + (b.w - a.w) * w
+    )
+    << res.normalized() or >>
+}
+pub fn (q Quaternion) slerp(other Quaternion, t f64) Quaternion {
+    a := q.normalized() or >>
+    $b := other.normalized() or >>
+    $d := a.dot(b)
+    if d < 0.0 {
+        d = -d
+        b = quaternion(-b.x, -b.y, -b.z, -b.w)
+    }
+    w := math.max(0.0, math.min(1.0, t))
+    if d > 0.9995 {
+        << a.nlerp(b, w) or >>
+    }
+    theta0 := math.acos(math.max(-1.0, math.min(1.0, d)))
+    sin0 := math.sin(theta0)
+    if math.abs(sin0) <= 1e-12 { << a }
+    theta := theta0 * w
+    s0 := math.sin(theta0 - theta) / sin0
+    s1 := math.sin(theta) / sin0
+    << quaternion(
+        s0 * a.x + s1 * b.x,
+        s0 * a.y + s1 * b.y,
+        s0 * a.z + s1 * b.z,
+        s0 * a.w + s1 * b.w
+    ).normalized() or >>
+}
+pub fn (q Quaternion) angle_to(other Quaternion) f64 {
+    a := q.normalized() or >>
+    b := other.normalized() or >>
+    d := math.min(1.0, math.abs(a.dot(b)))
+    << 2.0 * math.acos(d)
 }
 pub fn (q Quaternion) rotation_matrix() Mat4 {
     n := q.normalized() or >>

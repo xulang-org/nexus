@@ -10,14 +10,27 @@ pub struct Vec3 {
     pub z f64
 }
 pub fn vec3(x f64, y f64, z f64) Vec3 { << Vec3{x: x, y: y, z: z} }
+pub fn (v Vec3) neg() Vec3 { << vec3(-v.x, -v.y, -v.z) }
 pub fn (v Vec3) add(other Vec3) Vec3 { << vec3(v.x + other.x, v.y + other.y, v.z + other.z) }
 pub fn (v Vec3) sub(other Vec3) Vec3 { << vec3(v.x - other.x, v.y - other.y, v.z - other.z) }
 pub fn (v Vec3) scaled(amount f64) Vec3 { << vec3(v.x * amount, v.y * amount, v.z * amount) }
+pub fn (v Vec3) mul_components(other Vec3) Vec3 { << vec3(v.x * other.x, v.y * other.y, v.z * other.z) }
 pub fn (v Vec3) dot(other Vec3) f64 { << v.x * other.x + v.y * other.y + v.z * other.z }
 pub fn (v Vec3) cross(other Vec3) Vec3 {
     << vec3(v.y * other.z - v.z * other.y, v.z * other.x - v.x * other.z, v.x * other.y - v.y * other.x)
 }
+pub fn (v Vec3) length_sq() f64 { << v.dot(v) }
 pub fn (v Vec3) length() f64 { << math.sqrt(v.dot(v)) }
+pub fn (v Vec3) distance_sq(other Vec3) f64 {
+    dx := v.x - other.x
+    dy := v.y - other.y
+    dz := v.z - other.z
+    << dx * dx + dy * dy + dz * dz
+}
+pub fn (v Vec3) distance(other Vec3) f64 { << math.sqrt(v.distance_sq(other)) }
+pub fn (v Vec3) lerp(other Vec3, weight f64) Vec3 {
+    << v.add(other.sub(v).scaled(weight))
+}
 pub fn (v Vec3) is_finite() bool { << finite(v.x) && finite(v.y) && finite(v.z) }
 pub fn (v Vec3) normalized() Vec3 {
     if !v.is_finite() {
@@ -30,6 +43,59 @@ pub fn (v Vec3) normalized() Vec3 {
     length := unit.length()
     if length <= 0.0 { >> errors.new("nexus: invalid vector magnitude") }
     << unit.scaled(1.0 / length)
+}
+pub fn (v Vec3) normalized_or_zero() Vec3 {
+    if !v.is_finite() { << vec3(0.0, 0.0, 0.0) }
+    scale := math.max(math.abs(v.x), math.max(math.abs(v.y), math.abs(v.z)))
+    if scale <= 0.0 { << vec3(0.0, 0.0, 0.0) }
+    unit := vec3(v.x / scale, v.y / scale, v.z / scale)
+    length := unit.length()
+    if length <= 0.0 { << vec3(0.0, 0.0, 0.0) }
+    << unit.scaled(1.0 / length)
+}
+pub fn (v Vec3) reflect(normal Vec3) Vec3 {
+    n := normal.normalized_or_zero()
+    << v.sub(n.scaled(2.0 * v.dot(n)))
+}
+pub fn (v Vec3) project(onto Vec3) Vec3 {
+    denom := onto.length_sq()
+    if denom <= 1e-12 { << vec3(0.0, 0.0, 0.0) }
+    << onto.scaled(v.dot(onto) / denom)
+}
+pub fn (v Vec3) project_on_plane(plane_normal Vec3) Vec3 {
+    n := plane_normal.normalized_or_zero()
+    << v.sub(n.scaled(v.dot(n)))
+}
+pub fn (v Vec3) angle_between(other Vec3) f64 {
+    denom := math.sqrt(v.length_sq() * other.length_sq())
+    if !finite(denom) || denom <= 1e-12 { << 0.0 }
+    cs := math.max(-1.0, math.min(1.0, v.dot(other) / denom))
+    << math.acos(cs)
+}
+pub fn (v Vec3) clamp_length(max_length f64) Vec3 {
+    if !finite(max_length) || max_length <= 0.0 { << vec3(0.0, 0.0, 0.0) }
+    len_sq := v.length_sq()
+    if len_sq <= max_length * max_length || len_sq <= 1e-18 { << v }
+    len := math.sqrt(len_sq)
+    if len <= 1e-12 { << vec3(0.0, 0.0, 0.0) }
+    << v.scaled(max_length / len)
+}
+pub fn (v Vec3) move_towards(target Vec3, max_delta f64) Vec3 {
+    if !finite(max_delta) || max_delta <= 0.0 { << v }
+    diff := target.sub(v)
+    dist := diff.length()
+    if dist <= max_delta || dist <= 1e-12 { << target }
+    << v.add(diff.scaled(max_delta / dist))
+}
+pub fn (v Vec3) approx_eq(other Vec3, eps f64) bool {
+    t := math.max(0.0, eps)
+    << math.abs(v.x - other.x) <= t && math.abs(v.y - other.y) <= t && math.abs(v.z - other.z) <= t
+}
+pub fn min_vec3(a Vec3, b Vec3) Vec3 {
+    << vec3(math.min(a.x, b.x), math.min(a.y, b.y), math.min(a.z, b.z))
+}
+pub fn max_vec3(a Vec3, b Vec3) Vec3 {
+    << vec3(math.max(a.x, b.x), math.max(a.y, b.y), math.max(a.z, b.z))
 }
 
 pub struct Vec4 {
@@ -113,4 +179,105 @@ pub fn rotation_x(angle f64) Mat4 {
     sn := math.sin(angle)
     << Mat4{c0: vec4(1.0, 0.0, 0.0, 0.0), c1: vec4(0.0, cs, sn, 0.0),
         c2: vec4(0.0, -sn, cs, 0.0), c3: vec4(0.0, 0.0, 0.0, 1.0)}
+}
+pub fn rotation_z(angle f64) Mat4 {
+    cs := math.cos(angle)
+    sn := math.sin(angle)
+    << Mat4{c0: vec4(cs, sn, 0.0, 0.0), c1: vec4(-sn, cs, 0.0, 0.0),
+        c2: vec4(0.0, 0.0, 1.0, 0.0), c3: vec4(0.0, 0.0, 0.0, 1.0)}
+}
+pub fn from_trs(position Vec3, rotation Quaternion, scale Vec3) Mat4 {
+    if !position.is_finite() || !scale.is_finite() {
+        >> errors.new("nexus math: from_trs requires finite position and scale")
+    }
+    r := rotation.rotation_matrix() or >>
+    << Mat4{
+        c0: vec4(r.c0.x * scale.x, r.c0.y * scale.x, r.c0.z * scale.x, 0.0),
+        c1: vec4(r.c1.x * scale.y, r.c1.y * scale.y, r.c1.z * scale.y, 0.0),
+        c2: vec4(r.c2.x * scale.z, r.c2.y * scale.z, r.c2.z * scale.z, 0.0),
+        c3: vec4(position.x, position.y, position.z, 1.0)
+    }
+}
+pub fn (m Mat4) transform_point(p Vec3) Vec3 {
+    v := m.transform(vec4(p.x, p.y, p.z, 1.0))
+    << v.xyz()
+}
+pub fn (m Mat4) transform_direction(d Vec3) Vec3 {
+    v := m.transform(vec4(d.x, d.y, d.z, 0.0))
+    << v.xyz()
+}
+pub fn (m Mat4) translation() Vec3 { << m.c3.xyz() }
+pub fn (m Mat4) basis_x() Vec3 { << m.c0.xyz() }
+pub fn (m Mat4) basis_y() Vec3 { << m.c1.xyz() }
+pub fn (m Mat4) basis_z() Vec3 { << m.c2.xyz() }
+pub fn (m Mat4) extract_scale() Vec3 {
+    << vec3(m.c0.xyz().length(), m.c1.xyz().length(), m.c2.xyz().length())
+}
+// General 4x4 matrix inverse (supports projection and affine matrices).
+pub fn (m Mat4) inverse() Mat4 {
+    if !m.is_finite() { >> errors.new("nexus math: inverse requires a finite 4x4 matrix") }
+    a00 := m.c0.x
+    a01 := m.c1.x
+    a02 := m.c2.x
+    a03 := m.c3.x
+    a10 := m.c0.y
+    a11 := m.c1.y
+    a12 := m.c2.y
+    a13 := m.c3.y
+    a20 := m.c0.z
+    a21 := m.c1.z
+    a22 := m.c2.z
+    a23 := m.c3.z
+    a30 := m.c0.w
+    a31 := m.c1.w
+    a32 := m.c2.w
+    a33 := m.c3.w
+
+    b00 := a00 * a11 - a01 * a10
+    b01 := a00 * a12 - a02 * a10
+    b02 := a00 * a13 - a03 * a10
+    b03 := a01 * a12 - a02 * a11
+    b04 := a01 * a13 - a03 * a11
+    b05 := a02 * a13 - a03 * a12
+    b06 := a20 * a31 - a21 * a30
+    b07 := a20 * a32 - a22 * a30
+    b08 := a20 * a33 - a23 * a30
+    b09 := a21 * a32 - a22 * a31
+    b10 := a21 * a33 - a23 * a31
+    b11 := a22 * a33 - a23 * a32
+
+    det := b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06
+    if !finite(det) || math.abs(det) <= 1e-14 {
+        >> errors.new("nexus math: singular 4x4 matrix")
+    }
+    inv_det := 1.0 / det
+
+    c0x := (a11 * b11 - a12 * b10 + a13 * b09) * inv_det
+    c0y := (-a10 * b11 + a12 * b08 - a13 * b07) * inv_det
+    c0z := (a10 * b10 - a11 * b08 + a13 * b06) * inv_det
+    c0w := (-a10 * b09 + a11 * b07 - a12 * b06) * inv_det
+
+    c1x := (-a01 * b11 + a02 * b10 - a03 * b09) * inv_det
+    c1y := (a00 * b11 - a02 * b08 + a03 * b07) * inv_det
+    c1z := (-a00 * b10 + a01 * b08 - a03 * b06) * inv_det
+    c1w := (a00 * b09 - a01 * b07 + a02 * b06) * inv_det
+
+    c2x := (a31 * b05 - a32 * b04 + a33 * b03) * inv_det
+    c2y := (-a30 * b05 + a32 * b02 - a33 * b01) * inv_det
+    c2z := (a30 * b04 - a31 * b02 + a33 * b00) * inv_det
+    c2w := (-a30 * b03 + a31 * b01 - a32 * b00) * inv_det
+
+    c3x := (-a21 * b05 + a22 * b04 - a23 * b03) * inv_det
+    c3y := (a20 * b05 - a22 * b02 + a23 * b01) * inv_det
+    c3z := (-a20 * b04 + a21 * b02 - a23 * b00) * inv_det
+    c3w := (a20 * b03 - a21 * b01 + a22 * b00) * inv_det
+
+    res := Mat4{
+        c0: vec4(c0x, c0y, c0z, c0w),
+        c1: vec4(c1x, c1y, c1z, c1w),
+        c2: vec4(c2x, c2y, c2z, c2w),
+        c3: vec4(c3x, c3y, c3z, c3w)
+    }
+    if !res.is_finite() { >> errors.new("nexus math: 4x4 matrix inverse overflow") }
+    << res
 }

@@ -9,7 +9,7 @@ ROOT=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='xu standard 3D ') as directory:
     root=Path(directory)
     shutil.copyfile(ROOT/'xu.xun',root/'xu.xun')
-    for package in ('foundation/math','platform/present','resources/mesh','resources/canvas','resources/lighting','resources/shadow','rendering/three_d','rendering/two_d',
+    for package in ('foundation/math','platform/present','resources/mesh','resources/canvas','resources/lighting','resources/lighting2d','resources/shadow','rendering/three_d','rendering/two_d',
                     'assets/shaders/three_d','assets/shaders/two_d','internal/file_snapshot','build/mesh-shaders'):
         shutil.copytree(ROOT/package,root/package)
     (root/'checks').mkdir()

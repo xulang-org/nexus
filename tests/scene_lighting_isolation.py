@@ -11,7 +11,7 @@ with tempfile.TemporaryDirectory(prefix='xu light persistence ') as directory:
     root=Path(directory)
     shutil.copyfile(ROOT/'xu.xun',root/'xu.xun')
     for package in ('foundation/math', 'resources/camera','resources/lighting','resources/shadow','resources/scene','resources/lod',
-                    'resources/sprite3d','resources/tilemap','formats/scene',
+                    'resources/persistence','resources/sprite3d','resources/tilemap','formats/scene',
                     'internal/file_snapshot','scene','integration/lighting','integration/scene','integration/scene_lighting'):
         shutil.copytree(ROOT/package,root/package)
     shutil.copytree(ROOT/'build/scene-lighting-fixtures',root/'build/scene-lighting-fixtures')

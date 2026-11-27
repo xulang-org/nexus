@@ -1,0 +1,276 @@
+@"github.com/xulang-org/nexus/timing"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#math
+
+pub struct TimerHandle {
+    pub id int
+    pub generation int
+}
+
+pub struct FiredTimer {
+    pub handle TimerHandle
+    pub tag string
+    pub payload int
+    pub fire_count int
+}
+
+struct TimerSlot {
+    alive bool
+    generation int
+    paused bool
+    unscaled bool
+    repeating bool
+    duration f64
+    remaining f64
+    repeats_left int // <= 0 when repeating forever
+    fire_count int
+    tag string
+    payload int
+}
+
+pub struct TimerScheduler {
+    slots []TimerSlot
+    free_ids []int
+}
+
+pub fn new_timer_scheduler() TimerScheduler {
+    << TimerScheduler{slots: []TimerSlot{}, free_ids: []int{}}
+}
+
+fn make_timer_slot(delay f64, repeating bool, repeat_count int, tag &string, payload int, unscaled bool, gen int) TimerSlot {
+    << TimerSlot{
+        alive: true,
+        generation: gen,
+        paused: false,
+        unscaled: unscaled,
+        repeating: repeating,
+        duration: delay,
+        remaining: delay,
+        repeats_left: repeat_count,
+        fire_count: 0,
+        tag: *tag + "",
+        payload: payload
+    }
+}
+
+fn spawn_timer(s $&TimerScheduler, delay f64, repeating bool, repeat_count int, tag string, payload int, unscaled bool) TimerHandle {
+    if !fm.finite(delay) || delay <= 0.0 || delay > 86400.0 {
+        >> errors.new("nexus timing: timer interval must be finite and in (0, 86400]")
+    }
+    if s.free_ids.len > 0 {
+        last := s.free_ids.len - 1
+        id := s.free_ids[last]
+        $nf := []int{}
+        for i in 0:last { nf.push(s.free_ids[i]) }
+        s.free_ids = nf
+        gen := s.slots[id].generation
+        s.slots[id] = make_timer_slot(delay, repeating, repeat_count, &tag, payload, unscaled, gen)
+        << TimerHandle{id: id, generation: gen}
+    }
+    id := s.slots.len
+    s.slots.push(make_timer_slot(delay, repeating, repeat_count, &tag, payload, unscaled, 1))
+    << TimerHandle{id: id, generation: 1}
+}
+
+pub fn (s $&TimerScheduler) after(delay f64, tag string, payload int, unscaled bool) TimerHandle {
+    << spawn_timer(s, delay, false, 1, tag, payload, unscaled) or >>
+}
+
+// repeat_count <= 0 repeats indefinitely until cancelled.
+pub fn (s $&TimerScheduler) every(interval f64, repeat_count int, tag string, payload int, unscaled bool) TimerHandle {
+    << spawn_timer(s, interval, true, repeat_count, tag, payload, unscaled) or >>
+}
+
+pub fn (s &TimerScheduler) is_active(h TimerHandle) bool {
+    if h.id < 0 || h.id >= s.slots.len { << false }
+    sid := h.id
+    sl := &s.slots[sid]
+    << sl.alive && sl.generation == h.generation
+}
+
+pub fn (s $&TimerScheduler) cancel(h TimerHandle) bool {
+    if !s.is_active(h) { << false }
+    s.slots[h.id].alive = false
+    s.slots[h.id].generation = s.slots[h.id].generation + 1
+    s.free_ids.push(h.id)
+    << true
+}
+
+pub fn (s $&TimerScheduler) cancel_by_tag(tag string) int {
+    if tag.len == 0 { << 0 }
+    $n := 0
+    for i in 0:s.slots.len {
+        if s.slots[i].alive && s.slots[i].tag == tag {
+            s.slots[i].alive = false
+            s.slots[i].generation = s.slots[i].generation + 1
+            s.free_ids.push(i)
+            n += 1
+        }
+    }
+    << n
+}
+
+pub fn (s $&TimerScheduler) pause(h TimerHandle) bool {
+    if !s.is_active(h) { << false }
+    s.slots[h.id].paused = true
+    << true
+}
+
+pub fn (s $&TimerScheduler) resume(h TimerHandle) bool {
+    if !s.is_active(h) { << false }
+    s.slots[h.id].paused = false
+    << true
+}
+
+pub fn (s &TimerScheduler) remaining(h TimerHandle) f64 {
+    if !s.is_active(h) { << 0.0 }
+    << math.max(0.0, s.slots[h.id].remaining)
+}
+
+pub fn (s &TimerScheduler) progress(h TimerHandle) f64 {
+    if !s.is_active(h) { << 1.0 }
+    d := s.slots[h.id].duration
+    if d <= 1e-12 { << 1.0 }
+    << fm.clamp01(1.0 - s.slots[h.id].remaining / d)
+}
+
+pub fn (s &TimerScheduler) active_count() int {
+    $n := 0
+    for sl in s.slots {
+        if sl.alive { n += 1 }
+    }
+    << n
+}
+
+pub fn (s $&TimerScheduler) step(scaled_dt f64, unscaled_dt f64) []FiredTimer {
+    if !fm.finite(scaled_dt) || scaled_dt < 0.0 || !fm.finite(unscaled_dt) || unscaled_dt < 0.0 {
+        >> errors.new("nexus timing: timer dt must be finite and non-negative")
+    }
+    $fired := []FiredTimer{}
+    for i in 0:s.slots.len {
+        if !s.slots[i].alive || s.slots[i].paused { -> }
+        $dt := scaled_dt
+        if s.slots[i].unscaled { dt = unscaled_dt }
+        if dt <= 0.0 { -> }
+        s.slots[i].remaining = s.slots[i].remaining - dt
+        if s.slots[i].remaining > 0.0 { -> }
+
+        handle := TimerHandle{id: i, generation: s.slots[i].generation}
+        if !s.slots[i].repeating {
+            s.slots[i].fire_count = s.slots[i].fire_count + 1
+            fired.push(FiredTimer{
+                handle: handle,
+                tag: s.slots[i].tag + "",
+                payload: s.slots[i].payload,
+                fire_count: s.slots[i].fire_count
+            })
+            s.slots[i].alive = false
+            s.slots[i].generation = s.slots[i].generation + 1
+            s.free_ids.push(i)
+            ->
+        }
+        $steps := 0
+        while s.slots[i].alive && s.slots[i].remaining <= 0.0 && steps < 64 {
+            steps += 1
+            s.slots[i].fire_count = s.slots[i].fire_count + 1
+            fired.push(FiredTimer{
+                handle: handle,
+                tag: s.slots[i].tag + "",
+                payload: s.slots[i].payload,
+                fire_count: s.slots[i].fire_count
+            })
+            if s.slots[i].repeats_left > 0 {
+                s.slots[i].repeats_left = s.slots[i].repeats_left - 1
+                if s.slots[i].repeats_left == 0 {
+                    s.slots[i].alive = false
+                    s.slots[i].generation = s.slots[i].generation + 1
+                    s.free_ids.push(i)
+                    <-
+                }
+            }
+            s.slots[i].remaining = s.slots[i].remaining + s.slots[i].duration
+        }
+    }
+    << fired
+}
+
+struct CooldownSlot {
+    name string
+    duration f64
+    remaining f64
+}
+
+pub struct CooldownMap {
+    slots []CooldownSlot
+    index map[string]int
+}
+
+pub fn new_cooldown_map() CooldownMap {
+    << CooldownMap{slots: []CooldownSlot{}, index: map[string]int{}}
+}
+
+pub fn (c $&CooldownMap) start(name string, duration f64) int {
+    if name.len == 0 || !fm.finite(duration) || duration <= 0.0 {
+        >> errors.new("nexus timing: invalid cooldown name or duration")
+    }
+    if c.index.has(name) {
+        idx := c.index[name]
+        c.slots[idx].duration = duration
+        c.slots[idx].remaining = duration
+        << idx
+    }
+    idx := c.slots.len
+    c.slots.push(CooldownSlot{name: name + "", duration: duration, remaining: duration})
+    c.index[name + ""] = idx
+    << idx
+}
+
+pub fn (c &CooldownMap) is_ready(name string) bool {
+    if !c.index.has(name) { << true }
+    << c.slots[c.index[name]].remaining <= 0.0
+}
+
+pub fn (c &CooldownMap) remaining(name string) f64 {
+    if !c.index.has(name) { << 0.0 }
+    << math.max(0.0, c.slots[c.index[name]].remaining)
+}
+
+pub fn (c &CooldownMap) ratio(name string) f64 {
+    if !c.index.has(name) { << 0.0 }
+    ci := c.index[name]
+    sl := &c.slots[ci]
+    if sl.duration <= 1e-12 || sl.remaining <= 0.0 { << 0.0 }
+    << fm.clamp01(sl.remaining / sl.duration)
+}
+
+pub fn (c $&CooldownMap) reduce(name string, amount f64) {
+    if !fm.finite(amount) || amount <= 0.0 || !c.index.has(name) { << }
+    idx := c.index[name]
+    c.slots[idx].remaining = math.max(0.0, c.slots[idx].remaining - amount)
+}
+
+pub fn (c $&CooldownMap) reset(name string) {
+    if !c.index.has(name) { << }
+    c.slots[c.index[name]].remaining = 0.0
+}
+
+pub fn (c $&CooldownMap) clear() {
+    c.slots = []CooldownSlot{}
+    c.index = map[string]int{}
+}
+
+pub fn (c $&CooldownMap) step(dt f64) int {
+    if !fm.finite(dt) || dt < 0.0 {
+        >> errors.new("nexus timing: cooldown dt must be finite and non-negative")
+    }
+    $active := 0
+    for i in 0:c.slots.len {
+        if c.slots[i].remaining > 0.0 {
+            c.slots[i].remaining = math.max(0.0, c.slots[i].remaining - dt)
+            if c.slots[i].remaining > 0.0 { active += 1 }
+        }
+    }
+    << active
+}

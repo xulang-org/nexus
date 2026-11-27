@@ -1,0 +1,394 @@
+@"github.com/xulang-org/nexus/scene"
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+#errors
+#strings
+
+pub const META_STRING = 1
+pub const META_INT = 2
+pub const META_FLOAT = 3
+pub const META_BOOL = 4
+
+fn (tree $&SceneTree) clear_slot_meta(index int) {
+    tree.slot_meta_keys[index] = []string{}
+    tree.slot_meta_kinds[index] = []int{}
+    tree.slot_meta_strs[index] = []string{}
+    tree.slot_meta_ints[index] = []int{}
+    tree.slot_meta_f64s[index] = []f64{}
+    tree.slot_meta_bools[index] = []bool{}
+}
+
+pub fn (tree $&SceneTree) add_to_group(id int, group string) int {
+    index := tree.editable(id) or >>
+    if group.len == 0 || group.len > 128 {
+        >> errors.new("nexus: invalid group name")
+    }
+    for g in tree.slot_groups[index] {
+        if g == group { << 0 }
+    }
+    tree.slot_groups[index].push(group + "")
+    << 0
+}
+
+pub fn (tree $&SceneTree) remove_from_group(id int, group string) bool {
+    index := tree.editable(id) or >>
+    $next := []string{}
+    $removed := false
+    for g in tree.slot_groups[index] {
+        if g == group {
+            removed = true
+        } else {
+            next.push(g)
+        }
+    }
+    if !removed { << false }
+    tree.slot_groups[index] = next
+    << true
+}
+
+pub fn (tree &SceneTree) is_in_group(id int, group string) bool {
+    index := tree.index(id) or >>
+    for g in tree.slot_groups[index] {
+        if g == group { << true }
+    }
+    << false
+}
+
+pub fn (tree &SceneTree) node_groups(id int) []string {
+    index := tree.index(id) or >>
+    $out := []string{}
+    for g in tree.slot_groups[index] { out.push(g + "") }
+    << out
+}
+
+pub fn (tree &SceneTree) nodes_in_group(group string) []int {
+    if group.len == 0 { << []int{} }
+    ids := tree.subtree(tree.root()) or >>
+    $out := []int{}
+    for id in ids {
+        index := tree.index(id) or >>
+        if tree.slots[index].pending_free { -> }
+        for g in tree.slot_groups[index] {
+            if g == group {
+                out.push(id)
+                <-
+            }
+        }
+    }
+    << out
+}
+
+fn (tree &SceneTree) find_meta_slot(index int, key &string) int {
+    keys := &tree.slot_meta_keys[index]
+    for i in 0:keys.len {
+        if keys[i] == *key { << i }
+    }
+    << -1
+}
+
+fn valid_meta_key(key &string) int {
+    if key.len == 0 || key.len > 128 {
+        >> errors.new("nexus: metadata key must be 1..128 bytes")
+    }
+    << 0
+}
+
+pub fn (tree $&SceneTree) set_meta_str(id int, key string, value string) int {
+    index := tree.editable(id) or >>
+    valid_meta_key(&key) or >>
+    slot := tree.find_meta_slot(index, &key)
+    if slot >= 0 {
+        tree.slot_meta_kinds[index][slot] = META_STRING
+        tree.slot_meta_strs[index][slot] = value + ""
+        tree.slot_meta_ints[index][slot] = 0
+        tree.slot_meta_f64s[index][slot] = 0.0
+        tree.slot_meta_bools[index][slot] = false
+        << 0
+    }
+    tree.slot_meta_keys[index].push(key + "")
+    tree.slot_meta_kinds[index].push(META_STRING)
+    tree.slot_meta_strs[index].push(value + "")
+    tree.slot_meta_ints[index].push(0)
+    tree.slot_meta_f64s[index].push(0.0)
+    tree.slot_meta_bools[index].push(false)
+    << 0
+}
+
+pub fn (tree $&SceneTree) set_meta_int(id int, key string, value int) int {
+    index := tree.editable(id) or >>
+    valid_meta_key(&key) or >>
+    slot := tree.find_meta_slot(index, &key)
+    if slot >= 0 {
+        tree.slot_meta_kinds[index][slot] = META_INT
+        tree.slot_meta_strs[index][slot] = ""
+        tree.slot_meta_ints[index][slot] = value
+        tree.slot_meta_f64s[index][slot] = 0.0
+        tree.slot_meta_bools[index][slot] = false
+        << 0
+    }
+    tree.slot_meta_keys[index].push(key + "")
+    tree.slot_meta_kinds[index].push(META_INT)
+    tree.slot_meta_strs[index].push("")
+    tree.slot_meta_ints[index].push(value)
+    tree.slot_meta_f64s[index].push(0.0)
+    tree.slot_meta_bools[index].push(false)
+    << 0
+}
+
+pub fn (tree $&SceneTree) set_meta_f64(id int, key string, value f64) int {
+    index := tree.editable(id) or >>
+    valid_meta_key(&key) or >>
+    if !fm.finite(value) { >> errors.new("nexus: float metadata must be finite") }
+    slot := tree.find_meta_slot(index, &key)
+    if slot >= 0 {
+        tree.slot_meta_kinds[index][slot] = META_FLOAT
+        tree.slot_meta_strs[index][slot] = ""
+        tree.slot_meta_ints[index][slot] = 0
+        tree.slot_meta_f64s[index][slot] = value
+        tree.slot_meta_bools[index][slot] = false
+        << 0
+    }
+    tree.slot_meta_keys[index].push(key + "")
+    tree.slot_meta_kinds[index].push(META_FLOAT)
+    tree.slot_meta_strs[index].push("")
+    tree.slot_meta_ints[index].push(0)
+    tree.slot_meta_f64s[index].push(value)
+    tree.slot_meta_bools[index].push(false)
+    << 0
+}
+
+pub fn (tree $&SceneTree) set_meta_bool(id int, key string, value bool) int {
+    index := tree.editable(id) or >>
+    valid_meta_key(&key) or >>
+    slot := tree.find_meta_slot(index, &key)
+    if slot >= 0 {
+        tree.slot_meta_kinds[index][slot] = META_BOOL
+        tree.slot_meta_strs[index][slot] = ""
+        tree.slot_meta_ints[index][slot] = 0
+        tree.slot_meta_f64s[index][slot] = 0.0
+        tree.slot_meta_bools[index][slot] = value
+        << 0
+    }
+    tree.slot_meta_keys[index].push(key + "")
+    tree.slot_meta_kinds[index].push(META_BOOL)
+    tree.slot_meta_strs[index].push("")
+    tree.slot_meta_ints[index].push(0)
+    tree.slot_meta_f64s[index].push(0.0)
+    tree.slot_meta_bools[index].push(value)
+    << 0
+}
+
+pub fn (tree &SceneTree) has_meta(id int, key string) bool {
+    index := tree.index(id) or >>
+    << tree.find_meta_slot(index, &key) >= 0
+}
+
+pub fn (tree &SceneTree) meta_kind(id int, key string) int {
+    index := tree.index(id) or >>
+    slot := tree.find_meta_slot(index, &key)
+    if slot < 0 { << 0 }
+    << tree.slot_meta_kinds[index][slot]
+}
+
+pub fn (tree &SceneTree) get_meta_str(id int, key string) string {
+    index := tree.index(id) or >>
+    slot := tree.find_meta_slot(index, &key)
+    if slot < 0 || tree.slot_meta_kinds[index][slot] != META_STRING {
+        >> errors.new("nexus: missing or non-string metadata: " + key)
+    }
+    << tree.slot_meta_strs[index][slot] + ""
+}
+
+pub fn (tree &SceneTree) get_meta_int(id int, key string) int {
+    index := tree.index(id) or >>
+    slot := tree.find_meta_slot(index, &key)
+    if slot < 0 || tree.slot_meta_kinds[index][slot] != META_INT {
+        >> errors.new("nexus: missing or non-int metadata: " + key)
+    }
+    << tree.slot_meta_ints[index][slot]
+}
+
+pub fn (tree &SceneTree) get_meta_f64(id int, key string) f64 {
+    index := tree.index(id) or >>
+    slot := tree.find_meta_slot(index, &key)
+    if slot < 0 || tree.slot_meta_kinds[index][slot] != META_FLOAT {
+        >> errors.new("nexus: missing or non-float metadata: " + key)
+    }
+    << tree.slot_meta_f64s[index][slot]
+}
+
+pub fn (tree &SceneTree) get_meta_bool(id int, key string) bool {
+    index := tree.index(id) or >>
+    slot := tree.find_meta_slot(index, &key)
+    if slot < 0 || tree.slot_meta_kinds[index][slot] != META_BOOL {
+        >> errors.new("nexus: missing or non-bool metadata: " + key)
+    }
+    << tree.slot_meta_bools[index][slot]
+}
+
+pub fn (tree $&SceneTree) remove_meta(id int, key string) bool {
+    index := tree.editable(id) or >>
+    slot := tree.find_meta_slot(index, &key)
+    if slot < 0 { << false }
+    n := tree.slot_meta_keys[index].len
+    last := n - 1
+    if slot < last {
+        tree.slot_meta_keys[index][slot] = tree.slot_meta_keys[index][last]
+        tree.slot_meta_kinds[index][slot] = tree.slot_meta_kinds[index][last]
+        tree.slot_meta_strs[index][slot] = tree.slot_meta_strs[index][last]
+        tree.slot_meta_ints[index][slot] = tree.slot_meta_ints[index][last]
+        tree.slot_meta_f64s[index][slot] = tree.slot_meta_f64s[index][last]
+        tree.slot_meta_bools[index][slot] = tree.slot_meta_bools[index][last]
+    }
+    $nk := []string{}
+    $nkd := []int{}
+    $ns := []string{}
+    $ni := []int{}
+    $nf := []f64{}
+    $nb := []bool{}
+    for i in 0:last {
+        nk.push(tree.slot_meta_keys[index][i])
+        nkd.push(tree.slot_meta_kinds[index][i])
+        ns.push(tree.slot_meta_strs[index][i])
+        ni.push(tree.slot_meta_ints[index][i])
+        nf.push(tree.slot_meta_f64s[index][i])
+        nb.push(tree.slot_meta_bools[index][i])
+    }
+    tree.slot_meta_keys[index] = nk
+    tree.slot_meta_kinds[index] = nkd
+    tree.slot_meta_strs[index] = ns
+    tree.slot_meta_ints[index] = ni
+    tree.slot_meta_f64s[index] = nf
+    tree.slot_meta_bools[index] = nb
+    << true
+}
+
+pub fn (tree &SceneTree) meta_keys(id int) []string {
+    index := tree.index(id) or >>
+    $out := []string{}
+    for k in tree.slot_meta_keys[index] { out.push(k + "") }
+    << out
+}
+
+pub fn (tree $&SceneTree) rename(id int, new_name string) int {
+    index := tree.editable(id) or >>
+    parent := tree.slots[index].parent
+    if parent < 0 {
+        if !valid_name(&new_name) { >> errors.new("nexus: invalid root node name") }
+    } else {
+        tree.check_name(parent, &new_name, index) or >>
+    }
+    tree.slots[index].name = new_name + ""
+    << 0
+}
+
+pub fn (tree &SceneTree) children(id int) []int {
+    index := tree.index(id) or >>
+    $out := []int{}
+    $child := tree.slots[index].first_child
+    while child >= 0 {
+        out.push(tree.node_id(child))
+        child = tree.slots[child].next
+    }
+    << out
+}
+
+pub fn (tree &SceneTree) child_count(id int) int {
+    index := tree.index(id) or >>
+    $n := 0
+    $child := tree.slots[index].first_child
+    while child >= 0 {
+        n += 1
+        child = tree.slots[child].next
+    }
+    << n
+}
+
+pub fn (tree &SceneTree) node_path(id int) string {
+    $index := tree.index(id) or >>
+    $rev := []string{}
+    while index >= 0 {
+        rev.push(tree.slots[index].name + "")
+        index = tree.slots[index].parent
+    }
+    $parts := []string{}
+    $i := rev.len - 1
+    while i >= 0 {
+        parts.push(rev[i])
+        i -= 1
+    }
+    << "/" + strings.join(parts, "/")
+}
+
+pub fn (tree &SceneTree) is_ancestor_of(ancestor_id int, descendant_id int) bool {
+    a_idx := tree.index(ancestor_id) or >>
+    $d_idx := tree.index(descendant_id) or >>
+    d_idx = tree.slots[d_idx].parent
+    while d_idx >= 0 {
+        if d_idx == a_idx { << true }
+        d_idx = tree.slots[d_idx].parent
+    }
+    << false
+}
+
+pub fn (tree &SceneTree) find_nodes_by_name(root_id int, name string) []int {
+    ids := tree.subtree(root_id) or >>
+    $out := []int{}
+    for id in ids {
+        index := tree.index(id) or >>
+        if tree.slots[index].name == name {
+            out.push(id)
+        }
+    }
+    << out
+}
+
+pub fn (tree &SceneTree) live_node_count() int {
+    $n := 0
+    for s in tree.slots {
+        if s.alive { n += 1 }
+    }
+    << n
+}
+
+pub fn (tree $&SceneTree) duplicate_subtree(id int, parent_id int, new_name string) int {
+    packed := pack_scene(tree, id) or >>
+    << packed.instantiate(tree, parent_id, new_name) or >>
+}
+
+pub fn (tree &SceneTree) global_position(id int) fm.Vec2 {
+    t := tree.global_transform(id) or >>
+    << t.translation()
+}
+
+pub fn (tree $&SceneTree) set_global_position(id int, position fm.Vec2) int {
+    index := tree.editable(id) or >>
+    _ := tree.require_spatial(index, NODE_2D) or >>
+    if !position.is_finite() { >> errors.new("nexus: 2D position must be finite") }
+    parent_idx := tree.slots[index].parent
+    $local_pos := position
+    if parent_idx >= 0 {
+        pw := tree.inherited_2d(parent_idx) or >>
+        local_pos = pw.inverse_point(position) or >>
+    }
+    << tree.set_position(id, local_pos) or >>
+}
+
+pub fn (tree &SceneTree) global_position_3d(id int) fm.Vec3 {
+    t := tree.global_transform_3d(id) or >>
+    << t.translation()
+}
+
+pub fn (tree $&SceneTree) set_global_position_3d(id int, position fm.Vec3) int {
+    index := tree.editable(id) or >>
+    _ := tree.require_spatial(index, NODE_3D) or >>
+    if !position.is_finite() { >> errors.new("nexus: 3D position must be finite") }
+    parent_idx := tree.slots[index].parent
+    $local_pos := position
+    if parent_idx >= 0 {
+        pw := tree.inherited_3d(parent_idx) or >>
+        inv := pw.affine_inverse() or >>
+        local_pos = inv.transform_point(position)
+    }
+    << tree.set_position_3d(id, local_pos) or >>
+}

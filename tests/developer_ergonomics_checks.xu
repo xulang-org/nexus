@@ -1,0 +1,642 @@
+@main
+
+#gpu
+#math
+events #window/events
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+camres #"github.com/xulang-org/nexus/resources/camera"
+colors #"github.com/xulang-org/nexus/foundation/color"
+diag #"github.com/xulang-org/nexus/foundation/diagnostics"
+evbus #"github.com/xulang-org/nexus/foundation/events"
+sp #"github.com/xulang-org/nexus/foundation/spatial"
+nexus #"github.com/xulang-org/nexus/scene"
+controls #"github.com/xulang-org/nexus/input"
+ibridge #"github.com/xulang-org/nexus/integration/input"
+timing #"github.com/xulang-org/nexus/timing"
+tl #"github.com/xulang-org/nexus/animation/timeline"
+canvas #"github.com/xulang-org/nexus/resources/canvas"
+mesh #"github.com/xulang-org/nexus/resources/mesh"
+ecs #"github.com/xulang-org/nexus/ecs"
+p2 #"github.com/xulang-org/nexus/physics2d"
+p3 #"github.com/xulang-org/nexus/physics3d"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+ren2 #"github.com/xulang-org/nexus/rendering/two_d"
+shd #"github.com/xulang-org/nexus/assets/shaders/three_d"
+shd2 #"github.com/xulang-org/nexus/assets/shaders/two_d"
+
+fn near_f(a f64, b f64, tol f64) bool { << math.abs(a - b) <= tol }
+fn ch_r(c int) int { << (c >> 24) & 255 }
+fn ch_g(c int) int { << (c >> 16) & 255 }
+fn ch_b(c int) int { << (c >> 8) & 255 }
+fn ch_a(c int) int { << c & 255 }
+
+fn check_math_curves_noise() int {
+    // 1. 2D Vec2 / Transform2D / Rect2
+    v := fm.vec2(3.0, 4.0)
+    assert(near_f(v.length_sq(), 25.0, 1e-9))
+    assert(near_f(v.perp().dot(v), 0.0, 1e-9))
+    assert(near_f(fm.vec2(1.0, 0.0).rotated(math.pi() * 0.5).y, 1.0, 1e-6))
+    ref := fm.vec2(1.0, -1.0).reflect(fm.vec2(0.0, 1.0))
+    assert(ref.approx_eq(fm.vec2(1.0, 1.0), 1e-6))
+    assert(fm.vec2(10.0, 0.0).clamp_length(3.0).approx_eq(fm.vec2(3.0, 0.0), 1e-6))
+    assert(fm.vec2(0.0, 0.0).move_towards(fm.vec2(3.0, 4.0), 2.5).approx_eq(fm.vec2(1.5, 2.0), 1e-6))
+    t2 := fm.transform_2d(fm.vec2(10.0, 20.0), 0.75, fm.vec2(2.0, 3.0))
+    assert(t2.translation().approx_eq(fm.vec2(10.0, 20.0), 1e-6))
+    assert(near_f(t2.rotation(), 0.75, 1e-6))
+    assert(t2.scale().approx_eq(fm.vec2(2.0, 3.0), 1e-6))
+    pt := fm.vec2(-5.0, 7.0)
+    pt_back := t2.inverse_point(t2.point(pt)) or >>
+    assert(pt_back.approx_eq(pt, 1e-6))
+    ra := fm.rect2(0.0, 0.0, 10.0, 10.0)
+    rb := fm.rect2(6.0, 4.0, 10.0, 10.0)
+    assert(ra.has_intersection(rb))
+    ri := ra.intersection(rb) or >>
+    assert(ri.position.approx_eq(fm.vec2(6.0, 4.0), 1e-6) && ri.size.approx_eq(fm.vec2(4.0, 6.0), 1e-6))
+    ru := ra.union_rect(rb) or >>
+    assert(ru.size.approx_eq(fm.vec2(16.0, 14.0), 1e-6) && near_f(ri.area(), 24.0, 1e-6))
+
+    // 2. 3D Vec3 / Quaternion / Mat4 / Aabb3
+    v3 := fm.vec3(1.0, 2.0, 2.0)
+    assert(near_f(v3.length(), 3.0, 1e-9))
+    assert(fm.vec3(0.0, 0.0, 0.0).normalized_or_zero().approx_eq(fm.vec3(0.0, 0.0, 0.0), 1e-9))
+    assert(near_f(fm.vec3(1.0, 0.0, 0.0).angle_between(fm.vec3(0.0, 1.0, 0.0)), math.pi() * 0.5, 1e-6))
+
+    rz := fm.rotation_z(math.pi() * 0.5)
+    assert(rz.transform_point(fm.vec3(1.0, 0.0, 0.0)).approx_eq(fm.vec3(0.0, 1.0, 0.0), 1e-6))
+
+    qe := fm.quat_from_euler_yxz(0.35, -0.8, 0.25) or >>
+    e_back := qe.to_euler_yxz() or >>
+    assert(e_back.approx_eq(fm.vec3(0.35, -0.8, 0.25), 1e-5))
+    qflip := fm.quat_from_to_rotation(fm.vec3(0.0, 1.0, 0.0), fm.vec3(0.0, -1.0, 0.0)) or >>
+    vflip := qflip.rotate_vec3(fm.vec3(0.0, 1.0, 0.0)) or >>
+    assert(vflip.approx_eq(fm.vec3(0.0, -1.0, 0.0), 1e-5))
+    qlook := fm.quat_look_rotation(fm.vec3(1.0, 0.0, 0.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+    // Camera forward -Z rotated by look rotation points along +X!
+    vlook := qlook.rotate_vec3(fm.vec3(0.0, 0.0, -1.0)) or >>
+    assert(vlook.approx_eq(fm.vec3(1.0, 0.0, 0.0), 1e-5))
+    q0 := fm.quat_from_axis_angle(fm.vec3(0.0, 1.0, 0.0), 0.0) or >>
+    q1 := fm.quat_from_axis_angle(fm.vec3(0.0, 1.0, 0.0), math.pi() * 0.5) or >>
+    qs := q0.slerp(q1, 0.5) or >>
+    vslerp := qs.rotate_vec3(fm.vec3(0.0, 0.0, 1.0)) or >>
+    assert(vslerp.approx_eq(fm.vec3(0.70710678, 0.0, 0.70710678), 1e-5))
+
+    trs := fm.from_trs(fm.vec3(4.0, -2.0, 7.0), qe, fm.vec3(2.0, 3.0, 4.0)) or >>
+    assert(trs.translation().approx_eq(fm.vec3(4.0, -2.0, 7.0), 1e-6))
+    assert(trs.extract_scale().approx_eq(fm.vec3(2.0, 3.0, 4.0), 1e-5))
+    inv_trs := trs.inverse() or >>
+    prod := trs.multiply(inv_trs)
+    assert(prod.c0.xyz().approx_eq(fm.vec3(1.0, 0.0, 0.0), 1e-6))
+    assert(prod.c3.xyz().approx_eq(fm.vec3(0.0, 0.0, 0.0), 1e-6))
+
+    box := fm.aabb3(fm.vec3(-1.0, -1.0, -1.0), fm.vec3(1.0, 1.0, 1.0)) or >>
+    tbox := box.transformed(fm.translation_3d(fm.vec3(5.0, 0.0, 0.0)).multiply(fm.scale_3d(fm.vec3(2.0, 1.0, 1.0)))) or >>
+    tb_sz := tbox.size() or >>
+    tb_vol := tbox.volume() or >>
+    assert(tb_sz.approx_eq(fm.vec3(4.0, 2.0, 2.0), 1e-6) && near_f(tb_vol, 16.0, 1e-6))
+
+    // 3. Curves, Easing & Arc-Length Splines
+    for ek in 0:31 {
+        e0 := fm.ease(ek, 0.0)
+        e1 := fm.ease(ek, 1.0)
+        assert(near_f(e0, 0.0, 1e-4) && near_f(e1, 1.0, 1e-4))
+    }
+    assert(near_f(fm.lerp_angle(3.0, -3.0, 0.5), math.pi(), 1e-4) || near_f(math.abs(fm.lerp_angle(3.0, -3.0, 0.5)), math.pi(), 1e-4))
+    assert(near_f(fm.ping_pong(2.5, 2.0), 1.5, 1e-6))
+    assert(fm.damp(0.0, 10.0, 8.0, 0.5) > 9.5)
+
+    spline := fm.new_spline_path_3d([
+        fm.vec3(0.0, 0.0, 0.0),
+        fm.vec3(2.0, 0.0, 0.0),
+        fm.vec3(4.0, 2.0, 0.0),
+        fm.vec3(6.0, 2.0, 0.0)
+    ], false, 24) or >>
+    assert(spline.total_length() > 6.5)
+    assert(spline.sample_by_t(0.0).approx_eq(fm.vec3(0.0, 0.0, 0.0), 1e-5))
+    assert(spline.sample_by_t(1.0).approx_eq(fm.vec3(6.0, 2.0, 0.0), 1e-5))
+    p_a := spline.sample_by_distance(2.0)
+    p_b := spline.sample_by_distance(3.0)
+    assert(p_b.distance(p_a) <= 1.01 && p_b.distance(p_a) >= 0.90)
+
+    // 4. Geometry & Noise
+    ray := fm.ray3d(fm.vec3(0.0, 5.0, 0.0), fm.vec3(0.0, -1.0, 0.0)) or >>
+    pl := fm.plane_from_point_normal(fm.vec3(0.0, 1.0, 0.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+    hp := fm.ray_plane_intersect(ray, pl)
+    assert(hp.hit && near_f(hp.t, 4.0, 1e-6) && hp.point.approx_eq(fm.vec3(0.0, 1.0, 0.0), 1e-6))
+    sph := fm.sphere3d(fm.vec3(0.0, 0.0, 0.0), 1.0) or >>
+    hs := fm.ray_sphere_intersect(ray, sph)
+    assert(hs.hit && near_f(hs.t, 4.0, 1e-6) && hs.normal.approx_eq(fm.vec3(0.0, 1.0, 0.0), 1e-6))
+    ha := fm.ray_aabb_intersect(ray, box)
+    assert(ha.hit && near_f(ha.t, 4.0, 1e-6))
+    ht := fm.ray_triangle_intersect(ray, fm.vec3(-2.0, 0.5, -2.0), fm.vec3(2.0, 0.5, -2.0), fm.vec3(0.0, 0.5, 2.0), false)
+    assert(ht.hit && near_f(ht.t, 4.5, 1e-6))
+
+    n1 := fm.fbm_2d(1.25, 3.75, 42, 4, 2.0, 0.5)
+    n2 := fm.fbm_2d(1.25, 3.75, 42, 4, 2.0, 0.5)
+    n3 := fm.perlin_3d(0.4, 0.7, 1.9, 42)
+    assert(near_f(n1, n2, 1e-12) && n1 >= -1.0 && n1 <= 1.0 && n3 >= -1.0 && n3 <= 1.0)
+    << 0
+}
+
+fn expects_bad_hex() bool {
+    _ := colors.from_hex("#12345") or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn check_color() int {
+    assert(colors.WHITE == 4294967295 && ch_r(colors.RED) == 255 && ch_a(colors.RED) == 255)
+    c1 := colors.from_hex("#f80") or >>
+    assert(ch_r(c1) == 255 && ch_g(c1) == 136 && ch_b(c1) == 0 && ch_a(c1) == 255)
+    assert(colors.to_hex(c1, false) == "#FF8800")
+    c2 := colors.from_hex("11223380") or >>
+    assert(colors.to_hex(c2, true) == "#11223380")
+    assert(expects_bad_hex())
+
+    // HSV round-trip & sRGB vs Linear lerp check
+    hsv := colors.to_hsv(colors.from_hsv(210.0, 0.75, 0.85, 0.5))
+    assert(near_f(hsv.h, 210.0, 1e-4) && near_f(hsv.s, 0.75, 1e-4) && near_f(hsv.v, 0.85, 1e-4))
+    mix_srgb := colors.lerp_rgba8(colors.RED, colors.GREEN, 0.5)
+    mix_lin := colors.lerp_linear_rgba8(colors.RED, colors.GREEN, 0.5) or >>
+    assert(ch_r(mix_lin) > ch_r(mix_srgb) + 40)
+    c_pre := colors.rgba8(200, 100, 50, 128) or >>
+    pm := colors.premultiply_rgba8(c_pre) or >>
+    assert(ch_r(pm) >= 99 && ch_r(pm) <= 101 && ch_a(pm) == 128)
+    << 0
+}
+
+fn check_diagnostics_events_spatial() int {
+    // 1. Logger ring buffer & category filter
+    $lg := diag.new_logger(4) or >>
+    lg.set_level(diag.LOG_WARN) or >>
+    lg.set_category_level("net", diag.LOG_DEBUG) or >>
+    assert(!lg.info("render", "skipped info", 10))
+    assert(lg.debug("net", "ping", 11))
+    assert(lg.warn("render", "low fps", 12))
+    assert(lg.error("audio", "underrun", 13))
+    assert(lg.fatal("sys", "oom", 14))
+    assert(lg.warn("net", "jitter", 15))
+    // Ring size 4 keeps last 4 (seqs 2..5) while total_logged == 5!
+    assert(lg.total_logged() == 5 && lg.buffered_count() == 4)
+    rec := lg.recent(2)
+    assert(rec.len == 2 && rec[0].seq == 4 && rec[1].seq == 5)
+    assert(lg.filter(diag.LOG_ERROR, "").len == 2)
+    assert(diag.level_name(diag.LOG_WARN) == "WARN")
+    assert(lg.export_json().len > 20)
+
+    // 2. CVarRegistry + command parsing + JSON archive persistence
+    $cv := diag.new_cvar_registry()
+    cv.register_int_range("r_msaa", 4, 1, 8, diag.CVAR_ARCHIVE, "MSAA samples") or >>
+    cv.register_float_range("g_gravity", 9.8, 0.0, 50.0, diag.CVAR_ARCHIVE, "World gravity") or >>
+    cv.register_bool("sv_cheats", false, diag.CVAR_NONE, "Enable cheats") or >>
+    cv.register_bool("god", false, diag.CVAR_CHEAT, "God mode") or >>
+    cv.register_string("r_title", "Nexus Game", diag.CVAR_ARCHIVE | diag.CVAR_READONLY, "Readonly title") or >>
+    cv.register_command("spawn", "Spawn entity at coords") or >>
+
+    // Cheat protection before cheats_enabled
+    res_cheat := cv.exec_line("god true")
+    assert(!res_cheat.ok)
+    cv.set_cheats_enabled(true)
+    assert(cv.exec_line("god true").ok && cv.get_bool("god"))
+    // Clamping + quoted arg + command dispatch + comments
+    assert(cv.exec_line("r_msaa 32 # clamp to 8").ok && cv.get_int("r_msaa") == 8)
+    assert(cv.exec_line("spawn \"Boss Goblin\" 10 20").is_command)
+    cmds := cv.drain_commands()
+    assert(cmds.len == 1 && cmds[0].name == "spawn" && cmds[0].args[0] == "Boss Goblin" && cmds[0].args[2] == "20")
+    assert(cv.autocomplete("r_").len == 2)
+    arch_json := cv.export_archive_json()
+    cv.reset("r_msaa") or >>
+    assert(cv.get_int("r_msaa") == 4)
+    cv.import_json(&arch_json) or >>
+    assert(cv.get_int("r_msaa") == 8)
+
+    // 3. EventBus priority & prefix routing
+    $bus := evbus.new_event_bus(64, 16) or >>
+    sub_all := bus.subscribe_prefix("combat.", "", 0) or >>
+    sub_crit := bus.subscribe("combat.hit", "crit", 5) or >>
+    bus.enqueue(evbus.make_event("combat.heal", 1, 2, 1, 10, 0.0, fm.vec3(0.0, 0.0, 0.0), "hp", "")) or >>
+    bus.enqueue(evbus.make_event("combat.hit", 1, 3, 10, 99, 1.5, fm.vec3(1.0, 2.0, 3.0), "sword", "crit")) or >>
+    assert(bus.pending_count() == 2)
+    bus.flush()
+    all_ev := bus.poll(sub_all) or >>
+    crit_ev := bus.poll(sub_crit) or >>
+    // High priority event (10) delivered before priority 1!
+    assert(all_ev.len == 2 && all_ev[0].topic == "combat.hit" && all_ev[1].topic == "combat.heal")
+    assert(crit_ev.len == 1 && crit_ev[0].int_val == 99)
+    assert(bus.unsubscribe(sub_crit) && !bus.is_subscribed(sub_crit))
+
+    // 4. SpatialHash2D & SpatialHash3D deduplication & nearest
+    $sh2 := sp.new_spatial_hash_2d(4.0) or >>
+    sh2.insert(10, fm.rect2(0.0, 0.0, 10.0, 10.0)) or >> // spans multiple cells!
+    sh2.insert(20, fm.rect2(1.0, 1.0, 2.0, 2.0)) or >>
+    sh2.insert_circle(30, fm.vec2(20.0, 20.0), 1.0) or >>
+    hits2 := sh2.query_rect(fm.rect2(0.5, 0.5, 8.0, 8.0)) or >>
+    assert(hits2.len == 2) // entity 10 returned only ONCE!
+    near2 := sh2.nearest(fm.vec2(2.0, 2.0), 6.0, 1) or >>
+    assert(near2.len == 1 && near2[0].id == 20)
+    sh2.update(30, fm.rect2(1.5, 1.5, 1.0, 1.0)) or >>
+    qr2 := sh2.query_radius(fm.vec2(2.0, 2.0), 1.0) or >>
+    assert(qr2.len == 3)
+    assert(sh2.remove(10) && !sh2.contains(10) && sh2.count() == 2)
+
+    $sh3 := sp.new_spatial_hash_3d(2.0) or >>
+    sh3.insert_sphere(1, fm.vec3(0.0, 0.0, 0.0), 3.0) or >>
+    sh3.insert_sphere(2, fm.vec3(1.0, 0.0, 0.0), 0.5) or >>
+    near3 := sh3.nearest(fm.vec3(0.9, 0.0, 0.0), 4.0, 2) or >>
+    assert(near3.len == 2 && near3[0].id == 2 && near3[1].id == 1)
+    << 0
+}
+
+fn check_scene_and_camera3d() int {
+    // 1. SceneTree groups, metadata, ergonomics, global_position, slot recycle, PackedScene
+    $tree := nexus.new_scene_tree("Root", 64) or >>
+    hero := tree.add_child(tree.root(), "Hero") or >>
+    weapon := tree.add_child(hero, "Sword") or >>
+    tree.set_position(hero, fm.vec2(100.0, 50.0)) or >>
+    tree.set_global_position(weapon, fm.vec2(125.0, 80.0)) or >>
+    gp_w := tree.global_position(weapon) or >>
+    assert(gp_w.approx_eq(fm.vec2(125.0, 80.0), 1e-5))
+    np_w := tree.node_path(weapon) or >>
+    assert(np_w == "/Root/Hero/Sword")
+    is_anc := tree.is_ancestor_of(tree.root(), weapon) or >>
+    cc_h := tree.child_count(hero) or >>
+    assert(is_anc && cc_h == 1)
+
+    tree.add_to_group(hero, "players") or >>
+    tree.add_to_group(weapon, "weapons") or >>
+    tree.set_meta_str(hero, "class", "ranger") or >>
+    tree.set_meta_int(hero, "level", 12) or >>
+    tree.set_meta_f64(hero, "crit", 0.25) or >>
+    tree.set_meta_bool(hero, "boss", false) or >>
+    in_p := tree.is_in_group(hero, "players") or >>
+    p_grp := tree.nodes_in_group("players") or >>
+    cls := tree.get_meta_str(hero, "class") or >>
+    lvl := tree.get_meta_int(hero, "level") or >>
+    assert(in_p && p_grp.len == 1)
+    assert(cls == "ranger" && lvl == 12)
+
+    dup := tree.duplicate_subtree(hero, tree.root(), "HeroClone") or >>
+    dup_in := tree.is_in_group(dup, "players") or >>
+    dup_cls := tree.get_meta_str(dup, "class") or >>
+    p_grp2 := tree.nodes_in_group("players") or >>
+    assert(dup_in && dup_cls == "ranger")
+    assert(p_grp2.len == 2)
+
+    // Queue free + flush_free + slot reuse must NEVER leak previous groups or metadata!
+    tree.queue_free(dup) or >>
+    tree.flush_free() or >>
+    p_grp3 := tree.nodes_in_group("players") or >>
+    assert(p_grp3.len == 1)
+    fresh := tree.add_child(tree.root(), "FreshNode") or >>
+    fg := tree.node_groups(fresh) or >>
+    fm_k := tree.meta_keys(fresh) or >>
+    assert(fg.len == 0 && fm_k.len == 0)
+
+    tree.rename(weapon, "Greataxe") or >>
+    np_w2 := tree.node_path(weapon) or >>
+    assert(np_w2 == "/Root/Hero/Greataxe")
+
+    // 2. Camera3D & SceneTree 3D world_to_screen <-> screen_to_world_ray round-trip
+    $cam := nexus.new_camera_3d()
+    cam.position = fm.vec3(0.0, 4.0, 10.0)
+    cam.target = fm.vec3(0.0, 0.0, 0.0)
+    vp_size := fm.vec2(1280.0, 720.0)
+    target_pt := fm.vec3(1.5, 0.5, -1.0)
+    sp_pt := cam.world_to_screen(target_pt, vp_size) or >>
+    assert(sp_pt.in_front && sp_pt.visible)
+    pick_ray := cam.screen_to_world_ray(fm.vec2(sp_pt.x, sp_pt.y), vp_size) or >>
+    dist_sq := fm.point_segment_distance_sq_3d(target_pt, pick_ray.origin, pick_ray.point_at(100.0))
+    assert(dist_sq < 1e-8)
+    fr := cam.frustum(1280.0 / 720.0) or >>
+    assert(fr.contains_point(target_pt))
+    assert(!fr.contains_point(fm.vec3(0.0, 4.0, 20.0)))
+
+    // 3. SceneTree node camera (ortho & perspective) picking + PackedScene metadata/groups preservation
+    $t3 := nexus.new_scene_tree_3d("World3D", 32) or >>
+    cam_node := t3.add_child_3d(t3.root(), "OrthoCam") or >>
+    t3.set_orthographic_camera_3d(cam_node, camres.orthographic(10.0, 0.5, 50.0) or >>) or >>
+    t3.set_position_3d(cam_node, fm.vec3(0.0, 0.0, 10.0)) or >>
+    world_p := fm.vec3(2.0, -1.5, 0.0)
+    sp_o := t3.camera_world_to_screen_3d(cam_node, world_p, vp_size) or >>
+    assert(sp_o.in_front && sp_o.visible)
+    ray_o := t3.camera_screen_to_world_ray_3d(cam_node, fm.vec2(sp_o.x, sp_o.y), vp_size) or >>
+    assert(fm.point_segment_distance_sq_3d(world_p, ray_o.origin, ray_o.point_at(30.0)) < 1e-8)
+    fr_o := t3.camera_frustum_3d(cam_node, 1280.0 / 720.0) or >>
+    assert(fr_o.contains_point(world_p) && !fr_o.contains_point(fm.vec3(0.0, 25.0, 0.0)))
+
+    packed := nexus.pack_scene(&tree, hero) or >>
+    r_id := tree.root()
+    p_root := packed.instantiate($&tree, r_id, "PackedHero") or >>
+    p_in := tree.is_in_group(p_root, "players") or >>
+    p_lvl := tree.get_meta_int(p_root, "level") or >>
+    assert(p_in && p_lvl == 12)
+    << 0
+}
+
+fn check_input_timers_tweens() int {
+    // 1. InputMap pointer, wheel, clicks, chord, held duration (available on release frame!), JSON
+    $im := controls.new_input_map()
+    im.bind("move_s", events.KEY_S) or >>
+    im.bind_chord("save", events.KEY_S, controls.MOD_CTRL) or >>
+    im.bind_mouse("fire", controls.MOUSE_BUTTON_LEFT) or >>
+
+    // Frame 1: Plain S does NOT trigger Ctrl+S chord!
+    im.begin_frame()
+    $ev := events.empty()
+    ev.kind = events.EVENT_KEY_DOWN
+    ev.physical_key = events.KEY_S
+    ibridge.apply_window_input($&im, &ev) or >>
+    pr_s := im.pressed("move_s") or >>
+    pr_save := im.pressed("save") or >>
+    assert(pr_s && !pr_save)
+    ev.kind = events.EVENT_KEY_UP
+    ibridge.apply_window_input($&im, &ev) or >>
+
+    // Frame 2: Ctrl+S triggers save chord; Mouse left click + double click + wheel
+    im.begin_frame()
+    ev.kind = events.EVENT_KEY_DOWN
+    ev.physical_key = events.KEY_S
+    ev.modifiers = events.MOD_LEFT_CTRL
+    ibridge.apply_window_input($&im, &ev) or >>
+    pr_save2 := im.pressed("save") or >>
+    jp_save2 := im.just_pressed("save") or >>
+    assert(pr_save2 && jp_save2 && im.has_modifier(controls.MOD_CTRL))
+
+    $pm := events.empty()
+    pm.kind = events.EVENT_POINTER_DOWN
+    pm.button = events.BUTTON_LEFT
+    pm.clicks = 2
+    pm.x = 320.0
+    pm.y = 180.0
+    ibridge.apply_window_input($&im, &pm) or >>
+    pr_fire := im.pressed("fire") or >>
+    m_jp := im.mouse_button_just_pressed(controls.MOUSE_BUTTON_LEFT) or >>
+    m_clk := im.mouse_clicks(controls.MOUSE_BUTTON_LEFT) or >>
+    assert(pr_fire && m_jp)
+    assert(m_clk == 2)
+    assert(im.mouse_position().approx_eq(fm.vec2(320.0, 180.0), 1e-6))
+
+    $wh := events.empty()
+    wh.kind = events.EVENT_WHEEL
+    wh.dx = 0.0
+    wh.dy = 1.5
+    ibridge.apply_window_input($&im, &wh) or >>
+    assert(near_f(im.mouse_wheel().y, 1.5, 1e-6))
+
+    // Hold duration preserved on just_released frame (for charged attack release!)
+    im.advance_timers(0.75) or >>
+    hd1 := im.held_duration("fire") or >>
+    assert(near_f(hd1, 0.75, 1e-6))
+    pm.kind = events.EVENT_POINTER_UP
+    ibridge.apply_window_input($&im, &pm) or >>
+    jr_fire := im.just_released("fire") or >>
+    hd2 := im.held_duration("fire") or >>
+    assert(jr_fire && near_f(hd2, 0.75, 1e-6))
+    im.begin_frame()
+    hd3 := im.held_duration("fire") or >>
+    assert(near_f(hd3, 0.0, 1e-6))
+
+    bjson := im.export_bindings_json()
+    $im2 := controls.new_input_map()
+    im2.import_bindings_json(&bjson) or >>
+    mbs := im2.action_mouse_buttons("fire") or >>
+    assert(im2.has_action("save") && mbs[0] == controls.MOUSE_BUTTON_LEFT)
+
+    // 2. TimerScheduler + CooldownMap + TweenManager
+    $ts := timing.new_timer_scheduler()
+    t1 := ts.after(0.5, "bomb", 7, false) or >>
+    t2 := ts.every(0.2, 3, "dot", 9, true) or >>
+    fired1 := ts.step(0.1, 0.25) or >>
+    assert(fired1.len == 1 && fired1[0].tag == "dot" && ts.remaining(t1) > 0.39)
+    fired2 := ts.step(0.5, 0.5) or >>
+    assert(fired2.len == 3) // bomb + 2 remaining dot ticks!
+    assert(!ts.is_active(t1) && !ts.is_active(t2) && ts.active_count() == 0)
+
+    $cd := timing.new_cooldown_map()
+    cd.start("dash", 2.0) or >>
+    assert(!cd.is_ready("dash") && near_f(cd.ratio("dash"), 1.0, 1e-6))
+    cd.step(1.0) or >>
+    assert(near_f(cd.remaining("dash"), 1.0, 1e-6) && near_f(cd.ratio("dash"), 0.5, 1e-6))
+    cd.step(1.5) or >>
+    assert(cd.is_ready("dash"))
+
+    $tw := tl.new_tween_manager()
+    th := tw.tween_vec2(fm.vec2(0.0, 0.0), fm.vec2(100.0, 50.0), 1.0, fm.EASE_OUT_QUAD, "ui") or >>
+    tw.set_delay(th, 0.25) or >>
+    _ := tw.step(0.75, 0.75) or >> // 0.25 delay + 0.50 progress
+    tv := tw.value(th) or >>
+    assert(!tv.finished && near_f(tv.progress, 0.5, 1e-6) && tv.vec2.x > 70.0)
+    done := tw.step(0.6, 0.6) or >>
+    assert(done.len == 1 && done[0].finished && done[0].vec2.approx_eq(fm.vec2(100.0, 50.0), 1e-6))
+    tv_done := tw.value(th) or >>
+    assert(tv_done.finished && tv_done.vec2.approx_eq(fm.vec2(100.0, 50.0), 1e-6))
+    << 0
+}
+
+fn check_2d_3d_primitives_and_debug_gpu() int {
+    // 1. 2D Vector/Debug Primitives on BOTH Metal GPU and Software 2D
+    w := 128
+    h := 96
+    cprog := shd2.load_canvas("build/canvas-shaders") or >>
+    bg := colors.rgba8(12, 14, 18, 255) or >>
+
+    $batch := canvas.new_batch()
+    batch.rect_outline(fm.rect2(8.0, 8.0, 40.0, 30.0), 2.0, colors.GREEN) or >>
+    batch.circle_fill(fm.vec2(88.0, 32.0), 16.0, 24, colors.RED) or >>
+    batch.circle_outline(fm.vec2(88.0, 70.0), 14.0, 3.0, 24, colors.CYAN) or >>
+    batch.arrow(fm.vec2(16.0, 70.0), fm.vec2(56.0, 70.0), 3.0, 10.0, 10.0, colors.YELLOW) or >>
+    batch.grid(fm.rect2(0.0, 0.0, 32.0, 32.0), 16.0, 1.0, colors.GRAY) or >>
+    poly := [fm.vec2(52.0, 12.0), fm.vec2(66.0, 12.0), fm.vec2(62.0, 28.0), fm.vec2(50.0, 26.0)]
+    batch.polygon_fill(&poly, colors.MAGENTA) or >>
+
+    $r_gpu := ren2.open_2d("2D Primitives GPU", w, h, gpu.METAL, &cprog) or >>
+    r_gpu.begin(bg) or >>
+    r_gpu.submit(&batch) or >>
+    g_circle := r_gpu.read_pixel(88, 32) or >>
+    g_border := r_gpu.read_pixel(24, 9) or >>
+    g_empty := r_gpu.read_pixel(120, 90) or >>
+    r_gpu.present() or >>
+    r_gpu.close() or >>
+
+    $r_soft := ren2.open_2d_headless(w, h) or >>
+    r_soft.begin(bg) or >>
+    r_soft.submit(&batch) or >>
+    s_circle := r_soft.read_pixel(88, 32) or >>
+    s_border := r_soft.read_pixel(24, 9) or >>
+    r_soft.present() or >>
+    r_soft.close() or >>
+
+    assert(ch_r(g_circle) > 240 && ch_g(g_circle) < 20 && ch_r(s_circle) > 240)
+    assert(ch_g(g_border) > 240 && ch_g(s_border) > 240)
+    assert(ch_r(g_empty) == 12 && ch_b(g_empty) == 18)
+
+    // 2. 3D Procedural Meshes + DebugDraw3D rendered on Metal Device3D
+    m_box := mesh.box_mesh_3d(fm.vec3(1.5, 1.0, 1.5), colors.WHITE) or >>
+    m_plane := mesh.plane_mesh_3d(4.0, 4.0, 2, 2, colors.WHITE) or >>
+    m_cyl := mesh.cylinder_mesh_3d(0.6, 0.8, 2.0, 12, colors.WHITE) or >>
+    m_cone := mesh.cone_mesh_3d(0.75, 1.5, 12, colors.WHITE) or >>
+    m_cap := mesh.capsule_mesh_3d(0.5, 1.0, 12, 4, colors.WHITE) or >>
+    m_box.validate() or >>
+    m_plane.validate() or >>
+    m_cyl.validate() or >>
+    m_cone.validate() or >>
+    m_cap.validate() or >>
+
+    $dbg := mesh.new_debug_draw_3d(0.06) or >>
+    dbg_box := fm.aabb3(fm.vec3(-1.0, -1.0, -1.0), fm.vec3(1.0, 1.0, 1.0)) or >>
+    dbg.aabb(dbg_box, colors.CYAN, 0.0) or >>
+    dbg.axes(fm.identity_3d(), 1.2, 1.0) or >>
+    dbg.sphere(fm.vec3(0.0, 0.0, 0.0), 0.7, 12, colors.YELLOW, 0.0) or >>
+    seg_before := dbg.segment_count()
+    assert(seg_before > 20)
+    dbg_mesh := dbg.build_mesh() or >>
+    dbg_mesh.validate() or >>
+
+    program := shd.load_mesh("build/mesh-shaders") or >>
+    $dev := ren.open_3d("3D Primitives & DebugDraw", 96, 96, gpu.METAL, &program) or >>
+    $gbox := dev.upload(&m_box) or >>
+    $gplane := dev.upload(&m_plane) or >>
+    $gcyl := dev.upload(&m_cyl) or >>
+    $gcone := dev.upload(&m_cone) or >>
+    $gcap := dev.upload(&m_cap) or >>
+    $gdbg := dev.upload(&dbg_mesh) or >>
+
+    eye := fm.vec3(0.0, 0.8, 3.2)
+    view := nexus.look_at_3d(eye, fm.vec3(0.0, 0.0, 0.0), fm.vec3(0.0, 1.0, 0.0)) or >>
+    proj := nexus.perspective_3d(0.9, 1.0, 0.1, 30.0) or >>
+    vp := proj.multiply(view)
+
+    dev.begin(bg) or >>
+    dev.draw(&gbox, vp.multiply(fm.translation_3d(fm.vec3(-2.5, 0.0, 0.0)))) or >>
+    dev.draw(&gplane, vp.multiply(fm.translation_3d(fm.vec3(0.0, -3.5, 0.0)))) or >>
+    dev.draw(&gcyl, vp.multiply(fm.translation_3d(fm.vec3(-2.5, 2.2, 0.0)))) or >>
+    dev.draw(&gcone, vp.multiply(fm.translation_3d(fm.vec3(2.5, 2.2, 0.0)))) or >>
+    dev.draw(&gcap, vp.multiply(fm.translation_3d(fm.vec3(2.5, 0.0, 0.0)))) or >>
+    dev.draw(&gdbg, vp) or >>
+    px_center := dev.read_pixel(48, 48) or >>
+    px_corner := dev.read_pixel(2, 2) or >>
+    dev.present() or >>
+
+    // Axes pass right through center -> non-background colored pixel!
+    assert(px_center != bg && px_corner == bg)
+
+    // Stepping dt = 0.05 drops duration=0 frame segments while keeping duration=1.0 axes segments!
+    dbg.step(0.05)
+    assert(dbg.segment_count() < seg_before && dbg.segment_count() >= 15)
+
+    gdbg.close() or >>
+    gcap.close() or >>
+    gcone.close() or >>
+    gcyl.close() or >>
+    gplane.close() or >>
+    gbox.close() or >>
+    dev.close() or >>
+    << 0
+}
+
+fn expects_zero_ray_err(w2 &p2.PhysicsWorld2D) bool {
+    _ := w2.raycast(fm.vec2(0.0, 0.0), fm.vec2(0.0, 0.0), 10.0, 1, false) or (err) {
+        _ := err.msg()
+        << true
+    }
+    << false
+}
+
+fn check_ecs_and_physics_queries() int {
+    // 1. EcsWorld query, archetype migration & generational custom stores
+    $ew := ecs.new_ecs_world()
+    e1 := ew.spawn(ecs.COMP_TRANSFORM | ecs.COMP_HEALTH) or >>
+    e2 := ew.spawn(ecs.COMP_TRANSFORM | ecs.COMP_VELOCITY) or >>
+    e3 := ew.spawn(ecs.COMP_TRANSFORM) or >>
+    ew.set_transform(e1, fm.vec3(11.0, 22.0, 33.0), fm.vec3(2.0, 2.0, 2.0)) or >>
+    ew.set_health(e1, 45.0, 120.0, 2.5) or >>
+
+    ew.add_component(e1, ecs.COMP_VELOCITY) or >>
+    ew.set_velocity(e1, fm.vec3(3.0, 0.0, 0.0)) or >>
+    em1 := ew.entity_mask(e1) or >>
+    pos1 := ew.get_position(e1) or >>
+    hp1 := ew.get_health(e1) or >>
+    assert(em1 == (ecs.COMP_TRANSFORM | ecs.COMP_HEALTH | ecs.COMP_VELOCITY))
+    assert(pos1.approx_eq(fm.vec3(11.0, 22.0, 33.0), 1e-6))
+    assert(near_f(hp1, 45.0, 1e-6))
+
+    ew.remove_component(e1, ecs.COMP_HEALTH) or >>
+    em2 := ew.entity_mask(e1) or >>
+    pos2 := ew.get_position(e1) or >>
+    assert(em2 == (ecs.COMP_TRANSFORM | ecs.COMP_VELOCITY))
+    assert(pos2.approx_eq(fm.vec3(11.0, 22.0, 33.0), 1e-6))
+
+    q := ew.query(ecs.COMP_TRANSFORM | ecs.COMP_VELOCITY, ecs.COMP_AUDIO)
+    assert(q.len == 2)
+
+    $tags := ecs.new_tag_set()
+    $scores := ecs.new_int_store()
+    $weights := ecs.new_float_store()
+    $names := ecs.new_string_store()
+    $anchors := ecs.new_vec3_store()
+    tags.add(e1, "player") or >>
+    tags.add(e3, "npc") or >>
+    scores.set(e1, 9001)
+    scores.set(e2, 42)
+    weights.set(e1, 72.5)
+    names.set(e1, "Aria")
+    anchors.set(e1, fm.vec3(1.0, 2.0, 3.0))
+    sc1 := scores.get(e1) or >>
+    wt1 := weights.get(e1) or >>
+    nm1 := names.get(e1) or >>
+    an1 := anchors.get(e1) or >>
+    assert(tags.has(e1, "player") && sc1 == 9001 && near_f(wt1, 72.5, 1e-6) && nm1 == "Aria" && an1.approx_eq(fm.vec3(1.0, 2.0, 3.0), 1e-6))
+
+    ew.despawn(e2) or >>
+    assert(!scores.has(e2) || !ew.is_alive(e2))
+    assert(scores.prune_dead(&ew) == 1 && scores.len() == 1)
+    assert(tags.entities_with("player").len == 1)
+
+    // 2. Physics2D zero-dir rejection + overlap_point / overlap_circle / raycast_all
+    $w2 := p2.new_physics_world_2d()
+    c0 := w2.add_solid(fm.rect2(10.0, 0.0, 10.0, 10.0), 1, 1) or >>
+    c1 := w2.add_solid(fm.rect2(30.0, 0.0, 10.0, 10.0), 1, 1) or >>
+    _ := w2.add_trigger(fm.rect2(12.0, 2.0, 4.0, 4.0), 1, 1) or >>
+    op_nt := w2.overlap_point(fm.vec2(14.0, 4.0), 1, false) or >>
+    op_wt := w2.overlap_point(fm.vec2(14.0, 4.0), 1, true) or >>
+    oc := w2.overlap_circle(fm.vec2(9.0, 5.0), 1.5, 1, false) or >>
+    assert(op_nt.len == 1 && op_wt.len == 2 && oc.len == 1)
+    all2 := w2.raycast_all(fm.vec2(0.0, 5.0), fm.vec2(1.0, 0.0), 50.0, 1, false, false) or >>
+    assert(all2.len == 2 && all2[0].collider_id == c0 && all2[1].collider_id == c1)
+
+    assert(expects_zero_ray_err(&w2))
+
+    // 3. Physics3D raycast_all, overlap_aabb, overlap_sphere
+    sb0 := fm.aabb3(fm.vec3(2.0, -1.0, -1.0), fm.vec3(4.0, 1.0, 1.0)) or >>
+    sb1 := fm.aabb3(fm.vec3(8.0, -1.0, -1.0), fm.vec3(10.0, 1.0, 1.0)) or >>
+    solids := [sb0, sb1]
+    all3 := p3.raycast_all(fm.vec3(0.0, 0.0, 0.0), fm.vec3(1.0, 0.0, 0.0), 20.0, &solids) or >>
+    assert(all3.len == 2 && near_f(all3[0].distance, 2.0, 1e-6) && near_f(all3[1].distance, 8.0, 1e-6))
+    qbox := fm.aabb3(fm.vec3(3.0, 0.0, 0.0), fm.vec3(5.0, 2.0, 2.0)) or >>
+    oa3 := p3.overlap_aabb(qbox, &solids) or >>
+    os3 := p3.overlap_sphere(fm.vec3(7.5, 0.0, 0.0), 1.0, &solids) or >>
+    assert(oa3.len == 1 && oa3[0] == 0)
+    assert(os3.len == 1 && os3[0] == 1)
+    << 0
+}
+
+fn run() int {
+    check_math_curves_noise() or >>
+    check_color() or >>
+    check_diagnostics_events_spatial() or >>
+    check_scene_and_camera3d() or >>
+    check_input_timers_tweens() or >>
+    check_2d_3d_primitives_and_debug_gpu() or >>
+    check_ecs_and_physics_queries() or >>
+    println("PASS: developer_ergonomics_checks (Math/Curves/Noise/Color + Log/CVar/EventBus/SpatialHash + Scene Meta/Groups/Cam3DPick + Pointer/Chord Input + Timers/Tweens + 2D/3D Primitives & DebugDraw3D GPU + ECS Migration/Stores & Physics Queries)")
+    << 0
+}
+
+fn main() int {
+    << run() or (err) {
+        eprintln(err.msg())
+        << 1
+    }
+}

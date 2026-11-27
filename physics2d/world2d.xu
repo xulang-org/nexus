@@ -185,8 +185,123 @@ pub fn (w &PhysicsWorld2D) overlap_rect(query fm.Rect2, mask int, include_trigge
     << ids
 }
 
+pub fn (w &PhysicsWorld2D) overlap_point(point fm.Vec2, mask int, include_triggers bool) []int {
+    if !point.is_finite() { >> errors.new("nexus physics2d: overlap_point requires finite point") }
+    $ids := []int{}
+    for c in w.colliders {
+        if !c.enabled || !layer_matches(&c, mask) { -> }
+        if !include_triggers && c.kind == COLLIDER_TRIGGER { -> }
+        if c.bounds.contains(point) { ids.push(c.id) }
+    }
+    << ids
+}
+
+pub fn (w &PhysicsWorld2D) overlap_circle(center fm.Vec2, radius f64, mask int, include_triggers bool) []int {
+    if !center.is_finite() || !fm.finite(radius) || radius < 0.0 {
+        >> errors.new("nexus physics2d: invalid overlap_circle center or radius")
+    }
+    rsq := radius * radius
+    $ids := []int{}
+    for c in w.colliders {
+        if !c.enabled || !layer_matches(&c, mask) { -> }
+        if !include_triggers && c.kind == COLLIDER_TRIGGER { -> }
+        closest := c.bounds.clamp_point(center)
+        if closest.distance_sq(center) <= rsq { ids.push(c.id) }
+    }
+    << ids
+}
+
+pub fn (w &PhysicsWorld2D) raycast_all(origin fm.Vec2, dir fm.Vec2, max_dist f64, mask int, include_one_way bool, include_triggers bool) []RaycastHit2D {
+    if !fm.finite(origin.x) || !fm.finite(origin.y) || !fm.finite(dir.x) || !fm.finite(dir.y) ||
+        !fm.finite(max_dist) || max_dist <= 0.0 || dir.length_sq() <= 1e-18 {
+        >> errors.new("nexus physics2d: invalid raycast_all parameters")
+    }
+    unit_dir := dir.normalized()
+    dx := unit_dir.x * max_dist
+    dy := unit_dir.y * max_dist
+    $hits := []RaycastHit2D{}
+    for c in w.colliders {
+        if !c.enabled || !layer_matches(&c, mask) { -> }
+        if !include_triggers && c.kind == COLLIDER_TRIGGER { -> }
+        if c.kind == COLLIDER_ONE_WAY && !include_one_way { -> }
+        $tmin := 0.0
+        $tmax := 1.0
+        $nx := 0.0
+        $ny := 0.0
+        $miss := false
+        if math.abs(dx) <= 1e-12 {
+            if origin.x < c.bounds.position.x || origin.x > c.bounds.position.x + c.bounds.size.x { miss = true }
+        } else {
+            tx1 := (c.bounds.position.x - origin.x) / dx
+            tx2 := (c.bounds.position.x + c.bounds.size.x - origin.x) / dx
+            $tenter := tx1
+            $texit := tx2
+            $cand_nx := -1.0
+            if tx1 > tx2 {
+                tenter = tx2
+                texit = tx1
+                cand_nx = 1.0
+            }
+            if tenter > tmin {
+                tmin = tenter
+                nx = cand_nx
+                ny = 0.0
+            }
+            if texit < tmax { tmax = texit }
+            if tmin > tmax { miss = true }
+        }
+        if !miss {
+            if math.abs(dy) <= 1e-12 {
+                if origin.y < c.bounds.position.y || origin.y > c.bounds.position.y + c.bounds.size.y { miss = true }
+            } else {
+                ty1 := (c.bounds.position.y - origin.y) / dy
+                ty2 := (c.bounds.position.y + c.bounds.size.y - origin.y) / dy
+                $tenter := ty1
+                $texit := ty2
+                $cand_ny := -1.0
+                if ty1 > ty2 {
+                    tenter = ty2
+                    texit = ty1
+                    cand_ny = 1.0
+                }
+                if tenter > tmin {
+                    tmin = tenter
+                    nx = 0.0
+                    ny = cand_ny
+                }
+                if texit < tmax { tmax = texit }
+                if tmin > tmax { miss = true }
+            }
+        }
+        if !miss && tmin >= 0.0 && tmin <= 1.0 {
+            dist := tmin * max_dist
+            hits.push(RaycastHit2D{
+                hit: true,
+                collider_id: c.id,
+                distance: dist,
+                fraction: tmin,
+                point: origin.add(unit_dir.scaled(dist)),
+                normal: fm.vec2(nx, ny)
+            })
+        }
+    }
+    if hits.len > 1 {
+        for i in 0:(hits.len - 1) {
+            for j in (i + 1):hits.len {
+                if hits[j].distance < hits[i].distance {
+                    tmp := hits[i]
+                    hits[i] = hits[j]
+                    hits[j] = tmp
+                }
+            }
+        }
+    }
+    << hits
+}
+
 pub fn (w &PhysicsWorld2D) raycast(origin fm.Vec2, dir fm.Vec2, max_dist f64, mask int, include_one_way bool) RaycastHit2D {
-    if !fm.finite(origin.x) || !fm.finite(origin.y) || !fm.finite(dir.x) || !fm.finite(dir.y) || !fm.finite(max_dist) || max_dist <= 0.0 {
+    if !fm.finite(origin.x) || !fm.finite(origin.y) || !fm.finite(dir.x) || !fm.finite(dir.y) ||
+        !fm.finite(max_dist) || max_dist <= 0.0 || dir.length_sq() <= 1e-18 {
         >> errors.new("nexus physics2d: invalid raycast parameters")
     }
     unit_dir := dir.normalized() or >>

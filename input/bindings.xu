@@ -22,6 +22,19 @@ pub fn (input $&InputMap) unbind_key(name string, key int) int {
     << 0
 }
 
+pub fn (input $&InputMap) unbind_mouse(name string, button int) int {
+    index := input.action_index(&name) or >>
+    $next := []MouseBinding{}
+    for b in input.mouse_bindings {
+        if !(b.action == index && b.button == button) {
+            next.push(b)
+        }
+    }
+    input.mouse_bindings = next
+    input.refresh()
+    << 0
+}
+
 pub fn (input $&InputMap) unbind_action(name string) int {
     index := input.action_index(&name) or >>
     $next_k := []InputBinding{}
@@ -32,8 +45,18 @@ pub fn (input $&InputMap) unbind_action(name string) int {
     for s in input.source_bindings {
         if s.action != index { next_s.push(s) }
     }
+    $next_m := []MouseBinding{}
+    for m in input.mouse_bindings {
+        if m.action != index { next_m.push(m) }
+    }
+    $next_c := []ChordBinding{}
+    for c in input.chord_bindings {
+        if c.action != index { next_c.push(c) }
+    }
     input.bindings = next_k
     input.source_bindings = next_s
+    input.mouse_bindings = next_m
+    input.chord_bindings = next_c
     input.refresh()
     << 0
 }
@@ -64,6 +87,15 @@ pub fn (input &InputMap) action_sources(name string) []int {
     << out
 }
 
+pub fn (input &InputMap) action_mouse_buttons(name string) []int {
+    index := input.action_index(&name) or >>
+    $out := []int{}
+    for m in input.mouse_bindings {
+        if m.action == index { out.push(m.button) }
+    }
+    << out
+}
+
 pub fn (input &InputMap) export_bindings_json() string {
     $b := strings.new_byte_builder(512)
     fmt_s := BINDINGS_FORMAT + ""
@@ -75,6 +107,7 @@ pub fn (input &InputMap) export_bindings_json() string {
         act_name := input.actions[i].name + ""
         keys := input.action_keys(act_name + "") or >>
         srcs := input.action_sources(act_name + "") or >>
+        mbs := input.action_mouse_buttons(act_name + "") or >>
         b.write_str("{\"name\":" + json.quote(&act_name) + ",\"keys\":[")
         for ki in 0:keys.len {
             if ki > 0 { b.write_str(",") }
@@ -84,6 +117,19 @@ pub fn (input &InputMap) export_bindings_json() string {
         for si in 0:srcs.len {
             if si > 0 { b.write_str(",") }
             b.write_str(str(srcs[si]))
+        }
+        b.write_str("],\"mouse_buttons\":[")
+        for mi in 0:mbs.len {
+            if mi > 0 { b.write_str(",") }
+            b.write_str(str(mbs[mi]))
+        }
+        b.write_str("],\"chords\":[")
+        $first_c := true
+        for ch in input.chord_bindings {
+            if ch.action != i { -> }
+            if !first_c { b.write_str(",") }
+            first_c = false
+            b.write_str("{\"key\":" + str(ch.key) + ",\"modifiers\":" + str(ch.modifiers) + "}")
         }
         b.write_str("]}")
     }
@@ -110,6 +156,8 @@ pub fn (input $&InputMap) import_bindings_json(raw &string) int {
     input.actions = []Action{}
     input.bindings = []InputBinding{}
     input.source_bindings = []SourceBinding{}
+    input.mouse_bindings = []MouseBinding{}
+    input.chord_bindings = []ChordBinding{}
 
     for i in 0:doc.count(acts) {
         node := doc.at(acts, i)
@@ -117,6 +165,7 @@ pub fn (input $&InputMap) import_bindings_json(raw &string) int {
             >> errors.new("nexus input: invalid action binding object")
         }
         name := doc.as_string(doc.get(node, "name")) or >>
+        _ := input.ensure_action(name + "") or >>
         klist := doc.get(node, "keys")
         slist := doc.get(node, "sources")
         if klist < 0 || !doc.is_list(klist) || slist < 0 || !doc.is_list(slist) {
@@ -129,6 +178,31 @@ pub fn (input $&InputMap) import_bindings_json(raw &string) int {
         for si in 0:doc.count(slist) {
             src := doc.as_int(doc.at(slist, si)) or >>
             input.bind_source(name + "", src) or >>
+        }
+        if doc.has(node, "mouse_buttons") {
+            mlist := doc.get(node, "mouse_buttons")
+            if mlist < 0 || !doc.is_list(mlist) {
+                >> errors.new("nexus input: mouse_buttons must be array")
+            }
+            for mi in 0:doc.count(mlist) {
+                btn := doc.as_int(doc.at(mlist, mi)) or >>
+                input.bind_mouse(name + "", btn) or >>
+            }
+        }
+        if doc.has(node, "chords") {
+            clist := doc.get(node, "chords")
+            if clist < 0 || !doc.is_list(clist) {
+                >> errors.new("nexus input: chords must be array")
+            }
+            for ci in 0:doc.count(clist) {
+                cnode := doc.at(clist, ci)
+                if !doc.is_dict(cnode) || !doc.has(cnode, "key") || !doc.has(cnode, "modifiers") {
+                    >> errors.new("nexus input: invalid chord binding object")
+                }
+                ckey := doc.as_int(doc.get(cnode, "key")) or >>
+                cmods := doc.as_int(doc.get(cnode, "modifiers")) or >>
+                input.bind_chord(name + "", ckey, cmods) or >>
+            }
         }
     }
     input.refresh()

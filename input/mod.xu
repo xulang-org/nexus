@@ -2,10 +2,23 @@
 
 fm #"github.com/xulang-org/nexus/foundation/math"
 #errors
+#math
 
 pub const MAX_KEYS = 512
 pub const MAX_ACTIONS = 128
 pub const MAX_SOURCES = 128
+pub const MAX_MOUSE_BUTTONS = 8
+
+pub const MOUSE_BUTTON_LEFT = 1
+pub const MOUSE_BUTTON_MIDDLE = 2
+pub const MOUSE_BUTTON_RIGHT = 3
+pub const MOUSE_BUTTON_BACK = 4
+pub const MOUSE_BUTTON_FORWARD = 5
+
+pub const MOD_SHIFT = 3
+pub const MOD_CTRL = 12
+pub const MOD_ALT = 48
+pub const MOD_META = 192
 
 struct Action {
     name string
@@ -13,73 +26,155 @@ struct Action {
     just_pressed bool
     just_released bool
     value f64
+    held_time f64
 }
 struct InputBinding {
     action int
     key int
 }
-struct SourceBinding { action int
-    source int }
+struct SourceBinding {
+    action int
+    source int
+}
+struct MouseBinding {
+    action int
+    button int
+}
+struct ChordBinding {
+    action int
+    key int
+    modifiers int
+}
 pub struct InputMap {
     keys []bool
     actions []Action
     bindings []InputBinding
     sources []f64
     source_bindings []SourceBinding
+    mouse_buttons []bool
+    mouse_just_pressed []bool
+    mouse_just_released []bool
+    mouse_clicks []int
+    mouse_pos fm.Vec2
+    mouse_delta fm.Vec2
+    mouse_wheel fm.Vec2
+    modifiers int
+    mouse_bindings []MouseBinding
+    chord_bindings []ChordBinding
 }
 pub fn new_input_map() InputMap {
     $keys := []bool{}
     for i in 0:MAX_KEYS { keys.push(false) }
     $sources := []f64{}
     for i in 0:MAX_SOURCES { sources.push(0.0) }
+    $mb := []bool{}
+    $mjp := []bool{}
+    $mjr := []bool{}
+    $mc := []int{}
+    for i in 0:MAX_MOUSE_BUTTONS {
+        mb.push(false)
+        mjp.push(false)
+        mjr.push(false)
+        mc.push(0)
+    }
     << InputMap{keys: keys, actions: []Action{}, bindings: []InputBinding{},
-        sources: sources, source_bindings: []SourceBinding{}}
+        sources: sources, source_bindings: []SourceBinding{},
+        mouse_buttons: mb, mouse_just_pressed: mjp, mouse_just_released: mjr, mouse_clicks: mc,
+        mouse_pos: fm.vec2(0.0, 0.0), mouse_delta: fm.vec2(0.0, 0.0), mouse_wheel: fm.vec2(0.0, 0.0),
+        modifiers: 0, mouse_bindings: []MouseBinding{}, chord_bindings: []ChordBinding{}}
+}
+pub fn (input &InputMap) has_action(name string) bool {
+    for i in 0:input.actions.len { if input.actions[i].name == name { << true } }
+    << false
 }
 fn (input &InputMap) action_index(name &string) int {
     for i in 0:input.actions.len { if input.actions[i].name == *name { << i } }
     >> errors.new("nexus: unknown input action: " + name)
 }
+fn (input $&InputMap) ensure_action(name string) int {
+    if name.len == 0 || name.len > 128 {
+        >> errors.new("nexus: invalid input action name")
+    }
+    for i in 0:input.actions.len { if input.actions[i].name == name { << i } }
+    if input.actions.len >= MAX_ACTIONS { >> errors.new("nexus: input action capacity exceeded") }
+    input.actions.push(Action{name: name, pressed: false,
+        just_pressed: false, just_released: false, value: 0.0, held_time: 0.0})
+    << input.actions.len - 1
+}
 // Multiple physical keys can hold one action. Bind before processing input.
 pub fn (input $&InputMap) bind(name string, key int) int {
-    if name.len == 0 || name.len > 128 || key < 0 || key >= MAX_KEYS {
+    if key < 0 || key >= MAX_KEYS {
         >> errors.new("nexus: invalid input binding")
     }
-    $index := -1
-    for i in 0:input.actions.len { if input.actions[i].name == name { index = i } }
-    if index < 0 {
-        if input.actions.len >= MAX_ACTIONS { >> errors.new("nexus: input action capacity exceeded") }
-        input.actions.push(Action{name: name, pressed: false,
-            just_pressed: false, just_released: false, value: 0.0})
-        index = input.actions.len - 1
-    }
+    index := input.ensure_action(name + "") or >>
     for binding in input.bindings { if binding.action == index && binding.key == key { << 0 } }
     input.bindings.push(InputBinding{action: index, key: key})
-    if input.keys[key] { input.actions[index].pressed = true
-        input.actions[index].value = 1.0 }
+    input.refresh()
     << 0
 }
 // Independent analog sources share actions without impersonating keyboard keys.
 pub fn (input $&InputMap) bind_source(name string, source int) int {
-    if name.len == 0 || name.len > 128 || source < 0 || source >= MAX_SOURCES {
+    if source < 0 || source >= MAX_SOURCES {
         >> errors.new("nexus: invalid input source binding")
     }
-    $index := -1
-    for i in 0:input.actions.len { if input.actions[i].name == name { index = i } }
-    if index < 0 {
-        if input.actions.len >= MAX_ACTIONS { >> errors.new("nexus: input action capacity exceeded") }
-        input.actions.push(Action{name: name, pressed: false, just_pressed: false, just_released: false, value: 0.0})
-        index = input.actions.len - 1
-    }
+    index := input.ensure_action(name + "") or >>
     for binding in input.source_bindings { if binding.action == index && binding.source == source { << 0 } }
     input.source_bindings.push(SourceBinding{action: index, source: source})
     input.refresh()
     << 0
 }
+pub fn (input $&InputMap) bind_mouse(name string, button int) int {
+    if button < 0 || button >= MAX_MOUSE_BUTTONS {
+        >> errors.new("nexus: mouse button outside input range")
+    }
+    index := input.ensure_action(name + "") or >>
+    for binding in input.mouse_bindings { if binding.action == index && binding.button == button { << 0 } }
+    input.mouse_bindings.push(MouseBinding{action: index, button: button})
+    input.refresh()
+    << 0
+}
+pub fn (input $&InputMap) bind_chord(name string, key int, required_modifiers int) int {
+    if key < 0 || key >= MAX_KEYS {
+        >> errors.new("nexus: chord key outside input range")
+    }
+    index := input.ensure_action(name + "") or >>
+    req := required_modifiers & (MOD_SHIFT | MOD_CTRL | MOD_ALT | MOD_META)
+    for binding in input.chord_bindings {
+        if binding.action == index && binding.key == key && binding.modifiers == req { << 0 }
+    }
+    input.chord_bindings.push(ChordBinding{action: index, key: key, modifiers: req})
+    input.refresh()
+    << 0
+}
+fn effective_modifiers(input &InputMap) int {
+    $m := input.modifiers
+    if input.keys[225] || input.keys[229] { m = m | 1 }
+    if input.keys[224] || input.keys[228] { m = m | 4 }
+    if input.keys[226] || input.keys[230] { m = m | 16 }
+    if input.keys[227] || input.keys[231] { m = m | 64 }
+    << m
+}
+fn chord_mods_satisfied(required int, active int) bool {
+    if (required & MOD_SHIFT) != 0 && (active & MOD_SHIFT) == 0 { << false }
+    if (required & MOD_CTRL) != 0 && (active & MOD_CTRL) == 0 { << false }
+    if (required & MOD_ALT) != 0 && (active & MOD_ALT) == 0 { << false }
+    if (required & MOD_META) != 0 && (active & MOD_META) == 0 { << false }
+    << true
+}
 fn (input $&InputMap) refresh() {
+    eff_mods := effective_modifiers(input)
     for i in 0:input.actions.len {
         $value := 0.0
         for binding in input.bindings {
             if binding.action == i && input.keys[binding.key] { value = 1.0 }
+        }
+        for binding in input.mouse_bindings {
+            if binding.action == i && input.mouse_buttons[binding.button] { value = 1.0 }
+        }
+        for binding in input.chord_bindings {
+            if binding.action == i && input.keys[binding.key] && chord_mods_satisfied(binding.modifiers, eff_mods) {
+                value = 1.0
+            }
         }
         for binding in input.source_bindings {
             if binding.action == i && input.sources[binding.source] > value { value = input.sources[binding.source] }
@@ -88,7 +183,10 @@ fn (input $&InputMap) refresh() {
         pressed := value > 0.0
         input.actions[i].value = value
         input.actions[i].pressed = pressed
-        if pressed && !previous { input.actions[i].just_pressed = true }
+        if pressed && !previous {
+            input.actions[i].just_pressed = true
+            input.actions[i].held_time = 0.0
+        }
         if !pressed && previous { input.actions[i].just_released = true }
     }
 }
@@ -105,7 +203,99 @@ pub fn (input $&InputMap) begin_frame() {
     for i in 0:input.actions.len {
         input.actions[i].just_pressed = false
         input.actions[i].just_released = false
+        if !input.actions[i].pressed {
+            input.actions[i].held_time = 0.0
+        }
     }
+    for b in 0:MAX_MOUSE_BUTTONS {
+        input.mouse_just_pressed[b] = false
+        input.mouse_just_released[b] = false
+        input.mouse_clicks[b] = 0
+    }
+    input.mouse_delta = fm.vec2(0.0, 0.0)
+    input.mouse_wheel = fm.vec2(0.0, 0.0)
+}
+pub fn (input $&InputMap) advance_timers(dt f64) int {
+    if !fm.finite(dt) || dt < 0.0 {
+        >> errors.new("nexus: input timer dt must be finite and non-negative")
+    }
+    for i in 0:input.actions.len {
+        if input.actions[i].pressed {
+            input.actions[i].held_time = input.actions[i].held_time + dt
+        }
+    }
+    << 0
+}
+pub fn (input &InputMap) held_duration(name string) f64 {
+    index := input.action_index(&name) or >>
+    << input.actions[index].held_time
+}
+pub fn (input $&InputMap) feed_modifiers(mods int) {
+    if input.modifiers == mods { << }
+    input.modifiers = mods
+    input.refresh()
+}
+pub fn (input $&InputMap) feed_pointer_move(x f64, y f64, dx f64, dy f64) int {
+    if !fm.finite(x) || !fm.finite(y) || !fm.finite(dx) || !fm.finite(dy) {
+        >> errors.new("nexus: non-finite pointer motion")
+    }
+    input.mouse_pos = fm.vec2(x, y)
+    input.mouse_delta = input.mouse_delta.add(fm.vec2(dx, dy))
+    << 0
+}
+pub fn (input $&InputMap) feed_pointer_button(button int, down bool, clicks int, x f64, y f64) int {
+    if button < 0 || button >= MAX_MOUSE_BUTTONS || !fm.finite(x) || !fm.finite(y) {
+        >> errors.new("nexus: invalid pointer button or position")
+    }
+    input.mouse_pos = fm.vec2(x, y)
+    prev := input.mouse_buttons[button]
+    input.mouse_buttons[button] = down
+    if down && !prev {
+        input.mouse_just_pressed[button] = true
+        $clk := 1
+        if clicks > 0 { clk = clicks }
+        input.mouse_clicks[button] = clk
+    } else if !down && prev {
+        input.mouse_just_released[button] = true
+    }
+    input.refresh()
+    << 0
+}
+pub fn (input $&InputMap) feed_wheel(dx f64, dy f64) int {
+    if !fm.finite(dx) || !fm.finite(dy) {
+        >> errors.new("nexus: non-finite wheel delta")
+    }
+    input.mouse_wheel = input.mouse_wheel.add(fm.vec2(dx, dy))
+    << 0
+}
+pub fn (input &InputMap) mouse_position() fm.Vec2 { << input.mouse_pos }
+pub fn (input &InputMap) mouse_delta() fm.Vec2 { << input.mouse_delta }
+pub fn (input &InputMap) mouse_wheel() fm.Vec2 { << input.mouse_wheel }
+pub fn (input &InputMap) modifiers() int { << effective_modifiers(input) }
+pub fn (input &InputMap) has_modifier(mask int) bool { << (effective_modifiers(input) & mask) != 0 }
+pub fn (input &InputMap) mouse_button_down(button int) bool {
+    if button < 0 || button >= MAX_MOUSE_BUTTONS {
+        >> errors.new("nexus: mouse button outside input range")
+    }
+    << input.mouse_buttons[button]
+}
+pub fn (input &InputMap) mouse_button_just_pressed(button int) bool {
+    if button < 0 || button >= MAX_MOUSE_BUTTONS {
+        >> errors.new("nexus: mouse button outside input range")
+    }
+    << input.mouse_just_pressed[button]
+}
+pub fn (input &InputMap) mouse_button_just_released(button int) bool {
+    if button < 0 || button >= MAX_MOUSE_BUTTONS {
+        >> errors.new("nexus: mouse button outside input range")
+    }
+    << input.mouse_just_released[button]
+}
+pub fn (input &InputMap) mouse_clicks(button int) int {
+    if button < 0 || button >= MAX_MOUSE_BUTTONS {
+        >> errors.new("nexus: mouse button outside input range")
+    }
+    << input.mouse_clicks[button]
 }
 pub fn (input $&InputMap) feed_key(key int, down bool) int {
     if key < 0 || key >= MAX_KEYS { >> errors.new("nexus: key outside input range") }
@@ -117,6 +307,15 @@ pub fn (input $&InputMap) feed_key(key int, down bool) int {
 pub fn (input $&InputMap) release_all() {
     for i in 0:MAX_KEYS { input.keys[i] = false }
     for i in 0:MAX_SOURCES { input.sources[i] = 0.0 }
+    for b in 0:MAX_MOUSE_BUTTONS {
+        if input.mouse_buttons[b] { input.mouse_just_released[b] = true }
+        input.mouse_buttons[b] = false
+        input.mouse_just_pressed[b] = false
+        input.mouse_clicks[b] = 0
+    }
+    input.modifiers = 0
+    input.mouse_delta = fm.vec2(0.0, 0.0)
+    input.mouse_wheel = fm.vec2(0.0, 0.0)
     for i in 0:input.actions.len {
         if input.actions[i].pressed { input.actions[i].just_released = true }
         input.actions[i].pressed = false

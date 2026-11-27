@@ -1,0 +1,268 @@
+@"github.com/xulang-org/nexus/foundation/diagnostics"
+
+#encoding/json
+#errors
+#math
+#strconv
+#strings
+
+pub const LOG_TRACE = 0
+pub const LOG_DEBUG = 1
+pub const LOG_INFO = 2
+pub const LOG_WARN = 3
+pub const LOG_ERROR = 4
+pub const LOG_FATAL = 5
+pub const LOG_OFF = 6
+
+pub const MAX_LOG_CAPACITY = 16384
+
+pub struct LogEntry {
+    pub seq int
+    pub level int
+    pub category string
+    pub message string
+    pub timestamp_ms int
+}
+
+pub struct Logger {
+    capacity int
+    entries []LogEntry
+    write_idx int
+    count int
+    next_seq int
+    min_level int
+    cat_names []string
+    cat_levels []int
+    level_counts []int
+}
+
+fn valid_level(level int) bool {
+    << level >= LOG_TRACE && level <= LOG_OFF
+}
+
+pub fn level_name(level int) string {
+    if level == LOG_TRACE { << "TRACE" }
+    if level == LOG_DEBUG { << "DEBUG" }
+    if level == LOG_INFO { << "INFO" }
+    if level == LOG_WARN { << "WARN" }
+    if level == LOG_ERROR { << "ERROR" }
+    if level == LOG_FATAL { << "FATAL" }
+    if level == LOG_OFF { << "OFF" }
+    << "UNKNOWN"
+}
+
+pub fn new_logger(capacity int) Logger {
+    if capacity < 1 || capacity > MAX_LOG_CAPACITY {
+        >> errors.new("nexus diagnostics: logger capacity must be in 1..16384")
+    }
+    $counts := []int{}
+    for _ in 0:7 { counts.push(0) }
+    << Logger{
+        capacity: capacity,
+        entries: []LogEntry{},
+        write_idx: 0,
+        count: 0,
+        next_seq: 1,
+        min_level: LOG_INFO,
+        cat_names: []string{},
+        cat_levels: []int{},
+        level_counts: counts
+    }
+}
+
+pub fn (l $&Logger) set_level(level int) int {
+    if !valid_level(level) {
+        >> errors.new("nexus diagnostics: invalid log level")
+    }
+    l.min_level = level
+    << 0
+}
+
+pub fn (l &Logger) level() int { << l.min_level }
+
+pub fn (l $&Logger) set_category_level(category string, level int) int {
+    if category.len == 0 || !valid_level(level) {
+        >> errors.new("nexus diagnostics: invalid log category or level")
+    }
+    for i in 0:l.cat_names.len {
+        if l.cat_names[i] == category {
+            l.cat_levels[i] = level
+            << 0
+        }
+    }
+    l.cat_names.push(category + "")
+    l.cat_levels.push(level)
+    << 0
+}
+
+pub fn (l $&Logger) clear_category_level(category string) bool {
+    for i in 0:l.cat_names.len {
+        if l.cat_names[i] == category {
+            last := l.cat_names.len - 1
+            if i < last {
+                l.cat_names[i] = l.cat_names[last]
+                l.cat_levels[i] = l.cat_levels[last]
+            }
+            $next_names := []string{}
+            $next_levels := []int{}
+            for j in 0:last {
+                next_names.push(l.cat_names[j])
+                next_levels.push(l.cat_levels[j])
+            }
+            l.cat_names = next_names
+            l.cat_levels = next_levels
+            << true
+        }
+    }
+    << false
+}
+
+pub fn (l &Logger) effective_level(category string) int {
+    for i in 0:l.cat_names.len {
+        if l.cat_names[i] == category { << l.cat_levels[i] }
+    }
+    << l.min_level
+}
+
+fn make_log_entry(seq int, level int, cat &string, msg &string, timestamp_ms int) LogEntry {
+    << LogEntry{
+        seq: seq,
+        level: level,
+        category: *cat + "",
+        message: *msg + "",
+        timestamp_ms: timestamp_ms
+    }
+}
+
+pub fn (l $&Logger) log(level int, category string, message string, timestamp_ms int) bool {
+    if level < LOG_TRACE || level > LOG_FATAL {
+        >> errors.new("nexus diagnostics: entry level must be LOG_TRACE..LOG_FATAL")
+    }
+    if category.len == 0 {
+        >> errors.new("nexus diagnostics: log category cannot be empty")
+    }
+    if level < l.effective_level(category + "") {
+        << false
+    }
+    seq := l.next_seq
+    l.next_seq = seq + 1
+    l.level_counts[level] = l.level_counts[level] + 1
+    if l.entries.len < l.capacity {
+        l.entries.push(make_log_entry(seq, level, &category, &message, timestamp_ms))
+    } else {
+        l.entries[l.write_idx] = make_log_entry(seq, level, &category, &message, timestamp_ms)
+    }
+    $cap := l.capacity
+    if cap < 1 { cap = 1 }
+    l.write_idx = (l.write_idx + 1) % cap
+    if l.count < l.capacity {
+        l.count = l.count + 1
+    }
+    << true
+}
+
+pub fn (l $&Logger) trace(category string, message string, ts_ms int) bool {
+    << l.log(LOG_TRACE, category, message, ts_ms) or >>
+}
+
+pub fn (l $&Logger) debug(category string, message string, ts_ms int) bool {
+    << l.log(LOG_DEBUG, category, message, ts_ms) or >>
+}
+
+pub fn (l $&Logger) info(category string, message string, ts_ms int) bool {
+    << l.log(LOG_INFO, category, message, ts_ms) or >>
+}
+
+pub fn (l $&Logger) warn(category string, message string, ts_ms int) bool {
+    << l.log(LOG_WARN, category, message, ts_ms) or >>
+}
+
+pub fn (l $&Logger) error(category string, message string, ts_ms int) bool {
+    << l.log(LOG_ERROR, category, message, ts_ms) or >>
+}
+
+pub fn (l $&Logger) fatal(category string, message string, ts_ms int) bool {
+    << l.log(LOG_FATAL, category, message, ts_ms) or >>
+}
+
+pub fn (l &Logger) total_logged() int { << l.next_seq - 1 }
+pub fn (l &Logger) buffered_count() int { << l.count }
+
+pub fn (l &Logger) count_by_level(level int) int {
+    if !valid_level(level) { << 0 }
+    << l.level_counts[level]
+}
+
+pub fn (l $&Logger) clear() {
+    l.entries = []LogEntry{}
+    l.write_idx = 0
+    l.count = 0
+}
+
+fn clone_entry(e &LogEntry) LogEntry {
+    << LogEntry{
+        seq: e.seq,
+        level: e.level,
+        category: e.category + "",
+        message: e.message + "",
+        timestamp_ms: e.timestamp_ms
+    }
+}
+
+pub fn (l &Logger) recent(limit int) []LogEntry {
+    $out := []LogEntry{}
+    if l.count == 0 || limit == 0 { << out }
+    $take := l.count
+    if limit > 0 && limit < take { take = limit }
+    $cap := l.capacity
+    if cap < 1 { cap = 1 }
+    $oldest := l.write_idx
+    if l.count < l.capacity { oldest = 0 }
+    skip := l.count - take
+    for i in 0:take {
+        idx := (oldest + skip + i) % cap
+        out.push(clone_entry(&l.entries[idx]))
+    }
+    << out
+}
+
+pub fn (l &Logger) filter(min_level int, category string) []LogEntry {
+    $out := []LogEntry{}
+    if l.count == 0 { << out }
+    $cap := l.capacity
+    if cap < 1 { cap = 1 }
+    $oldest := l.write_idx
+    if l.count < l.capacity { oldest = 0 }
+    for i in 0:l.count {
+        idx := (oldest + i) % cap
+        e := &l.entries[idx]
+        if e.level < min_level { -> }
+        if category.len > 0 && e.category != category { -> }
+        out.push(clone_entry(e))
+    }
+    << out
+}
+
+pub fn format_entry(e &LogEntry) string {
+    << "[" + strconv.itoa(e.timestamp_ms) + "][" + level_name(e.level) + "][" + e.category + "] " + e.message
+}
+
+pub fn (l &Logger) export_json() string {
+    items := l.recent(l.count)
+    $b := strings.new_byte_builder(512)
+    b.write_str("{\"total_logged\":" + strconv.itoa(l.total_logged()) + ",\"entries\":[")
+    for i in 0:items.len {
+        if i > 0 { b.write_str(",") }
+        e := &items[i]
+        lvl := level_name(e.level)
+        cat := e.category + ""
+        msg := e.message + ""
+        b.write_str("{\"seq\":" + strconv.itoa(e.seq) +
+            ",\"level\":" + json.quote(&lvl) +
+            ",\"category\":" + json.quote(&cat) +
+            ",\"message\":" + json.quote(&msg) +
+            ",\"timestamp_ms\":" + strconv.itoa(e.timestamp_ms) + "}")
+    }
+    b.write_str("]}")
+    << b.to_string()
+}

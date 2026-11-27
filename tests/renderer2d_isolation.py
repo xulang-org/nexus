@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='xu-nexus-render-isolation-') as temporary:
     target = Path(temporary)
     shutil.copyfile(ROOT / 'xu.xun', target / 'xu.xun')
-    for name in ('foundation', 'platform/present', 'rendering/two_d', 'resources/canvas',
+    for name in ('foundation', 'platform/present', 'rendering/two_d', 'resources/canvas', 'resources/lighting2d',
                  'internal/file_snapshot', 'assets/shaders/two_d', 'build/canvas-shaders'):
         shutil.copytree(ROOT / name, target / name)
     (target / 'checks').mkdir()

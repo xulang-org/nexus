@@ -11,9 +11,34 @@ import subprocess
 import tempfile
 from canvas_shaders import prepare
 from mesh_shaders import prepare_mesh
-from project import publish, published_scene
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def project_cli():
+    cli = ROOT / 'build/nexus-project'
+    if not cli.is_file():
+        subprocess.run(['make', 'project-cli'], cwd=ROOT, check=True)
+    return cli
+
+
+def publish(project, output, validator):
+    cli = project_cli()
+    subprocess.run(
+        [str(cli), 'build', str(project), '--output', str(output), '--validator', str(validator)],
+        cwd=ROOT, check=True,
+    )
+    publication = json.loads((Path(output) / 'current.json').read_bytes())
+    return publication, {}
+
+
+def published_scene(output, name):
+    cli = project_cli()
+    result = subprocess.run(
+        [str(cli), 'scene', str(name), '--output', str(output)],
+        cwd=ROOT, check=True, capture_output=True, text=True,
+    )
+    return Path(result.stdout.strip())
 ISOMETRIC_ASSETS = ROOT / 'examples/isometric_2d/assets'
 HD2D_ASSETS = ROOT / 'examples/hd2d_scene/assets'
 CANVAS_FILES = ['canvas/format', 'canvas/canvas.vert.bin', 'canvas/canvas.frag.bin']

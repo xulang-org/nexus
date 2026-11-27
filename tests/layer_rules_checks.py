@@ -253,3 +253,10 @@ for source in ('resources/persistence/guid.xu', 'resources/persistence/migration
     rejects(changed(source, 'nexus_audio_native'), 'native audio import must stay')
     rejects(changed(source, module + '/scene'), 'forbidden dependency')
 print('PASS: resources/persistence stays pure CPU data with zero OS, GPU, native, or scene dependencies')
+
+for source in ('foundation/diagnostics/log.xu', 'foundation/diagnostics/cvar.xu', 'foundation/events/mod.xu', 'foundation/spatial/mod.xu'):
+    rejects(changed(source, 'os'), 'forbidden external import')
+    rejects(changed(source, 'gpu'), 'forbidden external import')
+    rejects(changed(source, 'nexus_audio_native'), 'native audio import must stay')
+    rejects(changed(source, module + '/scene'), 'forbidden layer dependency')
+print('PASS: foundation diagnostics, events, and spatial stay pure CPU foundation with zero OS, GPU, native, or scene dependencies')

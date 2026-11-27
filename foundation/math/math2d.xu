@@ -9,11 +9,27 @@ pub struct Vec2 {
 }
 
 pub fn vec2(x f64, y f64) Vec2 { << Vec2{x: x, y: y} }
+pub fn vec2_from_angle(radians f64) Vec2 {
+    if !finite(radians) { << vec2(1.0, 0.0) }
+    << vec2(math.cos(radians), math.sin(radians))
+}
+pub fn (v Vec2) is_finite() bool { << finite(v.x) && finite(v.y) }
+pub fn (v Vec2) neg() Vec2 { << vec2(-v.x, -v.y) }
 pub fn (v Vec2) add(other Vec2) Vec2 { << vec2(v.x + other.x, v.y + other.y) }
 pub fn (v Vec2) sub(other Vec2) Vec2 { << vec2(v.x - other.x, v.y - other.y) }
 pub fn (v Vec2) scaled(amount f64) Vec2 { << vec2(v.x * amount, v.y * amount) }
+pub fn (v Vec2) mul_components(other Vec2) Vec2 { << vec2(v.x * other.x, v.y * other.y) }
 pub fn (v Vec2) dot(other Vec2) f64 { << v.x * other.x + v.y * other.y }
+pub fn (v Vec2) cross(other Vec2) f64 { << v.x * other.y - v.y * other.x }
+pub fn (v Vec2) perp() Vec2 { << vec2(-v.y, v.x) }
+pub fn (v Vec2) length_sq() f64 { << v.dot(v) }
 pub fn (v Vec2) length() f64 { << math.sqrt(v.dot(v)) }
+pub fn (v Vec2) distance_sq(other Vec2) f64 {
+    dx := v.x - other.x
+    dy := v.y - other.y
+    << dx * dx + dy * dy
+}
+pub fn (v Vec2) distance(other Vec2) f64 { << math.sqrt(v.distance_sq(other)) }
 pub fn (v Vec2) normalized() Vec2 {
     length := v.length()
     if length <= 0.000000001 { << vec2(0.0, 0.0) }
@@ -22,6 +38,42 @@ pub fn (v Vec2) normalized() Vec2 {
 pub fn (v Vec2) lerp(other Vec2, weight f64) Vec2 {
     << v.add(other.sub(v).scaled(weight))
 }
+pub fn (v Vec2) angle() f64 { << math.atan2(v.y, v.x) }
+pub fn (v Vec2) rotated(radians f64) Vec2 {
+    cs := math.cos(radians)
+    sn := math.sin(radians)
+    << vec2(v.x * cs - v.y * sn, v.x * sn + v.y * cs)
+}
+pub fn (v Vec2) reflect(normal Vec2) Vec2 {
+    n := normal.normalized()
+    << v.sub(n.scaled(2.0 * v.dot(n)))
+}
+pub fn (v Vec2) project(onto Vec2) Vec2 {
+    denom := onto.length_sq()
+    if denom <= 1e-12 { << vec2(0.0, 0.0) }
+    << onto.scaled(v.dot(onto) / denom)
+}
+pub fn (v Vec2) clamp_length(max_length f64) Vec2 {
+    if !finite(max_length) || max_length <= 0.0 { << vec2(0.0, 0.0) }
+    len_sq := v.length_sq()
+    if len_sq <= max_length * max_length || len_sq <= 1e-18 { << v }
+    len := math.sqrt(len_sq)
+    if len <= 1e-12 { << vec2(0.0, 0.0) }
+    << v.scaled(max_length / len)
+}
+pub fn (v Vec2) move_towards(target Vec2, max_delta f64) Vec2 {
+    if !finite(max_delta) || max_delta <= 0.0 { << v }
+    diff := target.sub(v)
+    dist := diff.length()
+    if dist <= max_delta || dist <= 1e-12 { << target }
+    << v.add(diff.scaled(max_delta / dist))
+}
+pub fn (v Vec2) approx_eq(other Vec2, eps f64) bool {
+    t := math.max(0.0, eps)
+    << math.abs(v.x - other.x) <= t && math.abs(v.y - other.y) <= t
+}
+pub fn min_vec2(a Vec2, b Vec2) Vec2 { << vec2(math.min(a.x, b.x), math.min(a.y, b.y)) }
+pub fn max_vec2(a Vec2, b Vec2) Vec2 { << vec2(math.max(a.x, b.x), math.max(a.y, b.y)) }
 pub fn finite(value f64) bool { << !math.is_nan(value) && !math.is_inf(value) }
 
 // Column-vector affine algebra; angles are radians. Screen-axis conventions
@@ -63,6 +115,21 @@ pub fn (t Transform2D) inverse() Transform2D {
     << Transform2D{a: t.d / det, b: -t.b / det, c: -t.c / det, d: t.a / det,
         tx: (t.c * t.ty - t.d * t.tx) / det, ty: (t.b * t.tx - t.a * t.ty) / det}
 }
+pub fn (t Transform2D) translation() Vec2 { << vec2(t.tx, t.ty) }
+pub fn (t Transform2D) rotation() f64 { << math.atan2(t.b, t.a) }
+pub fn (t Transform2D) scale() Vec2 {
+    sx := math.sqrt(t.a * t.a + t.b * t.b)
+    $sy := math.sqrt(t.c * t.c + t.d * t.d)
+    if t.a * t.d - t.b * t.c < 0.0 { sy = -sy }
+    << vec2(sx, sy)
+}
+pub fn (t Transform2D) direction(v Vec2) Vec2 {
+    << vec2(t.a * v.x + t.c * v.y, t.b * v.x + t.d * v.y)
+}
+pub fn (t Transform2D) inverse_point(v Vec2) Vec2 {
+    inv := t.inverse() or >>
+    << inv.point(v)
+}
 
 pub struct Rect2 {
     pub position Vec2
@@ -83,4 +150,36 @@ pub fn (r Rect2) contains(point Vec2) bool {
 pub fn (r Rect2) overlaps(other Rect2) bool {
     << r.position.x < other.position.x + other.size.x && r.position.x + r.size.x > other.position.x &&
         r.position.y < other.position.y + other.size.y && r.position.y + r.size.y > other.position.y
+}
+pub fn (r Rect2) min() Vec2 { << r.position }
+pub fn (r Rect2) max() Vec2 { << r.position.add(r.size) }
+pub fn (r Rect2) center() Vec2 { << vec2(r.position.x + r.size.x * 0.5, r.position.y + r.size.y * 0.5) }
+pub fn (r Rect2) area() f64 { << r.size.x * r.size.y }
+pub fn (r Rect2) expanded(margin f64) Rect2 {
+    if !r.valid() || !finite(margin) { >> errors.new("nexus math: invalid rect expansion") }
+    out := rect2(r.position.x - margin, r.position.y - margin, r.size.x + margin * 2.0, r.size.y + margin * 2.0)
+    if !out.valid() { >> errors.new("nexus math: expanded Rect2 has non-positive size") }
+    << out
+}
+pub fn (r Rect2) union_rect(other Rect2) Rect2 {
+    if !r.valid() || !other.valid() { >> errors.new("nexus math: union requires valid Rect2 bounds") }
+    min_x := math.min(r.position.x, other.position.x)
+    min_y := math.min(r.position.y, other.position.y)
+    max_x := math.max(r.position.x + r.size.x, other.position.x + other.size.x)
+    max_y := math.max(r.position.y + r.size.y, other.position.y + other.size.y)
+    << rect2(min_x, min_y, max_x - min_x, max_y - min_y)
+}
+pub fn (r Rect2) has_intersection(other Rect2) bool { << r.overlaps(other) }
+pub fn (r Rect2) intersection(other Rect2) Rect2 {
+    if !r.overlaps(other) { >> errors.new("nexus math: Rect2 rectangles do not overlap") }
+    min_x := math.max(r.position.x, other.position.x)
+    min_y := math.max(r.position.y, other.position.y)
+    max_x := math.min(r.position.x + r.size.x, other.position.x + other.size.x)
+    max_y := math.min(r.position.y + r.size.y, other.position.y + other.size.y)
+    << rect2(min_x, min_y, max_x - min_x, max_y - min_y)
+}
+pub fn (r Rect2) clamp_point(point Vec2) Vec2 {
+    cx := math.max(r.position.x, math.min(r.position.x + r.size.x, point.x))
+    cy := math.max(r.position.y, math.min(r.position.y + r.size.y, point.y))
+    << vec2(cx, cy)
 }

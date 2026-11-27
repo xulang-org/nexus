@@ -12,7 +12,7 @@ with tempfile.TemporaryDirectory(prefix='xu-nexus-scene-isolation-') as director
     target = Path(directory)
     shutil.copyfile(root / 'xu.xun', target / 'xu.xun')
     for package in ['scene', 'foundation/math', 'resources/camera', 'resources/scene','resources/lod','resources/lighting','resources/shadow',
-                    'resources/sprite3d', 'resources/tilemap', 'formats/scene', 'internal/file_snapshot', 'integration/scene']:
+                    'resources/persistence', 'resources/sprite3d', 'resources/tilemap', 'formats/scene', 'internal/file_snapshot', 'integration/scene']:
         shutil.copytree(root / package, target / package)
     check = target / 'checks'
     check.mkdir()
