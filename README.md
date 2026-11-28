@@ -8,7 +8,7 @@
 
 # Nexus Engine
 
-Nexus Engine 是独立的 Xu 游戏引擎库，模块为 `github.com/xulang-org/nexus`，当前开发版本 `0.1.2-dev.1`。
+Nexus Engine 是独立的 Xu 游戏引擎库，模块为 `github.com/xulang-org/nexus`，当前版本 `0.1.2`。
 场景树、可复用场景、变换、相机、图集动画、输入、时钟、碰撞、画布和精灵逻辑使用 Xu。
 3D 向量、矩阵、透视相机、网格构建、父子变换、材质参数和场景绘制同样使用 Xu。
 音频资源、重采样、声像、IMA ADPCM（`0x0011`）编解码、每总线 DSP 效果架（RBJ Biquad 低通/高通/带通滤波、回声延迟与 Schroeder/Moorer 立体声混响）、总线混音和节点播放状态也由 Xu 实现；设备提交使用独立音频 C ABI。
