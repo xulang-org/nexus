@@ -13,66 +13,66 @@ struct AnimationDescription { name string
     duration f64
     tracks []AnimationTrack }
 fn (parser $&GlbParser) read_animations(root int,asset $&GlbGeometry) int {
-    nodes := optional_array(&parser.doc,root,"animations",128) or >>
+    nodes := optional_array(&parser.doc,root,"animations",128) >>>
     $budget := 0
     for node in nodes {
         allowed := ["name","channels","samplers"]
-        fields(&parser.doc,node,&allowed) or >>
-        samplers := array_property(&parser.doc,node,"samplers",1,4096) or >>
+        fields(&parser.doc,node,&allowed) >>>
+        samplers := array_property(&parser.doc,node,"samplers",1,4096) >>>
         for sampler in samplers {
             sf := ["input","output","interpolation"]
-            fields(&parser.doc,sampler,&sf) or >>
-            mode := text(&parser.doc,sampler,"interpolation","LINEAR") or >>
+            fields(&parser.doc,sampler,&sf) >>>
+            mode := text(&parser.doc,sampler,"interpolation","LINEAR") >>>
             if mode!="LINEAR" && mode!="STEP" && mode!="CUBICSPLINE" { >> errors.new("nexus GLB: invalid animation interpolation") }
-            input := parser.data_accessor(integer(&parser.doc,sampler,"input",-1,0,parser.accessors.len-1) or >>,1) or >>
-            oi := integer(&parser.doc,sampler,"output",-1,0,parser.accessors.len-1) or >>
+            input := parser.data_accessor(integer(&parser.doc,sampler,"input",-1,0,parser.accessors.len-1) >>>,1) >>>
+            oi := integer(&parser.doc,sampler,"output",-1,0,parser.accessors.len-1) >>>
             if oi<0 || (parser.accessors[oi].components!=3 && parser.accessors[oi].components!=4) { >> errors.new("nexus GLB: animation output must be VEC3/VEC4") }
-            output := parser.data_accessor(oi,parser.accessors[oi].components) or >>
+            output := parser.data_accessor(oi,parser.accessors[oi].components) >>>
             $factor := 1
             if mode=="CUBICSPLINE" { factor=3 }
             if output.count!=input.count*factor || !input.bounds { >> errors.new("nexus GLB: animation sample counts or time bounds invalid") }
             $previous := -1.0
             for k in 0:input.count {
-                t := parser.component(input,k,0) or >>
+                t := parser.component(input,k,0) >>>
                 if t<0.0 || t<=previous || t>1000000000.0 { >> errors.new("nexus GLB: animation times must be finite, nonnegative and strictly increasing") }
                 if k==0 && math.abs(t-input.minimum.x)>0.000001 { >> errors.new("nexus GLB: animation minimum time mismatch") }
                 previous=t
             }
             if math.abs(previous-input.maximum.x)>0.000001 { >> errors.new("nexus GLB: animation maximum time mismatch") }
         }
-        channels := array_property(&parser.doc,node,"channels",1,4096) or >>
+        channels := array_property(&parser.doc,node,"channels",1,4096) >>>
         $tracks := []AnimationTrack{}
         $seen := map[string]bool{}
         $duration := 0.0
         for channel in channels {
             cf := ["sampler","target"]
-            fields(&parser.doc,channel,&cf) or >>
-            si := integer(&parser.doc,channel,"sampler",-1,0,samplers.len-1) or >>
+            fields(&parser.doc,channel,&cf) >>>
+            si := integer(&parser.doc,channel,"sampler",-1,0,samplers.len-1) >>>
             if si<0 { >> errors.new("nexus GLB: animation channel needs sampler") }
-            target := required(&parser.doc,channel,"target") or >>
+            target := required(&parser.doc,channel,"target") >>>
             tf := ["node","path"]
-            fields(&parser.doc,target,&tf) or >>
-            ni := integer(&parser.doc,target,"node",-1,0,asset.nodes.len-1) or >>
-            path := text(&parser.doc,target,"path","") or >>
+            fields(&parser.doc,target,&tf) >>>
+            ni := integer(&parser.doc,target,"node",-1,0,asset.nodes.len-1) >>>
+            path := text(&parser.doc,target,"path","") >>>
             if ni<0 || asset.nodes[ni].matrix || (path!="translation" && path!="rotation" && path!="scale") { >> errors.new("nexus GLB: animation targets require TRS nodes and translation/rotation/scale paths") }
             key := str(ni)+"/"+path
             if seen.has(key+"") { >> errors.new("nexus GLB: duplicate animation channel target") }
             seen[key]=true
             sampler := samplers[si]
-            input := parser.data_accessor(integer(&parser.doc,sampler,"input",-1,0,parser.accessors.len-1) or >>,1) or >>
+            input := parser.data_accessor(integer(&parser.doc,sampler,"input",-1,0,parser.accessors.len-1) >>>,1) >>>
             $components := 3
             if path=="rotation" { components=4 }
-            output := parser.data_accessor(integer(&parser.doc,sampler,"output",-1,0,parser.accessors.len-1) or >>,components) or >>
+            output := parser.data_accessor(integer(&parser.doc,sampler,"output",-1,0,parser.accessors.len-1) >>>,components) >>>
             if output.count>262144-budget { >> errors.new("nexus GLB: animation key budget exceeded") }
             budget+=output.count
-            mode := text(&parser.doc,sampler,"interpolation","LINEAR") or >>
+            mode := text(&parser.doc,sampler,"interpolation","LINEAR") >>>
             $times := []f64{}
             $values := []fm.Vec4{}
-            for k in 0:input.count { times.push(parser.component(input,k,0) or >>) }
+            for k in 0:input.count { times.push(parser.component(input,k,0) >>>) }
             for k in 0:output.count {
-                xyz := parser.vector3(output,k) or >>
+                xyz := parser.vector3(output,k) >>>
                 $w := 0.0
-                if components==4 { w=parser.component(output,k,3) or >> }
+                if components==4 { w=parser.component(output,k,3) >>> }
                 value := fm.vec4(xyz.x,xyz.y,xyz.z,w)
                 if path=="rotation" && (mode!="CUBICSPLINE" || k%3==1) && math.abs(xyz.dot(xyz)+w*w-1.0)>0.0001 { >> errors.new("nexus GLB: rotation keys must be unit quaternions") }
                 values.push(value)
@@ -80,13 +80,13 @@ fn (parser $&GlbParser) read_animations(root int,asset $&GlbGeometry) int {
             duration=math.max(duration,times[times.len-1])
             tracks.push(AnimationTrack{node: ni,path: path,interpolation: mode,times: times,values: values})
         }
-        asset.animations.push(AnimationDescription{name: text(&parser.doc,node,"name","") or >>,duration: duration,tracks: tracks})
+        asset.animations.push(AnimationDescription{name: text(&parser.doc,node,"name","") >>>,duration: duration,tracks: tracks})
     }
     << 0
 }
 fn mix4(a fm.Vec4,b fm.Vec4,x f64,y f64) fm.Vec4 { << fm.vec4(a.x*x+b.x*y,a.y*x+b.y*y,a.z*x+b.z*y,a.w*x+b.w*y) }
 fn rotation_unit(v fm.Vec4) fm.Vec4 {
-    q := fm.quaternion(v.x,v.y,v.z,v.w).normalized() or >>
+    q := fm.quaternion(v.x,v.y,v.z,v.w).normalized() >>>
     << fm.vec4(q.x,q.y,q.z,q.w)
 }
 fn slerp_rotation(a fm.Vec4, b_in fm.Vec4, t f64) fm.Vec4 {
@@ -97,9 +97,9 @@ fn slerp_rotation(a fm.Vec4, b_in fm.Vec4, t f64) fm.Vec4 {
         dot = -dot
     }
     dot = math.min(dot, 1.0)
-    if dot > 0.9995 { << rotation_unit(mix4(a, b, 1.0 - t, t)) or >> }
+    if dot > 0.9995 { << rotation_unit(mix4(a, b, 1.0 - t, t)) >>> }
     angle := math.acos(dot)
-    << rotation_unit(mix4(a, b, math.sin((1.0 - t) * angle) / math.sin(angle), math.sin(t * angle) / math.sin(angle))) or >>
+    << rotation_unit(mix4(a, b, math.sin((1.0 - t) * angle) / math.sin(angle), math.sin(t * angle) / math.sin(angle))) >>>
 }
 
 fn sample_track(track &AnimationTrack,time f64) fm.Vec4 {
@@ -125,11 +125,11 @@ fn sample_track(track &AnimationTrack,time f64) fm.Vec4 {
         p := mix4(a,b,2.0*t*t*t-3.0*t*t+1.0,-2.0*t*t*t+3.0*t*t)
         tangent := mix4(track.values[at*3+2],track.values[(at+1)*3],(t*t*t-2.0*t*t+t)*delta,(t*t*t-t*t)*delta)
         result := mix4(p,tangent,1.0,1.0)
-        if track.path=="rotation" { << rotation_unit(result) or >> }
+        if track.path=="rotation" { << rotation_unit(result) >>> }
         << result
     }
     if track.path!="rotation" { << mix4(a,b,1.0-t,t) }
-    << slerp_rotation(a, b, t) or >>
+    << slerp_rotation(a, b, t) >>>
 }
 pub fn (asset &GlbGeometry) animation_count() int { << asset.animations.len }
 pub fn (asset &GlbGeometry) animation_name(index int) string {
@@ -158,7 +158,7 @@ fn (asset &GlbGeometry) sample_trs_channels(index int, time f64) TrsSampleBuffer
     if index >= 0 {
         for j in 0:asset.animations[index].tracks.len {
             track := &asset.animations[index].tracks[j]
-            value := sample_track(track, time) or >>
+            value := sample_track(track, time) >>>
             if track.path == "translation" {
                 translations[track.node] = value.xyz()
             } else if track.path == "rotation" {
@@ -176,7 +176,7 @@ fn (asset &GlbGeometry) build_local_matrices(trs &TrsSampleBuffer) []fm.Mat4 {
         $local := asset.nodes[i].local
         if !asset.nodes[i].matrix {
             q := trs.rotations[i]
-            rotation := fm.quaternion(q.x, q.y, q.z, q.w).rotation_matrix() or >>
+            rotation := fm.quaternion(q.x, q.y, q.z, q.w).rotation_matrix() >>>
             local = fm.translation_3d(trs.translations[i]).multiply(rotation).multiply(fm.scale_3d(trs.scales[i]))
         }
         if !local.is_affine() { >> errors.new("nexus GLB: animated transform overflow") }
@@ -187,18 +187,18 @@ fn (asset &GlbGeometry) build_local_matrices(trs &TrsSampleBuffer) []fm.Mat4 {
 // Explicit time, clamped to each track. Looping/blending belongs to a player.
 // -1 returns the authored pose. Each sample starts from authored TRS values.
 pub fn (asset &GlbGeometry) sample_pose(index int,time f64) []fm.Mat4 {
-    trs := asset.sample_trs_channels(index, time) or >>
-    << asset.build_local_matrices(&trs) or >>
+    trs := asset.sample_trs_channels(index, time) >>>
+    << asset.build_local_matrices(&trs) >>>
 }
 // Linearly blends translations/scales and shortest-arc SLERP blends rotations between two clips.
 pub fn (asset &GlbGeometry) sample_blended_pose(index_a int, time_a f64, index_b int, time_b f64, blend f64) []fm.Mat4 {
     if !fm.finite(blend) || blend < 0.0 || blend > 1.0 {
         >> errors.new("nexus GLB: pose blend weight must be in [0, 1]")
     }
-    if blend <= 0.0 { << asset.sample_pose(index_a, time_a) or >> }
-    if blend >= 1.0 { << asset.sample_pose(index_b, time_b) or >> }
-    $a := asset.sample_trs_channels(index_a, time_a) or >>
-    b := asset.sample_trs_channels(index_b, time_b) or >>
+    if blend <= 0.0 { << asset.sample_pose(index_a, time_a) >>> }
+    if blend >= 1.0 { << asset.sample_pose(index_b, time_b) >>> }
+    $a := asset.sample_trs_channels(index_a, time_a) >>>
+    b := asset.sample_trs_channels(index_b, time_b) >>>
     inv_w := 1.0 - blend
     for i in 0:asset.nodes.len {
         ta := a.translations[i]
@@ -207,9 +207,9 @@ pub fn (asset &GlbGeometry) sample_blended_pose(index_a int, time_a f64, index_b
         sb := b.scales[i]
         a.translations[i] = fm.vec3(ta.x * inv_w + tb.x * blend, ta.y * inv_w + tb.y * blend, ta.z * inv_w + tb.z * blend)
         a.scales[i] = fm.vec3(sa.x * inv_w + sb.x * blend, sa.y * inv_w + sb.y * blend, sa.z * inv_w + sb.z * blend)
-        a.rotations[i] = slerp_rotation(a.rotations[i], b.rotations[i], blend) or >>
+        a.rotations[i] = slerp_rotation(a.rotations[i], b.rotations[i], blend) >>>
     }
-    << asset.build_local_matrices(&a) or >>
+    << asset.build_local_matrices(&a) >>>
 }
 pub struct NodeTrs {
     pub translation fm.Vec3
@@ -222,7 +222,7 @@ pub fn (asset &GlbGeometry) node_parent(index int) int {
     << asset.nodes[index].parent
 }
 pub fn (asset &GlbGeometry) sample_trs_pose(index int, time f64) []NodeTrs {
-    trs := asset.sample_trs_channels(index, time) or >>
+    trs := asset.sample_trs_channels(index, time) >>>
     $out := []NodeTrs{}
     for i in 0:asset.nodes.len {
         out.push(NodeTrs{
@@ -241,7 +241,7 @@ pub fn (asset &GlbGeometry) local_matrices_from_trs(trs &[]NodeTrs) []fm.Mat4 {
         $local := asset.nodes[i].local
         if !asset.nodes[i].matrix && !trs[i].is_matrix {
             q := trs[i].rotation
-            rotation := fm.quaternion(q.x, q.y, q.z, q.w).rotation_matrix() or >>
+            rotation := fm.quaternion(q.x, q.y, q.z, q.w).rotation_matrix() >>>
             local = fm.translation_3d(trs[i].translation).multiply(rotation).multiply(fm.scale_3d(trs[i].scale))
         }
         if !local.is_affine() { >> errors.new("nexus GLB: animated transform overflow") }

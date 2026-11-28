@@ -24,7 +24,7 @@ fn from_bytes(buf &[]u8) string {
 }
 
 fn clean_dir(path string) int {
-    os.remove_all(path) or (err) {
+    os.remove_all(path) >>> (err) {
         _ := err.msg()
         << 0
     }
@@ -32,7 +32,7 @@ fn clean_dir(path string) int {
 }
 
 fn cloud_write_fails(c $&st.SteamClient, name string, payload &[]u8) bool {
-    _ := c.cloud_write(name, payload) or (err) {
+    _ := c.cloud_write(name, payload) >>> (err) {
         _ := err.msg()
         << true
     }
@@ -40,7 +40,7 @@ fn cloud_write_fails(c $&st.SteamClient, name string, payload &[]u8) bool {
 }
 
 fn read_slot_fails(s &isteam.SteamSaveStore, c &st.SteamClient, slot string) bool {
-    _ := s.read_slot(c, slot) or (err) {
+    _ := s.read_slot(c, slot) >>> (err) {
         _ := err.msg()
         << true
     }
@@ -48,7 +48,7 @@ fn read_slot_fails(s &isteam.SteamSaveStore, c &st.SteamClient, slot string) boo
 }
 
 fn mount_workshop_fails(item &rs.SteamWorkshopItem, key &string) bool {
-    _ := isteam.mount_workshop_bundle(item, key) or (err) {
+    _ := isteam.mount_workshop_bundle(item, key) >>> (err) {
         _ := err.msg()
         << true
     }
@@ -56,7 +56,7 @@ fn mount_workshop_fails(item &rs.SteamWorkshopItem, key &string) bool {
 }
 
 fn script_unlock_fails(c $&st.SteamClient, cfg &rs.SteamAppConfig, idx int) bool {
-    _ := isteam.script_unlock_achievement(c, cfg, idx) or (err) {
+    _ := isteam.script_unlock_achievement(c, cfg, idx) >>> (err) {
         _ := err.msg()
         << true
     }
@@ -66,7 +66,7 @@ fn script_unlock_fails(c $&st.SteamClient, cfg &rs.SteamAppConfig, idx int) bool
 fn run() int {
     tmp := filepath.join(["build", "steam-integration-tmp"])
     clean_dir(tmp + "")
-    os.mkdir_all(tmp + "") or >>
+    os.mkdir_all(tmp + "") >>>
 
     $cfg := rs.default_config(480, 481)
     cfg.cloud_quota_bytes = 4096
@@ -80,41 +80,41 @@ fn run() int {
 
     // 1. Auto fallback -> mock when libsteam_api absent
     state_dir := filepath.join([tmp + "", "player1"])
-    $c1 := st.init_auto(cfg.clone(), state_dir + "") or >>
+    $c1 := st.init_auto(cfg.clone(), state_dir + "") >>>
     assert(c1.is_initialized() && !c1.is_native() && c1.backend_name() == "steam_mock")
-    c1.set_rich_presence("status", "In Lobby") or >>
+    c1.set_rich_presence("status", "In Lobby") >>>
     assert(c1.get_rich_presence("status") == "In Lobby")
 
     // Achievements + stats + persistence
-    c1.unlock_achievement("ACH_WIN") or >>
-    c1.indicate_achievement_progress("ACH_100", 50, 100) or >>
+    c1.unlock_achievement("ACH_WIN") >>>
+    c1.indicate_achievement_progress("ACH_100", 50, 100) >>>
     assert(c1.has_achievement("ACH_WIN"))
     assert(!c1.has_achievement("ACH_100"))
-    c1.set_stat_int("wins", 7) or >>
-    c1.set_stat_float("best_time", 42.5) or >>
-    c1.store_stats() or >>
+    c1.set_stat_int("wins", 7) >>>
+    c1.set_stat_float("best_time", 42.5) >>>
+    c1.store_stats() >>>
 
     // Leaderboards keep_best
-    c1.submit_score("top_score", 1500, true) or >>
-    c1.submit_score("top_score", 1200, true) or >>
+    c1.submit_score("top_score", 1500, true) >>>
+    c1.submit_score("top_score", 1200, true) >>>
     rows := c1.query_leaderboard("top_score", 10)
     assert(rows.len == 1 && rows[0].score == 1500 && rows[0].rank == 1)
 
     // Cloud write/read/quota guard
     raw_save := to_bytes("save-payload-v1")
-    c1.cloud_write("slot1.dat", &raw_save) or >>
+    c1.cloud_write("slot1.dat", &raw_save) >>>
     assert(c1.cloud_exists("slot1.dat"))
-    got_save := c1.cloud_read("slot1.dat") or >>
+    got_save := c1.cloud_read("slot1.dat") >>>
     assert(from_bytes(&got_save) == "save-payload-v1")
 
     $too_big := []u8{}
     for _ in 0:4200 { too_big.push(u8(65)) }
     assert(cloud_write_fails($&c1, "huge.dat", &too_big))
 
-    c1.shutdown() or >>
+    c1.shutdown() >>>
 
     // Reopen from disk to prove state survived across client restarts
-    $c1_reloaded := st.init_mock(cfg.clone(), state_dir + "", 76561198000000001, "NexusPlayer") or >>
+    $c1_reloaded := st.init_mock(cfg.clone(), state_dir + "", 76561198000000001, "NexusPlayer") >>>
     assert(c1_reloaded.has_achievement("ACH_WIN"))
     assert(c1_reloaded.get_stat_int("wins") == 7)
     assert(c1_reloaded.get_stat_float("best_time") == 42.5)
@@ -123,40 +123,40 @@ fn run() int {
     assert(reloaded_rows.len == 1 && reloaded_rows[0].score == 1500)
 
     // 2. SteamRuntimeBridge: overlay auto-pause + InputMap reset + Steam Deck UI scale
-    $clock := timing.new_scaled_clock(60, 4) or >>
+    $clock := timing.new_scaled_clock(60, 4) >>>
     $imap := inp.new_input_map()
-    imap.bind("jump", 32) or >>
+    imap.bind("jump", 32) >>>
     imap.begin_frame()
-    imap.feed_key(32, true) or >>
+    imap.feed_key(32, true) >>>
     assert(imap.pressed("jump"))
     $bridge := isteam.new_runtime_bridge(true)
-    c1_reloaded.set_mock_steam_deck(true, true) or >>
-    c1_reloaded.set_mock_overlay_active(true) or >>
-    st1 := bridge.step($&c1_reloaded, $&clock, $&imap) or >>
+    c1_reloaded.set_mock_steam_deck(true, true) >>>
+    c1_reloaded.set_mock_overlay_active(true) >>>
+    st1 := bridge.step($&c1_reloaded, $&clock, $&imap) >>>
     assert(st1.overlay_active && st1.paused_by_overlay && clock.is_paused())
     assert(!imap.pressed("jump"))
     assert(st1.on_steam_deck && st1.prefer_gamepad_glyphs && st1.ui_scale == 1.25)
-    c1_reloaded.set_mock_overlay_active(false) or >>
-    st2 := bridge.step($&c1_reloaded, $&clock, $&imap) or >>
+    c1_reloaded.set_mock_overlay_active(false) >>>
+    st2 := bridge.step($&c1_reloaded, $&clock, $&imap) >>>
     assert(!st2.overlay_active && !st2.paused_by_overlay && !clock.is_paused())
 
     // 3. SHA-256 SteamSaveStore integrity envelope + tamper detection
     mirror_dir := filepath.join([tmp + "", "mirror"])
     store := isteam.new_save_store(mirror_dir)
     save_data := to_bytes("hero_hp=100;level=5")
-    store.write_slot($&c1_reloaded, "campaign/slot0.sav", &save_data) or >>
-    loaded_data := store.read_slot(&c1_reloaded, "campaign/slot0.sav") or >>
+    store.write_slot($&c1_reloaded, "campaign/slot0.sav", &save_data) >>>
+    loaded_data := store.read_slot(&c1_reloaded, "campaign/slot0.sav") >>>
     assert(from_bytes(&loaded_data) == "hero_hp=100;level=5")
 
     bad_env := to_bytes("NXSV1|0000000000000000000000000000000000000000000000000000000000000000|tampered")
-    c1_reloaded.cloud_write("campaign/slot0.sav", &bad_env) or >>
+    c1_reloaded.cloud_write("campaign/slot0.sav", &bad_env) >>>
     assert(read_slot_fails(&store, &c1_reloaded, "campaign/slot0.sav"))
 
     // 4. Two-peer Lobby & P2P SteamNetBridge routing
-    $c2 := st.init_mock(cfg.clone(), "", 76561198000000002, "FriendPeer") or >>
+    $c2 := st.init_mock(cfg.clone(), "", 76561198000000002, "FriendPeer") >>>
     $bus := st.new_mock_bus()
-    lid := bus.create_lobby($&c1_reloaded, rs.LOBBY_PUBLIC, 4) or >>
-    bus.join_lobby($&c2, lid) or >>
+    lid := bus.create_lobby($&c1_reloaded, rs.LOBBY_PUBLIC, 4) >>>
+    bus.join_lobby($&c2, lid) >>>
     assert(c1_reloaded.has_lobby() && c2.has_lobby())
     hdr := netw.PacketHeader{
         channel: netw.CHANNEL_RELIABLE_ORDERED,
@@ -167,20 +167,20 @@ fn run() int {
         reliable_seq: 1
     }
     pkt_body := to_bytes("ping-from-p1")
-    isteam.send_net_packet($&c1_reloaded, 76561198000000002, 0, hdr, &pkt_body) or >>
+    isteam.send_net_packet($&c1_reloaded, 76561198000000002, 0, hdr, &pkt_body) >>>
     routed := bus.route($&c1_reloaded, $&c2)
     assert(routed == 1)
-    recvd := isteam.poll_net_packets($&c2, 0) or >>
+    recvd := isteam.poll_net_packets($&c2, 0) >>>
     assert(recvd.len == 1 && recvd[0].sender_steam_id == 76561198000000001)
     assert(from_bytes(&recvd[0].decoded.payload) == "ping-from-p1")
 
     // 5. DLC & Workshop HMAC-SHA256 bundle mount + tamper check
-    c1_reloaded.register_mock_dlc(rs.SteamDlcInfo{app_id: 482, installed: true, name: "Expansion"}) or >>
+    c1_reloaded.register_mock_dlc(rs.SteamDlcInfo{app_id: 482, installed: true, name: "Expansion"}) >>>
     assert(c1_reloaded.is_dlc_installed(482))
     mod_dir := filepath.join([tmp + "", "workshop_mod"])
     mod_key := "workshop-hmac-secret"
     mod_sources := [bm.BundleSource{key: "config", rel_path: "mod.txt", bytes: "damage_mult=2"}]
-    bm.pack_bundle(mod_dir + "", "ugc_555", 1, &mod_sources, &mod_key) or >>
+    bm.pack_bundle(mod_dir + "", "ugc_555", 1, &mod_sources, &mod_key) >>>
     c1_reloaded.register_mock_workshop_item(rs.SteamWorkshopItem{
         published_file_id: 555,
         title: "DoubleDamage",
@@ -188,30 +188,30 @@ fn run() int {
         size_bytes: 128,
         subscribed: true,
         installed: true
-    }) or >>
+    }) >>>
     ugc_list := c1_reloaded.installed_workshop_items()
     assert(ugc_list.len == 1 && ugc_list[0].published_file_id == 555)
-    mounted := isteam.mount_workshop_bundle(&ugc_list[0], &mod_key) or >>
+    mounted := isteam.mount_workshop_bundle(&ugc_list[0], &mod_key) >>>
     assert(mounted.active && mounted.read_asset("config") == "damage_mult=2")
 
     bad_mod := "damage_mult=9999"
-    snapshot.write_atomic(filepath.join([mod_dir + "", "mod.txt"]), &bad_mod) or >>
+    snapshot.write_atomic(filepath.join([mod_dir + "", "mod.txt"]), &bad_mod) >>>
     assert(mount_workshop_fails(&ugc_list[0], &mod_key))
 
     // 6. Script adapter bounds
-    isteam.script_add_stat_int($&c1_reloaded, &cfg, 0, 3) or >>
+    isteam.script_add_stat_int($&c1_reloaded, &cfg, 0, 3) >>>
     assert(c1_reloaded.get_stat_int("wins") == 10)
     assert(script_unlock_fails($&c1_reloaded, &cfg, 99))
 
-    c1_reloaded.shutdown() or >>
-    c2.shutdown() or >>
+    c1_reloaded.shutdown() >>>
+    c2.shutdown() >>>
     clean_dir(tmp + "")
     println("PASS: steam_integration_checks")
     << 0
 }
 
 fn main() int {
-    run() or (err) {
+    run() >>> (err) {
         println("FAIL: " + err.msg())
         << 1
     }

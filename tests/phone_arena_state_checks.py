@@ -8,11 +8,11 @@ ROOT = Path(__file__).resolve().parents[1]
 XU = os.environ.get('XU', 'xu')
 SOURCE = r'''@main
 fn rejects(raw string, solids &[]fm.Rect2) bool {
-    decode_checkpoint(&raw, solids) or (err) { << true }
+    decode_checkpoint(&raw, solids) >>> (err) { << true }
     << false
 }
 fn save_fails(path string, state &Checkpoint, solids &[]fm.Rect2) bool {
-    save_checkpoint(path, state, solids) or (err) { << true }
+    save_checkpoint(path, state, solids) >>> (err) { << true }
     << false
 }
 fn run() int {
@@ -20,15 +20,15 @@ fn run() int {
     root := args[1]
     path := root + "/arena.json"
     solids := [fm.rect2(122.0,75.0,14.0,225.0)]
-    initial := load_checkpoint(path + "", &solids) or >>
+    initial := load_checkpoint(path + "", &solids) >>>
     assert(initial.position.x == 42.0 && initial.collected == 0 && !initial.paused)
     state := Checkpoint{position: fm.vec2(61.123456789,215.000000001), collected: 37, paused: true}
-    raw := encode_checkpoint(&state, &solids) or >>
-    decoded := decode_checkpoint(&raw, &solids) or >>
+    raw := encode_checkpoint(&state, &solids) >>>
+    decoded := decode_checkpoint(&raw, &solids) >>>
     assert(decoded.position.x == state.position.x && decoded.position.y == state.position.y)
     assert(decoded.collected == 37 && decoded.paused)
-    save_checkpoint(path + "", &state, &solids) or >>
-    loaded := load_checkpoint(path + "", &solids) or >>
+    save_checkpoint(path + "", &state, &solids) >>>
+    loaded := load_checkpoint(path + "", &solids) >>>
     assert(loaded.position.x == state.position.x && loaded.collected == 37 && loaded.paused)
     invalid := ["", "{", "[]", "{}",
         "{\"version\":2,\"x\":42,\"y\":180,\"collected\":0,\"paused\":false}",
@@ -41,21 +41,21 @@ fn run() int {
     for bad in invalid { assert(rejects(bad + "", &solids)) }
     // A failed replacement must not destroy an existing directory or leave staging files.
     protected := root + "/protected"
-    os.mkdir(protected + "") or >>
-    os.write(protected + "/original", "retained") or >>
-    assert((save_fails(protected + "", &state, &solids) or >>) && (os.read(protected + "/original") or >>) == "retained")
-    entries := os.entries(root + "") or >>
+    os.mkdir(protected + "") >>>
+    os.write(protected + "/original", "retained") >>>
+    assert((save_fails(protected + "", &state, &solids) >>>) && (os.read(protected + "/original") >>>) == "retained")
+    entries := os.entries(root + "") >>>
     for entry in entries {
         assert(!strings.contains(&entry.name, ".tmp-"))
     }
-    os.write(path + "", "malformed") or >>
-    recovered := load_checkpoint(path + "", &solids) or >>
+    os.write(path + "", "malformed") >>>
+    recovered := load_checkpoint(path + "", &solids) >>>
     assert(recovered.position.x == 42.0 && recovered.collected == 0)
     $preserved := false
-    recovered_entries := os.entries(root + "") or >>
+    recovered_entries := os.entries(root + "") >>>
     for entry in recovered_entries {
         if strings.contains(&entry.name, ".rejected-") {
-            assert((os.read(root + "/" + entry.name) or >>) == "malformed")
+            assert((os.read(root + "/" + entry.name) >>>) == "malformed")
             preserved = true
         }
     }
@@ -63,7 +63,7 @@ fn run() int {
     println("arena checkpoint: strict codec, exact float round-trip, atomic failure cleanup and corrupt-file recovery PASS")
     << 0
 }
-fn main() int { << run() or (err) { eprintln(err.msg())
+fn main() int { << run() >>> (err) { eprintln(err.msg())
     << 1 } }
 '''
 

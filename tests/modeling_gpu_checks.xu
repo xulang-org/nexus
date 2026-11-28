@@ -33,15 +33,15 @@ fn is_valid_png(raw &string) bool {
 }
 
 fn copy_file(src string, dst string) int {
-    raw := snapshot.read(src, snapshot.MAX_BYTES) or >>
-    snapshot.write_atomic(dst, &raw) or >>
+    raw := snapshot.read(src, snapshot.MAX_BYTES) >>>
+    snapshot.write_atomic(dst, &raw) >>>
     << 0
 }
 
 fn must_cmd(bin &string, args &[]string, label string) string {
     $cmd := exec.command(*bin + "")
     for i in 0:args.len { cmd.args.push(args[i] + "") }
-    out := cmd.combined_output() or (err) {
+    out := cmd.combined_output() >>> (err) {
         eprintln("FAIL [" + label + "]: " + err.msg())
         <<< 1
     }
@@ -64,9 +64,9 @@ fn (r $&LineSocketReader) read_line_timeout(timeout_ms int) string {
             if trimmed.len > 0 { << trimmed }
             ->
         }
-        ready := os.socket_poll(r.fd, 1) or >>
+        ready := os.socket_poll(r.fd, 1) >>>
         if ready != 0 {
-            chunk := net.conn_read(r.fd, 4096) or >>
+            chunk := net.conn_read(r.fd, 4096) >>>
             if chunk.len == 0 {
                 >> errors.new("modeling_gpu_checks: live socket closed (EOF)")
             }
@@ -83,7 +83,7 @@ fn (r $&LineSocketReader) read_line_timeout(timeout_ms int) string {
 
 fn send_line(conn &net.Conn, payload string) int {
     line := payload + "\n"
-    _ := conn.write(&line) or >>
+    _ := conn.write(&line) >>>
     << 0
 }
 
@@ -92,34 +92,34 @@ fn parse_event_name(line &string) string {
     if !doc.ok() { >> errors.new("invalid live event JSON: " + *line) }
     root := doc.root()
     if !doc.is_dict(root) { >> errors.new("live event not an object: " + *line) }
-    << doc.as_string(doc.get(root, "event")) or >>
+    << doc.as_string(doc.get(root, "event")) >>>
 }
 
 fn wait_for_event(r $&LineSocketReader, target string, timeout_ms int) string {
     for _ in 0:64 {
-        line := r.read_line_timeout(timeout_ms) or >>
-        ev := parse_event_name(&line) or >>
+        line := r.read_line_timeout(timeout_ms) >>>
+        ev := parse_event_name(&line) >>>
         if ev == target { << line }
     }
     >> errors.new("did not observe expected event: " + target)
 }
 
 fn close_listener_quiet(l $&net.Listener) {
-    _ := l.close() or (ce) {
+    _ := l.close() >>> (ce) {
         _ := ce
         <<
     }
 }
 
 fn close_conn_quiet(c $&net.Conn) {
-    _ := c.close() or (ce) {
+    _ := c.close() >>> (ce) {
         _ := ce
         <<
     }
 }
 
 fn remove_dir_quiet(p string) {
-    _ := os.remove_all(p + "") or (err) {
+    _ := os.remove_all(p + "") >>> (err) {
         _ := err
         <<
     }
@@ -127,7 +127,7 @@ fn remove_dir_quiet(p string) {
 
 fn accept_once(l net.Listener, out chan net.Conn, err_ch chan string) {
     $ml := l
-    conn := ml.accept() or (err) {
+    conn := ml.accept() >>> (err) {
         close_listener_quiet($&ml)
         err_ch <- err.msg()
         <<
@@ -151,14 +151,14 @@ fn wait_accept(acc_ch chan net.Conn, err_ch chan string, timeout_ms int) net.Con
 }
 
 fn run_checks(vp_bin string, val_bin string, cli_bin string) int {
-    work := filepath.abs(&"build/modeling-gpu-test") or >>
+    work := filepath.abs(&"build/modeling-gpu-test") >>>
     remove_dir_quiet(work + "")
-    os.mkdir_all(work + "/assets/models") or >>
+    os.mkdir_all(work + "/assets/models") >>>
     proj_json := work + "/project.json"
     world_src := work + "/assets/world.xuscene"
-    copy_file("examples/scene_assets/project.json", proj_json + "") or >>
-    copy_file("examples/scene_assets/assets/world.xuscene", world_src + "") or >>
-    copy_file("examples/scene_assets/assets/panels.glb", work + "/assets/panels.glb") or >>
+    copy_file("examples/scene_assets/project.json", proj_json + "") >>>
+    copy_file("examples/scene_assets/assets/world.xuscene", world_src + "") >>>
+    copy_file("examples/scene_assets/assets/panels.glb", work + "/assets/panels.glb") >>>
 
     // Test A: --live-script + --whitebox-out (Metal rendering + subobject extrude/inset + GLB export)
     before_png := work + "/wb_before.png"
@@ -177,7 +177,7 @@ fn run_checks(vp_bin string, val_bin string, cli_bin string) int {
         "{\"cmd\":\"apply\"}"
     ]
     script_text := strings.join(script_lines, "\n") + "\n"
-    snapshot.write_atomic(script_path + "", &script_text) or >>
+    snapshot.write_atomic(script_path + "", &script_text) >>>
 
     _ := must_cmd(&vp_bin, &[
         "--scene", world_src + "",
@@ -186,19 +186,19 @@ fn run_checks(vp_bin string, val_bin string, cli_bin string) int {
         "--whitebox-out", wb1_glb + ""
     ], "viewport --live-script whitebox")
 
-    before_raw := snapshot.read(before_png + "", snapshot.MAX_BYTES) or >>
-    after_raw := snapshot.read(after_png + "", snapshot.MAX_BYTES) or >>
+    before_raw := snapshot.read(before_png + "", snapshot.MAX_BYTES) >>>
+    after_raw := snapshot.read(after_png + "", snapshot.MAX_BYTES) >>>
     check(is_valid_png(&before_raw), "Test A before PNG valid")
     check(is_valid_png(&after_raw), "Test A after PNG valid")
     check(before_raw != after_raw, "Test A extrude+inset changes rendered GPU pixels")
 
-    wb1_raw := snapshot.read(wb1_glb + "", gltf.MAX_GLB_BYTES) or >>
-    wb1_dec := gltf.decode_glb_geometry(&wb1_raw) or >>
-    check(wb1_dec.primitive_count() >= 1 && (wb1_dec.index_count(0) or >>) / 3 > 12, "Test A whitebox GLB has extruded/inset triangles")
+    wb1_raw := snapshot.read(wb1_glb + "", gltf.MAX_GLB_BYTES) >>>
+    wb1_dec := gltf.decode_glb_geometry(&wb1_raw) >>>
+    check(wb1_dec.primitive_count() >= 1 && (wb1_dec.index_count(0) >>>) / 3 > 12, "Test A whitebox GLB has extruded/inset triangles")
     _ := must_cmd(&val_bin, &["glb", wb1_glb + ""], "Test A validate wb1.glb")
 
     // Test B: --live-connect bidirectional NDJSON over TCP loopback
-    listener := net.listen_on("tcp", "127.0.0.1:0") or >>
+    listener := net.listen_on("tcp", "127.0.0.1:0") >>>
     addr := listener.addr()
     out2_scene := work + "/out2.xuscene"
     wb2_glb := work + "/wb2.glb"
@@ -217,35 +217,35 @@ fn run_checks(vp_bin string, val_bin string, cli_bin string) int {
     vp_cmd.args.push(addr + "")
     vp_cmd.args.push("--whitebox-out")
     vp_cmd.args.push(wb2_glb + "")
-    vp_cmd.start() or >>
+    vp_cmd.start() >>>
 
-    $conn := wait_accept(acc_ch, err_ch, 15000) or >>
+    $conn := wait_accept(acc_ch, err_ch, 15000) >>>
     _ := conn.set_nodelay(true)
-    fd := conn.descriptor() or >>
+    fd := conn.descriptor() >>>
     $reader := LineSocketReader{fd: fd, rem: ""}
 
-    ready_line := wait_for_event($&reader, "ready", 15000) or >>
+    ready_line := wait_for_event($&reader, "ready", 15000) >>>
     ready_doc := json.parse_max(&ready_line, 65536)
-    backend := ready_doc.as_string(ready_doc.get(ready_doc.root(), "backend")) or >>
+    backend := ready_doc.as_string(ready_doc.get(ready_doc.root(), "backend")) >>>
     check(backend.len > 0, "Test B ready event reports non-empty GPU backend")
 
-    send_line(&conn, "{\"cmd\":\"spawn_whitebox\",\"shape\":\"stair\",\"size\":[2.5,2.0,3.0]}") or >>
-    wb_spawn_line := wait_for_event($&reader, "whitebox", 15000) or >>
+    send_line(&conn, "{\"cmd\":\"spawn_whitebox\",\"shape\":\"stair\",\"size\":[2.5,2.0,3.0]}") >>>
+    wb_spawn_line := wait_for_event($&reader, "whitebox", 15000) >>>
     wb_sdoc := json.parse_max(&wb_spawn_line, 65536)
-    spawn_faces := wb_sdoc.as_int(wb_sdoc.get(wb_sdoc.root(), "faces")) or >>
-    spawn_tris := wb_sdoc.as_int(wb_sdoc.get(wb_sdoc.root(), "triangles")) or >>
+    spawn_faces := wb_sdoc.as_int(wb_sdoc.get(wb_sdoc.root(), "faces")) >>>
+    spawn_tris := wb_sdoc.as_int(wb_sdoc.get(wb_sdoc.root(), "triangles")) >>>
     check(spawn_faces >= 10 && spawn_tris > 12, "Test B stair spawn whitebox metrics valid")
 
-    send_line(&conn, "{\"cmd\":\"set_mode\",\"mode\":\"face\"}") or >>
-    send_line(&conn, "{\"cmd\":\"select_subobject\",\"indices\":[0]}") or >>
-    send_line(&conn, "{\"cmd\":\"model_op\",\"op\":\"extrude\",\"value\":0.6}") or >>
+    send_line(&conn, "{\"cmd\":\"set_mode\",\"mode\":\"face\"}") >>>
+    send_line(&conn, "{\"cmd\":\"select_subobject\",\"indices\":[0]}") >>>
+    send_line(&conn, "{\"cmd\":\"model_op\",\"op\":\"extrude\",\"value\":0.6}") >>>
     $ext_faces := 0
     $ext_tris := 0
     for _ in 0:32 {
-        ev_line := wait_for_event($&reader, "whitebox", 15000) or >>
+        ev_line := wait_for_event($&reader, "whitebox", 15000) >>>
         doc := json.parse_max(&ev_line, 65536)
-        f := doc.as_int(doc.get(doc.root(), "faces")) or >>
-        t := doc.as_int(doc.get(doc.root(), "triangles")) or >>
+        f := doc.as_int(doc.get(doc.root(), "faces")) >>>
+        t := doc.as_int(doc.get(doc.root(), "triangles")) >>>
         if f > spawn_faces && t > spawn_tris {
             ext_faces = f
             ext_tris = t
@@ -254,26 +254,26 @@ fn run_checks(vp_bin string, val_bin string, cli_bin string) int {
     }
     check(ext_faces > spawn_faces && ext_tris > spawn_tris, "Test B extrude increases whitebox faces and triangles")
 
-    send_line(&conn, "{\"cmd\":\"capture\",\"path\":" + json.quote(&live_png) + "}") or >>
-    _ := wait_for_event($&reader, "captured", 15000) or >>
+    send_line(&conn, "{\"cmd\":\"capture\",\"path\":" + json.quote(&live_png) + "}") >>>
+    _ := wait_for_event($&reader, "captured", 15000) >>>
 
-    send_line(&conn, "{\"cmd\":\"apply\"}") or >>
-    closed_line := wait_for_event($&reader, "closed", 15000) or >>
+    send_line(&conn, "{\"cmd\":\"apply\"}") >>>
+    closed_line := wait_for_event($&reader, "closed", 15000) >>>
     c_doc := json.parse_max(&closed_line, 65536)
-    outcome := c_doc.as_string(c_doc.get(c_doc.root(), "outcome")) or >>
+    outcome := c_doc.as_string(c_doc.get(c_doc.root(), "outcome")) >>>
     check(outcome == "apply", "Test B closed outcome is apply")
 
     close_conn_quiet($&conn)
-    vp_cmd.wait() or >>
+    vp_cmd.wait() >>>
 
-    live_raw := snapshot.read(live_png + "", snapshot.MAX_BYTES) or >>
+    live_raw := snapshot.read(live_png + "", snapshot.MAX_BYTES) >>>
     check(is_valid_png(&live_raw), "Test B live capture PNG valid")
-    wb2_raw := snapshot.read(wb2_glb + "", gltf.MAX_GLB_BYTES) or >>
-    _ := gltf.decode_glb_geometry(&wb2_raw) or >>
+    wb2_raw := snapshot.read(wb2_glb + "", gltf.MAX_GLB_BYTES) >>>
+    _ := gltf.decode_glb_geometry(&wb2_raw) >>>
     _ := must_cmd(&val_bin, &["glb", wb2_glb + ""], "Test B validate wb2.glb")
 
     // Test C: Exported GLB registered into project & reloaded in Metal viewport with --check-node
-    exp := project.export_glb_bytes_to_project(proj_json + "", "assets/models/whitebox.glb", &wb1_raw, val_bin + "") or >>
+    exp := project.export_glb_bytes_to_project(proj_json + "", "assets/models/whitebox.glb", &wb1_raw, val_bin + "") >>>
     wb_hash := sha256.sum256(wb1_raw + "")
     uid_q := json.quote(&exp.uid)
     hash_q := json.quote(&wb_hash)
@@ -299,7 +299,7 @@ fn run_checks(vp_bin string, val_bin string, cli_bin string) int {
     wb_scene_path := work + "/assets/wb_scene.xuscene"
     wb_scene_out := work + "/assets/wb_scene_out.xuscene"
     wb_reloaded_png := work + "/wb_reloaded.png"
-    snapshot.write_atomic(wb_scene_path + "", &wb_scene_json) or >>
+    snapshot.write_atomic(wb_scene_path + "", &wb_scene_json) >>>
     _ := must_cmd(&val_bin, &["scene", wb_scene_path + ""], "Test C validate reloaded wb_scene.xuscene")
     _ := must_cmd(&vp_bin, &[
         "--scene", wb_scene_path + "",
@@ -307,7 +307,7 @@ fn run_checks(vp_bin string, val_bin string, cli_bin string) int {
         "--check-node", "WhiteboxNode",
         "--capture", wb_reloaded_png + ""
     ], "Test C Metal viewport reload & check-node on exported GLB")
-    wb_rel_raw := snapshot.read(wb_reloaded_png + "", snapshot.MAX_BYTES) or >>
+    wb_rel_raw := snapshot.read(wb_reloaded_png + "", snapshot.MAX_BYTES) >>>
     check(is_valid_png(&wb_rel_raw), "Test C reloaded GLB PNG capture valid")
     _ := must_cmd(&cli_bin, &["build", proj_json + "", "--output", work + "/dist", "--validator", val_bin + ""], "Test C build project with exported whitebox GLB")
 
@@ -327,7 +327,7 @@ fn main() int {
         else if args[i] == "--project-cli" { cli_bin = args[i + 1] + "" }
         i += 2
     }
-    << run_checks(vp_bin, val_bin, cli_bin) or (err) {
+    << run_checks(vp_bin, val_bin, cli_bin) >>> (err) {
         eprintln("FAIL: " + err.msg())
         << 1
     }
