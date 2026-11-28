@@ -17,9 +17,8 @@ pub const PB_EXPORT = 2
 pub const PB_LANG = 3
 pub const PB_NODE_UP = 4
 pub const PB_NODE_DN = 5
-pub const PB_NODE_VIS = 6
-pub const PB_RELOCATE = 7
-pub const PB_REMOVE_ASSET = 8
+pub const PB_RELOCATE = 6
+pub const PB_REMOVE_ASSET = 7
 
 pub const PT_ASSET_PRIMS = 0
 
@@ -39,19 +38,10 @@ pub struct EditorPanels {
     pub id_tree_hdr_row int
     pub id_node_up_btn int
     pub id_node_dn_btn int
-    pub id_node_vis_btn int
     pub id_tree_filter int
-    pub id_left_hsplit int
     pub id_asset_prims int
     pub id_relocate_btn int
     pub id_remove_asset_btn int
-
-    pub left_tree_ratio f64
-    pub hsplit_y f64
-    pub avail_flex f64
-    pub last_tree_h f64
-    pub split_orig_tree_h f64
-    pub split_start_gy f64
 
     pub glb_prim_cache map[string]string
 }
@@ -128,18 +118,10 @@ pub fn new_panels_shell() EditorPanels {
         id_tree_hdr_row: 0,
         id_node_up_btn: 0,
         id_node_dn_btn: 0,
-        id_node_vis_btn: 0,
         id_tree_filter: 0,
-        id_left_hsplit: 0,
         id_asset_prims: 0,
         id_relocate_btn: 0,
         id_remove_asset_btn: 0,
-        left_tree_ratio: 0.89,
-        hsplit_y: 0.0,
-        avail_flex: 162.0,
-        last_tree_h: 126.0,
-        split_orig_tree_h: 126.0,
-        split_start_gy: 0.0,
         glb_prim_cache: map[string]string{}
     }
 }
@@ -178,16 +160,14 @@ pub fn panels_create_tree_tools(
     id_ev &ui.CanvasEvent
 ) int {
     id_row := add_box(view, id_left_pane, &row_box(ilw, 24.0, 3.0)) >>>
-    id_tree_hdr := add_box(view, id_row, &leaf_box(math.max(60.0, ilw - 84.0), 24.0)) >>>
-    // Button indices 4, 5, 6
-    id_up := push_panel_btn(p, view, id_row, 25.0, 24.0, ctx, id_ev, "") >>>
-    id_dn := push_panel_btn(p, view, id_row, 25.0, 24.0, ctx, id_ev, "") >>>
-    id_vis := push_panel_btn(p, view, id_row, 25.0, 24.0, ctx, id_ev, "") >>>
-    id_flt := push_panel_field(p, view, id_left_pane, ilw, 42.0, ctx, id_ev, "Filter tree", "") >>>
+    id_tree_hdr := add_box(view, id_row, &leaf_box(math.max(60.0, ilw - 56.0), 24.0)) >>>
+    // Button indices 4, 5
+    id_up := push_panel_btn(p, view, id_row, 24.0, 24.0, ctx, id_ev, "") >>>
+    id_dn := push_panel_btn(p, view, id_row, 24.0, 24.0, ctx, id_ev, "") >>>
+    id_flt := push_panel_field(p, view, id_left_pane, ilw, 30.0, ctx, id_ev, "Filter tree...", "") >>>
     p.id_tree_hdr_row = id_row
     p.id_node_up_btn = id_up
     p.id_node_dn_btn = id_dn
-    p.id_node_vis_btn = id_vis
     p.id_tree_filter = id_flt
     << id_tree_hdr
 }
@@ -230,8 +210,10 @@ pub fn panels_dispose(p $&EditorPanels) {
 pub fn panels_apply_lang(p $&EditorPanels, lang int) {
     lbl := lang_toggle_label(lang)
     set_lbl_text($&p.btn_labels[PB_LANG], &lbl)
-    flt_lbl := tr(lang, "Filter tree", "筛选节点")
+    flt_lbl := tr(lang, "Filter nodes...", "筛选节点...")
     $dec := widgets.field_decoration(&flt_lbl)
+    dec.floating = widgets.LABEL_NEVER
+    dec.clearable = true
     dec.reserve_helper = false
     set_field_dec($&p.fields[PF_TREE_FILTER], &dec)
     p.glb_prim_cache = map[string]string{}
@@ -240,7 +222,7 @@ pub fn panels_apply_lang(p $&EditorPanels, lang int) {
 pub fn panels_apply_styles(p $&EditorPanels, styles &widgets.Styles, pal &PaperPalette) {
     ico_sec := icon_button_style(styles, widgets.BUTTON_SECONDARY)
     ico_sub := icon_button_style(styles, widgets.BUTTON_SUBTLE)
-    ico_dng := icon_button_style(styles, widgets.BUTTON_DANGER)
+    ico_dng := icon_danger_subtle_style(styles, pal)
     pill_sec := pill_button_style(styles, widgets.BUTTON_SECONDARY)
     set_btn_style($&p.buttons[PB_OPEN_PROJ], &ico_sec)
     set_btn_style($&p.buttons[PB_SCENE_MGR], &ico_sec)
@@ -248,11 +230,10 @@ pub fn panels_apply_styles(p $&EditorPanels, styles &widgets.Styles, pal &PaperP
     set_btn_style($&p.buttons[PB_LANG], &pill_sec)
     set_btn_style($&p.buttons[PB_NODE_UP], &ico_sub)
     set_btn_style($&p.buttons[PB_NODE_DN], &ico_sub)
-    set_btn_style($&p.buttons[PB_NODE_VIS], &ico_sub)
     set_btn_style($&p.buttons[PB_RELOCATE], &ico_sub)
     set_btn_style($&p.buttons[PB_REMOVE_ASSET], &ico_dng)
 
-    cf := compact_field_style(styles)
+    cf := inline_field_style(styles)
     set_field_style($&p.fields[PF_TREE_FILTER], &cf)
 
     st_meta := selectable_text_style(styles, pal, 11.0, pal.muted)
@@ -269,21 +250,16 @@ pub fn panels_place(p $&EditorPanels, view &widgets.View, styles &widgets.Styles
     for i in 0:p.texts.len {
         place_view_text(view, p.text_ids[i], vp, $&p.texts[i]) >>>
     }
-    hb := view.node_bounds(p.id_left_hsplit) >>>
-    p.hsplit_y = hb.y
     << 0
 }
 
 fn icon_for_panel_btn(idx int, sel_visible bool) int {
+    _ := sel_visible
     if idx == PB_OPEN_PROJ { << ICON_OPEN }
     if idx == PB_SCENE_MGR { << ICON_SCENE_MGR }
     if idx == PB_EXPORT { << ICON_EXPORT }
     if idx == PB_NODE_UP { << ICON_UP }
     if idx == PB_NODE_DN { << ICON_DOWN }
-    if idx == PB_NODE_VIS {
-        if sel_visible { << ICON_EYE }
-        << ICON_EYE_OFF
-    }
     if idx == PB_RELOCATE { << ICON_RELOCATE }
     << ICON_DEL
 }
@@ -298,12 +274,13 @@ pub fn panels_draw(
     dragging_split int,
     sel_visible bool
 ) int {
-    if id == p.id_left_hsplit {
-        frame.fill_rect(0.0, 0.0, bounds.width, bounds.height, pal.canvas) >>>
-        $col := pal.border
-        if dragging_split == 3 { col = pal.focus }
-        frame.fill_round_rect(bounds.width * 0.5 - 16.0, 2.5, 32.0, 3.0, 1.5, col) >>>
-        << 1
+    _ := dragging_split
+    _ := pal
+    if bounds.width <= 0.5 || bounds.height <= 0.5 {
+        for i in 0:p.button_ids.len { if p.button_ids[i] == id { << 1 } }
+        for i in 0:p.field_ids.len { if p.field_ids[i] == id { << 1 } }
+        for i in 0:p.text_ids.len { if p.text_ids[i] == id { << 1 } }
+        << 0
     }
     for i in 0:p.button_ids.len {
         if p.button_ids[i] == id {

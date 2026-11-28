@@ -361,6 +361,345 @@ pub fn sphere_editable(radius f64, segments int, rings int, color int, mat_slot 
     << m
 }
 
+pub fn cone_editable(radius f64, height f64, segments int, color int, mat_slot int) rm.EditableMesh {
+    if !fm.finite(radius) || radius <= 0.0001 || !fm.finite(height) || height <= 0.0001 ||
+        segments < 3 || segments > 64 {
+        >> errors.new("nexus modeling: invalid cone parameters")
+    }
+    $m := rm.new_editable_mesh("Cone")
+    hy := height * 0.5
+    $bot := []int{}
+    for i in 0:segments {
+        theta := f64(i) / f64(segments) * 2.0 * math.pi()
+        bot.push(m.add_vertex(fm.vec3(radius * math.cos(theta), -hy, radius * math.sin(theta)), color) >>>)
+    }
+    apex := m.add_vertex(fm.vec3(0.0, hy, 0.0), color) >>>
+    for i in 0:segments {
+        $ni := i + 1
+        if ni >= segments { ni = 0 }
+        u0 := f64(i) / f64(segments)
+        u1 := f64(i + 1) / f64(segments)
+        um := (u0 + u1) * 0.5
+        a := bot[i]
+        b := bot[ni]
+        pa := m.vertices[a].position
+        pb := m.vertices[b].position
+        px := m.vertices[apex].position
+        n := px.sub(pa).cross(pb.sub(pa)).normalized_or_zero()
+        m.add_polygon([a, apex, b], [fm.vec2(u0, 1.0), fm.vec2(um, 0.0), fm.vec2(u1, 1.0)],
+            true, n, false, mat_slot, 1) >>>
+    }
+    $bot_uvs := []fm.Vec2{}
+    for i in 0:segments {
+        theta := f64(i) / f64(segments) * 2.0 * math.pi()
+        bot_uvs.push(fm.vec2(0.5 + 0.5 * math.cos(theta), 0.5 + 0.5 * math.sin(theta)))
+    }
+    m.add_polygon(~bot, bot_uvs, true, fm.vec3(0.0, -1.0, 0.0), true, mat_slot, 0) >>>
+    compute_normals($&m) >>>
+    << m
+}
+
+pub fn capsule_editable(radius f64, cylinder_height f64, segments int, hemi_rings int, color int, mat_slot int) rm.EditableMesh {
+    raw := meshes.capsule_mesh_3d(radius, cylinder_height, segments, hemi_rings, color) >>>
+    $m := from_mesh_data("Capsule", &raw, 1e-5) >>>
+    for i in 0:m.faces.len {
+        m.faces[i].material_slot = mat_slot
+        m.faces[i].smoothing_group = 1
+    }
+    compute_normals($&m) >>>
+    << m
+}
+
+pub fn torus_editable(major_radius f64, minor_radius f64, major_seg int, minor_seg int, color int, mat_slot int) rm.EditableMesh {
+    if !fm.finite(major_radius) || major_radius <= 0.0001 || !fm.finite(minor_radius) || minor_radius <= 0.0001 ||
+        minor_radius >= major_radius * 0.98 || major_seg < 6 || major_seg > 64 || minor_seg < 4 || minor_seg > 48 {
+        >> errors.new("nexus modeling: invalid torus parameters")
+    }
+    $m := rm.new_editable_mesh("Torus")
+    $grid := []int{}
+    for i in 0:major_seg {
+        u := f64(i) / f64(major_seg) * 2.0 * math.pi()
+        cu := math.cos(u)
+        su := math.sin(u)
+        for j in 0:minor_seg {
+            v := f64(j) / f64(minor_seg) * 2.0 * math.pi()
+            cv := math.cos(v)
+            sv := math.sin(v)
+            rr := major_radius + minor_radius * cv
+            grid.push(m.add_vertex(fm.vec3(rr * cu, minor_radius * sv, rr * su), color) >>>)
+        }
+    }
+    for i in 0:major_seg {
+        $ni := i + 1
+        if ni >= major_seg { ni = 0 }
+        u0 := f64(i) / f64(major_seg)
+        u1 := f64(i + 1) / f64(major_seg)
+        um := (u0 + u1) * 0.5 * 2.0 * math.pi()
+        for j in 0:minor_seg {
+            $nj := j + 1
+            if nj >= minor_seg { nj = 0 }
+            v0 := f64(j) / f64(minor_seg)
+            v1 := f64(j + 1) / f64(minor_seg)
+            vm := (v0 + v1) * 0.5 * 2.0 * math.pi()
+            v00 := grid[i * minor_seg + j]
+            v01 := grid[i * minor_seg + nj]
+            v11 := grid[ni * minor_seg + nj]
+            v10 := grid[ni * minor_seg + j]
+            p00 := m.vertices[v00].position
+            p01 := m.vertices[v01].position
+            p10 := m.vertices[v10].position
+            n := p01.sub(p00).cross(p10.sub(p00)).normalized_or_zero()
+            out_n := fm.vec3(math.cos(vm) * math.cos(um), math.sin(vm), math.cos(vm) * math.sin(um))
+            if n.dot(out_n) < 0.0 {
+                m.add_polygon([v00, v10, v11, v01],
+                    [fm.vec2(u0, v0), fm.vec2(u1, v0), fm.vec2(u1, v1), fm.vec2(u0, v1)],
+                    true, n.scaled(-1.0), false, mat_slot, 1) >>>
+            } else {
+                m.add_polygon([v00, v01, v11, v10],
+                    [fm.vec2(u0, v0), fm.vec2(u0, v1), fm.vec2(u1, v1), fm.vec2(u1, v0)],
+                    true, n, false, mat_slot, 1) >>>
+            }
+        }
+    }
+    compute_normals($&m) >>>
+    << m
+}
+
+pub fn pyramid_editable(size fm.Vec3, color int, mat_slot int) rm.EditableMesh {
+    check_dim(size, "pyramid") >>>
+    hx := size.x * 0.5
+    hy := size.y * 0.5
+    hz := size.z * 0.5
+    $m := rm.new_editable_mesh("Pyramid")
+    v0 := m.add_vertex(fm.vec3(-hx, -hy, hz), color) >>>
+    v1 := m.add_vertex(fm.vec3(hx, -hy, hz), color) >>>
+    v2 := m.add_vertex(fm.vec3(hx, -hy, -hz), color) >>>
+    v3 := m.add_vertex(fm.vec3(-hx, -hy, -hz), color) >>>
+    apex := m.add_vertex(fm.vec3(0.0, hy, 0.0), color) >>>
+
+    append_quad($&m, v3, v2, v1, v0, fm.vec3(0.0, -1.0, 0.0), mat_slot) >>>
+    sides := [[v0, v1], [v1, v2], [v2, v3], [v3, v0]]
+    for si in 0:sides.len {
+        a := sides[si][0]
+        b := sides[si][1]
+        pa := m.vertices[a].position
+        pb := m.vertices[b].position
+        px := m.vertices[apex].position
+        sn := pb.sub(pa).cross(px.sub(pa)).normalized() >>>
+        append_tri($&m, a, b, apex, sn, mat_slot) >>>
+    }
+    compute_normals($&m) >>>
+    project_uv_box_all($&m, 1.0) >>>
+    << m
+}
+
+pub fn prism_editable(radius f64, height f64, sides int, color int, mat_slot int) rm.EditableMesh {
+    if !fm.finite(radius) || radius <= 0.0001 || !fm.finite(height) || height <= 0.0001 ||
+        sides < 3 || sides > 32 {
+        >> errors.new("nexus modeling: invalid prism parameters")
+    }
+    $m := rm.new_editable_mesh("Prism")
+    hy := height * 0.5
+    $bot := []int{}
+    $top := []int{}
+    for i in 0:sides {
+        theta := f64(i) / f64(sides) * 2.0 * math.pi()
+        cs := math.cos(theta)
+        sn := math.sin(theta)
+        bot.push(m.add_vertex(fm.vec3(radius * cs, -hy, radius * sn), color) >>>)
+        top.push(m.add_vertex(fm.vec3(radius * cs, hy, radius * sn), color) >>>)
+    }
+    for i in 0:sides {
+        $ni := i + 1
+        if ni >= sides { ni = 0 }
+        a := bot[i]
+        b := top[i]
+        c := top[ni]
+        d := bot[ni]
+        pa := m.vertices[a].position
+        pb := m.vertices[b].position
+        pd := m.vertices[d].position
+        n := pb.sub(pa).cross(pd.sub(pa)).normalized_or_zero()
+        append_quad($&m, a, b, c, d, n, mat_slot) >>>
+    }
+    $top_rev := []int{}
+    $top_uvs := []fm.Vec2{}
+    $bot_uvs := []fm.Vec2{}
+    for i in 0:sides {
+        idx := sides - 1 - i
+        top_rev.push(top[idx])
+        th_t := f64(idx) / f64(sides) * 2.0 * math.pi()
+        top_uvs.push(fm.vec2(0.5 + 0.5 * math.cos(th_t), 0.5 - 0.5 * math.sin(th_t)))
+        th_b := f64(i) / f64(sides) * 2.0 * math.pi()
+        bot_uvs.push(fm.vec2(0.5 + 0.5 * math.cos(th_b), 0.5 + 0.5 * math.sin(th_b)))
+    }
+    m.add_polygon(top_rev, top_uvs, true, fm.vec3(0.0, 1.0, 0.0), true, mat_slot, 0) >>>
+    m.add_polygon(~bot, bot_uvs, true, fm.vec3(0.0, -1.0, 0.0), true, mat_slot, 0) >>>
+    compute_normals($&m) >>>
+    project_uv_box_all($&m, 1.0) >>>
+    << m
+}
+
+pub fn tube_editable(outer_radius f64, inner_radius f64, height f64, segments int, color int, mat_slot int) rm.EditableMesh {
+    if !fm.finite(outer_radius) || outer_radius <= 0.0002 || !fm.finite(inner_radius) || inner_radius <= 0.0001 ||
+        inner_radius >= outer_radius - 0.0001 || !fm.finite(height) || height <= 0.0001 ||
+        segments < 4 || segments > 64 {
+        >> errors.new("nexus modeling: invalid tube parameters")
+    }
+    $m := rm.new_editable_mesh("Tube")
+    hy := height * 0.5
+    $ob := []int{}
+    $ot := []int{}
+    $ib := []int{}
+    $it := []int{}
+    for i in 0:segments {
+        theta := f64(i) / f64(segments) * 2.0 * math.pi()
+        cs := math.cos(theta)
+        sn := math.sin(theta)
+        ob.push(m.add_vertex(fm.vec3(outer_radius * cs, -hy, outer_radius * sn), color) >>>)
+        ot.push(m.add_vertex(fm.vec3(outer_radius * cs, hy, outer_radius * sn), color) >>>)
+        ib.push(m.add_vertex(fm.vec3(inner_radius * cs, -hy, inner_radius * sn), color) >>>)
+        it.push(m.add_vertex(fm.vec3(inner_radius * cs, hy, inner_radius * sn), color) >>>)
+    }
+    for i in 0:segments {
+        $ni := i + 1
+        if ni >= segments { ni = 0 }
+        u0 := f64(i) / f64(segments)
+        u1 := f64(i + 1) / f64(segments)
+        // Outer wall
+        oa := ob[i]
+        ob_v := ot[i]
+        oc := ot[ni]
+        od := ob[ni]
+        on_out := m.vertices[ob_v].position.sub(m.vertices[oa].position).cross(m.vertices[od].position.sub(m.vertices[oa].position)).normalized_or_zero()
+        m.add_polygon([oa, ob_v, oc, od], [fm.vec2(u0, 1.0), fm.vec2(u0, 0.0), fm.vec2(u1, 0.0), fm.vec2(u1, 1.0)],
+            true, on_out, false, mat_slot, 1) >>>
+        // Inner wall (normals point inward)
+        ia := ib[ni]
+        ib_v := it[ni]
+        ic := it[i]
+        id := ib[i]
+        on_in := m.vertices[ib_v].position.sub(m.vertices[ia].position).cross(m.vertices[id].position.sub(m.vertices[ia].position)).normalized_or_zero()
+        m.add_polygon([ia, ib_v, ic, id], [fm.vec2(u1, 1.0), fm.vec2(u1, 0.0), fm.vec2(u0, 0.0), fm.vec2(u0, 1.0)],
+            true, on_in, false, mat_slot, 1) >>>
+        // Top annular cap (+Y)
+        append_quad($&m, it[i], it[ni], ot[ni], ot[i], fm.vec3(0.0, 1.0, 0.0), mat_slot) >>>
+        // Bottom annular cap (-Y)
+        append_quad($&m, ob[i], ob[ni], ib[ni], ib[i], fm.vec3(0.0, -1.0, 0.0), mat_slot) >>>
+    }
+    compute_normals($&m) >>>
+    project_uv_box_all($&m, 1.0) >>>
+    << m
+}
+
+pub fn dome_editable(radius f64, segments int, rings int, color int, mat_slot int) rm.EditableMesh {
+    if !fm.finite(radius) || radius <= 0.0001 || segments < 4 || segments > 64 || rings < 2 || rings > 32 {
+        >> errors.new("nexus modeling: invalid dome parameters")
+    }
+    $m := rm.new_editable_mesh("Dome")
+    y_shift := -radius * 0.5
+    top_v := m.add_vertex(fm.vec3(0.0, radius + y_shift, 0.0), color) >>>
+    $ring_verts := [][]int{}
+    for r in 1:(rings + 1) {
+        phi := f64(r) / f64(rings) * (math.pi() * 0.5)
+        rr := radius * math.sin(phi)
+        y := radius * math.cos(phi) + y_shift
+        $row := []int{}
+        for i in 0:segments {
+            theta := f64(i) / f64(segments) * 2.0 * math.pi()
+            row.push(m.add_vertex(fm.vec3(rr * math.cos(theta), y, rr * math.sin(theta)), color) >>>)
+        }
+        ring_verts.push(row)
+    }
+    // Pole fan
+    for i in 0:segments {
+        $ni := i + 1
+        if ni >= segments { ni = 0 }
+        v0 := ring_verts[0][ni]
+        v1 := ring_verts[0][i]
+        pt := m.vertices[top_v].position
+        p0 := m.vertices[v0].position
+        p1 := m.vertices[v1].position
+        n := p0.sub(pt).cross(p1.sub(pt)).normalized_or_zero()
+        u0 := f64(i) / f64(segments)
+        u1 := f64(i + 1) / f64(segments)
+        v_ring := 1.0 / f64(rings)
+        m.add_polygon([top_v, v0, v1], [fm.vec2((u0 + u1) * 0.5, 0.0), fm.vec2(u1, v_ring), fm.vec2(u0, v_ring)],
+            true, n, false, mat_slot, 1) >>>
+    }
+    // Latitude bands
+    for r in 1:rings {
+        vt0 := f64(r) / f64(rings)
+        vt1 := f64(r + 1) / f64(rings)
+        for i in 0:segments {
+            $ni := i + 1
+            if ni >= segments { ni = 0 }
+            u0 := f64(i) / f64(segments)
+            u1 := f64(i + 1) / f64(segments)
+            a := ring_verts[r][i]
+            b := ring_verts[r - 1][i]
+            c := ring_verts[r - 1][ni]
+            d := ring_verts[r][ni]
+            pa := m.vertices[a].position
+            pb := m.vertices[b].position
+            pd := m.vertices[d].position
+            n := pb.sub(pa).cross(pd.sub(pa)).normalized_or_zero()
+            m.add_polygon([a, b, c, d],
+                [fm.vec2(u0, vt1), fm.vec2(u0, vt0), fm.vec2(u1, vt0), fm.vec2(u1, vt1)],
+                true, n, false, mat_slot, 1) >>>
+        }
+    }
+    // Bottom flat equator cap (-Y)
+    last_r := rings - 1
+    eq := &ring_verts[last_r]
+    $bot_cap := []int{}
+    $bot_uvs := []fm.Vec2{}
+    for i in 0:segments {
+        bot_cap.push(eq[i])
+        theta := f64(i) / f64(segments) * 2.0 * math.pi()
+        bot_uvs.push(fm.vec2(0.5 + 0.5 * math.cos(theta), 0.5 + 0.5 * math.sin(theta)))
+    }
+    m.add_polygon(bot_cap, bot_uvs, true, fm.vec3(0.0, -1.0, 0.0), true, mat_slot, 0) >>>
+    compute_normals($&m) >>>
+    << m
+}
+
+pub fn plane_editable(width f64, depth f64, seg_x int, seg_z int, color int, mat_slot int) rm.EditableMesh {
+    if !fm.finite(width) || width <= 0.0001 || !fm.finite(depth) || depth <= 0.0001 ||
+        seg_x < 1 || seg_x > 32 || seg_z < 1 || seg_z > 32 {
+        >> errors.new("nexus modeling: invalid plane parameters")
+    }
+    $m := rm.new_editable_mesh("Plane")
+    $grid := []int{}
+    for r in 0:(seg_z + 1) {
+        vf := f64(r) / f64(seg_z)
+        z := (vf - 0.5) * depth
+        for c in 0:(seg_x + 1) {
+            uf := f64(c) / f64(seg_x)
+            x := (uf - 0.5) * width
+            grid.push(m.add_vertex(fm.vec3(x, 0.0, z), color) >>>)
+        }
+    }
+    stride := seg_x + 1
+    up_n := fm.vec3(0.0, 1.0, 0.0)
+    for r in 0:seg_z {
+        v0 := f64(r) / f64(seg_z)
+        v1 := f64(r + 1) / f64(seg_z)
+        for c in 0:seg_x {
+            u0 := f64(c) / f64(seg_x)
+            u1 := f64(c + 1) / f64(seg_x)
+            a := grid[r * stride + c]
+            b := a + 1
+            cc := a + stride
+            d := cc + 1
+            m.add_polygon([a, cc, d, b],
+                [fm.vec2(u0, v0), fm.vec2(u0, v1), fm.vec2(u1, v1), fm.vec2(u1, v0)],
+                true, up_n, true, mat_slot, 0) >>>
+        }
+    }
+    << m
+}
+
 pub fn generate_brush_mesh(brush &rm.CsgBrush) rm.EditableMesh {
     brush.validate() >>>
     $m := rm.new_editable_mesh(brush.name + "")

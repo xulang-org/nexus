@@ -2,6 +2,8 @@
 
 fm #"github.com/xulang-org/nexus/foundation/math"
 data #"github.com/xulang-org/nexus/resources/lighting"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+shadows #"github.com/xulang-org/nexus/resources/shadow"
 resource #"github.com/xulang-org/nexus/resources/scene"
 canvas #"github.com/xulang-org/nexus/resources/canvas"
 ui_bridge #"github.com/xulang-org/nexus/integration/ui"
@@ -76,6 +78,7 @@ struct Options { path string
     capture string
     live_connect string
     live_script string
+    embed_connect string
     whitebox_out string
     whitebox_shape string
     snap SnapSteps }
@@ -83,7 +86,7 @@ struct Options { path string
 fn options() Options {
     args := os.args()
     $config := Options{path: "", output: "", meta_out: "", select_node: -1, check_node: "", check_also: "", check_local: false, modern: false, capture: "",
-        live_connect: "", live_script: "", whitebox_out: "", whitebox_shape: "",
+        live_connect: "", live_script: "", embed_connect: "", whitebox_out: "", whitebox_shape: "",
         snap: SnapSteps{move: 0.25, rotate: 15.0, scale: 10.0}}
     $i := 1
     while i < args.len {
@@ -110,6 +113,7 @@ fn options() Options {
         else if args[i] == "--capture" { config.capture = value }
         else if args[i] == "--live-connect" { config.live_connect = value }
         else if args[i] == "--live-script" { config.live_script = value }
+        else if args[i] == "--embed-connect" { config.embed_connect = value }
         else if args[i] == "--whitebox-out" { config.whitebox_out = value }
         else if args[i] == "--whitebox" { config.whitebox_shape = value }
         else if args[i] == "--snap-move" {
@@ -122,11 +126,13 @@ fn options() Options {
         else { >> errors.new("unknown viewport option: " + args[i]) }
         i += 2
     }
-    if config.path.len == 0 || config.output.len == 0 {
+    if config.path.len == 0 || (config.output.len == 0 && config.embed_connect.len == 0) {
         >> errors.new("viewport requires a scene and a separate output path")
     }
     config.path = filepath.abs(&config.path) >>>
-    config.output = filepath.abs(&config.output) >>>
+    if config.output.len > 0 {
+        config.output = filepath.abs(&config.output) >>>
+    }
     if config.meta_out.len > 0 {
         config.meta_out = filepath.abs(&config.meta_out) >>>
     }
@@ -167,12 +173,89 @@ struct SceneNodeMeta {
     is_3d bool
 }
 
+struct ModernPipelineBox {
+    items []world3d.ModernPipeline3D
+}
+
 struct ViewportModernHost {
     enabled bool
-    pipelines []world3d.ModernPipeline3D
+    cprog ren.ClusteredProgram3D
+    iprog ren.IndirectProgram3D
+    pprog ren.PostProcessProgram3D
+    sprog ren.ShadowProgram3D
+    shadow_maps []ren.ShadowMap3D
+    shadow_res int
+    shadow_faces int
+    atm_list []ren.AtmosphereRenderer3D
+    has_atm bool
+    atm_cfg ren.AtmosphereConfig3D
+    particles []ren.GpuParticleSystem3D
+    particle_nodes []int
+    dummy_grid []ren.Mesh3D
     ambient fm.Vec3
     exposure f64
     pp_cfg ren.PostProcessConfig3D
+}
+
+fn try_open_modern_host_shadow(
+    device &ren.Device3D,
+    modern $&ViewportModernHost,
+    sdesc shadows.ShadowDescription3D
+) bool {
+    sm_new := device.shadow_map(sdesc, &modern.sprog) >>> (err) {
+        eprintln("viewport shadow fallback (unshadowed): " + err.msg())
+        << false
+    }
+    modern.shadow_maps.push(sm_new)
+    modern.shadow_res = sdesc.resolution()
+    modern.shadow_faces = sdesc.face_count()
+    << true
+}
+
+fn close_modern_host_shadows(modern $&ViewportModernHost) {
+    for i in 0:modern.shadow_maps.len {
+        _ := ($&modern.shadow_maps[i]).close() >>> (err) {
+            _ := err
+            <<
+        }
+    }
+    modern.shadow_maps = []ren.ShadowMap3D{}
+}
+
+fn close_modern_host_pipelines(mp_box $&ModernPipelineBox) {
+    for i in 0:mp_box.items.len {
+        _ := ($&mp_box.items[i]).close() >>> (err) {
+            _ := err
+            <<
+        }
+    }
+    mp_box.items = []world3d.ModernPipeline3D{}
+}
+
+fn close_modern_host(modern $&ViewportModernHost, mp_box $&ModernPipelineBox) {
+    close_modern_host_shadows(modern)
+    close_modern_host_pipelines(mp_box)
+    for i in 0:modern.atm_list.len {
+        _ := ($&modern.atm_list[i]).close() >>> (err) {
+            _ := err
+            <<
+        }
+    }
+    modern.atm_list = []ren.AtmosphereRenderer3D{}
+    for i in 0:modern.particles.len {
+        _ := ($&modern.particles[i]).close() >>> (err) {
+            _ := err
+            <<
+        }
+    }
+    modern.particles = []ren.GpuParticleSystem3D{}
+    for i in 0:modern.dummy_grid.len {
+        _ := ($&modern.dummy_grid[i]).close() >>> (err) {
+            _ := err
+            <<
+        }
+    }
+    modern.dummy_grid = []ren.Mesh3D{}
 }
 
 struct EditorView {
@@ -769,7 +852,7 @@ fn gather_view_lights(slights &scene_lights.SceneLights3D, tree &scene.SceneTree
 }
 
 fn draw_view(device $&ren.Device3D, overlay $&ren2.Overlay2D, hud $&ui_bridge.UiFrame, world $&world3d.Scene3D,
-    modern $&ViewportModernHost, slights &scene_lights.SceneLights3D, scene_mods &imod.SceneModeling3D, tree &scene.SceneTree, editor &EditorView,
+    modern $&ViewportModernHost, mp_box $&ModernPipelineBox, slights &scene_lights.SceneLights3D, scene_mods &imod.SceneModeling3D, tree &scene.SceneTree, editor &EditorView,
     wb $&WhiteboxHost, frame CameraFrame, capture string) int {
     world.select_lods(tree, frame.position) >>>
     if wb.active {
@@ -777,22 +860,86 @@ fn draw_view(device $&ren.Device3D, overlay $&ren2.Overlay2D, hud $&ui_bridge.Ui
         wb_s := $&wb.session
         _ := wb_s.sync_gpu(device, wb_mat, &[]ren.Material3D{}, true) >>>
     }
-    if modern.enabled && modern.pipelines.len > 0 {
-        lights_list := gather_view_lights(slights, tree, editor.use_scene_lights) >>>
-        $opaque_refs := []ren.MeshRef3D{}
-        $opaque_worlds := []fm.Mat4{}
-        $opaque_mats := []ren.Material3D{}
-        _ := world.collect_visible_draws(tree, frame.projection, $&opaque_refs, $&opaque_worlds, $&opaque_mats) >>>
-        _ := scene_mods.collect_draws(tree, &editor.tree_ids, $&opaque_refs, $&opaque_worlds, $&opaque_mats) >>>
-        if wb.active {
-            _ := wb.session.collect_draws(wb.world, $&opaque_refs, $&opaque_worlds, $&opaque_mats) >>>
+    if modern.enabled && mp_box.items.len > 0 {
+        rw := device.render_width()
+        rh := device.render_height()
+        if mp_box.items[0].target_width() != rw || mp_box.items[0].target_height() != rh {
+            close_modern_host_pipelines(mp_box)
+            mp_new := world3d.new_modern_pipeline_3d(device, &modern.cprog, &modern.iprog, &modern.pprog) >>>
+            mp_box.items.push(mp_new)
         }
+        for pi in 0:modern.particles.len {
+            ps := $&modern.particles[pi]
+            ps.step(device, 1.0 / 60.0) >>>
+        }
+        lights_list := gather_view_lights(slights, tree, editor.use_scene_lights) >>>
         amb := modern.ambient
         exp := modern.exposure
         pp := modern.pp_cfg
-        mp := $&modern.pipelines[0]
+        $lights_copy := []data.Light3D{}
+        for li in 0:lights_list.len { lights_copy.push(lights_list[li]) }
+        lighting := data.environment(amb, frame.position, exp, lights_copy) >>>
+
+        $sbind := ren.no_shadow_binding()
+        if lighting.source_count() > 0 {
+            b := compute_embed_bounds(tree, &editor.tree_ids)
+            src0 := lighting.source(0) >>>
+            $sdir := fm.vec3(0.45, 0.78, 0.42).normalized() >>>
+            if src0.kind() != data.POINT {
+                sdir = src0.direction().normalized() >>>
+            }
+            d0 := shadows.directional(b.center, sdir, b.radius, math.max(30.0, b.radius * 4.0), 512) >>>
+            sdesc := (d0.with_bias(0.0005, 0.002) >>>).with_pcss_light_radius(2.0) >>>
+            if modern.shadow_maps.len == 0 || modern.shadow_res != sdesc.resolution() || modern.shadow_faces != sdesc.face_count() {
+                close_modern_host_shadows(modern)
+                if !try_open_modern_host_shadow(device, modern, sdesc) {
+                    modern.shadow_res = 0
+                    modern.shadow_faces = 0
+                }
+            }
+            if modern.shadow_maps.len > 0 {
+                $casters := world.shadow_casters(tree) >>>
+                mc := scene_mods.shadow_casters(tree, &editor.tree_ids) >>>
+                for ci in 0:mc.len { casters.push(mc[ci]) }
+                sm := $&modern.shadow_maps[0]
+                _ := sm.render(device, &casters, sdesc) >>>
+                sbind = sm.binding(&lighting, 0) >>>
+            }
+        }
+
+        $all_refs := []ren.MeshRef3D{}
+        $all_worlds := []fm.Mat4{}
+        $all_mats := []ren.Material3D{}
+        _ := world.collect_visible_draws(tree, frame.projection, $&all_refs, $&all_worlds, $&all_mats) >>>
+        _ := scene_mods.collect_draws(tree, &editor.tree_ids, $&all_refs, $&all_worlds, $&all_mats) >>>
+        if wb.active {
+            _ := wb.session.collect_draws(wb.world, $&all_refs, $&all_worlds, $&all_mats) >>>
+        }
+        $opaque_refs := []ren.MeshRef3D{}
+        $opaque_worlds := []fm.Mat4{}
+        $opaque_mats := []ren.Material3D{}
+        $tq := ren.new_transparent_queue_3d()
+        for di in 0:all_refs.len {
+            if all_mats[di].is_alpha_blended() {
+                _ := tq.submit(all_refs[di], all_worlds[di], all_mats[di], 0.0) >>>
+            } else {
+                opaque_refs.push(all_refs[di])
+                opaque_worlds.push(all_worlds[di])
+                opaque_mats.push(all_mats[di])
+            }
+        }
+        $atm_cfg := modern.atm_cfg
+        mp := $&mp_box.items[0]
         _ := mp.prepare_lights(device, amb, frame.position, exp, &lights_list, frame.view, frame.proj, frame.near, frame.far) >>>
-        _ := mp.render_clustered_hdr_frame(device, &opaque_refs, &opaque_worlds, &opaque_mats, frame.view, frame.proj, frame.near, frame.far, EDITOR_CANVAS, &pp) >>>
+        if modern.atm_list.len > 0 && modern.dummy_grid.len > 0 {
+            _ := mp.render_scene_effects_frame(
+                device, false, &modern.dummy_grid[0], &opaque_refs, &opaque_worlds, &opaque_mats, &sbind,
+                modern.has_atm, &modern.atm_list[0], &atm_cfg, &tq, &modern.particles,
+                frame.position, frame.view, frame.proj, frame.near, frame.far, EDITOR_CANVAS, &pp
+            ) >>>
+        } else {
+            _ := mp.render_clustered_hdr_frame(device, &opaque_refs, &opaque_worlds, &opaque_mats, frame.view, frame.proj, frame.near, frame.far, EDITOR_CANVAS, &pp) >>>
+        }
     } else {
         lighting := data.environment(fm.vec3(0.24, 0.25, 0.27), frame.position, 1.0,
             gather_view_lights(slights, tree, editor.use_scene_lights) >>>) >>>
@@ -922,6 +1069,9 @@ fn write_viewport_meta(config &Options, editor &EditorView) int {
 
 fn run() int {
     config := options() >>>
+    if config.embed_connect.len > 0 {
+        << run_embed_server(&config) >>>
+    }
     directory := filepath.dir(&config.path)
     document := files.load(config.path + "") >>>
     doc_meta := files.load(config.path + "") >>>
@@ -944,7 +1094,7 @@ fn run() int {
     $world := world3d.new_scene_3d(&device) >>>
     root := models.instantiate($&world, $&tree, parent, name + "") >>>
     picker := models.picker(&tree, root) >>>
-    $scene_mods := imod.prepare_scene_modeling(&device, &doc_meta) >>>
+    $scene_mods := imod.prepare_scene_modeling_in_dir(&device, &doc_meta, directory + "") >>>
 
     $slights := scene_lights.new_scene_lights_3d()
     if doc_meta.light_count() > 0 {
@@ -952,6 +1102,32 @@ fn run() int {
     }
 
     tree_ids := tree.subtree(root) >>>
+    for mi in 0:doc_meta.material_override_count() {
+        ov := doc_meta.material_override(mi) >>> (err) {
+            _ := err
+            ->
+        }
+        if ov.slot != 0 || ov.node < 0 || ov.node >= tree_ids.len { -> }
+        tid := tree_ids[ov.node]
+        $mat3d := scene_mods.resolve_material_3d(&ov.material) >>> (err) {
+            _ := err
+            ->
+        }
+        $mat_plain := imod.material_asset_to_3d(&ov.material) >>> (err) {
+            _ := err
+            ->
+        }
+        keep_ds := world.is_node_double_sided(tid)
+        if keep_ds && !mat3d.is_double_sided() {
+            mat3d = mat3d.with_double_sided(true)
+        }
+        if !try_apply_world_mat($&world, &tree, tid, mat3d) {
+            if keep_ds && !mat_plain.is_double_sided() {
+                mat_plain = mat_plain.with_double_sided(true)
+            }
+            _ := try_apply_world_mat($&world, &tree, tid, mat_plain)
+        }
+    }
     $doc_by_tree_id := map[int]int{}
     for d in 0:tree_ids.len { doc_by_tree_id[tree_ids[d]] = d }
 
@@ -1016,6 +1192,8 @@ fn run() int {
     $pp_cfg := ren.post_process_defaults_3d()
     $env_ambient := fm.vec3(0.24, 0.25, 0.27)
     $env_exposure := 1.0
+    $has_atm := false
+    $atm_cfg := ren.default_atmosphere_config_3d()
     if doc_meta.environment_count() > 0 {
         ev := doc_meta.environment(0) >>>
         env_ambient = ev.ambient
@@ -1027,19 +1205,70 @@ fn run() int {
         pp_cfg.bloom_intensity = ev.bloom_intensity
         pp_cfg.taa_enabled = ev.taa_enabled
         pp_cfg.exposure = ev.exposure
+        has_atm = ev.sky_mode == resource.SKY_ATMOSPHERE || ev.fog_density > 0.0001
+        nsun := embed_unit_dir_or_sun(ev.sun_dir)
+        atm_cfg.sky_enabled = ev.sky_mode == resource.SKY_ATMOSPHERE
+        atm_cfg.sun_direction = nsun
+        atm_cfg.sun_radiance = fm.vec3(ev.sun_intensity, ev.sun_intensity * 0.96, ev.sun_intensity * 0.90)
+        atm_cfg.mie_scale = math.max(0.2, ev.turbidity * 0.4)
+        atm_cfg.fog_enabled = ev.fog_density > 0.0001
+        atm_cfg.fog_near = 0.5
+        atm_cfg.fog_far = 120.0
+        atm_cfg.fog_density = math.min(10.0, math.max(0.0, ev.fog_density))
+        atm_cfg.fog_scattering_strength = math.max(0.0, ev.fog_scattering)
     }
     $modern := ViewportModernHost{
         enabled: use_modern,
-        pipelines: []world3d.ModernPipeline3D{},
+        cprog: ren.ClusteredProgram3D{format: 0, entrypoint: "", compute: []u8{}, vertex: []u8{}, fragment: []u8{}},
+        iprog: ren.IndirectProgram3D{format: 0, entrypoint: "", hiz_depth: []u8{}, hiz_mip: []u8{}, cull: []u8{}, vertex: []u8{}, fragment: []u8{}},
+        pprog: ren.empty_postprocess_program_3d(),
+        sprog: ren.ShadowProgram3D{format: 0, entrypoint: "", vertex: []u8{}, fragment: []u8{}},
+        shadow_maps: []ren.ShadowMap3D{},
+        shadow_res: 0,
+        shadow_faces: 0,
+        atm_list: []ren.AtmosphereRenderer3D{},
+        has_atm: has_atm,
+        atm_cfg: atm_cfg,
+        particles: []ren.GpuParticleSystem3D{},
+        particle_nodes: []int{},
+        dummy_grid: []ren.Mesh3D{},
         ambient: env_ambient,
         exposure: env_exposure,
         pp_cfg: pp_cfg
     }
+    $mp_box := ModernPipelineBox{items: []world3d.ModernPipeline3D{}}
     if use_modern {
-        cprog := mesh_shaders.load_clustered_program("build/mesh-shaders") >>>
-        iprog := mesh_shaders.load_indirect_program("build/mesh-shaders") >>>
-        pprog := mesh_shaders.load_postprocess_program("build/mesh-shaders") >>>
-        modern.pipelines.push(world3d.new_modern_pipeline_3d(&device, &cprog, &iprog, &pprog) >>>)
+        modern.cprog = mesh_shaders.load_clustered_program("build/mesh-shaders") >>>
+        modern.iprog = mesh_shaders.load_indirect_program("build/mesh-shaders") >>>
+        modern.pprog = mesh_shaders.load_postprocess_program("build/mesh-shaders") >>>
+        modern.sprog = mesh_shaders.load_shadow("build/mesh-shaders") >>>
+        aprog := mesh_shaders.load_atmosphere_program("build/mesh-shaders") >>>
+        mp0 := world3d.new_modern_pipeline_3d(&device, &modern.cprog, &modern.iprog, &modern.pprog) >>>
+        mp_box.items.push(mp0)
+        ar0 := device.atmosphere_renderer(&aprog) >>>
+        modern.atm_list.push(ar0)
+        $dmesh_cpu := meshes.new_mesh_data_3d()
+        dmesh_cpu.vertex(fm.vec3(0.0, 0.0, 0.0), 0) >>>
+        dmesh_cpu.vertex(fm.vec3(0.0, 0.0, 0.0), 0) >>>
+        dmesh_cpu.vertex(fm.vec3(0.0, 0.0, 0.0), 0) >>>
+        dmesh_cpu.triangle(0, 1, 2) >>>
+        dg := device.upload(&dmesh_cpu) >>>
+        modern.dummy_grid.push(dg)
+        if doc_meta.particle_emitter_3d_count() > 0 {
+            vprog := mesh_shaders.load_particle_program("build/mesh-shaders") >>>
+            for pi in 0:doc_meta.particle_emitter_3d_count() {
+                att := doc_meta.particle_emitter_3d(pi) >>>
+                $origin := fm.vec3(0.0, 0.0, 0.0)
+                if att.node >= 0 && att.node < tree_ids.len {
+                    origin = (tree.global_transform_3d(tree_ids[att.node]) >>>).c3.xyz()
+                }
+                $ps := device.gpu_particle_system(&vprog, att.max_particles, 3001 + pi * 37) >>>
+                ps.set_emitter(&build_embed_particle_emitter(&att, origin)) >>>
+                for _ in 0:18 { ps.step(&device, 1.0 / 60.0) >>> }
+                modern.particles.push(ps)
+                modern.particle_nodes.push(att.node)
+            }
+        }
     }
 
     $init_sel := []int{}
@@ -1130,7 +1359,7 @@ fn run() int {
         if editor.outcome != EDITING {
             if (pending_capture.len > 0 || (wb_emit_pending && live_ch.connected && wb.active)) && size.x >= 1.0 && size.y >= 1.0 {
                 frame := camera_frame(editor.orbit, size) >>>
-                draw_view($&device, $&overlay, $&hud, $&world, $&modern, &slights, &scene_mods, &tree, &editor, $&wb, frame, pending_capture + "") >>>
+                draw_view($&device, $&overlay, $&hud, $&world, $&modern, $&mp_box, &slights, &scene_mods, &tree, &editor, $&wb, frame, pending_capture + "") >>>
                 if pending_capture.len > 0 {
                     emit_captured_event(&live_ch, pending_capture + "")
                     pending_capture = ""
@@ -1153,7 +1382,7 @@ fn run() int {
             check_edit($&editor, $&tree, $&world, &picker, root, size, config.check_node + "") >>>
         }
         frame := camera_frame(editor.orbit, size) >>>
-        draw_view($&device, $&overlay, $&hud, $&world, $&modern, &slights, &scene_mods, &tree, &editor, $&wb, frame, pending_capture + "") >>>
+        draw_view($&device, $&overlay, $&hud, $&world, $&modern, $&mp_box, &slights, &scene_mods, &tree, &editor, $&wb, frame, pending_capture + "") >>>
         if pending_capture.len > 0 {
             emit_captured_event(&live_ch, pending_capture + "")
             pending_capture = ""
@@ -1176,8 +1405,8 @@ fn run() int {
     live_ch.close_live()
     wb_sess := $&wb.session
     _ := wb_sess.close()
-    if modern.enabled && modern.pipelines.len > 0 {
-        ($&modern.pipelines[0]).close()
+    if modern.enabled {
+        close_modern_host($&modern, $&mp_box)
     }
     scene_mods.close() >>>
     models.close() >>>

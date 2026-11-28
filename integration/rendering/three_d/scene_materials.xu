@@ -19,6 +19,12 @@ pub fn (scene $&Scene3D) set_material(tree &nexus.SceneTree, node int, material 
     scene.materials[node] = material
     << 0
 }
+
+pub fn (scene &Scene3D) is_node_double_sided(node int) bool {
+    if !scene.materials.has(node) { << false }
+    << scene.materials[node].is_double_sided()
+}
+
 pub fn (scene $&Scene3D) clear_material(node int) int {
     if !scene.materials.has(node) { << 0 }
     materials := $&scene.materials
@@ -49,33 +55,38 @@ fn (scene &Scene3D) draw_lit_with_shadow(device $&ren.Device3D,tree &nexus.Scene
     $culled_triangles := 0
     $lod_instances := 0
     $lod_triangles_saved := 0
-    for node in order {
-        if !scene.meshes.has(node) { -> }
-        if !(tree.is_visible(node) >>>) { -> }
-        mesh := scene.selected_mesh(node) >>>
-        world := tree.global_transform_3d(node) >>>
-        $count := 0
-        if scene.materials.has(node) {
-            material := &scene.materials[node]
-            if !(scene.owner.material_in_view(mesh,world,view_projection,material) >>>) {
-                culled_instances+=1
-                culled_triangles+=mesh.triangle_count()
-                ->
+    for pass in 0:2 {
+        transparent_pass := pass == 1
+        for node in order {
+            if !scene.meshes.has(node) { -> }
+            is_blend := scene.materials.has(node) && scene.materials[node].is_alpha_blended()
+            if is_blend != transparent_pass { -> }
+            if !(tree.is_visible(node) >>>) { -> }
+            mesh := scene.selected_mesh(node) >>>
+            world := tree.global_transform_3d(node) >>>
+            $count := 0
+            if scene.materials.has(node) {
+                material := &scene.materials[node]
+                if !(scene.owner.material_in_view(mesh,world,view_projection,material) >>>) {
+                    culled_instances+=1
+                    culled_triangles+=mesh.triangle_count()
+                    ->
+                }
+                count = device.draw_material_shadowed_reference(mesh, world, view_projection, material, lighting,shadow) >>>
+            } else {
+                mvp := view_projection.multiply(world)
+                if !(scene.owner.mesh_in_view(mesh,mvp) >>>) {
+                    culled_instances+=1
+                    culled_triangles+=mesh.triangle_count()
+                    ->
+                }
+                count = device.draw_reference(mesh,mvp) >>>
             }
-            count = device.draw_material_shadowed_reference(mesh, world, view_projection, material, lighting,shadow) >>>
-        } else {
-            mvp := view_projection.multiply(world)
-            if !(scene.owner.mesh_in_view(mesh,mvp) >>>) {
-                culled_instances+=1
-                culled_triangles+=mesh.triangle_count()
-                ->
-            }
-            count = device.draw_reference(mesh,mvp) >>>
+            instances = instances + 1
+            triangles = triangles + count
+            if (scene.lod_level(node) >>>)>0 { lod_instances+=1
+                lod_triangles_saved+=scene.meshes[node].triangle_count()-count }
         }
-        instances = instances + 1
-        triangles = triangles + count
-        if (scene.lod_level(node) >>>)>0 { lod_instances+=1
-            lod_triangles_saved+=scene.meshes[node].triangle_count()-count }
     }
     << SceneDraw3D{instances: instances,triangles: triangles,culled_instances: culled_instances,culled_triangles: culled_triangles,
         lod_instances: lod_instances,lod_triangles_saved: lod_triangles_saved}
@@ -112,4 +123,63 @@ pub fn (scene &Scene3D) collect_visible_draws(
         count += 1
     }
     << count
+}
+
+pub fn (scene &Scene3D) collect_visible_draws_stats(
+    tree &nexus.SceneTree,
+    view_projection fm.Mat4,
+    out_refs $&[]ren.MeshRef3D,
+    out_worlds $&[]fm.Mat4,
+    out_mats $&[]ren.Material3D
+) SceneDraw3D {
+    order := tree.subtree(tree.root()) >>>
+    unlit_mat := (ren.material_3d(fm.vec3(1.0, 1.0, 1.0), 0.0, 1.0, fm.vec3(0.0, 0.0, 0.0)) >>>).with_shaded(false)
+    $instances := 0
+    $triangles := 0
+    $culled_instances := 0
+    $culled_triangles := 0
+    $lod_instances := 0
+    $lod_triangles_saved := 0
+    for node in order {
+        if !scene.meshes.has(node) { -> }
+        if !(tree.is_visible(node) >>>) { -> }
+        mesh := scene.selected_mesh(node) >>>
+        world := tree.global_transform_3d(node) >>>
+        if scene.materials.has(node) {
+            mat := scene.materials[node]
+            if !(scene.owner.material_in_view(mesh, world, view_projection, &mat) >>>) {
+                culled_instances += 1
+                culled_triangles += mesh.triangle_count()
+                ->
+            }
+            out_refs.push(mesh)
+            out_worlds.push(world)
+            out_mats.push(mat)
+        } else {
+            mvp := view_projection.multiply(world)
+            if !(scene.owner.mesh_in_view(mesh, mvp) >>>) {
+                culled_instances += 1
+                culled_triangles += mesh.triangle_count()
+                ->
+            }
+            out_refs.push(mesh)
+            out_worlds.push(world)
+            out_mats.push(unlit_mat)
+        }
+        count := mesh.triangle_count()
+        instances += 1
+        triangles += count
+        if (scene.lod_level(node) >>>) > 0 {
+            lod_instances += 1
+            lod_triangles_saved += scene.meshes[node].triangle_count() - count
+        }
+    }
+    << SceneDraw3D{
+        instances: instances,
+        triangles: triangles,
+        culled_instances: culled_instances,
+        culled_triangles: culled_triangles,
+        lod_instances: lod_instances,
+        lod_triangles_saved: lod_triangles_saved
+    }
 }

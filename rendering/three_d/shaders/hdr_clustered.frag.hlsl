@@ -95,6 +95,19 @@ float3 unit_safe(float3 value) {
     return scaled / sqrt(dot(scaled, scaled));
 }
 
+#define XU_VEC2 float2
+#define XU_VEC3 float3
+#define XU_VEC4 float4
+#define XU_MIX lerp
+#define XU_DDX(v) ddx(v)
+#define XU_DDY(v) ddy(v)
+#define XU_MAT4 float4x4
+#define XU_MUL(m,v) mul(m,v)
+#define XU_SHADOW_RESOURCES Texture2D<float4> shadow_map, SamplerState shadow_sampling
+#define XU_SHADOW_READ(uv) shadow_map.SampleLevel(shadow_sampling,uv,0.0).r
+#define XU_SHADOW_ARGS shadow_map,shadow_sampling
+#include "shadow.inc"
+
 float3 material_direct(float3 base, float metallic, float roughness,
     float clearcoat, float clearcoat_roughness, float ior,
     float3 sheen_color, float sheen_roughness,
@@ -279,19 +292,51 @@ Output main(Input input, bool is_front : SV_IsFrontFace) {
         indirect_ambient += sample_irradiance(input.world, shading_normal) * irr.dims_mode.z;
     }
     float3 linear_color = indirect_ambient * occlusion * base * (1.0 - metallic) + emission;
+    float3 v_ind = unit_safe(l.eye_exposure.xyz - input.world);
+    float nv_ind = max(dot(shading_normal, v_ind), 0.0001);
     float max_sheen_ind = max(sheen_color.x, max(sheen_color.y, sheen_color.z));
     if (max_sheen_ind > 0.0) {
-        float3 v_dir = unit_safe(l.eye_exposure.xyz - input.world);
-        float nv_ind = max(dot(shading_normal, v_dir), 0.0001);
         linear_color += indirect_ambient * occlusion * sheen_color * pow(1.0 - nv_ind, 2.0) * 0.35;
+    }
+    float3 refl_dir = reflect(-v_ind, shading_normal);
+    float sky_t = clamp(refl_dir.y * 0.5 + 0.5, 0.0, 1.0);
+    float3 env_hemi = indirect_ambient * lerp(float3(0.42, 0.40, 0.38), float3(1.50, 1.58, 1.72), sky_t);
+    if (metallic > 0.001) {
+        float ior_r_ind = (ior - 1.0) / max(ior + 1.0, 1e-4);
+        float f0_ind_s = ior_r_ind * ior_r_ind;
+        float3 f0_ind = lerp(float3(f0_ind_s, f0_ind_s, f0_ind_s), base, metallic);
+        float3 r1 = float3(1.0 - roughness, 1.0 - roughness, 1.0 - roughness);
+        float3 f_rough = f0_ind + (max(r1, f0_ind) - f0_ind) * pow(1.0 - nv_ind, 5.0);
+        linear_color += env_hemi * occlusion * f_rough * metallic * (1.0 - roughness * 0.45);
+    }
+    if (clearcoat > 0.001) {
+        float cc_f_ind = 0.04 + 0.96 * pow(1.0 - nv_ind, 5.0);
+        linear_color += env_hemi * occlusion * (clearcoat * cc_f_ind * (1.0 - clearcoat_roughness * 0.55));
+    }
+
+    float shadow_vis = 1.0;
+    int shadow_light_idx = -1;
+    if (s.shadow_filter.w > 0.5) {
+        shadow_light_idx = int(s.shadow_filter.z);
+        if (s.shadow_filter.w > 3.5) {
+            shadow_vis = cascade_shadow_visibility(input.world, input.world_normal,
+                XU_MUL(s.mvp[0], XU_VEC4(input.world, 1.0)), XU_MUL(s.mvp[1], XU_VEC4(input.world, 1.0)),
+                XU_MUL(s.mvp[2], XU_VEC4(input.world, 1.0)), XU_MUL(s.mvp[3], XU_VEC4(input.world, 1.0)),
+                s.camera_depth, s.ranges[0], s.ranges[1], s.ranges[2], s.ranges[3], s.limits,
+                s.direction_bias, s.shadow_filter, s.depth, s.gradient_scales, shadow_texture, shadow_sampler);
+        } else {
+            shadow_vis = shadow_visibility(input.world, input.world_normal, s.mvp[0], s.direction_bias,
+                s.shadow_filter, s.depth, s.gradient_scales.x, shadow_texture, shadow_sampler);
+        }
     }
 
     uint total_clusters = uint(l.grid_mode.x) * uint(l.grid_mode.y) * uint(l.grid_mode.z);
     uint dir_count = min(cluster_counts[total_clusters], MAX_LIGHTS_PER_CLUSTER);
     for (uint di = 0u; di < dir_count; ++di) {
         uint li = cluster_indices[total_clusters * MAX_LIGHTS_PER_CLUSTER + di];
+        float vis = (int(li) == shadow_light_idx) ? shadow_vis : 1.0;
         linear_color += source_direct(base, metallic, roughness, clearcoat, clearcoat_roughness, ior,
-            sheen_color, sheen_roughness, shading_normal, input.world, l.eye_exposure.xyz, lights[li]);
+            sheen_color, sheen_roughness, shading_normal, input.world, l.eye_exposure.xyz, lights[li]) * vis;
     }
 
     if (l.ambient_count.w > 0.5) {
@@ -310,8 +355,9 @@ Output main(Input input, bool is_front : SV_IsFrontFace) {
         uint base_idx = cid * MAX_LIGHTS_PER_CLUSTER;
         for (uint ci = 0u; ci < local_count; ++ci) {
             uint li = cluster_indices[base_idx + ci];
+            float vis = (int(li) == shadow_light_idx) ? shadow_vis : 1.0;
             linear_color += source_direct(base, metallic, roughness, clearcoat, clearcoat_roughness, ior,
-                sheen_color, sheen_roughness, shading_normal, input.world, l.eye_exposure.xyz, lights[li]);
+                sheen_color, sheen_roughness, shading_normal, input.world, l.eye_exposure.xyz, lights[li]) * vis;
         }
     }
 

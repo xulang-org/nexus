@@ -187,3 +187,44 @@ pub fn (q &TransparentQueue3D) flush_into_hdr(
         frustum_culled: q.draws.len - visible_order.len
     }
 }
+
+pub fn (q &TransparentQueue3D) flush_into_hdr_shadowed(
+    device &Device3D,
+    hdr $&HdrTarget3D,
+    clustered &ClusteredRenderer3D,
+    shadow &ShadowBinding3D,
+    view fm.Mat4,
+    view_projection fm.Mat4
+) TransparentSortStats3D {
+    device.alive() >>>
+    if !view.is_affine() || !view_projection.is_finite() {
+        >> errors.new("nexus 3D: transparent flush requires valid view and view-projection")
+    }
+    if q.draws.len == 0 {
+        << TransparentSortStats3D{submitted: 0, visible: 0, frustum_culled: 0}
+    }
+    order := q.sorted_indices(view) >>>
+    dref := device.reference()
+    $visible_order := []int{}
+    for idx in order {
+        d := &q.draws[idx]
+        dref.validate_material(d.mesh, &d.material) >>>
+        mvp := view_projection.multiply(d.world)
+        if dref.mesh_in_view(d.mesh, mvp) >>> {
+            visible_order.push(idx)
+        }
+    }
+    if visible_order.len > 0 {
+        hdr.begin_transparent_overlay(device) >>>
+        for idx in visible_order {
+            d := &q.draws[idx]
+            hdr.draw_clustered_shadowed(device, clustered, shadow, d.mesh, d.world, view, view_projection, &d.material) >>>
+        }
+        hdr.end() >>>
+    }
+    << TransparentSortStats3D{
+        submitted: q.draws.len,
+        visible: visible_order.len,
+        frustum_culled: q.draws.len - visible_order.len
+    }
+}

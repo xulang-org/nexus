@@ -1,0 +1,561 @@
+@main
+
+controls #"github.com/xulang-org/nexus/input"
+files #"github.com/xulang-org/nexus/integration/scene"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+resource #"github.com/xulang-org/nexus/resources/scene"
+scene #"github.com/xulang-org/nexus/scene"
+xacp #"github.com/xulang-org/nexus/xacp"
+#image/png
+#math
+#strings
+#ui
+#ui/layout
+widgets #ui/widgets
+
+const XACP_ID_STATUS = 900001
+const XACP_ID_PREVIEW_STATE = 900002
+const XACP_ID_STAGE_3D = 900010
+const XACP_ID_STAGE_SPLIT = 900011
+const XACP_ID_STAGE_2D = 900012
+const XACP_ID_STAGE_TILE = 900013
+const XACP_ID_INSP_TRANSFORM = 900020
+const XACP_ID_INSP_MATERIAL = 900021
+const XACP_ID_INSP_COMPONENTS = 900022
+const XACP_ID_SCENE_NODE_BASE = 900100
+
+pub struct EditorXacpHost {
+    pub last_rev string
+    pub last_status string
+    pub last_ui_sig string
+    pub frame_num int
+    pub preview_xacp_port int
+}
+
+pub fn empty_shadow_tree() scene.SceneTree {
+    << scene.new_scene_tree_3d("EditorScene", 4097) >>>
+}
+
+pub fn open_editor_xacp_ctrl(port int) xacp.GameControl {
+    $ctrl := xacp.inactive()
+    if port > 0 {
+        ctrl = xacp.attach_tcp(port)
+        if ctrl.is_open() {
+            ctrl.set_canvas_size(1240, 700)
+            println("XACP editor control listening on 127.0.0.1:" + str(ctrl.port))
+        } else {
+            eprintln("XACP editor control failed to bind port " + str(port))
+        }
+    }
+    << ctrl
+}
+
+pub fn new_editor_xacp_host(preview_port int) EditorXacpHost {
+    << EditorXacpHost{
+        last_rev: "",
+        last_status: "",
+        last_ui_sig: "",
+        frame_num: 0,
+        preview_xacp_port: preview_port
+    }
+}
+
+fn build_shadow_tree_from_doc(doc &resource.Document) scene.SceneTree {
+    packed := files.to_packed_nodes(doc) >>>
+    $t := scene.new_scene_tree_3d("EditorScene", 4097) >>>
+    r := t.root()
+    _ := packed.instantiate($&t, r, "Scene") >>> (err) {
+        _ := err
+        << t
+    }
+    << t
+}
+
+fn sync_editor_xacp_shadow_tree(
+    xh $&EditorXacpHost,
+    ctrl $&xacp.GameControl,
+    cur scene.SceneTree,
+    ed &Editor
+) scene.SceneTree {
+    if xh.last_rev == ed.draft.current { << cur }
+    doc := ed.draft.document() >>> (err) {
+        _ := err
+        << cur
+    }
+    next_t := build_shadow_tree_from_doc(&doc) >>> (err) {
+        _ := err
+        << cur
+    }
+    xh.last_rev = ed.draft.current + ""
+    ctrl.bump_revision()
+    << next_t
+}
+
+fn safe_node_bounds(view &widgets.View, id int) layout.Rect {
+    << view.node_bounds(id) >>> (err) {
+        _ := err
+        << layout.Rect{x: 0.0, y: 0.0, width: 0.0, height: 0.0}
+    }
+}
+
+fn bool_tag(v bool) string {
+    if v { << "1" }
+    << "0"
+}
+
+fn reg_rect_node(
+    ctrl $&xacp.GameControl,
+    id int,
+    parent int,
+    kind string,
+    label string,
+    x f64,
+    y f64,
+    w f64,
+    h f64,
+    visible bool,
+    enabled bool,
+    focusable bool,
+    focused bool,
+    checked bool,
+    val f64
+) {
+    ctrl.register_ui_node(xacp.UiNodeSnapshot{
+        id: id,
+        parent: parent,
+        kind: kind,
+        label: label,
+        x: x,
+        y: y,
+        width: w,
+        height: h,
+        visible: visible,
+        enabled: enabled,
+        focusable: focusable,
+        focused: focused,
+        checked: checked,
+        value: val
+    })
+}
+
+fn reg_widget_node(
+    ctrl $&xacp.GameControl,
+    view &widgets.View,
+    id int,
+    parent int,
+    kind string,
+    label string,
+    enabled bool,
+    focusable bool,
+    focused bool,
+    checked bool,
+    val f64
+) {
+    b := safe_node_bounds(view, id)
+    vis := b.width > 0.5 && b.height > 0.5
+    reg_rect_node(ctrl, id, parent, kind, label, b.x, b.y, b.width, b.height, vis, enabled, focusable, focused, checked, val)
+}
+
+fn preset_btn_index_at(k int) int {
+    if k == 0 { << MB_PRESET_0 }
+    if k == 1 { << MB_PRESET_1 }
+    if k == 2 { << MB_PRESET_2 }
+    if k == 3 { << MB_PRESET_3 }
+    if k == 4 { << MB_PRESET_4 }
+    if k == 5 { << MB_PRESET_5 }
+    if k == 6 { << MB_PRESET_6 }
+    if k == 7 { << MB_PRESET_7 }
+    if k == 8 { << MB_PRESET_8 }
+    << MB_PRESET_9
+}
+
+fn field_label_for(idx int) string {
+    if idx == MF_R { << "R" }
+    if idx == MF_G { << "G" }
+    if idx == MF_B { << "B" }
+    if idx == MF_METALLIC { << "Metallic" }
+    if idx == MF_ROUGHNESS { << "Roughness" }
+    if idx == MF_OP_STEP { << "OpStep" }
+    if idx == MF_EMIT { << "Emit" }
+    if idx == MF_ALPHA { << "Alpha" }
+    if idx == MF_COAT { << "Coat" }
+    if idx == MF_IOR { << "IOR" }
+    << "Field" + str(idx)
+}
+
+fn compute_ui_sig(ed &Editor) string {
+    << ed.draft.current + "|" +
+        str(ed.selected_node) + "|" +
+        str(ed.stage_mode) + "|" +
+        str(ed.insp_tab) + "|" +
+        bool_tag(ed.preview_active) + "|" +
+        bool_tag(ed.modeling.mat_dirty) + "|" +
+        bool_tag(ed.modeling.mat_two_sided) + "|" +
+        str(ed.modeling.active_preset) + "|" +
+        str(int(ed.viewport_w)) + "x" + str(int(ed.viewport_h)) + "|" +
+        ed.status_text
+}
+
+fn rebuild_editor_xacp_ui(xh &EditorXacpHost, c $&xacp.GameControl, ed &Editor, view &widgets.View) {
+    pport := xh.preview_xacp_port
+    c.clear_ui_nodes()
+
+    root_id := ed.id_root
+    reg_widget_node(c, view, root_id, 0, "UiRoot", "EditorRoot", true, false, false, false, 0.0)
+    reg_rect_node(c, XACP_ID_STATUS, root_id, "UiStatus", "status:" + ed.status_text, 0.0, 0.0, 0.0, 0.0, true, false, false, false, false, f64(ed.status_kind))
+    pstate := "preview_active=" + bool_tag(ed.preview_active) +
+        ",preview_port=" + str(pport) +
+        ",selected=" + str(ed.selected_node) +
+        ",stage=" + str(ed.stage_mode) +
+        ",insp_tab=" + str(ed.insp_tab)
+    reg_rect_node(c, XACP_ID_PREVIEW_STATE, root_id, "UiState", pstate, 0.0, 0.0, 0.0, 0.0, true, false, false, false, ed.preview_active, f64(pport))
+
+    // Toolbar
+    reg_widget_node(c, view, ed.id_save_btn, ed.id_toolbar, "UiButton", "toolbar:save", ed.draft.dirty(), true, false, false, 0.0)
+    reg_widget_node(c, view, ed.id_undo_btn, ed.id_toolbar, "UiButton", "toolbar:undo", ed.draft.can_undo(), true, false, false, 0.0)
+    reg_widget_node(c, view, ed.id_redo_btn, ed.id_toolbar, "UiButton", "toolbar:redo", ed.draft.can_redo(), true, false, false, 0.0)
+    reg_widget_node(c, view, ed.id_preview_btn, ed.id_toolbar, "UiButton", "toolbar:preview", !ed.preview_active, true, false, ed.preview_active, 0.0)
+    reg_widget_node(c, view, ed.id_import_btn, ed.id_toolbar, "UiButton", "toolbar:import", !ed.import_active, true, false, false, 0.0)
+    reg_widget_node(c, view, ed.id_globals_btn, ed.id_toolbar, "UiButton", "toolbar:globals", true, true, false, false, 0.0)
+    reg_widget_node(c, view, ed.id_new_scene_btn, ed.id_toolbar, "UiButton", "toolbar:new_scene", true, true, false, false, 0.0)
+
+    // Stage tabs + individual tab segments
+    stb := safe_node_bounds(view, ed.id_stage_tabs)
+    st_vis := stb.width > 0.5 && stb.height > 0.5
+    reg_rect_node(c, ed.id_stage_tabs, ed.id_toolbar, "UiTabs", "stage:tabs", stb.x, stb.y, stb.width, stb.height, st_vis, true, true, false, false, f64(ed.stage_mode))
+    st_seg_w := stb.width * 0.25
+    reg_rect_node(c, XACP_ID_STAGE_3D, ed.id_stage_tabs, "UiButton", "stage:tab_3d", stb.x, stb.y, st_seg_w, stb.height, st_vis, true, true, ed.stage_mode == STAGE_MODE_3D, ed.stage_mode == STAGE_MODE_3D, 0.0)
+    reg_rect_node(c, XACP_ID_STAGE_SPLIT, ed.id_stage_tabs, "UiButton", "stage:tab_split", stb.x + st_seg_w, stb.y, st_seg_w, stb.height, st_vis, true, true, ed.stage_mode == STAGE_MODE_SPLIT, ed.stage_mode == STAGE_MODE_SPLIT, 1.0)
+    reg_rect_node(c, XACP_ID_STAGE_2D, ed.id_stage_tabs, "UiButton", "stage:tab_2d", stb.x + st_seg_w * 2.0, stb.y, st_seg_w, stb.height, st_vis, true, true, ed.stage_mode == STAGE_MODE_2D, ed.stage_mode == STAGE_MODE_2D, 2.0)
+    reg_rect_node(c, XACP_ID_STAGE_TILE, ed.id_stage_tabs, "UiButton", "stage:tab_tilemap", stb.x + st_seg_w * 3.0, stb.y, st_seg_w, stb.height, st_vis, true, true, ed.stage_mode == STAGE_MODE_TILEMAP, ed.stage_mode == STAGE_MODE_TILEMAP, 3.0)
+
+    // Inspector tabs + individual tab segments
+    itb := safe_node_bounds(view, ed.id_insp_tabs)
+    it_vis := itb.width > 0.5 && itb.height > 0.5
+    reg_rect_node(c, ed.id_insp_tabs, ed.id_right_pane, "UiTabs", "inspector:tabs", itb.x, itb.y, itb.width, itb.height, it_vis, true, true, false, false, f64(ed.insp_tab))
+    it_seg_w := itb.width / 3.0
+    reg_rect_node(c, XACP_ID_INSP_TRANSFORM, ed.id_insp_tabs, "UiButton", "inspector:tab_transform", itb.x, itb.y, it_seg_w, itb.height, it_vis, true, true, ed.insp_tab == 0, ed.insp_tab == 0, 0.0)
+    reg_rect_node(c, XACP_ID_INSP_MATERIAL, ed.id_insp_tabs, "UiButton", "inspector:tab_material", itb.x + it_seg_w, itb.y, it_seg_w, itb.height, it_vis, true, true, ed.insp_tab == 1, ed.insp_tab == 1, 1.0)
+    reg_rect_node(c, XACP_ID_INSP_COMPONENTS, ed.id_insp_tabs, "UiButton", "inspector:tab_components", itb.x + it_seg_w * 2.0, itb.y, it_seg_w, itb.height, it_vis, true, true, ed.insp_tab == 2, ed.insp_tab == 2, 2.0)
+
+    // Outliner quick-add menu + Stage bar & modeling controls
+    reg_widget_node(c, view, ed.id_add_node_select, ed.id_tree_btns, "UiSelect", "outliner:add_node_select", true, true, false, false, f64(ed.add_node_select.selected()))
+    reg_widget_node(c, view, ed.id_fit_btn, ed.id_stage_bar, "UiButton", "stage:fit", true, true, false, false, 0.0)
+    reg_widget_node(c, view, ed.id_snap_btn, ed.id_stage_bar, "UiButton", "stage:snap", true, true, false, false, 0.0)
+    reg_widget_node(c, view, ed.id_stage_axis_btn, ed.id_stage_bar, "UiButton", "stage:axis", true, true, false, false, 0.0)
+    reg_widget_node(c, view, ed.id_top_view, ed.id_center_pane, "UiViewport3D", "stage:viewport3d", true, true, false, false, 0.0)
+    reg_widget_node(c, view, ed.modeling.id_shape_select, ed.id_stage_bar, "UiSelect", "modeling:shape_select", true, true, false, false, f64(ed.modeling.shape_select.selected()))
+
+    if ed.modeling.button_ids.len > MB_MAT_TWOSIDED {
+        reg_widget_node(c, view, ed.modeling.button_ids[MB_BOX], ed.id_stage_bar, "UiButton", "modeling:box", true, true, false, false, 0.0)
+        reg_widget_node(c, view, ed.modeling.button_ids[MB_SPHERE], ed.id_stage_bar, "UiButton", "modeling:sphere", true, true, false, false, 0.0)
+        reg_widget_node(c, view, ed.modeling.button_ids[MB_WEDGE], ed.id_stage_bar, "UiButton", "modeling:wedge", true, true, false, false, 0.0)
+        reg_widget_node(c, view, ed.modeling.button_ids[MB_CYL], ed.id_stage_bar, "UiButton", "modeling:cyl", true, true, false, false, 0.0)
+        reg_widget_node(c, view, ed.modeling.button_ids[MB_ARCH], ed.id_stage_bar, "UiButton", "modeling:arch", true, true, false, false, 0.0)
+        reg_widget_node(c, view, ed.modeling.button_ids[MB_STAIR], ed.id_stage_bar, "UiButton", "modeling:stair", true, true, false, false, 0.0)
+        reg_widget_node(c, view, ed.modeling.button_ids[MB_CSG], ed.id_stage_bar, "UiButton", "modeling:csg", true, true, false, false, 0.0)
+    }
+
+    // Material panel controls
+    reg_widget_node(c, view, ed.id_apply_btn, ed.id_right_pane, "UiButton", "inspector:apply", true, true, false, false, 0.0)
+    reg_widget_node(c, view, ed.modeling.id_mat_preset_select, ed.id_tab_material_box, "UiSelect", "material:preset_select", true, true, false, false, f64(ed.modeling.mat_preset_select.selected()))
+    reg_widget_node(c, view, ed.modeling.id_mat_tex_select, ed.id_tab_material_box, "UiSelect", "material:tex_select", true, true, false, false, f64(ed.modeling.mat_tex_select.selected()))
+    if ed.modeling.button_ids.len > MB_PRESET_9 {
+        reg_widget_node(c, view, ed.modeling.button_ids[MB_MAT_CLEAR], ed.id_tab_material_box, "UiButton", "material:clear", true, true, false, false, 0.0)
+        reg_widget_node(c, view, ed.modeling.button_ids[MB_MAT_TWOSIDED], ed.id_tab_material_box, "UiToggle", "material:twosided", true, true, false, ed.modeling.mat_two_sided, 0.0)
+        for k in 0:10 {
+            bidx := preset_btn_index_at(k)
+            spec := modeling_preset_spec(k)
+            reg_widget_node(c, view, ed.modeling.button_ids[bidx], ed.id_tab_material_box, "UiButton", "material:preset_" + str(k) + ":" + spec.name_en, true, true, false, ed.modeling.active_preset == k, f64(k))
+        }
+    }
+    for fi in 0:ed.modeling.field_ids.len {
+        if fi >= ed.modeling.fields.len { <- }
+        fid := ed.modeling.field_ids[fi]
+        val := ed.modeling.fields[fi].value()
+        reg_widget_node(c, view, fid, ed.id_tab_material_box, "UiField", "material:field_" + field_label_for(fi) + "=" + val, true, true, ed.focused_id == fid, false, 0.0)
+    }
+
+    // Scene tree nodes
+    doc := ed.draft.document() >>> (err) {
+        _ := err
+        <<
+    }
+    for d in 0:doc.node_count() {
+        nd := doc.describe_node(d) >>> (err) {
+            _ := err
+            ->
+        }
+        $par_id := ed.id_tree
+        if nd.parent >= 0 { par_id = XACP_ID_SCENE_NODE_BASE + nd.parent }
+        reg_rect_node(
+            c,
+            XACP_ID_SCENE_NODE_BASE + d,
+            par_id,
+            "SceneTreeItem",
+            "scene:" + str(d) + ":" + nd.name,
+            0.0, 0.0, 180.0, 22.0,
+            true,
+            true,
+            true,
+            d == ed.selected_node,
+            nd.visible,
+            f64(d)
+        )
+    }
+}
+
+fn sync_editor_xacp_ui(xh $&EditorXacpHost, ctrl $&xacp.GameControl, ed &Editor, view &widgets.View) {
+    if ed.status_text != xh.last_status {
+        xh.last_status = ed.status_text + ""
+        if ed.status_text.len > 0 {
+            ctrl.log_output("stdout", ed.status_text + "\n")
+        }
+    }
+    sig := compute_ui_sig(ed)
+    if sig == xh.last_ui_sig && ctrl.ui_nodes.len > 0 {
+        <<
+    }
+    xh.last_ui_sig = sig
+    rebuild_editor_xacp_ui(xh, ctrl, ed, view)
+}
+
+fn click_at_point(ed $&Editor, view $&widgets.View, cx f64, cy f64) int {
+    ev_mv := make_script_input(ed, ui.EV_POINTER_MOVE, cx, cy, 0, 0, 0, 0, 0.0)
+    ev_dn := make_script_input(ed, ui.EV_POINTER_DOWN, cx, cy, ui.BUTTON_LEFT, 1, 0, 0, 0.0)
+    ev_up := make_script_input(ed, ui.EV_POINTER_UP, cx, cy, ui.BUTTON_LEFT, 0, 0, 0, 0.0)
+    _ := ed.handle_input_event(&ev_mv, view) >>>
+    _ := ed.handle_input_event(&ev_dn, view) >>>
+    _ := ed.handle_input_event(&ev_up, view) >>>
+    << 0
+}
+
+fn xacp_key_to_ui_key(code int) int {
+    if code == xacp.KEY_ESCAPE { << ui.KEY_ESCAPE }
+    if code == xacp.KEY_ENTER { << ui.KEY_ENTER }
+    if code == xacp.KEY_TAB { << ui.KEY_TAB }
+    if code == xacp.KEY_BACKSPACE { << ui.KEY_BACKSPACE }
+    if code == xacp.KEY_SPACE { << 32 }
+    if code >= 4 && code <= 29 { << 97 + (code - 4) }
+    if code >= 30 && code <= 38 { << 49 + (code - 30) }
+    if code == 39 { << 48 }
+    << code
+}
+
+fn apply_editor_xacp_action(req &xacp.UiActionRequest, ed $&Editor, view $&widgets.View) int {
+    id := req.node_id
+    act := req.act + ""
+    if act == "click" {
+        if id >= XACP_ID_STAGE_3D && id <= XACP_ID_STAGE_TILE {
+            b := safe_node_bounds(view, ed.id_stage_tabs)
+            if b.width > 0.5 && b.height > 0.5 {
+                frac := f64(id - XACP_ID_STAGE_3D) * 0.25 + 0.125
+                click_at_point(ed, view, b.x + b.width * frac, b.y + b.height * 0.5) >>>
+            } else {
+                ed.set_stage_mode(stage_tab_to_mode(id - XACP_ID_STAGE_3D), view)
+            }
+            << 0
+        }
+        if id >= XACP_ID_INSP_TRANSFORM && id <= XACP_ID_INSP_COMPONENTS {
+            b := safe_node_bounds(view, ed.id_insp_tabs)
+            if b.width > 0.5 && b.height > 0.5 {
+                frac := f64(id - XACP_ID_INSP_TRANSFORM) / 3.0 + (1.0 / 6.0)
+                click_at_point(ed, view, b.x + b.width * frac, b.y + b.height * 0.5) >>>
+            } else {
+                ed.set_insp_tab(id - XACP_ID_INSP_TRANSFORM, view)
+            }
+            << 0
+        }
+        if id >= XACP_ID_SCENE_NODE_BASE {
+            ed.select_scene_node(id - XACP_ID_SCENE_NODE_BASE, view)
+            << 0
+        }
+        _ := try_present_frame(view, ed)
+        b := safe_node_bounds(view, id)
+        if b.width > 0.5 && b.height > 0.5 {
+            click_at_point(ed, view, b.x + b.width * 0.5, b.y + b.height * 0.5) >>>
+        }
+        << 0
+    }
+    if act == "set_text" {
+        for fi in 0:ed.modeling.field_ids.len {
+            if fi >= ed.modeling.fields.len { <- }
+            if ed.modeling.field_ids[fi] == id {
+                mod_p := $&ed.modeling
+                fld := $&mod_p.fields[fi]
+                txt := req.text + ""
+                set_field_val(fld, &txt)
+                ed.modeling.mat_dirty = true
+                ed.repaint_all(view)
+                << 0
+            }
+        }
+        << 0
+    }
+    if act == "set_value" {
+        v := int(math.round(req.value))
+        if id == ed.id_add_node_select {
+            set_sel_selected($&ed.add_node_select, 0)
+            if v == 1 { ed.do_add_node(resource.NODE_3D, "Node3D", view) }
+            else if v == 2 { ed.do_add_node(resource.NODE_2D, "Node2D", view) }
+            else if v == 3 { ed.do_add_node(resource.NODE_GROUP, "Group", view) }
+            else if v == 4 { ed.do_add_preset_cam(view) }
+            else if v == 5 { ed.do_add_preset_lgt(view) }
+            else if v == 6 { ed.do_add_preset_dir_lgt(view) }
+            else if v == 7 { ed.do_add_preset_spot_lgt(view) }
+            else if v == 8 { ed.do_add_preset_env(view) }
+            else if v == 9 { ed.do_add_preset_vfx(view) }
+            << 0
+        }
+        if id == ed.modeling.id_mat_preset_select {
+            mod_p := $&ed.modeling
+            sel := $&mod_p.mat_preset_select
+            set_sel_selected(sel, v)
+            ed.do_apply_preset_from_select(view)
+            << 0
+        }
+        if id == ed.modeling.id_shape_select {
+            mod_p := $&ed.modeling
+            sel := $&mod_p.shape_select
+            set_sel_selected(sel, v)
+            ed.do_spawn_shape_from_select(view)
+            << 0
+        }
+        if id == ed.modeling.id_mat_tex_select {
+            mod_p := $&ed.modeling
+            sel := $&mod_p.mat_tex_select
+            set_sel_selected(sel, v)
+            ed.do_apply_pbr_texture(view)
+            << 0
+        }
+        if id == ed.id_insp_tabs {
+            ed.set_insp_tab(v, view)
+            << 0
+        }
+        if id == ed.id_stage_tabs {
+            ed.set_stage_mode(stage_tab_to_mode(v), view)
+            << 0
+        }
+        << 0
+    }
+    if act == "set_checked" {
+        if id >= XACP_ID_SCENE_NODE_BASE {
+            sidx := id - XACP_ID_SCENE_NODE_BASE
+            doc := ed.draft.document() >>> (err) {
+                _ := err
+                << 0
+            }
+            if sidx >= 0 && sidx < doc.node_count() {
+                nd := doc.describe_node(sidx) >>> (err) {
+                    _ := err
+                    << 0
+                }
+                if nd.visible != req.checked {
+                    ed.do_toggle_node_visible(sidx, view)
+                }
+            }
+            << 0
+        }
+        if ed.modeling.button_ids.len > MB_MAT_TWOSIDED && id == ed.modeling.button_ids[MB_MAT_TWOSIDED] {
+            if ed.modeling.mat_two_sided != req.checked {
+                ed.do_toggle_twosided(view)
+            }
+            << 0
+        }
+    }
+    << 0
+}
+
+fn apply_editor_xacp_input(ev &xacp.InputActionEvent, ed $&Editor, view $&widgets.View) int {
+    if ev.ev == "pointer_move" {
+        inp := make_script_input(ed, ui.EV_POINTER_MOVE, ev.x, ev.y, 0, 0, ev.modifiers, 0, 0.0)
+        _ := ed.handle_input_event(&inp, view) >>>
+    } else if ev.ev == "pointer_down" || ev.ev == "pointer_up" {
+        $kind := ui.EV_POINTER_DOWN
+        $mask := script_button_mask(ev.button)
+        if ev.ev == "pointer_up" {
+            kind = ui.EV_POINTER_UP
+            mask = 0
+        }
+        inp := make_script_input(ed, kind, ev.x, ev.y, ev.button, mask, ev.modifiers, 0, 0.0)
+        _ := ed.handle_input_event(&inp, view) >>>
+    } else if ev.ev == "pointer_scroll" || ev.ev == "scroll" {
+        inp := make_script_input(ed, ui.EV_POINTER_SCROLL, ev.x, ev.y, 0, 0, ev.modifiers, 0, ev.dy)
+        _ := ed.handle_input_event(&inp, view) >>>
+    } else if ev.ev == "key_down" || ev.ev == "key_up" {
+        $kind := ui.EV_KEY_DOWN
+        if ev.ev == "key_up" { kind = ui.EV_KEY_UP }
+        ukey := xacp_key_to_ui_key(ev.key)
+        inp := make_script_input(ed, kind, 0.0, 0.0, 0, 0, ev.modifiers, ukey, 0.0)
+        _ := ed.handle_input_event(&inp, view) >>>
+    }
+    << 0
+}
+
+pub fn step_editor_xacp(
+    xh $&EditorXacpHost,
+    ctrl $&xacp.GameControl,
+    cur_tree scene.SceneTree,
+    xinp $&controls.InputMap,
+    ed $&Editor,
+    view $&widgets.View
+) scene.SceneTree {
+    $shadow_tree := cur_tree
+    if !ctrl.is_open() { << shadow_tree }
+    xh.frame_num += 1
+    ctrl.set_frame(xh.frame_num)
+    ctrl.set_canvas_size(int(ed.viewport_w), int(ed.viewport_h))
+    shadow_tree = sync_editor_xacp_shadow_tree(xh, ctrl, shadow_tree, ed)
+    sync_editor_xacp_ui(xh, ctrl, ed, view)
+    xinp.begin_frame()
+    for _ in 0:8 {
+        if !ctrl.poll($&shadow_tree, xinp) { <- }
+    }
+    actions := ctrl.drain_ui_actions()
+    for i in 0:actions.len {
+        _ := apply_editor_xacp_action(&actions[i], ed, view) >>> (err) {
+            _ := err
+            ->
+        }
+    }
+    evs := ctrl.drain_input_events()
+    for i in 0:evs.len {
+        _ := apply_editor_xacp_input(&evs[i], ed, view) >>> (err) {
+            _ := err
+            ->
+        }
+    }
+    if actions.len > 0 || evs.len > 0 {
+        shadow_tree = sync_editor_xacp_shadow_tree(xh, ctrl, shadow_tree, ed)
+        xh.last_ui_sig = ""
+        sync_editor_xacp_ui(xh, ctrl, ed, view)
+    }
+    << shadow_tree
+}
+
+fn capture_editor_xacp_png(ed $&Editor, view $&widgets.View, out_path string) string {
+    _ := try_present_frame(view, ed)
+    c := layout.tight(ed.viewport_w, ed.viewport_h) >>>
+    $snap := widgets.snapshot_styled(view, &c, 1.0, ed) >>>
+    pw := snap.pixel_width
+    ph := snap.pixel_height
+    px := snap.rgba_bytes() >>> (err) {
+        _ := snap.dispose()
+        >> err
+    }
+    _ := snap.dispose() >>>
+    enc := png.encode_rgba_bytes(&px, pw, ph) >>>
+    snapshot.write_atomic(out_path + "", &enc) >>>
+    << str(pw) + "x" + str(ph)
+}
+
+pub fn fulfill_editor_xacp_screenshot(ctrl $&xacp.GameControl, ed $&Editor, view $&widgets.View) {
+    if !ctrl.is_open() || !ctrl.screenshot_requested() { << }
+    shot_path := "build/editor_xacp.png"
+    dims := capture_editor_xacp_png(ed, view, shot_path + "") >>> (err) {
+        _ := ctrl.reject_screenshot("editor screenshot failed: " + err.msg())
+        <<
+    }
+    _ := dims
+    _ := ctrl.fulfill_screenshot(int(ed.viewport_w), int(ed.viewport_h), shot_path)
+}

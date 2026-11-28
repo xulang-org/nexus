@@ -268,6 +268,9 @@ pub fn (hdr $&HdrTarget3D) begin_transparent_overlay(device &Device3D) int {
     << 0
 }
 
+pub fn (hdr &HdrTarget3D) render_width() int { << hdr.width }
+pub fn (hdr &HdrTarget3D) render_height() int { << hdr.height }
+
 pub fn (hdr $&HdrTarget3D) draw_clustered(
     device &Device3D,
     clustered &ClusteredRenderer3D,
@@ -281,7 +284,25 @@ pub fn (hdr $&HdrTarget3D) draw_clustered(
     $w := []int{}
     for v in words { w.push(scalar_word(v) >>>) }
     irr_bytes := word_bytes(&w) >>>
-    << hdr.draw_hdr_internal(device, clustered, &hdr.buffers[0], &irr_bytes, mesh, world, view, view_projection, material) >>>
+    no_shadow := no_shadow_binding()
+    << hdr.draw_hdr_internal(device, clustered, &no_shadow, &hdr.buffers[0], &irr_bytes, mesh, world, view, view_projection, material) >>>
+}
+
+pub fn (hdr $&HdrTarget3D) draw_clustered_shadowed(
+    device &Device3D,
+    clustered &ClusteredRenderer3D,
+    shadow &ShadowBinding3D,
+    mesh MeshRef3D,
+    world fm.Mat4,
+    view fm.Mat4,
+    view_projection fm.Mat4,
+    material &Material3D
+) int {
+    words := [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+    $w := []int{}
+    for v in words { w.push(scalar_word(v) >>>) }
+    irr_bytes := word_bytes(&w) >>>
+    << hdr.draw_hdr_internal(device, clustered, shadow, &hdr.buffers[0], &irr_bytes, mesh, world, view, view_projection, material) >>>
 }
 
 pub fn (hdr $&HdrTarget3D) draw_clustered_gi(
@@ -307,7 +328,8 @@ pub fn (hdr $&HdrTarget3D) draw_clustered_gi(
     $w := []int{}
     for v in words { w.push(scalar_word(v) >>>) }
     irr_bytes := word_bytes(&w) >>>
-    << hdr.draw_hdr_internal(device, clustered, &irradiance.buffers[0], &irr_bytes, mesh, world, view, view_projection, material) >>>
+    no_shadow := no_shadow_binding()
+    << hdr.draw_hdr_internal(device, clustered, &no_shadow, &irradiance.buffers[0], &irr_bytes, mesh, world, view, view_projection, material) >>>
 }
 
 pub fn (hdr $&HdrTarget3D) draw_clustered_ddgi(
@@ -329,12 +351,14 @@ pub fn (hdr $&HdrTarget3D) draw_clustered_ddgi(
     }
     irr_bytes := ddgi.irradiance_uniform_bytes(irr_strength) >>>
     sh_idx := ddgi.active_slot
-    << hdr.draw_hdr_internal(device, clustered, &ddgi.buffers[sh_idx], &irr_bytes, mesh, world, view, view_projection, material) >>>
+    no_shadow := no_shadow_binding()
+    << hdr.draw_hdr_internal(device, clustered, &no_shadow, &ddgi.buffers[sh_idx], &irr_bytes, mesh, world, view, view_projection, material) >>>
 }
 
 fn (hdr $&HdrTarget3D) draw_hdr_internal(
     device &Device3D,
     clustered &ClusteredRenderer3D,
+    shadow &ShadowBinding3D,
     probe_buf &gpu.Buffer,
     irr_bytes &[]u8,
     mesh MeshRef3D,
@@ -367,7 +391,15 @@ fn (hdr $&HdrTarget3D) draw_hdr_internal(
     params := material_hdr_words(material, orientation) >>>
     frag_bytes := word_bytes(&params) >>>
     light_bytes := clustered.lighting_uniform_bytes() >>>
-    shadow_bytes := zero_bytes(416)
+    $shadow_bytes := zero_bytes(416)
+    if shadow.present && shadow.has_gpu {
+        if shadow.source < 0 || shadow.source >= clustered.light_count {
+            >> errors.new("nexus 3D: HDR shadow light index out of range")
+        }
+        shadow.validate_camera(view_projection) >>>
+        swords := shadow_words(shadow, shadow.source) >>>
+        shadow_bytes = word_bytes(&swords) >>>
+    }
 
     pass := $&hdr.passes[0]
     $pidx := 0
@@ -391,7 +423,11 @@ fn (hdr $&HdrTarget3D) draw_hdr_internal(
             pass.sampler(gpu.FRAGMENT, i, &device.whites[0], &device.white_samplers[0]) >>>
         }
     }
-    pass.sampler(gpu.FRAGMENT, 5, &device.whites[0], &device.white_samplers[0]) >>>
+    if shadow.present && shadow.has_gpu {
+        pass.sampler_ref(gpu.FRAGMENT, 5, shadow.image, device.white_samplers[0].reference()) >>>
+    } else {
+        pass.sampler(gpu.FRAGMENT, 5, &device.whites[0], &device.white_samplers[0]) >>>
+    }
     pass.uniform(gpu.VERTEX, 0, &vert_bytes) >>>
     pass.uniform(gpu.FRAGMENT, 0, &frag_bytes) >>>
     pass.uniform(gpu.FRAGMENT, 1, &light_bytes) >>>

@@ -1,0 +1,1246 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+camera_data #"github.com/xulang-org/nexus/resources/camera"
+data #"github.com/xulang-org/nexus/resources/lighting"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+resource #"github.com/xulang-org/nexus/resources/scene"
+shadows #"github.com/xulang-org/nexus/resources/shadow"
+imod #"github.com/xulang-org/nexus/integration/modeling"
+files #"github.com/xulang-org/nexus/integration/scene"
+scene_lights #"github.com/xulang-org/nexus/integration/lighting"
+scene_lighting #"github.com/xulang-org/nexus/integration/scene_lighting"
+models3d #"github.com/xulang-org/nexus/integration/scene_render"
+world3d #"github.com/xulang-org/nexus/integration/rendering/three_d"
+scene #"github.com/xulang-org/nexus/scene"
+mesh_shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+gpu_info #"github.com/xulang-org/nexus/platform/gpu"
+#encoding/json
+#errors
+#gpu
+#math
+#net
+#path/filepath
+#strconv
+#strings
+#time
+
+const EMBED_FRAME_RGBA = 1
+const EMBED_PICK_RESULT = 2
+const EMBED_READY = 3
+const EMBED_ERROR = 4
+
+const EMBED_ORTHO_TOP = 0
+const EMBED_ORTHO_FRONT = 1
+const EMBED_ORTHO_RIGHT = 2
+
+// Warm Paper studio viewport backdrop & axes from xu-ui-tokens.json
+const EMBED_PAPER_BG = 0xede8e2ff
+const EMBED_GRID_MINOR = 0xd2cac0ff
+const EMBED_GRID_MAJOR = 0xb7aca0ff
+const EMBED_AXIS_X = 0xb82138ff
+const EMBED_AXIS_Y = 0x146747ff
+const EMBED_AXIS_Z = 0x1b648fff
+
+struct EmbedViewportRect {
+    x int
+    y int
+    w int
+    h int
+}
+
+struct EmbedCameraSpec {
+    center fm.Vec3
+    distance f64
+    yaw f64
+    pitch f64
+    ortho_size f64
+    ortho_axis int
+}
+
+struct EmbedSceneHost {
+    directory string
+    doc resource.Document
+    tree scene.SceneTree
+    root int
+    tree_ids []int
+    models models3d.SceneModels3D
+    picker models3d.ScenePicker3D
+    scene_mods imod.SceneModeling3D
+    slights scene_lights.SceneLights3D
+    has_lights bool
+    particles []ren.GpuParticleSystem3D
+    particle_nodes []int
+}
+
+struct EmbedGpuFx {
+    has_gpu bool
+    cprog ren.ClusteredProgram3D
+    iprog ren.IndirectProgram3D
+    pprog ren.PostProcessProgram3D
+    sprog ren.ShadowProgram3D
+    aprog ren.AtmosphereProgram3D
+    vprog ren.ParticleProgram3D
+    atm_list []ren.AtmosphereRenderer3D
+    shadow_maps []ren.ShadowMap3D
+    shadow_res int
+    shadow_faces int
+    fx_time f64
+}
+
+struct EmbedPipelines {
+    items []world3d.ModernPipeline3D
+}
+
+struct EmbedBounds {
+    center fm.Vec3
+    radius f64
+}
+
+fn push_u32_le(sb $&strings.ByteBuilder, v int) {
+    sb.write_byte(v & 255)
+    sb.write_byte((v >> 8) & 255)
+    sb.write_byte((v >> 16) & 255)
+    sb.write_byte((v >> 24) & 255)
+}
+
+fn embed_write_all(conn &net.Conn, payload &string) int {
+    $pos := 0
+    total := payload.len
+    while pos < total {
+        $end := pos + 65536
+        if end > total { end = total }
+        chunk := payload[pos:end] + ""
+        wrote := conn.write(&chunk) >>>
+        if wrote <= 0 {
+            >> errors.new("embed server: socket write stalled")
+        }
+        pos = pos + wrote
+    }
+    << 0
+}
+
+fn send_embed_packet(conn &net.Conn, kind int, seq int, payload &string) int {
+    $hdr := strings.new_byte_builder(16)
+    hdr.write_str("NXF1")
+    push_u32_le($&hdr, kind)
+    push_u32_le($&hdr, seq)
+    push_u32_le($&hdr, payload.len)
+    embed_write_all(conn, &hdr.to_string()) >>>
+    if payload.len > 0 {
+        embed_write_all(conn, payload) >>>
+    }
+    << 0
+}
+
+fn send_embed_rgba(conn &net.Conn, seq int, w int, h int, pixels &[]u8) int {
+    $sb := strings.new_byte_builder(8 + pixels.len)
+    push_u32_le($&sb, w)
+    push_u32_le($&sb, h)
+    for b in pixels {
+        sb.write_byte(int(b))
+    }
+    payload := sb.to_string()
+    << send_embed_packet(conn, EMBED_FRAME_RGBA, seq, &payload) >>>
+}
+
+fn add_grid_quad(mesh $&meshes.MeshData3D, a fm.Vec3, b fm.Vec3, off fm.Vec3, normal fm.Vec3, col int) int {
+    i0 := mesh.vertex_lit(a.sub(off), col, normal) >>>
+    i1 := mesh.vertex_lit(a.add(off), col, normal) >>>
+    i2 := mesh.vertex_lit(b.add(off), col, normal) >>>
+    i3 := mesh.vertex_lit(b.sub(off), col, normal) >>>
+    mesh.triangle(i0, i1, i2) >>>
+    mesh.triangle(i0, i2, i3) >>>
+    << 0
+}
+
+fn build_plane_grid_mesh(device &ren.Device3D, plane int) ren.Mesh3D {
+    $m := meshes.new_mesh_data_3d()
+    $k := -10
+    while k <= 10 {
+        fk := f64(k)
+        $col_a := EMBED_GRID_MINOR
+        $hw_a := 0.011
+        $col_b := EMBED_GRID_MINOR
+        $hw_b := 0.011
+        if k % 5 == 0 && k != 0 {
+            col_a = EMBED_GRID_MAJOR
+            hw_a = 0.017
+            col_b = EMBED_GRID_MAJOR
+            hw_b = 0.017
+        }
+        if plane == EMBED_ORTHO_TOP {
+            if k == 0 {
+                col_a = EMBED_AXIS_Z
+                hw_a = 0.024
+                col_b = EMBED_AXIS_X
+                hw_b = 0.024
+            }
+            n := fm.vec3(0.0, 1.0, 0.0)
+            add_grid_quad($&m, fm.vec3(fk, 0.0, -10.0), fm.vec3(fk, 0.0, 10.0), fm.vec3(hw_a, 0.0, 0.0), n, col_a) >>>
+            add_grid_quad($&m, fm.vec3(-10.0, 0.0, fk), fm.vec3(10.0, 0.0, fk), fm.vec3(0.0, 0.0, hw_b), n, col_b) >>>
+        } else if plane == EMBED_ORTHO_FRONT {
+            if k == 0 {
+                col_a = EMBED_AXIS_Y
+                hw_a = 0.024
+                col_b = EMBED_AXIS_X
+                hw_b = 0.024
+            }
+            n := fm.vec3(0.0, 0.0, 1.0)
+            add_grid_quad($&m, fm.vec3(fk, -10.0, 0.0), fm.vec3(fk, 10.0, 0.0), fm.vec3(hw_a, 0.0, 0.0), n, col_a) >>>
+            add_grid_quad($&m, fm.vec3(-10.0, fk, 0.0), fm.vec3(10.0, fk, 0.0), fm.vec3(0.0, hw_b, 0.0), n, col_b) >>>
+        } else {
+            if k == 0 {
+                col_a = EMBED_AXIS_Y
+                hw_a = 0.024
+                col_b = EMBED_AXIS_Z
+                hw_b = 0.024
+            }
+            n := fm.vec3(1.0, 0.0, 0.0)
+            add_grid_quad($&m, fm.vec3(0.0, -10.0, fk), fm.vec3(0.0, 10.0, fk), fm.vec3(0.0, 0.0, hw_a), n, col_a) >>>
+            add_grid_quad($&m, fm.vec3(0.0, fk, -10.0), fm.vec3(0.0, fk, 10.0), fm.vec3(0.0, hw_b, 0.0), n, col_b) >>>
+        }
+        k += 1
+    }
+    << device.upload(&m) >>>
+}
+
+fn build_embed_particle_emitter(
+    att &resource.ParticleEmitter3DAttachment,
+    origin fm.Vec3
+) ren.ParticleEmitter3D {
+    $em := ren.default_particle_emitter_3d(origin)
+    rate := math.max(1.0, att.spawn_rate)
+    life := math.max(0.15, att.lifetime)
+    spd := math.max(0.0, att.speed)
+    sz := math.max(0.03, att.size)
+    sr := f64((att.start_color >> 16) & 255) / 255.0
+    sg := f64((att.start_color >> 8) & 255) / 255.0
+    sb := f64(att.start_color & 255) / 255.0
+    $sa := f64((att.start_color >> 24) & 255) / 255.0
+    if sa < 0.05 { sa = 1.0 }
+    er := f64((att.end_color >> 16) & 255) / 255.0
+    eg := f64((att.end_color >> 8) & 255) / 255.0
+    eb := f64(att.end_color & 255) / 255.0
+    ea := f64((att.end_color >> 24) & 255) / 255.0
+    em.emit_rate = rate
+    em.life_min = math.max(0.08, life * 0.7)
+    em.life_max = life
+    em.speed_min = spd * 0.65
+    em.speed_max = math.max(0.1, spd)
+    em.gravity = fm.vec3(0.0, att.gravity, 0.0)
+    em.size_start_min = sz * 0.75
+    em.size_start_max = sz
+    em.color_keys = [
+        sr, sg, sb, sa,
+        (sr + er) * 0.5, (sg + eg) * 0.5, (sb + eb) * 0.5, sa * 0.75,
+        er, eg, eb, math.max(0.15, (sa + ea) * 0.35),
+        er, eg, eb, 0.0
+    ]
+    if att.additive {
+        em.start_additive = 1.0
+        em.end_additive = 1.0
+        em.emissive_scale = 2.6
+    } else {
+        em.start_additive = 0.0
+        em.end_additive = 0.0
+        em.emissive_scale = 1.15
+    }
+    << em
+}
+
+fn close_embed_particles(host $&EmbedSceneHost) {
+    for i in 0:host.particles.len {
+        ps := $&host.particles[i]
+        _ := ps.close() >>> (err) {
+            _ := err
+            <<
+        }
+    }
+    host.particles = []ren.GpuParticleSystem3D{}
+}
+
+fn close_embed_scene(host $&EmbedSceneHost) {
+    close_embed_particles(host)
+    sm := $&host.scene_mods
+    _ := sm.close() >>> (err) {
+        _ := err
+        <<
+    }
+    md := $&host.models
+    _ := md.close() >>> (err) {
+        _ := err
+        <<
+    }
+}
+
+fn close_embed_gpu_shadow_maps(fx $&EmbedGpuFx) {
+    for i in 0:fx.shadow_maps.len {
+        sm := $&fx.shadow_maps[i]
+        _ := sm.close() >>> (err) {
+            _ := err
+            <<
+        }
+    }
+    fx.shadow_maps = []ren.ShadowMap3D{}
+}
+
+fn close_embed_gpu_pipelines(pipes $&EmbedPipelines) {
+    for i in 0:pipes.items.len {
+        mp := $&pipes.items[i]
+        _ := mp.close() >>> (err) {
+            _ := err
+            <<
+        }
+    }
+    pipes.items = []world3d.ModernPipeline3D{}
+}
+
+fn close_embed_gpu_atm(fx $&EmbedGpuFx) {
+    for i in 0:fx.atm_list.len {
+        ar := $&fx.atm_list[i]
+        _ := ar.close() >>> (err) {
+            _ := err
+            <<
+        }
+    }
+    fx.atm_list = []ren.AtmosphereRenderer3D{}
+}
+
+fn close_embed_gpu_fx(fx $&EmbedGpuFx) {
+    close_embed_gpu_shadow_maps(fx)
+    close_embed_gpu_atm(fx)
+}
+
+fn try_apply_world_mat(world $&world3d.Scene3D, tree &scene.SceneTree, nid int, mat ren.Material3D) bool {
+    _ := world.set_material(tree, nid, mat) >>> (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn try_set_world_mat_override(
+    world $&world3d.Scene3D,
+    tree &scene.SceneTree,
+    nid int,
+    mat ren.Material3D,
+    fallback_mat ren.Material3D
+) {
+    keep_ds := world.is_node_double_sided(nid)
+    $next_mat := mat
+    if keep_ds && !next_mat.is_double_sided() {
+        next_mat = next_mat.with_double_sided(true)
+    }
+    if try_apply_world_mat(world, tree, nid, next_mat) {
+        <<
+    }
+    $plain := fallback_mat
+    if keep_ds && !plain.is_double_sided() {
+        plain = plain.with_double_sided(true)
+    }
+    _ := try_apply_world_mat(world, tree, nid, plain)
+}
+
+fn apply_world_material_overrides(
+    doc &resource.Document,
+    scene_mods &imod.SceneModeling3D,
+    world $&world3d.Scene3D,
+    tree &scene.SceneTree,
+    tree_ids &[]int
+) {
+    for i in 0:doc.material_override_count() {
+        ov := doc.material_override(i) >>> (err) {
+            _ := err
+            ->
+        }
+        if ov.slot != 0 || ov.node < 0 || ov.node >= tree_ids.len { -> }
+        mat3d := scene_mods.resolve_material_3d(&ov.material) >>> (err) {
+            _ := err
+            ->
+        }
+        mat_plain := imod.material_asset_to_3d(&ov.material) >>> (err) {
+            _ := err
+            ->
+        }
+        try_set_world_mat_override(world, tree, tree_ids[ov.node], mat3d, mat_plain)
+    }
+}
+
+fn push_loaded_embed_scene(
+    device &ren.Device3D,
+    scene_path string,
+    has_gpu bool,
+    vprog &ren.ParticleProgram3D,
+    worlds $&[]world3d.Scene3D,
+    hosts $&[]EmbedSceneHost
+) int {
+    directory := filepath.dir(&scene_path)
+    document := files.load(scene_path + "") >>>
+    doc_meta := files.load(scene_path + "") >>>
+    name := (doc_meta.describe_node(0) >>>).name
+    $models := models3d.prepare_surfaces(device, document, directory + "") >>>
+    $tree := scene.new_scene_tree_3d("EmbedEditor", 4097) >>> (err) {
+        _ := models.close()
+        >> err
+    }
+    parent := tree.root()
+    $world := world3d.new_scene_3d(device) >>> (err) {
+        _ := models.close()
+        >> err
+    }
+    root := models.instantiate($&world, $&tree, parent, name + "") >>> (err) {
+        _ := models.close()
+        >> err
+    }
+    picker := models.picker(&tree, root) >>> (err) {
+        _ := models.close()
+        >> err
+    }
+    $scene_mods := imod.prepare_scene_modeling_in_dir(device, &doc_meta, directory + "") >>> (err) {
+        _ := models.close()
+        >> err
+    }
+    $slights := scene_lights.new_scene_lights_3d()
+    has_lights := doc_meta.light_count() > 0
+    if has_lights {
+        scene_lighting.bind(&doc_meta, $&slights, &tree, root) >>> (err) {
+            _ := scene_mods.close()
+            _ := models.close()
+            >> err
+        }
+    }
+    tree_ids := tree.subtree(root) >>> (err) {
+        _ := scene_mods.close()
+        _ := models.close()
+        >> err
+    }
+    apply_world_material_overrides(&doc_meta, &scene_mods, $&world, &tree, &tree_ids)
+
+    $particles := []ren.GpuParticleSystem3D{}
+    $particle_nodes := []int{}
+    if has_gpu && doc_meta.particle_emitter_3d_count() > 0 {
+        for pi in 0:doc_meta.particle_emitter_3d_count() {
+            att := doc_meta.particle_emitter_3d(pi) >>> (err) {
+                for ppi in 0:particles.len { _ := ($&particles[ppi]).close() }
+                _ := scene_mods.close()
+                _ := models.close()
+                >> err
+            }
+            $origin := fm.vec3(0.0, 0.0, 0.0)
+            if att.node >= 0 && att.node < tree_ids.len {
+                origin = (tree.global_transform_3d(tree_ids[att.node]) >>>).c3.xyz()
+            }
+            $ps := device.gpu_particle_system(vprog, att.max_particles, 2001 + pi * 37) >>> (err) {
+                for ppi in 0:particles.len { _ := ($&particles[ppi]).close() }
+                _ := scene_mods.close()
+                _ := models.close()
+                >> err
+            }
+            ps.set_emitter(&build_embed_particle_emitter(&att, origin)) >>> (err) {
+                _ := ps.close()
+                for ppi in 0:particles.len { _ := ($&particles[ppi]).close() }
+                _ := scene_mods.close()
+                _ := models.close()
+                >> err
+            }
+            for _ in 0:24 {
+                ps.step(device, 1.0 / 60.0) >>> (err) {
+                    _ := ps.close()
+                    for ppi in 0:particles.len { _ := ($&particles[ppi]).close() }
+                    _ := scene_mods.close()
+                    _ := models.close()
+                    >> err
+                }
+            }
+            particles.push(ps)
+            particle_nodes.push(att.node)
+        }
+    }
+
+    if hosts.len > 0 {
+        last_i := hosts.len - 1
+        close_embed_scene($&hosts[last_i])
+    }
+    worlds.push(world)
+    hosts.push(EmbedSceneHost{
+        directory: directory + "",
+        doc: doc_meta,
+        tree: tree,
+        root: root,
+        tree_ids: tree_ids,
+        models: models,
+        picker: picker,
+        scene_mods: scene_mods,
+        slights: slights,
+        has_lights: has_lights,
+        particles: particles,
+        particle_nodes: particle_nodes
+    })
+    << 0
+}
+
+fn close_embed_mesh_quiet(m $&ren.Mesh3D) {
+    _ := m.close() >>> (err) {
+        _ := err
+        <<
+    }
+}
+
+fn close_embed_device_quiet(d $&ren.Device3D) {
+    _ := d.close() >>> (err) {
+        _ := err
+        <<
+    }
+}
+
+fn close_embed_conn_quiet(c $&net.Conn) {
+    _ := c.close() >>> (err) {
+        _ := err
+        <<
+    }
+}
+
+fn try_reload_embed_hosts(
+    device &ren.Device3D,
+    conn &net.Conn,
+    sp string,
+    seq int,
+    has_gpu bool,
+    vprog &ren.ParticleProgram3D,
+    worlds $&[]world3d.Scene3D,
+    hosts $&[]EmbedSceneHost
+) {
+    push_loaded_embed_scene(device, sp, has_gpu, vprog, worlds, hosts) >>> (err) {
+        emsg := "{\"error\":" + json.quote(&err.msg()) + "}"
+        _ := send_embed_packet(conn, EMBED_ERROR, seq, &emsg) >>> (serr) {
+            _ := serr
+            <<
+        }
+        <<
+    }
+}
+
+fn safe_pick_3d(
+    picker &models3d.ScenePicker3D,
+    world &world3d.Scene3D,
+    tree &scene.SceneTree,
+    origin fm.Vec3,
+    direction fm.Vec3,
+    near f64,
+    far f64
+) models3d.ScenePick3D {
+    << picker.pick(world, tree, origin, direction, near, far) >>> (err) {
+        _ := err
+        << models3d.ScenePick3D{node: 0, distance: far}
+    }
+}
+
+fn try_select_lods(w $&world3d.Scene3D, tree &scene.SceneTree, pos fm.Vec3) {
+    _ := w.select_lods(tree, pos) >>> (err) {
+        _ := err
+        <<
+    }
+}
+
+fn embed_persp_camera(cam &EmbedCameraSpec, rect EmbedViewportRect) CameraFrame {
+    orb := Orbit{center: cam.center, distance: cam.distance, yaw: cam.yaw, pitch: cam.pitch}
+    << camera_frame(orb, fm.vec2(f64(rect.w), f64(rect.h))) >>>
+}
+
+fn embed_ortho_camera(cam &EmbedCameraSpec, rect EmbedViewportRect) CameraFrame {
+    $axis_dir := fm.vec3(0.0, 1.0, 0.0)
+    $up_vec := fm.vec3(0.0, 0.0, -1.0)
+    if cam.ortho_axis == EMBED_ORTHO_FRONT {
+        axis_dir = fm.vec3(0.0, 0.0, 1.0)
+        up_vec = fm.vec3(0.0, 1.0, 0.0)
+    } else if cam.ortho_axis == EMBED_ORTHO_RIGHT {
+        axis_dir = fm.vec3(1.0, 0.0, 0.0)
+        up_vec = fm.vec3(0.0, 1.0, 0.0)
+    }
+    near := 0.05
+    far := 400.0
+    pos := cam.center.add(axis_dir.scaled(60.0))
+    fwd := axis_dir.scaled(-1.0)
+    right := fwd.cross(up_vec).normalized() >>>
+    up := right.cross(fwd)
+    aspect := math.max(0.1, f64(rect.w)) / math.max(0.1, f64(rect.h))
+    view := scene.look_at_3d(pos, cam.center, up_vec) >>>
+    lens := camera_data.orthographic(cam.ortho_size, near, far) >>>
+    proj := lens.projection(aspect) >>>
+    << CameraFrame{
+        position: pos, right: right, up: up, forward: fwd,
+        view: view, proj: proj, projection: proj.multiply(view),
+        size: fm.vec2(f64(rect.w), f64(rect.h)),
+        tangent: 1.0, near: near, far: far
+    }
+}
+
+fn embed_ortho_ray(cam &EmbedCameraSpec, frame &CameraFrame, rect EmbedViewportRect, px f64, py f64) ViewRay {
+    rw := math.max(1.0, f64(rect.w))
+    rh := math.max(1.0, f64(rect.h))
+    lx := px - f64(rect.x)
+    ly := py - f64(rect.y)
+    nx := (2.0 * lx / rw) - 1.0
+    ny := 1.0 - (2.0 * ly / rh)
+    half_h := cam.ortho_size * 0.5
+    half_w := half_h * (rw / rh)
+    origin := frame.position.add(frame.right.scaled(nx * half_w)).add(frame.up.scaled(ny * half_h))
+    << ViewRay{origin: origin, direction: frame.forward, near: frame.near, far: frame.far}
+}
+
+fn compute_embed_bounds(tree &scene.SceneTree, tree_ids &[]int) EmbedBounds {
+    $has_pt := false
+    $low := fm.vec3(0.0, 0.0, 0.0)
+    $high := fm.vec3(0.0, 0.0, 0.0)
+    for d in 1:tree_ids.len {
+        nid := tree_ids[d]
+        vis := tree.is_visible(nid) >>> (err) {
+            _ := err
+            ->
+        }
+        if !vis { -> }
+        info := tree.node_info(nid) >>> (err) {
+            _ := err
+            ->
+        }
+        if info.kind != scene.NODE_3D { -> }
+        wp := (tree.global_transform_3d(nid) >>> (err) {
+            _ := err
+            ->
+        }).c3.xyz()
+        if !has_pt {
+            low = wp
+            high = wp
+            has_pt = true
+        } else {
+            low = fm.vec3(math.min(low.x, wp.x), math.min(low.y, wp.y), math.min(low.z, wp.z))
+            high = fm.vec3(math.max(high.x, wp.x), math.max(high.y, wp.y), math.max(high.z, wp.z))
+        }
+    }
+    if !has_pt {
+        << EmbedBounds{center: fm.vec3(0.0, 0.0, 0.0), radius: 8.0}
+    }
+    center := low.add(high).scaled(0.5)
+    half_ext := high.sub(low).scaled(0.5)
+    << EmbedBounds{center: center, radius: math.max(6.0, half_ext.length() + 4.0)}
+}
+
+fn embed_default_sun_dir() fm.Vec3 {
+    << fm.vec3(0.45, 0.78, 0.42).normalized() >>> (err) {
+        _ := err
+        << fm.vec3(0.0, 1.0, 0.0)
+    }
+}
+
+fn embed_unit_dir_or_sun(v fm.Vec3) fm.Vec3 {
+    << v.normalized() >>> (err) {
+        _ := err
+        << embed_default_sun_dir()
+    }
+}
+
+fn gather_embed_lights_with_shadows(
+    doc &resource.Document,
+    slights &scene_lights.SceneLights3D,
+    tree &scene.SceneTree,
+    has_lights bool,
+    shadow_sel $&scene_lights.ShadowSelection3D
+) []data.Light3D {
+    if has_lights && slights.binding_count() > 0 {
+        gathered := slights.gather_with_shadows(tree, shadow_sel) >>> (err) {
+            _ := err
+            << []data.Light3D{}
+        }
+        if gathered.len > 0 { << gathered }
+    }
+    $sun_dir := fm.vec3(0.45, 0.78, 0.42)
+    $sun_int := 2.35
+    if doc.environment_count() > 0 {
+        ev := doc.environment(0) >>>
+        sun_dir = ev.sun_dir
+        sun_int = ev.sun_intensity
+    }
+    nsun := embed_unit_dir_or_sun(sun_dir)
+    key := data.directional(nsun, fm.vec3(sun_int, sun_int * 0.96, sun_int * 0.90)) >>>
+    fill := data.directional(fm.vec3(-0.55, 0.38, 0.48), fm.vec3(0.85, 0.92, 1.02)) >>>
+    rim := data.directional(fm.vec3(-0.30, 0.45, -0.82), fm.vec3(1.05, 1.08, 1.15)) >>>
+    << [key, fill, rim]
+}
+
+fn try_open_embed_shadow_map(
+    device &ren.Device3D,
+    gpu_fx $&EmbedGpuFx,
+    shadow_desc shadows.ShadowDescription3D
+) bool {
+    sm_new := device.shadow_map(shadow_desc, &gpu_fx.sprog) >>> (err) {
+        eprintln("embed shadow fallback (unshadowed): " + err.msg())
+        << false
+    }
+    gpu_fx.shadow_maps.push(sm_new)
+    gpu_fx.shadow_res = shadow_desc.resolution()
+    gpu_fx.shadow_faces = shadow_desc.face_count()
+    << true
+}
+
+fn prepare_embed_shadow_binding(
+    device $&ren.Device3D,
+    gpu_fx $&EmbedGpuFx,
+    host &EmbedSceneHost,
+    w3 &world3d.Scene3D,
+    frame &CameraFrame,
+    lighting &data.Environment3D,
+    shadow_sel &scene_lights.ShadowSelection3D
+) ren.ShadowBinding3D {
+    if !gpu_fx.has_gpu { << ren.no_shadow_binding() }
+    $shadow_source := -1
+    $shadow_desc := shadows.default_directional()
+    if host.has_lights && host.slights.binding_count() > 0 {
+        if shadow_sel.source >= 0 && shadow_sel.source < lighting.source_count() {
+            src := lighting.source(shadow_sel.source) >>>
+            if shadow_sel.cascades.enabled() {
+                shadow_source = shadow_sel.source
+                cc := shadows.cascade_camera(frame.view, frame.proj) >>>
+                $ss := shadow_sel.cascades.settings() >>>
+                if ss.resolution > 512 { ss.resolution = 512 }
+                shadow_desc = shadows.cascaded(src, cc, ss) >>>
+            } else if shadow_sel.punctual.enabled() {
+                shadow_source = shadow_sel.source
+                $ps := shadow_sel.punctual.settings() >>>
+                if ps.resolution > 512 { ps.resolution = 512 }
+                pprof := shadows.punctual_profile(src, ps) >>>
+                shadow_desc = pprof.description(src) >>>
+            }
+        }
+    } else if lighting.source_count() > 0 {
+        src0 := lighting.source(0) >>>
+        if src0.kind() != data.POINT {
+            shadow_source = 0
+            b := compute_embed_bounds(&host.tree, &host.tree_ids)
+            sdir := src0.direction().normalized() >>>
+            d0 := shadows.directional(b.center, sdir, b.radius, math.max(30.0, b.radius * 4.0), 512) >>>
+            shadow_desc = (d0.with_bias(0.0005, 0.002) >>>).with_pcss_light_radius(2.0) >>>
+        }
+    }
+    if shadow_source < 0 {
+        << ren.no_shadow_binding()
+    }
+    if gpu_fx.shadow_maps.len == 0 || gpu_fx.shadow_res != shadow_desc.resolution() || gpu_fx.shadow_faces != shadow_desc.face_count() {
+        close_embed_gpu_shadow_maps(gpu_fx)
+        if !try_open_embed_shadow_map(device, gpu_fx, shadow_desc) {
+            gpu_fx.shadow_res = 0
+            gpu_fx.shadow_faces = 0
+            << ren.no_shadow_binding()
+        }
+    }
+    $casters := w3.shadow_casters(&host.tree) >>>
+    mc := host.scene_mods.shadow_casters(&host.tree, &host.tree_ids) >>>
+    for ci in 0:mc.len { casters.push(mc[ci]) }
+    sm := $&gpu_fx.shadow_maps[0]
+    _ := sm.render(device, &casters, shadow_desc) >>>
+    << sm.binding(lighting, shadow_source) >>>
+}
+
+fn resolve_embed_shadow_source(host &EmbedSceneHost, lighting &data.Environment3D, shadow_sel &scene_lights.ShadowSelection3D) int {
+    if host.has_lights && host.slights.binding_count() > 0 {
+        if shadow_sel.source >= 0 && shadow_sel.source < lighting.source_count() {
+            if shadow_sel.cascades.enabled() || shadow_sel.punctual.enabled() {
+                << shadow_sel.source
+            }
+        }
+        << -1
+    }
+    if lighting.source_count() > 0 { << 0 }
+    << -1
+}
+
+fn render_embed_pane(
+    device $&ren.Device3D,
+    gpu_fx $&EmbedGpuFx,
+    w3 $&world3d.Scene3D,
+    host &EmbedSceneHost,
+    grid_mesh &ren.Mesh3D,
+    rect EmbedViewportRect,
+    frame &CameraFrame,
+    show_grid bool
+) int {
+    if rect.w < 4 || rect.h < 4 { << 0 }
+    w3.select_lods(&host.tree, frame.position) >>>
+    $shadow_sel := scene_lights.no_shadow_selection()
+    lights := gather_embed_lights_with_shadows(&host.doc, &host.slights, &host.tree, host.has_lights, $&shadow_sel) >>>
+    $ambient := fm.vec3(0.42, 0.41, 0.40)
+    $exposure := 1.0
+    if host.doc.environment_count() > 0 {
+        ev := host.doc.environment(0) >>>
+        ambient = ev.ambient
+        exposure = ev.exposure
+    }
+    lighting := data.environment(ambient, frame.position, exposure, lights) >>>
+    sbind := prepare_embed_shadow_binding(device, gpu_fx, host, w3, frame, &lighting, &shadow_sel) >>>
+    shadow_idx := resolve_embed_shadow_source(host, &lighting, &shadow_sel)
+    device.set_viewport(rect.x, rect.y, rect.w, rect.h) >>>
+    if show_grid {
+        device.draw(grid_mesh, frame.projection) >>>
+    }
+    if gpu_fx.shadow_maps.len > 0 && shadow_idx >= 0 {
+        w3.draw_lit_shadowed(device, &host.tree, frame.projection, &lighting, &gpu_fx.shadow_maps[0], shadow_idx) >>>
+        _ := host.scene_mods.draw_lit_shadowed(device, &host.tree, &host.tree_ids, frame.projection, &lighting, &sbind) >>>
+    } else {
+        _ := w3.draw_lit(device, &host.tree, frame.projection, &lighting) >>>
+        _ := host.scene_mods.draw_lit(device, &host.tree, &host.tree_ids, frame.projection, &lighting) >>>
+    }
+    << 0
+}
+
+fn render_embed_modern_single(
+    device $&ren.Device3D,
+    gpu_fx $&EmbedGpuFx,
+    gpu_pipes $&EmbedPipelines,
+    w3 $&world3d.Scene3D,
+    host $&EmbedSceneHost,
+    grid_mesh &ren.Mesh3D,
+    rect EmbedViewportRect,
+    frame &CameraFrame,
+    show_grid bool
+) int {
+    rw := device.render_width()
+    rh := device.render_height()
+    if gpu_pipes.items.len == 0 || gpu_pipes.items[0].target_width() != rw || gpu_pipes.items[0].target_height() != rh {
+        close_embed_gpu_pipelines(gpu_pipes)
+        mp_new := world3d.new_modern_pipeline_3d(device, &gpu_fx.cprog, &gpu_fx.iprog, &gpu_fx.pprog) >>>
+        gpu_pipes.items.push(mp_new)
+    }
+
+    for pi in 0:host.particles.len {
+        nidx := host.particle_nodes[pi]
+        if nidx >= 0 && nidx < host.tree_ids.len {
+            att := host.doc.particle_emitter_3d(pi) >>>
+            origin := (host.tree.global_transform_3d(host.tree_ids[nidx]) >>>).c3.xyz()
+            ps := $&host.particles[pi]
+            ps.set_emitter(&build_embed_particle_emitter(&att, origin)) >>>
+        }
+        ps := $&host.particles[pi]
+        ps.step(device, 1.0 / 60.0) >>>
+    }
+
+    w3.select_lods(&host.tree, frame.position) >>>
+    $shadow_sel := scene_lights.no_shadow_selection()
+    lights := gather_embed_lights_with_shadows(&host.doc, &host.slights, &host.tree, host.has_lights, $&shadow_sel) >>>
+
+    $ambient := fm.vec3(0.36, 0.36, 0.37)
+    $pp_cfg := ren.post_process_defaults_3d()
+    pp_cfg.ao_enabled = true
+    pp_cfg.ao_strength = 0.45
+    pp_cfg.ssr_enabled = false
+    pp_cfg.bloom_enabled = true
+    pp_cfg.bloom_threshold = 1.0
+    pp_cfg.bloom_intensity = 0.30
+    pp_cfg.taa_enabled = false
+    pp_cfg.exposure = 1.0
+    $has_atm := false
+    $atm_cfg := ren.default_atmosphere_config_3d()
+    $clear_col := EMBED_PAPER_BG
+    z_near := math.max(0.05, frame.near)
+    z_far := math.max(z_near + 1.0, frame.far)
+
+    if host.doc.environment_count() > 0 {
+        ev := host.doc.environment(0) >>>
+        ambient = ev.ambient
+        pp_cfg.ao_enabled = ev.gtao_enabled
+        pp_cfg.ao_strength = 0.80
+        pp_cfg.ssr_enabled = ev.ssr_enabled
+        pp_cfg.bloom_enabled = ev.bloom_enabled
+        pp_cfg.bloom_threshold = ev.bloom_threshold
+        pp_cfg.bloom_intensity = ev.bloom_intensity
+        pp_cfg.taa_enabled = false
+        pp_cfg.exposure = ev.exposure
+        has_atm = ev.sky_mode == resource.SKY_ATMOSPHERE || ev.fog_density > 0.0001
+        nsun := embed_unit_dir_or_sun(ev.sun_dir)
+        atm_cfg.sky_enabled = ev.sky_mode == resource.SKY_ATMOSPHERE
+        atm_cfg.sun_direction = nsun
+        atm_cfg.sun_radiance = fm.vec3(ev.sun_intensity, ev.sun_intensity * 0.96, ev.sun_intensity * 0.90)
+        atm_cfg.mie_scale = math.max(0.2, ev.turbidity * 0.4)
+        atm_cfg.fog_enabled = ev.fog_density > 0.0001
+        atm_cfg.fog_near = math.max(0.5, z_near)
+        atm_cfg.fog_far = math.max(atm_cfg.fog_near + 5.0, math.min(120.0, z_far))
+        atm_cfg.fog_density = math.min(10.0, math.max(0.0, ev.fog_density))
+        atm_cfg.fog_scattering_strength = math.max(0.0, ev.fog_scattering)
+        gpu_fx.fx_time = gpu_fx.fx_time + (1.0 / 60.0)
+        atm_cfg.time = gpu_fx.fx_time
+        if atm_cfg.sky_enabled {
+            clear_col = (18 << 24) | (28 << 16) | (46 << 8) | 255
+        }
+    }
+
+    $lights_copy := []data.Light3D{}
+    for li in 0:lights.len { lights_copy.push(lights[li]) }
+    lighting := data.environment(ambient, frame.position, pp_cfg.exposure, lights_copy) >>>
+    sbind := prepare_embed_shadow_binding(device, gpu_fx, host, w3, frame, &lighting, &shadow_sel) >>>
+
+    $all_refs := []ren.MeshRef3D{}
+    $all_worlds := []fm.Mat4{}
+    $all_mats := []ren.Material3D{}
+    _ := w3.collect_visible_draws_stats(&host.tree, frame.projection, $&all_refs, $&all_worlds, $&all_mats) >>>
+    _ := host.scene_mods.collect_draws(&host.tree, &host.tree_ids, $&all_refs, $&all_worlds, $&all_mats) >>>
+
+    $op_refs := []ren.MeshRef3D{}
+    $op_worlds := []fm.Mat4{}
+    $op_mats := []ren.Material3D{}
+    $tq := ren.new_transparent_queue_3d()
+    for di in 0:all_refs.len {
+        if all_mats[di].is_alpha_blended() {
+            _ := tq.submit(all_refs[di], all_worlds[di], all_mats[di], 0.0) >>>
+        } else {
+            op_refs.push(all_refs[di])
+            op_worlds.push(all_worlds[di])
+            op_mats.push(all_mats[di])
+        }
+    }
+
+    _ := rect
+    mp := $&gpu_pipes.items[0]
+    _ := mp.prepare_lights_mode(device, ambient, frame.position, pp_cfg.exposure, &lights, frame.view, frame.proj, z_near, z_far, 0) >>>
+    _ := mp.render_scene_effects_frame(
+        device, show_grid, grid_mesh, &op_refs, &op_worlds, &op_mats, &sbind,
+        has_atm, &gpu_fx.atm_list[0], &atm_cfg, &tq, &host.particles,
+        frame.position, frame.view, frame.proj, z_near, z_far, clear_col, &pp_cfg
+    ) >>>
+    << 0
+}
+
+fn json_bool_or(doc &json.Doc, obj int, key string, fallback bool) bool {
+    if !doc.has(obj, key + "") { << fallback }
+    << doc.as_bool(doc.get(obj, key + "")) >>> (err) {
+        _ := err
+        << fallback
+    }
+}
+
+fn json_int_or(doc &json.Doc, obj int, key string, fallback int) int {
+    if !doc.has(obj, key + "") { << fallback }
+    << doc.as_int(doc.get(obj, key + "")) >>> (err) {
+        _ := err
+        << fallback
+    }
+}
+
+fn parse_cam_spec(doc &json.Doc, root int) EmbedCameraSpec {
+    $spec := EmbedCameraSpec{
+        center: fm.vec3(0.0, 0.5, 0.0),
+        distance: 6.5,
+        yaw: 0.55,
+        pitch: 0.42,
+        ortho_size: 8.0,
+        ortho_axis: EMBED_ORTHO_TOP
+    }
+    spec.ortho_axis = json_int_or(doc, root, "ortho_axis", EMBED_ORTHO_TOP)
+    if !doc.has(root, "cam") { << spec }
+    arr := doc.get(root, "cam")
+    if arr < 0 || !doc.is_list(arr) || doc.count(arr) < 7 { << spec }
+    cx := doc.as_f64(doc.at(arr, 0)) >>> (err) { << spec }
+    cy := doc.as_f64(doc.at(arr, 1)) >>> (err) { << spec }
+    cz := doc.as_f64(doc.at(arr, 2)) >>> (err) { << spec }
+    dist := doc.as_f64(doc.at(arr, 3)) >>> (err) { << spec }
+    yaw := doc.as_f64(doc.at(arr, 4)) >>> (err) { << spec }
+    pitch := doc.as_f64(doc.at(arr, 5)) >>> (err) { << spec }
+    osize := doc.as_f64(doc.at(arr, 6)) >>> (err) { << spec }
+    if fm.finite(cx) && fm.finite(cy) && fm.finite(cz) { spec.center = fm.vec3(cx, cy, cz) }
+    if fm.finite(dist) && dist > 0.05 { spec.distance = dist }
+    if fm.finite(yaw) { spec.yaw = yaw }
+    if fm.finite(pitch) { spec.pitch = pitch }
+    if fm.finite(osize) && osize > 0.1 { spec.ortho_size = osize }
+    << spec
+}
+
+fn clamp_embed_dim(v int, lo int, hi int) int {
+    if v < lo { << lo }
+    if v > hi { << hi }
+    << v
+}
+
+fn parse_embed_mat4(doc &json.Doc, root int) fm.Mat4 {
+    if !doc.has(root, "mat") { << fm.identity_3d() }
+    arr := doc.get(root, "mat")
+    if arr < 0 || !doc.is_list(arr) || doc.count(arr) < 16 { << fm.identity_3d() }
+    $vals := []f64{}
+    for i in 0:16 {
+        v := doc.as_f64(doc.at(arr, i)) >>> (err) {
+            _ := err
+            << fm.identity_3d()
+        }
+        if !fm.finite(v) { << fm.identity_3d() }
+        vals.push(v)
+    }
+    << fm.Mat4{
+        c0: fm.vec4(vals[0], vals[1], vals[2], vals[3]),
+        c1: fm.vec4(vals[4], vals[5], vals[6], vals[7]),
+        c2: fm.vec4(vals[8], vals[9], vals[10], vals[11]),
+        c3: fm.vec4(vals[12], vals[13], vals[14], vals[15])
+    }
+}
+
+fn try_set_embed_transform(hosts $&[]EmbedSceneHost, node_idx int, mat fm.Mat4) {
+    if hosts.len == 0 || node_idx <= 0 { << }
+    cur := hosts.len - 1
+    host := $&hosts[cur]
+    if node_idx >= host.tree_ids.len { << }
+    tid := host.tree_ids[node_idx]
+    if tid <= 0 { << }
+    t := $&host.tree
+    _ := t.set_transform_3d(tid, mat) >>> (err) {
+        _ := err
+        <<
+    }
+    _ := t.flush_transforms() >>> (err) {
+        _ := err
+        <<
+    }
+}
+
+fn split_viewport_rects(w int, h int, split bool) []EmbedViewportRect {
+    if !split || w < 160 {
+        << [EmbedViewportRect{x: 0, y: 0, w: w, h: h}]
+    }
+    lw := int(f64(w) * 0.56)
+    rw := w - lw - 2
+    if rw < 32 {
+        << [EmbedViewportRect{x: 0, y: 0, w: w, h: h}]
+    }
+    << [
+        EmbedViewportRect{x: 0, y: 0, w: lw, h: h},
+        EmbedViewportRect{x: lw + 2, y: 0, w: rw, h: h}
+    ]
+}
+
+fn run_embed_server(config &Options) int {
+    mesh_program := mesh_shaders.load_mesh("build/mesh-shaders") >>>
+    $device := ren.open_3d_offscreen_adaptive(640, 480, gpu.AUTO, &mesh_program) >>>
+    $backend := "Software"
+    $gpu_fx := EmbedGpuFx{
+        has_gpu: false,
+        cprog: ren.ClusteredProgram3D{format: 0, entrypoint: "", compute: []u8{}, vertex: []u8{}, fragment: []u8{}},
+        iprog: ren.IndirectProgram3D{format: 0, entrypoint: "", hiz_depth: []u8{}, hiz_mip: []u8{}, cull: []u8{}, vertex: []u8{}, fragment: []u8{}},
+        pprog: ren.empty_postprocess_program_3d(),
+        sprog: ren.ShadowProgram3D{format: 0, entrypoint: "", vertex: []u8{}, fragment: []u8{}},
+        aprog: ren.empty_atmosphere_program_3d(),
+        vprog: ren.empty_particle_program_3d(),
+        atm_list: []ren.AtmosphereRenderer3D{},
+        shadow_maps: []ren.ShadowMap3D{},
+        shadow_res: 0,
+        shadow_faces: 0,
+        fx_time: 0.0
+    }
+    $gpu_pipes := EmbedPipelines{items: []world3d.ModernPipeline3D{}}
+    if device.is_gpu() {
+        $bcode := 0
+        bres := device.backend() >>> (err) {
+            _ := err
+            << 0
+        }
+        bcode = bres
+        backend = gpu_info.backend_name(bcode)
+        gpu_fx.has_gpu = true
+        gpu_fx.cprog = mesh_shaders.load_clustered_program("build/mesh-shaders") >>>
+        gpu_fx.iprog = mesh_shaders.load_indirect_program("build/mesh-shaders") >>>
+        gpu_fx.pprog = mesh_shaders.load_postprocess_program("build/mesh-shaders") >>>
+        gpu_fx.sprog = mesh_shaders.load_shadow("build/mesh-shaders") >>>
+        gpu_fx.aprog = mesh_shaders.load_atmosphere_program("build/mesh-shaders") >>>
+        gpu_fx.vprog = mesh_shaders.load_particle_program("build/mesh-shaders") >>>
+        ar0 := device.atmosphere_renderer(&gpu_fx.aprog) >>>
+        gpu_fx.atm_list.push(ar0)
+    }
+    $grid_xz := build_plane_grid_mesh(&device, EMBED_ORTHO_TOP) >>>
+    $grid_xy := build_plane_grid_mesh(&device, EMBED_ORTHO_FRONT) >>>
+    $grid_yz := build_plane_grid_mesh(&device, EMBED_ORTHO_RIGHT) >>>
+    $worlds := []world3d.Scene3D{}
+    $hosts := []EmbedSceneHost{}
+    push_loaded_embed_scene(&device, config.path + "", gpu_fx.has_gpu, &gpu_fx.vprog, $&worlds, $&hosts) >>>
+
+    $conn := net.dial_to("tcp", config.embed_connect + "") >>> (err) {
+        if hosts.len > 0 {
+            last_c := hosts.len - 1
+            close_embed_scene($&hosts[last_c])
+        }
+        close_embed_gpu_pipelines($&gpu_pipes)
+    close_embed_gpu_fx($&gpu_fx)
+        close_embed_mesh_quiet($&grid_xz)
+        close_embed_mesh_quiet($&grid_xy)
+        close_embed_mesh_quiet($&grid_yz)
+        close_embed_device_quiet($&device)
+        >> err
+    }
+    _ := conn.set_nodelay(true) >>> (err) {
+        _ := err
+        << 0
+    }
+    ready_json := "{\"backend\":" + json.quote(&backend) + "}"
+    send_embed_packet(&conn, EMBED_READY, 0, &ready_json) >>>
+
+    $rem := ""
+    $running := true
+    while running {
+        $line := ""
+        while true {
+            idx := strings.index_byte(&rem, 10)
+            if idx >= 0 {
+                line = strings.trim_space(&(rem[0:idx] + ""))
+                rem = rem[idx + 1:rem.len] + ""
+                if line.len > 0 { <- }
+                ->
+            }
+            chunk := conn.read(8192) >>> (err) {
+                _ := err
+                running = false
+                <-
+            }
+            if chunk.len == 0 {
+                running = false
+                <-
+            }
+            rem = rem + chunk
+        }
+        if !running || line.len == 0 { <- }
+
+        doc := json.parse_max(&line, 1048576)
+        if !doc.ok() || !doc.is_dict(doc.root()) { -> }
+        root := doc.root()
+        cmd := json_str_or(&doc, root, "cmd", "")
+        seq := json_int_or(&doc, root, "seq", 0)
+
+        if cmd == "quit" {
+            running = false
+            <-
+        } else if cmd == "load" {
+            sp := json_str_or(&doc, root, "scene", "")
+            if sp.len > 0 {
+                try_reload_embed_hosts(&device, &conn, sp, seq, gpu_fx.has_gpu, &gpu_fx.vprog, $&worlds, $&hosts)
+            }
+        } else if cmd == "set_transform" {
+            node_idx := json_int_or(&doc, root, "node", -1)
+            mat := parse_embed_mat4(&doc, root)
+            try_set_embed_transform($&hosts, node_idx, mat)
+        } else if cmd == "render" {
+            cur := hosts.len - 1
+            w3 := $&worlds[cur]
+            host := $&hosts[cur]
+            w := clamp_embed_dim(json_int_or(&doc, root, "w", 640), 64, 1920)
+            h := clamp_embed_dim(json_int_or(&doc, root, "h", 480), 64, 1200)
+            split := json_bool_or(&doc, root, "split", false)
+            show_grid := json_bool_or(&doc, root, "grid", true)
+            cam := parse_cam_spec(&doc, root)
+            if w != device.render_width() || h != device.render_height() {
+                close_embed_gpu_pipelines($&gpu_pipes)
+                device.resize_offscreen(w, h) >>>
+            }
+            rects := split_viewport_rects(w, h, split)
+            persp := embed_persp_camera(&cam, rects[0]) >>>
+            if rects.len == 1 && gpu_fx.has_gpu {
+                render_embed_modern_single($&device, $&gpu_fx, $&gpu_pipes, w3, host, &grid_xz, rects[0], &persp, show_grid) >>>
+            } else {
+                device.begin(EMBED_PAPER_BG) >>>
+                render_embed_pane($&device, $&gpu_fx, w3, host, &grid_xz, rects[0], &persp, show_grid) >>>
+                if rects.len > 1 {
+                    ortho := embed_ortho_camera(&cam, rects[1]) >>>
+                    if cam.ortho_axis == EMBED_ORTHO_FRONT {
+                        render_embed_pane($&device, $&gpu_fx, w3, host, &grid_xy, rects[1], &ortho, show_grid) >>>
+                    } else if cam.ortho_axis == EMBED_ORTHO_RIGHT {
+                        render_embed_pane($&device, $&gpu_fx, w3, host, &grid_yz, rects[1], &ortho, show_grid) >>>
+                    } else {
+                        render_embed_pane($&device, $&gpu_fx, w3, host, &grid_xz, rects[1], &ortho, show_grid) >>>
+                    }
+                }
+                device.reset_viewport() >>>
+            }
+            cap_path := json_str_or(&doc, root, "capture", "")
+            if cap_path.len > 0 {
+                device.capture(cap_path + "") >>>
+            }
+            pixels := device.read_pixels_rgba() >>>
+            device.finish_offscreen() >>>
+            _ := send_embed_rgba(&conn, seq, w, h, &pixels) >>> (err) {
+                _ := err
+                running = false
+                <-
+            }
+        } else if cmd == "pick" {
+            cur := hosts.len - 1
+            w3 := $&worlds[cur]
+            host := &hosts[cur]
+            w := clamp_embed_dim(json_int_or(&doc, root, "w", 640), 64, 1920)
+            h := clamp_embed_dim(json_int_or(&doc, root, "h", 480), 64, 1200)
+            px := json_f64_or(&doc, root, "x", f64(w) * 0.5)
+            py := json_f64_or(&doc, root, "y", f64(h) * 0.5)
+            split := json_bool_or(&doc, root, "split", false)
+            sel := json_int_or(&doc, root, "sel", -1)
+            sub_mode := json_int_or(&doc, root, "sub_mode", 0)
+            cam := parse_cam_spec(&doc, root)
+            rects := split_viewport_rects(w, h, split)
+            $use_rect := rects[0]
+            $use_ortho := false
+            if rects.len > 1 && px >= f64(rects[1].x) {
+                use_rect = rects[1]
+                use_ortho = true
+            }
+            $frame := embed_persp_camera(&cam, use_rect) >>>
+            $ray := ViewRay{origin: frame.position, direction: frame.forward, near: frame.near, far: frame.far}
+            if use_ortho {
+                frame = embed_ortho_camera(&cam, use_rect) >>>
+                ray = embed_ortho_ray(&cam, &frame, use_rect, px, py)
+            } else {
+                pt := fm.vec2(px - f64(use_rect.x), py - f64(use_rect.y))
+                ray = frame.ray(pt) >>>
+            }
+            $resp := "{\"hit\":false,\"node\":-1,\"sub_mode\":0,\"sub_idx\":-1,\"v0\":-1,\"v1\":-1}"
+            $sub_picked := false
+            if sub_mode > 0 && sel > 0 {
+                spick := host.scene_mods.pick_subobject_at(&host.tree, &host.tree_ids, sel, sub_mode, ray.origin, ray.direction)
+                if spick.hit {
+                    resp = "{\"hit\":true,\"node\":" + str(sel) + ",\"sub_mode\":" + str(sub_mode) +
+                        ",\"sub_idx\":" + str(spick.index) + ",\"v0\":" + str(spick.v0) + ",\"v1\":" + str(spick.v1) + "}"
+                    sub_picked = true
+                }
+            }
+            if !sub_picked {
+                $best_doc := -1
+                $best_dist := ray.far
+                hm := host.scene_mods.pick_node(&host.tree, &host.tree_ids, ray.origin, ray.direction, ray.near, ray.far)
+                if hm.hit {
+                    best_doc = hm.node_idx
+                    best_dist = hm.distance
+                }
+                try_select_lods(w3, &host.tree, frame.position)
+                ghit := safe_pick_3d(&host.picker, w3, &host.tree, ray.origin, ray.direction, ray.near, best_dist)
+                if ghit.node > 0 {
+                    for idx in 0:host.tree_ids.len {
+                        if host.tree_ids[idx] == ghit.node {
+                            best_doc = idx
+                            <-
+                        }
+                    }
+                }
+                if best_doc > 0 {
+                    resp = "{\"hit\":true,\"node\":" + str(best_doc) + ",\"sub_mode\":0,\"sub_idx\":-1,\"v0\":-1,\"v1\":-1}"
+                }
+            }
+            _ := send_embed_packet(&conn, EMBED_PICK_RESULT, seq, &resp) >>> (err) {
+                _ := err
+                running = false
+                <-
+            }
+        }
+    }
+
+    close_embed_conn_quiet($&conn)
+    if hosts.len > 0 {
+        last_i := hosts.len - 1
+        close_embed_scene($&hosts[last_i])
+    }
+    close_embed_gpu_pipelines($&gpu_pipes)
+    close_embed_gpu_fx($&gpu_fx)
+    close_embed_mesh_quiet($&grid_xz)
+    close_embed_mesh_quiet($&grid_xy)
+    close_embed_mesh_quiet($&grid_yz)
+    close_embed_device_quiet($&device)
+    << 0
+}

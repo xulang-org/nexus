@@ -47,6 +47,28 @@ pub fn new_modern_pipeline_3d(
     }
 }
 
+pub fn (mp &ModernPipeline3D) target_width() int { << mp.hdr.render_width() }
+pub fn (mp &ModernPipeline3D) target_height() int { << mp.hdr.render_height() }
+
+pub fn (mp $&ModernPipeline3D) prepare_lights_mode(
+    device &ren.Device3D,
+    ambient fm.Vec3,
+    eye fm.Vec3,
+    exposure f64,
+    lights &[]light_data.Light3D,
+    view fm.Mat4,
+    proj fm.Mat4,
+    z_near f64,
+    z_far f64,
+    slice_mode int
+) int {
+    if mp.closed || !mp.owner.matches(device) {
+        >> errors.new("nexus modern: closed or foreign ModernPipeline3D")
+    }
+    cl := $&mp.clustered
+    << cl.bin_lights(device, ambient, eye, exposure, lights, view, proj, z_near, z_far, slice_mode) >>>
+}
+
 pub fn (mp $&ModernPipeline3D) prepare_lights(
     device &ren.Device3D,
     ambient fm.Vec3,
@@ -58,11 +80,7 @@ pub fn (mp $&ModernPipeline3D) prepare_lights(
     z_near f64,
     z_far f64
 ) int {
-    if mp.closed || !mp.owner.matches(device) {
-        >> errors.new("nexus modern: closed or foreign ModernPipeline3D")
-    }
-    cl := $&mp.clustered
-    << cl.bin_lights(device, ambient, eye, exposure, lights, view, proj, z_near, z_far, 0) >>>
+    << mp.prepare_lights_mode(device, ambient, eye, exposure, lights, view, proj, z_near, z_far, 0) >>>
 }
 
 fn (mp $&ModernPipeline3D) render_unified_core(
@@ -598,6 +616,62 @@ pub fn (mp $&ModernPipeline3D) render_unified_ddgi_frame(
     }
     if has_particles {
         particles.draw_into_hdr(device, hdr_ref, view, proj) >>>
+    }
+
+    device.begin(clear_rgba) >>>
+    pp_ref := $&mp.pp
+    hiz_ref := $&mp.hiz
+    pp_ref.apply(device, hdr_ref, hiz_ref, view, proj, z_near, z_far, pp_cfg) >>>
+    << opaque_refs.len
+}
+
+pub fn (mp $&ModernPipeline3D) render_scene_effects_frame(
+    device $&ren.Device3D,
+    has_grid bool,
+    grid_mesh &ren.Mesh3D,
+    opaque_refs &[]ren.MeshRef3D,
+    opaque_worlds &[]fm.Mat4,
+    opaque_mats &[]ren.Material3D,
+    shadow &ren.ShadowBinding3D,
+    has_atmosphere bool,
+    atm_ren &ren.AtmosphereRenderer3D,
+    atm_cfg &ren.AtmosphereConfig3D,
+    transparent &ren.TransparentQueue3D,
+    particles &[]ren.GpuParticleSystem3D,
+    eye fm.Vec3,
+    view fm.Mat4,
+    proj fm.Mat4,
+    z_near f64,
+    z_far f64,
+    clear_rgba int,
+    pp_cfg &ren.PostProcessConfig3D
+) int {
+    if mp.closed || !mp.owner.matches(device) {
+        >> errors.new("nexus modern: closed or foreign ModernPipeline3D")
+    }
+    if opaque_refs.len != opaque_worlds.len || opaque_refs.len != opaque_mats.len {
+        >> errors.new("nexus modern: opaque mesh/world/material arrays length mismatch")
+    }
+    vp := proj.multiply(view)
+    hdr_ref := $&mp.hdr
+    hdr_ref.begin(device, clear_rgba) >>>
+    if has_grid {
+        grid_mat := (ren.material_3d(fm.vec3(1.0, 1.0, 1.0), 0.0, 1.0, fm.vec3(0.0, 0.0, 0.0)) >>>).with_shaded(false)
+        hdr_ref.draw_clustered(device, &mp.clustered, grid_mesh.reference(), fm.identity_3d(), view, vp, &grid_mat) >>>
+    }
+    for i in 0:opaque_refs.len {
+        hdr_ref.draw_clustered_shadowed(device, &mp.clustered, shadow, opaque_refs[i], opaque_worlds[i], view, vp, &opaque_mats[i]) >>>
+    }
+    hdr_ref.end() >>>
+
+    if has_atmosphere && (atm_cfg.sky_enabled || atm_cfg.fog_enabled) {
+        _ := atm_ren.apply_into_hdr(device, hdr_ref, &mp.clustered, eye, view, proj, atm_cfg) >>>
+    }
+    if transparent.count() > 0 {
+        _ := transparent.flush_into_hdr_shadowed(device, hdr_ref, &mp.clustered, shadow, view, vp) >>>
+    }
+    for pi in 0:particles.len {
+        particles[pi].draw_into_hdr(device, hdr_ref, view, proj) >>>
     }
 
     device.begin(clear_rgba) >>>

@@ -647,3 +647,159 @@ pub fn merge_vertices(m $&rm.EditableMesh, vert_ids &[]int, threshold f64) int {
     compute_normals(m) >>>
     << merged
 }
+
+fn clone_poly_face(f &rm.PolyFace) rm.PolyFace {
+    $cs := []int{}
+    for i in 0:f.corners.len { cs.push(f.corners[i]) }
+    << rm.PolyFace{
+        corners: ~cs,
+        material_slot: f.material_slot,
+        smoothing_group: f.smoothing_group
+    }
+}
+
+pub fn delete_faces(m $&rm.EditableMesh, face_ids &[]int) int {
+    if face_ids.len == 0 { << 0 }
+    $del := map[int]bool{}
+    for idx in 0:face_ids.len {
+        fi := face_ids[idx]
+        if fi < 0 || fi >= m.faces.len {
+            >> errors.new("nexus modeling: delete face index out of range")
+        }
+        del[fi] = true
+    }
+    $kept := []rm.PolyFace{}
+    for i in 0:m.faces.len {
+        if !del.has(i) {
+            kept.push(clone_poly_face(&m.faces[i]))
+        }
+    }
+    if kept.len == 0 {
+        >> errors.new("nexus modeling: cannot delete all faces")
+    }
+    m.faces = kept
+    compute_normals(m) >>>
+    << del.len()
+}
+
+fn safe_corner_uv(m &rm.EditableMesh, cid int) fm.Vec2 {
+    if cid >= 0 && cid < m.corners.len && m.corners[cid].has_uv {
+        << m.corners[cid].uv
+    }
+    << fm.vec2(0.0, 0.0)
+}
+
+fn subdivide_edge_midpoint(
+    m $&rm.EditableMesh,
+    edge_mids $&map[string]int,
+    v0 int,
+    v1 int
+) int {
+    $lo := v0
+    $hi := v1
+    if lo > hi {
+        lo = v1
+        hi = v0
+    }
+    ek := str(lo) + ":" + str(hi)
+    if edge_mids.has(ek) {
+        << edge_mids[ek]
+    }
+    pos := m.vertices[v0].position.add(m.vertices[v1].position).scaled(0.5)
+    col := m.vertices[v0].color
+    mv := m.add_vertex(pos, col) >>>
+    edge_mids[ek] = mv
+    << mv
+}
+
+pub fn subdivide_faces(m $&rm.EditableMesh, face_ids &[]int) []int {
+    $sel := map[int]bool{}
+    $targets := []int{}
+    for idx in 0:face_ids.len {
+        fi := face_ids[idx]
+        if fi < 0 || fi >= m.faces.len {
+            >> errors.new("nexus modeling: subdivide face index out of range")
+        }
+        if !sel.has(fi) {
+            sel[fi] = true
+            targets.push(fi)
+        }
+    }
+    if targets.len == 0 { << []int{} }
+
+    $edge_mids := map[string]int{}
+    $new_quads := []rm.PolyFace{}
+    for ti in 0:targets.len {
+        fi := targets[ti]
+        $orig_c := []int{}
+        fc_ref := &m.faces[fi]
+        mat_slot := fc_ref.material_slot
+        sm_grp := fc_ref.smoothing_group
+        for ci in 0:fc_ref.corners.len {
+            orig_c.push(fc_ref.corners[ci])
+        }
+        nc := orig_c.len
+        if nc < 3 { -> }
+
+        $cpos := fm.vec3(0.0, 0.0, 0.0)
+        $cuv := fm.vec2(0.0, 0.0)
+        $has_uv := false
+        $verts := []int{}
+        $uvs := []fm.Vec2{}
+        for k in 0:nc {
+            cid := orig_c[k]
+            vid := m.corners[cid].vertex
+            verts.push(vid)
+            cpos = cpos.add(m.vertices[vid].position)
+            if m.corners[cid].has_uv { has_uv = true }
+            uv := safe_corner_uv(m, cid)
+            uvs.push(uv)
+            cuv = cuv.add(uv)
+        }
+        inv_n := 1.0 / f64(nc)
+        cpos = cpos.scaled(inv_n)
+        cuv = cuv.scaled(inv_n)
+        ccol := m.vertices[verts[0]].color
+        center_v := m.add_vertex(cpos, ccol) >>>
+
+        $mids := []int{}
+        $muvs := []fm.Vec2{}
+        for k in 0:nc {
+            $nxt := k + 1
+            if nxt >= nc { nxt = 0 }
+            mv := subdivide_edge_midpoint(m, $&edge_mids, verts[k], verts[nxt]) >>>
+            mids.push(mv)
+            muvs.push(uvs[k].add(uvs[nxt]).scaled(0.5))
+        }
+
+        zero_n := fm.vec3(0.0, 0.0, 0.0)
+        for k in 0:nc {
+            $prev := k - 1
+            if prev < 0 { prev = nc - 1 }
+            ca := m.add_corner(verts[k], uvs[k], has_uv, zero_n, false) >>>
+            cb := m.add_corner(mids[k], muvs[k], has_uv, zero_n, false) >>>
+            cc := m.add_corner(center_v, cuv, has_uv, zero_n, false) >>>
+            cd := m.add_corner(mids[prev], muvs[prev], has_uv, zero_n, false) >>>
+            new_quads.push(rm.PolyFace{
+                corners: [ca, cb, cc, cd],
+                material_slot: mat_slot,
+                smoothing_group: sm_grp
+            })
+        }
+    }
+
+    $kept := []rm.PolyFace{}
+    for i in 0:m.faces.len {
+        if !sel.has(i) {
+            kept.push(clone_poly_face(&m.faces[i]))
+        }
+    }
+    $created := []int{}
+    for qi in 0:new_quads.len {
+        created.push(kept.len)
+        kept.push(clone_poly_face(&new_quads[qi]))
+    }
+    m.faces = kept
+    compute_normals(m) >>>
+    << created
+}
