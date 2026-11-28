@@ -48,15 +48,24 @@ pub struct Mixer {
     clips []pcm.Clip
     bank_samples int
     revision int
+    bank_hash int
+    stream_hash int
     streams []PcmStream
     stream_samples int
+    scratch_l [][]f64
+    scratch_r [][]f64
 }
 // MixBlock is a preview. Only commit after its samples reach the intended sink.
-// Its stamp describes the complete immutable bank and mutable mixer state;
-// another mixer can accept it only when that state is exactly equivalent.
+// Its integer revision & bank/stream hashes ensure another mixer or mutated state
+// cannot accept a stale or foreign receipt.
 pub struct MixBlock {
     pub samples []int
-    stamp string
+    stamp_rev int
+    stamp_bank int
+    stamp_stream int
+    stamp_rate int
+    stamp_voices int
+    stamp_buses int
     phases []int
     playing []bool
     frames int
@@ -75,7 +84,8 @@ pub fn new_mixer(rate int, capacity int) Mixer {
     $streams := []PcmStream{}
     for i in 0:MAX_STREAMS { streams.push(empty_stream(0)) }
     << Mixer{rate: rate, voices: voices, buses: [Bus{parent: -1, gain: 1000, muted: false, paused: false, name: "Master", dsp: default_bus_dsp()}],
-        clips: []pcm.Clip{}, bank_samples: 0, revision: 0, streams: streams, stream_samples: 0}
+        clips: []pcm.Clip{}, bank_samples: 0, revision: 0, bank_hash: 1469598103934665603, stream_hash: 1469598103934665603,
+        streams: streams, stream_samples: 0, scratch_l: [][]f64{}, scratch_r: [][]f64{}}
 }
 fn control(value f64, minimum f64, maximum f64) int {
     if math.is_nan(value) || math.is_inf(value) || value < minimum || value > maximum { >> errors.new("nexus mixer: invalid gain or pan") }
@@ -98,6 +108,8 @@ pub fn (mixer $&Mixer) add_clip(clip pcm.Clip) int {
     clip.validate() >>>
     if mixer.clips.len >= MAX_CLIPS || clip.sample_count() > MAX_BANK_SAMPLES - mixer.bank_samples { >> errors.new("nexus mixer: PCM bank capacity exceeded") }
     index := mixer.clips.len
+    fp := clip.fingerprint()
+    mixer.bank_hash = mix_hash_str(mix_hash_int(mixer.bank_hash, clip.sample_rate() * 13 + clip.channel_count()), &fp)
     mixer.bank_samples = mixer.bank_samples + clip.sample_count()
     mixer.clips.push(clip)
     mixer.revision = mixer.revision + 1
@@ -307,24 +319,16 @@ fn (mixer &Mixer) any_bus_dsp_active() bool {
     }
     << false
 }
-fn (mixer &Mixer) state_stamp() string {
-    $stamp := str(mixer.rate) + ":" + str(mixer.revision) + ":" + str(mixer.voices.len)
-    for i in 0:mixer.clips.len { stamp = stamp + ":c" + mixer.clips[i].fingerprint() }
-    for i in 0:mixer.streams.len {
-        source := &mixer.streams[i]
-        stamp = stamp + ":s" + str(source.generation) + "," + str(flag(source.open)) + "," + str(source.rate) + "," + str(source.channels) + "," + str(source.capacity) + "," +
-            str(source.read_frame) + "," + str(source.position) + "," + str(source.write_frame) + "," + str(flag(source.eof)) + "," + str(source.consumer) + "," + source.digest
+fn mix_hash_int(h int, v int) int {
+    << ((h ^ v) * 1099511628211) & 0x3fffffffffffffff
+}
+
+fn mix_hash_str(h int, s &string) int {
+    $acc := h
+    for i in 0:s.len {
+        acc = ((acc ^ (s[i] & 255)) * 1099511628211) & 0x3fffffffffffffff
     }
-    for i in 0:mixer.buses.len {
-        bus := &mixer.buses[i]
-        stamp = stamp + ":b" + str(bus.parent) + "," + str(bus.gain) + "," + str(flag(bus.muted)) + "," + str(flag(bus.paused)) + "," + bus.dsp.stamp()
-    }
-    for i in 0:mixer.voices.len {
-        v := &mixer.voices[i]
-        stamp = stamp + ":v" + str(v.generation) + "," + str(flag(v.allocated)) + "," + str(flag(v.playing)) + "," + str(v.clip) + "," + str(v.bus) + "," +
-            str(v.phase) + "," + str(v.gain) + "," + str(v.pan) + "," + str(flag(v.paused)) + "," + str(flag(v.looping)) + "," + str(v.fade_start) + "," + str(v.fade_target) + "," + str(v.fade_total) + "," + str(v.fade_position) + "," + str(flag(v.fade_stop)) + "," + str(flag(v.fade_hold)) + "," + str(v.pitch_milli) + "," + str(v.itd_frames) + "," + str(v.gain_l_milli) + "," + str(v.gain_r_milli)
-    }
-    << stamp
+    << acc
 }
 struct BusState { gain f64
     paused bool }
@@ -350,7 +354,9 @@ struct VoiceRenderOutcome {
     lpf_r f64
     underrun bool
 }
-fn (mixer &Mixer) sample_clip_at_phase(
+fn sample_clip_at_phase_from(
+    clips &[]pcm.Clip,
+    streams &[]PcmStream,
     source &SourceInfo,
     clip_id int,
     raw_phase int,
@@ -374,11 +380,13 @@ fn (mixer &Mixer) sample_clip_at_phase(
     if next >= source.frames {
         if looping { next = 0 } else { next = at }
     }
-    a := mixer.source_sample(clip_id, at, channel) >>>
-    b := mixer.source_sample(clip_id, next, channel) >>>
+    a := source_sample_from(clips, streams, clip_id, at, channel) >>>
+    b := source_sample_from(clips, streams, clip_id, next, channel) >>>
     << f64(a) + f64(b - a) * weight
 }
-fn (mixer &Mixer) mix_voice_into(
+fn mix_voice_into_from(
+    clips &[]pcm.Clip,
+    streams &[]PcmStream,
     voice &Voice,
     bus_gain f64,
     frames int,
@@ -386,7 +394,7 @@ fn (mixer &Mixer) mix_voice_into(
     left $&[]f64,
     right $&[]f64
 ) VoiceRenderOutcome {
-    source := mixer.source_info(voice.clip) >>>
+    source := source_info_from(clips, streams, voice.clip) >>>
     if rate < 1 { >> errors.new("nexus mixer: zero output rate") }
     period := source.frames * rate
     if !source.streaming && period == 0 { >> errors.new("nexus mixer: empty clip period") }
@@ -427,21 +435,21 @@ fn (mixer &Mixer) mix_voice_into(
             }
             if !source.streaming && voice.looping { next = 0 } else { next = at }
         }
-        a := mixer.source_sample(voice.clip, at, 0) >>>
-        b := mixer.source_sample(voice.clip, next, 0) >>>
+        a := source_sample_from(clips, streams, voice.clip, at, 0) >>>
+        b := source_sample_from(clips, streams, voice.clip, next, 0) >>>
         $l := f64(a) + f64(b - a) * weight
         $r := l
         if source.channels == 2 {
-            c := mixer.source_sample(voice.clip, at, 1) >>>
-            d := mixer.source_sample(voice.clip, next, 1) >>>
+            c := source_sample_from(clips, streams, voice.clip, at, 1) >>>
+            d := source_sample_from(clips, streams, voice.clip, next, 1) >>>
             r = f64(c) + f64(d - c) * weight
         }
         if voice.itd_frames > 0 && !source.streaming {
-            l = mixer.sample_clip_at_phase(&source, voice.clip, phase - voice.itd_frames * step, voice.looping, rate, 0) >>>
+            l = sample_clip_at_phase_from(clips, streams, &source, voice.clip, phase - voice.itd_frames * step, voice.looping, rate, 0) >>>
         } else if voice.itd_frames < 0 && !source.streaming {
             $ch_r := 0
             if source.channels == 2 { ch_r = 1 }
-            r = mixer.sample_clip_at_phase(&source, voice.clip, phase - (-voice.itd_frames) * step, voice.looping, rate, ch_r) >>>
+            r = sample_clip_at_phase_from(clips, streams, &source, voice.clip, phase - (-voice.itd_frames) * step, voice.looping, rate, ch_r) >>>
         }
         if voice.lpf_alpha_l < 0.999999 {
             lpf_l = lpf_l + voice.lpf_alpha_l * (l - lpf_l)
@@ -464,6 +472,16 @@ fn (mixer &Mixer) mix_voice_into(
     if !source.streaming && voice.looping { phase = wrap_phase(phase, period)
     } else if source.eof && phase >= period { active = false }
     << VoiceRenderOutcome{phase: phase, active: active, fade_position: fade_position, lpf_l: lpf_l, lpf_r: lpf_r, underrun: underrun}
+}
+fn (mixer &Mixer) mix_voice_into(
+    voice &Voice,
+    bus_gain f64,
+    frames int,
+    rate int,
+    left $&[]f64,
+    right $&[]f64
+) VoiceRenderOutcome {
+    << mix_voice_into_from(&mixer.clips, &mixer.streams, voice, bus_gain, frames, rate, left, right) >>>
 }
 pub fn (mixer &Mixer) prepare(frames int) MixBlock {
     mixer.valid() >>>
@@ -579,14 +597,34 @@ pub fn (mixer &Mixer) prepare(frames int) MixBlock {
             rev -= 1
         }
     }
-    << MixBlock{samples: samples, stamp: mixer.state_stamp(), phases: phases, playing: playing, frames: frames,
-        fade_positions: fade_positions, dsp_next: dsp_next, lpf_l: lpf_l, lpf_r: lpf_r, underruns: underruns}
+    << MixBlock{
+        samples: samples,
+        stamp_rev: mixer.revision,
+        stamp_bank: mixer.bank_hash,
+        stamp_stream: mixer.stream_hash,
+        stamp_rate: mixer.rate,
+        stamp_voices: mixer.voices.len,
+        stamp_buses: mixer.buses.len,
+        phases: phases,
+        playing: playing,
+        frames: frames,
+        fade_positions: fade_positions,
+        dsp_next: dsp_next,
+        lpf_l: lpf_l,
+        lpf_r: lpf_r,
+        underruns: underruns
+    }
 }
 pub fn (block &MixBlock) frame_count() int { << block.frames }
 pub fn (mixer $&Mixer) commit(block &MixBlock) int {
     mixer.valid() >>>
     if block.frames < 1 || block.frames > MAX_BLOCK_FRAMES || block.samples.len != block.frames * 2 || block.phases.len != mixer.voices.len ||
-        block.playing.len != mixer.voices.len || block.fade_positions.len != mixer.voices.len || block.stamp != mixer.state_stamp() { >> errors.new("nexus mixer: stale or foreign mix block") }
+        block.playing.len != mixer.voices.len || block.fade_positions.len != mixer.voices.len ||
+        block.stamp_rev != mixer.revision || block.stamp_bank != mixer.bank_hash ||
+        block.stamp_stream != mixer.stream_hash || block.stamp_rate != mixer.rate ||
+        block.stamp_voices != mixer.voices.len || block.stamp_buses != mixer.buses.len {
+        >> errors.new("nexus mixer: stale or foreign mix block")
+    }
     for i in 0:mixer.voices.len { mixer.voices[i].phase = block.phases[i]
         mixer.voices[i].playing = block.playing[i]
         mixer.voices[i].fade_position = block.fade_positions[i]
@@ -601,10 +639,101 @@ pub fn (mixer $&Mixer) commit(block &MixBlock) int {
     mixer.revision = mixer.revision + 1
     << 0
 }
+
+fn ensure_scratch_buses(sl $&[][]f64, sr $&[][]f64, bus_count int, frames int) {
+    while sl.len < bus_count {
+        sl.push([]f64{})
+        sr.push([]f64{})
+    }
+    for b in 0:bus_count {
+        bl := $&sl[b]
+        br := $&sr[b]
+        while bl.len < frames { bl.push(0.0) }
+        while br.len < frames { br.push(0.0) }
+        for f in 0:frames {
+            bl[f] = 0.0
+            br[f] = 0.0
+        }
+    }
+}
+
 pub fn (mixer $&Mixer) render(frames int) []int {
-    block := mixer.prepare(frames) >>>
-    mixer.commit(&block) >>>
+    mixer.valid() >>>
+    if frames < 1 || frames > MAX_BLOCK_FRAMES { >> errors.new("nexus mixer: invalid block frame count") }
+    rate := mixer.rate
+    if rate == 0 { >> errors.new("nexus mixer: zero output rate") }
+    dsp_mode := mixer.any_bus_dsp_active()
+    bus_count := mixer.buses.len
+    $needed_buses := 1
+    if dsp_mode { needed_buses = bus_count }
+
+    ensure_scratch_buses($&mixer.scratch_l, $&mixer.scratch_r, needed_buses, frames)
+
     $samples := []int{}
-    for sample in block.samples { samples.push(sample) }
+    $outcomes := []VoiceRenderOutcome{}
+    $ran_voice := []bool{}
+    for i in 0:mixer.voices.len {
+        if mixer.voices[i].playing {
+            state := mixer.bus_state(mixer.voices[i].bus)
+            if !mixer.voices[i].paused && !state.paused {
+                $target_bus := 0
+                $vgain := state.gain
+                if dsp_mode {
+                    target_bus = mixer.voices[i].bus
+                    vgain = 1.0
+                }
+                out := mix_voice_into_from(&mixer.clips, &mixer.streams, &mixer.voices[i], vgain, frames, rate,
+                    $&mixer.scratch_l[target_bus], $&mixer.scratch_r[target_bus]) >>>
+                outcomes.push(out)
+                ran_voice.push(true)
+                ->
+            }
+        }
+        outcomes.push(VoiceRenderOutcome{phase: mixer.voices[i].phase, active: mixer.voices[i].playing,
+            fade_position: mixer.voices[i].fade_position, lpf_l: mixer.voices[i].lpf_state_l, lpf_r: mixer.voices[i].lpf_state_r, underrun: false})
+        ran_voice.push(false)
+    }
+
+    for i in 0:mixer.voices.len {
+        if ran_voice[i] {
+            mixer.voices[i].phase = outcomes[i].phase
+            mixer.voices[i].playing = outcomes[i].active
+            mixer.voices[i].fade_position = outcomes[i].fade_position
+            mixer.voices[i].lpf_state_l = outcomes[i].lpf_l
+            mixer.voices[i].lpf_state_r = outcomes[i].lpf_r
+        }
+    }
+
+    if !dsp_mode {
+        for f in 0:frames {
+            samples.push(quantize(mixer.scratch_l[0][f]))
+            samples.push(quantize(mixer.scratch_r[0][f]))
+        }
+    } else {
+        $rev := bus_count - 1
+        while rev >= 0 {
+            if !mixer.bus_state(rev).paused {
+                process_bus_dsp($&mixer.buses[rev].dsp, $&mixer.scratch_l[rev], $&mixer.scratch_r[rev], frames)
+            }
+            $bgain := f64(mixer.buses[rev].gain) / 1000.0
+            if mixer.buses[rev].muted { bgain = 0.0 }
+            parent := mixer.buses[rev].parent
+            if parent >= 0 {
+                for f in 0:frames {
+                    mixer.scratch_l[parent][f] += mixer.scratch_l[rev][f] * bgain
+                    mixer.scratch_r[parent][f] += mixer.scratch_r[rev][f] * bgain
+                }
+            } else {
+                for f in 0:frames {
+                    samples.push(quantize(mixer.scratch_l[0][f] * bgain))
+                    samples.push(quantize(mixer.scratch_r[0][f] * bgain))
+                }
+            }
+            rev -= 1
+        }
+    }
+
+    mixer.consume_streams()
+    mixer.revision = mixer.revision + 1
     << samples
 }

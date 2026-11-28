@@ -1,7 +1,59 @@
 @main
 
 assets #"github.com/xulang-org/nexus/assets/audio"
+wav #"github.com/xulang-org/nexus/formats/wav"
+#math
 #os
+#strings
+
+fn write_u16_le(sb $&strings.ByteBuilder, v int) {
+    sb.write_byte(v & 255)
+    sb.write_byte((v >> 8) & 255)
+}
+
+fn write_u32_le(sb $&strings.ByteBuilder, v int) {
+    sb.write_byte(v & 255)
+    sb.write_byte((v >> 8) & 255)
+    sb.write_byte((v >> 16) & 255)
+    sb.write_byte((v >> 24) & 255)
+}
+
+fn make_extensible_wav(sub_tag int, bits int, channels int, rate int, data_bytes &[]u8, bad_guid bool) string {
+    align := channels * (bits / 8)
+    byte_rate := rate * align
+    total_size := 12 + 8 + 40 + 8 + data_bytes.len
+    $sb := strings.new_byte_builder(total_size)
+    sb.write_str("RIFF")
+    write_u32_le($&sb, total_size - 8)
+    sb.write_str("WAVE")
+    sb.write_str("fmt ")
+    write_u32_le($&sb, 40)
+    write_u16_le($&sb, wav.ENCODING_EXTENSIBLE)
+    write_u16_le($&sb, channels)
+    write_u32_le($&sb, rate)
+    write_u32_le($&sb, byte_rate)
+    write_u16_le($&sb, align)
+    write_u16_le($&sb, bits)
+    write_u16_le($&sb, 22) // cbSize
+    write_u16_le($&sb, bits) // wValidBitsPerSample
+    write_u32_le($&sb, 3) // dwChannelMask
+    write_u32_le($&sb, sub_tag) // SubFormat Data1
+    guid_tail := [0, 0, 16, 0, 128, 0, 0, 170, 0, 56, 155, 113]
+    for i in 0:12 {
+        $b := guid_tail[i]
+        if bad_guid && i == 11 { b = 0 }
+        sb.write_byte(b)
+    }
+    sb.write_str("data")
+    write_u32_le($&sb, data_bytes.len)
+    for b in data_bytes { sb.write_byte(int(b)) }
+    << sb.to_string()
+}
+
+fn decode_rejected(raw &string) bool {
+    _ := wav.decode(raw) >>> (err) { << true }
+    << false
+}
 
 fn rejected(name string) bool { assets.load_wav("build/audio-fixtures/" + name) >>> (err) { << true }
     << false }
@@ -58,6 +110,28 @@ fn run() int {
     assert(rejected("empty.wav"))
     assert(rejected("duplicate-fmt.wav"))
     assert(rejected("duplicate-data.wav"))
+
+    // Regression: 40-byte WAVE_FORMAT_EXTENSIBLE (PCM16 + IEEE float with minor overshoot) + invalid GUID rejection.
+    $pcm_ext_data := [u8(0xe8), u8(0x03), u8(0x18), u8(0xfc)] // +1000, -1000 (little-endian i16)
+    ext_pcm_wav := make_extensible_wav(wav.ENCODING_PCM, 16, 1, 24000, &pcm_ext_data, false)
+    ext_pcm := wav.decode(&ext_pcm_wav) >>>
+    assert(ext_pcm.sample_count() == 2 && (ext_pcm.sample(0, 0) >>>) == 1000 && (ext_pcm.sample(1, 0) >>>) == -1000)
+
+    $flt_sb := strings.new_byte_builder(12)
+    write_u32_le($&flt_sb, math.float32_bits(1.02))
+    write_u32_le($&flt_sb, math.float32_bits(-1.02))
+    write_u32_le($&flt_sb, math.float32_bits(0.5))
+    flt_str := flt_sb.to_string()
+    $flt_bytes := []u8{}
+    for i in 0:flt_str.len { flt_bytes.push(u8(flt_str[i] & 255)) }
+    ext_flt_wav := make_extensible_wav(wav.ENCODING_FLOAT, 32, 1, 48000, &flt_bytes, false)
+    ext_flt := wav.decode(&ext_flt_wav) >>>
+    assert(ext_flt.sample_count() == 3 && (ext_flt.sample(0, 0) >>>) == 32767 &&
+        (ext_flt.sample(1, 0) >>>) == -32768 && (ext_flt.sample(2, 0) >>>) == 16384)
+
+    bad_guid_wav := make_extensible_wav(wav.ENCODING_PCM, 16, 1, 24000, &pcm_ext_data, true)
+    assert(decode_rejected(&bad_guid_wav))
+
     println("PASS: PCM8/16/24/32, float WAV, stereo, odd/unknown chunks and order; 16 malformed/unsupported WAV cases")
     << 0
 }

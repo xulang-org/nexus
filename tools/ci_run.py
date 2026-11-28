@@ -11,91 +11,12 @@ import shutil
 import subprocess
 import sys
 
+if __package__:
+    from .manifest import CHECK_TARGETS, HEADLESS_TESTS, RELEASE_TOOLS
+else:
+    from manifest import CHECK_TARGETS, HEADLESS_TESTS, RELEASE_TOOLS
+
 ROOT = Path(__file__).resolve().parents[1]
-
-CHECK_TARGETS = (
-    ("examples/model_formats/main.xu", False, None),
-    ("examples/lod/main.xu", False, None),
-    ("examples/lighting/main.xu", False, None),
-    ("examples/window_input/main.xu", False, None),
-    ("examples/gpu_surface/main.xu", False, None),
-    ("examples/gpu_offscreen/main.xu", False, None),
-    ("examples/gpu_compute/main.xu", False, None),
-    ("examples/arena/main.xu", False, None),
-    ("examples/phone_arena", False, None),
-    ("examples/phone_3d", False, None),
-    ("examples/miniprogram", False, None),
-    ("examples/webgl_3d/main.xu", False, None),
-    ("examples/headless/main.xu", False, None),
-    ("examples/two_d/main.xu", False, None),
-    ("examples/three_d/main.xu", False, None),
-    ("examples/isometric_2d", False, None),
-    ("examples/hd2d_scene", False, None),
-    ("examples/physics_3d/main.xu", False, None),
-    ("examples/character_course/main.xu", False, None),
-    ("examples/glb_preview/main.xu", False, None),
-    ("examples/modern_sandbox/main.xu", False, None),
-    ("cmd/scriptc/main.xu", False, None),
-    ("cmd/project_validate/main.xu", False, None),
-    ("cmd/project_viewport", False, None),
-    ("cmd/project", False, None),
-    ("cmd/project_editor", True, None),
-    ("cmd/tilemap_editor", False, None),
-    ("tests/project_import_checks.xu", False, None),
-    ("tests/project_editor_checks.xu", False, None),
-    ("tests/scene_v10_modeling_checks.xu", False, None),
-    ("tests/modeling_cpu_checks.xu", False, None),
-    ("tests/glb_obj_roundtrip_checks.xu", False, None),
-    ("tests/modeling_gpu_checks.xu", False, None),
-    ("tests/studio_ui_checks.xu", False, None),
-    ("tests/developer_systems_r2_checks.xu", False, None),
-    ("tests/developer_systems_r3_checks.xu", False, None),
-    ("tests/developer_systems_r4_checks.xu", False, None),
-)
-
-HEADLESS_TESTS = (
-    ("tests/core_checks.xu", "core-tests", (), {}),
-    ("tests/xacp_checks.xu", "xacp-tests", (), {}),
-    ("tests/scene_soa_transform_checks.xu", "scene-soa-tests", (), {}),
-    ("tests/scene_v9_modern_checks.xu", "scene-v9-tests", (), {}),
-    ("tests/scene_v10_modeling_checks.xu", "scene-v10-modeling-checks", (), {"SDL_VIDEODRIVER": "nonexistent", "XU_NEXUS_SDL_LIBRARY": "/nonexistent/scene-v10-no-sdl"}),
-    ("tests/scene_prefab_runtime_checks.xu", "prefab-runtime-checks", (), {}),
-    ("tests/ecs_archetype_parallel_checks.xu", "ecs-parallel-checks", (), {}),
-    ("tests/physics3d_checks.xu", "physics3d-checks", (), {}),
-    ("tests/character3d_checks.xu", "character3d-checks", (), {}),
-    ("tests/capsule3d_checks.xu", "capsule3d-checks", (), {}),
-    ("tests/physics2d_platformer_checks.xu", "physics2d-platformer-checks", (), {}),
-    ("tests/navigation_checks.xu", "navigation-checks", (), {}),
-    ("tests/ai_bt_nav_checks.xu", "ai-bt-nav-checks", (), {}),
-    ("tests/animation_timeline_checks.xu", "animation-timeline-checks", (), {}),
-    ("tests/input_replay_timing_checks.xu", "input-replay-timing-checks", (), {}),
-    ("tests/audio_mixer_checks.xu", "audio-mixer-checks", (), {}),
-    ("tests/audio_dsp_adpcm_checks.xu", "audio-dsp-checks", (), {}),
-    ("tests/audio_async_music_checks.xu", "audio-async-music-checks", (), {}),
-    ("tests/spatial_audio_checks.xu", "spatial-audio-checks", (), {}),
-    ("tests/networking_multiplayer_checks.xu", "networking-multiplayer-checks", (), {}),
-    ("tests/bundle_hotreload_checks.xu", "bundle-checks", (), {}),
-    ("tests/persistent_entities_checks.xu", "persistent-entities-checks", (), {}),
-    ("tests/modeling_cpu_checks.xu", "modeling-cpu-checks", (), {"SDL_VIDEODRIVER": "nonexistent", "XU_NEXUS_SDL_LIBRARY": "/nonexistent/modeling-no-sdl"}),
-    ("tests/gameplay_components_checks.xu", "gameplay-components-checks", (), {}),
-    ("tests/gameplay_integration_checks.xu", "gameplay-integration-checks", (), {}),
-    ("tests/i18n_checks.xu", "i18n-checks", (), {}),
-    ("tests/steam_data_checks.xu", "steam-data-checks", (), {}),
-    ("tests/console_data_checks.xu", "console-data-checks", (), {}),
-    ("tests/taptap_data_checks.xu", "taptap-data-checks", (), {}),
-    ("tests/developer_systems_r2_checks.xu", "developer-systems-r2-checks", (), {}),
-    ("tests/developer_systems_r3_checks.xu", "developer-systems-r3-checks", (), {}),
-    ("tests/developer_systems_r4_checks.xu", "developer-systems-r4-checks", (), {}),
-)
-
-RELEASE_TOOLS = (
-    ("cmd/project", "nexus-project", (), False),
-    ("cmd/project_validate/main.xu", "nexus-project-validate", (), False),
-    ("cmd/project_viewport", "nexus-project-viewport", (), False),
-    ("cmd/scriptc/main.xu", "xu-nexus-script", (), False),
-    ("cmd/project_editor", "nexus-project-editor", ("--desktop", "--no-webview"), True),
-    ("cmd/tilemap_editor", "nexus-tilemap-editor", ("--desktop",), False),
-)
 
 
 def exe_name(stem: str) -> str:
@@ -202,9 +123,14 @@ def run_test(xu_bin: str, env: dict[str, str]) -> None:
     build_dir = ROOT / "build"
     build_dir.mkdir(parents=True, exist_ok=True)
     run_step([sys.executable, "tests/make_glb_fixtures.py"], env, "Generate GLB fixtures")
+    run_step([sys.executable, "tests/make_glb_material_fixtures.py"], env, "Generate GLB material fixtures")
     run_step([sys.executable, "tests/make_audio_fixtures.py"], env, "Generate audio fixtures")
+    run_step([sys.executable, "tests/make_scene_fixtures.py"], env, "Generate scene fixtures")
+    run_step([sys.executable, "tests/make_scene_asset_fixtures.py"], env, "Generate scene asset fixtures")
+    run_step([sys.executable, "tests/make_scene_audio_fixtures.py"], env, "Generate scene audio fixtures")
     scriptc_bin = build_dir / exe_name("xu-nexus-script")
     run_step([xu_bin, "build", "cmd/scriptc/main.xu", "-o", str(scriptc_bin)], env, "build scriptc for fixture")
+    run_step([sys.executable, "tests/make_script_fixtures.py"], env, "Generate script fixtures")
     run_step(
         [
             sys.executable,
@@ -219,6 +145,7 @@ def run_test(xu_bin: str, env: dict[str, str]) -> None:
         env,
         "Generate scene-script fixture",
     )
+    run_step([sys.executable, "tests/make_scene_script_fixtures.py"], env, "Generate scene script fixtures")
     for py_iso in ("tests/layer_headless_checks.py", "tests/canvas_isolation.py", "tests/scene_process_checks.py"):
         run_step([sys.executable, py_iso], env, py_iso)
 

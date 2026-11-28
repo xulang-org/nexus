@@ -98,20 +98,22 @@ struct EmbedBounds {
     radius f64
 }
 
-fn push_u32_le(sb $&strings.ByteBuilder, v int) {
-    sb.write_byte(v & 255)
-    sb.write_byte((v >> 8) & 255)
-    sb.write_byte((v >> 16) & 255)
-    sb.write_byte((v >> 24) & 255)
-}
-
 fn embed_write_all(conn &net.Conn, payload &string) int {
-    $pos := 0
     total := payload.len
+    if total == 0 { << 0 }
+    $pos := 0
     while pos < total {
-        $end := pos + 65536
+        if pos == 0 && total <= 262144 {
+            wrote := conn.write(payload) >>>
+            if wrote <= 0 {
+                >> errors.new("embed server: socket write stalled")
+            }
+            pos = pos + wrote
+            ->
+        }
+        $end := pos + 262144
         if end > total { end = total }
-        chunk := payload[pos:end] + ""
+        chunk := (*payload)[pos:end]
         wrote := conn.write(&chunk) >>>
         if wrote <= 0 {
             >> errors.new("embed server: socket write stalled")
@@ -122,27 +124,77 @@ fn embed_write_all(conn &net.Conn, payload &string) int {
 }
 
 fn send_embed_packet(conn &net.Conn, kind int, seq int, payload &string) int {
-    $hdr := strings.new_byte_builder(16)
-    hdr.write_str("NXF1")
-    push_u32_le($&hdr, kind)
-    push_u32_le($&hdr, seq)
-    push_u32_le($&hdr, payload.len)
-    embed_write_all(conn, &hdr.to_string()) >>>
-    if payload.len > 0 {
+    plen := payload.len
+    $hdr := make_string(16)
+    hdr[0] = 78
+    hdr[1] = 88
+    hdr[2] = 70
+    hdr[3] = 49
+    hdr[4] = kind & 255
+    hdr[5] = (kind >> 8) & 255
+    hdr[6] = (kind >> 16) & 255
+    hdr[7] = (kind >> 24) & 255
+    hdr[8] = seq & 255
+    hdr[9] = (seq >> 8) & 255
+    hdr[10] = (seq >> 16) & 255
+    hdr[11] = (seq >> 24) & 255
+    hdr[12] = plen & 255
+    hdr[13] = (plen >> 8) & 255
+    hdr[14] = (plen >> 16) & 255
+    hdr[15] = (plen >> 24) & 255
+    embed_write_all(conn, &hdr) >>>
+    if plen > 0 {
         embed_write_all(conn, payload) >>>
     }
     << 0
 }
 
 fn send_embed_rgba(conn &net.Conn, seq int, w int, h int, pixels &[]u8) int {
-    $sb := strings.new_byte_builder(8 + pixels.len)
-    push_u32_le($&sb, w)
-    push_u32_le($&sb, h)
-    for b in pixels {
-        sb.write_byte(int(b))
+    total := pixels.len
+    plen := 8 + total
+    $first_px := 262144
+    if first_px > total { first_px = total }
+    $first := make_string(24 + first_px)
+    first[0] = 78
+    first[1] = 88
+    first[2] = 70
+    first[3] = 49
+    first[4] = EMBED_FRAME_RGBA & 255
+    first[5] = (EMBED_FRAME_RGBA >> 8) & 255
+    first[6] = (EMBED_FRAME_RGBA >> 16) & 255
+    first[7] = (EMBED_FRAME_RGBA >> 24) & 255
+    first[8] = seq & 255
+    first[9] = (seq >> 8) & 255
+    first[10] = (seq >> 16) & 255
+    first[11] = (seq >> 24) & 255
+    first[12] = plen & 255
+    first[13] = (plen >> 8) & 255
+    first[14] = (plen >> 16) & 255
+    first[15] = (plen >> 24) & 255
+    first[16] = w & 255
+    first[17] = (w >> 8) & 255
+    first[18] = (w >> 16) & 255
+    first[19] = (w >> 24) & 255
+    first[20] = h & 255
+    first[21] = (h >> 8) & 255
+    first[22] = (h >> 16) & 255
+    first[23] = (h >> 24) & 255
+    for i in 0:first_px {
+        first[24 + i] = int(pixels[i])
     }
-    payload := sb.to_string()
-    << send_embed_packet(conn, EMBED_FRAME_RGBA, seq, &payload) >>>
+    embed_write_all(conn, &first) >>>
+    $pos := first_px
+    while pos < total {
+        $n := 262144
+        if pos + n > total { n = total - pos }
+        $buf := make_string(n)
+        for i in 0:n {
+            buf[i] = int(pixels[pos + i])
+        }
+        embed_write_all(conn, &buf) >>>
+        pos = pos + n
+    }
+    << 0
 }
 
 fn add_grid_quad(mesh $&meshes.MeshData3D, a fm.Vec3, b fm.Vec3, off fm.Vec3, normal fm.Vec3, col int) int {
@@ -250,26 +302,49 @@ fn build_embed_particle_emitter(
     << em
 }
 
+fn close_embed_particle_quiet(ps $&ren.GpuParticleSystem3D) {
+    _ := ps.close() >>> (err) {
+        _ := err
+        <<
+    }
+}
+
+fn close_embed_scene_mods_quiet(sm $&imod.SceneModeling3D) {
+    _ := sm.close() >>> (err) {
+        _ := err
+        <<
+    }
+}
+
+fn close_embed_models_quiet(md $&models3d.SceneModels3D) {
+    _ := md.close() >>> (err) {
+        _ := err
+        <<
+    }
+}
+
+fn close_embed_world_quiet(w $&world3d.Scene3D, tree &scene.SceneTree) {
+    _ := w.prune(tree) >>> (err) {
+        _ := err
+        <<
+    }
+}
+
 fn close_embed_particles(host $&EmbedSceneHost) {
     for i in 0:host.particles.len {
-        ps := $&host.particles[i]
-        _ := ps.close() >>> (err) {
-            _ := err
-            <<
-        }
+        close_embed_particle_quiet($&host.particles[i])
     }
     host.particles = []ren.GpuParticleSystem3D{}
 }
 
 fn close_embed_scene(host $&EmbedSceneHost) {
     close_embed_particles(host)
-    sm := $&host.scene_mods
+    close_embed_scene_mods_quiet($&host.scene_mods)
+    close_embed_models_quiet($&host.models)
+}
+
+fn close_embed_shadow_map_quiet(sm $&ren.ShadowMap3D) {
     _ := sm.close() >>> (err) {
-        _ := err
-        <<
-    }
-    md := $&host.models
-    _ := md.close() >>> (err) {
         _ := err
         <<
     }
@@ -277,33 +352,35 @@ fn close_embed_scene(host $&EmbedSceneHost) {
 
 fn close_embed_gpu_shadow_maps(fx $&EmbedGpuFx) {
     for i in 0:fx.shadow_maps.len {
-        sm := $&fx.shadow_maps[i]
-        _ := sm.close() >>> (err) {
-            _ := err
-            <<
-        }
+        close_embed_shadow_map_quiet($&fx.shadow_maps[i])
     }
     fx.shadow_maps = []ren.ShadowMap3D{}
 }
 
+fn close_embed_pipeline_quiet(mp $&world3d.ModernPipeline3D) {
+    _ := mp.close() >>> (err) {
+        _ := err
+        <<
+    }
+}
+
 fn close_embed_gpu_pipelines(pipes $&EmbedPipelines) {
     for i in 0:pipes.items.len {
-        mp := $&pipes.items[i]
-        _ := mp.close() >>> (err) {
-            _ := err
-            <<
-        }
+        close_embed_pipeline_quiet($&pipes.items[i])
     }
     pipes.items = []world3d.ModernPipeline3D{}
 }
 
+fn close_embed_atm_quiet(ar $&ren.AtmosphereRenderer3D) {
+    _ := ar.close() >>> (err) {
+        _ := err
+        <<
+    }
+}
+
 fn close_embed_gpu_atm(fx $&EmbedGpuFx) {
     for i in 0:fx.atm_list.len {
-        ar := $&fx.atm_list[i]
-        _ := ar.close() >>> (err) {
-            _ := err
-            <<
-        }
+        close_embed_atm_quiet($&fx.atm_list[i])
     }
     fx.atm_list = []ren.AtmosphereRenderer3D{}
 }
@@ -368,89 +445,113 @@ fn apply_world_material_overrides(
     }
 }
 
-fn push_loaded_embed_scene(
+fn clone_embed_document(doc &resource.Document) resource.Document {
+    $refs := []resource.ResourceReference{}
+    for i in 0:doc.resource_count() {
+        refs.push(doc.resource(i) >>>)
+    }
+    << resource.with_references(doc, doc, refs) >>>
+}
+
+fn cleanup_partial_particles(particles $&[]ren.GpuParticleSystem3D) {
+    for ppi in 0:particles.len {
+        close_embed_particle_quiet($&particles[ppi])
+    }
+}
+
+fn load_embed_scene(
     device &ren.Device3D,
     scene_path string,
     has_gpu bool,
     vprog &ren.ParticleProgram3D,
-    worlds $&[]world3d.Scene3D,
-    hosts $&[]EmbedSceneHost
-) int {
+    world $&world3d.Scene3D
+) EmbedSceneHost {
     directory := filepath.dir(&scene_path)
-    document := files.load(scene_path + "") >>>
     doc_meta := files.load(scene_path + "") >>>
     name := (doc_meta.describe_node(0) >>>).name
-    $models := models3d.prepare_surfaces(device, document, directory + "") >>>
+    doc_copy := clone_embed_document(&doc_meta) >>>
+    $models := models3d.prepare_surfaces(device, doc_copy, directory + "") >>>
     $tree := scene.new_scene_tree_3d("EmbedEditor", 4097) >>> (err) {
-        _ := models.close()
+        close_embed_models_quiet($&models)
         >> err
     }
     parent := tree.root()
-    $world := world3d.new_scene_3d(device) >>> (err) {
-        _ := models.close()
-        >> err
-    }
-    root := models.instantiate($&world, $&tree, parent, name + "") >>> (err) {
-        _ := models.close()
+    root := models.instantiate(world, $&tree, parent, name + "") >>> (err) {
+        close_embed_world_quiet(world, &tree)
+        close_embed_models_quiet($&models)
         >> err
     }
     picker := models.picker(&tree, root) >>> (err) {
-        _ := models.close()
+        close_embed_world_quiet(world, &tree)
+        close_embed_models_quiet($&models)
         >> err
     }
     $scene_mods := imod.prepare_scene_modeling_in_dir(device, &doc_meta, directory + "") >>> (err) {
-        _ := models.close()
+        close_embed_world_quiet(world, &tree)
+        close_embed_models_quiet($&models)
         >> err
     }
     $slights := scene_lights.new_scene_lights_3d()
     has_lights := doc_meta.light_count() > 0
     if has_lights {
         scene_lighting.bind(&doc_meta, $&slights, &tree, root) >>> (err) {
-            _ := scene_mods.close()
-            _ := models.close()
+            close_embed_scene_mods_quiet($&scene_mods)
+            close_embed_world_quiet(world, &tree)
+            close_embed_models_quiet($&models)
             >> err
         }
     }
     tree_ids := tree.subtree(root) >>> (err) {
-        _ := scene_mods.close()
-        _ := models.close()
+        close_embed_scene_mods_quiet($&scene_mods)
+        close_embed_world_quiet(world, &tree)
+        close_embed_models_quiet($&models)
         >> err
     }
-    apply_world_material_overrides(&doc_meta, &scene_mods, $&world, &tree, &tree_ids)
+    apply_world_material_overrides(&doc_meta, &scene_mods, world, &tree, &tree_ids)
 
     $particles := []ren.GpuParticleSystem3D{}
     $particle_nodes := []int{}
     if has_gpu && doc_meta.particle_emitter_3d_count() > 0 {
         for pi in 0:doc_meta.particle_emitter_3d_count() {
             att := doc_meta.particle_emitter_3d(pi) >>> (err) {
-                for ppi in 0:particles.len { _ := ($&particles[ppi]).close() }
-                _ := scene_mods.close()
-                _ := models.close()
+                cleanup_partial_particles($&particles)
+                close_embed_scene_mods_quiet($&scene_mods)
+                close_embed_world_quiet(world, &tree)
+                close_embed_models_quiet($&models)
                 >> err
             }
             $origin := fm.vec3(0.0, 0.0, 0.0)
             if att.node >= 0 && att.node < tree_ids.len {
-                origin = (tree.global_transform_3d(tree_ids[att.node]) >>>).c3.xyz()
+                origin = (tree.global_transform_3d(tree_ids[att.node]) >>> (err) {
+                    cleanup_partial_particles($&particles)
+                    close_embed_scene_mods_quiet($&scene_mods)
+                    close_embed_world_quiet(world, &tree)
+                    close_embed_models_quiet($&models)
+                    >> err
+                }).c3.xyz()
             }
             $ps := device.gpu_particle_system(vprog, att.max_particles, 2001 + pi * 37) >>> (err) {
-                for ppi in 0:particles.len { _ := ($&particles[ppi]).close() }
-                _ := scene_mods.close()
-                _ := models.close()
+                cleanup_partial_particles($&particles)
+                close_embed_scene_mods_quiet($&scene_mods)
+                close_embed_world_quiet(world, &tree)
+                close_embed_models_quiet($&models)
                 >> err
             }
             ps.set_emitter(&build_embed_particle_emitter(&att, origin)) >>> (err) {
-                _ := ps.close()
-                for ppi in 0:particles.len { _ := ($&particles[ppi]).close() }
-                _ := scene_mods.close()
-                _ := models.close()
+                close_embed_particle_quiet($&ps)
+                cleanup_partial_particles($&particles)
+                close_embed_scene_mods_quiet($&scene_mods)
+                close_embed_world_quiet(world, &tree)
+                close_embed_models_quiet($&models)
                 >> err
             }
             for _ in 0:24 {
                 ps.step(device, 1.0 / 60.0) >>> (err) {
-                    _ := ps.close()
-                    for ppi in 0:particles.len { _ := ($&particles[ppi]).close() }
-                    _ := scene_mods.close()
-                    _ := models.close()
+                    close_embed_particle_quiet($&ps)
+                    cleanup_partial_particles($&particles)
+                    close_embed_scene_mods_quiet($&scene_mods)
+                    close_embed_world_quiet(world, &tree)
+                    close_embed_models_quiet($&models)
                     >> err
                 }
             }
@@ -459,12 +560,7 @@ fn push_loaded_embed_scene(
         }
     }
 
-    if hosts.len > 0 {
-        last_i := hosts.len - 1
-        close_embed_scene($&hosts[last_i])
-    }
-    worlds.push(world)
-    hosts.push(EmbedSceneHost{
+    << EmbedSceneHost{
         directory: directory + "",
         doc: doc_meta,
         tree: tree,
@@ -477,8 +573,7 @@ fn push_loaded_embed_scene(
         has_lights: has_lights,
         particles: particles,
         particle_nodes: particle_nodes
-    })
-    << 0
+    }
 }
 
 fn close_embed_mesh_quiet(m $&ren.Mesh3D) {
@@ -512,7 +607,7 @@ fn try_reload_embed_hosts(
     worlds $&[]world3d.Scene3D,
     hosts $&[]EmbedSceneHost
 ) {
-    push_loaded_embed_scene(device, sp, has_gpu, vprog, worlds, hosts) >>> (err) {
+    $next_world := world3d.new_scene_3d(device) >>> (err) {
         emsg := "{\"error\":" + json.quote(&err.msg()) + "}"
         _ := send_embed_packet(conn, EMBED_ERROR, seq, &emsg) >>> (serr) {
             _ := serr
@@ -520,6 +615,17 @@ fn try_reload_embed_hosts(
         }
         <<
     }
+    next_host := load_embed_scene(device, sp, has_gpu, vprog, $&next_world) >>> (err) {
+        emsg := "{\"error\":" + json.quote(&err.msg()) + "}"
+        _ := send_embed_packet(conn, EMBED_ERROR, seq, &emsg) >>> (serr) {
+            _ := serr
+            <<
+        }
+        <<
+    }
+    close_active_embed_slot(worlds, hosts)
+    worlds[0] = next_world
+    hosts[0] = next_host
 }
 
 fn safe_pick_3d(
@@ -982,8 +1088,7 @@ fn parse_embed_mat4(doc &json.Doc, root int) fm.Mat4 {
 
 fn try_set_embed_transform(hosts $&[]EmbedSceneHost, node_idx int, mat fm.Mat4) {
     if hosts.len == 0 || node_idx <= 0 { << }
-    cur := hosts.len - 1
-    host := $&hosts[cur]
+    host := $&hosts[0]
     if node_idx >= host.tree_ids.len { << }
     tid := host.tree_ids[node_idx]
     if tid <= 0 { << }
@@ -1013,6 +1118,29 @@ fn split_viewport_rects(w int, h int, split bool) []EmbedViewportRect {
     ]
 }
 
+fn try_embed_device_backend(device &ren.Device3D) int {
+    << device.backend() >>> (err) {
+        _ := err
+        << 0
+    }
+}
+
+fn try_embed_set_nodelay(conn &net.Conn) {
+    _ := conn.set_nodelay(true) >>> (err) {
+        _ := err
+        <<
+    }
+}
+
+fn close_active_embed_slot(worlds $&[]world3d.Scene3D, hosts $&[]EmbedSceneHost) {
+    if hosts.len > 0 {
+        close_embed_scene($&hosts[0])
+        if worlds.len > 0 {
+            close_embed_world_quiet($&worlds[0], &hosts[0].tree)
+        }
+    }
+}
+
 fn run_embed_server(config &Options) int {
     mesh_program := mesh_shaders.load_mesh("build/mesh-shaders") >>>
     $device := ren.open_3d_offscreen_adaptive(640, 480, gpu.AUTO, &mesh_program) >>>
@@ -1033,12 +1161,7 @@ fn run_embed_server(config &Options) int {
     }
     $gpu_pipes := EmbedPipelines{items: []world3d.ModernPipeline3D{}}
     if device.is_gpu() {
-        $bcode := 0
-        bres := device.backend() >>> (err) {
-            _ := err
-            << 0
-        }
-        bcode = bres
+        bcode := try_embed_device_backend(&device)
         backend = gpu_info.backend_name(bcode)
         gpu_fx.has_gpu = true
         gpu_fx.cprog = mesh_shaders.load_clustered_program("build/mesh-shaders") >>>
@@ -1053,29 +1176,50 @@ fn run_embed_server(config &Options) int {
     $grid_xz := build_plane_grid_mesh(&device, EMBED_ORTHO_TOP) >>>
     $grid_xy := build_plane_grid_mesh(&device, EMBED_ORTHO_FRONT) >>>
     $grid_yz := build_plane_grid_mesh(&device, EMBED_ORTHO_RIGHT) >>>
-    $worlds := []world3d.Scene3D{}
-    $hosts := []EmbedSceneHost{}
-    push_loaded_embed_scene(&device, config.path + "", gpu_fx.has_gpu, &gpu_fx.vprog, $&worlds, $&hosts) >>>
-
-    $conn := net.dial_to("tcp", config.embed_connect + "") >>> (err) {
-        if hosts.len > 0 {
-            last_c := hosts.len - 1
-            close_embed_scene($&hosts[last_c])
-        }
+    $init_world := world3d.new_scene_3d(&device) >>> (err) {
         close_embed_gpu_pipelines($&gpu_pipes)
-    close_embed_gpu_fx($&gpu_fx)
+        close_embed_gpu_fx($&gpu_fx)
         close_embed_mesh_quiet($&grid_xz)
         close_embed_mesh_quiet($&grid_xy)
         close_embed_mesh_quiet($&grid_yz)
         close_embed_device_quiet($&device)
         >> err
     }
-    _ := conn.set_nodelay(true) >>> (err) {
-        _ := err
-        << 0
+    init_host := load_embed_scene(&device, config.path + "", gpu_fx.has_gpu, &gpu_fx.vprog, $&init_world) >>> (err) {
+        close_embed_gpu_pipelines($&gpu_pipes)
+        close_embed_gpu_fx($&gpu_fx)
+        close_embed_mesh_quiet($&grid_xz)
+        close_embed_mesh_quiet($&grid_xy)
+        close_embed_mesh_quiet($&grid_yz)
+        close_embed_device_quiet($&device)
+        >> err
     }
+    $worlds := [init_world]
+    $hosts := [init_host]
+
+    $conn := net.dial_to("tcp", config.embed_connect + "") >>> (err) {
+        close_active_embed_slot($&worlds, $&hosts)
+        close_embed_gpu_pipelines($&gpu_pipes)
+        close_embed_gpu_fx($&gpu_fx)
+        close_embed_mesh_quiet($&grid_xz)
+        close_embed_mesh_quiet($&grid_xy)
+        close_embed_mesh_quiet($&grid_yz)
+        close_embed_device_quiet($&device)
+        >> err
+    }
+    try_embed_set_nodelay(&conn)
     ready_json := "{\"backend\":" + json.quote(&backend) + "}"
-    send_embed_packet(&conn, EMBED_READY, 0, &ready_json) >>>
+    send_embed_packet(&conn, EMBED_READY, 0, &ready_json) >>> (err) {
+        close_embed_conn_quiet($&conn)
+        close_active_embed_slot($&worlds, $&hosts)
+        close_embed_gpu_pipelines($&gpu_pipes)
+        close_embed_gpu_fx($&gpu_fx)
+        close_embed_mesh_quiet($&grid_xz)
+        close_embed_mesh_quiet($&grid_xy)
+        close_embed_mesh_quiet($&grid_yz)
+        close_embed_device_quiet($&device)
+        >> err
+    }
 
     $rem := ""
     $running := true
@@ -1121,9 +1265,8 @@ fn run_embed_server(config &Options) int {
             mat := parse_embed_mat4(&doc, root)
             try_set_embed_transform($&hosts, node_idx, mat)
         } else if cmd == "render" {
-            cur := hosts.len - 1
-            w3 := $&worlds[cur]
-            host := $&hosts[cur]
+            w3 := $&worlds[0]
+            host := $&hosts[0]
             w := clamp_embed_dim(json_int_or(&doc, root, "w", 640), 64, 1920)
             h := clamp_embed_dim(json_int_or(&doc, root, "h", 480), 64, 1200)
             split := json_bool_or(&doc, root, "split", false)
@@ -1164,9 +1307,8 @@ fn run_embed_server(config &Options) int {
                 <-
             }
         } else if cmd == "pick" {
-            cur := hosts.len - 1
-            w3 := $&worlds[cur]
-            host := &hosts[cur]
+            w3 := $&worlds[0]
+            host := &hosts[0]
             w := clamp_embed_dim(json_int_or(&doc, root, "w", 640), 64, 1920)
             h := clamp_embed_dim(json_int_or(&doc, root, "h", 480), 64, 1200)
             px := json_f64_or(&doc, root, "x", f64(w) * 0.5)
@@ -1232,10 +1374,7 @@ fn run_embed_server(config &Options) int {
     }
 
     close_embed_conn_quiet($&conn)
-    if hosts.len > 0 {
-        last_i := hosts.len - 1
-        close_embed_scene($&hosts[last_i])
-    }
+    close_active_embed_slot($&worlds, $&hosts)
     close_embed_gpu_pipelines($&gpu_pipes)
     close_embed_gpu_fx($&gpu_fx)
     close_embed_mesh_quiet($&grid_xz)

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import gzip
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -15,23 +18,13 @@ import tarfile
 import tempfile
 import zipfile
 
+if __package__:
+    from .manifest import DESKTOP_TARGETS, NATIVE_LIBS, RELEASE_TOOLS
+else:
+    from manifest import DESKTOP_TARGETS, NATIVE_LIBS, RELEASE_TOOLS
+
 ROOT = Path(__file__).resolve().parents[1]
-DESKTOP_TARGETS = ("macos-arm64", "macos-x64", "linux-x64", "linux-arm64", "windows-x64")
-NATIVE_LIBS = (
-    ("audio.json", "nexus_audio"),
-    ("image.json", "nexus_image"),
-    ("steam.json", "nexus_steam"),
-    ("console.json", "nexus_console"),
-    ("taptap.json", "nexus_taptap"),
-)
-RELEASE_TOOLS = (
-    "nexus-project",
-    "nexus-project-validate",
-    "nexus-project-viewport",
-    "xu-nexus-script",
-    "nexus-project-editor",
-    "nexus-tilemap-editor",
-)
+DEFAULT_SOURCE_DATE_EPOCH = 1767225600
 
 
 def read_nexus_version() -> str:
@@ -83,29 +76,47 @@ def extract_single_slice(xulib_path: Path, target: str) -> bytes:
     raise SystemExit(f"Target slice {target} not found in {xulib_path}")
 
 
+def resolve_source_date_epoch() -> int:
+    raw = os.environ.get("SOURCE_DATE_EPOCH")
+    if raw is None or not raw.strip():
+        return DEFAULT_SOURCE_DATE_EPOCH
+    return int(raw)
+
+
 def write_dir_archive(src_dir: Path, archive_prefix: str, dest_archive: Path, is_zip: bool) -> None:
     files = sorted(p for p in src_dir.rglob("*") if p.is_file())
     dest_archive.parent.mkdir(parents=True, exist_ok=True)
+    epoch = resolve_source_date_epoch()
     if is_zip:
+        dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+        zip_dt = (max(dt.year, 1980), dt.month, dt.day, dt.hour, dt.minute, dt.second)
         with zipfile.ZipFile(dest_archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for p in files:
                 rel = p.relative_to(src_dir).as_posix()
-                zf.write(p, arcname=f"{archive_prefix}/{rel}")
+                zi = zipfile.ZipInfo(filename=f"{archive_prefix}/{rel}", date_time=zip_dt)
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                mode = 0o755 if PurePosixPath(rel).parts[0] == "bin" else 0o644
+                zi.create_system = 3
+                zi.external_attr = (0o100000 | mode) << 16
+                zf.writestr(zi, p.read_bytes())
     else:
-        with tarfile.open(dest_archive, "w:gz") as tf:
-            for p in files:
-                rel = p.relative_to(src_dir).as_posix()
-                info = tf.gettarinfo(str(p), arcname=f"{archive_prefix}/{rel}")
-                info.uid = 0
-                info.gid = 0
-                info.uname = "root"
-                info.gname = "root"
-                if PurePosixPath(rel).parts[0] == "bin":
-                    info.mode = 0o755
-                else:
-                    info.mode = 0o644
-                with p.open("rb") as fh:
-                    tf.addfile(info, fh)
+        with dest_archive.open("wb") as raw_out:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw_out, mtime=epoch) as gz:
+                with tarfile.open(fileobj=gz, mode="w") as tf:
+                    for p in files:
+                        rel = p.relative_to(src_dir).as_posix()
+                        info = tf.gettarinfo(str(p), arcname=f"{archive_prefix}/{rel}")
+                        info.uid = 0
+                        info.gid = 0
+                        info.uname = "root"
+                        info.gname = "root"
+                        info.mtime = epoch
+                        if PurePosixPath(rel).parts[0] == "bin":
+                            info.mode = 0o755
+                        else:
+                            info.mode = 0o644
+                        with p.open("rb") as fh:
+                            tf.addfile(info, fh)
 
 
 def stage_target(args: argparse.Namespace) -> int:
@@ -124,7 +135,7 @@ def stage_target(args: argparse.Namespace) -> int:
         (stage_root / "shaders" / "mesh").mkdir(parents=True)
 
         suffix = ".exe" if target.startswith("windows-") else ""
-        for tool in RELEASE_TOOLS:
+        for _, tool, _, _ in RELEASE_TOOLS:
             src_bin = tools_dir / f"{tool}{suffix}"
             if not src_bin.is_file():
                 raise SystemExit(f"Missing built tool binary: {src_bin}")

@@ -36,4 +36,4 @@
 同步迁移全部示例、工具和验收代码，不为开发中间版本保留兼容门面。通用数学与基础能力独立于引擎服务，
 场景不依赖输入、时钟、物理、音频或渲染；跨系统行为通过 integration 包组合。
 
-桌面与 Phone 的 2D/3D 渲染复用 Xu 标准 gpu/window。微信小程序和抖音小游戏的 WebGL 宿主分别消费 `resources/canvas` 的 2D 批次与 `integration/rendering/webgl` 的 3D 网格帧。平台 JavaScript 负责纹理上传、渲染提交和宿主事件。CPU 画布录制禁止导入 GPU 服务。Nexus 仅保留音频设备和 CPU PNG codec 两个原生模块，禁止重新引入 GPU 原生桥接或重复的窗口事件协议。
+桌面与 Phone 的 2D/3D 渲染复用 Xu 标准 gpu/window。微信小程序和抖音小游戏的 WebGL 宿主分别消费 `resources/canvas` 的 2D 批次与 `integration/rendering/webgl` 的 3D 网格帧。平台 JavaScript 负责纹理上传、渲染提交和宿主事件。CPU 画布录制禁止导入 GPU 服务。Nexus 仅保留音频设备（`nexus_audio`）、CPU PNG codec（`nexus_image`）以及平台 SDK 桥接（`nexus_steam`、`nexus_console`、`nexus_taptap`）五个原生模块，禁止重新引入 GPU 原生桥接或重复的窗口事件协议。

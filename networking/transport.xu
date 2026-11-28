@@ -9,6 +9,10 @@
 pub const NET_MAGIC = 20056 // 0x4E58 ("NX")
 pub const MAX_PACKET_BYTES = 1400
 pub const HEADER_BYTES = 14
+pub const MAX_ORDERED_WINDOW = 256
+pub const MAX_PENDING_RELIABLE = 256
+pub const MAX_RELIABLE_ATTEMPTS = 16
+const UNORD_DUP_WINDOW = 64
 
 pub const CHANNEL_UNRELIABLE = 0
 pub const CHANNEL_RELIABLE_ORDERED = 1
@@ -140,6 +144,7 @@ struct PendingReliable {
 }
 
 struct BufferedOrdered {
+    occupied bool
     reliable_seq int
     kind int
     sequence int
@@ -153,6 +158,10 @@ pub struct ReliableChannel {
     remote_seq int
     remote_ack_bits int
     next_recv_reliable_seq int
+    has_unord_rseq bool
+    unord_latest_rseq int
+    unord_bits_lo int
+    unord_bits_hi int
     pending []PendingReliable
     ordered_buf []BufferedOrdered
     srtt_ms f64
@@ -166,6 +175,16 @@ pub struct ReliableChannel {
 }
 
 pub fn new_reliable_channel() ReliableChannel {
+    $ordered := []BufferedOrdered{}
+    for _ in 0:MAX_ORDERED_WINDOW {
+        ordered.push(BufferedOrdered{
+            occupied: false,
+            reliable_seq: 0,
+            kind: 0,
+            sequence: 0,
+            payload: []u8{}
+        })
+    }
     << ReliableChannel{
         next_send_seq: 1,
         next_send_reliable_seq: 0,
@@ -173,8 +192,12 @@ pub fn new_reliable_channel() ReliableChannel {
         remote_seq: 0,
         remote_ack_bits: 0,
         next_recv_reliable_seq: 0,
+        has_unord_rseq: false,
+        unord_latest_rseq: 0,
+        unord_bits_lo: 0,
+        unord_bits_hi: 0,
         pending: []PendingReliable{},
-        ordered_buf: []BufferedOrdered{},
+        ordered_buf: ordered,
         srtt_ms: 80.0,
         rtt_var_ms: 20.0,
         has_rtt: false,
@@ -201,6 +224,10 @@ fn (ch $&ReliableChannel) initial_rto_ms() f64 {
 }
 
 pub fn (ch $&ReliableChannel) send(channel int, kind int, payload &[]u8, now_ms f64) []u8 {
+    if (channel == CHANNEL_RELIABLE_ORDERED || channel == CHANNEL_RELIABLE_UNORDERED) &&
+        ch.pending.len >= MAX_PENDING_RELIABLE {
+        >> errors.new("nexus net: reliable pending queue full")
+    }
     seq := ch.next_send_seq
     ch.next_send_seq = (ch.next_send_seq + 1) % 65536
     $rseq := 0
@@ -325,62 +352,88 @@ fn (ch $&ReliableChannel) record_remote_seq(seq int) bool {
     << true
 }
 
+fn (ch $&ReliableChannel) record_unord_rseq(rseq int) bool {
+    if !ch.has_unord_rseq {
+        ch.has_unord_rseq = true
+        ch.unord_latest_rseq = rseq
+        ch.unord_bits_lo = 0
+        ch.unord_bits_hi = 0
+        << true
+    }
+    diff := seq_diff(rseq, ch.unord_latest_rseq)
+    if diff == 0 { << false }
+    if diff > 0 {
+        if diff >= UNORD_DUP_WINDOW {
+            ch.unord_bits_lo = 0
+            ch.unord_bits_hi = 0
+        } else if diff == 32 {
+            ch.unord_bits_hi = ch.unord_bits_lo & 0xffffffff
+            ch.unord_bits_lo = 1 << 31
+        } else if diff > 32 {
+            ch.unord_bits_hi = ((ch.unord_bits_lo << (diff - 32)) | (1 << (diff - 33))) & 0xffffffff
+            ch.unord_bits_lo = 0
+        } else {
+            ch.unord_bits_hi = ((ch.unord_bits_hi << diff) | (ch.unord_bits_lo >> (32 - diff))) & 0xffffffff
+            ch.unord_bits_lo = ((ch.unord_bits_lo << diff) | (1 << (diff - 1))) & 0xffffffff
+        }
+        ch.unord_latest_rseq = rseq
+        << true
+    }
+    age := -diff
+    if age > UNORD_DUP_WINDOW { << false }
+    if age <= 32 {
+        bit := age - 1
+        if ((ch.unord_bits_lo >> bit) & 1) != 0 { << false }
+        ch.unord_bits_lo = ch.unord_bits_lo | (1 << bit)
+        << true
+    }
+    bit := age - 33
+    if ((ch.unord_bits_hi >> bit) & 1) != 0 { << false }
+    ch.unord_bits_hi = ch.unord_bits_hi | (1 << bit)
+    << true
+}
+
 fn (ch $&ReliableChannel) push_ordered_message(rseq int, kind int, seq int, payload &[]u8) {
-    // Drop if already delivered or already buffered.
-    if seq_diff(rseq, ch.next_recv_reliable_seq) < 0 {
+    // Drop if already delivered, out of receive window, or already buffered.
+    diff := seq_diff(rseq, ch.next_recv_reliable_seq)
+    if diff < 0 {
         ch.duplicates_dropped += 1
         <<
     }
-    for i in 0:ch.ordered_buf.len {
-        if ch.ordered_buf[i].reliable_seq == rseq {
-            ch.duplicates_dropped += 1
-            <<
-        }
+    if diff >= MAX_ORDERED_WINDOW {
+        <<
     }
-    ch.ordered_buf.push(BufferedOrdered{
+    slot := rseq % MAX_ORDERED_WINDOW
+    if ch.ordered_buf[slot].occupied && ch.ordered_buf[slot].reliable_seq == rseq {
+        ch.duplicates_dropped += 1
+        <<
+    }
+    ch.ordered_buf[slot] = BufferedOrdered{
+        occupied: true,
         reliable_seq: rseq,
         kind: kind,
         sequence: seq,
         payload: clone_bytes(payload)
-    })
+    }
 }
 
 fn (ch $&ReliableChannel) flush_ordered(out $&[]DeliveredMessage) {
-    $progressed := true
-    while progressed {
-        progressed = false
-        $found_idx := -1
-        for i in 0:ch.ordered_buf.len {
-            if ch.ordered_buf[i].reliable_seq == ch.next_recv_reliable_seq {
-                found_idx = i
-                <-
-            }
+    while true {
+        slot := ch.next_recv_reliable_seq % MAX_ORDERED_WINDOW
+        b := &ch.ordered_buf[slot]
+        if !b.occupied || b.reliable_seq != ch.next_recv_reliable_seq {
+            <-
         }
-        if found_idx >= 0 {
-            b := &ch.ordered_buf[found_idx]
-            out.push(DeliveredMessage{
-                channel: CHANNEL_RELIABLE_ORDERED,
-                kind: b.kind,
-                sequence: b.sequence,
-                reliable_seq: b.reliable_seq,
-                payload: clone_bytes(&b.payload)
-            })
-            $next_buf := []BufferedOrdered{}
-            for i in 0:ch.ordered_buf.len {
-                if i != found_idx {
-                    e := &ch.ordered_buf[i]
-                    next_buf.push(BufferedOrdered{
-                        reliable_seq: e.reliable_seq,
-                        kind: e.kind,
-                        sequence: e.sequence,
-                        payload: clone_bytes(&e.payload)
-                    })
-                }
-            }
-            ch.ordered_buf = next_buf
-            ch.next_recv_reliable_seq = (ch.next_recv_reliable_seq + 1) % 65536
-            progressed = true
-        }
+        out.push(DeliveredMessage{
+            channel: CHANNEL_RELIABLE_ORDERED,
+            kind: b.kind,
+            sequence: b.sequence,
+            reliable_seq: b.reliable_seq,
+            payload: clone_bytes(&b.payload)
+        })
+        ch.ordered_buf[slot].occupied = false
+        ch.ordered_buf[slot].payload = []u8{}
+        ch.next_recv_reliable_seq = (ch.next_recv_reliable_seq + 1) % 65536
     }
 }
 
@@ -400,6 +453,12 @@ pub fn (ch $&ReliableChannel) on_receive(raw &[]u8, now_ms f64) []DeliveredMessa
         ch.push_ordered_message(pkt.header.reliable_seq, pkt.header.kind, pkt.header.sequence, &pkt.payload)
         ch.flush_ordered($&out)
         << out
+    }
+    if pkt.header.channel == CHANNEL_RELIABLE_UNORDERED {
+        if !ch.record_unord_rseq(pkt.header.reliable_seq) {
+            ch.duplicates_dropped += 1
+            << out
+        }
     }
     if pkt.header.kind == PKT_DATA || pkt.header.kind == PKT_CONNECT ||
         pkt.header.kind == PKT_ACCEPT || pkt.header.kind == PKT_DISCONNECT {
@@ -432,7 +491,16 @@ fn retransmit_wire_if_due(p &PendingReliable, new_seq int, ack_st &[]int, now_ms
 pub fn (ch $&ReliableChannel) poll_retransmits(now_ms f64) []NetPacket {
     $out := []NetPacket{}
     ack_st := ch.current_ack_state()
+    $has_expired := false
     for i in 0:ch.pending.len {
+        if now_ms - ch.pending[i].last_sent_ms < ch.pending[i].rto_ms {
+            ->
+        }
+        if ch.pending[i].attempts >= MAX_RELIABLE_ATTEMPTS {
+            ch.pending[i].attempts = -1
+            has_expired = true
+            ->
+        }
         new_seq := ch.next_send_seq
         wire := retransmit_wire_if_due(&ch.pending[i], new_seq, &ack_st, now_ms) >>>
         if wire.len > 0 {
@@ -445,6 +513,26 @@ pub fn (ch $&ReliableChannel) poll_retransmits(now_ms f64) []NetPacket {
             ch.packets_sent += 1
             out.push(NetPacket{data: clone_bytes(&wire)})
         }
+    }
+    if has_expired {
+        $kept := []PendingReliable{}
+        for i in 0:ch.pending.len {
+            p := &ch.pending[i]
+            if p.attempts >= 0 {
+                kept.push(PendingReliable{
+                    seq: p.seq,
+                    reliable_seq: p.reliable_seq,
+                    channel: p.channel,
+                    kind: p.kind,
+                    payload: clone_bytes(&p.payload),
+                    first_sent_ms: p.first_sent_ms,
+                    last_sent_ms: p.last_sent_ms,
+                    rto_ms: p.rto_ms,
+                    attempts: p.attempts
+                })
+            }
+        }
+        ch.pending = kept
     }
     << out
 }

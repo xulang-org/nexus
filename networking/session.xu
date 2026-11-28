@@ -20,6 +20,7 @@ struct ServerPeerState {
     has_baseline bool
     baseline WorldSnapshot
     sent_history []WorldSnapshot
+    sent_history_pos int
     last_input_seq int
 }
 
@@ -67,6 +68,7 @@ pub fn (s $&ServerSession) add_peer(peer_id int, interest InterestConfig) int {
         has_baseline: false,
         baseline: new_world_snapshot(0, 0),
         sent_history: []WorldSnapshot{},
+        sent_history_pos: 0,
         last_input_seq: 0
     })
     << idx
@@ -178,6 +180,24 @@ fn (s $&ServerSession) apply_peer_input_batch(pidx int, peer_id int, br $&BitRea
     << 0
 }
 
+fn (s $&ServerSession) process_peer_message(
+    pidx int,
+    peer_id int,
+    m &DeliveredMessage,
+    rpcs $&[]NetRpcEvent
+) int {
+    $br := new_bit_reader(&m.payload)
+    tag := br.read_u8() >>>
+    if tag == MSG_INPUT_BATCH {
+        s.apply_peer_input_batch(pidx, peer_id, $&br) >>>
+    } else if tag == MSG_RPC_EVENT {
+        ev_id := br.read_u32() >>>
+        ev_data := br.read_bytes(1024) >>>
+        rpcs.push(NetRpcEvent{sender_peer: peer_id, event_id: ev_id, payload: ev_data})
+    }
+    << 0
+}
+
 pub fn (s $&ServerSession) on_packet_from_peer(peer_id int, raw &[]u8, now_ms f64) []NetRpcEvent {
     pidx := s.find_peer_idx(peer_id)
     if pidx < 0 { >> errors.new("nexus net: unknown peer_id") }
@@ -187,15 +207,7 @@ pub fn (s $&ServerSession) on_packet_from_peer(peer_id int, raw &[]u8, now_ms f6
     for i in 0:msgs.len {
         m := &msgs[i]
         if m.kind != PKT_DATA || m.payload.len == 0 { -> }
-        $br := new_bit_reader(&m.payload)
-        tag := br.read_u8() >>>
-        if tag == MSG_INPUT_BATCH {
-            s.apply_peer_input_batch(pidx, peer_id, $&br) >>>
-        } else if tag == MSG_RPC_EVENT {
-            ev_id := br.read_u32() >>>
-            ev_data := br.read_bytes(1024) >>>
-            rpcs.push(NetRpcEvent{sender_peer: peer_id, event_id: ev_id, payload: ev_data})
-        }
+        _ := s.process_peer_message(pidx, peer_id, m, $&rpcs) >>> (err) { -> }
     }
     << rpcs
 }
@@ -216,15 +228,14 @@ pub fn (s $&ServerSession) build_outbound_for_peer(
     im := $&s.peers[pidx].interest
     snap := im.filter_snapshot(&s.entities, peer_id, observer_pos, tick, ack_seq)
 
-    // Store snapshot in bounded 32-entry baseline history.
-    s.peers[pidx].sent_history.push(clone_snapshot(&snap))
-    if s.peers[pidx].sent_history.len > 32 {
-        $trimmed := []WorldSnapshot{}
-        start_h := s.peers[pidx].sent_history.len - 32
-        for i in start_h:s.peers[pidx].sent_history.len {
-            trimmed.push(clone_snapshot(&s.peers[pidx].sent_history[i]))
-        }
-        s.peers[pidx].sent_history = trimmed
+    // Store snapshot in fixed-size 32-entry ring buffer without per-tick re-cloning.
+    p := $&s.peers[pidx]
+    if p.sent_history.len < 32 {
+        p.sent_history.push(clone_snapshot(&snap))
+    } else {
+        pos := p.sent_history_pos % 32
+        p.sent_history[pos] = clone_snapshot(&snap)
+        p.sent_history_pos = (pos + 1) % 32
     }
 
     delta := encode_snapshot_delta(&snap, &s.peers[pidx].baseline, s.peers[pidx].has_baseline, &s.bounds) >>>

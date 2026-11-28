@@ -45,6 +45,45 @@ pub struct HizPyramid3D {
     closed bool
 }
 
+fn hiz_fill_mip_dims(sw int, sh int, mip_widths $&[]int, mip_heights $&[]int) int {
+    $mw := (sw + 1) / 2
+    $mh := (sh + 1) / 2
+    if mw < 1 { mw = 1 }
+    if mh < 1 { mh = 1 }
+
+    $done := false
+    $total_bytes := 0
+    for _ in 0:8 {
+        if !done {
+            mip_widths.push(mw)
+            mip_heights.push(mh)
+            total_bytes += mw * mh * 4
+            if mw == 1 && mh == 1 {
+                done = true
+            } else {
+                if mw > 1 { mw = (mw + 1) / 2 }
+                if mh > 1 { mh = (mh + 1) / 2 }
+            }
+        }
+    }
+    << total_bytes
+}
+
+fn hiz_allocate_mips(dev &gpu.Device, widths &[]int, heights &[]int) []gpu.Texture {
+    $mips := []gpu.Texture{}
+    for lvl in 0:widths.len {
+        $tex := dev.texture_2d(gpu.Texture2DDesc{
+            format: layout.R32_FLOAT,
+            width: widths[lvl],
+            height: heights[lvl],
+            levels: 1,
+            usage: gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COMPUTE_STORAGE_WRITE
+        }) >>>
+        mips.push(tex)
+    }
+    << mips
+}
+
 pub fn (device &Device3D) hiz_pyramid(program &IndirectProgram3D) HizPyramid3D {
     device.alive() >>>
     if device.active { >> errors.new("nexus 3D: create Hi-Z pyramid outside a frame") }
@@ -63,31 +102,13 @@ pub fn (device &Device3D) hiz_pyramid(program &IndirectProgram3D) HizPyramid3D {
 
     sw := device.target_width * device.render_scale
     sh := device.target_height * device.render_scale
-    $mw := (sw + 1) / 2
-    $mh := (sh + 1) / 2
-    if mw < 1 { mw = 1 }
-    if mh < 1 { mh = 1 }
-
     $mip_widths := []int{}
     $mip_heights := []int{}
-    $done := false
-    $total_bytes := 0
-    for lvl in 0:8 {
-        if !done {
-            mip_widths.push(mw)
-            mip_heights.push(mh)
-            total_bytes += mw * mh * 4
-            if mw == 1 && mh == 1 {
-                done = true
-            } else {
-                if mw > 1 { mw = (mw + 1) / 2 }
-                if mh > 1 { mh = (mh + 1) / 2 }
-            }
-        }
-    }
+    total_bytes := hiz_fill_mip_dims(sw, sh, $&mip_widths, $&mip_heights)
 
     stats := dev.stats() >>>
-    internal_bytes := device.target_width * device.target_height * 8 + 4
+    $internal_bytes := device.target_width * device.target_height * 8 + 4
+    if device.render_scale == 2 { internal_bytes = device.target_width * device.target_height * 36 + 4 }
     if stats.texture_count + mip_widths.len > 513 + device.targets.len ||
         total_bytes > 67108864 - (stats.texture_bytes - internal_bytes) {
         >> errors.new("nexus 3D: Hi-Z pyramid exceeds texture count or 64 MiB VRAM budget")
@@ -115,17 +136,7 @@ pub fn (device &Device3D) hiz_pyramid(program &IndirectProgram3D) HizPyramid3D {
     sdesc.mip_filter = gpu.NEAREST
     $samp := dev.sampler(sdesc) >>>
 
-    $mips := []gpu.Texture{}
-    for lvl in 0:mip_widths.len {
-        $tex := dev.texture_2d(gpu.Texture2DDesc{
-            format: layout.R32_FLOAT,
-            width: mip_widths[lvl],
-            height: mip_heights[lvl],
-            levels: 1,
-            usage: gpu.TEXTURE_SAMPLED | gpu.TEXTURE_COMPUTE_STORAGE_WRITE
-        }) >>>
-        mips.push(tex)
-    }
+    mips := hiz_allocate_mips(dev, &mip_widths, &mip_heights) >>>
 
     << HizPyramid3D{
         owner: device.reference(),
@@ -139,6 +150,43 @@ pub fn (device &Device3D) hiz_pyramid(program &IndirectProgram3D) HizPyramid3D {
         ready: false,
         closed: false
     }
+}
+
+pub fn (hiz $&HizPyramid3D) resize(device &Device3D, w int, h int) int {
+    device.alive() >>>
+    if device.active { >> errors.new("nexus 3D: resize Hi-Z pyramid outside a frame") }
+    if !device.is_gpu() { >> errors.new("nexus 3D: Hi-Z pyramid requires GPU backend") }
+    if hiz.closed || !hiz.owner.matches(device) { >> errors.new("nexus 3D: closed or foreign Hi-Z pyramid") }
+    target_size(w, h) >>>
+    if hiz.source_width == w && hiz.source_height == h { << 0 }
+
+    dev := device.gpu_device() >>>
+    $mip_widths := []int{}
+    $mip_heights := []int{}
+    total_bytes := hiz_fill_mip_dims(w, h, $&mip_widths, $&mip_heights)
+    $old_bytes := 0
+    for i in 0:hiz.mip_widths.len {
+        old_bytes += hiz.mip_widths[i] * hiz.mip_heights[i] * 4
+    }
+    stats := dev.stats() >>>
+    $internal_bytes := device.target_width * device.target_height * 8 + 4
+    if device.render_scale == 2 { internal_bytes = device.target_width * device.target_height * 36 + 4 }
+    if stats.texture_count - hiz.mips.len + mip_widths.len > 513 + device.targets.len ||
+        total_bytes > 67108864 - (stats.texture_bytes - internal_bytes - old_bytes) {
+        >> errors.new("nexus 3D: Hi-Z pyramid exceeds texture count or 64 MiB VRAM budget")
+    }
+
+    for i in 0:hiz.mips.len {
+        m := $&hiz.mips[i]
+        m.close() >>>
+    }
+    hiz.mips = hiz_allocate_mips(dev, &mip_widths, &mip_heights) >>>
+    hiz.mip_widths = mip_widths
+    hiz.mip_heights = mip_heights
+    hiz.source_width = w
+    hiz.source_height = h
+    hiz.ready = false
+    << 0
 }
 
 fn hiz_params_bytes(sw int, sh int, dw int, dh int) []u8 {

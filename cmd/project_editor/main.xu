@@ -487,7 +487,30 @@ fn try_accept_and_close(w $&ui.Window) {
     }
 }
 
-fn launch_viewport_session(workers chan WorkerDone, ed $&Editor, view $&widgets.View) int {
+fn track_worker_temp_dir(dirs $&[]string, dir string) {
+    if dir.len == 0 { << }
+    dirs.push(dir + "")
+}
+
+fn untrack_worker_temp_dir(dirs &[]string, dir string) []string {
+    $kept := []string{}
+    for i in 0:dirs.len {
+        if dirs[i] != dir {
+            kept.push(dirs[i] + "")
+        }
+    }
+    << kept
+}
+
+fn cleanup_worker_temp_dirs(dirs &[]string) {
+    for i in 0:dirs.len {
+        if dirs[i].len > 0 {
+            try_remove_all(dirs[i] + "")
+        }
+    }
+}
+
+fn launch_viewport_session(workers chan WorkerDone, temp_dirs $&[]string, ed $&Editor, view $&widgets.View) int {
     tmp_dir := os.mkdir_temp("", "nexus-editor-vp-") >>>
     doc := ed.draft.document() >>> (err) {
         try_remove_all(tmp_dir + "")
@@ -501,6 +524,7 @@ fn launch_viewport_session(workers chan WorkerDone, ed $&Editor, view $&widgets.
     meta_out := filepath.join([tmp_dir + "", "viewport-meta.json"])
     rev := ed.draft.current + ""
     sel_node := ed.selected_node
+    track_worker_temp_dir(temp_dirs, tmp_dir + "")
     ed.viewport_active = true
     ed.sync_toolbar_states()
     ed.set_status(STATUS_INFO, "3D View open...", view)
@@ -521,7 +545,7 @@ fn launch_preview_session(workers chan WorkerDone, ed $&Editor, view $&widgets.V
     << 0
 }
 
-fn launch_tilemap_session(workers chan WorkerDone, ed $&Editor, view $&widgets.View) int {
+fn launch_tilemap_session(workers chan WorkerDone, temp_dirs $&[]string, ed $&Editor, view $&widgets.View) int {
     tmp_dir := os.mkdir_temp("", "nexus-editor-tm-") >>>
     doc := ed.draft.document() >>> (err) {
         try_remove_all(tmp_dir + "")
@@ -533,6 +557,7 @@ fn launch_tilemap_session(workers chan WorkerDone, ed $&Editor, view $&widgets.V
     }
     before_raw := try_read_text(staged + "")
     rev := ed.draft.current + ""
+    track_worker_temp_dir(temp_dirs, tmp_dir + "")
     ed.tilemap_active = true
     ed.sync_toolbar_states()
     ed.set_status(STATUS_INFO, "TileMap Editor open...", view)
@@ -688,8 +713,8 @@ fn finish_relocate_asset(new_path &string, ed $&Editor, view $&widgets.View) int
     << 0
 }
 
-fn try_launch_viewport(workers chan WorkerDone, ed $&Editor, view $&widgets.View) {
-    _ := launch_viewport_session(workers, ed, view) >>> (err) {
+fn try_launch_viewport(workers chan WorkerDone, temp_dirs $&[]string, ed $&Editor, view $&widgets.View) {
+    _ := launch_viewport_session(workers, temp_dirs, ed, view) >>> (err) {
         ed.set_status(STATUS_ERR, err.msg(), view)
         <<
     }
@@ -702,8 +727,8 @@ fn try_launch_preview(workers chan WorkerDone, ed $&Editor, view $&widgets.View,
     }
 }
 
-fn try_launch_tilemap(workers chan WorkerDone, ed $&Editor, view $&widgets.View) {
-    _ := launch_tilemap_session(workers, ed, view) >>> (err) {
+fn try_launch_tilemap(workers chan WorkerDone, temp_dirs $&[]string, ed $&Editor, view $&widgets.View) {
+    _ := launch_tilemap_session(workers, temp_dirs, ed, view) >>> (err) {
         ed.set_status(STATUS_ERR, err.msg(), view)
         <<
     }
@@ -917,9 +942,17 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
     init_proj := clone_project(&ed.project)
     init_src := ed.draft.source + ""
     $embed := start_embed_bridge(cfg.viewport_bin + "", &init_proj, &init_src, &init_doc)
+    if !embed.active && embed.last_error.len > 0 {
+        ed.vp3d.last_error = embed.last_error + ""
+        ed.vp3d.backend_name = "Paper CPU (" + embed.last_error + ")"
+        if ed.stage_mode == STAGE_MODE_3D || ed.stage_mode == STAGE_MODE_SPLIT {
+            ed.set_status(STATUS_INFO, "3D viewport fallback: " + embed.last_error, $&view)
+        }
+    }
     _ := try_present_frame($&view, $&ed)
 
     workers := chan WorkerDone{cap: 8}
+    $worker_tmp_dirs := []string{}
     $import_req := ui.Request{id: 0, window_id: 0, canvas_id: 0, generation: 0, kind: 0}
     $open_proj_req := ui.Request{id: 0, window_id: 0, canvas_id: 0, generation: 0, kind: 0}
     $relocate_req := ui.Request{id: 0, window_id: 0, canvas_id: 0, generation: 0, kind: 0}
@@ -931,6 +964,7 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
             step_script_runner($&script, $&ed, $&view, time.instant()) >>> (serr) {
                 if xacp_ctrl.is_open() { xacp_ctrl.close() }
                 stop_embed_bridge($&embed)
+                cleanup_worker_temp_dirs(&worker_tmp_dirs)
                 ed.dispose($&view)
                 >> serr
             }
@@ -975,7 +1009,7 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
         if ed.req_launch_viewport {
             ed.req_launch_viewport = false
             if !ed.viewport_active {
-                try_launch_viewport(workers, $&ed, $&view)
+                try_launch_viewport(workers, $&worker_tmp_dirs, $&ed, $&view)
             }
         }
 
@@ -989,7 +1023,7 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
         if ed.req_launch_tilemap {
             ed.req_launch_tilemap = false
             if !ed.tilemap_active {
-                try_launch_tilemap(workers, $&ed, $&view)
+                try_launch_tilemap(workers, $&worker_tmp_dirs, $&ed, $&view)
             }
         }
 
@@ -1002,7 +1036,11 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
 
         now := time.instant()
         ed.tick_animations($&view, now)
+        prev_vp_err := ed.vp3d.last_error + ""
         dispatch_embed_requests($&embed, $&ed)
+        if ed.vp3d.last_error.len > 0 && ed.vp3d.last_error != prev_vp_err {
+            ed.set_status(STATUS_ERR, ed.vp3d.last_error + "", $&view)
+        }
         if try_present_frame($&view, $&ed) {
             retry_deadline = time.zero_instant()
         } else {
@@ -1041,6 +1079,7 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
                 }
                 if wmsg.temp_dir.len > 0 {
                     try_remove_all(wmsg.temp_dir + "")
+                    worker_tmp_dirs = untrack_worker_temp_dir(&worker_tmp_dirs, wmsg.temp_dir + "")
                 }
                 ed.sync_toolbar_states()
                 ed.repaint_all($&view)
@@ -1071,6 +1110,7 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
                 }
                 if wmsg.temp_dir.len > 0 {
                     try_remove_all(wmsg.temp_dir + "")
+                    worker_tmp_dirs = untrack_worker_temp_dir(&worker_tmp_dirs, wmsg.temp_dir + "")
                 }
                 ed.sync_toolbar_states()
                 ed.repaint_all($&view)
@@ -1107,6 +1147,7 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
     }
     if xacp_ctrl.is_open() { xacp_ctrl.close() }
     stop_embed_bridge($&embed)
+    cleanup_worker_temp_dirs(&worker_tmp_dirs)
     ed.dispose($&view)
     << 0
 }

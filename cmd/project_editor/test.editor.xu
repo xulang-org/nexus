@@ -1096,6 +1096,95 @@ fn test_multi_selection_batch_draft_ops() {
     cleanup_dir(tmp + "")
 }
 
+fn run_batch_undo_at_max_history(tmp string) int {
+    scene_path := filepath.join([tmp + "", "assets", "world.xuscene"])
+    $d := open_draft(scene_path + "") >>>
+    n1 := d.spawn_whitebox_node(0, "box", fm.vec3(1.0, 1.0, 1.0)) >>>
+    n2 := d.spawn_whitebox_node(0, "box", fm.vec3(1.0, 1.0, 1.0)) >>>
+    n3 := d.spawn_whitebox_node(0, "box", fm.vec3(1.0, 1.0, 1.0)) >>>
+
+    // Fill undo stack up to MAX_HISTORY (32)
+    for i in 0:34 {
+        d.set_node_visible_only(n1, (i % 2) == 1) >>>
+    }
+    t_true(d.undo.len == MAX_HISTORY, "undo stack reaches MAX_HISTORY (32)")
+
+    pre_batch_raw := d.current + ""
+    pre_batch_rev := d.revision
+    undo_top_before := d.undo[d.undo.len - 1] + ""
+
+    // 1. Transaction batch edit at MAX_HISTORY
+    d.begin_batch()
+    d.set_node_camera_perspective(n1, 55.0, 0.1, 100.0) >>>
+    d.set_node_camera_perspective(n2, 55.0, 0.1, 100.0) >>>
+    d.set_node_camera_perspective(n3, 55.0, 0.1, 100.0) >>>
+    d.commit_batch()
+
+    t_true(d.undo.len == MAX_HISTORY, "batch commit keeps undo stack capped at MAX_HISTORY")
+    t_true(d.revision > pre_batch_rev, "batch commit advances draft revision")
+    doc_batch := d.document() >>>
+    t_true(
+        (doc_batch.describe_node(n1) >>>).camera.is_set() &&
+        (doc_batch.describe_node(n2) >>>).camera.is_set() &&
+        (doc_batch.describe_node(n3) >>>).camera.is_set(),
+        "batch edit applies camera to all 3 nodes"
+    )
+
+    d.undo_edit() >>>
+    t_true(d.current == pre_batch_raw, "single undo_edit restores exact pre-batch state at MAX_HISTORY")
+    doc_undone := d.document() >>>
+    t_true(
+        !(doc_undone.describe_node(n1) >>>).camera.is_set() &&
+        !(doc_undone.describe_node(n2) >>>).camera.is_set() &&
+        !(doc_undone.describe_node(n3) >>>).camera.is_set(),
+        "single undo_edit clears batch camera on all 3 nodes"
+    )
+    t_true(d.undo[d.undo.len - 1] == undo_top_before, "pre-batch undo top entry preserved after single undo")
+
+    d.redo_edit() >>>
+    doc_redone := d.document() >>>
+    t_true(
+        (doc_redone.describe_node(n1) >>>).camera.is_set() &&
+        (doc_redone.describe_node(n2) >>>).camera.is_set() &&
+        (doc_redone.describe_node(n3) >>>).camera.is_set(),
+        "redo_edit restores batch camera on all 3 nodes"
+    )
+    d.undo_edit() >>>
+    t_true(d.current == pre_batch_raw, "undo_edit after redo restores exact pre-batch state")
+
+    // 2. Abort batch restores pre-batch state without polluting undo stack
+    undo_len_before_abort := d.undo.len
+    d.begin_batch()
+    d.set_node_camera_perspective(n1, 55.0, 0.1, 100.0) >>>
+    d.set_node_camera_perspective(n2, 55.0, 0.1, 100.0) >>>
+    d.abort_batch()
+    t_true(d.current == pre_batch_raw, "abort_batch restores exact pre-batch state")
+    t_true(d.undo.len == undo_len_before_abort && d.undo[d.undo.len - 1] == undo_top_before, "abort_batch leaves undo stack unchanged")
+
+    // 3. Hardened collapse_undo_to fallback at MAX_HISTORY
+    d.set_node_visible_only(n1, false) >>>
+    t_true(d.undo.len == MAX_HISTORY, "undo stack back at MAX_HISTORY before collapse_undo_to test")
+    base_len := d.undo.len
+    base_raw := d.current + ""
+    d.set_node_camera_perspective(n1, 55.0, 0.1, 100.0) >>>
+    d.set_node_camera_perspective(n2, 55.0, 0.1, 100.0) >>>
+    d.set_node_camera_perspective(n3, 55.0, 0.1, 100.0) >>>
+    d.collapse_undo_to(base_len, base_raw + "")
+    d.undo_edit() >>>
+    t_true(d.current == base_raw, "hardened collapse_undo_to at MAX_HISTORY restores pre-batch state on single undo")
+    << 0
+}
+
+fn test_batch_undo_at_max_history() {
+    tmp := setup_fixture_project()
+    _ := run_batch_undo_at_max_history(tmp + "") >>> (err) {
+        cleanup_dir(tmp + "")
+        t_fail("batch_undo_at_max_history: " + err.msg())
+        <<
+    }
+    cleanup_dir(tmp + "")
+}
+
 fn main() int {
     test_theme_paper_tokens()
     println("PASS: test_theme_paper_tokens")
@@ -1123,5 +1212,7 @@ fn main() int {
     println("PASS: test_phase6_unified_modeling_and_pbr")
     test_multi_selection_batch_draft_ops()
     println("PASS: test_multi_selection_batch_draft_ops")
+    test_batch_undo_at_max_history()
+    println("PASS: test_batch_undo_at_max_history")
     << 0
 }

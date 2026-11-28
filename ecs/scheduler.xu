@@ -311,10 +311,12 @@ fn persistent_worker_loop(jobs chan WorkerJob, done chan int) {
         $n := 0
         for i in 0:job.chunks.len {
             chk := &job.chunks[i]
-            _ := run_chunk_stage_systems(job.chunk_masks[i], &job.kinds, &job.req_masks, chk, job.dt, job.listener)
-            meta := <-chk.meta
-            n += meta.count
-            chk.meta <- meta
+            ran := run_chunk_stage_systems(job.chunk_masks[i], &job.kinds, &job.req_masks, chk, job.dt, job.listener)
+            if ran > 0 {
+                meta := <-chk.meta
+                n += meta.count
+                chk.meta <- meta
+            }
         }
         done <- n
     }
@@ -371,7 +373,12 @@ pub fn execute_sequential(world &EcsWorld, schedule &EcsSchedule, ctx FrameConte
     if !fm.finite(ctx.dt) || ctx.dt < 0.0 || !ctx.listener.is_finite() {
         >> errors.new("nexus ecs: invalid FrameContext")
     }
-    $processed := 0
+    $chunk_ran := [][]bool{}
+    for ai in 0:world.archetypes.len {
+        $flags := []bool{}
+        for _ in 0:world.archetypes[ai].chunks.len { flags.push(false) }
+        chunk_ran.push(flags)
+    }
     for st_i in 0:schedule.stages.len {
         st := &schedule.stages[st_i]
         $kinds := []int{}
@@ -387,10 +394,20 @@ pub fn execute_sequential(world &EcsWorld, schedule &EcsSchedule, ctx FrameConte
                 chk := &arch.chunks[ci]
                 ran := run_chunk_stage_systems(arch.mask, &kinds, &req_masks, chk, ctx.dt, ctx.listener)
                 if ran > 0 {
-                    meta := <-chk.meta
-                    processed += meta.count
-                    chk.meta <- meta
+                    chunk_ran[ai][ci] = true
                 }
+            }
+        }
+    }
+    $processed := 0
+    for ai in 0:world.archetypes.len {
+        arch := &world.archetypes[ai]
+        for ci in 0:arch.chunks.len {
+            if chunk_ran[ai][ci] {
+                chk := &arch.chunks[ci]
+                meta := <-chk.meta
+                processed += meta.count
+                chk.meta <- meta
             }
         }
     }

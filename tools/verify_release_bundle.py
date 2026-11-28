@@ -12,16 +12,10 @@ import struct
 import tarfile
 import zipfile
 
-DESKTOP_TARGETS = ("macos-arm64", "macos-x64", "linux-x64", "linux-arm64", "windows-x64")
-NATIVE_LIBS = ("nexus_audio", "nexus_image", "nexus_steam", "nexus_console", "nexus_taptap")
-RELEASE_TOOLS = (
-    "nexus-project",
-    "nexus-project-validate",
-    "nexus-project-viewport",
-    "xu-nexus-script",
-    "nexus-project-editor",
-    "nexus-tilemap-editor",
-)
+if __package__:
+    from .manifest import DESKTOP_TARGETS, NATIVE_LIBS, RELEASE_TOOLS
+else:
+    from manifest import DESKTOP_TARGETS, NATIVE_LIBS, RELEASE_TOOLS
 
 
 def sha256_file(path: Path) -> str:
@@ -132,12 +126,12 @@ def verify_target_archive(archive_path: Path, version: str, target: str) -> None
     assert all(digests[k] == v for k, v in meta["files"].items())
 
     suffix = ".exe" if target.startswith("windows-") else ""
-    expected_bins = {f"bin/{t}{suffix}" for t in RELEASE_TOOLS}
+    expected_bins = {f"bin/{t}{suffix}" for _, t, _, _ in RELEASE_TOOLS}
     assert expected_bins <= set(bin_headers), f"{archive_path.name}: missing tools {expected_bins - set(bin_headers)}"
     for rel, hdr in bin_headers.items():
         verify_binary_header(hdr, target, f"{archive_path.name}:{rel}")
 
-    expected_libs = {f"native/{lib}.xulib" for lib in NATIVE_LIBS}
+    expected_libs = {f"native/{lib}.xulib" for _, lib in NATIVE_LIBS}
     assert expected_libs <= set(xulibs), f"{archive_path.name}: missing xulibs {expected_libs - set(xulibs)}"
     for rel, raw in xulibs.items():
         verify_xulib_slices(raw, (target,), f"{archive_path.name}:{rel}")
@@ -153,7 +147,7 @@ def verify_native_all_archive(archive_path: Path, version: str, targets: tuple[s
     assert meta["version"] == version and meta["target"] == "native-all"
     assert set(digests) == set(meta["files"]) | {"bundle.json"}
     assert all(digests[k] == v for k, v in meta["files"].items())
-    expected_libs = {f"native/{lib}.xulib" for lib in NATIVE_LIBS}
+    expected_libs = {f"native/{lib}.xulib" for _, lib in NATIVE_LIBS}
     assert set(xulibs) == expected_libs, f"native-all libs mismatch: {set(xulibs)}"
     for rel, raw in xulibs.items():
         verify_xulib_slices(raw, targets, f"{archive_path.name}:{rel}")

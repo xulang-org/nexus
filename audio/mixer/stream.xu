@@ -58,6 +58,7 @@ pub fn (mixer $&Mixer) open_stream(rate int, channels int, capacity_frames int) 
             mixer.streams[i] = PcmStream{generation: generation, open: true, rate: rate, channels: channels, capacity: capacity_frames,
                 read_frame: 0, write_frame: 0, eof: false, consumer: 0, position: 0, digest: "", samples: samples}
             mixer.stream_samples = mixer.stream_samples + capacity_frames * channels
+            mixer.stream_hash = mix_hash_int(mixer.stream_hash, rate * 7 + channels * 3 + capacity_frames)
             mixer.revision = mixer.revision + 1
             << generation * MAX_STREAMS + i + 1
         }
@@ -97,6 +98,7 @@ pub fn (mixer $&Mixer) feed_stream(id int, samples &[]int, finished bool) int {
     source.write_frame = source.write_frame + frames
     source.eof = finished
     source.digest = next_digest
+    mixer.stream_hash = mix_hash_str(mixer.stream_hash, &source.digest)
     mixer.revision = mixer.revision + 1
     << frames
 }
@@ -117,6 +119,7 @@ pub fn (mixer $&Mixer) close_stream(id int) int {
     mixer.stream_samples = mixer.stream_samples - mixer.streams[index].capacity * mixer.streams[index].channels
     generation := mixer.streams[index].generation
     mixer.streams[index] = empty_stream(generation)
+    mixer.stream_hash = mix_hash_int(mixer.stream_hash, index * 31 + generation)
     mixer.revision = mixer.revision + 1
     << 0
 }
@@ -135,19 +138,41 @@ struct SourceInfo { rate int
     frames int
     streaming bool
     eof bool }
-fn (mixer &Mixer) source_info(source int) SourceInfo {
+fn source_info_from(clips &[]pcm.Clip, streams &[]PcmStream, source int) SourceInfo {
     if source >= 0 {
-        clip := &mixer.clips[source]
+        clip := &clips[source]
         << SourceInfo{rate: clip.sample_rate(), channels: clip.channel_count(), frames: clip.frame_count(), streaming: false, eof: true}
     }
-    index := mixer.stream_index(-source - 1) >>>
-    stream := &mixer.streams[index]
+    id := -source - 1
+    if id <= 0 { >> errors.new("nexus mixer: stale or invalid stream") }
+    slot := (id - 1) % MAX_STREAMS
+    if slot >= streams.len || !streams[slot].open || streams[slot].generation != (id - 1) / MAX_STREAMS {
+        >> errors.new("nexus mixer: stale or invalid stream")
+    }
+    stream := &streams[slot]
     << SourceInfo{rate: stream.rate, channels: stream.channels, frames: stream.write_frame, streaming: true, eof: stream.eof}
 }
+fn source_sample_from(clips &[]pcm.Clip, streams &[]PcmStream, source int, frame int, channel int) int {
+    if source >= 0 { << clips[source].sample(frame, channel) >>> }
+    id := -source - 1
+    if id <= 0 { >> errors.new("nexus mixer: stale or invalid stream") }
+    slot := (id - 1) % MAX_STREAMS
+    if slot >= streams.len || !streams[slot].open || streams[slot].generation != (id - 1) / MAX_STREAMS {
+        >> errors.new("nexus mixer: stale or invalid stream")
+    }
+    s := &streams[slot]
+    capacity := s.capacity
+    if capacity == 0 { >> errors.new("nexus mixer: closed stream buffer") }
+    if frame < s.read_frame || frame >= s.write_frame || channel < 0 || channel >= s.channels {
+        >> errors.new("nexus mixer: sample outside buffered stream")
+    }
+    << s.samples[(frame % capacity) * s.channels + channel]
+}
+fn (mixer &Mixer) source_info(source int) SourceInfo {
+    << source_info_from(&mixer.clips, &mixer.streams, source) >>>
+}
 fn (mixer &Mixer) source_sample(source int, frame int, channel int) int {
-    if source >= 0 { << mixer.clips[source].sample(frame, channel) >>> }
-    index := mixer.stream_index(-source - 1) >>>
-    << mixer.stream_sample(index, frame, channel) >>>
+    << source_sample_from(&mixer.clips, &mixer.streams, source, frame, channel) >>>
 }
 fn (mixer $&Mixer) consume_streams() {
     rate := mixer.rate
@@ -196,6 +221,7 @@ pub fn (mixer $&Mixer) reset_stream(id int, samples &[]int, finished bool, resum
         voice := $&mixer.voices[slot]
         reset_transport(voice, 0, resume, finished && frames == 0)
     }
+    mixer.stream_hash = mix_hash_str(mixer.stream_hash, &source.digest)
     mixer.revision = mixer.revision + 1
     << frames
 }

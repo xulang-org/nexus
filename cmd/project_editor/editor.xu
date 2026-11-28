@@ -2857,7 +2857,7 @@ pub fn (ed $&Editor) sync_inspector(doc &resource.Document) {
         gizmo_screen_dir_x: 1.0, gizmo_screen_dir_y: 0.0, gizmo_world_per_px: 0.01,
         gizmo_triad_hover: 0, live_gizmo_dirty: false,
         has_image: false, images: []draw.Image{}, img_w: 0, img_h: 0,
-        backend_name: "", connected: false, scene_rev_sent: "", render_seq: 0,
+        backend_name: "", connected: false, scene_rev_sent: -1, last_error: "", render_seq: 0,
         in_flight: false, dirty_render: false, pending_pick: false, pick_additive: false, pick_down_additive: false, pick_x: 0.0, pick_y: 0.0,
         pending_capture_3d: "", pending_capture_done: ""
     }
@@ -3249,10 +3249,9 @@ fn (ed $&Editor) apply_inspector_multi(view $&widgets.View) int {
         }
     }
 
-    base_len := ed.draft.undo.len
-    base_raw := ed.draft.current + ""
     targets3d := ed.selected_3d_targets(&doc)
     d := $&ed.draft
+    d.begin_batch()
     d.set_nodes_properties_batch(
         &targets,
         chg_vis, vis,
@@ -3261,6 +3260,7 @@ fn (ed $&Editor) apply_inspector_multi(view $&widgets.View) int {
         chg_rx, chg_ry, chg_rz, fm.vec3(rx, ry, rz),
         chg_sx, chg_sy, chg_sz, fm.vec3(sx, sy, sz)
     ) >>> (err) {
+        d.abort_batch()
         ed.set_status(STATUS_ERR, err.msg(), view)
         >> err
     }
@@ -3269,9 +3269,9 @@ fn (ed $&Editor) apply_inspector_multi(view $&widgets.View) int {
     if mat_commit {
         ed.try_commit_pbr_fields_quiet_multi(&targets3d)
         ed.modeling.mat_dirty = false
-        d2 := $&ed.draft
-        d2.collapse_undo_to(base_len, base_raw)
     }
+    d2 := $&ed.draft
+    d2.commit_batch()
     ed.name_error = ""
     ed.insp_dirty = false
     ed.modeling.mat_dirty = false
@@ -3528,7 +3528,7 @@ pub fn (ed $&Editor) switch_scene(target_idx int, check_dirty bool, view $&widge
     ed.scene_index = target_idx
     ed.draft = next_draft
     ed.reset_comp_manual_open()
-    ed.vp3d.scene_rev_sent = ""
+    ed.vp3d.scene_rev_sent = -1
     next_sel := initial_selected_node(&ed.draft)
     ed.set_single_selection(next_sel)
     ed.placing_mode = false
@@ -4033,6 +4033,7 @@ pub fn (ed $&Editor) open_project_file(project_path &string, view $&widgets.View
     ed.scene_index = 0
     ed.draft = next_draft
     ed.reset_comp_manual_open()
+    ed.vp3d.scene_rev_sent = -1
     ed.set_single_selection(0)
     ed.placing_mode = false
     ed.panels.glb_prim_cache = map[string]string{}
@@ -4459,8 +4460,7 @@ fn try_patch_pbr_multi(
     set_coat bool, coat f64,
     set_ior bool, ior_v f64
 ) string {
-    base_len := d.undo.len
-    base_raw := d.current + ""
+    d.begin_batch()
     if set_col || set_met || set_rgh || set_emt {
         _ := d.patch_nodes_material_override(
             targets, 0,
@@ -4471,15 +4471,17 @@ fn try_patch_pbr_multi(
             false, false,
             false, ""
         ) >>> (err) {
+            if d.batch_depth == 1 { d.abort_batch() } else { d.commit_batch() }
             << err.msg()
         }
     }
     if set_alp || set_coat || set_ior {
         _ := d.patch_nodes_material_surface_ext(targets, 0, set_alp, alp, set_coat, coat, set_ior, ior_v) >>> (err) {
+            if d.batch_depth == 1 { d.abort_batch() } else { d.commit_batch() }
             << err.msg()
         }
     }
-    d.collapse_undo_to(base_len, base_raw)
+    d.commit_batch()
     << ""
 }
 
@@ -6838,6 +6840,7 @@ fn (ed $&Editor) handle_scene_manage_action(act int, view $&widgets.View) {
         }
         ed.scene_index = next_idx
         ed.draft = next_draft
+        ed.vp3d.scene_rev_sent = -1
         modal_close($&ed.modals)
         ed.refresh_project_selectors()
         ed.refresh_after_document_change(false, view)

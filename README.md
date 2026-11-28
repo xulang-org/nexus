@@ -41,7 +41,7 @@ export PATH="$NEXUS_XU_SDK/bin:$PATH"
 make sdk
 ```
 
-`make sdk` 应输出 `PASS: Xu SDK 0.14.2`。已有同一版本 SDK 时，直接设置上述环境变量或执行 `source /path/to/xu/env.sh` 即可。
+`make sdk` 应输出 `PASS: Xu SDK 0.14.4`。已有同一版本 SDK 时，直接设置上述环境变量或执行 `source /path/to/xu/env.sh` 即可。
 
 核心引擎突破与专项测试目标：
 - `make prefab-runtime-test`：验证 `integration/scene/prefabs.xu` 递归多级嵌套 Prefab 实例化、SHA-256 校验、循环引用拦截与节点可见性/位置覆盖应用。
@@ -86,9 +86,9 @@ make sdk
 
 ## CI 与版本发布
 
-- `python3 tools/ci_run.py --modes all --sdl-include <SDL3/include>`：跨平台 CI 入口，涵盖架构/边界/跨后端着色器与版本身份契约检查（`contracts`）、5 个原生 `.xulib` 桥接构建（`native`）、各后端着色器生成（`shaders`）、核心入口静态检查（`check`）、无窗口/无 GPU 核心回归测试集（`test`）及 7 个发行 CLI/Studio 工具构建（`build-tools`）。
+- `python3 tools/ci_run.py --modes all --sdl-include <SDL3/include>`：跨平台 CI 入口，涵盖架构/边界/跨后端着色器与版本身份契约检查（`contracts`）、5 个原生 `.xulib` 桥接构建（`native`）、各后端着色器生成（`shaders`）、核心入口静态检查（`check`）、无窗口/无 GPU 核心回归测试集（`test`）及 6 个发行 CLI/Studio 工具构建（`build-tools`）。
 - `python3 tools/check_release_identity.py`（或 `make release-identity-check`）：校验根 `xu.xun`、全仓子模块 `xu:`、`resources/project/mod.xu`、`README.md` 与 `RELEASES*.md` 版本一致性。
-- `.github/workflows/ci.yml` 在 `macos-arm64`、`macos-x64`、`linux-x64`、`linux-arm64` 与 `windows-x64` 五平台运行全量 CI；`.github/workflows/release.yml` 采用构建与发布隔离架构，在 Tag（`v*`）或手动触发时分平台构建工具与多平台原生 `.xulib` 归档，汇总校验 `SHA256SUMS` 与 `validation.json` 后发布 GitHub Release（发行记录见 [RELEASES.zh-CN.md](RELEASES.zh-CN.md) 与 [RELEASES.md](RELEASES.md)）。
+- `.github/workflows/ci.yml` 在 `macos-arm64`、`macos-x64`、`linux-x64`、`linux-arm64` 与 `windows-x64` 五平台运行架构契约、原生桥接、着色器生成、静态检查、无窗口/无 GPU 核心回归测试与发行工具构建（GPU 像素验证在 `macos-arm64` Metal 环境及可选/定时 `gpu-metal-smoke` 任务中运行）；`.github/workflows/release.yml` 采用构建与发布隔离架构，在 Tag（`v*`）或手动触发时分平台构建工具与多平台原生 `.xulib` 归档，汇总校验 `SHA256SUMS` 与 `validation.json` 后发布 GitHub Release（发行记录见 [RELEASES.zh-CN.md](RELEASES.zh-CN.md) 与 [RELEASES.md](RELEASES.md)）。
 
 ## Phone 原生 2D / 3D 示例
 
@@ -293,7 +293,7 @@ PNG 文件上传、最近邻/线性采样、透明混合、GPU 裁剪、有序�
 
 ## 运行
 
-需要 **Xu 0.14.2**、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
+需要 **Xu 0.14.4**、Clang、Python 3，以及 SDL 3.4+ 开发头文件和运行库。
 默认通过 `pkg-config sdl3` 查找头文件；Windows 可显式传入包含 `SDL3/SDL.h` 的目录。
 桥接在运行时加载 SDL，不把 SDL 源码或二进制复制进本库。
 
@@ -346,7 +346,7 @@ make demo-glb-materials
 ./build/glb-materials --frames 120 --capture build/glb-materials.png
 ```
 
-`make sdk` 核对实际编译器版本。默认使用 PATH 中的 `xu`，也可用 `XU` 选择完整的 Xu 0.14.2 SDK。
+`make sdk` 核对实际编译器版本。默认使用 PATH 中的 `xu`，也可用 `XU` 选择完整的 Xu 0.14.4 SDK。
 修复内容属于编译器：解析 native 模块、校验归档/目标/ABI、生成 C 调用适配和链接，调用所选 SDK 的配套工具，
 并为资源所有者及资源数组生成自动析构。标准库新增 `gpu/layout` 统一纹理格式、mip 链、行 pitch 与 mip offset 的受检计算，UI 图片上传与引擎 2D/3D 纹理共用；标准 `gpu` 已提供无窗口设备、缓冲区与异步传输、fence/读回、纹理/采样器、Shader/Pipeline 和离屏 render pass，以及 compact `[]u8` 借用 ABI。标准窗口/呈现已补齐，2D/3D 均已迁移标准事件、资源和绘制命令；PBR、场景和游戏预算仍在引擎。
 完整 SDK 的编译器、标准库和包搜索路径必须一致：
@@ -1311,7 +1311,7 @@ make project-cli project-validator
 ./build/nexus-project steam-stage ./my_game/project.json --output ./my_game/build/stage-steam
 ```
 
-仅包含 `format`、`version`、`assets`、`scenes` 4 个字段的最小工程清单（如本仓库 `examples/*`）保持 100% 向后兼容。完整结构、字段与协作规范见 [GAME_PROJECT_STRUCTURE.zh-CN.md](docs/GAME_PROJECT_STRUCTURE.zh-CN.md)，自动化验收入口 `make project-scaffold-test`。
+仅包含 `format`、`version`、`assets`、`scenes` 4 个字段的最小工程清单（如本仓库 `examples/*`）保持 100% 向后兼容。完整结构定义见 [resources/project/mod.xu](resources/project/mod.xu)（或运行 `./build/nexus-project layout` 查看），自动化验收入口 `make project-scaffold-test`。
 
 ## 项目资源索引与场景编辑
 
@@ -1784,7 +1784,7 @@ report := scripts.dispatch(&tree, host.DEFAULT_DISPATCH_LIMIT) >>>
 ```yaml
 module: example/my_game
 version: !ver 0.1.0
-xu: !ver 0.14.2
+xu: !ver 0.14.4
 require:
   "github.com/xulang-org/nexus": file:/path/to/nexus
 ```

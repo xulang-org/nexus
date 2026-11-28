@@ -34,6 +34,7 @@ pub struct ClusteredRenderer3D {
     compute []gpu.ComputePipeline
     pipelines []gpu.GraphicsPipeline
     buffers []gpu.Buffer
+    light_bytes []u8
     ambient fm.Vec3
     eye fm.Vec3
     exposure f64
@@ -208,6 +209,7 @@ pub fn (device &Device3D) clustered_renderer(program &ClusteredProgram3D) Cluste
         compute: [comp],
         pipelines: [p_none, p_back, p_front],
         buffers: [lights_buf, counts_buf, indices_buf],
+        light_bytes: zero_bytes(80),
         ambient: fm.vec3(0.0, 0.0, 0.0),
         eye: fm.vec3(0.0, 0.0, 0.0),
         exposure: 1.0,
@@ -305,7 +307,6 @@ pub fn (renderer $&ClusteredRenderer3D) bin_lights(
     pass.dispatch(groups, 1, 1) >>>
     pass.end() >>>
     $fence := enc.submit() >>>
-    fence.wait() >>>
     fence.close() >>>
 
     renderer.ambient = ambient
@@ -318,6 +319,7 @@ pub fn (renderer $&ClusteredRenderer3D) bin_lights(
     renderer.z_far = z_far
     renderer.slice_mode = slice_mode
     renderer.log_ratio = log_ratio
+    renderer.light_bytes = renderer.build_lighting_uniform_bytes() >>>
     renderer.ready = true
     << 0
 }
@@ -339,7 +341,7 @@ pub fn (renderer $&ClusteredRenderer3D) bin_environment(
     << renderer.bin_lights(device, env.ambient(), env.eye(), env.exposure(), &srcs, view, projection, z_near, z_far, slice_mode) >>>
 }
 
-fn (renderer &ClusteredRenderer3D) lighting_uniform_bytes() []u8 {
+fn (renderer &ClusteredRenderer3D) build_lighting_uniform_bytes() []u8 {
     $words := []int{}
     for v in [renderer.ambient.x, renderer.ambient.y, renderer.ambient.z, f64(renderer.light_count),
         renderer.eye.x, renderer.eye.y, renderer.eye.z, renderer.exposure,
@@ -349,6 +351,10 @@ fn (renderer &ClusteredRenderer3D) lighting_uniform_bytes() []u8 {
         words.push(scalar_word(v) >>>)
     }
     << word_bytes(&words) >>>
+}
+
+fn (renderer &ClusteredRenderer3D) lighting_uniform_bytes() []u8 {
+    << renderer.build_lighting_uniform_bytes() >>>
 }
 
 pub fn (renderer &ClusteredRenderer3D) draw_material(
@@ -430,7 +436,6 @@ fn (renderer &ClusteredRenderer3D) draw_clustered_internal(
     if sign < 0 { orientation = -1.0 }
     params := material_words(material, orientation) >>>
     frag_bytes := word_bytes(&params) >>>
-    light_bytes := renderer.lighting_uniform_bytes() >>>
 
     pass := $&device.passes[0]
     if material.surface_mode == 0 {
@@ -460,7 +465,7 @@ fn (renderer &ClusteredRenderer3D) draw_clustered_internal(
     }
     pass.uniform(gpu.VERTEX, 0, &vert_bytes) >>>
     pass.uniform(gpu.FRAGMENT, 0, &frag_bytes) >>>
-    pass.uniform(gpu.FRAGMENT, 1, &light_bytes) >>>
+    pass.uniform(gpu.FRAGMENT, 1, &renderer.light_bytes) >>>
     pass.uniform(gpu.FRAGMENT, 2, shadow_bytes) >>>
     pass.storage_buffer(gpu.FRAGMENT, 0, &renderer.buffers[0]) >>>
     pass.storage_buffer(gpu.FRAGMENT, 1, &renderer.buffers[1]) >>>

@@ -627,7 +627,7 @@ fn (world $&JointedWorld3D) solve_joint(j JointConstraint3D, inv_h2 f64) {
 }
 
 struct ContactList3D {
-    keys []int
+    key_index map[int]int
     a []int
     b []int
     la []fm.Vec3
@@ -637,7 +637,7 @@ struct ContactList3D {
 
 fn new_contact_list_3d() ContactList3D {
     << ContactList3D{
-        keys: []int{},
+        key_index: map[int]int{},
         a: []int{},
         b: []int{},
         la: []fm.Vec3{},
@@ -654,15 +654,15 @@ fn (cl $&ContactList3D) record(
     lb fm.Vec3,
     nrm fm.Vec3
 ) {
-    for ki in 0:cl.keys.len {
-        if cl.keys[ki] == key {
-            cl.la[ki] = la
-            cl.lb[ki] = lb
-            cl.ns[ki] = nrm
-            <<
-        }
+    if cl.key_index.has(key) {
+        ki := cl.key_index[key]
+        cl.la[ki] = la
+        cl.lb[ki] = lb
+        cl.ns[ki] = nrm
+        <<
     }
-    cl.keys.push(key)
+    ki := cl.a.len
+    cl.key_index[key] = ki
     cl.a.push(a)
     cl.b.push(b)
     cl.la.push(la)
@@ -1097,26 +1097,59 @@ fn (world $&JointedWorld3D) solve_hinge_motor_velocities(h f64) {
     }
 }
 
-fn (world $&JointedWorld3D) solve_all_static_geometry(
+struct StaticCandidates3D {
+    box_cands [][]int
+    tri_cands [][]int
+}
+
+fn (world &JointedWorld3D) collect_static_candidates(pad_margin f64) StaticCandidates3D {
+    has_boxes := world.static_boxes.len > 0
+    has_tris := world.static_triangles.len > 0
+    $box_cands := [][]int{}
+    $tri_cands := [][]int{}
+    pad := fm.vec3(pad_margin, pad_margin, pad_margin)
+    for i in 0:world.positions.len {
+        if (!has_boxes && !has_tris) || world.inv_mass[i] <= 0.0 {
+            box_cands.push([]int{})
+            tri_cands.push([]int{})
+            ->
+        }
+        bb := world.body_world_aabb(i) >>>
+        qbox := fm.Aabb3{minimum: bb.minimum.sub(pad), maximum: bb.maximum.add(pad)}
+        if has_boxes {
+            box_cands.push(world.box_bvh.query_aabb(qbox, &world.static_boxes))
+        } else {
+            box_cands.push([]int{})
+        }
+        if has_tris {
+            tri_cands.push(world.tri_bvh.query_aabb(qbox, &world.tri_bounds))
+        } else {
+            tri_cands.push([]int{})
+        }
+    }
+    << StaticCandidates3D{box_cands: box_cands, tri_cands: tri_cands}
+}
+
+fn (world $&JointedWorld3D) solve_all_static_geometry_cached(
     inv_h2 f64,
-    cl $&ContactList3D
+    cl $&ContactList3D,
+    cands &StaticCandidates3D
 ) int {
     has_boxes := world.static_boxes.len > 0
     has_tris := world.static_triangles.len > 0
     if !has_boxes && !has_tris { << 0 }
     for i in 0:world.positions.len {
         if world.inv_mass[i] <= 0.0 { -> }
-        bb := world.body_world_aabb(i) >>>
         if has_boxes {
-            hits := world.box_bvh.query_aabb(bb, &world.static_boxes)
-            for bi in hits {
+            bhits := &cands.box_cands[i]
+            for bi in bhits {
                 if (world.masks[i] & world.static_box_layers[bi]) != 0 {
                     world.solve_static_box_corners(i, world.static_boxes[bi], inv_h2, cl)
                 }
             }
         }
         if has_tris {
-            thits := world.tri_bvh.query_aabb(bb, &world.tri_bounds)
+            thits := &cands.tri_cands[i]
             for ti in thits {
                 tri := world.static_triangles[ti]
                 if (world.masks[i] & tri.layer) != 0 {
@@ -1174,13 +1207,14 @@ pub fn (world $&JointedWorld3D) step(dt f64, substeps int, solver_iters int) int
     // Pre-resolve any initial/spawn static overlaps purely positionally so (pos - prev_pos)/h never explodes.
     if world.static_boxes.len > 0 || world.static_triangles.len > 0 {
         $dummy_cl := new_contact_list_3d()
+        pre_cands := world.collect_static_candidates(0.25) >>>
         for _ in 0:4 {
-            world.solve_all_static_geometry(inv_h2, $&dummy_cl) >>>
+            world.solve_all_static_geometry_cached(inv_h2, $&dummy_cl, &pre_cands) >>>
             for ji in 0:world.joints.len {
                 world.solve_joint(world.joints[ji], inv_h2)
             }
         }
-        world.solve_all_static_geometry(inv_h2, $&dummy_cl) >>>
+        world.solve_all_static_geometry_cached(inv_h2, $&dummy_cl, &pre_cands) >>>
     }
 
     for _ in 0:substeps {
@@ -1205,6 +1239,7 @@ pub fn (world $&JointedWorld3D) step(dt f64, substeps int, solver_iters int) int
         }
 
         dyn_pairs := world.collect_dynamic_candidates() >>>
+        static_cands := world.collect_static_candidates(0.25) >>>
         pair_count := dyn_pairs.len / 2
         $cl := new_contact_list_3d()
         for _ in 0:solver_iters {
@@ -1215,7 +1250,7 @@ pub fn (world $&JointedWorld3D) step(dt f64, substeps int, solver_iters int) int
             for pi in 0:pair_count {
                 _ := world.solve_dynamic_obb_pair(dyn_pairs[pi * 2], dyn_pairs[pi * 2 + 1], inv_h2, $&cl) >>>
             }
-            world.solve_all_static_geometry(inv_h2, $&cl) >>>
+            world.solve_all_static_geometry_cached(inv_h2, $&cl, &static_cands) >>>
         }
 
         for i in 0:n {

@@ -20,6 +20,7 @@ struct CrowdAgent3D {
     area_costs []f64
     waypoints []fm.Vec3
     wp_index int
+    last_poly int
     stuck_timer f64
     repath_count int
 }
@@ -27,10 +28,12 @@ struct CrowdAgent3D {
 // Multi-agent NavMesh path-following + predictive Velocity-Obstacle / RVO steering solver.
 pub struct CrowdSolver3D {
     agents []CrowdAgent3D
+    free_slots []int
+    free_count int
 }
 
 pub fn new_crowd_solver_3d() CrowdSolver3D {
-    << CrowdSolver3D{agents: []CrowdAgent3D{}}
+    << CrowdSolver3D{agents: []CrowdAgent3D{}, free_slots: []int{}, free_count: 0}
 }
 
 pub fn (cs $&CrowdSolver3D) add_agent(
@@ -46,14 +49,13 @@ pub fn (cs $&CrowdSolver3D) add_agent(
         !fm.finite(max_speed) || max_speed <= 0.0 || !fm.finite(max_accel) || max_accel <= 0.0 {
         >> errors.new("nexus nav crowd: invalid agent parameters")
     }
-    if cs.agents.len >= MAX_CROWD_AGENTS {
+    if cs.free_count == 0 && cs.agents.len >= MAX_CROWD_AGENTS {
         >> errors.new("nexus nav crowd: agent capacity 256 exceeded")
     }
     snapped := nav.find_nearest_point(pos, include_mask) >>>
     $costs := []f64{}
     for c in area_costs { costs.push(c) }
-    id := cs.agents.len
-    cs.agents.push(CrowdAgent3D{
+    agent := CrowdAgent3D{
         active: true,
         pos: snapped.point,
         vel: fm.vec3(0.0, 0.0, 0.0),
@@ -67,9 +69,18 @@ pub fn (cs $&CrowdSolver3D) add_agent(
         area_costs: costs,
         waypoints: []fm.Vec3{},
         wp_index: 0,
+        last_poly: snapped.poly_id,
         stuck_timer: 0.0,
         repath_count: 0
-    })
+    }
+    if cs.free_count > 0 {
+        cs.free_count -= 1
+        id := cs.free_slots[cs.free_count]
+        cs.agents[id] = agent
+        << id
+    }
+    id := cs.agents.len
+    cs.agents.push(agent)
     << id
 }
 
@@ -83,7 +94,7 @@ pub fn (cs $&CrowdSolver3D) set_agent_target(
     }
     if !target.is_finite() { >> errors.new("nexus nav crowd: non-finite target") }
     ag := $&cs.agents[agent_id]
-    path := nav.find_path(ag.pos, target, ag.include_mask, &ag.area_costs) >>>
+    path := nav.find_path_hint(ag.pos, target, ag.include_mask, &ag.area_costs, ag.last_poly) >>>
     if path.len == 0 {
         ag.has_target = false
         ag.arrived = false
@@ -105,8 +116,17 @@ pub fn (cs $&CrowdSolver3D) remove_agent(agent_id int) int {
     if agent_id < 0 || agent_id >= cs.agents.len {
         >> errors.new("nexus nav crowd: invalid agent id")
     }
-    cs.agents[agent_id].active = false
-    cs.agents[agent_id].has_target = false
+    if cs.agents[agent_id].active {
+        cs.agents[agent_id].active = false
+        cs.agents[agent_id].has_target = false
+        cs.agents[agent_id].waypoints = []fm.Vec3{}
+        if cs.free_count < cs.free_slots.len {
+            cs.free_slots[cs.free_count] = agent_id
+        } else {
+            cs.free_slots.push(agent_id)
+        }
+        cs.free_count += 1
+    }
     << 0
 }
 
@@ -311,8 +331,9 @@ pub fn (cs $&CrowdSolver3D) step(dt f64, nav &NavMesh3D) int {
     $moved := 0
     for i in 0:n {
         if !cs.agents[i].active { -> }
-        hit := nav.find_nearest_point(cs.agents[i].pos, cs.agents[i].include_mask) >>>
+        hit := nav.find_nearest_point_hint(cs.agents[i].pos, cs.agents[i].include_mask, cs.agents[i].last_poly) >>>
         cs.agents[i].pos = hit.point
+        cs.agents[i].last_poly = hit.poly_id
         if cs.agents[i].has_target && !cs.agents[i].arrived {
             dx := cs.agents[i].pos.x - prev_positions[i].x
             dz := cs.agents[i].pos.z - prev_positions[i].z

@@ -419,6 +419,125 @@ fn check_end_to_end_session_and_scentree() int {
     << c1.baseline_tick()
 }
 
+fn reliable_send_rejected(ch $&netw.ReliableChannel, pay &[]u8) bool {
+    _ := ch.send(netw.CHANNEL_RELIABLE_ORDERED, netw.PKT_DATA, pay, 0.0) >>> (err) { << true }
+    << false
+}
+
+fn check_security_dedup_and_window_bounds() int {
+    // 1. Ordered receive window cap (MAX_ORDERED_WINDOW = 256) & ring-buffer flush.
+    $rx := netw.new_reliable_channel()
+    p0 := [u8(1)]
+    p1 := [u8(2)]
+    p_oob := [u8(99)]
+    // Out-of-window rseq=256 (diff=256 >= 256) must be dropped, not buffered.
+    w_oob := netw.encode_packet(netw.PacketHeader{
+        channel: netw.CHANNEL_RELIABLE_ORDERED,
+        kind: netw.PKT_DATA,
+        sequence: 1,
+        ack: 0,
+        ack_bits: 0,
+        reliable_seq: netw.MAX_ORDERED_WINDOW
+    }, &p_oob) >>>
+    d_oob := rx.on_receive(&w_oob, 10.0) >>>
+    if d_oob.len != 0 { >> errors.new("out-of-window ordered packet should not deliver") }
+
+    // Out-of-order rseq=1 then rseq=0 delivers [1, 2]; rseq=256 was NOT buffered.
+    w1 := netw.encode_packet(netw.PacketHeader{
+        channel: netw.CHANNEL_RELIABLE_ORDERED,
+        kind: netw.PKT_DATA,
+        sequence: 2,
+        ack: 0,
+        ack_bits: 0,
+        reliable_seq: 1
+    }, &p1) >>>
+    if (rx.on_receive(&w1, 20.0) >>>).len != 0 {
+        >> errors.new("rseq=1 arrived before rseq=0 and should buffer")
+    }
+    w0 := netw.encode_packet(netw.PacketHeader{
+        channel: netw.CHANNEL_RELIABLE_ORDERED,
+        kind: netw.PKT_DATA,
+        sequence: 3,
+        ack: 0,
+        ack_bits: 0,
+        reliable_seq: 0
+    }, &p0) >>>
+    d_flush := rx.on_receive(&w0, 30.0) >>>
+    if d_flush.len != 2 || int(d_flush[0].payload[0]) != 1 || int(d_flush[1].payload[0]) != 2 {
+        >> errors.new("ordered ring-buffer flush mismatch")
+    }
+
+    // 2. Reliable-unordered deduplication across retransmits (new wire seq, same reliable_seq).
+    $tx_u := netw.new_reliable_channel()
+    $rx_u := netw.new_reliable_channel()
+    u_pay := make_u32_payload(54321) >>>
+    u_pkt1 := tx_u.send(netw.CHANNEL_RELIABLE_UNORDERED, netw.PKT_DATA, &u_pay, 0.0) >>>
+    deliv1 := rx_u.on_receive(&u_pkt1, 10.0) >>>
+    if deliv1.len != 1 || read_u32_payload(&deliv1[0].payload) >>> != 54321 {
+        >> errors.new("initial reliable-unordered delivery failed")
+    }
+    // Sender receives no ACK -> retransmits with fresh wire sequence and same reliable_seq.
+    retx_u := tx_u.poll_retransmits(500.0) >>>
+    if retx_u.len != 1 { >> errors.new("expected 1 reliable-unordered retransmit") }
+    deliv2 := rx_u.on_receive(&retx_u[0].data, 510.0) >>>
+    if deliv2.len != 0 || rx_u.stats().duplicates_dropped == 0 {
+        >> errors.new("retransmitted reliable-unordered packet was delivered as duplicate")
+    }
+    // Receiver's ACK still clears sender's pending queue!
+    empty_u := []u8{}
+    hb_ack := rx_u.send(netw.CHANNEL_UNRELIABLE, netw.PKT_HEARTBEAT, &empty_u, 515.0) >>>
+    _ := tx_u.on_receive(&hb_ack, 520.0) >>>
+    if tx_u.unacked_count() != 0 {
+        >> errors.new("retransmitted reliable-unordered packet should still be ACKed")
+    }
+
+    // 3. Pending queue cap (MAX_PENDING_RELIABLE) & MAX_RELIABLE_ATTEMPTS expiry.
+    $cap_ch := netw.new_reliable_channel()
+    for i in 0:netw.MAX_PENDING_RELIABLE {
+        pl := make_u32_payload(i) >>>
+        _ := cap_ch.send(netw.CHANNEL_RELIABLE_ORDERED, netw.PKT_DATA, &pl, 0.0) >>>
+    }
+    extra_pl := make_u32_payload(9999) >>>
+    if !reliable_send_rejected($&cap_ch, &extra_pl) {
+        >> errors.new("expected pending reliable queue cap error")
+    }
+
+    $exp_ch := netw.new_reliable_channel()
+    ep := make_u32_payload(77) >>>
+    _ := exp_ch.send(netw.CHANNEL_RELIABLE_ORDERED, netw.PKT_DATA, &ep, 0.0) >>>
+    $t := 0.0
+    for _ in 0:30 {
+        t += 1200.0
+        _ := exp_ch.poll_retransmits(t) >>>
+    }
+    if exp_ch.unacked_count() != 0 {
+        >> errors.new("expected pending reliable entry to expire after MAX_RELIABLE_ATTEMPTS")
+    }
+
+    // 4. Per-message decode error isolation in ServerSession.on_packet_from_peer.
+    $srv := netw.new_server_session()
+    srv.add_peer(1, netw.default_interest_config()) >>>
+    $cli_raw := netw.new_reliable_channel()
+    // Send rseq=0 malformed (truncated input batch), then rseq=1 valid RPC; deliver rseq=1 first, then rseq=0.
+    bad_msg := [u8(netw.MSG_INPUT_BATCH)] // missing ack_snap_tick and count!
+    w_bad := cli_raw.send(netw.CHANNEL_RELIABLE_ORDERED, netw.PKT_DATA, &bad_msg, 0.0) >>>
+    $bw := netw.new_bit_writer()
+    bw.write_u8(netw.MSG_RPC_EVENT) >>>
+    bw.write_u32(88) >>>
+    rpc_body := [u8(7)]
+    bw.write_bytes(&rpc_body) >>>
+    good_msg := bw.finish()
+    w_good := cli_raw.send(netw.CHANNEL_RELIABLE_ORDERED, netw.PKT_DATA, &good_msg, 0.0) >>>
+    if (srv.on_packet_from_peer(1, &w_good, 5.0) >>>).len != 0 {
+        >> errors.new("expected rseq=1 to buffer behind rseq=0")
+    }
+    got_rpcs := srv.on_packet_from_peer(1, &w_bad, 10.0) >>>
+    if got_rpcs.len != 1 || got_rpcs[0].event_id != 88 {
+        >> errors.new("malformed message aborted subsequent valid message in same flush")
+    }
+    << 0
+}
+
 fn main() int {
     check_bitstream_and_quantization() >>> (err) {
         println("FAIL bitstream: " + err.msg())
@@ -442,6 +561,10 @@ fn main() int {
     }
     last_tick := check_end_to_end_session_and_scentree() >>> (err) {
         println("FAIL session/sceneree: " + err.msg())
+        << 1
+    }
+    check_security_dedup_and_window_bounds() >>> (err) {
+        println("FAIL security/dedup: " + err.msg())
         << 1
     }
 

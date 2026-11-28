@@ -7,6 +7,7 @@ pub const MAX_STREAM_BYTES = 2147483648
 pub const ENCODING_PCM = 1
 pub const ENCODING_FLOAT = 3
 pub const ENCODING_IMA_ADPCM = 17
+pub const ENCODING_EXTENSIBLE = 65534
 pub struct Layout {
     total int
     offset int
@@ -86,7 +87,7 @@ pub fn begin_layout(header &string, extent int) LayoutParser {
 }
 pub fn (parser &LayoutParser) position() int { << parser.position }
 pub fn (parser &LayoutParser) done() bool { << parser.position == parser.layout.total }
-// Preflight before a loader reads any payload: fmt takes 16/18/20 bytes, optional fact takes 4 bytes.
+// Preflight before a loader reads any payload: fmt takes 16/18/20/40 bytes, optional fact takes 4 bytes.
 pub fn (parser &LayoutParser) format_bytes(header &string) int {
     if header.len != 8 || parser.chunks >= 256 || parser.position < 12 || parser.layout.total - parser.position < 8 {
         >> errors.new("nexus WAV: invalid chunk table")
@@ -95,7 +96,7 @@ pub fn (parser &LayoutParser) format_bytes(header &string) int {
     room := parser.layout.total - parser.position - 8
     if size > room || size % 2 > room - size { >> errors.new("nexus WAV: chunk exceeds RIFF extent") }
     if tag(header, 0, "fmt ") {
-        if parser.saw_format || (size != 16 && size != 18 && size != 20) { >> errors.new("nexus WAV: unsupported or duplicate fmt chunk") }
+        if parser.saw_format || (size != 16 && size != 18 && size != 20 && size != 40) { >> errors.new("nexus WAV: unsupported or duplicate fmt chunk") }
         << size
     }
     if tag(header, 0, "fact") {
@@ -104,6 +105,20 @@ pub fn (parser &LayoutParser) format_bytes(header &string) int {
     }
     if tag(header, 0, "data") && parser.saw_data { >> errors.new("nexus WAV: duplicate data chunk") }
     << 0
+}
+
+fn extensible_subformat_encoding(payload &string) int {
+    guid_tail := [0, 0, 16, 0, 128, 0, 0, 170, 0, 56, 155, 113]
+    for i in 0:12 {
+        if byte_value(payload, 28 + i) != guid_tail[i] {
+            >> errors.new("nexus WAV: unsupported WAVE_FORMAT_EXTENSIBLE SubFormat GUID")
+        }
+    }
+    sub_tag := read32(payload, 24)
+    if sub_tag != ENCODING_PCM && sub_tag != ENCODING_FLOAT {
+        >> errors.new("nexus WAV: unsupported WAVE_FORMAT_EXTENSIBLE SubFormat encoding")
+    }
+    << sub_tag
 }
 pub fn (parser $&LayoutParser) accept(header &string, payload &string) int {
     required := parser.format_bytes(header) >>>
@@ -146,8 +161,30 @@ pub fn (parser $&LayoutParser) accept(header &string, payload &string) int {
             parser.layout.bits = bits
             parser.layout.samples_per_block = spb
             parser.saw_format = true
+        } else if encoding == ENCODING_EXTENSIBLE {
+            if required != 40 || read16(payload, 16) != 22 {
+                >> errors.new("nexus WAV: invalid WAVE_FORMAT_EXTENSIBLE header")
+            }
+            valid_bits := read16(payload, 18)
+            if valid_bits != 0 && valid_bits != bits {
+                >> errors.new("nexus WAV: unsupported WAVE_FORMAT_EXTENSIBLE valid_bits")
+            }
+            sub_enc := extensible_subformat_encoding(payload) >>>
+            if channels < 1 || channels > 2 || rate < 8000 || rate > 192000 ||
+                (sub_enc == ENCODING_FLOAT && bits != 32) || (bits != 8 && bits != 16 && bits != 24 && bits != 32) ||
+                alignment != channels * (bits / 8) || byte_rate != rate * alignment {
+                >> errors.new("nexus WAV: unsupported WAVE_FORMAT_EXTENSIBLE rate, bits, or alignment")
+            }
+            parser.layout.encoding = sub_enc
+            parser.layout.channels = channels
+            parser.layout.rate = rate
+            parser.layout.alignment = alignment
+            parser.layout.bits = bits
+            parser.layout.samples_per_block = 0
+            parser.saw_format = true
         } else {
             if required == 20 { >> errors.new("nexus WAV: 20-byte fmt requires IMA ADPCM encoding") }
+            if required == 40 { >> errors.new("nexus WAV: 40-byte fmt requires WAVE_FORMAT_EXTENSIBLE encoding") }
             if required == 18 && read16(payload, 16) != 0 { >> errors.new("nexus WAV: extended format unsupported") }
             if channels < 1 || channels > 2 || rate < 8000 || rate > 192000 ||
                 (encoding != ENCODING_PCM && encoding != ENCODING_FLOAT) ||
