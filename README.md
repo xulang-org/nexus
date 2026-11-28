@@ -1304,7 +1304,9 @@ GLB 表面、音频、脚本和 2D/3D 相机可保存到场景文件，实例覆
 make project-cli project-validator
 ./build/nexus-project layout
 ./build/nexus-project init ./my_game --name "Star Odyssey" --id com.studio.starodyssey --template 3d --locale zh-CN --platforms all --nexus-path "$(pwd)"
-./build/nexus-project doctor ./my_game/project.json --strict
+# 支持传目录或 project.json；可选 --fix（--dry-run 预览）、--toolchain、--category <name>、--json、--strict
+./build/nexus-project doctor ./my_game --toolchain
+./build/nexus-project doctor ./my_game --fix --dry-run
 (cd ./my_game && xu check src/main.xu && xu build src/main.xu -o build/game && ./build/game --smoke)
 ./build/nexus-project steam-stage ./my_game/project.json --output ./my_game/build/stage-steam
 ```
