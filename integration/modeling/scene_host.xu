@@ -101,6 +101,102 @@ fn close_entries(entries $&[]SceneModelEntry) {
 
 pub fn (host &SceneModeling3D) entry_count() int { << host.entries.len }
 
+pub struct ModelingPickHit {
+    pub hit bool
+    pub node_idx int
+    pub distance f64
+}
+
+pub struct ModelingSubPick {
+    pub hit bool
+    pub node_idx int
+    pub sub_mode int
+    pub index int
+    pub v0 int
+    pub v1 int
+    pub distance f64
+}
+
+pub fn (host &SceneModeling3D) pick_node(
+    tree &scene.SceneTree,
+    tree_ids &[]int,
+    origin fm.Vec3,
+    direction fm.Vec3,
+    near f64,
+    far f64
+) ModelingPickHit {
+    if host.closed {
+        << ModelingPickHit{hit: false, node_idx: -1, distance: far}
+    }
+    ray := fm.ray3d(origin, direction) or (err) {
+        _ := err
+        << ModelingPickHit{hit: false, node_idx: -1, distance: far}
+    }
+    $best := ModelingPickHit{hit: false, node_idx: -1, distance: far}
+    for i in 0:host.entries.len {
+        e := &host.entries[i]
+        if e.node_idx < 0 || e.node_idx >= tree_ids.len { -> }
+        nid := tree_ids[e.node_idx]
+        vis := tree.is_visible(nid) or (err) {
+            _ := err
+            ->
+        }
+        if !vis { -> }
+        world := tree.global_transform_3d(nid) or (err) {
+            _ := err
+            ->
+        }
+        fhit := mod.pick_face(&e.session.mesh, world, ray)
+        if fhit.hit && fhit.distance >= near && fhit.distance < best.distance {
+            best = ModelingPickHit{hit: true, node_idx: e.node_idx, distance: fhit.distance}
+        }
+    }
+    << best
+}
+
+pub fn (host &SceneModeling3D) pick_subobject_at(
+    tree &scene.SceneTree,
+    tree_ids &[]int,
+    node_idx int,
+    sub_mode int,
+    origin fm.Vec3,
+    direction fm.Vec3
+) ModelingSubPick {
+    if host.closed || sub_mode <= 0 || node_idx < 0 || node_idx >= tree_ids.len {
+        << ModelingSubPick{hit: false, node_idx: node_idx, sub_mode: sub_mode, index: -1, v0: -1, v1: -1, distance: 0.0}
+    }
+    ray := fm.ray3d(origin, direction) or (err) {
+        _ := err
+        << ModelingSubPick{hit: false, node_idx: node_idx, sub_mode: sub_mode, index: -1, v0: -1, v1: -1, distance: 0.0}
+    }
+    nid := tree_ids[node_idx]
+    world := tree.global_transform_3d(nid) or (err) {
+        _ := err
+        << ModelingSubPick{hit: false, node_idx: node_idx, sub_mode: sub_mode, index: -1, v0: -1, v1: -1, distance: 0.0}
+    }
+    for i in 0:host.entries.len {
+        e := &host.entries[i]
+        if e.node_idx != node_idx { -> }
+        if sub_mode == EDIT_MODE_VERTEX {
+            vh := mod.pick_vertex(&e.session.mesh, world, ray, 0.38)
+            if vh.hit {
+                << ModelingSubPick{hit: true, node_idx: node_idx, sub_mode: sub_mode, index: vh.vertex_id, v0: vh.vertex_id, v1: -1, distance: vh.distance}
+            }
+        } else if sub_mode == EDIT_MODE_EDGE {
+            eh := mod.pick_edge(&e.session.mesh, world, ray, 0.38)
+            if eh.hit {
+                << ModelingSubPick{hit: true, node_idx: node_idx, sub_mode: sub_mode, index: eh.v0, v0: eh.v0, v1: eh.v1, distance: eh.distance}
+            }
+        } else {
+            fh := mod.pick_face(&e.session.mesh, world, ray)
+            if fh.hit {
+                << ModelingSubPick{hit: true, node_idx: node_idx, sub_mode: sub_mode, index: fh.face_id, v0: -1, v1: -1, distance: fh.distance}
+            }
+        }
+    }
+    << ModelingSubPick{hit: false, node_idx: node_idx, sub_mode: sub_mode, index: -1, v0: -1, v1: -1, distance: 0.0}
+}
+
 pub fn (host &SceneModeling3D) draw_lit(
     device $&ren.Device3D,
     tree &scene.SceneTree,

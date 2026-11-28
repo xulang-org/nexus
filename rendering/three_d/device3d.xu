@@ -117,6 +117,16 @@ pub fn open_3d_headless(width int, height int) Device3D {
     prog := empty_shader_program_3d()
     << init_3d_session(session,&prog,width,height) or >>
 }
+pub fn open_3d_offscreen(width int, height int, backend int, program &ShaderProgram3D) Device3D {
+    target_size(width,height) or >>
+    $session := present.open_offscreen_gpu(width,height,backend,program.format) or >>
+    << init_3d_session(session,program,width,height) or >>
+}
+pub fn open_3d_offscreen_adaptive(width int, height int, backend int, program &ShaderProgram3D) Device3D {
+    target_size(width,height) or >>
+    $session := present.open_offscreen_adaptive(width,height,backend,program.format) or >>
+    << init_3d_session(session,program,width,height) or >>
+}
 
 fn open_3d_with_policy(options window.Options, backend int, program &ShaderProgram3D, policy int) Device3D {
     target_size(options.width,options.height) or >>
@@ -176,7 +186,8 @@ fn init_3d_session(session present.Session, program &ShaderProgram3D, width int,
     $blend_cw := dev.graphics_pipeline(&vs,&fs,&bdesc) or >>
     vs.close() or >>
     fs.close() or >>
-    format := sess.swapchain_format()
+    $format := sess.swapchain_format()
+    if format == 0 { format = layout.RGBA8_UNORM }
     $copying := presentation_pipeline(dev,program,format) or >>
     $resolving := presentation_pipeline(dev,program,layout.RGBA8_UNORM) or >>
     sw := size[0]
@@ -282,6 +293,31 @@ pub fn (device &Device3D) render_height() int {
 pub fn (device &Device3D) max_render_pixels() int {
     device.alive() or >>
     << device.max_render_pixels
+}
+pub fn (device $&Device3D) resize_offscreen(width int, height int) int {
+    device.alive() or >>
+    if device.active { >> errors.new("nexus 3D: cannot resize while frame is active") }
+    if device.session.has_display_window() { >> errors.new("nexus 3D: resize_offscreen requires windowless device") }
+    target_size(width, height) or >>
+    if !device.is_gpu() {
+        sess := $&device.session
+        sess.ensure_software_size(width, height) or >>
+        device.target_width = width
+        device.target_height = height
+        << 0
+    }
+    desired := bounded_render_size(width, height, device.max_render_pixels, device.render_scale) or >>
+    if desired[0] == device.target_width && desired[1] == device.target_height { << 0 }
+    dev := device.gpu_device() or >>
+    targets := render_targets(dev, desired[0], desired[1], device.render_scale) or >>
+    close_textures($&device.targets)
+    device.targets = targets
+    device.target_width = desired[0]
+    device.target_height = desired[1]
+    sess := $&device.session
+    sess.width = width
+    sess.height = height
+    << 0
 }
 pub fn (device &Device3D) poll() events.Event {
     device.alive() or >>

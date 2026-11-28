@@ -28,7 +28,6 @@ RELEASE_TOOLS = (
     "nexus-project",
     "nexus-project-validate",
     "nexus-project-viewport",
-    "nexus-studio",
     "xu-nexus-script",
     "nexus-project-editor",
     "nexus-tilemap-editor",

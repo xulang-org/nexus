@@ -1,0 +1,1383 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+resource #"github.com/xulang-org/nexus/resources/scene"
+#ui
+#ui/draw
+#ui/layout
+widgets #ui/widgets
+#math
+#path/filepath
+#strconv
+#strings
+#time
+
+// Center modeling bar + Inspector modeling button indices (keep 0..17 stable)
+pub const MB_BOX = 0
+pub const MB_WEDGE = 1
+pub const MB_STAIR = 2
+pub const MB_CYL = 3
+pub const MB_ARCH = 4
+pub const MB_CSG = 5
+pub const MB_MODE_OBJ = 6
+pub const MB_MODE_VERT = 7
+pub const MB_MODE_EDGE = 8
+pub const MB_MODE_FACE = 9
+pub const MB_EXTRUDE = 10
+pub const MB_INSET = 11
+pub const MB_BEVEL = 12
+pub const MB_UV = 13
+pub const MB_WIRE = 14
+pub const MB_MAT_APPLY = 15
+pub const MB_MAT_CLEAR = 16
+pub const MB_EXPORT_GLB = 17
+pub const MB_GIZMO_MOVE = 18
+pub const MB_GIZMO_ROT = 19
+pub const MB_GIZMO_SCALE = 20
+pub const MB_SPHERE = 21
+pub const MB_SUBDIV = 22
+pub const MB_FLIP = 23
+pub const MB_DEL_FACE = 24
+pub const MB_WELD = 25
+pub const MB_CSG_ADD_BOX = 26
+pub const MB_CSG_ADD_CUT = 27
+pub const MB_CSG_CYCLE = 28
+pub const MB_CSG_BAKE = 29
+pub const MB_PRESET_0 = 30
+pub const MB_PRESET_1 = 31
+pub const MB_PRESET_2 = 32
+pub const MB_PRESET_3 = 33
+pub const MB_PRESET_4 = 34
+pub const MB_MAT_TWOSIDED = 35
+pub const MB_PRESET_5 = 36
+pub const MB_PRESET_6 = 37
+pub const MB_PRESET_7 = 38
+pub const MB_PRESET_8 = 39
+pub const MB_PRESET_9 = 40
+
+// Inspector PBR & modeling field indices
+pub const MF_R = 0
+pub const MF_G = 1
+pub const MF_B = 2
+pub const MF_METALLIC = 3
+pub const MF_ROUGHNESS = 4
+pub const MF_OP_STEP = 5
+pub const MF_EMIT = 6
+
+pub struct ModelingPreset {
+    pub r f64
+    pub g f64
+    pub b f64
+    pub metallic f64
+    pub roughness f64
+    pub emit f64
+}
+
+pub fn modeling_preset_spec(idx int) ModelingPreset {
+    if idx == 1 { << ModelingPreset{r: 0.18, g: 0.19, b: 0.22, metallic: 0.10, roughness: 0.65, emit: 0.0} }
+    if idx == 2 { << ModelingPreset{r: 0.84, g: 0.16, b: 0.26, metallic: 0.05, roughness: 0.52, emit: 0.0} }
+    if idx == 3 { << ModelingPreset{r: 0.92, g: 0.72, b: 0.24, metallic: 0.58, roughness: 0.32, emit: 0.0} }
+    if idx == 4 { << ModelingPreset{r: 0.96, g: 0.40, b: 0.22, metallic: 0.05, roughness: 0.35, emit: 1.8} }
+    if idx == 5 { << ModelingPreset{r: 0.16, g: 0.68, b: 0.44, metallic: 0.04, roughness: 0.55, emit: 0.0} }
+    if idx == 6 { << ModelingPreset{r: 0.18, g: 0.46, b: 0.88, metallic: 0.06, roughness: 0.48, emit: 0.0} }
+    if idx == 7 { << ModelingPreset{r: 0.55, g: 0.30, b: 0.84, metallic: 0.08, roughness: 0.46, emit: 0.0} }
+    if idx == 8 { << ModelingPreset{r: 0.74, g: 0.77, b: 0.82, metallic: 0.55, roughness: 0.30, emit: 0.0} }
+    if idx == 9 { << ModelingPreset{r: 0.56, g: 0.37, b: 0.23, metallic: 0.02, roughness: 0.78, emit: 0.0} }
+    << ModelingPreset{r: 0.94, g: 0.93, b: 0.90, metallic: 0.02, roughness: 0.82, emit: 0.0}
+}
+
+pub struct ModelingPanel {
+    pub id_model_bar int
+    pub id_bar_div1 int
+    pub id_bar_div2 int
+    pub id_bar_spacer int
+    pub id_mat_div int
+    pub id_mat_hdr_row int
+    pub id_mat_hdr int
+    pub id_mat_swatch int
+    pub id_mat_empty int
+    pub id_mesh_stats int
+    pub id_mesh_ops_row int
+    pub id_csg_row int
+    pub id_mat_preset_row int
+    pub id_mat_preset_row2 int
+    pub id_mat_rgb_row int
+    pub id_mat_mr_row int
+    pub id_mat_tex_row int
+    pub id_mat_tex_select int
+    pub id_mat_btn_row int
+
+    pub buttons []widgets.Button
+    pub button_ids []int
+    pub btn_labels []widgets.StyledLabel
+    pub fields []widgets.Field
+    pub field_ids []int
+    pub div widgets.Divider
+    pub mesh_stats_txt widgets.SelectableText
+    pub mat_tex_select widgets.Select
+    pub mat_tex_labels []widgets.StyledLabel
+    pub mat_tex_uids []string
+    pub mat_tex_origin layout.Rect
+    pub no_tex_lbl widgets.StyledLabel
+
+    pub mat_preview_color draw.Color
+    pub has_active_mesh bool
+    pub has_active_mat bool
+    pub active_is_csg bool
+    pub mat_two_sided bool
+    pub mat_dirty bool
+    pub active_preset int
+    pub mat_seeds []string
+    pub mat_seed_two_sided bool
+    pub mat_seed_tex int
+    pub stage_3d_visible bool
+    pub bar_visible bool
+    pub card_visible bool
+    pub csg_visible bool
+    pub stats_visible bool
+}
+
+fn set_m_btn(
+    m $&ModelingPanel,
+    view $&widgets.View,
+    parent int,
+    idx int,
+    w f64,
+    h f64,
+    ctx &draw.Context,
+    id_ev &ui.CanvasEvent,
+    title string
+) int {
+    nid := add_interactive(view, parent, &leaf_box(w, h), ui.CURSOR_HAND, true)
+    b := widgets.button(id_ev, nid, &zero_rect()) or >>
+    m.button_ids[idx] = nid
+    m.buttons[idx] = b
+    dispose_label($&m.btn_labels[idx])
+    m.btn_labels[idx] = widgets.styled_label(ctx, &title)
+    << nid
+}
+
+fn push_m_field(
+    m $&ModelingPanel,
+    view $&widgets.View,
+    parent int,
+    w f64,
+    h f64,
+    ctx &draw.Context,
+    id_ev &ui.CanvasEvent,
+    label string,
+    val string
+) int {
+    nid := add_interactive(view, parent, &leaf_box(w, h), ui.CURSOR_TEXT, true)
+    view.set_capture_outside(nid, true) or >>
+    f := make_plain_field(ctx, id_ev, nid, label, val)
+    m.field_ids.push(nid)
+    m.fields.push(f)
+    << nid
+}
+
+fn is_stage_3d_btn_idx(idx int) bool {
+    << (idx >= MB_BOX && idx <= MB_CSG) || idx == MB_WIRE ||
+        (idx >= MB_GIZMO_MOVE && idx <= MB_GIZMO_SCALE) || idx == MB_SPHERE
+}
+
+fn is_bar_btn_idx(idx int) bool {
+    << (idx >= MB_MODE_OBJ && idx <= MB_UV) || idx == MB_EXPORT_GLB ||
+        (idx >= MB_SUBDIV && idx <= MB_CSG_BAKE)
+}
+
+fn is_csg_btn_idx(idx int) bool {
+    << idx >= MB_CSG_ADD_BOX && idx <= MB_CSG_BAKE
+}
+
+pub fn create_modeling_stage_left(
+    view $&widgets.View,
+    id_stage_bar int,
+    ctx &draw.Context,
+    id_ev &ui.CanvasEvent
+) ModelingPanel {
+    $btns := []widgets.Button{}
+    $bids := []int{}
+    $blbls := []widgets.StyledLabel{}
+    for bi in 0:(MB_PRESET_9 + 1) {
+        btns.push(widgets.button(id_ev, 1, &zero_rect()) or >>)
+        bids.push(0)
+        blbls.push(widgets.styled_label(ctx, &""))
+    }
+    $m := ModelingPanel{
+        id_model_bar: 0,
+        id_bar_div1: 0,
+        id_bar_div2: 0,
+        id_bar_spacer: 0,
+        id_mat_div: 0,
+        id_mat_hdr_row: 0,
+        id_mat_hdr: 0,
+        id_mat_swatch: 0,
+        id_mat_empty: 0,
+        id_mesh_stats: 0,
+        id_mesh_ops_row: 0,
+        id_csg_row: 0,
+        id_mat_preset_row: 0,
+        id_mat_preset_row2: 0,
+        id_mat_rgb_row: 0,
+        id_mat_mr_row: 0,
+        id_mat_tex_row: 0,
+        id_mat_tex_select: 0,
+        id_mat_btn_row: 0,
+        buttons: btns,
+        button_ids: bids,
+        btn_labels: blbls,
+        fields: []widgets.Field{},
+        field_ids: []int{},
+        div: widgets.divider(&zero_rect(), widgets.AXIS_HORIZONTAL) or >>,
+        mesh_stats_txt: widgets.selectable_text(ctx, id_ev, id_stage_bar, &zero_rect(), &"") or >>,
+        mat_tex_select: widgets.select_box(id_ev, 1, &zero_rect(), 1, 0) or >>,
+        mat_tex_labels: []widgets.StyledLabel{},
+        mat_tex_uids: [""],
+        mat_tex_origin: zero_rect(),
+        no_tex_lbl: widgets.styled_label(ctx, &"(No Texture)"),
+        mat_preview_color: draw.rgb(219, 214, 204),
+        has_active_mesh: false,
+        has_active_mat: false,
+        active_is_csg: false,
+        mat_two_sided: false,
+        mat_dirty: false,
+        active_preset: -1,
+        mat_seeds: ["0.86", "0.84", "0.80", "0.0", "0.72", "0.25", "0"],
+        mat_seed_two_sided: false,
+        mat_seed_tex: 0,
+        stage_3d_visible: true,
+        bar_visible: false,
+        card_visible: false,
+        csg_visible: false,
+        stats_visible: false
+    }
+
+    // Primary Stage Bar left: Gizmo tools (Move / Rotate / Scale) | Create Whitebox / CSG
+    _ := set_m_btn($&m, view, id_stage_bar, MB_GIZMO_MOVE, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn($&m, view, id_stage_bar, MB_GIZMO_ROT, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn($&m, view, id_stage_bar, MB_GIZMO_SCALE, 24.0, 24.0, ctx, id_ev, "")
+    m.id_bar_div1 = add_box(view, id_stage_bar, &leaf_box(6.0, 20.0))
+    _ := set_m_btn($&m, view, id_stage_bar, MB_BOX, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn($&m, view, id_stage_bar, MB_WEDGE, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn($&m, view, id_stage_bar, MB_STAIR, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn($&m, view, id_stage_bar, MB_CYL, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn($&m, view, id_stage_bar, MB_ARCH, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn($&m, view, id_stage_bar, MB_SPHERE, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn($&m, view, id_stage_bar, MB_CSG, 24.0, 24.0, ctx, id_ev, "")
+    << m
+}
+
+pub fn attach_modeling_stage_right(
+    m $&ModelingPanel,
+    view $&widgets.View,
+    id_stage_bar int,
+    ctx &draw.Context,
+    id_ev &ui.CanvasEvent
+) int {
+    _ := set_m_btn(m, view, id_stage_bar, MB_WIRE, 24.0, 24.0, ctx, id_ev, "")
+    << 0
+}
+
+pub fn attach_modeling_subbar(
+    m $&ModelingPanel,
+    view $&widgets.View,
+    id_center_pane int,
+    inner_cw f64,
+    ctx &draw.Context,
+    id_ev &ui.CanvasEvent
+) int {
+    $mb := row_box(inner_cw, 0.0, 2.0)
+    mb.clip = true
+    mbar := add_box(view, id_center_pane, &mb)
+    m.id_model_bar = mbar
+
+    // Sub-modes (Obj / Vert / Edge / Face)
+    _ := set_m_btn(m, view, mbar, MB_MODE_OBJ, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn(m, view, mbar, MB_MODE_VERT, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn(m, view, mbar, MB_MODE_EDGE, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn(m, view, mbar, MB_MODE_FACE, 24.0, 24.0, ctx, id_ev, "")
+    m.id_bar_div2 = add_box(view, mbar, &leaf_box(6.0, 20.0))
+
+    // Mesh ops (Extrude / Inset / Bevel / Subdiv / Flip / DelFace / Weld / UV)
+    _ := set_m_btn(m, view, mbar, MB_EXTRUDE, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn(m, view, mbar, MB_INSET, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn(m, view, mbar, MB_BEVEL, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn(m, view, mbar, MB_SUBDIV, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn(m, view, mbar, MB_FLIP, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn(m, view, mbar, MB_DEL_FACE, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn(m, view, mbar, MB_WELD, 24.0, 24.0, ctx, id_ev, "")
+    _ := set_m_btn(m, view, mbar, MB_UV, 24.0, 24.0, ctx, id_ev, "")
+
+    // CSG Brush buttons (shown when CSG node selected)
+    _ := set_m_btn(m, view, mbar, MB_CSG_ADD_BOX, 48.0, 24.0, ctx, id_ev, "+Box")
+    _ := set_m_btn(m, view, mbar, MB_CSG_ADD_CUT, 48.0, 24.0, ctx, id_ev, "-Cut")
+    _ := set_m_btn(m, view, mbar, MB_CSG_CYCLE, 36.0, 24.0, ctx, id_ev, "Op")
+    _ := set_m_btn(m, view, mbar, MB_CSG_BAKE, 46.0, 24.0, ctx, id_ev, "Bake")
+    << 0
+}
+
+pub fn attach_modeling_inspector(
+    m $&ModelingPanel,
+    view $&widgets.View,
+    id_mat_tab int,
+    id_comp_tab int,
+    scroll_cw f64,
+    ctx &draw.Context,
+    id_ev &ui.CanvasEvent
+) int {
+    m.id_mat_empty = add_box(view, id_mat_tab, &leaf_box(scroll_cw, 0.0))
+    m.id_mat_div = add_box(view, id_mat_tab, &leaf_box(scroll_cw, 0.0))
+    hrow := add_box(view, id_mat_tab, &row_box(scroll_cw, 20.0, 6.0))
+    m.id_mat_hdr_row = hrow
+    m.id_mat_hdr = add_box(view, hrow, &leaf_box(math.max(90.0, scroll_cw - 54.0), 20.0))
+    m.id_mat_swatch = add_box(view, hrow, &leaf_box(48.0, 18.0))
+
+    pre_row := add_box(view, id_mat_tab, &row_box(scroll_cw, 22.0, 4.0))
+    m.id_mat_preset_row = pre_row
+    pre_row2 := add_box(view, id_mat_tab, &row_box(scroll_cw, 22.0, 4.0))
+    m.id_mat_preset_row2 = pre_row2
+    rgb_row := add_box(view, id_mat_tab, &row_box(scroll_cw, 38.0, 4.0))
+    m.id_mat_rgb_row = rgb_row
+    mr_row := add_box(view, id_mat_tab, &row_box(scroll_cw, 38.0, 4.0))
+    m.id_mat_mr_row = mr_row
+    tex_row := add_box(view, id_mat_tab, &row_box(scroll_cw, 28.0, 4.0))
+    m.id_mat_tex_row = tex_row
+    btn_row := add_box(view, id_mat_tab, &row_box(scroll_cw, 28.0, 4.0))
+    m.id_mat_btn_row = btn_row
+    m.id_mesh_ops_row = m.id_model_bar
+    m.id_csg_row = m.id_model_bar
+
+    // MF_R(0)..MF_ROUGHNESS(4)
+    tri_w := (scroll_cw - 8.0) / 3.0
+    _ := push_m_field(m, view, rgb_row, tri_w, 38.0, ctx, id_ev, "R", "0.86")
+    _ := push_m_field(m, view, rgb_row, tri_w, 38.0, ctx, id_ev, "G", "0.84")
+    _ := push_m_field(m, view, rgb_row, tri_w, 38.0, ctx, id_ev, "B", "0.80")
+
+    _ := push_m_field(m, view, mr_row, tri_w, 38.0, ctx, id_ev, "Metal", "0.08")
+    _ := push_m_field(m, view, mr_row, tri_w, 38.0, ctx, id_ev, "Rough", "0.62")
+
+    // MF_OP_STEP(5) + spacer + MB_EXPORT_GLB(17) inside m.id_model_bar
+    _ := push_m_field(m, view, m.id_model_bar, 64.0, 26.0, ctx, id_ev, "", "0.30")
+    m.id_bar_spacer = add_box(view, m.id_model_bar, &leaf_box(8.0, 20.0))
+    _ := set_m_btn(m, view, m.id_model_bar, MB_EXPORT_GLB, 72.0, 24.0, ctx, id_ev, "Export GLB")
+
+    // MF_EMIT(6)
+    _ := push_m_field(m, view, mr_row, tri_w, 38.0, ctx, id_ev, "Emit", "0")
+
+    // 10 Color Presets (2 rows x 5)
+    pre_w := (scroll_cw - 16.0) / 5.0
+    for pi in 0:5 {
+        _ := set_m_btn(m, view, pre_row, MB_PRESET_0 + pi, pre_w, 20.0, ctx, id_ev, "")
+    }
+    for pi in 0:5 {
+        _ := set_m_btn(m, view, pre_row2, MB_PRESET_5 + pi, pre_w, 20.0, ctx, id_ev, "")
+    }
+
+    // Texture select + 2S toggle
+    tsid := add_interactive(view, tex_row, &leaf_box(math.max(80.0, scroll_cw - 32.0), 26.0), ui.CURSOR_HAND, true)
+    m.id_mat_tex_select = tsid
+    m.mat_tex_select = widgets.select_box(id_ev, tsid, &zero_rect(), 1, 0) or >>
+    _ := set_m_btn(m, view, tex_row, MB_MAT_TWOSIDED, 28.0, 26.0, ctx, id_ev, "")
+
+    // MB_MAT_APPLY(15, collapsed 0x0 — unified Apply Changes handles commit) + MB_MAT_CLEAR(16)
+    _ := set_m_btn(m, view, btn_row, MB_MAT_APPLY, 0.0, 0.0, ctx, id_ev, "")
+    _ := set_m_btn(m, view, btn_row, MB_MAT_CLEAR, scroll_cw, 26.0, ctx, id_ev, "Reset Material")
+
+    // Mesh stats inside Components tab (visible when node has EditableMesh/CSG)
+    mstats := add_interactive(view, id_comp_tab, &leaf_box(scroll_cw, 0.0), ui.CURSOR_TEXT, true)
+    m.id_mesh_stats = mstats
+    view.set_capture_outside(mstats, true) or >>
+    dispose_sel_text($&m.mesh_stats_txt)
+    m.mesh_stats_txt = widgets.selectable_text(ctx, id_ev, mstats, &zero_rect(), &"No editable mesh") or >>
+    set_text_ellipsis($&m.mesh_stats_txt, true)
+    << 0
+}
+
+pub fn modeling_dispose(m $&ModelingPanel) {
+    for i in 0:m.fields.len { dispose_field($&m.fields[i]) }
+    for i in 0:m.btn_labels.len { dispose_label($&m.btn_labels[i]) }
+    for i in 0:m.mat_tex_labels.len { dispose_label($&m.mat_tex_labels[i]) }
+    dispose_label($&m.no_tex_lbl)
+    dispose_sel_text($&m.mesh_stats_txt)
+}
+
+pub fn modeling_refresh_textures(m $&ModelingPanel, ctx &draw.Context, proj &Project, lang int) {
+    for i in 0:m.mat_tex_labels.len { dispose_label($&m.mat_tex_labels[i]) }
+    m.mat_tex_labels = []widgets.StyledLabel{}
+    m.mat_tex_uids = []string{}
+    none_t := tr(lang, "(No Texture)", "(无贴图)")
+    set_lbl_text($&m.no_tex_lbl, &none_t)
+    m.mat_tex_labels.push(widgets.styled_label(ctx, &none_t))
+    m.mat_tex_uids.push("")
+    for i in 0:proj.assets.len {
+        a := &proj.assets[i]
+        ext := strings.to_lower(&filepath.ext(&a.path))
+        if ext == ".png" {
+            lbl := filepath.base(&a.path)
+            m.mat_tex_labels.push(widgets.styled_label(ctx, &lbl))
+            m.mat_tex_uids.push(a.key + "")
+        }
+    }
+    cnt := min_int_val(m.mat_tex_labels.len, 64)
+    prev := m.mat_tex_select.selected()
+    set_sel_count($&m.mat_tex_select, cnt)
+    if prev >= 0 && prev < cnt {
+        set_sel_selected($&m.mat_tex_select, prev)
+    } else {
+        set_sel_selected($&m.mat_tex_select, 0)
+    }
+}
+
+pub fn modeling_close_selects(m $&ModelingPanel) {
+    if m.mat_tex_select.is_open() {
+        set_sel_open($&m.mat_tex_select, false)
+    }
+}
+
+pub fn modeling_sync_layout(
+    m $&ModelingPanel,
+    view $&widgets.View,
+    icw f64,
+    scroll_cw f64,
+    stage_3d_vis bool,
+    has_node3d_mat bool,
+    mat_tab_vis bool,
+    comp_tab_vis bool
+) int {
+    m.stage_3d_visible = stage_3d_vis
+    m.bar_visible = stage_3d_vis && (m.has_active_mesh || m.active_is_csg)
+    m.csg_visible = m.bar_visible && m.active_is_csg
+    m.card_visible = mat_tab_vis && has_node3d_mat
+    m.stats_visible = comp_tab_vis && m.has_active_mesh
+
+    // Primary Stage Bar left/right 3D controls
+    $siw := 24.0
+    if icw < 480.0 { siw = 22.0 }
+    if stage_3d_vis {
+        for bid in [MB_GIZMO_MOVE, MB_GIZMO_ROT, MB_GIZMO_SCALE, MB_BOX, MB_WEDGE, MB_STAIR, MB_CYL, MB_ARCH, MB_SPHERE, MB_CSG, MB_WIRE] {
+            view.set_style(m.button_ids[bid], &leaf_box(siw, 24.0)) or >>
+        }
+        view.set_style(m.id_bar_div1, &leaf_box(6.0, 20.0)) or >>
+    } else {
+        for bid in [MB_GIZMO_MOVE, MB_GIZMO_ROT, MB_GIZMO_SCALE, MB_BOX, MB_WEDGE, MB_STAIR, MB_CYL, MB_ARCH, MB_SPHERE, MB_CSG, MB_WIRE] {
+            view.set_style(m.button_ids[bid], &leaf_box(0.0, 0.0)) or >>
+        }
+        view.set_style(m.id_bar_div1, &leaf_box(0.0, 0.0)) or >>
+    }
+
+    // Contextual sub-bar (only visible for EditableMesh or CSG nodes in 3D/Split)
+    if m.bar_visible {
+        $iw := 24.0
+        $divw := 6.0
+        $step_w := 64.0
+        $exp_w := 74.0
+        $csg_bw := 52.0
+        if icw < 490.0 {
+            iw = 19.0
+            divw = 4.0
+            step_w = 54.0
+            exp_w = 58.0
+            csg_bw = 46.0
+        }
+        gap := 2.0
+        $mb := row_box(icw, 34.0, gap)
+        mb.clip = true
+        mb.padding = layout.Insets{left: 4.0, top: 2.0, right: 4.0, bottom: 6.0}
+        view.set_style(m.id_model_bar, &mb) or >>
+
+        if m.csg_visible {
+            for bid in [MB_MODE_OBJ, MB_MODE_VERT, MB_MODE_EDGE, MB_MODE_FACE, MB_EXTRUDE, MB_INSET, MB_BEVEL, MB_SUBDIV, MB_FLIP, MB_DEL_FACE, MB_WELD, MB_UV] {
+                view.set_style(m.button_ids[bid], &leaf_box(0.0, 0.0)) or >>
+            }
+            view.set_style(m.id_bar_div2, &leaf_box(0.0, 0.0)) or >>
+            view.set_style(m.field_ids[MF_OP_STEP], &leaf_box(0.0, 0.0)) or >>
+            for bid in MB_CSG_ADD_BOX:(MB_CSG_BAKE + 1) {
+                view.set_style(m.button_ids[bid], &leaf_box(csg_bw, 24.0)) or >>
+            }
+            view.set_style(m.button_ids[MB_EXPORT_GLB], &leaf_box(exp_w, 24.0)) or >>
+            used := 8.0 + 4.0 * csg_bw + exp_w + 19.0 * gap
+            spacer := math.max(2.0, icw - used)
+            view.set_style(m.id_bar_spacer, &leaf_box(spacer, 20.0)) or >>
+        } else {
+            for bid in [MB_MODE_OBJ, MB_MODE_VERT, MB_MODE_EDGE, MB_MODE_FACE, MB_EXTRUDE, MB_INSET, MB_BEVEL, MB_SUBDIV, MB_FLIP, MB_DEL_FACE, MB_WELD, MB_UV] {
+                view.set_style(m.button_ids[bid], &leaf_box(iw, 24.0)) or >>
+            }
+            view.set_style(m.id_bar_div2, &leaf_box(divw, 18.0)) or >>
+            view.set_style(m.field_ids[MF_OP_STEP], &leaf_box(step_w, 26.0)) or >>
+            for bid in MB_CSG_ADD_BOX:(MB_CSG_BAKE + 1) {
+                view.set_style(m.button_ids[bid], &leaf_box(0.0, 0.0)) or >>
+            }
+            view.set_style(m.button_ids[MB_EXPORT_GLB], &leaf_box(exp_w, 24.0)) or >>
+            used := 8.0 + 12.0 * iw + divw + step_w + exp_w + 19.0 * gap
+            spacer := math.max(2.0, icw - used)
+            view.set_style(m.id_bar_spacer, &leaf_box(spacer, 20.0)) or >>
+        }
+    } else {
+        $mb := row_box(icw, 0.0, 0.0)
+        mb.clip = true
+        view.set_style(m.id_model_bar, &mb) or >>
+        view.set_style(m.id_bar_div2, &leaf_box(0.0, 0.0)) or >>
+        view.set_style(m.id_bar_spacer, &leaf_box(0.0, 0.0)) or >>
+        for bid in [MB_MODE_OBJ, MB_MODE_VERT, MB_MODE_EDGE, MB_MODE_FACE, MB_EXTRUDE, MB_INSET, MB_BEVEL, MB_SUBDIV, MB_FLIP, MB_DEL_FACE, MB_WELD, MB_UV, MB_EXPORT_GLB] {
+            view.set_style(m.button_ids[bid], &leaf_box(0.0, 0.0)) or >>
+        }
+        for bid in MB_CSG_ADD_BOX:(MB_CSG_BAKE + 1) {
+            view.set_style(m.button_ids[bid], &leaf_box(0.0, 0.0)) or >>
+        }
+        view.set_style(m.field_ids[MF_OP_STEP], &leaf_box(0.0, 0.0)) or >>
+    }
+
+    if m.stats_visible {
+        view.set_style(m.id_mesh_stats, &leaf_box(scroll_cw, 20.0)) or >>
+    } else {
+        view.set_style(m.id_mesh_stats, &leaf_box(scroll_cw, 0.0)) or >>
+    }
+
+    if mat_tab_vis && !has_node3d_mat {
+        view.set_style(m.id_mat_empty, &leaf_box(scroll_cw, 44.0)) or >>
+    } else {
+        view.set_style(m.id_mat_empty, &leaf_box(scroll_cw, 0.0)) or >>
+    }
+
+    if !m.card_visible {
+        z0 := leaf_box(scroll_cw, 0.0)
+        r0 := row_box(scroll_cw, 0.0, 0.0)
+        view.set_style(m.id_mat_div, &z0) or >>
+        view.set_style(m.id_mat_hdr_row, &r0) or >>
+        view.set_style(m.id_mat_hdr, &leaf_box(0.0, 0.0)) or >>
+        view.set_style(m.id_mat_swatch, &leaf_box(0.0, 0.0)) or >>
+        view.set_style(m.id_mat_preset_row, &r0) or >>
+        view.set_style(m.id_mat_preset_row2, &r0) or >>
+        view.set_style(m.id_mat_rgb_row, &r0) or >>
+        view.set_style(m.id_mat_mr_row, &r0) or >>
+        view.set_style(m.id_mat_tex_row, &r0) or >>
+        view.set_style(m.id_mat_btn_row, &r0) or >>
+        for i in 0:5 { view.set_style(m.field_ids[i], &leaf_box(0.0, 0.0)) or >> }
+        view.set_style(m.field_ids[MF_EMIT], &leaf_box(0.0, 0.0)) or >>
+        for i in [MB_MAT_APPLY, MB_MAT_CLEAR, MB_MAT_TWOSIDED] {
+            view.set_style(m.button_ids[i], &leaf_box(0.0, 0.0)) or >>
+        }
+        for i in MB_PRESET_0:(MB_PRESET_4 + 1) { view.set_style(m.button_ids[i], &leaf_box(0.0, 0.0)) or >> }
+        for i in MB_PRESET_5:(MB_PRESET_9 + 1) { view.set_style(m.button_ids[i], &leaf_box(0.0, 0.0)) or >> }
+        view.set_style(m.id_mat_tex_select, &leaf_box(0.0, 0.0)) or >>
+        << 0
+    }
+
+    view.set_style(m.id_mat_div, &leaf_box(scroll_cw, 0.0)) or >>
+    view.set_style(m.id_mat_hdr_row, &row_box(scroll_cw, 20.0, 6.0)) or >>
+    view.set_style(m.id_mat_hdr, &leaf_box(math.max(90.0, scroll_cw - 54.0), 20.0)) or >>
+    view.set_style(m.id_mat_swatch, &leaf_box(48.0, 18.0)) or >>
+
+    // 10 Color & Material presets (2 rows x 5)
+    pre_w := (scroll_cw - 16.0) / 5.0
+    view.set_style(m.id_mat_preset_row, &row_box(scroll_cw, 22.0, 4.0)) or >>
+    for i in MB_PRESET_0:(MB_PRESET_4 + 1) {
+        view.set_style(m.button_ids[i], &leaf_box(pre_w, 20.0)) or >>
+    }
+    view.set_style(m.id_mat_preset_row2, &row_box(scroll_cw, 22.0, 4.0)) or >>
+    for i in MB_PRESET_5:(MB_PRESET_9 + 1) {
+        view.set_style(m.button_ids[i], &leaf_box(pre_w, 20.0)) or >>
+    }
+
+    tri_w := (scroll_cw - 8.0) / 3.0
+    view.set_style(m.id_mat_rgb_row, &row_box(scroll_cw, 38.0, 4.0)) or >>
+    view.set_style(m.field_ids[MF_R], &leaf_box(tri_w, 38.0)) or >>
+    view.set_style(m.field_ids[MF_G], &leaf_box(tri_w, 38.0)) or >>
+    view.set_style(m.field_ids[MF_B], &leaf_box(tri_w, 38.0)) or >>
+
+    view.set_style(m.id_mat_mr_row, &row_box(scroll_cw, 38.0, 4.0)) or >>
+    view.set_style(m.field_ids[MF_METALLIC], &leaf_box(tri_w, 38.0)) or >>
+    view.set_style(m.field_ids[MF_ROUGHNESS], &leaf_box(tri_w, 38.0)) or >>
+    view.set_style(m.field_ids[MF_EMIT], &leaf_box(tri_w, 38.0)) or >>
+
+    view.set_style(m.id_mat_tex_row, &row_box(scroll_cw, 28.0, 4.0)) or >>
+    view.set_style(m.id_mat_tex_select, &leaf_box(math.max(80.0, scroll_cw - 32.0), 26.0)) or >>
+    view.set_style(m.button_ids[MB_MAT_TWOSIDED], &leaf_box(28.0, 26.0)) or >>
+
+    view.set_style(m.id_mat_btn_row, &row_box(scroll_cw, 28.0, 0.0)) or >>
+    view.set_style(m.button_ids[MB_MAT_APPLY], &leaf_box(0.0, 0.0)) or >>
+    view.set_style(m.button_ids[MB_MAT_CLEAR], &leaf_box(scroll_cw, 26.0)) or >>
+    << 0
+}
+
+pub fn modeling_apply_styles(m $&ModelingPanel, styles &widgets.Styles, pal &PaperPalette) {
+    ico_sub := icon_button_style(styles, widgets.BUTTON_SUBTLE)
+    pill_sec := pill_button_style(styles, widgets.BUTTON_SECONDARY)
+    cmp_sec := compact_button_style(styles, widgets.BUTTON_SECONDARY)
+    cmp_sub := compact_button_style(styles, widgets.BUTTON_SUBTLE)
+    cmp_pri := compact_button_style(styles, widgets.BUTTON_PRIMARY)
+    for i in 0:15 { set_btn_style($&m.buttons[i], &ico_sub) }
+    set_btn_style($&m.buttons[MB_MAT_APPLY], &cmp_sub)
+    set_btn_style($&m.buttons[MB_MAT_CLEAR], &cmp_sub)
+    set_btn_style($&m.buttons[MB_EXPORT_GLB], &cmp_sec)
+    for i in MB_GIZMO_MOVE:(MB_WELD + 1) { set_btn_style($&m.buttons[i], &ico_sub) }
+    for i in MB_CSG_ADD_BOX:(MB_CSG_BAKE + 1) { set_btn_style($&m.buttons[i], &pill_sec) }
+    set_btn_style($&m.buttons[MB_CSG_BAKE], &cmp_pri)
+    for i in MB_PRESET_0:(MB_PRESET_4 + 1) { set_btn_style($&m.buttons[i], &ico_sub) }
+    set_btn_style($&m.buttons[MB_MAT_TWOSIDED], &ico_sub)
+    for i in MB_PRESET_5:(MB_PRESET_9 + 1) { set_btn_style($&m.buttons[i], &ico_sub) }
+
+    cs := compact_select_style(styles)
+    set_sel_style($&m.mat_tex_select, &cs)
+
+    cf := compact_field_style(styles)
+    for i in 0:m.fields.len {
+        if i == MF_OP_STEP {
+            $inf := inline_field_style(styles)
+            inf.inherit_font = false
+            inf.font = widgets.font_style(11.5)
+            inf.padding = layout.Insets{left: 6.0, top: 2.0, right: 6.0, bottom: 2.0}
+            set_field_style($&m.fields[i], &inf)
+        } else {
+            set_field_style($&m.fields[i], &cf)
+        }
+    }
+    st_meta := selectable_text_style(styles, pal, 11.0, pal.muted)
+    set_text_style($&m.mesh_stats_txt, &st_meta)
+}
+
+pub fn modeling_apply_lang(m $&ModelingPanel, lang int) {
+    set_lbl_text($&m.btn_labels[MB_MAT_CLEAR], &tr(lang, "Reset Material", "清除材质覆盖"))
+    set_lbl_text($&m.btn_labels[MB_EXPORT_GLB], &tr(lang, "Export GLB", "导出 GLB"))
+    set_lbl_text($&m.btn_labels[MB_CSG_ADD_BOX], &tr(lang, "+Box", "+并盒"))
+    set_lbl_text($&m.btn_labels[MB_CSG_ADD_CUT], &tr(lang, "-Cut", "-切槽"))
+    set_lbl_text($&m.btn_labels[MB_CSG_CYCLE], &tr(lang, "Op", "布尔"))
+    set_lbl_text($&m.btn_labels[MB_CSG_BAKE], &tr(lang, "Bake", "烘焙"))
+
+    lbls := [
+        tr(lang, "R", "红 R"),
+        tr(lang, "G", "绿 G"),
+        tr(lang, "B", "蓝 B"),
+        tr(lang, "Metal", "金属度"),
+        tr(lang, "Rough", "粗糙度"),
+        "",
+        tr(lang, "Emit", "自发光")
+    ]
+    for i in 0:lbls.len {
+        $dec := widgets.field_decoration(&lbls[i])
+        dec.reserve_helper = false
+        if i == MF_OP_STEP {
+            dec.floating = widgets.LABEL_NEVER
+            dec.prefix = ""
+        }
+        set_field_dec($&m.fields[i], &dec)
+    }
+}
+
+pub fn modeling_place(
+    m $&ModelingPanel,
+    view &widgets.View,
+    styles &widgets.Styles,
+    vp &layout.Rect,
+    insp_vp &layout.Rect
+) int {
+    for i in 0:m.buttons.len {
+        is_st := is_stage_3d_btn_idx(i)
+        is_bar := is_bar_btn_idx(i)
+        if is_st && !m.stage_3d_visible { -> }
+        if is_bar && !m.bar_visible { -> }
+        if is_csg_btn_idx(i) && !m.csg_visible { -> }
+        if !is_st && !is_bar && !m.card_visible { -> }
+        bid := m.button_ids[i]
+        sync_local_box_button(view, bid, $&m.buttons[i]) or >>
+    }
+    if m.bar_visible && !m.csg_visible {
+        place_view_field(view, m.field_ids[MF_OP_STEP], styles, vp, $&m.fields[MF_OP_STEP]) or >>
+    }
+    if m.stats_visible {
+        place_view_text(view, m.id_mesh_stats, insp_vp, $&m.mesh_stats_txt) or >>
+    }
+    if m.card_visible {
+        for i in 0:m.fields.len {
+            if i == MF_OP_STEP { -> }
+            fid := m.field_ids[i]
+            place_view_field(view, fid, styles, insp_vp, $&m.fields[i]) or >>
+        }
+        db := view.node_bounds(m.id_mat_div) or >>
+        dv := $&m.div
+        _ := dv.set_bounds(&layout.Rect{x: 0.0, y: 0.0, width: db.width, height: db.height}) or >>
+        tsid := m.id_mat_tex_select
+        m.mat_tex_origin = sync_local_box_select(view, tsid, styles, vp.height, $&m.mat_tex_select) or >>
+    }
+    _ := vp
+    << 0
+}
+
+pub fn modeling_sync_state(
+    m $&ModelingPanel,
+    styles &widgets.Styles,
+    pal &PaperPalette,
+    doc &resource.Document,
+    sel_node int,
+    selected_nodes &[]int,
+    vp &Viewport3DState,
+    lang int
+) {
+    info := inspect_node_modeling(doc, sel_node)
+    has_mesh := info.has_editable || info.has_csg
+    m.has_active_mesh = has_mesh
+    $any_has_mat := info.has_mat
+    $any_3d := false
+    for k in 0:selected_nodes.len {
+        nid := selected_nodes[k]
+        if nid > 0 && nid < doc.node_count() {
+            nd := doc.describe_node(nid) or (err) {
+                _ := err
+                ->
+            }
+            if nd.kind == resource.NODE_3D {
+                any_3d = true
+                if node_has_material_override(doc, nid, 0) {
+                    any_has_mat = true
+                }
+            }
+        }
+    }
+    m.has_active_mat = any_has_mat
+    m.active_is_csg = info.has_csg
+    m.mat_two_sided = info.mat.double_sided
+    m.mat_seed_two_sided = info.mat.double_sided
+
+    ico_act := icon_active_style(styles, pal)
+    ico_sub := icon_button_style(styles, widgets.BUTTON_SUBTLE)
+
+    for k in 0:4 {
+        bid := MB_MODE_OBJ + k
+        if vp.sub_mode == k { set_btn_style($&m.buttons[bid], &ico_act) }
+        else { set_btn_style($&m.buttons[bid], &ico_sub) }
+    }
+    for g in 0:3 {
+        gid := MB_GIZMO_MOVE + g
+        if vp.gizmo_tool == g { set_btn_style($&m.buttons[gid], &ico_act) }
+        else { set_btn_style($&m.buttons[gid], &ico_sub) }
+    }
+    for bid in [MB_EXTRUDE, MB_INSET, MB_BEVEL, MB_UV, MB_SUBDIV, MB_FLIP, MB_DEL_FACE, MB_WELD] {
+        set_btn_enabled($&m.buttons[bid], has_mesh)
+    }
+    if vp.show_wire { set_btn_style($&m.buttons[MB_WIRE], &ico_act) }
+    else { set_btn_style($&m.buttons[MB_WIRE], &ico_sub) }
+
+    if info.mat.double_sided { set_btn_style($&m.buttons[MB_MAT_TWOSIDED], &ico_act) }
+    else { set_btn_style($&m.buttons[MB_MAT_TWOSIDED], &ico_sub) }
+
+    $is_3d_sel := sel_node > 0 && sel_node < doc.node_count()
+    if selected_nodes.len > 1 { is_3d_sel = any_3d }
+    set_btn_enabled($&m.buttons[MB_MAT_APPLY], is_3d_sel)
+    set_btn_enabled($&m.buttons[MB_MAT_CLEAR], any_has_mat)
+    set_btn_enabled($&m.buttons[MB_EXPORT_GLB], has_mesh)
+    for i in MB_CSG_ADD_BOX:(MB_CSG_BAKE + 1) {
+        set_btn_enabled($&m.buttons[i], info.has_csg)
+    }
+    for i in MB_PRESET_0:(MB_PRESET_4 + 1) {
+        set_btn_enabled($&m.buttons[i], is_3d_sel)
+    }
+    for i in MB_PRESET_5:(MB_PRESET_9 + 1) {
+        set_btn_enabled($&m.buttons[i], is_3d_sel)
+    }
+    set_btn_enabled($&m.buttons[MB_MAT_TWOSIDED], is_3d_sel)
+    set_sel_enabled($&m.mat_tex_select, is_3d_sel)
+    for i in 0:m.fields.len {
+        if i == MF_OP_STEP {
+            enable_field($&m.fields[i], true)
+        } else {
+            enable_field($&m.fields[i], is_3d_sel)
+        }
+    }
+
+    $stxt := tr(lang, "Mesh: spawn Box / CSG or select whitebox", "网格：可生成基础体/CSG 或选中白盒节点")
+    if info.has_csg {
+        stxt = tr(lang, "CSG (", "CSG (") + str(info.brush_count) + tr(lang, " brushes) · ", " 笔刷) · ") +
+            str(info.verts) + "v · " + str(info.faces) + "f · " + str(info.tris) + "t"
+    } else if info.has_editable {
+        stxt = tr(lang, "Editable · ", "可编辑网格 · ") +
+            str(info.verts) + "v · " + str(info.edges) + "e · " + str(info.faces) + "f · " + str(info.tris) + "t"
+    }
+    set_text_val($&m.mesh_stats_txt, &stxt)
+
+    r_s := fmt_coord(info.mat.base_color.x)
+    g_s := fmt_coord(info.mat.base_color.y)
+    b_s := fmt_coord(info.mat.base_color.z)
+    met_s := fmt_coord(info.mat.metallic)
+    rgh_s := fmt_coord(info.mat.roughness)
+    emt_s := fmt_coord(info.mat.emission.x)
+    if m.mat_seeds.len >= 7 {
+        m.mat_seeds[MF_R] = r_s + ""
+        m.mat_seeds[MF_G] = g_s + ""
+        m.mat_seeds[MF_B] = b_s + ""
+        m.mat_seeds[MF_METALLIC] = met_s + ""
+        m.mat_seeds[MF_ROUGHNESS] = rgh_s + ""
+        m.mat_seeds[MF_EMIT] = emt_s + ""
+    }
+    set_field_val($&m.fields[MF_R], &r_s)
+    set_field_val($&m.fields[MF_G], &g_s)
+    set_field_val($&m.fields[MF_B], &b_s)
+    set_field_val($&m.fields[MF_METALLIC], &met_s)
+    set_field_val($&m.fields[MF_ROUGHNESS], &rgh_s)
+    set_field_val($&m.fields[MF_EMIT], &emt_s)
+
+    $tex_idx := 0
+    for ti in 0:m.mat_tex_uids.len {
+        if m.mat_tex_uids[ti] == info.mat.base_texture_uid {
+            tex_idx = ti
+            <-
+        }
+    }
+    m.mat_seed_tex = tex_idx
+    set_sel_selected($&m.mat_tex_select, tex_idx)
+
+    m.mat_dirty = false
+    m.active_preset = -1
+    if any_has_mat || is_3d_sel {
+        for pi in 0:10 {
+            pr := modeling_preset_spec(pi)
+            if math.abs(info.mat.base_color.x - pr.r) < 0.04 &&
+               math.abs(info.mat.base_color.y - pr.g) < 0.04 &&
+               math.abs(info.mat.base_color.z - pr.b) < 0.04 {
+                m.active_preset = pi
+                <-
+            }
+        }
+    }
+    m.mat_preview_color = draw.rgb(
+        int(math.max(0.0, math.min(255.0, info.mat.base_color.x * 255.0 + 0.5))),
+        int(math.max(0.0, math.min(255.0, info.mat.base_color.y * 255.0 + 0.5))),
+        int(math.max(0.0, math.min(255.0, info.mat.base_color.z * 255.0 + 0.5)))
+    )
+}
+
+fn parse_preview_channel(raw &string, scale255 bool) f64 {
+    t := strings.trim_space(raw)
+    v := strconv.parse_float(&t) or (err) {
+        _ := err
+        << -1.0
+    }
+    if !fm.finite(v) { << -1.0 }
+    if scale255 { << math.max(0.0, math.min(1.0, v / 255.0)) }
+    << math.max(0.0, math.min(1.0, v))
+}
+
+pub fn modeling_preview_color_from_fields(m $&ModelingPanel) {
+    $mr := parse_preview_channel(&m.fields[MF_R].value(), false)
+    $mg := parse_preview_channel(&m.fields[MF_G].value(), false)
+    $mb := parse_preview_channel(&m.fields[MF_B].value(), false)
+    raw_r := strings.trim_space(&m.fields[MF_R].value())
+    raw_g := strings.trim_space(&m.fields[MF_G].value())
+    raw_b := strings.trim_space(&m.fields[MF_B].value())
+    vr := strconv.parse_float(&raw_r) or (err) {
+        _ := err
+        <<
+    }
+    vg := strconv.parse_float(&raw_g) or (err) {
+        _ := err
+        <<
+    }
+    vb := strconv.parse_float(&raw_b) or (err) {
+        _ := err
+        <<
+    }
+    if !fm.finite(vr) || !fm.finite(vg) || !fm.finite(vb) { << }
+    if vr > 1.0 || vg > 1.0 || vb > 1.0 {
+        mr = parse_preview_channel(&raw_r, true)
+        mg = parse_preview_channel(&raw_g, true)
+        mb = parse_preview_channel(&raw_b, true)
+    } else {
+        mr = math.max(0.0, math.min(1.0, vr))
+        mg = math.max(0.0, math.min(1.0, vg))
+        mb = math.max(0.0, math.min(1.0, vb))
+    }
+    if mr < 0.0 || mg < 0.0 || mb < 0.0 { << }
+    m.mat_preview_color = draw.rgb(
+        int(mr * 255.0 + 0.5),
+        int(mg * 255.0 + 0.5),
+        int(mb * 255.0 + 0.5)
+    )
+    m.active_preset = -1
+}
+
+fn m_btn_icon(idx int) int {
+    if idx == MB_BOX { << ICON_BOX }
+    if idx == MB_WEDGE { << ICON_WEDGE }
+    if idx == MB_STAIR { << ICON_STAIR }
+    if idx == MB_CYL { << ICON_CYL }
+    if idx == MB_ARCH { << ICON_ARCH }
+    if idx == MB_CSG { << ICON_CSG }
+    if idx == MB_MODE_OBJ { << ICON_MODE_OBJ }
+    if idx == MB_MODE_VERT { << ICON_MODE_VERT }
+    if idx == MB_MODE_EDGE { << ICON_MODE_EDGE }
+    if idx == MB_MODE_FACE { << ICON_MODE_FACE }
+    if idx == MB_EXTRUDE { << ICON_EXTRUDE }
+    if idx == MB_INSET { << ICON_INSET }
+    if idx == MB_BEVEL { << ICON_BEVEL }
+    if idx == MB_UV { << ICON_UV }
+    if idx == MB_WIRE { << ICON_WIRE }
+    if idx == MB_GIZMO_MOVE { << ICON_MOVE }
+    if idx == MB_GIZMO_ROT { << ICON_ROTATE }
+    if idx == MB_GIZMO_SCALE { << ICON_SCALE }
+    if idx == MB_SPHERE { << ICON_SPHERE }
+    if idx == MB_SUBDIV { << ICON_SUBDIV }
+    if idx == MB_FLIP { << ICON_FLIP }
+    if idx == MB_DEL_FACE { << ICON_DEL_FACE }
+    if idx == MB_WELD { << ICON_WELD }
+    if idx == MB_MAT_TWOSIDED { << ICON_TWOSIDED }
+    << 0
+}
+
+fn paint_mat_field_bar(idx int, val_txt &string, bounds &layout.Rect, frame $&draw.Frame, pal &PaperPalette) int {
+    if idx != MF_R && idx != MF_G && idx != MF_B &&
+       idx != MF_METALLIC && idx != MF_ROUGHNESS && idx != MF_EMIT {
+        << 0
+    }
+    t := strings.trim_space(val_txt)
+    if t.len == 0 { << 0 }
+    v := strconv.parse_float(&t) or (err) {
+        _ := err
+        << 0
+    }
+    if !fm.finite(v) { << 0 }
+    $frac := math.max(0.0, math.min(1.0, v))
+    if (idx == MF_R || idx == MF_G || idx == MF_B) && v > 1.0 {
+        frac = math.max(0.0, math.min(1.0, v / 255.0))
+    } else if idx == MF_EMIT {
+        frac = math.max(0.0, math.min(1.0, v / 4.0))
+    }
+    $col := pal.brand
+    if idx == MF_R { col = draw.rgb(214, 72, 82) }
+    else if idx == MF_G { col = draw.rgb(52, 168, 108) }
+    else if idx == MF_B { col = draw.rgb(58, 126, 224) }
+    else if idx == MF_METALLIC { col = draw.rgb(112, 128, 152) }
+    else if idx == MF_ROUGHNESS { col = draw.rgb(154, 134, 114) }
+    else if idx == MF_EMIT { col = draw.rgb(236, 136, 46) }
+    tw := math.max(0.0, bounds.width - 10.0)
+    if tw > 4.0 {
+        by := math.max(0.0, bounds.height - 4.5)
+        frame.fill_round_rect(5.0, by, tw, 2.5, 1.25, pal.border.with_alpha(90)) or >>
+        fw := tw * frac
+        if fw >= 1.5 {
+            frame.fill_round_rect(5.0, by, fw, 2.5, 1.25, col) or >>
+        }
+    }
+    << 0
+}
+
+fn paint_preset_swatch(pre_idx int, active bool, bounds &layout.Rect, frame $&draw.Frame, pal &PaperPalette) int {
+    p := modeling_preset_spec(pre_idx)
+    col := draw.rgb(
+        int(math.max(0.0, math.min(255.0, p.r * 255.0 + 0.5))),
+        int(math.max(0.0, math.min(255.0, p.g * 255.0 + 0.5))),
+        int(math.max(0.0, math.min(255.0, p.b * 255.0 + 0.5)))
+    )
+    bw := math.max(8.0, bounds.width - 2.0)
+    bh := math.max(8.0, bounds.height - 2.0)
+    frame.fill_round_rect(1.0, 1.0, bw, bh, 5.0, col) or >>
+    if active {
+        frame.stroke_round_rect(1.0, 1.0, bw, bh, 5.0, pal.text, 2.0) or >>
+        frame.stroke_round_rect(2.5, 2.5, math.max(4.0, bw - 3.0), math.max(4.0, bh - 3.0), 3.5, pal.surface, 1.1) or >>
+    } else {
+        frame.stroke_round_rect(1.0, 1.0, bw, bh, 5.0, pal.border, 1.1) or >>
+    }
+    << 0
+}
+
+pub fn modeling_draw(
+    m $&ModelingPanel,
+    id int,
+    frame $&draw.Frame,
+    bounds &layout.Rect,
+    styles &widgets.Styles,
+    pal &PaperPalette,
+    lang int
+) int {
+    if bounds.height <= 0.5 || bounds.width <= 0.5 {
+        if id == m.id_mat_div || id == m.id_mat_hdr || id == m.id_mat_swatch ||
+           id == m.id_mat_empty || id == m.id_mesh_stats || id == m.id_mat_tex_select ||
+           id == m.id_bar_div1 || id == m.id_bar_div2 || id == m.id_model_bar {
+            << 1
+        }
+        for i in 0:m.field_ids.len { if m.field_ids[i] == id { << 1 } }
+        for i in 0:m.button_ids.len { if m.button_ids[i] == id { << 1 } }
+        << 0
+    }
+    if id == m.id_model_bar {
+        bh := math.max(18.0, bounds.height - 4.0)
+        frame.fill_round_rect(0.0, 0.0, bounds.width, bh, 7.0, pal.elevated) or >>
+        frame.stroke_round_rect(0.0, 0.0, bounds.width, bh, 7.0, pal.border, 1.0) or >>
+        << 1
+    }
+    if id == m.id_bar_div1 || id == m.id_bar_div2 {
+        frame.line(bounds.width * 0.5, 3.0, bounds.width * 0.5, math.max(4.0, bounds.height - 3.0), pal.border, 1.0) or >>
+        << 1
+    }
+    if id == m.id_mat_div {
+        dv := $&m.div
+        dv.paint_styled(frame, styles) or >>
+        << 1
+    }
+    if id == m.id_mat_empty {
+        msg := tr(lang, "Select a 3D node to edit PBR material & surface color.", "请在场景树或画布中选中 3D 节点以编辑材质与颜色。")
+        frame.text(0.0, 12.0, 11.5, pal.muted, &msg) or >>
+        << 1
+    }
+    if id == m.id_mat_hdr {
+        t := tr(lang, "PBR Surface Material", "PBR 表面材质")
+        frame.text(0.0, 2.0, 12.0, pal.text, &t) or >>
+        << 1
+    }
+    if id == m.id_mat_swatch {
+        frame.fill_round_rect(0.0, 1.0, bounds.width, math.max(10.0, bounds.height - 2.0), 4.0, m.mat_preview_color) or >>
+        frame.stroke_round_rect(0.0, 1.0, bounds.width, math.max(10.0, bounds.height - 2.0), 4.0, pal.border, 1.0) or >>
+        << 1
+    }
+    if id == m.id_mesh_stats {
+        paint_text_sel($&m.mesh_stats_txt, frame, styles) or >>
+        << 1
+    }
+    if id == m.id_mat_tex_select {
+        ts := m.mat_tex_select.clone()
+        tsel := ts.selected()
+        if tsel >= 0 && tsel < m.mat_tex_labels.len {
+            ts.paint_styled(frame, $&m.mat_tex_labels[tsel], styles) or >>
+        } else {
+            ts.paint_styled(frame, $&m.no_tex_lbl, styles) or >>
+        }
+        << 1
+    }
+    for i in 0:m.field_ids.len {
+        if m.field_ids[i] == id {
+            paint_field($&m.fields[i], frame, styles) or >>
+            paint_mat_field_bar(i, &m.fields[i].value(), bounds, frame, pal) or >>
+            << 1
+        }
+    }
+    for i in 0:m.button_ids.len {
+        if m.button_ids[i] == id {
+            b := m.buttons[i].clone()
+            if i >= MB_PRESET_0 && i <= MB_PRESET_4 {
+                pi := i - MB_PRESET_0
+                paint_preset_swatch(pi, m.active_preset == pi, bounds, frame, pal) or >>
+                << 1
+            }
+            if i >= MB_PRESET_5 && i <= MB_PRESET_9 {
+                pi := 5 + (i - MB_PRESET_5)
+                paint_preset_swatch(pi, m.active_preset == pi, bounds, frame, pal) or >>
+                << 1
+            }
+            ico := m_btn_icon(i)
+            if ico > 0 {
+                paint_icon_button(&b, $&m.btn_labels[i], ico, frame, styles) or >>
+            } else {
+                b.paint_styled(frame, $&m.btn_labels[i], styles) or >>
+            }
+            << 1
+        }
+    }
+    << 0
+}
+
+pub fn modeling_overlay(m $&ModelingPanel, frame $&draw.Frame, styles &widgets.Styles) int {
+    if !m.card_visible { << 0 }
+    for i in 0:m.fields.len {
+        field_popup_paint($&m.fields[i], frame, styles) or >>
+    }
+    paint_text_popup($&m.mesh_stats_txt, frame, styles) or >>
+    ts := m.mat_tex_select.clone()
+    to := copy_rect(&m.mat_tex_origin)
+    paint_select_popup(&ts, $&m.mat_tex_labels, &to, frame, styles) or >>
+    << 0
+}
+
+pub fn modeling_route_input(m $&ModelingPanel, id int, kind int, input &ui.InputEvent) widgets.Action {
+    for i in 0:m.button_ids.len {
+        if m.button_ids[i] == id {
+            is_st := is_stage_3d_btn_idx(i)
+            is_bar := is_bar_btn_idx(i)
+            if (is_st && !m.stage_3d_visible) ||
+               (is_bar && !m.bar_visible) ||
+               (is_csg_btn_idx(i) && !m.csg_visible) ||
+               (!is_st && !is_bar && !m.card_visible) {
+                << widgets.Action{kind: widgets.ACTION_NONE, id: id, needs_paint: false, request_focus: false, consumed: false, value: 0.0}
+            }
+            << route_btn($&m.buttons[i], kind, input)
+        }
+    }
+    if m.bar_visible && !m.csg_visible && id == m.field_ids[MF_OP_STEP] {
+        << route_field($&m.fields[MF_OP_STEP], kind, input)
+    }
+    if m.stats_visible && id == m.id_mesh_stats {
+        << route_text($&m.mesh_stats_txt, kind, input)
+    }
+    if m.card_visible {
+        if id == m.id_mat_tex_select { << route_sel($&m.mat_tex_select, kind, input) }
+        for i in 0:m.field_ids.len {
+            if i == MF_OP_STEP { -> }
+            if m.field_ids[i] == id { << route_field($&m.fields[i], kind, input) }
+        }
+    }
+    << widgets.Action{kind: widgets.ACTION_NONE, id: id, needs_paint: false, request_focus: false, consumed: false, value: 0.0}
+}
+
+pub fn modeling_route_open_select(
+    m $&ModelingPanel,
+    input &ui.InputEvent,
+    rid int,
+    view $&widgets.View
+) int {
+    if !m.card_visible || !m.mat_tex_select.is_open() { << 0 }
+    orig := copy_rect(&m.mat_tex_origin)
+    res := handle_open_select($&m.mat_tex_select, &orig, input, rid, view)
+    if res.handled {
+        if res.changed { << 2 }
+        << 1
+    }
+    << 0
+}
+
+fn try_dispatch_m_field(view $&widgets.View, rid int, event &ui.Event, f $&widgets.Field) {
+    _ := dispatch_field_text_event(view, rid, event, f) or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn try_dispatch_m_text(view $&widgets.View, event &ui.Event, s $&widgets.SelectableText) {
+    _ := dispatch_sel_text_event(view, event, s) or (err) {
+        _ := err
+        <<
+    }
+}
+
+pub fn modeling_route_popups(m $&ModelingPanel, view $&widgets.View, rid int, input &ui.InputEvent) bool {
+    if m.bar_visible && !m.csg_visible {
+        shit := route_popup_field(view, rid, input, $&m.fields[MF_OP_STEP]) or (err) {
+            _ := err
+            << false
+        }
+        if shit { << true }
+    }
+    if m.stats_visible {
+        thit := route_popup_text(view, rid, input, $&m.mesh_stats_txt) or (err) {
+            _ := err
+            << false
+        }
+        if thit { << true }
+    }
+    if !m.card_visible { << false }
+    for i in 0:m.fields.len {
+        if i == MF_OP_STEP { -> }
+        hit := route_popup_field(view, rid, input, $&m.fields[i]) or (err) {
+            _ := err
+            << false
+        }
+        if hit { << true }
+    }
+    << false
+}
+
+pub fn modeling_dispatch_events(m $&ModelingPanel, view $&widgets.View, rid int, event &ui.Event) {
+    if m.bar_visible && !m.csg_visible {
+        try_dispatch_m_field(view, rid, event, $&m.fields[MF_OP_STEP])
+    }
+    if m.stats_visible {
+        try_dispatch_m_text(view, event, $&m.mesh_stats_txt)
+    }
+    if !m.card_visible { << }
+    for i in 0:m.fields.len {
+        if i == MF_OP_STEP { -> }
+        try_dispatch_m_field(view, rid, event, $&m.fields[i])
+    }
+}
+
+pub fn modeling_has_popup(m &ModelingPanel) bool {
+    if m.bar_visible && !m.csg_visible && m.fields[MF_OP_STEP].has_popup_open() { << true }
+    if m.stats_visible && m.mesh_stats_txt.has_popup_open() { << true }
+    if !m.card_visible { << false }
+    if m.mat_tex_select.is_open() { << true }
+    for i in 0:m.fields.len {
+        if i == MF_OP_STEP { -> }
+        if m.fields[i].has_popup_open() { << true }
+    }
+    << false
+}
+
+pub fn modeling_any_focused(m &ModelingPanel) bool {
+    if m.bar_visible && !m.csg_visible && m.fields[MF_OP_STEP].is_focused() { << true }
+    if !m.card_visible { << false }
+    for i in 0:m.fields.len {
+        if i == MF_OP_STEP { -> }
+        if m.fields[i].is_focused() { << true }
+    }
+    << false
+}
+
+pub fn modeling_blur_all(m $&ModelingPanel) {
+    for i in 0:m.fields.len { focus_field($&m.fields[i], false) }
+}
+
+pub fn modeling_tick(m $&ModelingPanel, view $&widgets.View, now time.Instant, rm bool) {
+    if m.bar_visible && !m.csg_visible {
+        fid := m.field_ids[MF_OP_STEP]
+        if tick_field($&m.fields[MF_OP_STEP], now, rm) { repaint(view, fid) }
+    }
+    if !m.card_visible { << }
+    for i in 0:m.fields.len {
+        if i == MF_OP_STEP { -> }
+        fid := m.field_ids[i]
+        if tick_field($&m.fields[i], now, rm) { repaint(view, fid) }
+    }
+}
+
+pub fn modeling_next_tick(m &ModelingPanel, now time.Instant, rm bool, cur time.Instant) time.Instant {
+    $d := cur
+    if m.bar_visible && !m.csg_visible {
+        snext := field_next_tick(&m.fields[MF_OP_STEP], now, rm)
+        if !snext.is_zero() && (d.is_zero() || snext.before(d)) { d = snext }
+    }
+    if !m.card_visible { << d }
+    for i in 0:m.fields.len {
+        if i == MF_OP_STEP { -> }
+        next := field_next_tick(&m.fields[i], now, rm)
+        if !next.is_zero() && (d.is_zero() || next.before(d)) { d = next }
+    }
+    << d
+}
+
+pub fn modeling_cursor(m &ModelingPanel, view &widgets.View, insp_scroll int, x f64, y f64) int {
+    if m.bar_visible && !m.csg_visible {
+        spc := field_popup_cursor(&m.fields[MF_OP_STEP], x, y)
+        if spc >= 0 { << spc }
+        sfc := field_hit_cursor(view, m.field_ids[MF_OP_STEP], &m.fields[MF_OP_STEP], x, y)
+        if sfc >= 0 { << sfc }
+    }
+    if m.stats_visible {
+        tc := text_popup_cursor(&m.mesh_stats_txt, x, y)
+        if tc >= 0 { << tc }
+        if node_contains_clipped(view, m.id_mesh_stats, insp_scroll, x, y) {
+            << m.mesh_stats_txt.cursor_at(x, y)
+        }
+    }
+    if m.card_visible {
+        if m.mat_tex_select.is_open() {
+            << m.mat_tex_select.cursor_at(x - m.mat_tex_origin.x, y - m.mat_tex_origin.y)
+        }
+        for i in 0:m.fields.len {
+            if i == MF_OP_STEP { -> }
+            pc := field_popup_cursor(&m.fields[i], x, y)
+            if pc >= 0 { << pc }
+        }
+        for i in 0:m.fields.len {
+            if i == MF_OP_STEP { -> }
+            fc := field_hit_cursor_clipped(view, m.field_ids[i], insp_scroll, &m.fields[i], x, y)
+            if fc >= 0 { << fc }
+        }
+        tc_sel := sel_hit_cursor_clipped(view, m.id_mat_tex_select, insp_scroll, &m.mat_tex_select, x, y)
+        if tc_sel >= 0 { << tc_sel }
+    }
+    for i in 0:m.buttons.len {
+        is_st := is_stage_3d_btn_idx(i)
+        is_bar := is_bar_btn_idx(i)
+        if is_st {
+            if !m.stage_3d_visible { -> }
+            bc := btn_hit_cursor(view, m.button_ids[i], &m.buttons[i], x, y)
+            if bc >= 0 { << bc }
+        } else if is_bar {
+            if !m.bar_visible || (is_csg_btn_idx(i) && !m.csg_visible) { -> }
+            bc := btn_hit_cursor(view, m.button_ids[i], &m.buttons[i], x, y)
+            if bc >= 0 { << bc }
+        } else {
+            if !m.card_visible { -> }
+            bc := btn_hit_cursor_clipped(view, m.button_ids[i], insp_scroll, &m.buttons[i], x, y)
+            if bc >= 0 { << bc }
+        }
+    }
+    << -1
+}
+
+pub fn modeling_tooltip(m &ModelingPanel, view &widgets.View, x f64, y f64, lang int) TooltipHit {
+    if m.stage_3d_visible {
+        stips := [
+            tr(lang, "Create Whitebox Box", "创建白盒立方体"),
+            tr(lang, "Create Whitebox Wedge", "创建白盒斜坡"),
+            tr(lang, "Create Whitebox Stair", "创建白盒阶梯"),
+            tr(lang, "Create Whitebox Cylinder", "创建白盒圆柱"),
+            tr(lang, "Create Whitebox Arch", "创建白盒拱门"),
+            tr(lang, "Create CSG Hollow Cut", "创建 CSG 布尔挖空体")
+        ]
+        for i in 0:6 {
+            h := check_tip(view, m.button_ids[i], x, y, stips[i])
+            if h.id > 0 { << h }
+        }
+        hsph := check_tip(view, m.button_ids[MB_SPHERE], x, y, tr(lang, "Create Whitebox Sphere", "创建白盒球体"))
+        if hsph.id > 0 { << hsph }
+        hw := check_tip(view, m.button_ids[MB_WIRE], x, y, tr(lang, "Toggle Wireframe Overlay (W)", "切换线框叠加 (W)"))
+        if hw.id > 0 { << hw }
+        gtips := [
+            tr(lang, "Move Gizmo (T)", "移动工具 (T)"),
+            tr(lang, "Rotate Gizmo (R)", "旋转工具 (R)"),
+            tr(lang, "Scale Gizmo (S)", "缩放工具 (S)")
+        ]
+        for g in 0:3 {
+            h := check_tip(view, m.button_ids[MB_GIZMO_MOVE + g], x, y, gtips[g])
+            if h.id > 0 { << h }
+        }
+    }
+    if m.bar_visible {
+        btips := [
+            tr(lang, "Object Mode (1)", "物体模式 (1)"),
+            tr(lang, "Vertex Mode (2)", "顶点编辑模式 (2)"),
+            tr(lang, "Edge Mode (3)", "边编辑模式 (3)"),
+            tr(lang, "Face Mode (4)", "面编辑模式 (4)"),
+            tr(lang, "Extrude Selected Face (E)", "挤出选中面 (E)"),
+            tr(lang, "Inset Selected Face (I)", "内插选中面 (I)"),
+            tr(lang, "Bevel Edge (B)", "倒角边 (B)"),
+            tr(lang, "Box Project UV (U)", "三轴 Box UV 投影 (U)")
+        ]
+        for i in 0:btips.len {
+            h := check_tip(view, m.button_ids[MB_MODE_OBJ + i], x, y, btips[i])
+            if h.id > 0 { << h }
+        }
+        etips := [
+            tr(lang, "Subdivide Selected Face (K)", "细分选中面 (K)"),
+            tr(lang, "Flip Normals (N)", "翻转法线 (N)"),
+            tr(lang, "Delete Selected Face (X)", "删除选中面 (X)"),
+            tr(lang, "Weld / Merge Nearby Vertices (M)", "焊接合并近距顶点 (M)")
+        ]
+        for k in 0:etips.len {
+            h := check_tip(view, m.button_ids[MB_SUBDIV + k], x, y, etips[k])
+            if h.id > 0 { << h }
+        }
+        if !m.csg_visible {
+            hstep := check_tip(view, m.field_ids[MF_OP_STEP], x, y, tr(lang, "Mesh Op Step Distance", "网格操作步长"))
+            if hstep.id > 0 { << hstep }
+        }
+        hexp := check_tip(view, m.button_ids[MB_EXPORT_GLB], x, y, tr(lang, "Bake & Export Mesh as GLB Asset", "烘焙并导出网格为 GLB 资源"))
+        if hexp.id > 0 { << hexp }
+    }
+    if m.card_visible {
+        ptips := [
+            tr(lang, "Matte White Color", "哑光白色"),
+            tr(lang, "Charcoal Dark Color", "深灰碳黑"),
+            tr(lang, "Crimson Red Color", "绯红亮色"),
+            tr(lang, "Polished Gold Metallic", "亮金金属材质"),
+            tr(lang, "Neon Coral Emissive", "自发光霓虹橙")
+        ]
+        for p in 0:ptips.len {
+            h := check_tip(view, m.button_ids[MB_PRESET_0 + p], x, y, ptips[p])
+            if h.id > 0 { << h }
+        }
+        ptips2 := [
+            tr(lang, "Emerald Green Color", "翡翠绿色"),
+            tr(lang, "Cobalt Blue Color", "钴蓝亮色"),
+            tr(lang, "Royal Violet Color", "皇家紫色"),
+            tr(lang, "Brushed Steel Metallic", "拉丝银钢材质"),
+            tr(lang, "Warm Timber Matte", "暖木哑光材质")
+        ]
+        for p2 in 0:ptips2.len {
+            h := check_tip(view, m.button_ids[MB_PRESET_5 + p2], x, y, ptips2[p2])
+            if h.id > 0 { << h }
+        }
+        h2s := check_tip(view, m.button_ids[MB_MAT_TWOSIDED], x, y, tr(lang, "Two-Sided Material", "双面材质（关闭背面剔除）"))
+        if h2s.id > 0 { << h2s }
+    }
+    << empty_tooltip_hit()
+}

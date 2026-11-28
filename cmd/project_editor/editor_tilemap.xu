@@ -1,0 +1,945 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+resource #"github.com/xulang-org/nexus/resources/scene"
+tiles #"github.com/xulang-org/nexus/resources/tilemap"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#crypto/sha256
+#math
+#path/filepath
+#strings
+#ui
+#ui/draw
+#ui/layout
+widgets #ui/widgets
+
+pub const TM_ACT_NONE = 0
+pub const TM_ACT_REPAINT = 1
+pub const TM_ACT_COMMIT_STROKE = 2
+pub const TM_ACT_COMMIT_EXIT = 3
+pub const TM_ACT_SELECT_LAYER = 4
+
+const TM_PALETTE_W = 166
+const TM_SWATCH = 40
+const TM_COLS = 3
+const TM_MAX_ZOOM = 128
+
+pub const TM_TOOL_BRUSH = 0
+pub const TM_TOOL_ERASE = 1
+pub const TM_TOOL_RECT = 2
+pub const TM_TOOL_FILL = 3
+pub const TM_TOOL_EYEDROP = 4
+
+pub struct EmbeddedTileMap {
+    pub active bool
+    pub has_layer bool
+    pub layer_idx int
+    pub layer_names []string
+    pub layer resource.TileMap2DAttachment
+    pub order []tiles.CellCoord
+
+    pub has_atlas bool
+    pub atlases []draw.Image
+    pub atlas_uid string
+
+    pub tile int
+    pub page int
+    pub tool int
+    pub erasing bool
+    pub show_grid bool
+    pub placing_exit bool
+    pub exit_index int
+    pub exit_local fm.Vec2
+
+    pub zoom f64
+    pub center fm.Vec2
+    pub pointer fm.Vec2
+    pub panning bool
+    pub pan_start fm.Vec2
+    pub stroke bool
+    pub changed bool
+    pub rect_active bool
+    pub rect_start tiles.CellCoord
+    pub rect_end tiles.CellCoord
+}
+
+pub fn default_embedded_tilemap() EmbeddedTileMap {
+    ts := tiles.tileset_2d(4, 4, 32.0, 32.0, fm.vec2(0.5, 0.5)) or >>
+    grid := tiles.new_tilemap_2d(tiles.LAYOUT_ORTHOGONAL, 8, 8, 32.0, 32.0, 0.0, ts) or >>
+    dummy_layer := resource.tilemap_2d_attachment(0, "", 0, false, 0.0, true, grid)
+    << EmbeddedTileMap{
+        active: false,
+        has_layer: false,
+        layer_idx: 0,
+        layer_names: []string{},
+        layer: dummy_layer,
+        order: []tiles.CellCoord{},
+        has_atlas: false,
+        atlases: []draw.Image{},
+        atlas_uid: "",
+        tile: 0,
+        page: 0,
+        tool: TM_TOOL_BRUSH,
+        erasing: false,
+        show_grid: true,
+        placing_exit: false,
+        exit_index: -1,
+        exit_local: fm.vec2(0.0, 0.0),
+        zoom: 1.0,
+        center: fm.vec2(0.0, 0.0),
+        pointer: fm.vec2(-1.0, -1.0),
+        panning: false,
+        pan_start: fm.vec2(0.0, 0.0),
+        stroke: false,
+        changed: false,
+        rect_active: false,
+        rect_start: tiles.CellCoord{col: 0, row: 0},
+        rect_end: tiles.CellCoord{col: 0, row: 0}
+    }
+}
+
+pub fn (tm $&EmbeddedTileMap) dispose() {
+    if tm.has_atlas && tm.atlases.len > 0 {
+        im := $&tm.atlases[0]
+        _ := im.dispose() or (err) {
+            _ := err
+            <<
+        }
+    }
+    tm.atlases = []draw.Image{}
+    tm.has_atlas = false
+    tm.atlas_uid = ""
+}
+
+fn find_tm_exit_node(doc &resource.Document) int {
+    for i in 1:doc.node_count() {
+        nd := doc.describe_node(i) or (err) {
+            _ := err
+            << -1
+        }
+        if nd.parent == 0 && nd.kind == resource.NODE_2D && strings.has_prefix(&nd.name, "Exit_") {
+            << i
+        }
+    }
+    << -1
+}
+
+fn tm_layer_to_map(doc &resource.Document, layer_node int) fm.Transform2D {
+    $tr := fm.identity()
+    $idx := layer_node
+    $guard := 0
+    while idx > 0 && guard < 128 {
+        nd := doc.describe_node(idx) or (err) {
+            _ := err
+            << tr
+        }
+        if nd.kind == resource.NODE_2D {
+            tr = nd.local.multiply(tr)
+        }
+        idx = nd.parent
+        guard += 1
+    }
+    << tr
+}
+
+fn try_load_tm_atlas(ctx &draw.Context, proj &Project, draft_source &string, doc &resource.Document, uid &string) []draw.Image {
+    $out := []draw.Image{}
+    if uid.len == 0 { << out }
+    $src := ""
+    for i in 0:doc.resource_count() {
+        r := doc.resource(i) or (err) {
+            _ := err
+            << out
+        }
+        if r.uid == *uid {
+            dir := filepath.dir(draft_source)
+            src = filepath.join([dir, r.path + ""])
+            <-
+        }
+    }
+    if src.len == 0 {
+        src = proj.asset_source(uid) or (err) {
+            _ := err
+            << out
+        }
+    }
+    raw := snapshot.read(src + "", snapshot.MAX_BYTES) or (err) {
+        _ := err
+        << out
+    }
+    im := ctx.image_encoded(&raw) or (err) {
+        _ := err
+        << out
+    }
+    out.push(im)
+    << out
+}
+
+fn safe_tm_draw_order(grid &tiles.TileMap2D) []tiles.CellCoord {
+    << grid.draw_order() or (err) {
+        _ := err
+        << []tiles.CellCoord{}
+    }
+}
+
+fn safe_tm_inverse(tr &fm.Transform2D) fm.Transform2D {
+    << tr.inverse() or (err) {
+        _ := err
+        << fm.identity()
+    }
+}
+
+fn safe_point_to_cell(grid &tiles.TileMap2D, pt fm.Vec2) tiles.CellCoord {
+    << grid.point_to_cell(pt) or (err) {
+        _ := err
+        << tiles.CellCoord{col: -1, row: -1}
+    }
+}
+
+pub fn (tm $&EmbeddedTileMap) sync_from_document(
+    ctx &draw.Context,
+    proj &Project,
+    draft_source &string,
+    doc &resource.Document,
+    selected_node int,
+    canvas_bounds &layout.Rect
+) {
+    n := doc.tilemap_2d_count()
+    $names := []string{}
+    $target_idx := tm.layer_idx
+    if target_idx < 0 || target_idx >= n { target_idx = 0 }
+    for i in 0:n {
+        item := doc.tilemap_2d(i) or (err) {
+            _ := err
+            <<
+        }
+        nd := doc.describe_node(item.node) or (err) {
+            _ := err
+            <<
+        }
+        names.push(nd.name + "")
+        if item.node == selected_node {
+            target_idx = i
+        }
+    }
+    tm.layer_names = names
+    if n == 0 {
+        tm.has_layer = false
+        tm.order = []tiles.CellCoord{}
+        tm.exit_index = -1
+        <<
+    }
+    prev_uid := tm.atlas_uid + ""
+    was_has := tm.has_layer
+    tm.layer_idx = target_idx
+    raw_layer := doc.tilemap_2d(target_idx) or (err) {
+        _ := err
+        <<
+    }
+    tm.layer = clone_tilemap_2d(&raw_layer, raw_layer.node) or (err) {
+        _ := err
+        <<
+    }
+    tm.order = safe_tm_draw_order(&tm.layer.grid)
+    tm.has_layer = true
+    tm.exit_index = find_tm_exit_node(doc)
+    if tm.exit_index >= 0 {
+        lxf := tm_layer_to_map(doc, tm.layer.node)
+        inv := safe_tm_inverse(&lxf)
+        gate := doc.describe_node(tm.exit_index) or (err) {
+            _ := err
+            <<
+        }
+        tm.exit_local = inv.point(fm.vec2(gate.local.tx, gate.local.ty))
+    }
+    if tm.tile >= tm.layer.grid.tileset.tile_count() { tm.tile = 0 }
+    if !tm.has_atlas || prev_uid != tm.layer.resource_uid {
+        tm.dispose()
+        tm.atlases = try_load_tm_atlas(ctx, proj, draft_source, doc, &tm.layer.resource_uid)
+        if tm.atlases.len > 0 {
+            tm.has_atlas = true
+            tm.atlas_uid = tm.layer.resource_uid + ""
+        }
+    }
+    if !was_has {
+        tm.fit(canvas_bounds)
+    }
+}
+
+fn tm_canvas_rect(bounds &layout.Rect) fm.Rect2 {
+    cw := math.max(120.0, bounds.width - f64(TM_PALETTE_W))
+    << fm.rect2(0.0, 0.0, cw, bounds.height)
+}
+
+fn tm_screen(tm &EmbeddedTileMap, panel fm.Rect2, local fm.Vec2) fm.Vec2 {
+    << panel.position.add(panel.size.scaled(0.5)).add(local.sub(tm.center).scaled(tm.zoom))
+}
+
+fn tm_local(tm &EmbeddedTileMap, panel fm.Rect2, screen fm.Vec2) fm.Vec2 {
+    << tm.center.add(screen.sub(panel.position).sub(panel.size.scaled(0.5)).scaled(1.0 / math.max(0.001, tm.zoom)))
+}
+
+fn safe_quad_bounds(ts &tiles.TileSet2D) fm.Rect2 {
+    << ts.local_quad_bounds() or (err) {
+        _ := err
+        << fm.rect2(-16.0, -16.0, 32.0, 32.0)
+    }
+}
+
+fn safe_cell_visual_center(grid &tiles.TileMap2D, col int, row int, fallback fm.Vec2) fm.Vec2 {
+    << grid.cell_visual_center(col, row) or (err) {
+        _ := err
+        << fallback
+    }
+}
+
+pub fn (tm $&EmbeddedTileMap) fit(bounds &layout.Rect) {
+    if !tm.has_layer || tm.order.len == 0 { << }
+    panel := tm_canvas_rect(bounds)
+    grid := &tm.layer.grid
+    quad := safe_quad_bounds(&grid.tileset)
+    $low := fm.vec2(1.0e100, 1.0e100)
+    $high := fm.vec2(-1.0e100, -1.0e100)
+    for cell in tm.order {
+        ground := grid.cell_center(cell.col, cell.row)
+        vc := safe_cell_visual_center(grid, cell.col, cell.row, ground)
+        draw_at := vc.add(quad.position)
+        low.x = math.min(low.x, math.min(ground.x - grid.tile_width * 0.5, draw_at.x))
+        low.y = math.min(low.y, math.min(ground.y - grid.tile_height * 0.5, draw_at.y))
+        high.x = math.max(high.x, math.max(ground.x + grid.tile_width * 0.5, draw_at.x + quad.size.x))
+        high.y = math.max(high.y, math.max(ground.y + grid.tile_height * 0.5, draw_at.y + quad.size.y))
+    }
+    span := high.sub(low)
+    tw := grid.tile_width
+    th := grid.tile_height
+    tm.center = low.add(span.scaled(0.5))
+    min_z := 8.0 / math.max(1.0, math.min(tw, th))
+    ideal := math.min((panel.size.x - 48.0) / math.max(1.0, span.x), (panel.size.y - 48.0) / math.max(1.0, span.y))
+    tm.zoom = math.min(f64(TM_MAX_ZOOM), math.max(min_z, ideal))
+}
+
+fn tm_palette_cap(bounds &layout.Rect) int {
+    avail_h := bounds.height - 186.0
+    rows := int(math.max(1.0, math.floor(avail_h / (f64(TM_SWATCH) + 6.0))))
+    << rows * TM_COLS
+}
+
+fn tm_palette_pages(tm &EmbeddedTileMap, bounds &layout.Rect) int {
+    cap := tm_palette_cap(bounds)
+    if cap <= 0 { << 1 }
+    cnt := tm.layer.grid.tileset.tile_count()
+    if cnt <= 0 { << 1 }
+    << (cnt + cap - 1) / cap
+}
+
+fn tm_swatch_rect(bounds &layout.Rect, slot int) fm.Rect2 {
+    x0 := bounds.width - f64(TM_PALETTE_W) + 12.0
+    y0 := 100.0
+    col := slot % TM_COLS
+    row := slot / TM_COLS
+    sw := f64(TM_SWATCH)
+    << fm.rect2(x0 + f64(col) * (sw + 8.0), y0 + f64(row) * (sw + 6.0), sw, sw)
+}
+
+fn tm_ctrl_rect(bounds &layout.Rect, idx int) fm.Rect2 {
+    x0 := bounds.width - f64(TM_PALETTE_W) + 12.0
+    // 0: Brush, 1: Erase, 5: Rect (row1); 6: Fill, 7: Pick, 8: Grid (row2);
+    // 2: MoveExit, 3: Prev, 4: Next
+    if idx == 0 { << fm.rect2(x0, 36.0, 44.0, 24.0) }
+    if idx == 1 { << fm.rect2(x0 + 48.0, 36.0, 46.0, 24.0) }
+    if idx == 5 { << fm.rect2(x0 + 98.0, 36.0, 44.0, 24.0) }
+    if idx == 6 { << fm.rect2(x0, 66.0, 44.0, 24.0) }
+    if idx == 7 { << fm.rect2(x0 + 48.0, 66.0, 46.0, 24.0) }
+    if idx == 8 { << fm.rect2(x0 + 98.0, 66.0, 44.0, 24.0) }
+    if idx == 2 { << fm.rect2(x0, bounds.height - 84.0, 142.0, 24.0) }
+    if idx == 3 { << fm.rect2(x0, bounds.height - 34.0, 34.0, 24.0) }
+    << fm.rect2(x0 + 108.0, bounds.height - 34.0, 34.0, 24.0)
+}
+
+fn tm_layer_row_rect(bounds &layout.Rect, row int) fm.Rect2 {
+    _ := bounds
+    << fm.rect2(10.0, 36.0 + f64(row) * 26.0, 128.0, 22.0)
+}
+
+fn draw_tm_guide(frame $&draw.Frame, center fm.Vec2, half fm.Vec2, square bool, col draw.Color, w f64) int {
+    x := center.x
+    y := center.y
+    if square { << frame.stroke_rect(x - half.x, y - half.y, half.x * 2.0, half.y * 2.0, col, w) or >> }
+    frame.line(x, y - half.y, x + half.x, y, col, w) or >>
+    frame.line(x + half.x, y, x, y + half.y, col, w) or >>
+    frame.line(x, y + half.y, x - half.x, y, col, w) or >>
+    frame.line(x - half.x, y, x, y - half.y, col, w) or >>
+    << 0
+}
+
+fn draw_tm_tile(tm &EmbeddedTileMap, frame $&draw.Frame, tile int, dst fm.Rect2, nearest bool) int {
+    if !tm.has_atlas || tm.atlases.len == 0 {
+        frame.fill_round_rect(dst.position.x + 1.0, dst.position.y + 1.0, math.max(2.0, dst.size.x - 2.0),
+            math.max(2.0, dst.size.y - 2.0), 3.0, draw.rgba(190, 18, 60, 44)) or >>
+        << 0
+    }
+    uv := tm.layer.grid.tileset.tile_uv(tile) or >>
+    im := &tm.atlases[0]
+    w := f64(im.width)
+    h := f64(im.height)
+    sx := uv.position.x * w
+    sy := uv.position.y * h
+    src := draw.ImageRect{x: sx, y: sy, width: math.min(w - sx, uv.size.x * w), height: math.min(h - sy, uv.size.y * h)}
+    dst_r := draw.ImageRect{x: dst.position.x, y: dst.position.y, width: dst.size.x, height: dst.size.y}
+    $samp := draw.SAMPLER_LINEAR
+    if nearest { samp = draw.SAMPLER_NEAREST }
+    << frame.image_region(im, &src, &dst_r, 1.0, samp) or >>
+}
+
+fn draw_tm_btn(
+    frame $&draw.Frame,
+    r fm.Rect2,
+    label string,
+    active bool,
+    enabled bool,
+    pal &PaperPalette
+) int {
+    $bg := pal.elevated
+    $fg := pal.text
+    $bd := pal.border
+    if active {
+        bg = pal.text
+        fg = draw.rgb(255, 253, 251)
+        bd = pal.text
+    } else if !enabled {
+        bg = pal.subtle
+        fg = pal.muted
+    }
+    frame.fill_round_rect(r.position.x, r.position.y, r.size.x, r.size.y, 6.0, bg) or >>
+    frame.stroke_round_rect(r.position.x, r.position.y, r.size.x, r.size.y, 6.0, bd, 1.0) or >>
+    tx := r.position.x + math.max(5.0, (r.size.x - approx_label_width(&label, 6.4)) * 0.5)
+    frame.text(tx, r.position.y + 6.0, 11.5, fg, &label) or >>
+    << 0
+}
+
+fn draw_tm_icon_btn(
+    frame $&draw.Frame,
+    r fm.Rect2,
+    icon int,
+    active bool,
+    enabled bool,
+    pal &PaperPalette
+) int {
+    $bg := pal.elevated
+    $fg := pal.text
+    $bd := pal.border
+    if active {
+        bg = pal.text
+        fg = draw.rgb(255, 253, 251)
+        bd = pal.text
+    } else if !enabled {
+        bg = pal.subtle
+        fg = pal.muted.with_alpha(150)
+    }
+    frame.fill_round_rect(r.position.x, r.position.y, r.size.x, r.size.y, 6.0, bg) or >>
+    frame.stroke_round_rect(r.position.x, r.position.y, r.size.x, r.size.y, 6.0, bd, 1.0) or >>
+    paint_vector_icon(frame, icon, r.position.x + r.size.x * 0.5, r.position.y + r.size.y * 0.5, 13.5, fg) or >>
+    << 0
+}
+
+fn tm_tool_label(tm &EmbeddedTileMap, lang int) string {
+    if tm.erasing || tm.tool == TM_TOOL_ERASE { << tr(lang, "Erase", "橡皮") }
+    if tm.tool == TM_TOOL_RECT { << tr(lang, "Rect", "矩形") }
+    if tm.tool == TM_TOOL_FILL { << tr(lang, "Fill", "填充") }
+    if tm.tool == TM_TOOL_EYEDROP { << tr(lang, "Pick", "吸管") }
+    << tr(lang, "Brush", "画笔")
+}
+
+pub fn tilemap_tooltip(
+    tm &EmbeddedTileMap,
+    view &widgets.View,
+    id_top_view int,
+    x f64,
+    y f64,
+    lang int
+) TooltipHit {
+    if !tm.has_layer || id_top_view <= 0 { << empty_tooltip_hit() }
+    vb := view.node_bounds(id_top_view) or (err) {
+        _ := err
+        << empty_tooltip_hit()
+    }
+    if !vb.contains(x, y) { << empty_tooltip_hit() }
+    pt := fm.vec2(x - vb.x, y - vb.y)
+    lb := layout.Rect{x: 0.0, y: 0.0, width: vb.width, height: vb.height}
+    ids := [0, 1, 5, 6, 7, 8, 3, 4]
+    tips := [
+        tr(lang, "Brush Tile Tool", "画笔绘制工具"),
+        tr(lang, "Eraser Tool", "橡皮擦工具"),
+        tr(lang, "Rectangle Fill Tool", "矩形填充工具"),
+        tr(lang, "Flood Fill Bucket", "油漆桶填充工具"),
+        tr(lang, "Tile Eyedropper", "吸管取色工具"),
+        tr(lang, "Toggle Tile Grid", "切换瓦片网格"),
+        tr(lang, "Previous Tileset Page", "上一页图块"),
+        tr(lang, "Next Tileset Page", "下一页图块")
+    ]
+    for i in 0:ids.len {
+        idx := ids[i]
+        r := tm_ctrl_rect(&lb, idx)
+        if r.contains(pt) {
+            anc := layout.Rect{x: vb.x + r.position.x, y: vb.y + r.position.y, width: r.size.x, height: r.size.y}
+            << TooltipHit{id: 9000 + idx, text: tips[i], anchor: anc}
+        }
+    }
+    << empty_tooltip_hit()
+}
+
+pub fn paint_embedded_tilemap(
+    tm &EmbeddedTileMap,
+    frame $&draw.Frame,
+    bounds &layout.Rect,
+    pal &PaperPalette,
+    lang int
+) int {
+    frame.push() or >>
+    frame.clip_rect(0.0, 0.0, bounds.width, bounds.height) or >>
+    // Warm Paper drafting board backdrop
+    frame.fill_round_rect(0.0, 0.0, bounds.width, bounds.height, 8.0, draw.rgb(242, 238, 233)) or >>
+
+    if !tm.has_layer {
+        msg := tr(lang, "This scene has no TileMap2D layer yet.", "当前场景尚未包含 2D 瓦片地图图层。")
+        frame.text(math.max(24.0, (bounds.width - approx_label_width(&msg, 7.0)) * 0.5),
+            bounds.height * 0.5 - 8.0, 13.0, pal.muted, &msg) or >>
+        frame.stroke_round_rect(0.5, 0.5, bounds.width - 1.0, bounds.height - 1.0, 8.0, pal.border, 1.0) or >>
+        frame.pop() or >>
+        << 0
+    }
+
+    panel := tm_canvas_rect(bounds)
+    grid := &tm.layer.grid
+    frame.push() or >>
+    frame.clip_rect(panel.position.x, panel.position.y, panel.size.x, panel.size.y) or >>
+    quad := grid.tileset.local_quad_bounds() or >>
+    half := fm.vec2(grid.tile_width, grid.tile_height).scaled(tm.zoom * 0.5)
+    square := grid.layout == tiles.LAYOUT_ORTHOGONAL
+    if tm.show_grid {
+        for cell in tm.order {
+            center := tm_screen(tm, panel, grid.cell_center(cell.col, cell.row))
+            grect := fm.rect2(center.x - half.x, center.y - half.y, half.x * 2.0, half.y * 2.0)
+            if grect.overlaps(panel) {
+                draw_tm_guide(frame, center, half, square, pal.border, 0.85) or >>
+            }
+        }
+    }
+    for cell in tm.order {
+        tile := grid.cell(cell.col, cell.row) or >>
+        if tile == tiles.EMPTY_TILE { -> }
+        tl := tm_screen(tm, panel, (grid.cell_visual_center(cell.col, cell.row) or >>).add(quad.position))
+        dst := fm.rect2(tl.x, tl.y, quad.size.x * tm.zoom, quad.size.y * tm.zoom)
+        if dst.overlaps(panel) {
+            draw_tm_tile(tm, frame, tile, dst, tm.layer.pixel_art) or >>
+        }
+    }
+    if tm.rect_active {
+        $c0 := tm.rect_start.col
+        $c1 := tm.rect_end.col
+        if c0 > c1 {
+            c0 = tm.rect_end.col
+            c1 = tm.rect_start.col
+        }
+        $r0 := tm.rect_start.row
+        $r1 := tm.rect_end.row
+        if r0 > r1 {
+            r0 = tm.rect_end.row
+            r1 = tm.rect_start.row
+        }
+        for rr in r0:(r1 + 1) {
+            for cc in c0:(c1 + 1) {
+                if grid.in_bounds(cc, rr) {
+                    ctr := tm_screen(tm, panel, grid.cell_center(cc, rr))
+                    draw_tm_guide(frame, ctr, half, square, pal.brand, 1.8) or >>
+                }
+            }
+        }
+    }
+    if panel.contains(tm.pointer) {
+        cell := safe_point_to_cell(grid, tm_local(tm, panel, tm.pointer))
+        if grid.in_bounds(cell.col, cell.row) {
+            center := tm_screen(tm, panel, grid.cell_center(cell.col, cell.row))
+            $hcol := pal.brand
+            if tm.erasing || tm.tool == TM_TOOL_ERASE { hcol = pal.danger }
+            else if tm.tool == TM_TOOL_EYEDROP { hcol = pal.info }
+            draw_tm_guide(frame, center, half, square, hcol, 2.0) or >>
+        }
+    }
+    if tm.exit_index >= 0 {
+        gate := tm_screen(tm, panel, tm.exit_local)
+        draw_tm_guide(frame, gate, fm.vec2(10.0, 7.0), false, pal.info, 2.4) or >>
+    }
+    if tm.layer_names.len > 0 {
+        hdr := tr(lang, "Layers", "图层")
+        frame.fill_round_rect(8.0, 8.0, 136.0, f64(tm.layer_names.len) * 26.0 + 34.0, 8.0, pal.surface.with_alpha(235)) or >>
+        frame.stroke_round_rect(8.0, 8.0, 136.0, f64(tm.layer_names.len) * 26.0 + 34.0, 8.0, pal.border, 1.0) or >>
+        frame.text(16.0, 14.0, 11.5, pal.text, &hdr) or >>
+        for li in 0:tm.layer_names.len {
+            rr := tm_layer_row_rect(bounds, li)
+            $lcol := pal.muted
+            if li == tm.layer_idx {
+                frame.fill_round_rect(rr.position.x, rr.position.y, rr.size.x, rr.size.y, 5.0, draw.rgb(252, 228, 235)) or >>
+                lcol = pal.brand
+            }
+            nm := tm.layer_names[li] + ""
+            frame.text(rr.position.x + 8.0, rr.position.y + 4.0, 11.5, lcol, &nm) or >>
+        }
+    }
+    // Bottom hint pill
+    hint := tr(lang, "Paint Tile · Scroll Zoom · Right-Drag Pan", "左键绘制 · 滚轮缩放 · 右键平移")
+    frame.fill_round_rect(10.0, bounds.height - 30.0, math.max(120.0, approx_label_width(&hint, 6.2) + 16.0),
+        22.0, 6.0, pal.surface.with_alpha(232)) or >>
+    frame.text(18.0, bounds.height - 25.0, 11.0, pal.muted, &hint) or >>
+    frame.pop() or >>
+
+    // Right Paper Tileset Drawer inside TileMap view
+    px := bounds.width - f64(TM_PALETTE_W)
+    frame.fill_rect(px, 0.0, f64(TM_PALETTE_W), bounds.height, pal.surface) or >>
+    frame.line(px, 0.0, px, bounds.height, pal.border, 1.0) or >>
+    ttitle := tr(lang, "Tileset", "图块集")
+    frame.text(px + 12.0, 12.0, 12.5, pal.text, &ttitle) or >>
+    draw_tm_icon_btn(frame, tm_ctrl_rect(bounds, 0), ICON_TM_BRUSH, tm.tool == TM_TOOL_BRUSH && !tm.erasing, true, pal) or >>
+    draw_tm_icon_btn(frame, tm_ctrl_rect(bounds, 1), ICON_TM_ERASE, tm.erasing || tm.tool == TM_TOOL_ERASE, true, pal) or >>
+    draw_tm_icon_btn(frame, tm_ctrl_rect(bounds, 5), ICON_TM_RECT, tm.tool == TM_TOOL_RECT, true, pal) or >>
+    draw_tm_icon_btn(frame, tm_ctrl_rect(bounds, 6), ICON_TM_FILL, tm.tool == TM_TOOL_FILL, true, pal) or >>
+    draw_tm_icon_btn(frame, tm_ctrl_rect(bounds, 7), ICON_TM_PICK, tm.tool == TM_TOOL_EYEDROP, true, pal) or >>
+    draw_tm_icon_btn(frame, tm_ctrl_rect(bounds, 8), ICON_GRID_VIEW, tm.show_grid, true, pal) or >>
+
+    cap := tm_palette_cap(bounds)
+    for slot in 0:cap {
+        tile := tm.page * cap + slot
+        if tile >= grid.tileset.tile_count() { <- }
+        sw := tm_swatch_rect(bounds, slot)
+        frame.fill_round_rect(sw.position.x, sw.position.y, sw.size.x, sw.size.y, 5.0, pal.elevated) or >>
+        aspect := grid.tileset.draw_width / math.max(1.0, grid.tileset.draw_height)
+        iw := math.min(30.0, 30.0 * aspect)
+        ih := math.min(30.0, 30.0 / math.max(0.01, aspect))
+        icon_r := fm.rect2(sw.position.x + (sw.size.x - iw) * 0.5, sw.position.y + (sw.size.y - ih) * 0.5, iw, ih)
+        draw_tm_tile(tm, frame, tile, icon_r, true) or >>
+        if tile == tm.tile && !tm.erasing {
+            frame.stroke_round_rect(sw.position.x, sw.position.y, sw.size.x, sw.size.y, 5.0, pal.brand, 2.0) or >>
+        } else {
+            frame.stroke_round_rect(sw.position.x, sw.position.y, sw.size.x, sw.size.y, 5.0, pal.border, 1.0) or >>
+        }
+    }
+
+    if tm.exit_index >= 0 {
+        draw_tm_btn(frame, tm_ctrl_rect(bounds, 2), tr(lang, "Move Exit", "移动出口"), tm.placing_exit, true, pal) or >>
+    }
+    $tlbl := tm_tool_label(tm, lang) + " · " + tr(lang, "Tile ", "图块 ") + str(tm.tile)
+    if grid.tile_is_solid(tm.tile) { tlbl = tlbl + tr(lang, " · Solid", " · 碰撞") }
+    frame.text(px + 12.0, bounds.height - 54.0, 11.5, pal.muted, &tlbl) or >>
+
+    pages := tm_palette_pages(tm, bounds)
+    draw_tm_icon_btn(frame, tm_ctrl_rect(bounds, 3), ICON_CHEVRON_LEFT, false, tm.page > 0, pal) or >>
+    draw_tm_icon_btn(frame, tm_ctrl_rect(bounds, 4), ICON_CHEVRON_RIGHT, false, tm.page + 1 < pages, pal) or >>
+    plbl := str(tm.page + 1) + " / " + str(pages)
+    frame.text(px + 64.0, bounds.height - 29.0, 11.5, pal.muted, &plbl) or >>
+
+    frame.stroke_round_rect(0.5, 0.5, bounds.width - 1.0, bounds.height - 1.0, 8.0, pal.border, 1.0) or >>
+    frame.pop() or >>
+    << 0
+}
+
+fn safe_grid_cell(grid &tiles.TileMap2D, c int, r int) int {
+    << grid.cell(c, r) or (err) {
+        _ := err
+        << tiles.EMPTY_TILE
+    }
+}
+
+fn (tm $&EmbeddedTileMap) paint_cell_at(bounds &layout.Rect, pt fm.Vec2) bool {
+    panel := tm_canvas_rect(bounds)
+    cell := safe_point_to_cell(&tm.layer.grid, tm_local(tm, panel, pt))
+    if !tm.layer.grid.in_bounds(cell.col, cell.row) { << false }
+    $tile := tm.tile
+    if tm.erasing { tile = tiles.EMPTY_TILE }
+    cur := safe_grid_cell(&tm.layer.grid, cell.col, cell.row)
+    if cur == tile { << false }
+    l := $&tm.layer
+    g := $&l.grid
+    _ := g.set_cell(cell.col, cell.row, tile) or (err) {
+        _ := err
+        << false
+    }
+    tm.changed = true
+    << true
+}
+
+fn (tm $&EmbeddedTileMap) rect_fill_cells(a tiles.CellCoord, b tiles.CellCoord) bool {
+    $c0 := a.col
+    $c1 := b.col
+    if c0 > c1 {
+        c0 = b.col
+        c1 = a.col
+    }
+    $r0 := a.row
+    $r1 := b.row
+    if r0 > r1 {
+        r0 = b.row
+        r1 = a.row
+    }
+    $tile := tm.tile
+    if tm.erasing || tm.tool == TM_TOOL_ERASE { tile = tiles.EMPTY_TILE }
+    $did := false
+    l := $&tm.layer
+    g := $&l.grid
+    for r in r0:(r1 + 1) {
+        for c in c0:(c1 + 1) {
+            if !g.in_bounds(c, r) { -> }
+            cur := safe_grid_cell(g, c, r)
+            if cur == tile { -> }
+            _ := g.set_cell(c, r, tile) or (err) {
+                _ := err
+                ->
+            }
+            did = true
+        }
+    }
+    if did { tm.changed = true }
+    << did
+}
+
+fn (tm $&EmbeddedTileMap) flood_fill_at(bounds &layout.Rect, pt fm.Vec2) bool {
+    panel := tm_canvas_rect(bounds)
+    start := safe_point_to_cell(&tm.layer.grid, tm_local(tm, panel, pt))
+    if !tm.layer.grid.in_bounds(start.col, start.row) { << false }
+    target := safe_grid_cell(&tm.layer.grid, start.col, start.row)
+    $rep := tm.tile
+    if tm.erasing || tm.tool == TM_TOOL_ERASE { rep = tiles.EMPTY_TILE }
+    if target == rep { << false }
+    l := $&tm.layer
+    g := $&l.grid
+    $q := [start]
+    $seen := map[int]bool{}
+    seen[start.row * 4096 + start.col] = true
+    $qi := 0
+    $did := false
+    while qi < q.len && qi < 4096 {
+        cur := q[qi]
+        qi += 1
+        _ := g.set_cell(cur.col, cur.row, rep) or (err) {
+            _ := err
+            ->
+        }
+        did = true
+        nbrs := [
+            tiles.CellCoord{col: cur.col + 1, row: cur.row},
+            tiles.CellCoord{col: cur.col - 1, row: cur.row},
+            tiles.CellCoord{col: cur.col, row: cur.row + 1},
+            tiles.CellCoord{col: cur.col, row: cur.row - 1}
+        ]
+        for nb in nbrs {
+            if !g.in_bounds(nb.col, nb.row) { -> }
+            key := nb.row * 4096 + nb.col
+            if seen.has(key) { -> }
+            if safe_grid_cell(g, nb.col, nb.row) == target {
+                seen[key] = true
+                q.push(nb)
+            }
+        }
+    }
+    if did { tm.changed = true }
+    << did
+}
+
+fn (tm $&EmbeddedTileMap) eyedrop_at(bounds &layout.Rect, pt fm.Vec2) bool {
+    panel := tm_canvas_rect(bounds)
+    cell := safe_point_to_cell(&tm.layer.grid, tm_local(tm, panel, pt))
+    if !tm.layer.grid.in_bounds(cell.col, cell.row) { << false }
+    val := safe_grid_cell(&tm.layer.grid, cell.col, cell.row)
+    if val != tiles.EMPTY_TILE {
+        tm.tile = val
+        tm.tool = TM_TOOL_BRUSH
+        tm.erasing = false
+        << true
+    }
+    << false
+}
+
+pub fn (tm $&EmbeddedTileMap) route_input(bounds &layout.Rect, kind int, input &ui.InputEvent) int {
+    if kind == widgets.ROUTE_BLUR || kind == widgets.ROUTE_CANCEL {
+        was := tm.panning || tm.stroke || tm.rect_active
+        tm.panning = false
+        tm.stroke = false
+        tm.rect_active = false
+        tm.changed = false
+        if was { << TM_ACT_REPAINT }
+        << TM_ACT_NONE
+    }
+    if kind != widgets.ROUTE_INPUT { << TM_ACT_NONE }
+    if !tm.has_layer { << TM_ACT_NONE }
+    panel := tm_canvas_rect(bounds)
+    pt := fm.vec2(input.x, input.y)
+
+    if input.kind == ui.EV_POINTER_SCROLL && panel.contains(pt) {
+        before := tm_local(tm, panel, pt)
+        tw := tm.layer.grid.tile_width
+        th := tm.layer.grid.tile_height
+        min_z := 8.0 / math.max(1.0, math.min(tw, th))
+        tm.zoom = math.min(f64(TM_MAX_ZOOM), math.max(min_z, tm.zoom * math.exp(-input.dy * 0.10)))
+        tm.center = tm.center.add(before.sub(tm_local(tm, panel, pt)))
+        tm.pointer = pt
+        << TM_ACT_REPAINT
+    }
+    if input.kind == ui.EV_POINTER_MOVE {
+        if tm.panning && input.buttons == 0 {
+            tm.panning = false
+        }
+        if (tm.stroke || tm.rect_active) && (input.buttons & 1) == 0 {
+            tm.stroke = false
+            tm.rect_active = false
+        }
+        if tm.panning {
+            tm.center = tm.center.sub(pt.sub(tm.pan_start).scaled(1.0 / math.max(0.001, tm.zoom)))
+            tm.pan_start = pt
+            tm.pointer = pt
+            << TM_ACT_REPAINT
+        }
+        if tm.rect_active && panel.contains(pt) {
+            tm.rect_end = safe_point_to_cell(&tm.layer.grid, tm_local(tm, panel, pt))
+            tm.pointer = pt
+            << TM_ACT_REPAINT
+        }
+        if tm.stroke && panel.contains(pt) {
+            _ := tm.paint_cell_at(bounds, pt)
+            tm.pointer = pt
+            << TM_ACT_REPAINT
+        }
+        tm.pointer = pt
+        if panel.contains(pt) { << TM_ACT_REPAINT }
+        << TM_ACT_NONE
+    }
+    if input.kind == ui.EV_POINTER_DOWN {
+        if input.button == ui.BUTTON_RIGHT || input.button == ui.BUTTON_MIDDLE {
+            if panel.contains(pt) {
+                tm.panning = true
+                tm.pan_start = pt
+                << TM_ACT_REPAINT
+            }
+            << TM_ACT_NONE
+        }
+        if input.button != ui.BUTTON_LEFT { << TM_ACT_NONE }
+        for li in 0:tm.layer_names.len {
+            if tm_layer_row_rect(bounds, li).contains(pt) {
+                if li != tm.layer_idx {
+                    tm.layer_idx = li
+                    << TM_ACT_SELECT_LAYER
+                }
+                << TM_ACT_NONE
+            }
+        }
+        if tm_ctrl_rect(bounds, 0).contains(pt) {
+            tm.tool = TM_TOOL_BRUSH
+            tm.erasing = false
+            << TM_ACT_REPAINT
+        }
+        if tm_ctrl_rect(bounds, 1).contains(pt) {
+            tm.tool = TM_TOOL_ERASE
+            tm.erasing = true
+            << TM_ACT_REPAINT
+        }
+        if tm_ctrl_rect(bounds, 5).contains(pt) {
+            tm.tool = TM_TOOL_RECT
+            tm.erasing = false
+            << TM_ACT_REPAINT
+        }
+        if tm_ctrl_rect(bounds, 6).contains(pt) {
+            tm.tool = TM_TOOL_FILL
+            tm.erasing = false
+            << TM_ACT_REPAINT
+        }
+        if tm_ctrl_rect(bounds, 7).contains(pt) {
+            tm.tool = TM_TOOL_EYEDROP
+            tm.erasing = false
+            << TM_ACT_REPAINT
+        }
+        if tm_ctrl_rect(bounds, 8).contains(pt) {
+            tm.show_grid = !tm.show_grid
+            << TM_ACT_REPAINT
+        }
+        if tm.exit_index >= 0 && tm_ctrl_rect(bounds, 2).contains(pt) {
+            tm.placing_exit = !tm.placing_exit
+            << TM_ACT_REPAINT
+        }
+        pages := tm_palette_pages(tm, bounds)
+        if tm_ctrl_rect(bounds, 3).contains(pt) && tm.page > 0 {
+            tm.page -= 1
+            << TM_ACT_REPAINT
+        }
+        if tm_ctrl_rect(bounds, 4).contains(pt) && tm.page + 1 < pages {
+            tm.page += 1
+            << TM_ACT_REPAINT
+        }
+        cap := tm_palette_cap(bounds)
+        for slot in 0:cap {
+            tile := tm.page * cap + slot
+            if tile >= tm.layer.grid.tileset.tile_count() { <- }
+            if tm_swatch_rect(bounds, slot).contains(pt) {
+                tm.tile = tile
+                tm.tool = TM_TOOL_BRUSH
+                tm.erasing = false
+                << TM_ACT_REPAINT
+            }
+        }
+        if panel.contains(pt) {
+            if tm.placing_exit && tm.exit_index >= 0 {
+                loc := tm_local(tm, panel, pt)
+                cell := safe_point_to_cell(&tm.layer.grid, loc)
+                if tm.layer.grid.in_bounds(cell.col, cell.row) {
+                    tm.exit_local = loc
+                    tm.placing_exit = false
+                    << TM_ACT_COMMIT_EXIT
+                }
+                << TM_ACT_NONE
+            }
+            if tm.tool == TM_TOOL_EYEDROP {
+                if tm.eyedrop_at(bounds, pt) { << TM_ACT_REPAINT }
+                << TM_ACT_NONE
+            }
+            if tm.tool == TM_TOOL_FILL {
+                if tm.flood_fill_at(bounds, pt) {
+                    tm.changed = false
+                    << TM_ACT_COMMIT_STROKE
+                }
+                << TM_ACT_NONE
+            }
+            if tm.tool == TM_TOOL_RECT {
+                cell := safe_point_to_cell(&tm.layer.grid, tm_local(tm, panel, pt))
+                tm.rect_active = true
+                tm.rect_start = cell
+                tm.rect_end = cell
+                tm.pointer = pt
+                << TM_ACT_REPAINT
+            }
+            tm.stroke = true
+            tm.changed = false
+            _ := tm.paint_cell_at(bounds, pt)
+            tm.pointer = pt
+            << TM_ACT_REPAINT
+        }
+    }
+    if input.kind == ui.EV_POINTER_UP || input.kind == ui.EV_POINTER_CANCEL {
+        tm.panning = false
+        if tm.rect_active {
+            ra := tm.rect_start
+            rb := tm.rect_end
+            tm.rect_active = false
+            if input.kind == ui.EV_POINTER_UP && tm.rect_fill_cells(ra, rb) {
+                tm.changed = false
+                << TM_ACT_COMMIT_STROKE
+            }
+            << TM_ACT_REPAINT
+        }
+        was_stroke := tm.stroke
+        did_change := tm.changed
+        tm.stroke = false
+        tm.changed = false
+        if was_stroke && did_change && input.kind == ui.EV_POINTER_UP {
+            << TM_ACT_COMMIT_STROKE
+        }
+        << TM_ACT_NONE
+    }
+    << TM_ACT_NONE
+}

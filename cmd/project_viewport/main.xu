@@ -76,6 +76,7 @@ struct Options { path string
     capture string
     live_connect string
     live_script string
+    embed_connect string
     whitebox_out string
     whitebox_shape string
     snap SnapSteps }
@@ -83,7 +84,7 @@ struct Options { path string
 fn options() Options {
     args := os.args()
     $config := Options{path: "", output: "", meta_out: "", select_node: -1, check_node: "", check_also: "", check_local: false, modern: false, capture: "",
-        live_connect: "", live_script: "", whitebox_out: "", whitebox_shape: "",
+        live_connect: "", live_script: "", embed_connect: "", whitebox_out: "", whitebox_shape: "",
         snap: SnapSteps{move: 0.25, rotate: 15.0, scale: 10.0}}
     $i := 1
     while i < args.len {
@@ -110,6 +111,7 @@ fn options() Options {
         else if args[i] == "--capture" { config.capture = value }
         else if args[i] == "--live-connect" { config.live_connect = value }
         else if args[i] == "--live-script" { config.live_script = value }
+        else if args[i] == "--embed-connect" { config.embed_connect = value }
         else if args[i] == "--whitebox-out" { config.whitebox_out = value }
         else if args[i] == "--whitebox" { config.whitebox_shape = value }
         else if args[i] == "--snap-move" {
@@ -122,11 +124,13 @@ fn options() Options {
         else { >> errors.new("unknown viewport option: " + args[i]) }
         i += 2
     }
-    if config.path.len == 0 || config.output.len == 0 {
+    if config.path.len == 0 || (config.output.len == 0 && config.embed_connect.len == 0) {
         >> errors.new("viewport requires a scene and a separate output path")
     }
     config.path = filepath.abs(&config.path) or >>
-    config.output = filepath.abs(&config.output) or >>
+    if config.output.len > 0 {
+        config.output = filepath.abs(&config.output) or >>
+    }
     if config.meta_out.len > 0 {
         config.meta_out = filepath.abs(&config.meta_out) or >>
     }
@@ -922,6 +926,9 @@ fn write_viewport_meta(config &Options, editor &EditorView) int {
 
 fn run() int {
     config := options() or >>
+    if config.embed_connect.len > 0 {
+        << run_embed_server(&config) or >>
+    }
     directory := filepath.dir(&config.path)
     document := files.load(config.path + "") or >>
     doc_meta := files.load(config.path + "") or >>
@@ -952,6 +959,25 @@ fn run() int {
     }
 
     tree_ids := tree.subtree(root) or >>
+    for mi in 0:doc_meta.material_override_count() {
+        ov := doc_meta.material_override(mi) or (err) {
+            _ := err
+            ->
+        }
+        if ov.slot != 0 || ov.node <= 0 || ov.node >= tree_ids.len { -> }
+        tid := tree_ids[ov.node]
+        $mat3d := imod.material_asset_to_3d(&ov.material) or (err) {
+            _ := err
+            ->
+        }
+        if world.is_node_double_sided(tid) && !mat3d.is_double_sided() {
+            mat3d = mat3d.with_double_sided(true)
+        }
+        _ := world.set_material(&tree, tid, mat3d) or (err) {
+            _ := err
+            ->
+        }
+    }
     $doc_by_tree_id := map[int]int{}
     for d in 0:tree_ids.len { doc_by_tree_id[tree_ids[d]] = d }
 

@@ -1,0 +1,1684 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+camera_data #"github.com/xulang-org/nexus/resources/camera"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+resource #"github.com/xulang-org/nexus/resources/scene"
+mod #"github.com/xulang-org/nexus/modeling"
+#ui
+#ui/draw
+#ui/layout
+widgets #ui/widgets
+#math
+#strings
+#strconv
+
+pub const STAGE_MODE_2D = 0
+pub const STAGE_MODE_3D = 1
+pub const STAGE_MODE_SPLIT = 2
+pub const STAGE_MODE_TILEMAP = 3
+
+pub const SUB_MODE_OBJ = 0
+pub const SUB_MODE_VERT = 1
+pub const SUB_MODE_EDGE = 2
+pub const SUB_MODE_FACE = 3
+
+pub const ORTHO_TOP = 0
+pub const ORTHO_FRONT = 1
+pub const ORTHO_RIGHT = 2
+
+pub const VP3D_ACT_NONE = 0
+pub const VP3D_ACT_RENDER = 1
+pub const VP3D_ACT_PICK = 2
+pub const VP3D_ACT_CAPTURE = 3
+pub const VP3D_ACT_COMMIT_MOVE = 4
+pub const VP3D_ACT_COMMIT_SUB_MOVE = 5
+
+pub const GIZMO_MOVE = 0
+pub const GIZMO_ROTATE = 1
+pub const GIZMO_SCALE = 2
+
+struct VpPaneRect {
+    pub x f64
+    pub y f64
+    pub w f64
+    pub h f64
+}
+
+struct VpCamera {
+    pub is_ortho bool
+    pub position fm.Vec3
+    pub right fm.Vec3
+    pub up fm.Vec3
+    pub forward fm.Vec3
+    pub view fm.Mat4
+    pub proj fm.Mat4
+    pub vp fm.Mat4
+    pub ortho_size f64
+    pub tangent f64
+    pub near f64
+    pub far f64
+}
+
+struct VpProjPt {
+    pub pos fm.Vec2
+    pub visible bool
+}
+
+struct GizmoAxisEnd {
+    pub label string
+    pub tip fm.Vec2
+    pub depth f64
+    pub col draw.Color
+}
+
+pub struct Viewport3DState {
+    pub center fm.Vec3
+    pub distance f64
+    pub yaw f64
+    pub pitch f64
+    pub ortho_size f64
+    pub ortho_axis int
+
+    pub show_grid bool
+    pub show_wire bool
+    pub sub_mode int
+    pub selected_face int
+    pub selected_vert int
+    pub selected_e0 int
+    pub selected_e1 int
+
+    pub dragging_orbit bool
+    pub dragging_pan bool
+    pub drag_pane int
+    pub drag_start_x f64
+    pub drag_start_y f64
+    pub drag_last_x f64
+    pub drag_last_y f64
+    pub drag_moved bool
+
+    pub gizmo_hover_axis int
+    pub gizmo_drag_axis int
+    pub gizmo_tool int
+    pub gizmo_origin fm.Vec3
+    pub gizmo_delta fm.Vec3
+    pub gizmo_rot_deg fm.Vec3
+    pub gizmo_scale_mul fm.Vec3
+    pub gizmo_screen_dir_x f64
+    pub gizmo_screen_dir_y f64
+    pub gizmo_world_per_px f64
+    pub gizmo_triad_hover int
+    pub live_gizmo_dirty bool
+
+    pub has_image bool
+    pub images []draw.Image
+    pub img_w int
+    pub img_h int
+    pub backend_name string
+    pub connected bool
+    pub scene_rev_sent string
+    pub render_seq int
+    pub in_flight bool
+    pub dirty_render bool
+    pub pending_pick bool
+    pub pick_additive bool
+    pub pick_down_additive bool
+    pub pick_x f64
+    pub pick_y f64
+    pub pending_capture_3d string
+    pub pending_capture_done string
+}
+
+pub fn default_viewport_3d() Viewport3DState {
+    << Viewport3DState{
+        center: fm.vec3(0.0, 0.4, 0.0),
+        distance: 6.5,
+        yaw: 0.55,
+        pitch: 0.42,
+        ortho_size: 8.0,
+        ortho_axis: ORTHO_TOP,
+        show_grid: true,
+        show_wire: true,
+        sub_mode: SUB_MODE_OBJ,
+        selected_face: 0,
+        selected_vert: 0,
+        selected_e0: -1,
+        selected_e1: -1,
+        dragging_orbit: false,
+        dragging_pan: false,
+        drag_pane: 0,
+        drag_start_x: 0.0,
+        drag_start_y: 0.0,
+        drag_last_x: 0.0,
+        drag_last_y: 0.0,
+        drag_moved: false,
+        gizmo_hover_axis: 0,
+        gizmo_drag_axis: 0,
+        gizmo_tool: GIZMO_MOVE,
+        gizmo_origin: fm.vec3(0.0, 0.0, 0.0),
+        gizmo_delta: fm.vec3(0.0, 0.0, 0.0),
+        gizmo_rot_deg: fm.vec3(0.0, 0.0, 0.0),
+        gizmo_scale_mul: fm.vec3(1.0, 1.0, 1.0),
+        gizmo_screen_dir_x: 1.0,
+        gizmo_screen_dir_y: 0.0,
+        gizmo_world_per_px: 0.01,
+        gizmo_triad_hover: 0,
+        live_gizmo_dirty: false,
+        has_image: false,
+        images: []draw.Image{},
+        img_w: 0,
+        img_h: 0,
+        backend_name: "Paper CPU",
+        connected: false,
+        scene_rev_sent: "",
+        render_seq: 0,
+        in_flight: false,
+        dirty_render: false,
+        pending_pick: false,
+        pick_additive: false,
+        pick_down_additive: false,
+        pick_x: 0.0,
+        pick_y: 0.0,
+        pending_capture_3d: "",
+        pending_capture_done: ""
+    }
+}
+
+pub fn (vp $&Viewport3DState) dispose() {
+    if vp.has_image && vp.images.len > 0 {
+        im := $&vp.images[0]
+        _ := im.dispose() or (err) {
+            _ := err
+            <<
+        }
+    }
+    vp.images = []draw.Image{}
+    vp.has_image = false
+    vp.img_w = 0
+    vp.img_h = 0
+}
+
+pub fn (vp $&Viewport3DState) apply_rgba_frame(ctx &draw.Context, w int, h int, rgba &string) int {
+    if w <= 0 || h <= 0 || rgba.len != w * h * 4 { << 0 }
+    if vp.has_image && vp.images.len > 0 && vp.img_w == w && vp.img_h == h {
+        _ := vp.images[0].update_rgba(w * 4, rgba) or (err) {
+            _ := err
+            << 0
+        }
+        << 1
+    }
+    vp.dispose()
+    next_im := ctx.image_rgba(w, h, w * 4, rgba) or (err) {
+        _ := err
+        << 0
+    }
+    vp.images.push(next_im)
+    vp.has_image = true
+    vp.img_w = w
+    vp.img_h = h
+    << 1
+}
+
+pub fn (vp $&Viewport3DState) fit_scene(pts &[]StagePoint, doc &resource.Document) {
+    $has := false
+    $low := fm.vec3(0.0, 0.0, 0.0)
+    $high := fm.vec3(0.0, 0.0, 0.0)
+    for i in 1:pts.len {
+        p := &pts[i]
+        if p.kind != resource.NODE_3D { -> }
+        v := fm.vec3(p.x, p.y, p.z)
+        if !has {
+            low = v.sub(fm.vec3(1.5, 1.0, 1.5))
+            high = v.add(fm.vec3(1.5, 1.5, 1.5))
+            has = true
+        } else {
+            low = fm.vec3(math.min(low.x, v.x - 1.5), math.min(low.y, v.y - 1.0), math.min(low.z, v.z - 1.5))
+            high = fm.vec3(math.max(high.x, v.x + 1.5), math.max(high.y, v.y + 1.5), math.max(high.z, v.z + 1.5))
+        }
+    }
+    _ := doc
+    if !has {
+        vp.center = fm.vec3(0.0, 0.5, 0.0)
+        vp.distance = 6.5
+        vp.ortho_size = 8.0
+        <<
+    }
+    span := high.sub(low)
+    vp.center = low.add(span.scaled(0.5))
+    radius := span.length() * 0.5
+    vp.distance = math.max(4.5, math.min(60.0, radius * 1.9))
+    vp.ortho_size = math.max(4.5, math.min(80.0, math.max(span.x, math.max(span.y, span.z)) * 1.35))
+}
+
+pub fn (vp $&Viewport3DState) fit_selection(pts &[]StagePoint, selected_nodes &[]int, doc &resource.Document) bool {
+    _ := doc
+    $has := false
+    $low := fm.vec3(0.0, 0.0, 0.0)
+    $high := fm.vec3(0.0, 0.0, 0.0)
+    for k in 0:selected_nodes.len {
+        nid := selected_nodes[k]
+        if nid <= 0 || nid >= pts.len { -> }
+        p := &pts[nid]
+        if p.kind != resource.NODE_3D { -> }
+        v := fm.vec3(p.x, p.y, p.z)
+        if !has {
+            low = v.sub(fm.vec3(1.2, 0.9, 1.2))
+            high = v.add(fm.vec3(1.2, 1.2, 1.2))
+            has = true
+        } else {
+            low = fm.vec3(math.min(low.x, v.x - 1.2), math.min(low.y, v.y - 0.9), math.min(low.z, v.z - 1.2))
+            high = fm.vec3(math.max(high.x, v.x + 1.2), math.max(high.y, v.y + 1.2), math.max(high.z, v.z + 1.2))
+        }
+    }
+    if !has { << false }
+    span := high.sub(low)
+    vp.center = low.add(span.scaled(0.5))
+    radius := span.length() * 0.5
+    vp.distance = math.max(3.2, math.min(45.0, radius * 2.0))
+    vp.ortho_size = math.max(3.2, math.min(60.0, math.max(span.x, math.max(span.y, span.z)) * 1.45))
+    << true
+}
+
+fn vp_compute_panes(bounds &layout.Rect, split bool) []VpPaneRect {
+    if !split || bounds.width < 160.0 {
+        << [VpPaneRect{x: 0.0, y: 0.0, w: bounds.width, h: bounds.height}]
+    }
+    lw := math.floor(bounds.width * 0.56)
+    rw := bounds.width - lw - 2.0
+    if rw < 32.0 {
+        << [VpPaneRect{x: 0.0, y: 0.0, w: bounds.width, h: bounds.height}]
+    }
+    << [
+        VpPaneRect{x: 0.0, y: 0.0, w: lw, h: bounds.height},
+        VpPaneRect{x: lw + 2.0, y: 0.0, w: rw, h: bounds.height}
+    ]
+}
+
+fn (r VpPaneRect) contains(x f64, y f64) bool {
+    << x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h
+}
+
+fn vp_look_at(eye fm.Vec3, target fm.Vec3, up_in fm.Vec3) fm.Mat4 {
+    f := target.sub(eye).normalized() or (err) {
+        _ := err
+        << fm.identity_3d()
+    }
+    s := f.cross(up_in).normalized() or (err) {
+        _ := err
+        << fm.identity_3d()
+    }
+    u := s.cross(f)
+    << fm.Mat4{
+        c0: fm.vec4(s.x, u.x, -f.x, 0.0),
+        c1: fm.vec4(s.y, u.y, -f.y, 0.0),
+        c2: fm.vec4(s.z, u.z, -f.z, 0.0),
+        c3: fm.vec4(-s.dot(eye), -u.dot(eye), f.dot(eye), 1.0)
+    }
+}
+
+fn vp_perspective(fov f64, aspect f64, near f64, far f64) fm.Mat4 {
+    t := math.tan(fov * 0.5)
+    f := 1.0 / math.max(1e-6, t)
+    a := math.max(0.1, aspect)
+    // Reverse-Z / standard NDC compatible column matrix
+    nf := 1.0 / (near - far)
+    << fm.Mat4{
+        c0: fm.vec4(f / a, 0.0, 0.0, 0.0),
+        c1: fm.vec4(0.0, f, 0.0, 0.0),
+        c2: fm.vec4(0.0, 0.0, (far + near) * nf, -1.0),
+        c3: fm.vec4(0.0, 0.0, (2.0 * far * near) * nf, 0.0)
+    }
+}
+
+fn safe_norm3(v fm.Vec3, fb fm.Vec3) fm.Vec3 {
+    << v.normalized() or (err) {
+        _ := err
+        << fb
+    }
+}
+
+fn safe_persp_proj(fov f64, aspect f64, near f64, far f64) fm.Mat4 {
+    << camera_data.projection(fov, aspect, near, far) or (err) {
+        _ := err
+        << vp_perspective(fov, aspect, near, far)
+    }
+}
+
+fn safe_ortho_proj(size f64, aspect f64, near f64, far f64) fm.Mat4 {
+    lens := camera_data.orthographic(size, near, far) or (err) {
+        _ := err
+        << fm.identity_3d()
+    }
+    << lens.projection(aspect) or (err) {
+        _ := err
+        << fm.identity_3d()
+    }
+}
+
+fn vp_persp_camera(vp &Viewport3DState, rect VpPaneRect) VpCamera {
+    dir := fm.vec3(
+        math.sin(vp.yaw) * math.cos(vp.pitch),
+        math.sin(vp.pitch),
+        math.cos(vp.yaw) * math.cos(vp.pitch)
+    )
+    fov := 1.0471975511965976
+    near := math.max(0.00015, vp.distance * 0.002)
+    far := math.max(1000.0, vp.distance * 40.0)
+    pos := vp.center.add(dir.scaled(vp.distance))
+    fwd := dir.scaled(-1.0)
+    right := safe_norm3(fwd.cross(fm.vec3(0.0, 1.0, 0.0)), fm.vec3(1.0, 0.0, 0.0))
+    up := right.cross(fwd)
+    aspect := math.max(0.1, rect.w) / math.max(0.1, rect.h)
+    view := vp_look_at(pos, vp.center, fm.vec3(0.0, 1.0, 0.0))
+    proj := safe_persp_proj(fov, aspect, near, far)
+    << VpCamera{
+        is_ortho: false, position: pos, right: right, up: up, forward: fwd,
+        view: view, proj: proj, vp: proj.multiply(view),
+        ortho_size: vp.ortho_size, tangent: math.tan(fov * 0.5), near: near, far: far
+    }
+}
+
+fn vp_ortho_camera(vp &Viewport3DState, rect VpPaneRect) VpCamera {
+    $axis_dir := fm.vec3(0.0, 1.0, 0.0)
+    $up_vec := fm.vec3(0.0, 0.0, -1.0)
+    if vp.ortho_axis == ORTHO_FRONT {
+        axis_dir = fm.vec3(0.0, 0.0, 1.0)
+        up_vec = fm.vec3(0.0, 1.0, 0.0)
+    } else if vp.ortho_axis == ORTHO_RIGHT {
+        axis_dir = fm.vec3(1.0, 0.0, 0.0)
+        up_vec = fm.vec3(0.0, 1.0, 0.0)
+    }
+    near := 0.05
+    far := 400.0
+    pos := vp.center.add(axis_dir.scaled(60.0))
+    fwd := axis_dir.scaled(-1.0)
+    right := safe_norm3(fwd.cross(up_vec), fm.vec3(1.0, 0.0, 0.0))
+    up := right.cross(fwd)
+    aspect := math.max(0.1, rect.w) / math.max(0.1, rect.h)
+    view := vp_look_at(pos, vp.center, up_vec)
+    proj := safe_ortho_proj(vp.ortho_size, aspect, near, far)
+    << VpCamera{
+        is_ortho: true, position: pos, right: right, up: up, forward: fwd,
+        view: view, proj: proj, vp: proj.multiply(view),
+        ortho_size: vp.ortho_size, tangent: 1.0, near: near, far: far
+    }
+}
+
+fn (cam &VpCamera) project_unclipped(world fm.Vec3, rect VpPaneRect) VpProjPt {
+    clip := cam.vp.transform(fm.vec4(world.x, world.y, world.z, 1.0))
+    if !clip.is_finite() { << VpProjPt{pos: fm.vec2(0.0, 0.0), visible: false} }
+    if !cam.is_ortho && clip.w < cam.near { << VpProjPt{pos: fm.vec2(0.0, 0.0), visible: false} }
+    if math.abs(clip.w) <= 1e-8 { << VpProjPt{pos: fm.vec2(0.0, 0.0), visible: false} }
+    nx := clip.x / clip.w
+    ny := clip.y / clip.w
+    pt := fm.vec2(rect.x + (nx + 1.0) * 0.5 * rect.w, rect.y + (1.0 - ny) * 0.5 * rect.h)
+    << VpProjPt{pos: pt, visible: fm.finite(pt.x) && fm.finite(pt.y)}
+}
+
+fn draw_vp_clipped_segment(
+    frame $&draw.Frame,
+    cam &VpCamera,
+    rect VpPaneRect,
+    a fm.Vec3,
+    b fm.Vec3,
+    col draw.Color,
+    width f64
+) int {
+    pa := cam.project_unclipped(a, rect)
+    pb := cam.project_unclipped(b, rect)
+    if !pa.visible || !pb.visible { << 0 }
+    x0 := pa.pos.x
+    y0 := pa.pos.y
+    dx := pb.pos.x - x0
+    dy := pb.pos.y - y0
+    $t0 := 0.0
+    $t1 := 1.0
+    ps := [-dx, dx, -dy, dy]
+    qs := [x0 - rect.x, rect.x + rect.w - x0, y0 - rect.y, rect.y + rect.h - y0]
+    for i in 0:4 {
+        p := ps[i]
+        q := qs[i]
+        if math.abs(p) < 1e-9 {
+            if q < 0.0 { << 0 }
+        } else {
+            r := q / p
+            if p < 0.0 {
+                if r > t1 { << 0 }
+                if r > t0 { t0 = r }
+            } else {
+                if r < t0 { << 0 }
+                if r < t1 { t1 = r }
+            }
+        }
+    }
+    if t0 > t1 { << 0 }
+    frame.line(x0 + t0 * dx, y0 + t0 * dy, x0 + t1 * dx, y0 + t1 * dy, col, width) or >>
+    << 0
+}
+
+fn draw_vp_fallback_grid(
+    frame $&draw.Frame,
+    cam &VpCamera,
+    rect VpPaneRect,
+    ortho_axis int,
+    pal &PaperPalette
+) int {
+    minor := draw.rgb(218, 210, 200)
+    major := draw.rgb(186, 176, 165)
+    axis_y := pal.success
+    $k := -10
+    while k <= 10 {
+        fk := f64(k)
+        $ca := minor
+        $wa := 0.7
+        $cb := minor
+        $wb := 0.7
+        if k % 5 == 0 && k != 0 {
+            ca = major
+            wa = 1.0
+            cb = major
+            wb = 1.0
+        }
+        if !cam.is_ortho || ortho_axis == ORTHO_TOP {
+            if k == 0 {
+                ca = pal.axis_z
+                wa = 1.4
+                cb = pal.axis_x
+                wb = 1.4
+            }
+            draw_vp_clipped_segment(frame, cam, rect, fm.vec3(fk, 0.0, -10.0), fm.vec3(fk, 0.0, 10.0), ca, wa) or >>
+            draw_vp_clipped_segment(frame, cam, rect, fm.vec3(-10.0, 0.0, fk), fm.vec3(10.0, 0.0, fk), cb, wb) or >>
+        } else if ortho_axis == ORTHO_FRONT {
+            if k == 0 {
+                ca = axis_y
+                wa = 1.4
+                cb = pal.axis_x
+                wb = 1.4
+            }
+            draw_vp_clipped_segment(frame, cam, rect, fm.vec3(fk, -10.0, 0.0), fm.vec3(fk, 10.0, 0.0), ca, wa) or >>
+            draw_vp_clipped_segment(frame, cam, rect, fm.vec3(-10.0, fk, 0.0), fm.vec3(10.0, fk, 0.0), cb, wb) or >>
+        } else {
+            if k == 0 {
+                ca = axis_y
+                wa = 1.4
+                cb = pal.axis_z
+                wb = 1.4
+            }
+            draw_vp_clipped_segment(frame, cam, rect, fm.vec3(0.0, -10.0, fk), fm.vec3(0.0, 10.0, fk), ca, wa) or >>
+            draw_vp_clipped_segment(frame, cam, rect, fm.vec3(0.0, fk, -10.0), fm.vec3(0.0, fk, 10.0), cb, wb) or >>
+        }
+        k += 1
+    }
+    << 0
+}
+
+fn node_world_matrix_3d(doc &resource.Document, node_idx int) fm.Mat4 {
+    $acc := fm.identity_3d()
+    $cur := node_idx
+    $steps := 0
+    while cur >= 0 && cur < doc.node_count() && steps < 128 {
+        nd := doc.describe_node(cur) or (err) {
+            _ := err
+            << acc
+        }
+        if nd.kind == resource.NODE_3D {
+            acc = nd.local_3d.multiply(acc)
+        }
+        cur = nd.parent
+        steps += 1
+    }
+    << acc
+}
+
+fn vp_rot_euler_deg(p fm.Vec3, deg fm.Vec3) fm.Vec3 {
+    if deg.length_sq() <= 1e-12 { << p }
+    rad := 3.141592653589793 / 180.0
+    rx := deg.x * rad
+    ry := deg.y * rad
+    rz := deg.z * rad
+    cx := math.cos(rx)
+    sx := math.sin(rx)
+    $x := p.x
+    $y := p.y * cx - p.z * sx
+    $z := p.y * sx + p.z * cx
+    cy := math.cos(ry)
+    sy := math.sin(ry)
+    x2 := x * cy + z * sy
+    z2 := -x * sy + z * cy
+    cz := math.cos(rz)
+    sz := math.sin(rz)
+    << fm.vec3(x2 * cz - y * sz, x2 * sz + y * cz, z2)
+}
+
+fn vp_sub_vert_selected(m &rm.EditableMesh, vp &Viewport3DState, vid int) bool {
+    if vp.sub_mode == SUB_MODE_VERT { << vid == vp.selected_vert }
+    if vp.sub_mode == SUB_MODE_EDGE { << vid == vp.selected_e0 || vid == vp.selected_e1 }
+    if vp.sub_mode == SUB_MODE_FACE && vp.selected_face >= 0 && vp.selected_face < m.faces.len {
+        sf := vp.selected_face
+        fc := &m.faces[sf]
+        for k in 0:fc.corners.len {
+            if m.corners[fc.corners[k]].vertex == vid { << true }
+        }
+    }
+    << false
+}
+
+fn vp_eval_overlay_pt(world &fm.Mat4, m &rm.EditableMesh, vp &Viewport3DState, vid int) fm.Vec3 {
+    lp := m.vertices[vid].position
+    if vp.sub_mode == SUB_MODE_OBJ {
+        sp := fm.vec3(lp.x * vp.gizmo_scale_mul.x, lp.y * vp.gizmo_scale_mul.y, lp.z * vp.gizmo_scale_mul.z)
+        rp := vp_rot_euler_deg(sp, vp.gizmo_rot_deg)
+        << world.transform(fm.vec4(rp.x, rp.y, rp.z, 1.0)).xyz().add(vp.gizmo_delta)
+    }
+    wp := world.transform(fm.vec4(lp.x, lp.y, lp.z, 1.0)).xyz()
+    if vp.gizmo_drag_axis > 0 && vp_sub_vert_selected(m, vp, vid) {
+        << wp.add(vp.gizmo_delta)
+    }
+    << wp
+}
+
+fn draw_vp_mesh_overlay(
+    frame $&draw.Frame,
+    cam &VpCamera,
+    rect VpPaneRect,
+    doc &resource.Document,
+    node_idx int,
+    vp &Viewport3DState,
+    pal &PaperPalette,
+    fallback_mode bool
+) int {
+    if node_idx < 0 || node_idx >= doc.node_count() { << 0 }
+    if !vp.show_wire && vp.sub_mode == SUB_MODE_OBJ && !fallback_mode && vp.gizmo_drag_axis == 0 { << 0 }
+    meshes := extract_node_editable_mesh(doc, node_idx)
+    off := vp.gizmo_delta
+    if meshes.len == 0 {
+        if node_idx <= 0 { << 0 }
+        // Crisp oriented 3D corner selection brackets around selected GLB / non-editable 3D nodes
+        world := node_world_matrix_3d(doc, node_idx)
+        e := 0.56
+        ls := [
+            fm.vec3(-e, -e, -e), fm.vec3(e, -e, -e),
+            fm.vec3(e, -e, e), fm.vec3(-e, -e, e),
+            fm.vec3(-e, e, -e), fm.vec3(e, e, -e),
+            fm.vec3(e, e, e), fm.vec3(-e, e, e)
+        ]
+        $pts := []fm.Vec3{}
+        for k in 0:8 {
+            sp := fm.vec3(ls[k].x * vp.gizmo_scale_mul.x, ls[k].y * vp.gizmo_scale_mul.y, ls[k].z * vp.gizmo_scale_mul.z)
+            rp := vp_rot_euler_deg(sp, vp.gizmo_rot_deg)
+            pts.push(world.transform(fm.vec4(rp.x, rp.y, rp.z, 1.0)).xyz().add(off))
+        }
+        arm := 0.28
+        for i in 0:4 {
+            j := (i + 1) % 4
+            $a := pts[i]
+            $b := pts[j]
+            draw_vp_clipped_segment(frame, cam, rect, a, a.add(b.sub(a).scaled(arm)), pal.brand, 1.6) or >>
+            draw_vp_clipped_segment(frame, cam, rect, b, b.add(a.sub(b).scaled(arm)), pal.brand, 1.6) or >>
+            $a2 := pts[i + 4]
+            $b2 := pts[j + 4]
+            draw_vp_clipped_segment(frame, cam, rect, a2, a2.add(b2.sub(a2).scaled(arm)), pal.brand, 1.6) or >>
+            draw_vp_clipped_segment(frame, cam, rect, b2, b2.add(a2.sub(b2).scaled(arm)), pal.brand, 1.6) or >>
+            draw_vp_clipped_segment(frame, cam, rect, a, a.add(a2.sub(a).scaled(arm)), pal.brand, 1.6) or >>
+            draw_vp_clipped_segment(frame, cam, rect, a2, a2.add(a.sub(a2).scaled(arm)), pal.brand, 1.6) or >>
+        }
+        << 0
+    }
+    m := &meshes[0]
+    world := node_world_matrix_3d(doc, node_idx)
+    edges := m.build_edges()
+    wire_col := draw.rgba(40, 35, 41, 150)
+    $lim := edges.len
+    if lim > 360 { lim = 360 }
+    for ei in 0:lim {
+        edg := &edges[ei]
+        pa := vp_eval_overlay_pt(&world, m, vp, edg.v0)
+        pb := vp_eval_overlay_pt(&world, m, vp, edg.v1)
+        is_sel_edge := vp.sub_mode == SUB_MODE_EDGE &&
+            ((edg.v0 == vp.selected_e0 && edg.v1 == vp.selected_e1) || (edg.v0 == vp.selected_e1 && edg.v1 == vp.selected_e0))
+        if is_sel_edge {
+            draw_vp_clipped_segment(frame, cam, rect, pa, pb, pal.brand, 2.4) or >>
+        } else {
+            draw_vp_clipped_segment(frame, cam, rect, pa, pb, wire_col, 1.0) or >>
+        }
+    }
+    if vp.sub_mode == SUB_MODE_FACE && vp.selected_face >= 0 && vp.selected_face < m.faces.len {
+        sface := vp.selected_face
+        fc := &m.faces[sface]
+        nc := fc.corners.len
+        if nc >= 2 {
+            for k in 0:nc {
+                $nxt := k + 1
+                if nxt >= nc { nxt = 0 }
+                c0 := fc.corners[k]
+                c1 := fc.corners[nxt]
+                pa := vp_eval_overlay_pt(&world, m, vp, m.corners[c0].vertex)
+                pb := vp_eval_overlay_pt(&world, m, vp, m.corners[c1].vertex)
+                draw_vp_clipped_segment(frame, cam, rect, pa, pb, pal.brand, 2.5) or >>
+            }
+        }
+    }
+    if vp.sub_mode == SUB_MODE_VERT {
+        $vlim := m.vertices.len
+        if vlim > 240 { vlim = 240 }
+        for vi in 0:vlim {
+            wp := vp_eval_overlay_pt(&world, m, vp, vi)
+            pt := cam.project_unclipped(wp, rect)
+            if pt.visible && rect.contains(pt.pos.x, pt.pos.y) {
+                if vi == vp.selected_vert {
+                    frame.fill_circle(pt.pos.x, pt.pos.y, 4.2, pal.brand) or >>
+                    frame.stroke_circle(pt.pos.x, pt.pos.y, 4.2, pal.surface, 1.2) or >>
+                } else {
+                    frame.fill_circle(pt.pos.x, pt.pos.y, 2.6, pal.focus) or >>
+                }
+            }
+        }
+    }
+    << 0
+}
+
+fn vp_gizmo_axis_vec(axis int) fm.Vec3 {
+    if axis == 1 { << fm.vec3(1.0, 0.0, 0.0) }
+    if axis == 2 { << fm.vec3(0.0, 1.0, 0.0) }
+    if axis == 3 { << fm.vec3(0.0, 0.0, 1.0) }
+    << fm.vec3(0.0, 0.0, 0.0)
+}
+
+fn vp_gizmo_axis_col(axis int, pal &PaperPalette) draw.Color {
+    if axis == 1 { << pal.axis_x }
+    if axis == 2 { << pal.success }
+    << pal.axis_z
+}
+
+fn vp_gizmo_axis_name(axis int) string {
+    if axis == 1 { << "X" }
+    if axis == 2 { << "Y" }
+    << "Z"
+}
+
+fn vp_node_is_3d(doc &resource.Document, node_idx int) bool {
+    if node_idx <= 0 || node_idx >= doc.node_count() { << false }
+    nd := doc.describe_node(node_idx) or (err) {
+        _ := err
+        << false
+    }
+    << nd.kind == resource.NODE_3D
+}
+
+fn vp_gizmo_axis_len(cam &VpCamera, origin fm.Vec3) f64 {
+    if cam.is_ortho { << math.max(0.55, math.min(5.0, cam.ortho_size * 0.16)) }
+    d := origin.sub(cam.position).length()
+    << math.max(0.65, math.min(5.0, d * 0.16))
+}
+
+fn vp_pt_seg_dist(px f64, py f64, ax f64, ay f64, bx f64, by f64) f64 {
+    dx := bx - ax
+    dy := by - ay
+    len2 := dx * dx + dy * dy
+    if len2 < 1e-6 { << math.hypot(px - ax, py - ay) }
+    t := math.max(0.0, math.min(1.0, ((px - ax) * dx + (py - ay) * dy) / len2))
+    << math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+}
+
+pub fn vp_gizmo_anchor(doc &resource.Document, selected_node int, vp &Viewport3DState) fm.Vec3 {
+    world := node_world_matrix_3d(doc, selected_node)
+    base := world.c3.xyz()
+    if vp.sub_mode == SUB_MODE_OBJ { << base }
+    meshes := extract_node_editable_mesh(doc, selected_node)
+    if meshes.len == 0 { << base }
+    m := &meshes[0]
+    if vp.sub_mode == SUB_MODE_VERT && vp.selected_vert >= 0 && vp.selected_vert < m.vertices.len {
+        v := m.vertices[vp.selected_vert].position
+        << world.transform(fm.vec4(v.x, v.y, v.z, 1.0)).xyz()
+    }
+    if vp.sub_mode == SUB_MODE_EDGE && vp.selected_e0 >= 0 && vp.selected_e1 >= 0 &&
+        vp.selected_e0 < m.vertices.len && vp.selected_e1 < m.vertices.len {
+        va := m.vertices[vp.selected_e0].position
+        vb := m.vertices[vp.selected_e1].position
+        mid := va.add(vb).scaled(0.5)
+        << world.transform(fm.vec4(mid.x, mid.y, mid.z, 1.0)).xyz()
+    }
+    if vp.sub_mode == SUB_MODE_FACE && m.faces.len > 0 {
+        $sf := vp.selected_face
+        if sf < 0 || sf >= m.faces.len { sf = 0 }
+        fc := m.face_centroid(sf) or (err) {
+            _ := err
+            << base
+        }
+        << world.transform(fm.vec4(fc.x, fc.y, fc.z, 1.0)).xyz()
+    }
+    << base
+}
+
+pub fn vp_multi_gizmo_anchor(
+    doc &resource.Document,
+    selected_node int,
+    selected_nodes &[]int,
+    vp &Viewport3DState
+) fm.Vec3 {
+    if vp.sub_mode != SUB_MODE_OBJ || selected_nodes.len <= 1 {
+        << vp_gizmo_anchor(doc, selected_node, vp)
+    }
+    $chosen := map[int]bool{}
+    for i in 0:selected_nodes.len {
+        id := selected_nodes[i]
+        if id > 0 && id < doc.node_count() { chosen[id] = true }
+    }
+    $sum := fm.vec3(0.0, 0.0, 0.0)
+    $cnt := 0
+    for i in 1:doc.node_count() {
+        if !chosen.has(i) { -> }
+        nd := doc.describe_node(i) or (err) {
+            _ := err
+            << vp_gizmo_anchor(doc, selected_node, vp)
+        }
+        if nd.kind != resource.NODE_3D { -> }
+        $has_anc := false
+        $p := nd.parent
+        while p > 0 {
+            if chosen.has(p) {
+                has_anc = true
+                <-
+            }
+            pnd := doc.describe_node(p) or (err) {
+                _ := err
+                << vp_gizmo_anchor(doc, selected_node, vp)
+            }
+            p = pnd.parent
+        }
+        if !has_anc {
+            w := node_world_matrix_3d(doc, i)
+            sum = sum.add(w.c3.xyz())
+            cnt = cnt + 1
+        }
+    }
+    if cnt > 0 {
+        << sum.scaled(1.0 / f64(cnt))
+    }
+    << vp_gizmo_anchor(doc, selected_node, vp)
+}
+
+fn vp_ring_u(axis int) fm.Vec3 {
+    if axis == 1 { << fm.vec3(0.0, 1.0, 0.0) }
+    if axis == 2 { << fm.vec3(1.0, 0.0, 0.0) }
+    << fm.vec3(1.0, 0.0, 0.0)
+}
+
+fn vp_ring_v(axis int) fm.Vec3 {
+    if axis == 1 { << fm.vec3(0.0, 0.0, 1.0) }
+    if axis == 2 { << fm.vec3(0.0, 0.0, 1.0) }
+    << fm.vec3(0.0, 1.0, 0.0)
+}
+
+pub fn vp_gizmo_axis_screen(
+    vp &Viewport3DState,
+    bounds &layout.Rect,
+    split bool,
+    doc &resource.Document,
+    selected_node int,
+    selected_nodes &[]int,
+    axis int
+) []f64 {
+    if !vp_node_is_3d(doc, selected_node) || axis < 1 || axis > 3 { << []f64{} }
+    panes := vp_compute_panes(bounds, split)
+    cam := vp_persp_camera(vp, panes[0])
+    origin := vp_multi_gizmo_anchor(doc, selected_node, selected_nodes, vp).add(vp.gizmo_delta)
+    glen := vp_gizmo_axis_len(&cam, origin)
+    if vp.sub_mode == SUB_MODE_OBJ && vp.gizmo_tool == GIZMO_ROTATE {
+        rad := glen * 0.86
+        ru := vp_ring_u(axis)
+        rv := vp_ring_v(axis)
+        p_ring := cam.project_unclipped(origin.add(ru.scaled(rad)), panes[0])
+        p_tan := cam.project_unclipped(origin.add(ru.scaled(rad)).add(rv.scaled(rad * 0.45)), panes[0])
+        if !p_ring.visible || !p_tan.visible { << []f64{} }
+        // Start right on ring (offset backward so midpoint lands on p_ring)
+        p_back := fm.vec2(p_ring.pos.x - (p_tan.pos.x - p_ring.pos.x), p_ring.pos.y - (p_tan.pos.y - p_ring.pos.y))
+        << [p_back.x, p_back.y, p_tan.pos.x, p_tan.pos.y]
+    }
+    po := cam.project_unclipped(origin, panes[0])
+    pt := cam.project_unclipped(origin.add(vp_gizmo_axis_vec(axis).scaled(glen)), panes[0])
+    if !po.visible || !pt.visible { << []f64{} }
+    << [po.pos.x, po.pos.y, pt.pos.x, pt.pos.y]
+}
+
+fn vp_gizmo_hit_axis(
+    vp &Viewport3DState,
+    bounds &layout.Rect,
+    split bool,
+    doc &resource.Document,
+    selected_node int,
+    selected_nodes &[]int,
+    px f64,
+    py f64
+) int {
+    if !vp_node_is_3d(doc, selected_node) { << 0 }
+    panes := vp_compute_panes(bounds, split)
+    $rect := panes[0]
+    $use_ortho := false
+    if panes.len > 1 && px >= panes[1].x {
+        rect = panes[1]
+        use_ortho = true
+    }
+    $cam := vp_persp_camera(vp, rect)
+    if use_ortho { cam = vp_ortho_camera(vp, rect) }
+    origin := vp_multi_gizmo_anchor(doc, selected_node, selected_nodes, vp).add(vp.gizmo_delta)
+    po := cam.project_unclipped(origin, rect)
+    if !po.visible { << 0 }
+    glen := vp_gizmo_axis_len(&cam, origin)
+    if vp.sub_mode == SUB_MODE_OBJ && vp.gizmo_tool == GIZMO_ROTATE {
+        rad := glen * 0.86
+        segs := 20
+        $best_ax := 0
+        $best_d := 11.0
+        for ax in [1, 2, 3] {
+            ru := vp_ring_u(ax)
+            rv := vp_ring_v(ax)
+            for si in 0:segs {
+                a0 := 6.283185307179586 * f64(si) / f64(segs)
+                a1 := 6.283185307179586 * f64(si + 1) / f64(segs)
+                w0 := origin.add(ru.scaled(rad * math.cos(a0))).add(rv.scaled(rad * math.sin(a0)))
+                w1 := origin.add(ru.scaled(rad * math.cos(a1))).add(rv.scaled(rad * math.sin(a1)))
+                p0 := cam.project_unclipped(w0, rect)
+                p1 := cam.project_unclipped(w1, rect)
+                if !p0.visible || !p1.visible { -> }
+                d := vp_pt_seg_dist(px, py, p0.pos.x, p0.pos.y, p1.pos.x, p1.pos.y)
+                if d < best_d {
+                    best_d = d
+                    best_ax = ax
+                }
+            }
+        }
+        << best_ax
+    }
+    $best_ax := 0
+    $best_d := 14.0
+    for ax in [1, 2, 3] {
+        pt := cam.project_unclipped(origin.add(vp_gizmo_axis_vec(ax).scaled(glen)), rect)
+        if !pt.visible { -> }
+        if math.hypot(pt.pos.x - po.pos.x, pt.pos.y - po.pos.y) < 4.0 { -> }
+        sd := vp_pt_seg_dist(px, py, po.pos.x, po.pos.y, pt.pos.x, pt.pos.y)
+        td := math.hypot(px - pt.pos.x, py - pt.pos.y)
+        $d := sd
+        if td < d + 2.0 { d = td - 1.5 }
+        if d < best_d {
+            best_d = d
+            best_ax = ax
+        }
+    }
+    if best_ax == 0 && (vp.gizmo_tool == GIZMO_MOVE || vp.gizmo_tool == GIZMO_SCALE) {
+        if math.hypot(px - po.pos.x, py - po.pos.y) <= 10.5 {
+            << 4
+        }
+    }
+    << best_ax
+}
+
+fn draw_vp_paper_pill(
+    frame $&draw.Frame,
+    x f64,
+    y f64,
+    label string,
+    pal &PaperPalette,
+    text_col draw.Color
+) int {
+    pw := math.max(56.0, approx_label_width(&label, 6.4) + 18.0)
+    frame.fill_round_rect(x, y, pw, 22.0, 6.0, pal.surface.with_alpha(234)) or >>
+    frame.stroke_round_rect(x, y, pw, 22.0, 6.0, pal.border, 1.0) or >>
+    frame.text(x + 9.0, y + 4.0, 11.5, text_col, &label) or >>
+    << 0
+}
+
+fn clone_axis_end(e &GizmoAxisEnd) GizmoAxisEnd {
+    << GizmoAxisEnd{label: e.label + "", tip: e.tip, depth: e.depth, col: e.col}
+}
+
+fn vp_triad_hit(
+    vp &Viewport3DState,
+    bounds &layout.Rect,
+    split bool,
+    px f64,
+    py f64
+) int {
+    panes := vp_compute_panes(bounds, split)
+    if panes[0].w < 110.0 || bounds.height < 100.0 { << 0 }
+    cx := panes[0].x + panes[0].w - 34.0
+    cy := 36.0
+    if math.hypot(px - cx, py - cy) > 28.0 { << 0 }
+    if math.hypot(px - cx, py - cy) <= 7.0 { << 4 }
+    cam := vp_persp_camera(vp, panes[0])
+    ux := fm.vec3(cam.right.x, cam.up.x, cam.forward.x)
+    uy := fm.vec3(cam.right.y, cam.up.y, cam.forward.y)
+    uz := fm.vec3(cam.right.z, cam.up.z, cam.forward.z)
+    rod := 16.5
+    tips := [
+        fm.vec2(cx + ux.x * rod, cy - ux.y * rod),
+        fm.vec2(cx + uy.x * rod, cy - uy.y * rod),
+        fm.vec2(cx + uz.x * rod, cy - uz.y * rod)
+    ]
+    $best := 0
+    $best_d := 10.5
+    for i in 0:3 {
+        d := math.hypot(px - tips[i].x, py - tips[i].y)
+        if d < best_d {
+            best_d = d
+            best = i + 1
+        }
+    }
+    if best == 0 { << 4 }
+    << best
+}
+
+fn vp_apply_triad_snap(vp $&Viewport3DState, hit int) {
+    pi := 3.141592653589793
+    if hit == 1 {
+        if math.abs(vp.yaw - pi * 0.5) < 0.15 && math.abs(vp.pitch) < 0.15 {
+            vp.yaw = -pi * 0.5
+        } else {
+            vp.yaw = pi * 0.5
+        }
+        vp.pitch = 0.02
+    } else if hit == 2 {
+        if vp.pitch > 1.1 { vp.pitch = -1.42 } else { vp.pitch = 1.42 }
+    } else if hit == 3 {
+        if math.abs(vp.yaw) < 0.15 && math.abs(vp.pitch) < 0.15 {
+            vp.yaw = pi
+        } else {
+            vp.yaw = 0.0
+        }
+        vp.pitch = 0.02
+    } else if hit == 4 {
+        vp.yaw = 0.55
+        vp.pitch = 0.42
+    }
+}
+
+fn draw_vp_axis_triad(
+    frame $&draw.Frame,
+    cx f64,
+    cy f64,
+    cam &VpCamera,
+    hover_ax int,
+    pal &PaperPalette
+) int {
+    r := 23.0
+    frame.fill_circle(cx, cy, r + 3.0, pal.surface.with_alpha(232)) or >>
+    $bd_col := pal.border
+    if hover_ax == 4 { bd_col = pal.brand }
+    frame.stroke_circle(cx, cy, r + 3.0, bd_col, 1.0) or >>
+
+    ux := fm.vec3(cam.right.x, cam.up.x, cam.forward.x)
+    uy := fm.vec3(cam.right.y, cam.up.y, cam.forward.y)
+    uz := fm.vec3(cam.right.z, cam.up.z, cam.forward.z)
+    rod := 16.5
+    $axes := [
+        GizmoAxisEnd{label: "X", tip: fm.vec2(cx + ux.x * rod, cy - ux.y * rod), depth: ux.z, col: pal.axis_x},
+        GizmoAxisEnd{label: "Y", tip: fm.vec2(cx + uy.x * rod, cy - uy.y * rod), depth: uy.z, col: pal.success},
+        GizmoAxisEnd{label: "Z", tip: fm.vec2(cx + uz.x * rod, cy - uz.y * rod), depth: uz.z, col: pal.axis_z}
+    ]
+    for a in 0:3 {
+        for b in (a + 1):3 {
+            if axes[a].depth > axes[b].depth {
+                tmp := clone_axis_end(&axes[a])
+                axes[a] = clone_axis_end(&axes[b])
+                axes[b] = tmp
+            }
+        }
+    }
+    for i in 0:3 {
+        ax := &axes[i]
+        $ax_id := 1
+        if ax.label == "Y" { ax_id = 2 } else if ax.label == "Z" { ax_id = 3 }
+        $rad := 6.2
+        if hover_ax == ax_id { rad = 7.4 }
+        frame.line(cx, cy, ax.tip.x, ax.tip.y, ax.col, 1.9) or >>
+        frame.fill_circle(ax.tip.x, ax.tip.y, rad, ax.col) or >>
+        if hover_ax == ax_id {
+            frame.stroke_circle(ax.tip.x, ax.tip.y, rad, pal.text, 1.2) or >>
+        }
+        lbl := ax.label + ""
+        frame.text(ax.tip.x - 3.2, ax.tip.y - 5.2, 9.5, draw.rgb(255, 255, 255), &lbl) or >>
+    }
+    $ctr_col := pal.muted
+    if hover_ax == 4 { ctr_col = pal.brand }
+    frame.fill_circle(cx, cy, 2.5, ctr_col) or >>
+    << 0
+}
+
+fn ortho_axis_title(axis int, lang int) string {
+    if axis == ORTHO_FRONT { << tr(lang, "Ortho · Front", "正交 · 前视图") }
+    if axis == ORTHO_RIGHT { << tr(lang, "Ortho · Right", "正交 · 右视图") }
+    << tr(lang, "Ortho · Top", "正交 · 顶视图")
+}
+
+fn try_blit_vp_image(frame $&draw.Frame, img &draw.Image, w f64, h f64) bool {
+    _ := frame.image(img, 0.0, 0.0, w, h) or (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn vp_is_selected_id(selected_nodes &[]int, nid int) bool {
+    for i in 0:selected_nodes.len {
+        if selected_nodes[i] == nid { << true }
+    }
+    << false
+}
+
+fn draw_vp_scene_helpers(
+    frame $&draw.Frame,
+    cam &VpCamera,
+    rect VpPaneRect,
+    doc &resource.Document,
+    selected_node int,
+    selected_nodes &[]int,
+    pal &PaperPalette
+) int {
+    for i in 1:doc.node_count() {
+        nd := doc.describe_node(i) or (err) {
+            _ := err
+            << 0
+        }
+        if !nd.visible || nd.kind != resource.NODE_3D { -> }
+        if nd.camera.is_set() || nd.orthographic.is_set() {
+            w := node_world_matrix_3d(doc, i)
+            o := w.c3.xyz()
+            rx := w.c0.xyz().normalized()
+            ry := w.c1.xyz().normalized()
+            fz := w.c2.xyz().normalized().neg()
+            fw := 0.36
+            fh := 0.24
+            d := 0.55
+            c0 := o.add(fz.scaled(d)).add(rx.scaled(-fw)).add(ry.scaled(-fh))
+            c1 := o.add(fz.scaled(d)).add(rx.scaled(fw)).add(ry.scaled(-fh))
+            c2 := o.add(fz.scaled(d)).add(rx.scaled(fw)).add(ry.scaled(fh))
+            c3 := o.add(fz.scaled(d)).add(rx.scaled(-fw)).add(ry.scaled(fh))
+            $col := pal.axis_z
+            if i == selected_node || vp_is_selected_id(selected_nodes, i) { col = pal.brand }
+            draw_vp_clipped_segment(frame, cam, rect, o, c0, col, 1.3) or >>
+            draw_vp_clipped_segment(frame, cam, rect, o, c1, col, 1.3) or >>
+            draw_vp_clipped_segment(frame, cam, rect, o, c2, col, 1.3) or >>
+            draw_vp_clipped_segment(frame, cam, rect, o, c3, col, 1.3) or >>
+            draw_vp_clipped_segment(frame, cam, rect, c0, c1, col, 1.3) or >>
+            draw_vp_clipped_segment(frame, cam, rect, c1, c2, col, 1.3) or >>
+            draw_vp_clipped_segment(frame, cam, rect, c2, c3, col, 1.3) or >>
+            draw_vp_clipped_segment(frame, cam, rect, c3, c0, col, 1.3) or >>
+        }
+    }
+    for li in 0:doc.light_count() {
+        lgt := doc.light(li) or (err) {
+            _ := err
+            << 0
+        }
+        w := node_world_matrix_3d(doc, lgt.node)
+        o := w.c3.xyz()
+        pt := cam.project_unclipped(o, rect)
+        if pt.visible && rect.contains(pt.pos.x, pt.pos.y) {
+            $col := draw.rgb(212, 140, 26)
+            if lgt.node == selected_node || vp_is_selected_id(selected_nodes, lgt.node) { col = pal.brand }
+            frame.fill_circle(pt.pos.x, pt.pos.y, 5.2, col.with_alpha(230)) or >>
+            frame.stroke_circle(pt.pos.x, pt.pos.y, 8.2, col, 1.3) or >>
+            dir := w.c2.xyz().normalized().neg()
+            draw_vp_clipped_segment(frame, cam, rect, o, o.add(dir.scaled(0.55)), col, 1.4) or >>
+        }
+    }
+    << 0
+}
+
+fn draw_vp_move_gizmo(
+    frame $&draw.Frame,
+    cam &VpCamera,
+    rect VpPaneRect,
+    doc &resource.Document,
+    selected_node int,
+    selected_nodes &[]int,
+    vp &Viewport3DState,
+    pal &PaperPalette
+) int {
+    if !vp_node_is_3d(doc, selected_node) { << 0 }
+    origin := vp_multi_gizmo_anchor(doc, selected_node, selected_nodes, vp).add(vp.gizmo_delta)
+    po := cam.project_unclipped(origin, rect)
+    if !po.visible || !rect.contains(po.pos.x, po.pos.y) { << 0 }
+    glen := vp_gizmo_axis_len(cam, origin)
+
+    if vp.sub_mode == SUB_MODE_OBJ && vp.gizmo_tool == GIZMO_ROTATE {
+        rad := glen * 0.86
+        segs := 24
+        for ax in [1, 2, 3] {
+            ru := vp_ring_u(ax)
+            rv := vp_ring_v(ax)
+            active := vp.gizmo_drag_axis == ax || (vp.gizmo_drag_axis == 0 && vp.gizmo_hover_axis == ax)
+            col := vp_gizmo_axis_col(ax, pal)
+            $w := 1.9
+            if active { w = 3.2 }
+            for si in 0:segs {
+                a0 := 6.283185307179586 * f64(si) / f64(segs)
+                a1 := 6.283185307179586 * f64(si + 1) / f64(segs)
+                w0 := origin.add(ru.scaled(rad * math.cos(a0))).add(rv.scaled(rad * math.sin(a0)))
+                w1 := origin.add(ru.scaled(rad * math.cos(a1))).add(rv.scaled(rad * math.sin(a1)))
+                p0 := cam.project_unclipped(w0, rect)
+                p1 := cam.project_unclipped(w1, rect)
+                if p0.visible && p1.visible {
+                    frame.line(p0.pos.x, p0.pos.y, p1.pos.x, p1.pos.y, col, w) or >>
+                }
+            }
+            pt := cam.project_unclipped(origin.add(ru.scaled(rad)), rect)
+            if pt.visible {
+                frame.fill_circle(pt.pos.x, pt.pos.y, 5.8, col) or >>
+                albl := vp_gizmo_axis_name(ax)
+                frame.text(pt.pos.x - 3.2, pt.pos.y - 5.2, 9.0, draw.rgb(255, 255, 255), &albl) or >>
+            }
+        }
+    } else {
+        is_scl := vp.sub_mode == SUB_MODE_OBJ && vp.gizmo_tool == GIZMO_SCALE
+        for ax in [1, 2, 3] {
+            pt := cam.project_unclipped(origin.add(vp_gizmo_axis_vec(ax).scaled(glen)), rect)
+            if !pt.visible { -> }
+            if math.hypot(pt.pos.x - po.pos.x, pt.pos.y - po.pos.y) < 4.0 { -> }
+            active := vp.gizmo_drag_axis == ax || (vp.gizmo_drag_axis == 0 && vp.gizmo_hover_axis == ax)
+            col := vp_gizmo_axis_col(ax, pal)
+            $w := 2.2
+            $kr := 6.0
+            if active {
+                w = 3.4
+                kr = 7.4
+            }
+            frame.line(po.pos.x, po.pos.y, pt.pos.x, pt.pos.y, pal.surface.with_alpha(220), w + 2.0) or >>
+            frame.line(po.pos.x, po.pos.y, pt.pos.x, pt.pos.y, col, w) or >>
+            if is_scl {
+                frame.fill_rect(pt.pos.x - kr, pt.pos.y - kr, kr * 2.0, kr * 2.0, col) or >>
+                frame.stroke_rect(pt.pos.x - kr, pt.pos.y - kr, kr * 2.0, kr * 2.0, pal.surface, 1.2) or >>
+            } else {
+                frame.fill_circle(pt.pos.x, pt.pos.y, kr, col) or >>
+                frame.stroke_circle(pt.pos.x, pt.pos.y, kr, pal.surface, 1.2) or >>
+            }
+            albl := vp_gizmo_axis_name(ax)
+            frame.text(pt.pos.x - 3.2, pt.pos.y - 5.2, 9.0, draw.rgb(255, 255, 255), &albl) or >>
+        }
+    }
+    ctr_active := vp.gizmo_drag_axis == 4 || (vp.gizmo_drag_axis == 0 && vp.gizmo_hover_axis == 4)
+    $ctr_rad := 4.8
+    $ctr_bg := pal.surface
+    if ctr_active && (vp.sub_mode != SUB_MODE_OBJ || vp.gizmo_tool != GIZMO_ROTATE) {
+        ctr_rad = 6.6
+        ctr_bg = pal.brand
+    }
+    frame.fill_circle(po.pos.x, po.pos.y, ctr_rad, ctr_bg) or >>
+    frame.stroke_circle(po.pos.x, po.pos.y, ctr_rad, pal.brand, 1.8) or >>
+    if vp.gizmo_drag_axis > 0 {
+        $dlbl := ""
+        if vp.gizmo_drag_axis == 4 && vp.sub_mode == SUB_MODE_OBJ && vp.gizmo_tool == GIZMO_SCALE {
+            dlbl = "×XYZ " + fmt_coord(vp.gizmo_scale_mul.x)
+        } else if vp.gizmo_drag_axis == 4 {
+            dlbl = "ΔXYZ " + fmt_coord(vp.gizmo_delta.x) + "," + fmt_coord(vp.gizmo_delta.y)
+        } else if vp.sub_mode == SUB_MODE_OBJ && vp.gizmo_tool == GIZMO_ROTATE {
+            ang := vp.gizmo_rot_deg.dot(vp_gizmo_axis_vec(vp.gizmo_drag_axis))
+            $sign := "+"
+            if ang < 0.0 { sign = "" }
+            dlbl = "∠" + vp_gizmo_axis_name(vp.gizmo_drag_axis) + " " + sign + fmt_coord(ang) + "°"
+        } else if vp.sub_mode == SUB_MODE_OBJ && vp.gizmo_tool == GIZMO_SCALE {
+            sc := vp.gizmo_scale_mul.dot(vp_gizmo_axis_vec(vp.gizmo_drag_axis))
+            dlbl = "×" + vp_gizmo_axis_name(vp.gizmo_drag_axis) + " " + fmt_coord(sc)
+        } else {
+            val := vp.gizmo_delta.dot(vp_gizmo_axis_vec(vp.gizmo_drag_axis))
+            $sign := "+"
+            if val < 0.0 { sign = "" }
+            dlbl = "Δ" + vp_gizmo_axis_name(vp.gizmo_drag_axis) + " " + sign + fmt_coord(val)
+        }
+        lx := math.max(rect.x + 8.0, math.min(rect.x + rect.w - 102.0, po.pos.x + 12.0))
+        ly := math.max(rect.y + 38.0, po.pos.y - 28.0)
+        draw_vp_paper_pill(frame, lx, ly, dlbl, pal, pal.brand) or >>
+    }
+    << 0
+}
+
+fn vp_tool_hud_label(vp &Viewport3DState, lang int) string {
+    if vp.sub_mode == SUB_MODE_VERT { << tr(lang, "3D · Vertex", "透视 · 顶点") }
+    if vp.sub_mode == SUB_MODE_EDGE { << tr(lang, "3D · Edge", "透视 · 边") }
+    if vp.sub_mode == SUB_MODE_FACE { << tr(lang, "3D · Face", "透视 · 面") }
+    if vp.gizmo_tool == GIZMO_ROTATE { << tr(lang, "3D · Rotate", "透视 · 旋转") }
+    if vp.gizmo_tool == GIZMO_SCALE { << tr(lang, "3D · Scale", "透视 · 缩放") }
+    << tr(lang, "3D · Move", "透视 · 移动")
+}
+
+fn draw_vp_multi_selection_overlays(
+    frame $&draw.Frame,
+    cam &VpCamera,
+    rect VpPaneRect,
+    doc &resource.Document,
+    selected_node int,
+    selected_nodes &[]int,
+    vp &Viewport3DState,
+    pal &PaperPalette,
+    fallback_mode bool
+) int {
+    draw_vp_mesh_overlay(frame, cam, rect, doc, selected_node, vp, pal, fallback_mode) or >>
+    if selected_nodes.len > 1 {
+        for i in 0:selected_nodes.len {
+            nid := selected_nodes[i]
+            if nid > 0 && nid != selected_node && vp_node_is_3d(doc, nid) {
+                draw_vp_mesh_overlay(frame, cam, rect, doc, nid, vp, pal, true) or >>
+            }
+        }
+    }
+    << 0
+}
+
+pub fn paint_viewport_3d(
+    vp &Viewport3DState,
+    frame $&draw.Frame,
+    bounds &layout.Rect,
+    doc &resource.Document,
+    pts &[]StagePoint,
+    selected_node int,
+    selected_nodes &[]int,
+    stage_mode int,
+    pal &PaperPalette,
+    lang int
+) int {
+    split := stage_mode == STAGE_MODE_SPLIT
+    frame.push() or >>
+    frame.clip_rect(0.0, 0.0, bounds.width, bounds.height) or >>
+    // Warm Paper studio canvas backdrop matching xu-ui-tokens
+    bg := draw.rgb(237, 232, 226)
+    frame.fill_round_rect(0.0, 0.0, bounds.width, bounds.height, 8.0, bg) or >>
+
+    $using_gpu_img := false
+    if vp.has_image && vp.images.len > 0 {
+        using_gpu_img = try_blit_vp_image(frame, &vp.images[0], bounds.width, bounds.height)
+    }
+
+    panes := vp_compute_panes(bounds, split)
+    persp := vp_persp_camera(vp, panes[0])
+    if !using_gpu_img {
+        if vp.show_grid {
+            draw_vp_fallback_grid(frame, &persp, panes[0], ORTHO_TOP, pal) or >>
+        }
+        for i in 1:pts.len {
+            p := &pts[i]
+            if p.kind != resource.NODE_3D { -> }
+            pt := persp.project_unclipped(fm.vec3(p.x, p.y, p.z), panes[0])
+            if pt.visible && panes[0].contains(pt.pos.x, pt.pos.y) {
+                $col := pal.muted
+                $rad := 3.5
+                if i == selected_node || vp_is_selected_id(selected_nodes, i) {
+                    col = pal.brand
+                    rad = 5.0
+                }
+                frame.fill_circle(pt.pos.x, pt.pos.y, rad, col) or >>
+            }
+        }
+    }
+    draw_vp_scene_helpers(frame, &persp, panes[0], doc, selected_node, selected_nodes, pal) or >>
+    draw_vp_multi_selection_overlays(frame, &persp, panes[0], doc, selected_node, selected_nodes, vp, pal, !using_gpu_img) or >>
+    draw_vp_move_gizmo(frame, &persp, panes[0], doc, selected_node, selected_nodes, vp, pal) or >>
+
+    if panes.len > 1 {
+        ortho := vp_ortho_camera(vp, panes[1])
+        if !using_gpu_img && vp.show_grid {
+            draw_vp_fallback_grid(frame, &ortho, panes[1], vp.ortho_axis, pal) or >>
+        }
+        draw_vp_scene_helpers(frame, &ortho, panes[1], doc, selected_node, selected_nodes, pal) or >>
+        draw_vp_multi_selection_overlays(frame, &ortho, panes[1], doc, selected_node, selected_nodes, vp, pal, !using_gpu_img) or >>
+        draw_vp_move_gizmo(frame, &ortho, panes[1], doc, selected_node, selected_nodes, vp, pal) or >>
+        div_x := panes[0].w
+        frame.fill_rect(div_x, 0.0, 2.0, bounds.height, pal.border) or >>
+        draw_vp_paper_pill(frame, panes[1].x + 10.0, 10.0, ortho_axis_title(vp.ortho_axis, lang), pal, pal.text) or >>
+    }
+
+    persp_lbl := vp_tool_hud_label(vp, lang)
+    draw_vp_paper_pill(frame, 10.0, 10.0, persp_lbl, pal, pal.text) or >>
+
+    if panes[0].w >= 110.0 && bounds.height >= 100.0 {
+        draw_vp_axis_triad(frame, panes[0].x + panes[0].w - 34.0, 36.0, &persp, vp.gizmo_triad_hover, pal) or >>
+    }
+
+    // Bottom status & interaction hint pills
+    if bounds.height >= 96.0 {
+        info := inspect_node_modeling(doc, selected_node)
+        $stat_lbl := vp.backend_name + ""
+        if selected_nodes.len > 1 {
+            stat_lbl = tr(lang, str(selected_nodes.len) + " nodes · ", "已选 " + str(selected_nodes.len) + " 项 · ") + vp.backend_name
+        } else if selected_node > 0 && selected_node < doc.node_count() {
+            snd := doc.describe_node(selected_node) or (err) {
+                _ := err
+                << 0
+            }
+            if info.has_editable || info.has_csg {
+                stat_lbl = snd.name + " · " + str(info.verts) + "v " + str(info.faces) + "f · " + vp.backend_name
+            } else {
+                stat_lbl = snd.name + " · " + vp.backend_name
+            }
+        } else if info.has_editable || info.has_csg {
+            stat_lbl = vp.backend_name + " · " + str(info.verts) + "v " + str(info.faces) + "f " + str(info.tris) + "t"
+        }
+        draw_vp_paper_pill(frame, 10.0, bounds.height - 32.0, stat_lbl, pal, pal.muted) or >>
+        if bounds.width >= 380.0 {
+            $hint_lbl := tr(lang, "Drag Orbit · Shift+Click Multi · Right Pan · Scroll Zoom", "左键旋转 · Shift+点击多选 · 右键平移 · 滚轮缩放")
+            if vp.gizmo_drag_axis > 0 {
+                hint_lbl = tr(lang, "Dragging Transform · Esc Cancel", "拖拽变换中 · Esc 取消")
+            } else if selected_nodes.len > 1 {
+                hint_lbl = tr(lang, "Shift+Click Multi · Cmd+D Dup · Esc Single", "Shift+点击多选 · Cmd+D 复制 · Esc 取消多选")
+            }
+            hw := math.max(96.0, approx_label_width(&hint_lbl, 6.4) + 18.0)
+            draw_vp_paper_pill(frame, bounds.width - hw - 10.0, bounds.height - 32.0, hint_lbl, pal, pal.muted) or >>
+        }
+    }
+
+    frame.stroke_round_rect(0.5, 0.5, bounds.width - 1.0, bounds.height - 1.0, 8.0, pal.border, 1.0) or >>
+    frame.pop() or >>
+    << 0
+}
+
+pub fn (vp $&Viewport3DState) route_input(
+    bounds &layout.Rect,
+    split bool,
+    doc &resource.Document,
+    selected_node int,
+    selected_nodes &[]int,
+    snap_enabled bool,
+    snap_move f64,
+    snap_rot f64,
+    snap_scl f64,
+    kind int,
+    input &ui.InputEvent
+) int {
+    if kind == widgets.ROUTE_BLUR || kind == widgets.ROUTE_CANCEL {
+        was := vp.dragging_orbit || vp.dragging_pan || vp.gizmo_drag_axis > 0
+        vp.dragging_orbit = false
+        vp.dragging_pan = false
+        vp.drag_moved = false
+        vp.pick_down_additive = false
+        vp.gizmo_drag_axis = 0
+        vp.gizmo_delta = fm.vec3(0.0, 0.0, 0.0)
+        vp.gizmo_rot_deg = fm.vec3(0.0, 0.0, 0.0)
+        vp.gizmo_scale_mul = fm.vec3(1.0, 1.0, 1.0)
+        vp.live_gizmo_dirty = false
+        if was { << VP3D_ACT_CAPTURE }
+        << VP3D_ACT_NONE
+    }
+    if kind != widgets.ROUTE_INPUT { << VP3D_ACT_NONE }
+    if input.kind == ui.EV_POINTER_SCROLL {
+        panes := vp_compute_panes(bounds, split)
+        $in_ortho := panes.len > 1 && input.x >= panes[1].x
+        factor := math.exp(math.max(-2.0, math.min(2.0, -input.dy * 0.10)))
+        if in_ortho {
+            vp.ortho_size = math.max(1.2, math.min(120.0, vp.ortho_size * factor))
+        } else {
+            vp.distance = math.max(1.2, math.min(140.0, vp.distance * factor))
+        }
+        << VP3D_ACT_RENDER
+    }
+    if input.kind == ui.EV_POINTER_DOWN {
+        panes := vp_compute_panes(bounds, split)
+        $pane_idx := 0
+        if panes.len > 1 && input.x >= panes[1].x { pane_idx = 1 }
+        vp.drag_pane = pane_idx
+        vp.drag_start_x = input.x
+        vp.drag_start_y = input.y
+        vp.drag_last_x = input.x
+        vp.drag_last_y = input.y
+        vp.drag_moved = false
+        vp.pick_down_additive = (input.modifiers & (ui.MOD_SHIFT | ui.MOD_META | ui.MOD_CONTROL)) != 0
+        pan_mod := (input.modifiers & (ui.MOD_SHIFT | ui.MOD_ALT)) != 0
+        if input.button == ui.BUTTON_LEFT && !pan_mod {
+            triad_hit := vp_triad_hit(vp, bounds, split, input.x, input.y)
+            if triad_hit > 0 {
+                vp_apply_triad_snap(vp, triad_hit)
+                << VP3D_ACT_RENDER
+            }
+            hit_ax := vp_gizmo_hit_axis(vp, bounds, split, doc, selected_node, selected_nodes, input.x, input.y)
+            if hit_ax > 0 {
+                $rect := panes[0]
+                if pane_idx == 1 && panes.len > 1 { rect = panes[1] }
+                $cam := vp_persp_camera(vp, rect)
+                if pane_idx == 1 && panes.len > 1 { cam = vp_ortho_camera(vp, rect) }
+                origin := vp_multi_gizmo_anchor(doc, selected_node, selected_nodes, vp)
+                glen := vp_gizmo_axis_len(&cam, origin)
+                $sdx := 1.0
+                $sdy := 0.0
+                if hit_ax == 4 {
+                    sdx = 1.0
+                    sdy = 0.0
+                } else if vp.sub_mode == SUB_MODE_OBJ && vp.gizmo_tool == GIZMO_ROTATE {
+                    rad := glen * 0.86
+                    ru := vp_ring_u(hit_ax)
+                    rv := vp_ring_v(hit_ax)
+                    pr := cam.project_unclipped(origin.add(ru.scaled(rad)), rect)
+                    pt := cam.project_unclipped(origin.add(ru.scaled(rad)).add(rv.scaled(rad * 0.45)), rect)
+                    sdx = pt.pos.x - pr.pos.x
+                    sdy = pt.pos.y - pr.pos.y
+                } else {
+                    po := cam.project_unclipped(origin, rect)
+                    pt := cam.project_unclipped(origin.add(vp_gizmo_axis_vec(hit_ax).scaled(glen)), rect)
+                    sdx = pt.pos.x - po.pos.x
+                    sdy = pt.pos.y - po.pos.y
+                }
+                slen := math.max(8.0, math.hypot(sdx, sdy))
+                vp.gizmo_drag_axis = hit_ax
+                vp.gizmo_hover_axis = hit_ax
+                vp.gizmo_origin = origin
+                vp.gizmo_delta = fm.vec3(0.0, 0.0, 0.0)
+                vp.gizmo_rot_deg = fm.vec3(0.0, 0.0, 0.0)
+                vp.gizmo_scale_mul = fm.vec3(1.0, 1.0, 1.0)
+                vp.gizmo_screen_dir_x = sdx / slen
+                vp.gizmo_screen_dir_y = sdy / slen
+                $wpp := glen / slen
+                if hit_ax == 4 {
+                    if cam.is_ortho {
+                        wpp = cam.ortho_size / math.max(120.0, rect.h)
+                    } else {
+                        wpp = 2.0 * origin.sub(cam.position).length() * cam.tangent / math.max(120.0, rect.h)
+                    }
+                }
+                vp.gizmo_world_per_px = wpp
+                vp.live_gizmo_dirty = false
+                << VP3D_ACT_CAPTURE
+            }
+        }
+        if input.button == ui.BUTTON_RIGHT || input.button == ui.BUTTON_MIDDLE || pan_mod || pane_idx == 1 {
+            if input.button == ui.BUTTON_RIGHT || input.button == ui.BUTTON_MIDDLE || pan_mod || pane_idx == 1 {
+                vp.dragging_pan = true
+            } else {
+                vp.dragging_orbit = true
+            }
+        } else if input.button == ui.BUTTON_LEFT {
+            vp.dragging_orbit = true
+        }
+        << VP3D_ACT_CAPTURE
+    }
+    if input.kind == ui.EV_POINTER_MOVE {
+        if vp.gizmo_drag_axis > 0 && (input.buttons & 1) == 0 {
+            vp.gizmo_drag_axis = 0
+            vp.gizmo_delta = fm.vec3(0.0, 0.0, 0.0)
+            vp.gizmo_rot_deg = fm.vec3(0.0, 0.0, 0.0)
+            vp.gizmo_scale_mul = fm.vec3(1.0, 1.0, 1.0)
+            vp.live_gizmo_dirty = false
+            << VP3D_ACT_CAPTURE
+        }
+        if vp.dragging_orbit && (input.buttons & 1) == 0 {
+            vp.dragging_orbit = false
+            << VP3D_ACT_CAPTURE
+        }
+        if vp.dragging_pan && input.buttons == 0 {
+            vp.dragging_pan = false
+            << VP3D_ACT_CAPTURE
+        }
+        if vp.gizmo_drag_axis > 0 {
+            tot_dx := input.x - vp.drag_start_x
+            tot_dy := input.y - vp.drag_start_y
+            if tot_dx * tot_dx + tot_dy * tot_dy > 4.0 { vp.drag_moved = true }
+            vp.drag_last_x = input.x
+            vp.drag_last_y = input.y
+            if vp.gizmo_drag_axis == 4 {
+                if vp.sub_mode == SUB_MODE_OBJ && vp.gizmo_tool == GIZMO_SCALE {
+                    $sc := math.max(0.1, 1.0 + (tot_dx - tot_dy) * 0.008)
+                    if snap_enabled && snap_scl > 0.0 {
+                        sc = math.max(0.1, math.round(sc / snap_scl) * snap_scl)
+                    }
+                    vp.gizmo_scale_mul = fm.vec3(sc, sc, sc)
+                    vp.live_gizmo_dirty = true
+                    << VP3D_ACT_RENDER
+                }
+                panes := vp_compute_panes(bounds, split)
+                $rect := panes[0]
+                if vp.drag_pane == 1 && panes.len > 1 { rect = panes[1] }
+                $cam := vp_persp_camera(vp, rect)
+                if vp.drag_pane == 1 && panes.len > 1 { cam = vp_ortho_camera(vp, rect) }
+                $wd := cam.right.scaled(tot_dx * vp.gizmo_world_per_px).sub(cam.up.scaled(tot_dy * vp.gizmo_world_per_px))
+                if snap_enabled && snap_move > 0.0 {
+                    wd = fm.vec3(
+                        math.round(wd.x / snap_move) * snap_move,
+                        math.round(wd.y / snap_move) * snap_move,
+                        math.round(wd.z / snap_move) * snap_move
+                    )
+                }
+                vp.gizmo_delta = wd
+                if vp.sub_mode == SUB_MODE_OBJ {
+                    vp.live_gizmo_dirty = true
+                    << VP3D_ACT_RENDER
+                }
+                << VP3D_ACT_CAPTURE
+            }
+            proj_px := tot_dx * vp.gizmo_screen_dir_x + tot_dy * vp.gizmo_screen_dir_y
+            ax_v := vp_gizmo_axis_vec(vp.gizmo_drag_axis)
+            if vp.sub_mode == SUB_MODE_OBJ && vp.gizmo_tool == GIZMO_ROTATE {
+                $deg := proj_px * 0.85
+                if snap_enabled && snap_rot > 0.0 {
+                    deg = math.round(deg / snap_rot) * snap_rot
+                }
+                vp.gizmo_rot_deg = ax_v.scaled(deg)
+                vp.live_gizmo_dirty = true
+                << VP3D_ACT_RENDER
+            } else if vp.sub_mode == SUB_MODE_OBJ && vp.gizmo_tool == GIZMO_SCALE {
+                $sc := math.max(0.1, 1.0 + proj_px * 0.008)
+                if snap_enabled && snap_scl > 0.0 {
+                    sc = math.max(0.1, math.round(sc / snap_scl) * snap_scl)
+                }
+                $sx := 1.0
+                $sy := 1.0
+                $sz := 1.0
+                if vp.gizmo_drag_axis == 1 { sx = sc }
+                else if vp.gizmo_drag_axis == 2 { sy = sc }
+                else if vp.gizmo_drag_axis == 3 { sz = sc }
+                vp.gizmo_scale_mul = fm.vec3(sx, sy, sz)
+                vp.live_gizmo_dirty = true
+                << VP3D_ACT_RENDER
+            }
+            $world_d := proj_px * vp.gizmo_world_per_px
+            if snap_enabled && snap_move > 0.0 {
+                world_d = math.round(world_d / snap_move) * snap_move
+            }
+            vp.gizmo_delta = ax_v.scaled(world_d)
+            if vp.sub_mode == SUB_MODE_OBJ {
+                vp.live_gizmo_dirty = true
+                << VP3D_ACT_RENDER
+            }
+            << VP3D_ACT_CAPTURE
+        }
+        if vp.dragging_orbit || vp.dragging_pan {
+            tot_dx := input.x - vp.drag_start_x
+            tot_dy := input.y - vp.drag_start_y
+            if !vp.drag_moved {
+                if tot_dx * tot_dx + tot_dy * tot_dy <= 25.0 {
+                    << VP3D_ACT_CAPTURE
+                }
+                vp.drag_moved = true
+                vp.drag_last_x = input.x
+                vp.drag_last_y = input.y
+                << VP3D_ACT_CAPTURE
+            }
+        }
+        dx := input.x - vp.drag_last_x
+        dy := input.y - vp.drag_last_y
+        vp.drag_last_x = input.x
+        vp.drag_last_y = input.y
+        if vp.dragging_orbit {
+            vp.yaw = vp.yaw - dx * 0.0085
+            vp.pitch = math.max(-1.45, math.min(1.45, vp.pitch + dy * 0.0085))
+            << VP3D_ACT_RENDER
+        }
+        if vp.dragging_pan {
+            panes := vp_compute_panes(bounds, split)
+            $rect := panes[0]
+            if vp.drag_pane == 1 && panes.len > 1 { rect = panes[1] }
+            $cam := vp_persp_camera(vp, rect)
+            $scale := 2.0 * vp.distance * cam.tangent / math.max(120.0, bounds.height)
+            if vp.drag_pane == 1 && panes.len > 1 {
+                cam = vp_ortho_camera(vp, rect)
+                scale = vp.ortho_size / math.max(120.0, bounds.height)
+            }
+            vp.center = vp.center.add(cam.right.scaled(-dx * scale)).add(cam.up.scaled(dy * scale))
+            << VP3D_ACT_RENDER
+        }
+        next_triad := vp_triad_hit(vp, bounds, split, input.x, input.y)
+        $next_hover := 0
+        if next_triad == 0 {
+            next_hover = vp_gizmo_hit_axis(vp, bounds, split, doc, selected_node, selected_nodes, input.x, input.y)
+        }
+        if next_hover != vp.gizmo_hover_axis || next_triad != vp.gizmo_triad_hover {
+            vp.gizmo_hover_axis = next_hover
+            vp.gizmo_triad_hover = next_triad
+            << VP3D_ACT_CAPTURE
+        }
+        << VP3D_ACT_NONE
+    }
+    if input.kind == ui.EV_POINTER_LEAVE {
+        if vp.gizmo_hover_axis != 0 || vp.gizmo_triad_hover != 0 {
+            vp.gizmo_hover_axis = 0
+            vp.gizmo_triad_hover = 0
+            << VP3D_ACT_CAPTURE
+        }
+        << VP3D_ACT_NONE
+    }
+    if input.kind == ui.EV_POINTER_UP || input.kind == ui.EV_POINTER_CANCEL {
+        if vp.gizmo_drag_axis > 0 {
+            vp.gizmo_drag_axis = 0
+            was_moved := vp.drag_moved
+            vp.drag_moved = false
+            vp.live_gizmo_dirty = false
+            has_delta := vp.gizmo_delta.length() > 1e-6 ||
+                vp.gizmo_rot_deg.length() > 1e-4 ||
+                math.abs(vp.gizmo_scale_mul.x - 1.0) > 1e-4 ||
+                math.abs(vp.gizmo_scale_mul.y - 1.0) > 1e-4 ||
+                math.abs(vp.gizmo_scale_mul.z - 1.0) > 1e-4
+            if input.kind == ui.EV_POINTER_UP && has_delta {
+                if vp.sub_mode != SUB_MODE_OBJ {
+                    << VP3D_ACT_COMMIT_SUB_MOVE
+                }
+                << VP3D_ACT_COMMIT_MOVE
+            }
+            vp.gizmo_delta = fm.vec3(0.0, 0.0, 0.0)
+            vp.gizmo_rot_deg = fm.vec3(0.0, 0.0, 0.0)
+            vp.gizmo_scale_mul = fm.vec3(1.0, 1.0, 1.0)
+            if input.kind == ui.EV_POINTER_UP && !has_delta && !was_moved {
+                is_add := vp.pick_down_additive || ((input.modifiers & (ui.MOD_SHIFT | ui.MOD_META | ui.MOD_CONTROL)) != 0)
+                vp.pick_down_additive = false
+                vp.pending_pick = true
+                vp.pick_additive = is_add
+                vp.pick_x = input.x
+                vp.pick_y = input.y
+                << VP3D_ACT_PICK
+            }
+            vp.pick_down_additive = false
+            << VP3D_ACT_CAPTURE
+        }
+        was_click := (input.button == ui.BUTTON_LEFT) && !vp.drag_moved
+        was_drag := vp.dragging_orbit || vp.dragging_pan
+        is_add := vp.pick_down_additive || ((input.modifiers & (ui.MOD_SHIFT | ui.MOD_META | ui.MOD_CONTROL)) != 0)
+        vp.pick_down_additive = false
+        vp.dragging_orbit = false
+        vp.dragging_pan = false
+        vp.drag_moved = false
+        if was_click && input.kind == ui.EV_POINTER_UP {
+            vp.pending_pick = true
+            vp.pick_additive = is_add
+            vp.pick_x = input.x
+            vp.pick_y = input.y
+            << VP3D_ACT_PICK
+        }
+        if was_drag { << VP3D_ACT_CAPTURE }
+        << VP3D_ACT_NONE
+    }
+    << VP3D_ACT_NONE
+}

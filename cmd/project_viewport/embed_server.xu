@@ -1,0 +1,739 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+camera_data #"github.com/xulang-org/nexus/resources/camera"
+data #"github.com/xulang-org/nexus/resources/lighting"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+resource #"github.com/xulang-org/nexus/resources/scene"
+imod #"github.com/xulang-org/nexus/integration/modeling"
+files #"github.com/xulang-org/nexus/integration/scene"
+scene_lights #"github.com/xulang-org/nexus/integration/lighting"
+scene_lighting #"github.com/xulang-org/nexus/integration/scene_lighting"
+models3d #"github.com/xulang-org/nexus/integration/scene_render"
+world3d #"github.com/xulang-org/nexus/integration/rendering/three_d"
+scene #"github.com/xulang-org/nexus/scene"
+mesh_shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
+ren #"github.com/xulang-org/nexus/rendering/three_d"
+gpu_info #"github.com/xulang-org/nexus/platform/gpu"
+#encoding/json
+#errors
+#gpu
+#math
+#net
+#path/filepath
+#strconv
+#strings
+#time
+
+const EMBED_FRAME_RGBA = 1
+const EMBED_PICK_RESULT = 2
+const EMBED_READY = 3
+const EMBED_ERROR = 4
+
+const EMBED_ORTHO_TOP = 0
+const EMBED_ORTHO_FRONT = 1
+const EMBED_ORTHO_RIGHT = 2
+
+// Warm Paper studio viewport backdrop & axes from xu-ui-tokens.json
+const EMBED_PAPER_BG = 0xede8e2ff
+const EMBED_GRID_MINOR = 0xd2cac0ff
+const EMBED_GRID_MAJOR = 0xb7aca0ff
+const EMBED_AXIS_X = 0xb82138ff
+const EMBED_AXIS_Y = 0x146747ff
+const EMBED_AXIS_Z = 0x1b648fff
+
+struct EmbedViewportRect {
+    x int
+    y int
+    w int
+    h int
+}
+
+struct EmbedCameraSpec {
+    center fm.Vec3
+    distance f64
+    yaw f64
+    pitch f64
+    ortho_size f64
+    ortho_axis int
+}
+
+struct EmbedSceneHost {
+    directory string
+    doc resource.Document
+    tree scene.SceneTree
+    root int
+    tree_ids []int
+    models models3d.SceneModels3D
+    picker models3d.ScenePicker3D
+    scene_mods imod.SceneModeling3D
+    slights scene_lights.SceneLights3D
+    has_lights bool
+}
+
+fn push_u32_le(sb $&strings.ByteBuilder, v int) {
+    sb.write_byte(v & 255)
+    sb.write_byte((v >> 8) & 255)
+    sb.write_byte((v >> 16) & 255)
+    sb.write_byte((v >> 24) & 255)
+}
+
+fn embed_write_all(conn &net.Conn, payload &string) int {
+    $pos := 0
+    total := payload.len
+    while pos < total {
+        $end := pos + 65536
+        if end > total { end = total }
+        chunk := payload[pos:end] + ""
+        wrote := conn.write(&chunk) or >>
+        if wrote <= 0 {
+            >> errors.new("embed server: socket write stalled")
+        }
+        pos = pos + wrote
+    }
+    << 0
+}
+
+fn send_embed_packet(conn &net.Conn, kind int, seq int, payload &string) int {
+    $hdr := strings.new_byte_builder(16)
+    hdr.write_str("NXF1")
+    push_u32_le($&hdr, kind)
+    push_u32_le($&hdr, seq)
+    push_u32_le($&hdr, payload.len)
+    embed_write_all(conn, &hdr.to_string()) or >>
+    if payload.len > 0 {
+        embed_write_all(conn, payload) or >>
+    }
+    << 0
+}
+
+fn send_embed_rgba(conn &net.Conn, seq int, w int, h int, pixels &[]u8) int {
+    $sb := strings.new_byte_builder(8 + pixels.len)
+    push_u32_le($&sb, w)
+    push_u32_le($&sb, h)
+    for b in pixels {
+        sb.write_byte(int(b))
+    }
+    payload := sb.to_string()
+    << send_embed_packet(conn, EMBED_FRAME_RGBA, seq, &payload) or >>
+}
+
+fn add_grid_quad(mesh $&meshes.MeshData3D, a fm.Vec3, b fm.Vec3, off fm.Vec3, col int) int {
+    i0 := mesh.vertex(a.sub(off), col) or >>
+    i1 := mesh.vertex(a.add(off), col) or >>
+    i2 := mesh.vertex(b.add(off), col) or >>
+    i3 := mesh.vertex(b.sub(off), col) or >>
+    mesh.triangle(i0, i1, i2) or >>
+    mesh.triangle(i0, i2, i3) or >>
+    << 0
+}
+
+fn build_plane_grid_mesh(device &ren.Device3D, plane int) ren.Mesh3D {
+    $m := meshes.new_mesh_data_3d()
+    $k := -10
+    while k <= 10 {
+        fk := f64(k)
+        $col_a := EMBED_GRID_MINOR
+        $hw_a := 0.011
+        $col_b := EMBED_GRID_MINOR
+        $hw_b := 0.011
+        if k % 5 == 0 && k != 0 {
+            col_a = EMBED_GRID_MAJOR
+            hw_a = 0.017
+            col_b = EMBED_GRID_MAJOR
+            hw_b = 0.017
+        }
+        if plane == EMBED_ORTHO_TOP {
+            if k == 0 {
+                col_a = EMBED_AXIS_Z
+                hw_a = 0.024
+                col_b = EMBED_AXIS_X
+                hw_b = 0.024
+            }
+            add_grid_quad($&m, fm.vec3(fk, 0.0, -10.0), fm.vec3(fk, 0.0, 10.0), fm.vec3(hw_a, 0.0, 0.0), col_a) or >>
+            add_grid_quad($&m, fm.vec3(-10.0, 0.0, fk), fm.vec3(10.0, 0.0, fk), fm.vec3(0.0, 0.0, hw_b), col_b) or >>
+        } else if plane == EMBED_ORTHO_FRONT {
+            if k == 0 {
+                col_a = EMBED_AXIS_Y
+                hw_a = 0.024
+                col_b = EMBED_AXIS_X
+                hw_b = 0.024
+            }
+            add_grid_quad($&m, fm.vec3(fk, -10.0, 0.0), fm.vec3(fk, 10.0, 0.0), fm.vec3(hw_a, 0.0, 0.0), col_a) or >>
+            add_grid_quad($&m, fm.vec3(-10.0, fk, 0.0), fm.vec3(10.0, fk, 0.0), fm.vec3(0.0, hw_b, 0.0), col_b) or >>
+        } else {
+            if k == 0 {
+                col_a = EMBED_AXIS_Y
+                hw_a = 0.024
+                col_b = EMBED_AXIS_Z
+                hw_b = 0.024
+            }
+            add_grid_quad($&m, fm.vec3(0.0, -10.0, fk), fm.vec3(0.0, 10.0, fk), fm.vec3(0.0, 0.0, hw_a), col_a) or >>
+            add_grid_quad($&m, fm.vec3(0.0, fk, -10.0), fm.vec3(0.0, fk, 10.0), fm.vec3(0.0, hw_b, 0.0), col_b) or >>
+        }
+        k += 1
+    }
+    << device.upload(&m) or >>
+}
+
+fn close_embed_scene(host $&EmbedSceneHost) {
+    sm := $&host.scene_mods
+    _ := sm.close() or (err) {
+        _ := err
+        <<
+    }
+    md := $&host.models
+    _ := md.close() or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn try_set_world_mat_override(world $&world3d.Scene3D, tree &scene.SceneTree, nid int, mat ren.Material3D) {
+    keep_ds := world.is_node_double_sided(nid)
+    $next_mat := mat
+    if keep_ds && !next_mat.is_double_sided() {
+        next_mat = next_mat.with_double_sided(true)
+    }
+    _ := world.set_material(tree, nid, next_mat) or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn apply_world_material_overrides(
+    doc &resource.Document,
+    world $&world3d.Scene3D,
+    tree &scene.SceneTree,
+    tree_ids &[]int
+) {
+    for i in 0:doc.material_override_count() {
+        ov := doc.material_override(i) or (err) {
+            _ := err
+            ->
+        }
+        if ov.slot != 0 || ov.node <= 0 || ov.node >= tree_ids.len { -> }
+        mat3d := imod.material_asset_to_3d(&ov.material) or (err) {
+            _ := err
+            ->
+        }
+        try_set_world_mat_override(world, tree, tree_ids[ov.node], mat3d)
+    }
+}
+
+fn push_loaded_embed_scene(
+    device &ren.Device3D,
+    scene_path string,
+    worlds $&[]world3d.Scene3D,
+    hosts $&[]EmbedSceneHost
+) int {
+    directory := filepath.dir(&scene_path)
+    document := files.load(scene_path + "") or >>
+    doc_meta := files.load(scene_path + "") or >>
+    name := (doc_meta.describe_node(0) or >>).name
+    $models := models3d.prepare_surfaces(device, document, directory + "") or >>
+    $tree := scene.new_scene_tree_3d("EmbedEditor", 4097) or (err) {
+        _ := models.close()
+        >> err
+    }
+    parent := tree.root()
+    $world := world3d.new_scene_3d(device) or (err) {
+        _ := models.close()
+        >> err
+    }
+    root := models.instantiate($&world, $&tree, parent, name + "") or (err) {
+        _ := models.close()
+        >> err
+    }
+    picker := models.picker(&tree, root) or (err) {
+        _ := models.close()
+        >> err
+    }
+    $scene_mods := imod.prepare_scene_modeling(device, &doc_meta) or (err) {
+        _ := models.close()
+        >> err
+    }
+    $slights := scene_lights.new_scene_lights_3d()
+    has_lights := doc_meta.light_count() > 0
+    if has_lights {
+        scene_lighting.bind(&doc_meta, $&slights, &tree, root) or (err) {
+            _ := scene_mods.close()
+            _ := models.close()
+            >> err
+        }
+    }
+    tree_ids := tree.subtree(root) or (err) {
+        _ := scene_mods.close()
+        _ := models.close()
+        >> err
+    }
+    apply_world_material_overrides(&doc_meta, $&world, &tree, &tree_ids)
+    if hosts.len > 0 {
+        last_i := hosts.len - 1
+        close_embed_scene($&hosts[last_i])
+    }
+    worlds.push(world)
+    hosts.push(EmbedSceneHost{
+        directory: directory + "",
+        doc: doc_meta,
+        tree: tree,
+        root: root,
+        tree_ids: tree_ids,
+        models: models,
+        picker: picker,
+        scene_mods: scene_mods,
+        slights: slights,
+        has_lights: has_lights
+    })
+    << 0
+}
+
+fn close_embed_mesh_quiet(m $&ren.Mesh3D) {
+    _ := m.close() or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn close_embed_device_quiet(d $&ren.Device3D) {
+    _ := d.close() or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn close_embed_conn_quiet(c $&net.Conn) {
+    _ := c.close() or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn try_reload_embed_hosts(
+    device &ren.Device3D,
+    conn &net.Conn,
+    sp string,
+    seq int,
+    worlds $&[]world3d.Scene3D,
+    hosts $&[]EmbedSceneHost
+) {
+    push_loaded_embed_scene(device, sp, worlds, hosts) or (err) {
+        emsg := "{\"error\":" + json.quote(&err.msg()) + "}"
+        _ := send_embed_packet(conn, EMBED_ERROR, seq, &emsg) or (serr) {
+            _ := serr
+            <<
+        }
+        <<
+    }
+}
+
+fn safe_pick_3d(
+    picker &models3d.ScenePicker3D,
+    world &world3d.Scene3D,
+    tree &scene.SceneTree,
+    origin fm.Vec3,
+    direction fm.Vec3,
+    near f64,
+    far f64
+) models3d.ScenePick3D {
+    << picker.pick(world, tree, origin, direction, near, far) or (err) {
+        _ := err
+        << models3d.ScenePick3D{node: 0, distance: far}
+    }
+}
+
+fn try_select_lods(w $&world3d.Scene3D, tree &scene.SceneTree, pos fm.Vec3) {
+    _ := w.select_lods(tree, pos) or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn embed_persp_camera(cam &EmbedCameraSpec, rect EmbedViewportRect) CameraFrame {
+    orb := Orbit{center: cam.center, distance: cam.distance, yaw: cam.yaw, pitch: cam.pitch}
+    << camera_frame(orb, fm.vec2(f64(rect.w), f64(rect.h))) or >>
+}
+
+fn embed_ortho_camera(cam &EmbedCameraSpec, rect EmbedViewportRect) CameraFrame {
+    $axis_dir := fm.vec3(0.0, 1.0, 0.0)
+    $up_vec := fm.vec3(0.0, 0.0, -1.0)
+    if cam.ortho_axis == EMBED_ORTHO_FRONT {
+        axis_dir = fm.vec3(0.0, 0.0, 1.0)
+        up_vec = fm.vec3(0.0, 1.0, 0.0)
+    } else if cam.ortho_axis == EMBED_ORTHO_RIGHT {
+        axis_dir = fm.vec3(1.0, 0.0, 0.0)
+        up_vec = fm.vec3(0.0, 1.0, 0.0)
+    }
+    near := 0.05
+    far := 400.0
+    pos := cam.center.add(axis_dir.scaled(60.0))
+    fwd := axis_dir.scaled(-1.0)
+    right := fwd.cross(up_vec).normalized() or >>
+    up := right.cross(fwd)
+    aspect := math.max(0.1, f64(rect.w)) / math.max(0.1, f64(rect.h))
+    view := scene.look_at_3d(pos, cam.center, up_vec) or >>
+    lens := camera_data.orthographic(cam.ortho_size, near, far) or >>
+    proj := lens.projection(aspect) or >>
+    << CameraFrame{
+        position: pos, right: right, up: up, forward: fwd,
+        view: view, proj: proj, projection: proj.multiply(view),
+        size: fm.vec2(f64(rect.w), f64(rect.h)),
+        tangent: 1.0, near: near, far: far
+    }
+}
+
+fn embed_ortho_ray(cam &EmbedCameraSpec, frame &CameraFrame, rect EmbedViewportRect, px f64, py f64) ViewRay {
+    rw := math.max(1.0, f64(rect.w))
+    rh := math.max(1.0, f64(rect.h))
+    lx := px - f64(rect.x)
+    ly := py - f64(rect.y)
+    nx := (2.0 * lx / rw) - 1.0
+    ny := 1.0 - (2.0 * ly / rh)
+    half_h := cam.ortho_size * 0.5
+    half_w := half_h * (rw / rh)
+    origin := frame.position.add(frame.right.scaled(nx * half_w)).add(frame.up.scaled(ny * half_h))
+    << ViewRay{origin: origin, direction: frame.forward, near: frame.near, far: frame.far}
+}
+
+fn gather_embed_lights(slights &scene_lights.SceneLights3D, tree &scene.SceneTree, has_lights bool) []data.Light3D {
+    if has_lights && slights.binding_count() > 0 {
+        gathered := slights.gather(tree) or (err) {
+            _ := err
+            << []data.Light3D{}
+        }
+        if gathered.len > 0 { << gathered }
+    }
+    key := data.directional(fm.vec3(0.45, 0.78, 0.42), fm.vec3(2.35, 2.30, 2.20)) or >>
+    fill := data.directional(fm.vec3(-0.55, 0.38, 0.48), fm.vec3(0.95, 1.00, 1.08)) or >>
+    rim := data.directional(fm.vec3(-0.30, 0.45, -0.82), fm.vec3(1.10, 1.12, 1.18)) or >>
+    << [key, fill, rim]
+}
+
+fn render_embed_pane(
+    device $&ren.Device3D,
+    world $&world3d.Scene3D,
+    scene_mods &imod.SceneModeling3D,
+    tree &scene.SceneTree,
+    tree_ids &[]int,
+    slights &scene_lights.SceneLights3D,
+    has_lights bool,
+    grid_mesh &ren.Mesh3D,
+    rect EmbedViewportRect,
+    frame &CameraFrame,
+    show_grid bool
+) int {
+    if rect.w < 4 || rect.h < 4 { << 0 }
+    device.set_viewport(rect.x, rect.y, rect.w, rect.h) or >>
+    world.select_lods(tree, frame.position) or >>
+    lights := gather_embed_lights(slights, tree, has_lights) or >>
+    lighting := data.environment(fm.vec3(0.42, 0.41, 0.40), frame.position, 1.0, lights) or >>
+    if show_grid {
+        device.draw(grid_mesh, frame.projection) or >>
+    }
+    world.draw_lit(device, tree, frame.projection, &lighting) or >>
+    _ := scene_mods.draw_lit(device, tree, tree_ids, frame.projection, &lighting) or >>
+    << 0
+}
+
+fn json_bool_or(doc &json.Doc, obj int, key string, fallback bool) bool {
+    if !doc.has(obj, key + "") { << fallback }
+    << doc.as_bool(doc.get(obj, key + "")) or (err) {
+        _ := err
+        << fallback
+    }
+}
+
+fn json_int_or(doc &json.Doc, obj int, key string, fallback int) int {
+    if !doc.has(obj, key + "") { << fallback }
+    << doc.as_int(doc.get(obj, key + "")) or (err) {
+        _ := err
+        << fallback
+    }
+}
+
+fn parse_cam_spec(doc &json.Doc, root int) EmbedCameraSpec {
+    $spec := EmbedCameraSpec{
+        center: fm.vec3(0.0, 0.5, 0.0),
+        distance: 6.5,
+        yaw: 0.55,
+        pitch: 0.42,
+        ortho_size: 8.0,
+        ortho_axis: EMBED_ORTHO_TOP
+    }
+    spec.ortho_axis = json_int_or(doc, root, "ortho_axis", EMBED_ORTHO_TOP)
+    if !doc.has(root, "cam") { << spec }
+    arr := doc.get(root, "cam")
+    if arr < 0 || !doc.is_list(arr) || doc.count(arr) < 7 { << spec }
+    cx := doc.as_f64(doc.at(arr, 0)) or (err) { << spec }
+    cy := doc.as_f64(doc.at(arr, 1)) or (err) { << spec }
+    cz := doc.as_f64(doc.at(arr, 2)) or (err) { << spec }
+    dist := doc.as_f64(doc.at(arr, 3)) or (err) { << spec }
+    yaw := doc.as_f64(doc.at(arr, 4)) or (err) { << spec }
+    pitch := doc.as_f64(doc.at(arr, 5)) or (err) { << spec }
+    osize := doc.as_f64(doc.at(arr, 6)) or (err) { << spec }
+    if fm.finite(cx) && fm.finite(cy) && fm.finite(cz) { spec.center = fm.vec3(cx, cy, cz) }
+    if fm.finite(dist) && dist > 0.05 { spec.distance = dist }
+    if fm.finite(yaw) { spec.yaw = yaw }
+    if fm.finite(pitch) { spec.pitch = pitch }
+    if fm.finite(osize) && osize > 0.1 { spec.ortho_size = osize }
+    << spec
+}
+
+fn clamp_embed_dim(v int, lo int, hi int) int {
+    if v < lo { << lo }
+    if v > hi { << hi }
+    << v
+}
+
+fn parse_embed_mat4(doc &json.Doc, root int) fm.Mat4 {
+    if !doc.has(root, "mat") { << fm.identity_3d() }
+    arr := doc.get(root, "mat")
+    if arr < 0 || !doc.is_list(arr) || doc.count(arr) < 16 { << fm.identity_3d() }
+    $vals := []f64{}
+    for i in 0:16 {
+        v := doc.as_f64(doc.at(arr, i)) or (err) {
+            _ := err
+            << fm.identity_3d()
+        }
+        if !fm.finite(v) { << fm.identity_3d() }
+        vals.push(v)
+    }
+    << fm.Mat4{
+        c0: fm.vec4(vals[0], vals[1], vals[2], vals[3]),
+        c1: fm.vec4(vals[4], vals[5], vals[6], vals[7]),
+        c2: fm.vec4(vals[8], vals[9], vals[10], vals[11]),
+        c3: fm.vec4(vals[12], vals[13], vals[14], vals[15])
+    }
+}
+
+fn try_set_embed_transform(hosts $&[]EmbedSceneHost, node_idx int, mat fm.Mat4) {
+    if hosts.len == 0 || node_idx <= 0 { << }
+    cur := hosts.len - 1
+    host := $&hosts[cur]
+    if node_idx >= host.tree_ids.len { << }
+    tid := host.tree_ids[node_idx]
+    if tid <= 0 { << }
+    t := $&host.tree
+    _ := t.set_transform_3d(tid, mat) or (err) {
+        _ := err
+        <<
+    }
+    _ := t.flush_transforms() or (err) {
+        _ := err
+        <<
+    }
+}
+
+fn split_viewport_rects(w int, h int, split bool) []EmbedViewportRect {
+    if !split || w < 160 {
+        << [EmbedViewportRect{x: 0, y: 0, w: w, h: h}]
+    }
+    lw := int(f64(w) * 0.56)
+    rw := w - lw - 2
+    if rw < 32 {
+        << [EmbedViewportRect{x: 0, y: 0, w: w, h: h}]
+    }
+    << [
+        EmbedViewportRect{x: 0, y: 0, w: lw, h: h},
+        EmbedViewportRect{x: lw + 2, y: 0, w: rw, h: h}
+    ]
+}
+
+fn run_embed_server(config &Options) int {
+    mesh_program := mesh_shaders.load_mesh("build/mesh-shaders") or >>
+    $device := ren.open_3d_offscreen_adaptive(640, 480, gpu.AUTO, &mesh_program) or >>
+    $backend := "Software"
+    if device.is_gpu() {
+        $bcode := 0
+        bres := device.backend() or (err) {
+            _ := err
+            << 0
+        }
+        bcode = bres
+        backend = gpu_info.backend_name(bcode)
+    }
+    $grid_xz := build_plane_grid_mesh(&device, EMBED_ORTHO_TOP) or >>
+    $grid_xy := build_plane_grid_mesh(&device, EMBED_ORTHO_FRONT) or >>
+    $grid_yz := build_plane_grid_mesh(&device, EMBED_ORTHO_RIGHT) or >>
+    $worlds := []world3d.Scene3D{}
+    $hosts := []EmbedSceneHost{}
+    push_loaded_embed_scene(&device, config.path + "", $&worlds, $&hosts) or >>
+
+    $conn := net.dial_to("tcp", config.embed_connect + "") or (err) {
+        if hosts.len > 0 {
+            last_c := hosts.len - 1
+            close_embed_scene($&hosts[last_c])
+        }
+        close_embed_mesh_quiet($&grid_xz)
+        close_embed_mesh_quiet($&grid_xy)
+        close_embed_mesh_quiet($&grid_yz)
+        close_embed_device_quiet($&device)
+        >> err
+    }
+    _ := conn.set_nodelay(true) or (err) {
+        _ := err
+        << 0
+    }
+    ready_json := "{\"backend\":" + json.quote(&backend) + "}"
+    send_embed_packet(&conn, EMBED_READY, 0, &ready_json) or >>
+
+    $rem := ""
+    $running := true
+    while running {
+        $line := ""
+        while true {
+            idx := strings.index_byte(&rem, 10)
+            if idx >= 0 {
+                line = strings.trim_space(&(rem[0:idx] + ""))
+                rem = rem[idx + 1:rem.len] + ""
+                if line.len > 0 { <- }
+                ->
+            }
+            chunk := conn.read(8192) or (err) {
+                _ := err
+                running = false
+                <-
+            }
+            if chunk.len == 0 {
+                running = false
+                <-
+            }
+            rem = rem + chunk
+        }
+        if !running || line.len == 0 { <- }
+
+        doc := json.parse_max(&line, 1048576)
+        if !doc.ok() || !doc.is_dict(doc.root()) { -> }
+        root := doc.root()
+        cmd := json_str_or(&doc, root, "cmd", "")
+        seq := json_int_or(&doc, root, "seq", 0)
+
+        if cmd == "quit" {
+            running = false
+            <-
+        } else if cmd == "load" {
+            sp := json_str_or(&doc, root, "scene", "")
+            if sp.len > 0 {
+                try_reload_embed_hosts(&device, &conn, sp, seq, $&worlds, $&hosts)
+            }
+        } else if cmd == "set_transform" {
+            node_idx := json_int_or(&doc, root, "node", -1)
+            mat := parse_embed_mat4(&doc, root)
+            try_set_embed_transform($&hosts, node_idx, mat)
+        } else if cmd == "render" {
+            cur := hosts.len - 1
+            w3 := $&worlds[cur]
+            host := &hosts[cur]
+            w := clamp_embed_dim(json_int_or(&doc, root, "w", 640), 64, 1920)
+            h := clamp_embed_dim(json_int_or(&doc, root, "h", 480), 64, 1200)
+            split := json_bool_or(&doc, root, "split", false)
+            show_grid := json_bool_or(&doc, root, "grid", true)
+            cam := parse_cam_spec(&doc, root)
+            if w != device.render_width() || h != device.render_height() {
+                device.resize_offscreen(w, h) or >>
+            }
+            rects := split_viewport_rects(w, h, split)
+            device.begin(EMBED_PAPER_BG) or >>
+            persp := embed_persp_camera(&cam, rects[0]) or >>
+            render_embed_pane($&device, w3, &host.scene_mods, &host.tree, &host.tree_ids, &host.slights, host.has_lights, &grid_xz, rects[0], &persp, show_grid) or >>
+            if rects.len > 1 {
+                ortho := embed_ortho_camera(&cam, rects[1]) or >>
+                if cam.ortho_axis == EMBED_ORTHO_FRONT {
+                    render_embed_pane($&device, w3, &host.scene_mods, &host.tree, &host.tree_ids, &host.slights, host.has_lights, &grid_xy, rects[1], &ortho, show_grid) or >>
+                } else if cam.ortho_axis == EMBED_ORTHO_RIGHT {
+                    render_embed_pane($&device, w3, &host.scene_mods, &host.tree, &host.tree_ids, &host.slights, host.has_lights, &grid_yz, rects[1], &ortho, show_grid) or >>
+                } else {
+                    render_embed_pane($&device, w3, &host.scene_mods, &host.tree, &host.tree_ids, &host.slights, host.has_lights, &grid_xz, rects[1], &ortho, show_grid) or >>
+                }
+            }
+            device.reset_viewport() or >>
+            cap_path := json_str_or(&doc, root, "capture", "")
+            if cap_path.len > 0 {
+                device.capture(cap_path + "") or >>
+            }
+            pixels := device.read_pixels_rgba() or >>
+            device.finish_offscreen() or >>
+            _ := send_embed_rgba(&conn, seq, w, h, &pixels) or (err) {
+                _ := err
+                running = false
+                <-
+            }
+        } else if cmd == "pick" {
+            cur := hosts.len - 1
+            w3 := $&worlds[cur]
+            host := &hosts[cur]
+            w := clamp_embed_dim(json_int_or(&doc, root, "w", 640), 64, 1920)
+            h := clamp_embed_dim(json_int_or(&doc, root, "h", 480), 64, 1200)
+            px := json_f64_or(&doc, root, "x", f64(w) * 0.5)
+            py := json_f64_or(&doc, root, "y", f64(h) * 0.5)
+            split := json_bool_or(&doc, root, "split", false)
+            sel := json_int_or(&doc, root, "sel", -1)
+            sub_mode := json_int_or(&doc, root, "sub_mode", 0)
+            cam := parse_cam_spec(&doc, root)
+            rects := split_viewport_rects(w, h, split)
+            $use_rect := rects[0]
+            $use_ortho := false
+            if rects.len > 1 && px >= f64(rects[1].x) {
+                use_rect = rects[1]
+                use_ortho = true
+            }
+            $frame := embed_persp_camera(&cam, use_rect) or >>
+            $ray := ViewRay{origin: frame.position, direction: frame.forward, near: frame.near, far: frame.far}
+            if use_ortho {
+                frame = embed_ortho_camera(&cam, use_rect) or >>
+                ray = embed_ortho_ray(&cam, &frame, use_rect, px, py)
+            } else {
+                pt := fm.vec2(px - f64(use_rect.x), py - f64(use_rect.y))
+                ray = frame.ray(pt) or >>
+            }
+            $resp := "{\"hit\":false,\"node\":-1,\"sub_mode\":0,\"sub_idx\":-1,\"v0\":-1,\"v1\":-1}"
+            $sub_picked := false
+            if sub_mode > 0 && sel > 0 {
+                spick := host.scene_mods.pick_subobject_at(&host.tree, &host.tree_ids, sel, sub_mode, ray.origin, ray.direction)
+                if spick.hit {
+                    resp = "{\"hit\":true,\"node\":" + str(sel) + ",\"sub_mode\":" + str(sub_mode) +
+                        ",\"sub_idx\":" + str(spick.index) + ",\"v0\":" + str(spick.v0) + ",\"v1\":" + str(spick.v1) + "}"
+                    sub_picked = true
+                }
+            }
+            if !sub_picked {
+                $best_doc := -1
+                $best_dist := ray.far
+                hm := host.scene_mods.pick_node(&host.tree, &host.tree_ids, ray.origin, ray.direction, ray.near, ray.far)
+                if hm.hit {
+                    best_doc = hm.node_idx
+                    best_dist = hm.distance
+                }
+                try_select_lods(w3, &host.tree, frame.position)
+                ghit := safe_pick_3d(&host.picker, w3, &host.tree, ray.origin, ray.direction, ray.near, best_dist)
+                if ghit.node > 0 {
+                    for idx in 0:host.tree_ids.len {
+                        if host.tree_ids[idx] == ghit.node {
+                            best_doc = idx
+                            <-
+                        }
+                    }
+                }
+                if best_doc > 0 {
+                    resp = "{\"hit\":true,\"node\":" + str(best_doc) + ",\"sub_mode\":0,\"sub_idx\":-1,\"v0\":-1,\"v1\":-1}"
+                }
+            }
+            _ := send_embed_packet(&conn, EMBED_PICK_RESULT, seq, &resp) or (err) {
+                _ := err
+                running = false
+                <-
+            }
+        }
+    }
+
+    close_embed_conn_quiet($&conn)
+    if hosts.len > 0 {
+        last_i := hosts.len - 1
+        close_embed_scene($&hosts[last_i])
+    }
+    close_embed_mesh_quiet($&grid_xz)
+    close_embed_mesh_quiet($&grid_xy)
+    close_embed_mesh_quiet($&grid_yz)
+    close_embed_device_quiet($&device)
+    << 0
+}
