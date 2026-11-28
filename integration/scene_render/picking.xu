@@ -41,24 +41,24 @@ fn upper(a fm.Vec3, b fm.Vec3) fm.Vec3 {
 fn pick_model(source &gltf.GlbGeometry) PickModel {
     $meshes := []PickMesh{}
     for i in 0:source.primitive_count() {
-        initial := source.position(i, 0) or >>
+        initial := source.position(i, 0) >>>
         $low := initial
         $high := initial
         $points := []fm.Vec3{}
-        vertices := source.vertex_count(i) or >>
+        vertices := source.vertex_count(i) >>>
         for j in 0:vertices {
-            point := source.position(i, j) or >>
+            point := source.position(i, j) >>>
             low = lower(low, point)
             high = upper(high, point)
             points.push(point)
         }
         $indices := []int{}
-        count := source.index_count(i) or >>
-        for j in 0:count { indices.push(source.index(i, j) or >>) }
-        material := source.primitive_material(i) or >>
+        count := source.index_count(i) >>>
+        for j in 0:count { indices.push(source.index(i, j) >>>) }
+        material := source.primitive_material(i) >>>
         $two_sided := false
-        if material >= 0 { two_sided = (source.material(material) or >>).double_sided }
-        meshes.push(PickMesh{points: points, indices: indices, bounds: fm.aabb3(low, high) or >>, double_sided: two_sided})
+        if material >= 0 { two_sided = (source.material(material) >>>).double_sided }
+        meshes.push(PickMesh{points: points, indices: indices, bounds: fm.aabb3(low, high) >>>, double_sided: two_sided})
     }
     << PickModel{meshes: meshes}
 }
@@ -66,27 +66,27 @@ fn pick_model(source &gltf.GlbGeometry) PickModel {
 // Designed for a restored scene whose topology and surface attachments stay
 // fixed while editing transforms/visibility. Geometry is shared by source hash.
 fn prepare_picker(document &scene_data.Document, directory string, tree &nexus.SceneTree, root int) ScenePicker3D {
-    nodes := scene_files.matching_nodes(document, tree, root) or >>
+    nodes := scene_files.matching_nodes(document, tree, root) >>>
     $models := []PickModel{}
     $by_hash := map[string]int{}
     $by_uid := map[string]int{}
     $consumed := 0
     for i in 0:document.resource_count() {
-        source := document.resource(i) or >>
+        source := document.resource(i) >>>
         if source.kind != "glb_model" { -> }
-        raw := read_glb_source(&source, directory + "", consumed) or >>
+        raw := read_glb_source(&source, directory + "", consumed) >>>
         consumed += raw.len
         hash := source.content_hash + ""
         if !by_hash.has(hash + "") {
-            asset := gltf.decode_glb_geometry(&raw) or >>
+            asset := gltf.decode_glb_geometry(&raw) >>>
             by_hash[hash + ""] = models.len
-            models.push(pick_model(&asset) or >>)
+            models.push(pick_model(&asset) >>>)
         }
         by_uid[source.uid + ""] = by_hash[hash]
     }
     $surfaces := []PickSurface{}
     for i in 0:document.surface_count() {
-        entry := document.surface(i) or >>
+        entry := document.surface(i) >>>
         slot := by_uid[entry.resource_uid + ""]
         if entry.primitive >= models[slot].meshes.len { >> errors.new("nexus scene: picker primitive outside GLB") }
         material := models[slot].meshes[entry.primitive].double_sided
@@ -103,7 +103,7 @@ fn prepare_picker(document &scene_data.Document, directory string, tree &nexus.S
 
 pub fn (set &SceneModels3D) picker(tree &nexus.SceneTree, root int) ScenePicker3D {
     if set.closed { >> errors.new("nexus scene: closed model set") }
-    << prepare_picker(&set.document, set.base_directory + "", tree, root) or >>
+    << prepare_picker(&set.document, set.base_directory + "", tree, root) >>>
 }
 
 struct Interval { lower f64
@@ -163,20 +163,20 @@ pub fn (picker &ScenePicker3D) pick(scene &renderer.Scene3D, tree &nexus.SceneTr
     if !origin.is_finite() || !fm.finite(near) || !fm.finite(far) || near < 0.0 || far <= near {
         >> errors.new("nexus scene: invalid pick ray range")
     }
-    unit := direction.normalized() or >>
+    unit := direction.normalized() >>>
     $best := ScenePick3D{node: 0, distance: far}
     for surface in picker.surfaces {
-        if !(tree.is_visible(surface.node) or >>) { -> }
+        if !(tree.is_visible(surface.node) >>>) { -> }
         $level := 0
-        if surface.levels.len > 1 { level = scene.lod_level(surface.node) or >> }
+        if surface.levels.len > 1 { level = scene.lod_level(surface.node) >>> }
         if level < 0 || level >= surface.levels.len { >> errors.new("nexus scene: select LOD before picking") }
         binding := surface.levels[level]
         slot := binding.model
         primitive := binding.primitive
         model := &picker.models[slot]
         mesh := &model.meshes[primitive]
-        transform := tree.global_transform_3d(surface.node) or >>
-        inverse := transform.affine_inverse() or (err) { -> }
+        transform := tree.global_transform_3d(surface.node) >>>
+        inverse := transform.affine_inverse() >>> (err) { -> }
         local_origin := inverse.transform(fm.vec4(origin.x, origin.y, origin.z, 1.0)).xyz()
         local_ray := inverse.transform(fm.vec4(unit.x, unit.y, unit.z, 0.0)).xyz()
         hit := mesh_pick(mesh, local_origin, local_ray, Interval{lower: near, upper: best.distance}, surface.double_sided)
@@ -188,7 +188,7 @@ pub fn (picker &ScenePicker3D) pick(scene &renderer.Scene3D, tree &nexus.SceneTr
 pub fn (picker &ScenePicker3D) visible_bounds(tree &nexus.SceneTree, node int) fm.Aabb3 {
     $selection := []int{}
     if node != 0 { selection.push(node) }
-    << picker.visible_selection_bounds(tree, &selection) or >>
+    << picker.visible_selection_bounds(tree, &selection) >>>
 }
 
 pub fn (picker &ScenePicker3D) visible_selection_bounds(tree &nexus.SceneTree, selection &[]int) fm.Aabb3 {
@@ -198,10 +198,10 @@ pub fn (picker &ScenePicker3D) visible_selection_bounds(tree &nexus.SceneTree, s
     $high := low
     $found := false
     for surface in picker.surfaces {
-        if (selection.len > 0 && !selected.has(surface.node)) || !(tree.is_visible(surface.node) or >>) { -> }
+        if (selection.len > 0 && !selected.has(surface.node)) || !(tree.is_visible(surface.node) >>>) { -> }
         binding := surface.levels[0]
         bounds := picker.models[binding.model].meshes[binding.primitive].bounds
-        world := tree.global_transform_3d(surface.node) or >>
+        world := tree.global_transform_3d(surface.node) >>>
         for x in [bounds.minimum.x, bounds.maximum.x] {
             for y in [bounds.minimum.y, bounds.maximum.y] {
                 for z in [bounds.minimum.z, bounds.maximum.z] {
@@ -215,5 +215,5 @@ pub fn (picker &ScenePicker3D) visible_selection_bounds(tree &nexus.SceneTree, s
             }
         }
     }
-    << fm.aabb3(low, high) or >>
+    << fm.aabb3(low, high) >>>
 }

@@ -105,11 +105,11 @@ fn validate_config(cfg &AsyncAudioConfig) int {
 }
 
 fn close_reader_quiet(r $&assets.WavReader) {
-    r.close() or (e) { << }
+    r.close() >>> (e) { << }
 }
 
 fn decode_chunk_job(worker_id int, job &DecodeJob) DecodeResult {
-    $reader := assets.open_wav_reader(job.path + "") or (err) {
+    $reader := assets.open_wav_reader(job.path + "") >>> (err) {
         << DecodeResult{
             stream_id: job.stream_id, generation: job.generation, seq: job.seq,
             frames: 0, worker_id: worker_id, finished: false, samples: []int{},
@@ -118,7 +118,7 @@ fn decode_chunk_job(worker_id int, job &DecodeJob) DecodeResult {
     }
     if job.total_frames <= 0 || job.frames <= 0 || job.channels <= 0 {
         reader_ref := $&reader
-        reader_ref.close() or (e) { << DecodeResult{
+        reader_ref.close() >>> (e) { << DecodeResult{
             stream_id: job.stream_id, generation: job.generation, seq: job.seq,
             frames: 0, worker_id: worker_id, finished: false, samples: []int{},
             error_text: e.msg()
@@ -137,7 +137,7 @@ fn decode_chunk_job(worker_id int, job &DecodeJob) DecodeResult {
         $take := remaining
         avail := job.total_frames - pos
         if take > avail { take = avail }
-        part := reader.read_frames(pos, take) or (err) {
+        part := reader.read_frames(pos, take) >>> (err) {
             close_reader_quiet($&reader)
             << DecodeResult{
                 stream_id: job.stream_id, generation: job.generation, seq: job.seq,
@@ -151,7 +151,7 @@ fn decode_chunk_job(worker_id int, job &DecodeJob) DecodeResult {
         if !job.looping && remaining > 0 && pos == 0 { <- }
     }
     reader_ref := $&reader
-    reader_ref.close() or (err) {
+    reader_ref.close() >>> (err) {
         << DecodeResult{
             stream_id: job.stream_id, generation: job.generation, seq: job.seq,
             frames: 0, worker_id: worker_id, finished: false, samples: []int{},
@@ -188,7 +188,7 @@ fn audio_decode_worker(worker_id int, jobs chan DecodeJob, results chan DecodeRe
 }
 
 pub fn open_pool(cfg AsyncAudioConfig) AsyncAudioPool {
-    validate_config(&cfg) or >>
+    validate_config(&cfg) >>>
     jobs := chan DecodeJob{cap: 256}
     results := chan DecodeResult{cap: 256}
     stop := chan int{cap: 16}
@@ -214,14 +214,14 @@ pub fn open_pool(cfg AsyncAudioConfig) AsyncAudioPool {
 
 pub fn (pool $&AsyncAudioPool) open_stream(mixer $&mix.Mixer, path string, capacity_frames int, looping bool) int {
     if pool.closed { >> errors.new("nexus async_audio: pool is closed") }
-    $reader := assets.open_wav_reader(path + "") or >>
+    $reader := assets.open_wav_reader(path + "") >>>
     rate := reader.sample_rate()
     channels := reader.channel_count()
     total := reader.frame_count()
     rref := $&reader
-    rref.close() or >>
+    rref.close() >>>
     if total <= 0 { >> errors.new("nexus async_audio: WAV file contains zero frames") }
-    source := mixer.open_stream(rate, channels, capacity_frames) or >>
+    source := mixer.open_stream(rate, channels, capacity_frames) >>>
     id := pool.streams.len
     pool.streams.push(AsyncStreamSlot{
         id: id,
@@ -242,7 +242,7 @@ pub fn (pool $&AsyncAudioPool) open_stream(mixer $&mix.Mixer, path string, capac
         closed: false,
         pending: []PendingChunk{}
     })
-    pool.schedule_stream(mixer, id) or >>
+    pool.schedule_stream(mixer, id) >>>
     << id
 }
 
@@ -254,17 +254,17 @@ fn (pool &AsyncAudioPool) check_handle(handle int) int {
 }
 
 pub fn (pool &AsyncAudioPool) source_id(handle int) int {
-    pool.check_handle(handle) or >>
+    pool.check_handle(handle) >>>
     << pool.streams[handle].source
 }
 
 pub fn (pool &AsyncAudioPool) generation(handle int) int {
-    pool.check_handle(handle) or >>
+    pool.check_handle(handle) >>>
     << pool.streams[handle].generation
 }
 
 pub fn (pool &AsyncAudioPool) commit_cursor(handle int) int {
-    pool.check_handle(handle) or >>
+    pool.check_handle(handle) >>>
     << pool.streams[handle].commit_cursor
 }
 
@@ -330,7 +330,7 @@ fn drop_pending_at(src &[]PendingChunk, remove_idx int) []PendingChunk {
 fn (pool $&AsyncAudioPool) schedule_stream(mixer &mix.Mixer, handle int) int {
     slot := $&pool.streams[handle]
     if slot.closed || slot.eof_submitted { << 0 }
-    info := mixer.stream_info(slot.source) or >>
+    info := mixer.stream_info(slot.source) >>>
     $pending_frames := 0
     for c in slot.pending { pending_frames += c.frames }
     queued_approx := info.buffered_frames + pending_frames + slot.inflight * pool.config.chunk_frames
@@ -381,7 +381,7 @@ pub fn (pool $&AsyncAudioPool) pump(mixer $&mix.Mixer) int {
     while draining {
         select {
             msg := <-pool.results {
-                pool.ingest_result(msg) or >>
+                pool.ingest_result(msg) >>>
             }
             else {
                 draining = false
@@ -396,7 +396,7 @@ pub fn (pool $&AsyncAudioPool) pump(mixer $&mix.Mixer) int {
         $progressed := true
         while progressed {
             progressed = false
-            info := mixer.stream_info(pool.streams[i].source) or >>
+            info := mixer.stream_info(pool.streams[i].source) >>>
             if info.eof { <- }
             $found := -1
             for j in 0:pool.streams[i].pending.len {
@@ -410,7 +410,7 @@ pub fn (pool $&AsyncAudioPool) pump(mixer $&mix.Mixer) int {
             chunk_frames := chunk.frames
             if chunk_frames > info.room_frames { <- }
             chunk_finished := chunk.finished
-            mixer.feed_stream(pool.streams[i].source, &chunk.samples, chunk_finished) or >>
+            mixer.feed_stream(pool.streams[i].source, &chunk.samples, chunk_finished) >>>
             slot := $&pool.streams[i]
             slot.pending = drop_pending_at(&slot.pending, found)
             slot.next_commit_seq += 1
@@ -425,7 +425,7 @@ pub fn (pool $&AsyncAudioPool) pump(mixer $&mix.Mixer) int {
             newly_fed += chunk_frames
             progressed = true
         }
-        pool.schedule_stream(mixer, i) or >>
+        pool.schedule_stream(mixer, i) >>>
     }
     << newly_fed
 }
@@ -434,7 +434,7 @@ pub fn (pool $&AsyncAudioPool) pump(mixer $&mix.Mixer) int {
 // or all active streams have exhausted inflight work. Returns total newly fed frames.
 pub fn (pool $&AsyncAudioPool) wait_and_pump(mixer $&mix.Mixer, min_new_frames int, max_waits int) int {
     if pool.closed { >> errors.new("nexus async_audio: pool is closed") }
-    $fed_total := pool.pump(mixer) or >>
+    $fed_total := pool.pump(mixer) >>>
     $waits := 0
     while fed_total < min_new_frames && waits < max_waits {
         $has_inflight := false
@@ -446,8 +446,8 @@ pub fn (pool $&AsyncAudioPool) wait_and_pump(mixer $&mix.Mixer, min_new_frames i
         }
         if !has_inflight { <- }
         msg := <-pool.results
-        pool.ingest_result(msg) or >>
-        fed_total += pool.pump(mixer) or >>
+        pool.ingest_result(msg) >>>
+        fed_total += pool.pump(mixer) >>>
         waits += 1
     }
     << fed_total
@@ -455,14 +455,14 @@ pub fn (pool $&AsyncAudioPool) wait_and_pump(mixer $&mix.Mixer, min_new_frames i
 
 // Issues a generation barrier on seek so stale in-flight chunks from before the seek are discarded cleanly.
 pub fn (pool $&AsyncAudioPool) seek_frames(mixer $&mix.Mixer, handle int, frame int) int {
-    pool.check_handle(handle) or >>
+    pool.check_handle(handle) >>>
     slot := $&pool.streams[handle]
     if frame < 0 || frame > slot.total_frames {
         >> errors.new("nexus async_audio: seek frame outside audio duration")
     }
     $target := frame
     if slot.looping && target == slot.total_frames { target = 0 }
-    mixer.reset_stream(slot.source, &[]int{}, false, false) or >>
+    mixer.reset_stream(slot.source, &[]int{}, false, false) >>>
     slot.generation += 1
     slot.issue_cursor = target
     slot.commit_cursor = target
@@ -472,12 +472,12 @@ pub fn (pool $&AsyncAudioPool) seek_frames(mixer $&mix.Mixer, handle int, frame 
     slot.eof_submitted = false
     slot.eof_fed = false
     slot.pending = []PendingChunk{}
-    pool.schedule_stream(mixer, handle) or >>
+    pool.schedule_stream(mixer, handle) >>>
     << target
 }
 
 pub fn (pool $&AsyncAudioPool) seek_seconds(mixer $&mix.Mixer, handle int, seconds f64) int {
-    pool.check_handle(handle) or >>
+    pool.check_handle(handle) >>>
     rate := pool.streams[handle].sample_rate
     total := pool.streams[handle].total_frames
     if rate <= 0 { >> errors.new("nexus async_audio: invalid sample rate") }
@@ -486,7 +486,7 @@ pub fn (pool $&AsyncAudioPool) seek_seconds(mixer $&mix.Mixer, handle int, secon
         >> errors.new("nexus async_audio: seek time outside duration")
     }
     target := int(math.round_to_even(seconds * f64(rate)))
-    << pool.seek_frames(mixer, handle, target) or >>
+    << pool.seek_frames(mixer, handle, target) >>>
 }
 
 pub fn (pool $&AsyncAudioPool) close_stream(mixer $&mix.Mixer, handle int) int {
@@ -495,7 +495,7 @@ pub fn (pool $&AsyncAudioPool) close_stream(mixer $&mix.Mixer, handle int) int {
     }
     if pool.streams[handle].closed { << 0 }
     source := pool.streams[handle].source
-    if mixer.is_stream(source) { mixer.close_stream(source) or >> }
+    if mixer.is_stream(source) { mixer.close_stream(source) >>> }
     slot := $&pool.streams[handle]
     slot.closed = true
     slot.inflight = 0
@@ -513,7 +513,7 @@ pub fn (pool $&AsyncAudioPool) close(mixer $&mix.Mixer) int {
     }
     for i in 0:pool.streams.len {
         if !pool.streams[i].closed {
-            pool.close_stream(mixer, i) or >>
+            pool.close_stream(mixer, i) >>>
         }
     }
     pool.closed = true

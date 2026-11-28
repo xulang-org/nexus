@@ -14,7 +14,7 @@ fn assert(ok bool, msg string) int {
 }
 
 fn clean_dir(path string) int {
-    os.remove_all(path) or (err) {
+    os.remove_all(path) >>> (err) {
         _ := err.msg()
         << 0
     }
@@ -22,14 +22,14 @@ fn clean_dir(path string) int {
 }
 
 fn try_stage(mount $&bm.BundleMount, dir string, key &string) string {
-    mount.verify_and_stage(dir, key) or (err) {
+    mount.verify_and_stage(dir, key) >>> (err) {
         << err.msg()
     }
     << ""
 }
 
 fn try_validate(m &bres.BundleManifest) string {
-    m.validate() or (err) {
+    m.validate() >>> (err) {
         << err.msg()
     }
     << ""
@@ -37,15 +37,15 @@ fn try_validate(m &bres.BundleManifest) string {
 
 fn expect_stage_fail(mount $&bm.BundleMount, dir string, key &string, needle string) int {
     msg := try_stage(mount, dir, key)
-    assert(msg.len > 0, "expected verify_and_stage failure (" + needle + ")") or >>
-    assert(strings.contains(msg, needle), "unexpected error: " + msg) or >>
+    assert(msg.len > 0, "expected verify_and_stage failure (" + needle + ")") >>>
+    assert(strings.contains(msg, needle), "unexpected error: " + msg) >>>
     << 0
 }
 
 fn run() int {
     tmp_root := "build/bundle-test-tmp"
     clean_dir(tmp_root + "")
-    os.mkdir_all(tmp_root + "") or >>
+    os.mkdir_all(tmp_root + "") >>>
 
     key := "nexus-dev-hmac-secret-key-2026"
     wrong_key := "wrong-hmac-key"
@@ -60,45 +60,45 @@ fn run() int {
         bm.BundleSource{key: "config/tuning", rel_path: "config/tuning.json", bytes: "{\"gravity\":9.8}"},
         bm.BundleSource{key: "scripts/ai", rel_path: "scripts/ai.txt", bytes: "state=patrol-v1"}
     ]
-    m1 := bm.pack_bundle(v1_dir + "", "core-assets", 1, &sources_v1, &key) or >>
-    assert(m1.verify(&key) && !m1.verify(&wrong_key), "manifest v1 HMAC verify") or >>
+    m1 := bm.pack_bundle(v1_dir + "", "core-assets", 1, &sources_v1, &key) >>>
+    assert(m1.verify(&key) && !m1.verify(&wrong_key), "manifest v1 HMAC verify") >>>
 
     $mount := bm.new_mount()
-    mount.verify_and_stage(v1_dir + "", &key) or >>
-    assert(mount.active && mount.generation == 1, "mounted v1 generation 1") or >>
-    v1_ai := mount.read_asset("scripts/ai") or >>
-    assert(v1_ai == "state=patrol-v1", "read v1 asset") or >>
+    mount.verify_and_stage(v1_dir + "", &key) >>>
+    assert(mount.active && mount.generation == 1, "mounted v1 generation 1") >>>
+    v1_ai := mount.read_asset("scripts/ai") >>>
+    assert(v1_ai == "state=patrol-v1", "read v1 asset") >>>
 
     // Hot-reload to v2.
     sources_v2 := [
         bm.BundleSource{key: "config/tuning", rel_path: "config/tuning.json", bytes: "{\"gravity\":9.81}"},
         bm.BundleSource{key: "scripts/ai", rel_path: "scripts/ai.txt", bytes: "state=chase-v2"}
     ]
-    _m2 := bm.pack_bundle(v2_dir + "", "core-assets", 2, &sources_v2, &key) or >>
-    mount.verify_and_stage(v2_dir + "", &key) or >>
-    assert(mount.generation == 2 && mount.manifest.sequence == 2, "hot-reloaded to v2") or >>
-    v2_ai := mount.read_asset("scripts/ai") or >>
-    assert(v2_ai == "state=chase-v2", "read v2 asset") or >>
+    _m2 := bm.pack_bundle(v2_dir + "", "core-assets", 2, &sources_v2, &key) >>>
+    mount.verify_and_stage(v2_dir + "", &key) >>>
+    assert(mount.generation == 2 && mount.manifest.sequence == 2, "hot-reloaded to v2") >>>
+    v2_ai := mount.read_asset("scripts/ai") >>>
+    assert(v2_ai == "state=chase-v2", "read v2 asset") >>>
 
     // 1. Tampered asset file (same byte length) fails SHA-256 without disturbing active v2 mount.
-    _ := bm.pack_bundle(bad_tamper_dir + "", "core-assets", 3, &sources_v2, &key) or >>
+    _ := bm.pack_bundle(bad_tamper_dir + "", "core-assets", 3, &sources_v2, &key) >>>
     tampered := "TAMPERED_BYTES"
-    snapshot.write_atomic(filepath.join([bad_tamper_dir + "", "scripts/ai.txt"]), &tampered) or >>
-    expect_stage_fail($&mount, bad_tamper_dir + "", &key, "sha256") or >>
-    v2_after_tamper := mount.read_asset("scripts/ai") or >>
-    assert(v2_after_tamper == "state=chase-v2", "v2 untouched after tamper") or >>
+    snapshot.write_atomic(filepath.join([bad_tamper_dir + "", "scripts/ai.txt"]), &tampered) >>>
+    expect_stage_fail($&mount, bad_tamper_dir + "", &key, "sha256") >>>
+    v2_after_tamper := mount.read_asset("scripts/ai") >>>
+    assert(v2_after_tamper == "state=chase-v2", "v2 untouched after tamper") >>>
 
     // 2. Wrong HMAC key / forged manifest rejected without disturbing active v2.
-    _ := bm.pack_bundle(bad_sig_dir + "", "core-assets", 4, &sources_v2, &wrong_key) or >>
-    expect_stage_fail($&mount, bad_sig_dir + "", &key, "HMAC") or >>
-    v2_after_sig := mount.read_asset("scripts/ai") or >>
-    assert(v2_after_sig == "state=chase-v2", "v2 untouched after bad sig") or >>
+    _ := bm.pack_bundle(bad_sig_dir + "", "core-assets", 4, &sources_v2, &wrong_key) >>>
+    expect_stage_fail($&mount, bad_sig_dir + "", &key, "HMAC") >>>
+    v2_after_sig := mount.read_asset("scripts/ai") >>>
+    assert(v2_after_sig == "state=chase-v2", "v2 untouched after bad sig") >>>
 
     // 3. Anti-rollback replay (sequence <= 2) rejected.
-    _ := bm.pack_bundle(v2_replay_dir + "", "core-assets", 2, &sources_v1, &key) or >>
-    expect_stage_fail($&mount, v2_replay_dir + "", &key, "anti-rollback") or >>
-    v2_after_replay := mount.read_asset("scripts/ai") or >>
-    assert(v2_after_replay == "state=chase-v2", "v2 untouched after replay") or >>
+    _ := bm.pack_bundle(v2_replay_dir + "", "core-assets", 2, &sources_v1, &key) >>>
+    expect_stage_fail($&mount, v2_replay_dir + "", &key, "anti-rollback") >>>
+    v2_after_replay := mount.read_asset("scripts/ai") >>>
+    assert(v2_after_replay == "state=chase-v2", "v2 untouched after replay") >>>
 
     // 4. Path traversal in manifest rejected at validation/decode time.
     bad_manifest := bres.BundleManifest{
@@ -110,20 +110,20 @@ fn run() int {
         signature: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     }
     val_err := try_validate(&bad_manifest)
-    assert(strings.contains(val_err, "traversal"), "path traversal rejected by manifest validation") or >>
+    assert(strings.contains(val_err, "traversal"), "path traversal rejected by manifest validation") >>>
 
     // 5. Explicit rollback restores v1 cleanly.
-    mount.rollback() or >>
-    rb_ai := mount.read_asset("scripts/ai") or >>
-    assert(mount.manifest.sequence == 1 && rb_ai == "state=patrol-v1", "rollback restored v1") or >>
+    mount.rollback() >>>
+    rb_ai := mount.read_asset("scripts/ai") >>>
+    assert(mount.manifest.sequence == 1 && rb_ai == "state=patrol-v1", "rollback restored v1") >>>
 
-    os.remove_all(tmp_root + "") or >>
+    os.remove_all(tmp_root + "") >>>
     println("PASS: bundle_hotreload_checks")
     << 0
 }
 
 fn main() int {
-    run() or (err) {
+    run() >>> (err) {
         println("FAIL: " + err.msg())
         << 1
     }
