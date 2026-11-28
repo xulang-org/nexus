@@ -34,8 +34,8 @@ Page({
     data: { collected: 0, ready: false, mesh, status: "正在加载 Nexus…" },
 
     onLoad() {
-        this.runtime = { visible: false, closed: false, animation: null, lastFrame: null, touchId: null,
-            x: -1, y: -1, state: 0, score: 0 };
+        this.runtime = { visible: false, closed: false, contextLost: false, animation: null, lastFrame: null,
+            touchId: null, x: -1, y: -1, state: 0, score: 0 };
     },
 
     async onReady() {
@@ -53,7 +53,10 @@ Page({
                 mesh ? null : loadAtlas(canvas),
             ]);
             if (runtime.closed) return;
-            runtime.renderer = new WebGLCanvas(canvas, mesh ? game.model : atlas, 360, 240, mesh);
+            runtime.renderer = new WebGLCanvas(canvas, mesh ? game.model : atlas, 360, 240, mesh, {
+                onContextLost: () => this.handleContextLost(),
+                onContextRestored: () => this.handleContextRestored(),
+            });
             game.model = null;
             resize(runtime, bounds);
             runtime.game = game;
@@ -96,10 +99,10 @@ Page({
 
     schedule() {
         const runtime = this.runtime;
-        if (runtime.closed || !runtime.visible || !runtime.game || runtime.animation !== null) return;
+        if (runtime.closed || !runtime.visible || runtime.contextLost || !runtime.game || runtime.animation !== null) return;
         runtime.animation = runtime.renderer.canvas.requestAnimationFrame((timestamp) => {
             runtime.animation = null;
-            if (!runtime.visible || runtime.closed) return;
+            if (!runtime.visible || runtime.closed || runtime.contextLost) return;
             try {
                 if (mesh && runtime.lastFrame !== null &&
                     runtime.x === runtime.drawnX && runtime.y === runtime.drawnY) {
@@ -131,6 +134,27 @@ Page({
         });
     },
 
+    handleContextLost() {
+        const runtime = this.runtime;
+        if (runtime.closed) return;
+        runtime.contextLost = true;
+        this.stop();
+        this.setData({ status: "WebGL 上下文已丢失，等待恢复…" });
+    },
+
+    handleContextRestored() {
+        const runtime = this.runtime;
+        if (runtime.closed) return;
+        runtime.contextLost = false;
+        runtime.lastFrame = null;
+        if (mesh) {
+            runtime.drawnX = undefined;
+            runtime.drawnY = undefined;
+        }
+        this.setData({ status: hint });
+        this.schedule();
+    },
+
     stop() {
         const runtime = this.runtime;
         if (runtime.animation !== null) runtime.renderer.canvas.cancelAnimationFrame(runtime.animation);
@@ -155,28 +179,41 @@ Page({
         this.releaseTouch();
         runtime.state = runtime.game.reset();
         runtime.score = 0;
-        if (mesh) runtime.lastFrame = null;
+        if (mesh) {
+            runtime.lastFrame = null;
+            runtime.drawnX = undefined;
+            runtime.drawnY = undefined;
+        }
         this.setData({ collected: 0, status: hint });
     },
 
     touchStart(event) {
         const runtime = this.runtime;
-        if (!runtime.game || runtime.touchId !== null || !event.changedTouches.length) return;
+        if (!runtime.game || runtime.contextLost || runtime.touchId !== null || !event.changedTouches.length) return;
         const touch = event.changedTouches[0];
+        const point = this.resolvePoint(touch, false);
+        if (point[0] < 0) return;
         runtime.touchId = touch.identifier;
-        this.setTarget(touch);
+        [runtime.x, runtime.y] = point;
     },
 
     touchMove(event) {
-        const touch = event.changedTouches.find(({ identifier }) => identifier === this.runtime.touchId);
-        if (touch) this.setTarget(touch);
+        const runtime = this.runtime;
+        if (!runtime.game || runtime.touchId === null) return;
+        const touch = event.changedTouches.find(({ identifier }) => identifier === runtime.touchId);
+        if (touch) [runtime.x, runtime.y] = this.resolvePoint(touch, true);
     },
 
     touchEnd(event) {
         if (event.changedTouches.some(({ identifier }) => identifier === this.runtime.touchId)) this.releaseTouch();
     },
 
-    touchCancel() { this.releaseTouch(); },
+    touchCancel(event) {
+        const touches = event && Array.isArray(event.changedTouches) ? event.changedTouches : null;
+        if (!touches || !touches.length || touches.some(({ identifier }) => identifier === this.runtime.touchId)) {
+            this.releaseTouch();
+        }
+    },
 
     releaseTouch() {
         const runtime = this.runtime;
@@ -184,10 +221,10 @@ Page({
         runtime.x = runtime.y = -1;
     },
 
-    setTarget(touch) {
+    resolvePoint(touch, clamp = false) {
         const runtime = this.runtime;
         const x = Number.isFinite(touch.clientX) ? touch.clientX : runtime.bounds.left + touch.x;
         const y = Number.isFinite(touch.clientY) ? touch.clientY : runtime.bounds.top + touch.y;
-        [runtime.x, runtime.y] = runtime.renderer.point(x, y);
+        return runtime.renderer.point(x, y, { clamp });
     },
 });

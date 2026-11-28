@@ -5,8 +5,25 @@ const path = require("node:path");
 const MODEL_HEADER = 20;
 const VERTEX_BYTES = 24;
 
-function verifyRenderer(WebGLCanvas, model, first, second) {
-    const commands = [];
+function buildNxm1Model(width, height) {
+    const solid = 3;
+    const textured = 3;
+    const verticesBytes = (solid + textured) * VERTEX_BYTES;
+    const total = MODEL_HEADER + verticesBytes + width * height * 4;
+    const packet = Buffer.alloc(total);
+    packet.write("NXM1", 0, 4, "ascii");
+    packet.writeUInt32LE(solid, 4);
+    packet.writeUInt32LE(textured, 8);
+    packet.writeUInt32LE(width, 12);
+    packet.writeUInt32LE(height, 16);
+    for (let i = MODEL_HEADER; i < MODEL_HEADER + verticesBytes; i += VERTEX_BYTES) {
+        packet.writeUInt8(255, i + 23);
+    }
+    return packet;
+}
+
+function createGlMock(commands) {
+    let getErrorCalls = 0;
     const gl = new Proxy({
         NO_ERROR: 0,
         COLOR_BUFFER_BIT: 0x4000,
@@ -19,7 +36,17 @@ function verifyRenderer(WebGLCanvas, model, first, second) {
         FLOAT: 0x1406,
         UNSIGNED_BYTE: 0x1401,
         TRIANGLES: 4,
-        getError: () => 0,
+        TEXTURE_2D: 0x0de1,
+        TEXTURE_MIN_FILTER: 0x2801,
+        TEXTURE_MAG_FILTER: 0x2800,
+        TEXTURE_WRAP_S: 0x2802,
+        TEXTURE_WRAP_T: 0x2803,
+        NEAREST: 0x2600,
+        LINEAR: 0x2601,
+        LINEAR_MIPMAP_LINEAR: 0x2703,
+        REPEAT: 0x2901,
+        CLAMP_TO_EDGE: 0x812f,
+        getError: () => { getErrorCalls += 1; return 0; },
         getParameter: (name) => name === 0x0d56 ? 24 : 0,
         getShaderParameter: () => true,
         getProgramParameter: () => true,
@@ -28,6 +55,16 @@ function verifyRenderer(WebGLCanvas, model, first, second) {
             return object[name] ?? ((...args) => { commands.push([name, ...args]); return {}; });
         },
     });
+    return {
+        gl,
+        getErrorCount: () => getErrorCalls,
+        resetErrorCount: () => { getErrorCalls = 0; },
+    };
+}
+
+function verifyRenderer(WebGLCanvas, model, first, second) {
+    const commands = [];
+    const { gl, getErrorCount, resetErrorCount } = createGlMock(commands);
     const canvas = {
         getContext(type, options) {
             assert.equal(type, "webgl");
@@ -38,8 +75,17 @@ function verifyRenderer(WebGLCanvas, model, first, second) {
     const renderer = new WebGLCanvas(canvas, model, 360, 240, true);
     renderer.resize({ left: 0, top: 0, width: 840, height: 400 }, 2);
     assert.deepEqual(renderer.point(420, 200), [180, 120]);
+    assert.deepEqual(renderer.point(20, 200), [-1, -1], "unclamped point outside letterbox returns [-1, -1]");
+    assert.deepEqual(renderer.point(20, 200, { clamp: true }), [0, 120],
+        "clamped point outside left letterbox clamps to design viewport");
+    assert.deepEqual(renderer.point(830, 450, { clamp: true }), [359, 239],
+        "clamped point outside bottom-right letterbox clamps to max design coordinate");
+
+    resetErrorCount();
     renderer.draw(first);
     renderer.draw(second);
+    assert.equal(getErrorCount(), 0, "draw/drawModel must not call gl.getError() in hot loop");
+
     const solid = model.readUInt32LE(4);
     for (const expected of [
         ["enable", gl.DEPTH_TEST], ["depthFunc", gl.GREATER], ["clearDepth", 0],
@@ -58,6 +104,20 @@ function verifyRenderer(WebGLCanvas, model, first, second) {
     const images = commands.filter(([name]) => name === "texImage2D");
     assert.equal(images.length, 2, "white and embedded textures are uploaded once");
     assert.deepEqual(images[1].slice(4, 7), [256, 128, 0]);
+
+    const texParams = commands.filter(([name]) => name === "texParameteri");
+    assert.ok(texParams.some(([, target, pname, param]) =>
+        target === gl.TEXTURE_2D && pname === gl.TEXTURE_MIN_FILTER && param === gl.LINEAR_MIPMAP_LINEAR),
+        "POT 3D texture enables trilinear mipmap filtering");
+    assert.ok(commands.some(([name, target]) => name === "generateMipmap" && target === gl.TEXTURE_2D),
+        "POT 3D texture generates mipmaps");
+    assert.ok(texParams.some(([, target, pname, param]) =>
+        target === gl.TEXTURE_2D && pname === gl.TEXTURE_WRAP_S && param === gl.REPEAT),
+        "POT 3D texture uses REPEAT wrapS");
+    assert.ok(texParams.some(([, target, pname, param]) =>
+        target === gl.TEXTURE_2D && pname === gl.TEXTURE_WRAP_T && param === gl.REPEAT),
+        "POT 3D texture uses REPEAT wrapT");
+
     assert.equal(commands.filter(([name]) => name === "uniformMatrix4fv").length, 2);
     assert.throws(() => renderer.draw(Buffer.from("NXG3")), /相机帧长度无效/);
     const damaged = Buffer.from(first);
@@ -65,6 +125,24 @@ function verifyRenderer(WebGLCanvas, model, first, second) {
     assert.throws(() => renderer.draw(damaged), /相机矩阵无效/);
     assert.throws(() => new WebGLCanvas(canvas, model.subarray(0, model.length - 1), 360, 240, true), /模型包格式无效/);
     renderer.close();
+
+    // Verify WebGL1-safe NPOT texture parameters on non-power-of-two model textures.
+    const npotCommands = [];
+    const npotMock = createGlMock(npotCommands);
+    const npotCanvas = { getContext: () => npotMock.gl };
+    const npotRenderer = new WebGLCanvas(npotCanvas, buildNxm1Model(100, 75), 360, 240, true);
+    const npotTexParams = npotCommands.filter(([name]) => name === "texParameteri");
+    assert.ok(npotTexParams.some(([, , pname, param]) =>
+        pname === npotMock.gl.TEXTURE_MIN_FILTER && param === npotMock.gl.LINEAR),
+        "NPOT textures fall back to LINEAR minification");
+    assert.ok(npotTexParams.some(([, , pname, param]) =>
+        pname === npotMock.gl.TEXTURE_WRAP_S && param === npotMock.gl.CLAMP_TO_EDGE));
+    assert.ok(npotTexParams.some(([, , pname, param]) =>
+        pname === npotMock.gl.TEXTURE_WRAP_T && param === npotMock.gl.CLAMP_TO_EDGE));
+    assert.ok(!npotTexParams.some(([, , pname, param]) =>
+        pname === npotMock.gl.TEXTURE_MIN_FILTER && param === npotMock.gl.LINEAR_MIPMAP_LINEAR),
+        "NPOT textures must not use mipmap minification in WebGL1");
+    npotRenderer.close();
 }
 
 async function platformFrame(name) {
@@ -111,17 +189,29 @@ async function platformFrame(name) {
     const matrix = Buffer.from(game.advance(initial, -1, -1, 0).packet);
     assert.equal(matrix.toString("ascii", 0, 4), "NXC1");
     assert.equal(matrix.length, 68);
-    const rotated = game.advance(initial, 264, 64, 16667);
-    assert.equal(rotated.state, 264 | (64 << 9));
-    const rotatedMatrix = Buffer.from(rotated.packet);
-    assert.notDeepEqual(rotatedMatrix, matrix, "touch changes camera projection");
-    assert.deepEqual(Buffer.from(game.advance(rotated.state, -1, -1, 0).packet), rotatedMatrix,
-        "release preserves the camera");
+    const pressed = game.advance(initial, 264, 64, 16667);
+    const pressedMatrix = Buffer.from(pressed.packet);
+    assert.deepEqual(pressedMatrix, matrix, "pressing at an off-center coordinate does not jump camera");
+    const dragged = game.advance(pressed.state, 300, 96, 16667);
+    const draggedMatrix = Buffer.from(dragged.packet);
+    assert.notDeepEqual(draggedMatrix, matrix, "dragging applies relative camera rotation");
+    const draggedMore = game.advance(dragged.state, 316, 108, 16667);
+    const draggedMoreMatrix = Buffer.from(draggedMore.packet);
+    assert.notDeepEqual(draggedMoreMatrix, draggedMatrix, "continued drag smoothly updates camera");
+    const released = game.advance(draggedMore.state, -1, -1, 0);
+    assert.deepEqual(Buffer.from(released.packet), draggedMoreMatrix,
+        "releasing preserves the camera without snapping back");
+    const repressed = game.advance(released.state, 50, 180, 16667);
+    assert.deepEqual(Buffer.from(repressed.packet), draggedMoreMatrix,
+        "pressing again at another off-center coordinate does not jump camera");
     assert.deepEqual(Buffer.from(game.advance(game.reset(), -1, -1, 0).packet), matrix, "reset restores camera");
     const memory = game.memoryBytes();
-    for (let i = 0; i < 300; i += 1) game.advance(initial, i, 80, 16667);
+    let dragState = initial;
+    for (let i = 0; i < 300; i += 1) {
+        dragState = game.advance(dragState, i % 360, 80 + (i % 40), 16667).state;
+    }
     assert.equal(game.memoryBytes(), memory, "camera updates require no additional Wasm pages");
-    verifyRenderer(WebGLCanvas, model, matrix, rotatedMatrix);
+    verifyRenderer(WebGLCanvas, model, matrix, draggedMoreMatrix);
     console.log(`${name}: GLB=${glb.length} B, model=${model.length} B, Wasm=${wasm.length} B, linear memory=${memory} B`);
     return { glb, model, matrix };
 }

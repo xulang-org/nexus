@@ -53,7 +53,7 @@ fn floor(mesh $&meshes.MeshData3D) int {
     << 0
 }
 
-pub fn nexus_reset() int { << 180 | (120 << 9) }
+pub fn nexus_reset() int { << 0 }
 
 fn png_dimension(data &[]int, offset int) int {
     << (data[offset] << 24) | (data[offset + 1] << 16) | (data[offset + 2] << 8) | data[offset + 3]
@@ -121,9 +121,22 @@ pub fn nexus_load_model(length int) int {
     }
 }
 
+fn clamp_int(value int, lo int, hi int) int {
+    if value < lo { << lo }
+    if value > hi { << hi }
+    << value
+}
+
 fn render(state int) int {
-    yaw := 0.58 + f64((state & 511) - 180) * 0.014
-    pitch := 0.22 + f64(HEIGHT - (state >> 9)) * 0.0024
+    yaw_idx := (state >> 3) & 255
+    pitch_raw := (state >> 11) & 127
+    $pitch_offset := pitch_raw
+    if pitch_raw >= 64 { pitch_offset = pitch_raw - 128 }
+
+    yaw := 0.58 + f64(yaw_idx) * (2.0 * math.pi() / 256.0)
+    raw_pitch := 0.508 + f64(pitch_offset) * 0.03
+    pitch := math.max(-1.45, math.min(1.45, raw_pitch))
+
     $camera := scene.new_camera_3d()
     camera.target = fm.vec3(0.0, 0.65, 0.0)
     orbit := fm.rotation_y(yaw).multiply(fm.rotation_x(-pitch))
@@ -137,8 +150,51 @@ fn render(state int) int {
 }
 
 pub fn nexus_frame(state int, x int, y int, delta_us int) int {
-    $next := state
-    if x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT { next = x | (y << 9) }
+    // Bit 1 resets camera state; negative input falls back to initial state.
+    $cur := state
+    if cur < 0 || (cur & 2) != 0 { cur = 0 }
+
+    was_dragging := (cur & 1) != 0
+    $yaw_idx := (cur >> 3) & 255
+    pitch_raw := (cur >> 11) & 127
+    $pitch_offset := pitch_raw
+    if pitch_raw >= 64 { pitch_offset = pitch_raw - 128 }
+
+    $next := 0
+    if x >= 0 && y >= 0 {
+        cx := clamp_int(x, 0, WIDTH - 1)
+        cy := clamp_int(y, 0, HEIGHT - 1)
+        cur_x_enc := (cx / 3) + 1
+        cur_y_enc := (cy / 4) + 1
+        if was_dragging {
+            prev_x_enc := (cur >> 18) & 127
+            prev_y_enc := (cur >> 25) & 63
+            if prev_x_enc > 0 && prev_y_enc > 0 {
+                dx := cur_x_enc - prev_x_enc
+                dy := cur_y_enc - prev_y_enc
+                yaw_idx = (yaw_idx + dx) & 255
+                pitch_offset = clamp_int(pitch_offset - dy, -64, 31)
+            }
+        }
+        next = 1 | (yaw_idx << 3) | ((pitch_offset & 127) << 11) | (cur_x_enc << 18) | (cur_y_enc << 25)
+    } else {
+        $sub_yaw := 0
+        $has_interacted := 0
+        if was_dragging {
+            has_interacted = 1
+        } else {
+            sub_yaw = (cur >> 18) & 127
+            has_interacted = (cur >> 25) & 1
+        }
+        if has_interacted == 0 && delta_us > 0 {
+            dt_us := clamp_int(delta_us, 0, 100000)
+            total_sub := sub_yaw + (dt_us * 1043) / 1000000
+            yaw_idx = (yaw_idx + (total_sub >> 7)) & 255
+            sub_yaw = total_sub & 127
+        }
+        next = (yaw_idx << 3) | ((pitch_offset & 127) << 11) | (sub_yaw << 18) | (has_interacted << 25)
+    }
+
     << render(next) >>> (err) {
         eprintln(err.msg())
         << -1
