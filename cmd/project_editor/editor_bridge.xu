@@ -1,0 +1,1018 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+resource #"github.com/xulang-org/nexus/resources/scene"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
+#encoding/json
+#errors
+#image/png
+#math
+#net
+#os
+#os/exec
+#path/filepath
+#strconv
+#strings
+#time
+#ui
+#ui/draw
+#ui/layout
+widgets #ui/widgets
+
+pub const EMBED_MSG_READY = 1
+pub const EMBED_MSG_FRAME = 2
+pub const EMBED_MSG_PICK = 3
+pub const EMBED_MSG_ERROR = 4
+pub const EMBED_MSG_CLOSED = 5
+
+const NXF_FRAME_RGBA = 1
+const NXF_PICK_RESULT = 2
+const NXF_READY = 3
+const NXF_ERROR = 4
+
+pub struct EmbedMsg {
+    pub kind int
+    pub seq int
+    pub w int
+    pub h int
+    pub text string
+    pub data string
+}
+
+pub fn empty_embed_msg() EmbedMsg {
+    << EmbedMsg{kind: 0, seq: 0, w: 0, h: 0, text: "", data: ""}
+}
+
+pub struct EmbedBridge {
+    pub active bool
+    pub tmp_dir string
+    pub cmd_ch chan string
+    pub msg_ch chan EmbedMsg
+}
+
+pub fn inactive_embed_bridge() EmbedBridge {
+    << EmbedBridge{
+        active: false,
+        tmp_dir: "",
+        cmd_ch: chan string{cap: 1},
+        msg_ch: chan EmbedMsg{cap: 1}
+    }
+}
+
+fn read_u32_le(s &string, off int) int {
+    b0 := s[off] & 255
+    b1 := s[off + 1] & 255
+    b2 := s[off + 2] & 255
+    b3 := s[off + 3] & 255
+    << b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+fn read_nxf_exact(conn &net.Conn, rem $&string, n int) string {
+    while rem.len < n {
+        chunk := conn.read(65536) >>>
+        if chunk.len == 0 {
+            >> errors.new("embed bridge: EOF from viewport server")
+        }
+        *rem = *rem + chunk
+    }
+    head := (*rem)[0:n] + ""
+    *rem = (*rem)[n:rem.len] + ""
+    << head
+}
+
+fn read_nxf_packet(conn &net.Conn, rem $&string) EmbedMsg {
+    hdr := read_nxf_exact(conn, rem, 16) >>>
+    if hdr[0:4] != "NXF1" {
+        >> errors.new("embed bridge: invalid NXF1 header")
+    }
+    kind := read_u32_le(&hdr, 4)
+    seq := read_u32_le(&hdr, 8)
+    plen := read_u32_le(&hdr, 12)
+    $payload := ""
+    if plen > 0 {
+        payload = read_nxf_exact(conn, rem, plen) >>>
+    }
+    if kind == NXF_READY {
+        $bname := "Metal"
+        jdoc := json.parse_max(&payload, 65536)
+        if jdoc.ok() && jdoc.is_dict(jdoc.root()) {
+            b := sjson_str(&jdoc, jdoc.root(), "backend", "Metal")
+            if b.len > 0 { bname = b }
+        }
+        << EmbedMsg{kind: EMBED_MSG_READY, seq: seq, w: 0, h: 0, text: bname, data: ""}
+    }
+    if kind == NXF_FRAME_RGBA {
+        if payload.len < 8 {
+            >> errors.new("embed bridge: malformed RGBA frame packet")
+        }
+        w := read_u32_le(&payload, 0)
+        h := read_u32_le(&payload, 4)
+        expected := w * h * 4
+        if w <= 0 || h <= 0 || payload.len < 8 + expected {
+            >> errors.new("embed bridge: truncated RGBA pixels")
+        }
+        rgba := payload[8:8 + expected] + ""
+        << EmbedMsg{kind: EMBED_MSG_FRAME, seq: seq, w: w, h: h, text: "", data: rgba}
+    }
+    if kind == NXF_PICK_RESULT {
+        << EmbedMsg{kind: EMBED_MSG_PICK, seq: seq, w: 0, h: 0, text: payload, data: ""}
+    }
+    if kind == NXF_ERROR {
+        $emsg := payload + ""
+        jdoc := json.parse_max(&payload, 65536)
+        if jdoc.ok() && jdoc.is_dict(jdoc.root()) {
+            emsg = sjson_str(&jdoc, jdoc.root(), "error", payload + "")
+        }
+        << EmbedMsg{kind: EMBED_MSG_ERROR, seq: seq, w: 0, h: 0, text: emsg, data: ""}
+    }
+    << EmbedMsg{kind: EMBED_MSG_ERROR, seq: seq, w: 0, h: 0, text: "unknown NXF1 packet kind", data: ""}
+}
+
+fn write_conn_all(conn &net.Conn, text &string) int {
+    $pos := 0
+    while pos < text.len {
+        $end := pos + 32768
+        if end > text.len { end = text.len }
+        chunk := (*text)[pos:end] + ""
+        w := conn.write(&chunk) >>>
+        if w <= 0 {
+            >> errors.new("embed bridge: socket write stalled")
+        }
+        pos = pos + w
+    }
+    << 0
+}
+
+fn accept_and_run_supervisor(
+    ln net.Listener,
+    cmd_ch chan string,
+    msg_ch chan EmbedMsg,
+    viewport_bin string,
+    staged string,
+    addr string
+) int {
+    $l := ln
+    $cmd := exec.command(viewport_bin + "", "--scene", staged + "", "--embed-connect", addr + "")
+    cmd.start() >>> (err) {
+        _ := l.close()
+        >> err
+    }
+    $conn := l.accept() >>> (err) {
+        _ := l.close()
+        _ := cmd.wait()
+        >> err
+    }
+    _ := l.close()
+    _ := conn.set_nodelay(true) >>> (err) {
+        _ := err
+        << 0
+    }
+    $rem := ""
+    ready_pkt := read_nxf_packet(&conn, $&rem) >>> (err) {
+        _ := conn.close()
+        _ := cmd.wait()
+        >> err
+    }
+    msg_ch <- ready_pkt
+
+    while true {
+        line := <- cmd_ch
+        if line == "__QUIT__" {
+            qline := "{\"cmd\":\"quit\"}\n"
+            _ := write_conn_all(&conn, &qline)
+            <-
+        }
+        write_conn_all(&conn, &line) >>> (err) {
+            _ := conn.close()
+            _ := cmd.wait()
+            >> err
+        }
+        while true {
+            pkt := read_nxf_packet(&conn, $&rem) >>> (err) {
+                _ := conn.close()
+                _ := cmd.wait()
+                >> err
+            }
+            is_err := pkt.kind == EMBED_MSG_ERROR
+            msg_ch <- pkt
+            if !is_err { <- }
+        }
+    }
+    _ := conn.close()
+    _ := cmd.wait()
+    << 0
+}
+
+fn embed_supervisor_entry(
+    ln net.Listener,
+    cmd_ch chan string,
+    msg_ch chan EmbedMsg,
+    viewport_bin string,
+    staged string,
+    addr string
+) {
+    _ := accept_and_run_supervisor(ln, cmd_ch, msg_ch, viewport_bin, staged, addr) >>> (err) {
+        msg_ch <- EmbedMsg{kind: EMBED_MSG_CLOSED, seq: 0, w: 0, h: 0, text: err.msg(), data: ""}
+        <<
+    }
+    msg_ch <- EmbedMsg{kind: EMBED_MSG_CLOSED, seq: 0, w: 0, h: 0, text: "embed viewport closed", data: ""}
+}
+
+pub fn start_embed_bridge(
+    viewport_bin string,
+    project &Project,
+    draft_source &string,
+    doc &resource.Document
+) EmbedBridge {
+    if viewport_bin.len == 0 || !path_exists(viewport_bin + "") {
+        << inactive_embed_bridge()
+    }
+    tmp_dir := os.mkdir_temp("", "nexus-embed-vp-") >>> (err) {
+        _ := err
+        << inactive_embed_bridge()
+    }
+    staged := stage_scene(project, doc, draft_source, &tmp_dir) >>> (err) {
+        _ := err
+        try_remove_all(tmp_dir + "")
+        << inactive_embed_bridge()
+    }
+    ln := net.listen_on("tcp", "127.0.0.1:0") >>> (err) {
+        _ := err
+        try_remove_all(tmp_dir + "")
+        << inactive_embed_bridge()
+    }
+    addr := ln.addr()
+    cmd_ch := chan string{cap: 16}
+    msg_ch := chan EmbedMsg{cap: 8}
+    xu embed_supervisor_entry(ln, cmd_ch, msg_ch, viewport_bin + "", staged + "", addr + "")
+    << EmbedBridge{active: true, tmp_dir: tmp_dir + "", cmd_ch: cmd_ch, msg_ch: msg_ch}
+}
+
+pub fn stop_embed_bridge(br $&EmbedBridge) {
+    if br.active {
+        br.cmd_ch <- "__QUIT__"
+        br.active = false
+    }
+    if br.tmp_dir.len > 0 {
+        try_remove_all(br.tmp_dir + "")
+        br.tmp_dir = ""
+    }
+}
+
+fn json_cam_array(vp &Viewport3DState) string {
+    << "[" + fmt_coord(vp.center.x) + "," + fmt_coord(vp.center.y) + "," + fmt_coord(vp.center.z) + "," +
+        fmt_coord(vp.distance) + "," + fmt_coord(vp.yaw) + "," + fmt_coord(vp.pitch) + "," +
+        fmt_coord(vp.ortho_size) + "]"
+}
+
+fn json_bool_lit(v bool) string {
+    if v { << "true" }
+    << "false"
+}
+
+fn clamp_live_scale(v f64) f64 {
+    if math.abs(v) < 0.05 {
+        if v < 0.0 { << -0.05 }
+        << 0.05
+    }
+    if v > 100.0 { << 100.0 }
+    if v < -100.0 { << -100.0 }
+    << v
+}
+
+fn format_live_transform_cmd(ed &Editor, doc &resource.Document, seq int) string {
+    $chosen := map[int]bool{}
+    for i in 0:ed.selected_nodes.len {
+        id := ed.selected_nodes[i]
+        if id > 0 && id < doc.node_count() { chosen[id] = true }
+    }
+    if chosen.len() == 0 && ed.selected_node > 0 && ed.selected_node < doc.node_count() {
+        chosen[ed.selected_node] = true
+    }
+    if chosen.len() == 0 { << "" }
+    $nodes := document_nodes_and_refs(doc) >>> (err) {
+        _ := err
+        << ""
+    }
+    $roots := []int{}
+    for i in 1:nodes.len {
+        if !chosen.has(i) { -> }
+        $has_anc := false
+        $p := nodes[i].parent
+        while p > 0 {
+            if chosen.has(p) {
+                has_anc = true
+                <-
+            }
+            p = nodes[p].parent
+        }
+        if !has_anc && nodes[i].kind == resource.NODE_3D {
+            roots.push(i)
+        }
+    }
+    if roots.len == 0 { << "" }
+    has_rot_scl := ed.vp3d.gizmo_rot_deg.length() > 1e-9 ||
+        math.abs(ed.vp3d.gizmo_scale_mul.x - 1.0) > 1e-6 ||
+        math.abs(ed.vp3d.gizmo_scale_mul.y - 1.0) > 1e-6 ||
+        math.abs(ed.vp3d.gizmo_scale_mul.z - 1.0) > 1e-6
+    has_delta := ed.vp3d.gizmo_delta.length() > 1e-9
+    $out := ""
+    for k in 0:roots.len {
+        sel := roots[k]
+        nd := &nodes[sel]
+        $mat := nd.local_3d
+        if has_rot_scl {
+            $trs := decompose_trs(&nd.local_3d)
+            trs.rotation_deg = trs.rotation_deg.add(ed.vp3d.gizmo_rot_deg)
+            trs.scale = fm.vec3(
+                clamp_live_scale(trs.scale.x * ed.vp3d.gizmo_scale_mul.x),
+                clamp_live_scale(trs.scale.y * ed.vp3d.gizmo_scale_mul.y),
+                clamp_live_scale(trs.scale.z * ed.vp3d.gizmo_scale_mul.z)
+            )
+            mat = compose_trs(&trs)
+        }
+        if has_delta {
+            pw := world_matrix_3d(&nodes, nd.parent)
+            inv_pw := safe_affine_inverse(&pw)
+            w := pw.multiply(mat).c3.xyz()
+            w2 := fm.vec3(w.x + ed.vp3d.gizmo_delta.x, w.y + ed.vp3d.gizmo_delta.y, w.z + ed.vp3d.gizmo_delta.z)
+            l2 := inv_pw.transform(fm.vec4(w2.x, w2.y, w2.z, 1.0)).xyz()
+            mat.c3 = fm.vec4(l2.x, l2.y, l2.z, 1.0)
+        }
+        vals := [
+            fmt_coord(mat.c0.x), fmt_coord(mat.c0.y), fmt_coord(mat.c0.z), fmt_coord(mat.c0.w),
+            fmt_coord(mat.c1.x), fmt_coord(mat.c1.y), fmt_coord(mat.c1.z), fmt_coord(mat.c1.w),
+            fmt_coord(mat.c2.x), fmt_coord(mat.c2.y), fmt_coord(mat.c2.z), fmt_coord(mat.c2.w),
+            fmt_coord(mat.c3.x), fmt_coord(mat.c3.y), fmt_coord(mat.c3.z), fmt_coord(mat.c3.w)
+        ]
+        out = out + "{\"cmd\":\"set_transform\",\"seq\":" + str(seq) + ",\"node\":" + str(sel) +
+            ",\"mat\":[" + strings.join(vals, ",") + "]}\n"
+    }
+    << out
+}
+
+pub fn dispatch_embed_requests(br $&EmbedBridge, ed $&Editor) {
+    if !br.active || !ed.vp3d.connected || ed.vp3d.in_flight { << }
+    is_3d_stage := ed.stage_mode == STAGE_MODE_3D || ed.stage_mode == STAGE_MODE_SPLIT
+    if !is_3d_stage { << }
+    need_load := ed.vp3d.scene_rev_sent != ed.draft.current
+    need_live_xf := !need_load && ed.vp3d.live_gizmo_dirty && ed.vp3d.gizmo_drag_axis > 0 && ed.vp3d.sub_mode == SUB_MODE_OBJ
+    need_pick := ed.vp3d.pending_pick || ed.req_embed_pick
+    need_render := need_load || need_live_xf || ed.req_embed_render || ed.vp3d.dirty_render || !ed.vp3d.has_image
+
+    if !need_load && !need_live_xf && !need_pick && !need_render { << }
+
+    $buf := ""
+    if need_load {
+        doc := ed.draft.document() >>> (err) {
+            _ := err
+            <<
+        }
+        staged := stage_scene(&ed.project, &doc, &ed.draft.source, &br.tmp_dir) >>> (err) {
+            eprintln("embed stage_scene failed: " + err.msg())
+            <<
+        }
+        ed.vp3d.render_seq += 1
+        lseq := ed.vp3d.render_seq
+        buf = buf + "{\"cmd\":\"load\",\"seq\":" + str(lseq) + ",\"scene\":" + json.quote(&staged) + "}\n"
+        ed.vp3d.scene_rev_sent = ed.draft.current + ""
+    } else if need_live_xf {
+        ed.vp3d.live_gizmo_dirty = false
+        doc := ed.draft.document() >>> (err) {
+            _ := err
+            <<
+        }
+        ed.vp3d.render_seq += 1
+        xf_seq := ed.vp3d.render_seq
+        buf = buf + format_live_transform_cmd(ed, &doc, xf_seq)
+    }
+
+    w_raw := int(math.floor(ed.top_view_local.width * 1.5))
+    h_raw := int(math.floor(ed.top_view_local.height * 1.5))
+    $rw := w_raw
+    if rw < 96 { rw = 960 }
+    if rw > 1920 { rw = 1920 }
+    $rh := h_raw
+    if rh < 96 { rh = 640 }
+    if rh > 1200 { rh = 1200 }
+
+    if need_pick {
+        ed.vp3d.pending_pick = false
+        ed.req_embed_pick = false
+        ed.vp3d.render_seq += 1
+        pseq := ed.vp3d.render_seq
+        px := ed.vp3d.pick_x
+        py := ed.vp3d.pick_y
+        sx := px * f64(rw) / math.max(1.0, ed.top_view_local.width)
+        sy := py * f64(rh) / math.max(1.0, ed.top_view_local.height)
+        is_split := ed.stage_mode == STAGE_MODE_SPLIT
+        buf = buf + "{\"cmd\":\"pick\",\"seq\":" + str(pseq) + ",\"w\":" + str(rw) + ",\"h\":" + str(rh) +
+            ",\"x\":" + fmt_coord(sx) + ",\"y\":" + fmt_coord(sy) +
+            ",\"split\":" + json_bool_lit(is_split) + ",\"sel\":" + str(ed.selected_node) +
+            ",\"sub_mode\":" + str(ed.vp3d.sub_mode) + ",\"ortho_axis\":" + str(ed.vp3d.ortho_axis) +
+            ",\"cam\":" + json_cam_array(&ed.vp3d) + "}\n"
+        ed.vp3d.in_flight = true
+        br.cmd_ch <- buf
+        <<
+    }
+
+    ed.req_embed_render = false
+    ed.vp3d.dirty_render = false
+    ed.vp3d.render_seq += 1
+    rseq := ed.vp3d.render_seq
+    is_split := ed.stage_mode == STAGE_MODE_SPLIT
+    $cap_part := ""
+    if ed.vp3d.pending_capture_3d.len > 0 {
+        cap_part = ",\"capture\":" + json.quote(&ed.vp3d.pending_capture_3d)
+        ed.vp3d.pending_capture_done = ed.vp3d.pending_capture_3d + ""
+        ed.vp3d.pending_capture_3d = ""
+    }
+    buf = buf + "{\"cmd\":\"render\",\"seq\":" + str(rseq) + ",\"w\":" + str(rw) + ",\"h\":" + str(rh) +
+        ",\"split\":" + json_bool_lit(is_split) + ",\"grid\":" + json_bool_lit(ed.vp3d.show_grid) +
+        ",\"ortho_axis\":" + str(ed.vp3d.ortho_axis) + ",\"cam\":" + json_cam_array(&ed.vp3d) + cap_part + "}\n"
+    ed.vp3d.in_flight = true
+    br.cmd_ch <- buf
+}
+
+fn sjson_bool(jdoc &json.Doc, obj int, key string, fallback bool) bool {
+    if !jdoc.has(obj, key + "") { << fallback }
+    << jdoc.as_bool(jdoc.get(obj, key + "")) >>> (err) {
+        _ := err
+        << fallback
+    }
+}
+
+pub fn handle_embed_msg(msg &EmbedMsg, ed $&Editor, view $&widgets.View) {
+    if msg.kind == EMBED_MSG_READY {
+        ed.vp3d.connected = true
+        ed.vp3d.backend_name = "Paper " + msg.text
+        ed.vp3d.dirty_render = true
+        ed.req_embed_render = true
+        repaint(view, ed.id_top_view)
+        <<
+    }
+    if msg.kind == EMBED_MSG_FRAME {
+        ed.vp3d.in_flight = false
+        ctx_f := ed.context.clone()
+        vp_ptr := $&ed.vp3d
+        _ := vp_ptr.apply_rgba_frame(&ctx_f, msg.w, msg.h, &msg.data)
+        repaint(view, ed.id_top_view)
+        if ed.vp3d.pending_capture_done.len > 0 {
+            ed.vp3d.pending_capture_done = ""
+        }
+        <<
+    }
+    if msg.kind == EMBED_MSG_PICK {
+        ed.vp3d.in_flight = false
+        additive := ed.vp3d.pick_additive
+        ed.vp3d.pick_additive = false
+        jdoc := json.parse_max(&msg.text, 65536)
+        if jdoc.ok() && jdoc.is_dict(jdoc.root()) {
+            root := jdoc.root()
+            hit := sjson_bool(&jdoc, root, "hit", false)
+            if hit {
+                nid := try_json_int(&jdoc, jdoc.get(root, "node"))
+                smode := try_json_int(&jdoc, jdoc.get(root, "sub_mode"))
+                sidx := try_json_int(&jdoc, jdoc.get(root, "sub_idx"))
+                sv0 := try_json_int(&jdoc, jdoc.get(root, "v0"))
+                sv1 := try_json_int(&jdoc, jdoc.get(root, "v1"))
+                if smode == SUB_MODE_VERT && sidx >= 0 {
+                    ed.vp3d.selected_vert = sidx
+                } else if smode == SUB_MODE_EDGE && sv0 >= 0 && sv1 >= 0 {
+                    ed.vp3d.selected_e0 = sv0
+                    ed.vp3d.selected_e1 = sv1
+                } else if smode == SUB_MODE_FACE && sidx >= 0 {
+                    ed.vp3d.selected_face = sidx
+                } else if nid > 0 {
+                    if additive {
+                        ed.toggle_selection_node(nid)
+                        ed.sync_tree_selection(true)
+                        doc_p := ed.draft.document() >>> (err) {
+                            _ := err
+                            <<
+                        }
+                        ed.sync_inspector(&doc_p)
+                        ed.ensure_context_layout(view)
+                        ed.sync_toolbar_states()
+                        repaint(view, ed.id_left_pane)
+                    } else {
+                        ed.select_scene_node(nid, view)
+                    }
+                }
+                repaint(view, ed.id_top_view)
+                repaint(view, ed.id_right_pane)
+            } else if !additive && ed.vp3d.sub_mode == SUB_MODE_OBJ {
+                if ed.selected_nodes.len > 1 || ed.selected_node > 0 {
+                    ed.select_scene_node(0, view)
+                }
+            }
+        }
+        <<
+    }
+    if msg.kind == EMBED_MSG_ERROR {
+        ed.vp3d.in_flight = false
+        ed.set_status(STATUS_ERR, msg.text + "", view)
+        <<
+    }
+    if msg.kind == EMBED_MSG_CLOSED {
+        ed.vp3d.connected = false
+        ed.vp3d.in_flight = false
+        ed.vp3d.backend_name = "Paper CPU"
+        repaint(view, ed.id_top_view)
+    }
+}
+
+pub struct ScriptRunner {
+    pub active bool
+    pub lines []string
+    pub idx int
+    pub waiting_frame bool
+    pub wait_deadline time.Instant
+}
+
+pub fn load_script_runner(path &string) ScriptRunner {
+    if path.len == 0 {
+        << ScriptRunner{active: false, lines: []string{}, idx: 0, waiting_frame: false, wait_deadline: time.zero_instant()}
+    }
+    raw := os.read(*path + "") >>>
+    parts := strings.split(&raw, "\n")
+    $out := []string{}
+    for p in parts {
+        trm := strings.trim_space(&p)
+        if trm.len > 0 { out.push(trm) }
+    }
+    << ScriptRunner{active: true, lines: out, idx: 0, waiting_frame: false, wait_deadline: time.zero_instant()}
+}
+
+fn sjson_str(jdoc &json.Doc, obj int, key string, fallback string) string {
+    if !jdoc.has(obj, key + "") { << fallback }
+    << jdoc.as_string(jdoc.get(obj, key + "")) >>> (err) {
+        _ := err
+        << fallback
+    }
+}
+
+fn sjson_f64(jdoc &json.Doc, obj int, key string, fallback f64) f64 {
+    if !jdoc.has(obj, key + "") { << fallback }
+    << jdoc.as_f64(jdoc.get(obj, key + "")) >>> (err) {
+        _ := err
+        << fallback
+    }
+}
+
+fn sjson_int(jdoc &json.Doc, obj int, key string, fallback int) int {
+    if !jdoc.has(obj, key + "") { << fallback }
+    << jdoc.as_int(jdoc.get(obj, key + "")) >>> (err) {
+        _ := err
+        << fallback
+    }
+}
+
+fn make_script_input(
+    ed &Editor,
+    kind int,
+    x f64,
+    y f64,
+    button int,
+    buttons int,
+    modifiers int,
+    key int,
+    dy f64
+) ui.InputEvent {
+    << ui.InputEvent{
+        kind: kind,
+        window_id: ed.identity.window_id,
+        canvas_id: ed.identity.canvas_id,
+        generation: ed.identity.generation,
+        x: x,
+        y: y,
+        dx: 0.0,
+        dy: dy,
+        button: button,
+        buttons: buttons,
+        modifiers: modifiers,
+        key: key,
+        scan: 0,
+        repeat: 0,
+        click_count: 1,
+        time_ns: 0
+    }
+}
+
+fn resolve_script_target_id(ed &Editor, target &string) int {
+    t := target + ""
+    if t == "box" { << ed.modeling.button_ids[MB_BOX] }
+    if t == "wedge" { << ed.modeling.button_ids[MB_WEDGE] }
+    if t == "stair" { << ed.modeling.button_ids[MB_STAIR] }
+    if t == "cyl" { << ed.modeling.button_ids[MB_CYL] }
+    if t == "arch" { << ed.modeling.button_ids[MB_ARCH] }
+    if t == "csg" { << ed.modeling.button_ids[MB_CSG] }
+    if t == "obj" { << ed.modeling.button_ids[MB_MODE_OBJ] }
+    if t == "vert" { << ed.modeling.button_ids[MB_MODE_VERT] }
+    if t == "edge" { << ed.modeling.button_ids[MB_MODE_EDGE] }
+    if t == "face" { << ed.modeling.button_ids[MB_MODE_FACE] }
+    if t == "extrude" { << ed.modeling.button_ids[MB_EXTRUDE] }
+    if t == "inset" { << ed.modeling.button_ids[MB_INSET] }
+    if t == "bevel" { << ed.modeling.button_ids[MB_BEVEL] }
+    if t == "uv" { << ed.modeling.button_ids[MB_UV] }
+    if t == "wire" { << ed.modeling.button_ids[MB_WIRE] }
+    if t == "apply_pbr" { << ed.id_apply_btn }
+    if t == "clear_pbr" { << ed.modeling.button_ids[MB_MAT_CLEAR] }
+    if t == "export_glb" { << ed.modeling.button_ids[MB_EXPORT_GLB] }
+    if t == "gizmo_move" { << ed.modeling.button_ids[MB_GIZMO_MOVE] }
+    if t == "gizmo_rot" { << ed.modeling.button_ids[MB_GIZMO_ROT] }
+    if t == "gizmo_scale" { << ed.modeling.button_ids[MB_GIZMO_SCALE] }
+    if t == "sphere" { << ed.modeling.button_ids[MB_SPHERE] }
+    if t == "subdiv" { << ed.modeling.button_ids[MB_SUBDIV] }
+    if t == "flip" { << ed.modeling.button_ids[MB_FLIP] }
+    if t == "del_face" { << ed.modeling.button_ids[MB_DEL_FACE] }
+    if t == "weld" { << ed.modeling.button_ids[MB_WELD] }
+    if t == "csg_add_box" { << ed.modeling.button_ids[MB_CSG_ADD_BOX] }
+    if t == "csg_add_cut" { << ed.modeling.button_ids[MB_CSG_ADD_CUT] }
+    if t == "csg_cycle" { << ed.modeling.button_ids[MB_CSG_CYCLE] }
+    if t == "csg_bake" { << ed.modeling.button_ids[MB_CSG_BAKE] }
+    if t == "preset_0" { << ed.modeling.button_ids[MB_PRESET_0] }
+    if t == "preset_1" { << ed.modeling.button_ids[MB_PRESET_1] }
+    if t == "preset_2" { << ed.modeling.button_ids[MB_PRESET_2] }
+    if t == "preset_3" { << ed.modeling.button_ids[MB_PRESET_3] }
+    if t == "preset_4" { << ed.modeling.button_ids[MB_PRESET_4] }
+    if t == "preset_5" { << ed.modeling.button_ids[MB_PRESET_5] }
+    if t == "preset_6" { << ed.modeling.button_ids[MB_PRESET_6] }
+    if t == "preset_7" { << ed.modeling.button_ids[MB_PRESET_7] }
+    if t == "preset_8" { << ed.modeling.button_ids[MB_PRESET_8] }
+    if t == "preset_9" { << ed.modeling.button_ids[MB_PRESET_9] }
+    if t == "mat_2sided" { << ed.modeling.button_ids[MB_MAT_TWOSIDED] }
+    if t == "3d" || t == "split" || t == "2d" || t == "tile" { << ed.id_stage_tabs }
+    if t == "left_tab_scene" || t == "left_tab_assets" { << ed.id_left_tabs }
+    if t == "insp_tab_transform" || t == "insp_tab_material" || t == "insp_tab_components" { << ed.id_insp_tabs }
+    if t == "axis" { << ed.id_stage_axis_btn }
+    if t == "fit" { << ed.id_fit_btn }
+    if t == "snap" { << ed.id_snap_btn }
+    if t == "save" { << ed.id_save_btn }
+    if t == "undo" { << ed.id_undo_btn }
+    if t == "redo" { << ed.id_redo_btn }
+    if t == "dup" { << ed.id_dup_btn }
+    if t == "del" { << ed.id_del_btn }
+    if t == "top_view" { << ed.id_top_view }
+    << -1
+}
+
+fn resolve_script_target_frac(target &string) f64 {
+    t := target + ""
+    if t == "3d" { << 0.125 }
+    if t == "split" { << 0.375 }
+    if t == "2d" { << 0.625 }
+    if t == "tile" { << 0.875 }
+    if t == "left_tab_scene" { << 0.25 }
+    if t == "left_tab_assets" { << 0.75 }
+    if t == "insp_tab_transform" { << 0.1667 }
+    if t == "insp_tab_material" { << 0.5 }
+    if t == "insp_tab_components" { << 0.8333 }
+    << 0.5
+}
+
+fn parse_script_modifiers(jdoc &json.Doc, obj int) int {
+    $m := sjson_int(jdoc, obj, "modifiers", 0)
+    ms := sjson_str(jdoc, obj, "mod", "")
+    if ms == "shift" { m = m | ui.MOD_SHIFT }
+    else if ms == "ctrl" || ms == "control" { m = m | ui.MOD_CONTROL }
+    else if ms == "alt" { m = m | ui.MOD_ALT }
+    else if ms == "cmd" || ms == "meta" { m = m | ui.MOD_META }
+    else if ms == "cmd_shift" { m = m | ui.MOD_META | ui.MOD_SHIFT }
+    << m
+}
+
+fn parse_script_key(name &string) int {
+    k := name + ""
+    if k == "tab" { << ui.KEY_TAB }
+    if k == "esc" || k == "escape" { << ui.KEY_ESCAPE }
+    if k == "enter" { << ui.KEY_ENTER }
+    if k == "delete" { << ui.KEY_DELETE }
+    if k == "backspace" { << ui.KEY_BACKSPACE }
+    if k == "space" { << 32 }
+    if k.len == 1 {
+        << int(k[0])
+    }
+    << 0
+}
+
+fn script_button_code(btn_name &string) int {
+    b := btn_name + ""
+    if b == "right" { << ui.BUTTON_RIGHT }
+    if b == "middle" { << ui.BUTTON_MIDDLE }
+    << ui.BUTTON_LEFT
+}
+
+fn script_button_mask(btn int) int {
+    if btn == ui.BUTTON_RIGHT { << 2 }
+    if btn == ui.BUTTON_MIDDLE { << 4 }
+    << 1
+}
+
+pub fn step_script_runner(
+    sr $&ScriptRunner,
+    ed $&Editor,
+    view $&widgets.View,
+    now time.Instant
+) int {
+    if !sr.active { << 0 }
+    if sr.waiting_frame {
+        frame_ready := ed.vp3d.connected && !ed.vp3d.in_flight && !ed.req_embed_render && ed.vp3d.scene_rev_sent == ed.draft.current && ed.vp3d.has_image
+        if frame_ready || (!sr.wait_deadline.is_zero() && !now.before(sr.wait_deadline)) {
+            sr.waiting_frame = false
+        } else {
+            << 0
+        }
+    }
+    if sr.idx >= sr.lines.len {
+        ed.close_pending = true
+        sr.active = false
+        << 0
+    }
+    line := sr.lines[sr.idx] + ""
+    sr.idx += 1
+    jdoc := json.parse_max(&line, 1048576)
+    if !jdoc.ok() || !jdoc.is_dict(jdoc.root()) {
+        >> errors.new("script error: invalid JSON line: " + line)
+    }
+    root := jdoc.root()
+    cmd := sjson_str(&jdoc, root, "cmd", "")
+
+    if cmd == "set_stage_mode" {
+        m := sjson_str(&jdoc, root, "mode", "3d")
+        if m == "2d" { ed.set_stage_mode(STAGE_MODE_2D, view) }
+        else if m == "split" { ed.set_stage_mode(STAGE_MODE_SPLIT, view) }
+        else if m == "tilemap" { ed.set_stage_mode(STAGE_MODE_TILEMAP, view) }
+        else { ed.set_stage_mode(STAGE_MODE_3D, view) }
+    } else if cmd == "set_sub_mode" {
+        ed.vp3d.sub_mode = sjson_int(&jdoc, root, "mode", SUB_MODE_OBJ)
+        doc := ed.draft.document() >>>
+        ed.sync_inspector(&doc)
+        ed.repaint_all(view)
+    } else if cmd == "set_ortho_axis" {
+        ed.vp3d.ortho_axis = sjson_int(&jdoc, root, "axis", ORTHO_TOP)
+        ed.vp3d.dirty_render = true
+        ed.req_embed_render = true
+        ed.sync_toolbar_states()
+        ed.repaint_all(view)
+    } else if cmd == "toggle_grid" {
+        ed.vp3d.show_grid = !ed.vp3d.show_grid
+        ed.vp3d.dirty_render = true
+        ed.req_embed_render = true
+    } else if cmd == "toggle_wire" {
+        ed.vp3d.show_wire = !ed.vp3d.show_wire
+        doc := ed.draft.document() >>>
+        ed.sync_inspector(&doc)
+        ed.repaint_all(view)
+    } else if cmd == "fit" {
+        ed.do_fit_active_stage(view)
+    } else if cmd == "spawn_whitebox" {
+        shape := sjson_str(&jdoc, root, "shape", "box")
+        ed.do_spawn_whitebox(shape, view)
+    } else if cmd == "spawn_csg" {
+        ed.do_spawn_csg_cut(view)
+    } else if cmd == "model_op" {
+        op := sjson_str(&jdoc, root, "op", "extrude")
+        amt := sjson_f64(&jdoc, root, "amount", 0.25)
+        val := sjson_f64(&jdoc, root, "val", 0.4)
+        ed.do_mesh_op(op, amt, val, view)
+    } else if cmd == "set_material" {
+        mr := sjson_f64(&jdoc, root, "r", 0.86)
+        mg := sjson_f64(&jdoc, root, "g", 0.84)
+        mb := sjson_f64(&jdoc, root, "b", 0.80)
+        met := sjson_f64(&jdoc, root, "metallic", 0.08)
+        rgh := sjson_f64(&jdoc, root, "roughness", 0.62)
+        set_field_val($&ed.modeling.fields[MF_R], &fmt_coord(mr))
+        set_field_val($&ed.modeling.fields[MF_G], &fmt_coord(mg))
+        set_field_val($&ed.modeling.fields[MF_B], &fmt_coord(mb))
+        set_field_val($&ed.modeling.fields[MF_METALLIC], &fmt_coord(met))
+        set_field_val($&ed.modeling.fields[MF_ROUGHNESS], &fmt_coord(rgh))
+        ed.do_apply_pbr_material(view)
+    } else if cmd == "set_lang" {
+        lg := sjson_str(&jdoc, root, "lang", "en")
+        if lg == "zh" { ed.set_lang(LANG_ZH, view) }
+        else { ed.set_lang(LANG_EN, view) }
+    } else if cmd == "select_node" {
+        nid := sjson_int(&jdoc, root, "index", 0)
+        ed.select_scene_node(nid, view)
+    } else if cmd == "wait_frame" {
+        sr.waiting_frame = true
+        sr.wait_deadline = instant_plus_ms(now, 6000)
+        ed.vp3d.dirty_render = true
+        ed.req_embed_render = true
+    } else if cmd == "capture_ui" {
+        out_path := sjson_str(&jdoc, root, "path", "")
+        if out_path.len > 0 {
+            _ := try_present_frame(view, ed)
+            c := layout.tight(ed.viewport_w, ed.viewport_h) >>>
+            $snap := widgets.snapshot_styled(view, &c, 1.0, ed) >>>
+            px := snap.rgba_bytes() >>>
+            enc := png.encode_rgba_bytes(&px, snap.pixel_width, snap.pixel_height) >>>
+            snapshot.write_atomic(out_path + "", &enc) >>>
+            _ := snap.dispose() >>>
+        }
+    } else if cmd == "capture_3d" {
+        out_path := sjson_str(&jdoc, root, "path", "")
+        if out_path.len > 0 {
+            ed.vp3d.pending_capture_3d = out_path + ""
+            ed.vp3d.dirty_render = true
+            ed.req_embed_render = true
+            sr.waiting_frame = true
+            sr.wait_deadline = instant_plus_ms(now, 6000)
+        }
+    } else if cmd == "save_scene" {
+        if !ed.do_save(view) {
+            >> errors.new("script error: save_scene failed: " + ed.status_text)
+        }
+    } else if cmd == "export_glb" {
+        rel := sjson_str(&jdoc, root, "rel_path", "assets/exported_studio.glb")
+        doc := ed.draft.document() >>>
+        pp := ed.project.path + ""
+        vb := ed.validator_bin + ""
+        _ := export_node_glb_to_project(&doc, ed.selected_node, &pp, rel, &vb) >>>
+    } else if cmd == "undo" {
+        ed.do_undo(view)
+    } else if cmd == "redo" {
+        ed.do_redo(view)
+    } else if cmd == "click_widget" {
+        tgt := sjson_str(&jdoc, root, "target", "")
+        wid := resolve_script_target_id(ed, &tgt)
+        if wid <= 0 { >> errors.new("script error: unknown target widget " + tgt) }
+        _ := try_present_frame(view, ed)
+        wb := view.node_bounds(wid) >>>
+        if wb.width <= 0.0 || wb.height <= 0.0 {
+            >> errors.new("script error: hidden widget " + tgt)
+        }
+        frac := resolve_script_target_frac(&tgt)
+        cx := wb.x + wb.width * frac
+        cy := wb.y + wb.height * 0.5
+        mods := parse_script_modifiers(&jdoc, root)
+        ev_mv := make_script_input(ed, ui.EV_POINTER_MOVE, cx, cy, 0, 0, mods, 0, 0.0)
+        ev_dn := make_script_input(ed, ui.EV_POINTER_DOWN, cx, cy, ui.BUTTON_LEFT, 1, mods, 0, 0.0)
+        ev_up := make_script_input(ed, ui.EV_POINTER_UP, cx, cy, ui.BUTTON_LEFT, 0, mods, 0, 0.0)
+        _ := ed.handle_input_event(&ev_mv, view)
+        _ := ed.handle_input_event(&ev_dn, view)
+        _ := ed.handle_input_event(&ev_up, view)
+    } else if cmd == "drag_canvas" {
+        _ := try_present_frame(view, ed)
+        tv := view.node_bounds(ed.id_top_view) >>>
+        rx0 := sjson_f64(&jdoc, root, "rx0", 0.5)
+        ry0 := sjson_f64(&jdoc, root, "ry0", 0.5)
+        rx1 := sjson_f64(&jdoc, root, "rx1", 0.65)
+        ry1 := sjson_f64(&jdoc, root, "ry1", 0.55)
+        bstr := sjson_str(&jdoc, root, "button", "left")
+        btn := script_button_code(&bstr)
+        mask := script_button_mask(btn)
+        mods := parse_script_modifiers(&jdoc, root)
+        $steps := sjson_int(&jdoc, root, "steps", 6)
+        if steps < 1 { steps = 1 }
+        x0 := tv.x + tv.width * rx0
+        y0 := tv.y + tv.height * ry0
+        x1 := tv.x + tv.width * rx1
+        y1 := tv.y + tv.height * ry1
+        ev_hover := make_script_input(ed, ui.EV_POINTER_MOVE, x0, y0, 0, 0, mods, 0, 0.0)
+        ev_dn := make_script_input(ed, ui.EV_POINTER_DOWN, x0, y0, btn, mask, mods, 0, 0.0)
+        _ := ed.handle_input_event(&ev_hover, view)
+        _ := ed.handle_input_event(&ev_dn, view)
+        for si in 1:steps + 1 {
+            t := f64(si) / f64(steps)
+            px := x0 + (x1 - x0) * t
+            py := y0 + (y1 - y0) * t
+            ev_step := make_script_input(ed, ui.EV_POINTER_MOVE, px, py, 0, mask, mods, 0, 0.0)
+            _ := ed.handle_input_event(&ev_step, view)
+        }
+        ev_up := make_script_input(ed, ui.EV_POINTER_UP, x1, y1, btn, 0, mods, 0, 0.0)
+        _ := ed.handle_input_event(&ev_up, view)
+    } else if cmd == "scroll_canvas" {
+        _ := try_present_frame(view, ed)
+        tv := view.node_bounds(ed.id_top_view) >>>
+        rx := sjson_f64(&jdoc, root, "rx", 0.5)
+        ry := sjson_f64(&jdoc, root, "ry", 0.5)
+        dy := sjson_f64(&jdoc, root, "dy", -3.0)
+        mods := parse_script_modifiers(&jdoc, root)
+        px := tv.x + tv.width * rx
+        py := tv.y + tv.height * ry
+        ev_mv := make_script_input(ed, ui.EV_POINTER_MOVE, px, py, 0, 0, mods, 0, 0.0)
+        ev_sc := make_script_input(ed, ui.EV_POINTER_SCROLL, px, py, 0, 0, mods, 0, dy)
+        _ := ed.handle_input_event(&ev_mv, view)
+        _ := ed.handle_input_event(&ev_sc, view)
+    } else if cmd == "drag_gizmo" {
+        _ := try_present_frame(view, ed)
+        tv := view.node_bounds(ed.id_top_view) >>>
+        doc := ed.draft.document() >>>
+        astr := sjson_str(&jdoc, root, "axis", "x")
+        $ax := 1
+        if astr == "y" { ax = 2 }
+        else if astr == "z" { ax = 3 }
+        delta_px := sjson_f64(&jdoc, root, "delta_px", 72.0)
+        $steps := sjson_int(&jdoc, root, "steps", 6)
+        if steps < 1 { steps = 1 }
+        pts := vp_gizmo_axis_screen(&ed.vp3d, &tv, ed.stage_mode == STAGE_MODE_SPLIT, &doc, ed.selected_node, &ed.selected_nodes, ax)
+        if pts.len != 4 { >> errors.new("script error: gizmo axis not visible: " + astr) }
+        dx := pts[2] - pts[0]
+        dy := pts[3] - pts[1]
+        plen := math.sqrt(dx * dx + dy * dy)
+        if plen < 4.0 { >> errors.new("script error: gizmo axis too short") }
+        ux := dx / plen
+        uy := dy / plen
+        x0 := tv.x + (pts[0] + pts[2]) * 0.5
+        y0 := tv.y + (pts[1] + pts[3]) * 0.5
+        x1 := x0 + ux * delta_px
+        y1 := y0 + uy * delta_px
+        ev_mv := make_script_input(ed, ui.EV_POINTER_MOVE, x0, y0, 0, 0, 0, 0, 0.0)
+        ev_dn := make_script_input(ed, ui.EV_POINTER_DOWN, x0, y0, ui.BUTTON_LEFT, 1, 0, 0, 0.0)
+        _ := ed.handle_input_event(&ev_mv, view)
+        _ := ed.handle_input_event(&ev_dn, view)
+        for si in 1:steps + 1 {
+            t := f64(si) / f64(steps)
+            px := x0 + (x1 - x0) * t
+            py := y0 + (y1 - y0) * t
+            ev_step := make_script_input(ed, ui.EV_POINTER_MOVE, px, py, 0, 1, 0, 0, 0.0)
+            _ := ed.handle_input_event(&ev_step, view)
+        }
+        ev_up := make_script_input(ed, ui.EV_POINTER_UP, x1, y1, ui.BUTTON_LEFT, 0, 0, 0, 0.0)
+        _ := ed.handle_input_event(&ev_up, view)
+    } else if cmd == "key_press" {
+        kstr := sjson_str(&jdoc, root, "key", "")
+        kcode := parse_script_key(&kstr)
+        if kcode <= 0 { >> errors.new("script error: unknown key " + kstr) }
+        mods := parse_script_modifiers(&jdoc, root)
+        ev_dn := make_script_input(ed, ui.EV_KEY_DOWN, 0.0, 0.0, 0, 0, mods, kcode, 0.0)
+        ev_up := make_script_input(ed, ui.EV_KEY_UP, 0.0, 0.0, 0, 0, mods, kcode, 0.0)
+        _ := ed.handle_input_event(&ev_dn, view)
+        _ := ed.handle_input_event(&ev_up, view)
+    } else if cmd == "click_tm_swatch" {
+        _ := try_present_frame(view, ed)
+        tv := view.node_bounds(ed.id_top_view) >>>
+        slot := sjson_int(&jdoc, root, "slot", 1)
+        px := tv.x + tv.width - 154.0 + f64(slot % 3) * 48.0 + 20.0
+        py := tv.y + 100.0 + f64(slot / 3) * 46.0 + 20.0
+        ev_mv := make_script_input(ed, ui.EV_POINTER_MOVE, px, py, 0, 0, 0, 0, 0.0)
+        ev_dn := make_script_input(ed, ui.EV_POINTER_DOWN, px, py, ui.BUTTON_LEFT, 1, 0, 0, 0.0)
+        ev_up := make_script_input(ed, ui.EV_POINTER_UP, px, py, ui.BUTTON_LEFT, 0, 0, 0, 0.0)
+        _ := ed.handle_input_event(&ev_mv, view)
+        _ := ed.handle_input_event(&ev_dn, view)
+        _ := ed.handle_input_event(&ev_up, view)
+    } else if cmd == "click_tm_tool" {
+        _ := try_present_frame(view, ed)
+        tv := view.node_bounds(ed.id_top_view) >>>
+        tname := sjson_str(&jdoc, root, "tool", "brush")
+        $idx := 0
+        if tname == "erase" { idx = 1 }
+        else if tname == "rect" { idx = 5 }
+        else if tname == "fill" { idx = 6 }
+        else if tname == "pick" { idx = 7 }
+        else if tname == "grid" { idx = 8 }
+        x0 := tv.x + tv.width - 154.0
+        $px := x0 + 22.0
+        $py := tv.y + 49.0
+        if idx == 1 { px = x0 + 72.0 }
+        else if idx == 5 { px = x0 + 120.0 }
+        else if idx == 6 {
+            px = x0 + 22.0
+            py = tv.y + 79.0
+        } else if idx == 7 {
+            px = x0 + 72.0
+            py = tv.y + 79.0
+        } else if idx == 8 {
+            px = x0 + 120.0
+            py = tv.y + 79.0
+        }
+        ev_mv := make_script_input(ed, ui.EV_POINTER_MOVE, px, py, 0, 0, 0, 0, 0.0)
+        ev_dn := make_script_input(ed, ui.EV_POINTER_DOWN, px, py, ui.BUTTON_LEFT, 1, 0, 0, 0.0)
+        ev_up := make_script_input(ed, ui.EV_POINTER_UP, px, py, ui.BUTTON_LEFT, 0, 0, 0, 0.0)
+        _ := ed.handle_input_event(&ev_mv, view)
+        _ := ed.handle_input_event(&ev_dn, view)
+        _ := ed.handle_input_event(&ev_up, view)
+    } else if cmd == "click_triad" {
+        _ := try_present_frame(view, ed)
+        tv := view.node_bounds(ed.id_top_view) >>>
+        aname := sjson_str(&jdoc, root, "axis", "iso")
+        panes := vp_compute_panes(&ed.top_view_local, ed.stage_mode == STAGE_MODE_SPLIT)
+        cx := tv.x + panes[0].x + panes[0].w - 34.0
+        cy := tv.y + 36.0
+        $px := cx
+        $py := cy
+        if aname != "iso" {
+            cam := vp_persp_camera(&ed.vp3d, panes[0])
+            $v := fm.vec3(cam.right.x, cam.up.x, cam.forward.x)
+            if aname == "y" { v = fm.vec3(cam.right.y, cam.up.y, cam.forward.y) }
+            else if aname == "z" { v = fm.vec3(cam.right.z, cam.up.z, cam.forward.z) }
+            px = cx + v.x * 16.5
+            py = cy - v.y * 16.5
+        }
+        ev_mv := make_script_input(ed, ui.EV_POINTER_MOVE, px, py, 0, 0, 0, 0, 0.0)
+        ev_dn := make_script_input(ed, ui.EV_POINTER_DOWN, px, py, ui.BUTTON_LEFT, 1, 0, 0, 0.0)
+        ev_up := make_script_input(ed, ui.EV_POINTER_UP, px, py, ui.BUTTON_LEFT, 0, 0, 0, 0.0)
+        _ := ed.handle_input_event(&ev_mv, view)
+        _ := ed.handle_input_event(&ev_dn, view)
+        _ := ed.handle_input_event(&ev_up, view)
+    } else if cmd == "quit" {
+        ed.close_pending = true
+        sr.active = false
+    } else {
+        >> errors.new("script error: unknown command " + cmd)
+    }
+    << 0
+}

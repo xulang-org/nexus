@@ -1,0 +1,1116 @@
+@main
+
+fm #"github.com/xulang-org/nexus/foundation/math"
+gltf #"github.com/xulang-org/nexus/formats/gltf"
+rm #"github.com/xulang-org/nexus/resources/modeling"
+resource #"github.com/xulang-org/nexus/resources/scene"
+mod #"github.com/xulang-org/nexus/modeling"
+#errors
+#math
+#strings
+
+pub struct NodeModelingInfo {
+    pub has_editable bool
+    pub has_csg bool
+    pub brush_count int
+    pub verts int
+    pub edges int
+    pub faces int
+    pub tris int
+    pub has_mat bool
+    pub mat rm.MaterialAsset
+}
+
+pub fn default_studio_material() rm.MaterialAsset {
+    $m := rm.default_material_asset("Whitebox")
+    // Warm matte clay tuned for the Paper studio backdrop
+    m.base_color = fm.vec3(0.86, 0.84, 0.80)
+    m.metallic = 0.08
+    m.roughness = 0.62
+    << m
+}
+
+pub fn clone_material_asset(m &rm.MaterialAsset) rm.MaterialAsset {
+    << rm.MaterialAsset{
+        name: m.name + "",
+        base_color: m.base_color, alpha: m.alpha, metallic: m.metallic, roughness: m.roughness,
+        emission: m.emission, normal_scale: m.normal_scale, occlusion_strength: m.occlusion_strength,
+        alpha_mode: m.alpha_mode, alpha_cutoff: m.alpha_cutoff, double_sided: m.double_sided,
+        clearcoat: m.clearcoat, clearcoat_roughness: m.clearcoat_roughness,
+        sheen_color: m.sheen_color, sheen_roughness: m.sheen_roughness, ior: m.ior,
+        base_texture_uid: m.base_texture_uid + "", orm_texture_uid: m.orm_texture_uid + "",
+        normal_texture_uid: m.normal_texture_uid + "", emission_texture_uid: m.emission_texture_uid + "",
+        occlusion_texture_uid: m.occlusion_texture_uid + "",
+        uv_offset: m.uv_offset, uv_scale: m.uv_scale, flip_u: m.flip_u, flip_v: m.flip_v
+    }
+}
+
+pub fn cur_envs(doc &resource.Document) []resource.EnvironmentAttachment {
+    $out := []resource.EnvironmentAttachment{}
+    for i in 0:doc.environment_count() {
+        item := doc.environment(i) >>>
+        out.push(item)
+    }
+    << out
+}
+
+pub fn cur_bodies(doc &resource.Document) []resource.RigidBody3DAttachment {
+    $out := []resource.RigidBody3DAttachment{}
+    for i in 0:doc.rigid_body_3d_count() {
+        item := doc.rigid_body_3d(i) >>>
+        out.push(item)
+    }
+    << out
+}
+
+pub fn cur_joints(doc &resource.Document) []resource.Joint3DAttachment {
+    $out := []resource.Joint3DAttachment{}
+    for i in 0:doc.joint_3d_count() {
+        item := doc.joint_3d(i) >>>
+        out.push(item)
+    }
+    << out
+}
+
+pub fn cur_terrains(doc &resource.Document) []resource.TerrainAttachment {
+    $out := []resource.TerrainAttachment{}
+    for i in 0:doc.terrain_count() {
+        item := doc.terrain(i) >>>
+        out.push(item)
+    }
+    << out
+}
+
+pub fn cur_particles(doc &resource.Document) []resource.ParticleEmitter3DAttachment {
+    $out := []resource.ParticleEmitter3DAttachment{}
+    for i in 0:doc.particle_emitter_3d_count() {
+        item := doc.particle_emitter_3d(i) >>>
+        out.push(item)
+    }
+    << out
+}
+
+pub fn cur_prefabs(doc &resource.Document) []resource.PrefabInstanceAttachment {
+    $out := []resource.PrefabInstanceAttachment{}
+    for i in 0:doc.prefab_instance_count() {
+        pf := doc.prefab_instance(i) >>>
+        out.push(clone_prefab_instance(&pf, pf.node))
+    }
+    << out
+}
+
+pub fn copy_modeling_attachments(src &resource.Document, dst &resource.Document) resource.Document {
+    $ems := []resource.EditableMeshAttachment{}
+    for i in 0:src.editable_mesh_count() {
+        em := src.editable_mesh(i) >>>
+        if em.node >= 0 && em.node < dst.node_count() {
+            ems.push(~em)
+        }
+    }
+    $csgs := []resource.CsgTreeAttachment{}
+    for i in 0:src.csg_tree_count() {
+        cs := src.csg_tree(i) >>>
+        if cs.node >= 0 && cs.node < dst.node_count() {
+            csgs.push(~cs)
+        }
+    }
+    $mats := []resource.MaterialOverrideAttachment{}
+    for i in 0:src.material_override_count() {
+        mo := src.material_override(i) >>>
+        if mo.node >= 0 && mo.node < dst.node_count() {
+            mats.push(~mo)
+        }
+    }
+    << resource.with_modeling_attachments(dst, ems, csgs, mats) >>>
+}
+
+pub fn node_has_editable_mesh(doc &resource.Document, node_idx int) bool {
+    for i in 0:doc.editable_mesh_count() {
+        if (doc.editable_mesh(i) >>> (err) { << false }).node == node_idx { << true }
+    }
+    << false
+}
+
+pub fn node_has_csg_tree(doc &resource.Document, node_idx int) bool {
+    for i in 0:doc.csg_tree_count() {
+        if (doc.csg_tree(i) >>> (err) { << false }).node == node_idx { << true }
+    }
+    << false
+}
+
+pub fn find_node_material_override(doc &resource.Document, node_idx int, slot int) rm.MaterialAsset {
+    for i in 0:doc.material_override_count() {
+        mo := doc.material_override(i) >>> (err) {
+            _ := err
+            << default_studio_material()
+        }
+        if mo.node == node_idx && mo.slot == slot {
+            << clone_material_asset(&mo.material)
+        }
+    }
+    << default_studio_material()
+}
+
+pub fn node_has_material_override(doc &resource.Document, node_idx int, slot int) bool {
+    for i in 0:doc.material_override_count() {
+        mo := doc.material_override(i) >>> (err) {
+            _ := err
+            << false
+        }
+        if mo.node == node_idx && mo.slot == slot { << true }
+    }
+    << false
+}
+
+pub fn extract_node_editable_mesh(doc &resource.Document, node_idx int) []rm.EditableMesh {
+    for i in 0:doc.editable_mesh_count() {
+        att := doc.editable_mesh(i) >>> (err) {
+            _ := err
+            << []rm.EditableMesh{}
+        }
+        if att.node == node_idx {
+            << [att.mesh.clone()]
+        }
+    }
+    for i in 0:doc.csg_tree_count() {
+        att := doc.csg_tree(i) >>> (err) {
+            _ := err
+            << []rm.EditableMesh{}
+        }
+        if att.node == node_idx {
+            mesh := mod.evaluate_csg_tree("Csg_" + str(node_idx), &att.tree) >>> (err) {
+                _ := err
+                << []rm.EditableMesh{}
+            }
+            << [mesh]
+        }
+    }
+    << []rm.EditableMesh{}
+}
+
+pub fn inspect_node_modeling(doc &resource.Document, node_idx int) NodeModelingInfo {
+    $info := NodeModelingInfo{
+        has_editable: false,
+        has_csg: false,
+        brush_count: 0,
+        verts: 0,
+        edges: 0,
+        faces: 0,
+        tris: 0,
+        has_mat: node_has_material_override(doc, node_idx, 0),
+        mat: find_node_material_override(doc, node_idx, 0)
+    }
+    if node_idx < 0 || node_idx >= doc.node_count() { << info }
+    $meshes := extract_node_editable_mesh(doc, node_idx)
+    info.has_editable = node_has_editable_mesh(doc, node_idx)
+    for i in 0:doc.csg_tree_count() {
+        cs := doc.csg_tree(i) >>> (err) {
+            _ := err
+            << info
+        }
+        if cs.node == node_idx {
+            info.has_csg = true
+            info.brush_count = cs.tree.brushes.len
+            <-
+        }
+    }
+    if meshes.len > 0 {
+        m := &meshes[0]
+        edges := m.build_edges()
+        info.verts = m.vertices.len
+        info.edges = edges.len
+        info.faces = m.faces.len
+        $tris := 0
+        for fi in 0:m.faces.len {
+            c := m.faces[fi].corners.len
+            if c >= 3 { tris = tris + (c - 2) }
+        }
+        info.tris = tris
+    }
+    << info
+}
+
+fn build_hollow_csg_tree(size fm.Vec3, hole fm.Vec3) rm.CsgTree {
+    $t := rm.new_csg_tree()
+    $b0 := rm.default_csg_brush(1, rm.CSG_SHAPE_BOX, rm.CSG_OP_UNION)
+    b0.size = size
+    $b1 := rm.default_csg_brush(2, rm.CSG_SHAPE_BOX, rm.CSG_OP_SUBTRACT)
+    b1.size = hole
+    t.brushes.push(b0)
+    t.brushes.push(b1)
+    << t
+}
+
+fn build_whitebox_mesh(shape string, size fm.Vec3) rm.EditableMesh {
+    if shape == "wedge" { << mod.wedge_editable(size, 4294967295, 0) >>> }
+    if shape == "stair" { << mod.stair_editable(size, 6, 4294967295, 0) >>> }
+    if shape == "cylinder" {
+        r := math.min(size.x, size.z) * 0.5
+        << mod.cylinder_editable(r, r, size.y, 20, 4294967295, 0) >>>
+    }
+    if shape == "arch" {
+        thick := math.min(size.x * 0.25, 0.4)
+        << mod.arch_editable(size, thick, 12, 4294967295, 0) >>>
+    }
+    if shape == "sphere" {
+        rad := math.min(size.x, math.min(size.y, size.z)) * 0.5
+        << mod.sphere_editable(rad, 20, 12, 4294967295, 0) >>>
+    }
+    if shape == "cone" {
+        r := math.min(size.x, size.z) * 0.5
+        << mod.cone_editable(r, size.y, 20, 4294967295, 0) >>>
+    }
+    if shape == "capsule" {
+        r := math.min(size.x, size.z) * 0.31
+        ch := math.max(0.25, size.y - r * 2.0)
+        << mod.capsule_editable(r, ch, 20, 8, 4294967295, 0) >>>
+    }
+    if shape == "torus" {
+        r := math.min(size.x, size.z) * 0.5
+        << mod.torus_editable(r * 0.72, r * 0.28, 24, 14, 4294967295, 0) >>>
+    }
+    if shape == "pyramid" {
+        << mod.pyramid_editable(size, 4294967295, 0) >>>
+    }
+    if shape == "hex_prism" {
+        r := math.min(size.x, size.z) * 0.5
+        << mod.prism_editable(r, size.y, 6, 4294967295, 0) >>>
+    }
+    if shape == "tube" {
+        r := math.min(size.x, size.z) * 0.5
+        << mod.tube_editable(r, r * 0.60, size.y, 20, 4294967295, 0) >>>
+    }
+    if shape == "dome" {
+        r := math.min(size.x, math.min(size.y, size.z)) * 0.5
+        << mod.dome_editable(r, 20, 8, 4294967295, 0) >>>
+    }
+    if shape == "plane" {
+        << mod.plane_editable(size.x * 2.5, size.z * 2.5, 4, 4, 4294967295, 0) >>>
+    }
+    << mod.box_editable(size, 4294967295, 0) >>>
+}
+
+fn shape_display_label(shape string) string {
+    if shape == "wedge" { << "Wedge" }
+    if shape == "stair" { << "Stair" }
+    if shape == "cylinder" { << "Cylinder" }
+    if shape == "arch" { << "Arch" }
+    if shape == "sphere" { << "Sphere" }
+    if shape == "cone" { << "Cone" }
+    if shape == "capsule" { << "Capsule" }
+    if shape == "torus" { << "Torus" }
+    if shape == "pyramid" { << "Pyramid" }
+    if shape == "hex_prism" { << "HexPrism" }
+    if shape == "tube" { << "Tube" }
+    if shape == "dome" { << "Dome" }
+    if shape == "plane" { << "Plane" }
+    if shape == "csg_cut" { << "CSG Cut" }
+    << "Box"
+}
+
+fn replace_node_editable_in_doc(
+    doc &resource.Document,
+    node_idx int,
+    mesh rm.EditableMesh,
+    clear_csg bool
+) resource.Document {
+    $ems := []resource.EditableMeshAttachment{}
+    for i in 0:doc.editable_mesh_count() {
+        em := doc.editable_mesh(i) >>>
+        if em.node != node_idx { ems.push(~em) }
+    }
+    ems.push(resource.editable_mesh_attachment(node_idx, mesh))
+
+    $csgs := []resource.CsgTreeAttachment{}
+    for i in 0:doc.csg_tree_count() {
+        cs := doc.csg_tree(i) >>>
+        if !clear_csg || cs.node != node_idx { csgs.push(~cs) }
+    }
+    $mats := []resource.MaterialOverrideAttachment{}
+    for i in 0:doc.material_override_count() {
+        mo := doc.material_override(i) >>>
+        mats.push(~mo)
+    }
+    << resource.with_modeling_attachments(doc, ems, csgs, mats) >>>
+}
+
+fn replace_node_csg_in_doc(
+    doc &resource.Document,
+    node_idx int,
+    tree rm.CsgTree
+) resource.Document {
+    $ems := []resource.EditableMeshAttachment{}
+    for i in 0:doc.editable_mesh_count() {
+        em := doc.editable_mesh(i) >>>
+        if em.node != node_idx { ems.push(~em) }
+    }
+    $csgs := []resource.CsgTreeAttachment{}
+    for i in 0:doc.csg_tree_count() {
+        cs := doc.csg_tree(i) >>>
+        if cs.node != node_idx { csgs.push(~cs) }
+    }
+    csgs.push(resource.csg_tree_attachment(node_idx, tree))
+    $mats := []resource.MaterialOverrideAttachment{}
+    for i in 0:doc.material_override_count() {
+        mo := doc.material_override(i) >>>
+        mats.push(~mo)
+    }
+    << resource.with_modeling_attachments(doc, ems, csgs, mats) >>>
+}
+
+fn replace_node_mat_in_doc(
+    doc &resource.Document,
+    node_idx int,
+    slot int,
+    mat rm.MaterialAsset,
+    remove_only bool
+) resource.Document {
+    $ems := []resource.EditableMeshAttachment{}
+    for i in 0:doc.editable_mesh_count() {
+        em := doc.editable_mesh(i) >>>
+        ems.push(~em)
+    }
+    $csgs := []resource.CsgTreeAttachment{}
+    for i in 0:doc.csg_tree_count() {
+        cs := doc.csg_tree(i) >>>
+        csgs.push(~cs)
+    }
+    $mats := []resource.MaterialOverrideAttachment{}
+    for i in 0:doc.material_override_count() {
+        mo := doc.material_override(i) >>>
+        if mo.node != node_idx || mo.slot != slot { mats.push(~mo) }
+    }
+    if !remove_only {
+        mats.push(resource.material_override_attachment(node_idx, slot, clone_material_asset(&mat)))
+    }
+    << resource.with_modeling_attachments(doc, ems, csgs, mats) >>>
+}
+
+fn replace_nodes_mat_in_doc(
+    doc &resource.Document,
+    node_indices &[]int,
+    slot int,
+    mat rm.MaterialAsset,
+    remove_only bool
+) resource.Document {
+    $targets := map[int]bool{}
+    $order := []int{}
+    for i in 0:node_indices.len {
+        nid := node_indices[i]
+        if nid >= 0 && nid < doc.node_count() && !targets.has(nid) {
+            targets[nid] = true
+            order.push(nid)
+        }
+    }
+    $ems := []resource.EditableMeshAttachment{}
+    for i in 0:doc.editable_mesh_count() {
+        em := doc.editable_mesh(i) >>>
+        ems.push(~em)
+    }
+    $csgs := []resource.CsgTreeAttachment{}
+    for i in 0:doc.csg_tree_count() {
+        cs := doc.csg_tree(i) >>>
+        csgs.push(~cs)
+    }
+    $mats := []resource.MaterialOverrideAttachment{}
+    for i in 0:doc.material_override_count() {
+        mo := doc.material_override(i) >>>
+        if !targets.has(mo.node) || mo.slot != slot { mats.push(~mo) }
+    }
+    if !remove_only {
+        for i in 0:order.len {
+            mats.push(resource.material_override_attachment(order[i], slot, clone_material_asset(&mat)))
+        }
+    }
+    << resource.with_modeling_attachments(doc, ems, csgs, mats) >>>
+}
+
+fn choose_clear_spawn_pos_near(doc &resource.Document, size_y f64, ax f64, az f64, snap_step f64) fm.Vec3 {
+    cands := [
+        fm.vec2(0.0, 0.0), fm.vec2(2.4, 0.0), fm.vec2(-2.4, 0.0),
+        fm.vec2(0.0, 2.4), fm.vec2(0.0, -2.4),
+        fm.vec2(2.4, 2.4), fm.vec2(-2.4, 2.4), fm.vec2(2.4, -2.4), fm.vec2(-2.4, -2.4),
+        fm.vec2(4.8, 0.0), fm.vec2(-4.8, 0.0)
+    ]
+    $bx := ax
+    $bz := az
+    if snap_step > 0.0 {
+        bx = math.round(bx / snap_step) * snap_step
+        bz = math.round(bz / snap_step) * snap_step
+    }
+    $occ_x := []f64{}
+    $occ_z := []f64{}
+    for i in 1:doc.node_count() {
+        nd := doc.describe_node(i) >>> (err) {
+            _ := err
+            << fm.vec3(bx, size_y * 0.5, bz)
+        }
+        if nd.kind == resource.NODE_3D {
+            occ_x.push(nd.local_3d.c3.x)
+            occ_z.push(nd.local_3d.c3.z)
+        }
+    }
+    for c in cands {
+        $cx := bx + c.x
+        $cz := bz + c.y
+        if snap_step > 0.0 {
+            cx = math.round(cx / snap_step) * snap_step
+            cz = math.round(cz / snap_step) * snap_step
+        }
+        $busy := false
+        for k in 0:occ_x.len {
+            dx := occ_x[k] - cx
+            dz := occ_z[k] - cz
+            if dx * dx + dz * dz < 1.8 {
+                busy = true
+                <-
+            }
+        }
+        if !busy { << fm.vec3(cx, size_y * 0.5, cz) }
+    }
+    << fm.vec3(bx, size_y * 0.5, bz)
+}
+
+fn choose_clear_spawn_pos(doc &resource.Document, size_y f64) fm.Vec3 {
+    << choose_clear_spawn_pos_near(doc, size_y, 0.0, 0.0, 0.0)
+}
+
+pub fn (draft $&Draft) spawn_whitebox_node_near(parent_idx int, shape string, size fm.Vec3, ax f64, az f64, snap_step f64) int {
+    doc := draft.document() >>>
+    $p := parent_idx
+    if p < 0 || p >= doc.node_count() { p = 0 }
+    if doc.node_count() >= resource.MAX_NODES {
+        >> errors.new("nexus editor: scene node limit reached")
+    }
+    mesh := build_whitebox_mesh(shape + "", size) >>>
+    $spawn_h := size.y
+    if shape == "plane" { spawn_h = 0.04 }
+    pos := choose_clear_spawn_pos_near(&doc, spawn_h, ax, az, snap_step)
+    $nodes := document_nodes_and_refs(&doc) >>>
+    $children := children_table(&nodes)
+    label := unique_sibling_name(&nodes, &children, p, shape_display_label(shape + "")) >>>
+    $nd := resource.node(p, label, resource.NODE_3D)
+    nd.local_3d = fm.identity_3d()
+    nd.local_3d.c3 = fm.vec4(pos.x, pos.y, pos.z, 1.0)
+    new_raw := nodes.len
+    nodes.push(nd)
+    children.push([]int{})
+    children[p].push(new_raw)
+
+    $remap := []int{}
+    rebuilt := rebuild_from_children(
+        &doc,
+        nodes,
+        children,
+        []resource.ResourceReference{},
+        []resource.Surface{},
+        []resource.AudioEmitter{},
+        []resource.ScriptAttachment{},
+        []resource.ScriptConnection{},
+        []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
+        $&remap
+    ) >>>
+    new_idx := remap[new_raw]
+    with_mesh := replace_node_editable_in_doc(&rebuilt, new_idx, mesh, true) >>>
+    $init_mat := default_studio_material()
+    if shape == "plane" { init_mat.double_sided = true }
+    next := replace_node_mat_in_doc(&with_mesh, new_idx, 0, init_mat, false) >>>
+    draft.replace(&next) >>>
+    << new_idx
+}
+
+pub fn (draft $&Draft) spawn_whitebox_node(parent_idx int, shape string, size fm.Vec3) int {
+    << draft.spawn_whitebox_node_near(parent_idx, shape + "", size, 0.0, 0.0, 0.0) >>>
+}
+
+pub fn (draft $&Draft) spawn_csg_hollow_node_near(parent_idx int, size fm.Vec3, hole fm.Vec3, ax f64, az f64, snap_step f64) int {
+    doc := draft.document() >>>
+    $p := parent_idx
+    if p < 0 || p >= doc.node_count() { p = 0 }
+    if doc.node_count() >= resource.MAX_NODES {
+        >> errors.new("nexus editor: scene node limit reached")
+    }
+    tree := build_hollow_csg_tree(size, hole)
+    _ := mod.evaluate_csg_tree("StudioCsgHollow", &tree) >>>
+    pos := choose_clear_spawn_pos_near(&doc, size.y, ax, az, snap_step)
+    $nodes := document_nodes_and_refs(&doc) >>>
+    $children := children_table(&nodes)
+    label := unique_sibling_name(&nodes, &children, p, "CSG Cut") >>>
+    $nd := resource.node(p, label, resource.NODE_3D)
+    nd.local_3d = fm.identity_3d()
+    nd.local_3d.c3 = fm.vec4(pos.x, pos.y, pos.z, 1.0)
+    new_raw := nodes.len
+    nodes.push(nd)
+    children.push([]int{})
+    children[p].push(new_raw)
+
+    $remap := []int{}
+    rebuilt := rebuild_from_children(
+        &doc,
+        nodes,
+        children,
+        []resource.ResourceReference{},
+        []resource.Surface{},
+        []resource.AudioEmitter{},
+        []resource.ScriptAttachment{},
+        []resource.ScriptConnection{},
+        []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
+        $&remap
+    ) >>>
+    new_idx := remap[new_raw]
+    with_csg := replace_node_csg_in_doc(&rebuilt, new_idx, tree) >>>
+    next := replace_node_mat_in_doc(&with_csg, new_idx, 0, default_studio_material(), false) >>>
+    draft.replace(&next) >>>
+    << new_idx
+}
+
+pub fn (draft $&Draft) spawn_csg_hollow_node(parent_idx int, size fm.Vec3, hole fm.Vec3) int {
+    << draft.spawn_csg_hollow_node_near(parent_idx, size, hole, 0.0, 0.0, 0.0) >>>
+}
+
+pub fn (draft $&Draft) apply_mesh_op(
+    node_idx int,
+    op string,
+    sub_face int,
+    sub_e0 int,
+    sub_e1 int,
+    amount f64,
+    val f64
+) int {
+    doc := draft.document() >>>
+    if node_idx < 0 || node_idx >= doc.node_count() {
+        >> errors.new("nexus editor: select a whitebox / CSG node first")
+    }
+    $found := extract_node_editable_mesh(&doc, node_idx)
+    if found.len == 0 {
+        >> errors.new("nexus editor: selected node has no EditableMesh or CSG brush")
+    }
+    $mesh := found[0].clone()
+    if op == "extrude" {
+        $f := sub_face
+        if f < 0 || f >= mesh.faces.len { f = 0 }
+        if mesh.faces.len == 0 { >> errors.new("nexus editor: mesh has no faces") }
+        _ := mod.extrude_faces($&mesh, &[f], val) >>>
+    } else if op == "inset" {
+        $f := sub_face
+        if f < 0 || f >= mesh.faces.len { f = 0 }
+        if mesh.faces.len == 0 { >> errors.new("nexus editor: mesh has no faces") }
+        _ := mod.inset_faces($&mesh, &[f], amount, val) >>>
+    } else if op == "bevel" {
+        $e0 := sub_e0
+        $e1 := sub_e1
+        if e0 < 0 || e1 < 0 || e0 == e1 || e0 >= mesh.vertices.len || e1 >= mesh.vertices.len {
+            edges := mesh.build_edges()
+            $ok := false
+            for e in edges {
+                if e.faces.len == 2 {
+                    e0 = e.v0
+                    e1 = e.v1
+                    ok = true
+                    <-
+                }
+            }
+            if !ok && edges.len > 0 {
+                e0 = edges[0].v0
+                e1 = edges[0].v1
+                ok = true
+            }
+            if !ok { >> errors.new("nexus editor: mesh has no edges to bevel") }
+        }
+        _ := mod.bevel_edges($&mesh, &[e0], &[e1], val) >>>
+    } else if op == "box_uv" {
+        mod.project_uv_box_all($&mesh, val) >>>
+    } else if op == "flip_normals" {
+        $all := []int{}
+        for fi in 0:mesh.faces.len { all.push(fi) }
+        mod.flip_face_normals($&mesh, &all) >>>
+    } else if op == "subdivide" {
+        $f := sub_face
+        if f < 0 || f >= mesh.faces.len { f = 0 }
+        if mesh.faces.len == 0 { >> errors.new("nexus editor: mesh has no faces") }
+        _ := mod.subdivide_faces($&mesh, &[f]) >>>
+    } else if op == "delete_face" {
+        $f := sub_face
+        if f < 0 || f >= mesh.faces.len { f = 0 }
+        if mesh.faces.len <= 1 { >> errors.new("nexus editor: cannot delete the last face") }
+        _ := mod.delete_faces($&mesh, &[f]) >>>
+    } else if op == "weld" {
+        $all_v := []int{}
+        for vi in 0:mesh.vertices.len { all_v.push(vi) }
+        $thresh := amount
+        if thresh <= 0.0 { thresh = 0.02 }
+        _ := mod.merge_vertices($&mesh, &all_v, thresh) >>>
+    } else {
+        >> errors.new("nexus editor: unknown mesh op " + op)
+    }
+    mesh.validate() >>>
+    next := replace_node_editable_in_doc(&doc, node_idx, mesh, true) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) translate_sub_element(
+    node_idx int,
+    sub_mode int,
+    sub_vert int,
+    sub_e0 int,
+    sub_e1 int,
+    sub_face int,
+    world_delta fm.Vec3
+) int {
+    if !world_delta.is_finite() { >> errors.new("nexus editor: sub-element delta must be finite") }
+    if world_delta.length() <= 1e-9 { << 0 }
+    doc := draft.document() >>>
+    if node_idx <= 0 || node_idx >= doc.node_count() {
+        >> errors.new("nexus editor: select a whitebox / CSG node first")
+    }
+    found := extract_node_editable_mesh(&doc, node_idx)
+    if found.len == 0 {
+        >> errors.new("nexus editor: selected node has no EditableMesh")
+    }
+    $mesh := found[0].clone()
+    world := node_world_matrix_3d(&doc, node_idx)
+    inv_w := safe_affine_inverse(&world)
+    local_d := inv_w.transform(fm.vec4(world_delta.x, world_delta.y, world_delta.z, 0.0)).xyz()
+    if sub_mode == SUB_MODE_VERT {
+        if sub_vert < 0 || sub_vert >= mesh.vertices.len {
+            >> errors.new("nexus editor: selected vertex out of range")
+        }
+        mod.translate_vertices($&mesh, &[sub_vert], local_d) >>>
+    } else if sub_mode == SUB_MODE_EDGE {
+        if sub_e0 < 0 || sub_e1 < 0 || sub_e0 >= mesh.vertices.len || sub_e1 >= mesh.vertices.len {
+            >> errors.new("nexus editor: selected edge out of range")
+        }
+        mod.translate_vertices($&mesh, &[sub_e0, sub_e1], local_d) >>>
+    } else if sub_mode == SUB_MODE_FACE {
+        $f := sub_face
+        if f < 0 || f >= mesh.faces.len { f = 0 }
+        if mesh.faces.len == 0 { >> errors.new("nexus editor: mesh has no faces") }
+        mod.translate_faces($&mesh, &[f], local_d) >>>
+    }
+    mesh.validate() >>>
+    next := replace_node_editable_in_doc(&doc, node_idx, mesh, true) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+fn find_node_csg_index(doc &resource.Document, node_idx int) int {
+    for i in 0:doc.csg_tree_count() {
+        c := doc.csg_tree(i) >>>
+        if c.node == node_idx { << i }
+    }
+    << -1
+}
+
+pub fn (draft $&Draft) csg_add_brush(node_idx int, shape int, op int) int {
+    doc := draft.document() >>>
+    ci := find_node_csg_index(&doc, node_idx)
+    if ci < 0 { >> errors.new("nexus editor: select a CSG node first") }
+    att := doc.csg_tree(ci) >>>
+    $tree := att.tree.clone()
+    $next_id := 1
+    for i in 0:tree.brushes.len {
+        if tree.brushes[i].id >= next_id { next_id = tree.brushes[i].id + 1 }
+    }
+    $br := rm.default_csg_brush(next_id, shape, op)
+    shift := f64((tree.brushes.len % 4) - 1) * 0.28
+    if op == rm.CSG_OP_SUBTRACT {
+        br.size = fm.vec3(0.75, 0.75, 1.35)
+    } else {
+        br.size = fm.vec3(0.95, 0.95, 0.95)
+    }
+    br.transform = fm.translation_3d(fm.vec3(shift, 0.08 * f64(tree.brushes.len % 3), shift * 0.5))
+    tree.brushes.push(br)
+    tree.validate() >>>
+    _ := mod.evaluate_csg_tree("StudioCsgCheck", &tree) >>>
+    next := replace_node_csg_in_doc(&doc, node_idx, tree) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) csg_cycle_last_op(node_idx int) int {
+    doc := draft.document() >>>
+    ci := find_node_csg_index(&doc, node_idx)
+    if ci < 0 { >> errors.new("nexus editor: select a CSG node first") }
+    att := doc.csg_tree(ci) >>>
+    $tree := att.tree.clone()
+    if tree.brushes.len == 0 { >> errors.new("nexus editor: CSG tree is empty") }
+    last_i := tree.brushes.len - 1
+    tree.brushes[last_i].op = (tree.brushes[last_i].op + 1) % 3
+    tree.validate() >>>
+    _ := mod.evaluate_csg_tree("StudioCsgCheck", &tree) >>>
+    next := replace_node_csg_in_doc(&doc, node_idx, tree) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) bake_csg_to_editable(node_idx int) int {
+    doc := draft.document() >>>
+    ci := find_node_csg_index(&doc, node_idx)
+    if ci < 0 { >> errors.new("nexus editor: select a CSG node first") }
+    found := extract_node_editable_mesh(&doc, node_idx)
+    if found.len == 0 { >> errors.new("nexus editor: CSG evaluation produced empty mesh") }
+    $mesh := found[0].clone()
+    mesh.validate() >>>
+    next := replace_node_editable_in_doc(&doc, node_idx, mesh, true) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) set_material_override(node_idx int, slot int, mat rm.MaterialAsset) int {
+    doc := draft.document() >>>
+    if node_idx < 0 || node_idx >= doc.node_count() {
+        >> errors.new("nexus editor: node index out of range")
+    }
+    mat.validate() >>>
+    next := replace_node_mat_in_doc(&doc, node_idx, slot, mat, false) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) clear_material_override(node_idx int, slot int) int {
+    doc := draft.document() >>>
+    if node_idx < 0 || node_idx >= doc.node_count() {
+        >> errors.new("nexus editor: node index out of range")
+    }
+    next := replace_node_mat_in_doc(&doc, node_idx, slot, default_studio_material(), true) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) set_nodes_material_override(node_indices &[]int, slot int, mat rm.MaterialAsset) int {
+    doc := draft.document() >>>
+    $valid := []int{}
+    $seen := map[int]bool{}
+    for i in 0:node_indices.len {
+        nid := node_indices[i]
+        if nid > 0 && nid < doc.node_count() && !seen.has(nid) {
+            nd := doc.describe_node(nid) >>>
+            if nd.kind == resource.NODE_3D {
+                seen[nid] = true
+                valid.push(nid)
+            }
+        }
+    }
+    if valid.len == 0 {
+        >> errors.new("nexus editor: select a 3D node first")
+    }
+    mat.validate() >>>
+    next := replace_nodes_mat_in_doc(&doc, &valid, slot, mat, false) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) patch_nodes_material_override(
+    node_indices &[]int,
+    slot int,
+    set_color bool,
+    base_color fm.Vec3,
+    set_metal bool,
+    metallic f64,
+    set_rough bool,
+    roughness f64,
+    set_emit bool,
+    emit_strength f64,
+    set_twosided bool,
+    double_sided bool,
+    set_tex bool,
+    base_texture_uid string
+) int {
+    doc := draft.document() >>>
+    $valid := []int{}
+    $targets := map[int]bool{}
+    for i in 0:node_indices.len {
+        nid := node_indices[i]
+        if nid > 0 && nid < doc.node_count() && !targets.has(nid) {
+            nd := doc.describe_node(nid) >>>
+            if nd.kind == resource.NODE_3D {
+                targets[nid] = true
+                valid.push(nid)
+            }
+        }
+    }
+    if valid.len == 0 {
+        >> errors.new("nexus editor: select a 3D node first")
+    }
+    $ems := []resource.EditableMeshAttachment{}
+    for i in 0:doc.editable_mesh_count() {
+        em := doc.editable_mesh(i) >>>
+        ems.push(~em)
+    }
+    $csgs := []resource.CsgTreeAttachment{}
+    for i in 0:doc.csg_tree_count() {
+        cs := doc.csg_tree(i) >>>
+        csgs.push(~cs)
+    }
+    $mats := []resource.MaterialOverrideAttachment{}
+    for i in 0:doc.material_override_count() {
+        mo := doc.material_override(i) >>>
+        if !targets.has(mo.node) || mo.slot != slot { mats.push(~mo) }
+    }
+    for i in 0:valid.len {
+        nid := valid[i]
+        $m := find_node_material_override(&doc, nid, slot)
+        $prev_ev := 0.0
+        if m.base_color.x > 1e-5 { prev_ev = m.emission.x / m.base_color.x }
+        else if m.base_color.y > 1e-5 { prev_ev = m.emission.y / m.base_color.y }
+        else if m.base_color.z > 1e-5 { prev_ev = m.emission.z / m.base_color.z }
+        if set_color { m.base_color = base_color }
+        if set_metal { m.metallic = metallic }
+        if set_rough { m.roughness = roughness }
+        if set_emit {
+            ev_use := math.max(0.0, math.min(16.0, emit_strength))
+            m.emission = fm.vec3(ev_use * m.base_color.x, ev_use * m.base_color.y, ev_use * m.base_color.z)
+        } else if set_color && prev_ev > 1e-6 {
+            m.emission = fm.vec3(prev_ev * m.base_color.x, prev_ev * m.base_color.y, prev_ev * m.base_color.z)
+        }
+        if set_twosided { m.double_sided = double_sided }
+        if set_tex { m.base_texture_uid = base_texture_uid + "" }
+        m.validate() >>>
+        mats.push(resource.material_override_attachment(nid, slot, clone_material_asset(&m)))
+    }
+    next := resource.with_modeling_attachments(&doc, ems, csgs, mats) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) ensure_image_asset_ref(project &Project, uid &string) int {
+    if uid.len == 0 { << 0 }
+    doc := draft.document() >>>
+    $refs := document_refs(&doc) >>>
+    for i in 0:refs.len {
+        if refs[i].uid == *uid { << 0 }
+    }
+    ref := asset_ref_for_uid(project, &draft.source, uid, "image_rgba") >>>
+    upsert_ref($&refs, ref)
+    next := resource.with_references(&doc, &doc, refs) >>>
+    draft.replace_without_undo(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) apply_nodes_material_preset(node_indices &[]int, slot int, preset_mat &rm.MaterialAsset) int {
+    doc := draft.document() >>>
+    $valid := []int{}
+    $targets := map[int]bool{}
+    for i in 0:node_indices.len {
+        nid := node_indices[i]
+        if nid > 0 && nid < doc.node_count() && !targets.has(nid) {
+            nd := doc.describe_node(nid) >>>
+            if nd.kind == resource.NODE_3D {
+                targets[nid] = true
+                valid.push(nid)
+            }
+        }
+    }
+    if valid.len == 0 {
+        >> errors.new("nexus editor: select a 3D node first")
+    }
+    $ems := []resource.EditableMeshAttachment{}
+    for i in 0:doc.editable_mesh_count() {
+        em := doc.editable_mesh(i) >>>
+        ems.push(~em)
+    }
+    $csgs := []resource.CsgTreeAttachment{}
+    for i in 0:doc.csg_tree_count() {
+        cs := doc.csg_tree(i) >>>
+        csgs.push(~cs)
+    }
+    $mats := []resource.MaterialOverrideAttachment{}
+    for i in 0:doc.material_override_count() {
+        mo := doc.material_override(i) >>>
+        if !targets.has(mo.node) || mo.slot != slot { mats.push(~mo) }
+    }
+    for i in 0:valid.len {
+        nid := valid[i]
+        cur := find_node_material_override(&doc, nid, slot)
+        $m := clone_material_asset(preset_mat)
+        m.base_texture_uid = cur.base_texture_uid + ""
+        m.uv_offset = cur.uv_offset
+        m.uv_scale = cur.uv_scale
+        m.flip_u = cur.flip_u
+        m.flip_v = cur.flip_v
+        m.validate() >>>
+        mats.push(resource.material_override_attachment(nid, slot, m))
+    }
+    next := resource.with_modeling_attachments(&doc, ems, csgs, mats) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) patch_nodes_material_surface_ext(
+    node_indices &[]int,
+    slot int,
+    set_alpha bool,
+    alpha f64,
+    set_coat bool,
+    clearcoat f64,
+    set_ior bool,
+    ior f64
+) int {
+    doc := draft.document() >>>
+    $valid := []int{}
+    $targets := map[int]bool{}
+    for i in 0:node_indices.len {
+        nid := node_indices[i]
+        if nid > 0 && nid < doc.node_count() && !targets.has(nid) {
+            nd := doc.describe_node(nid) >>>
+            if nd.kind == resource.NODE_3D {
+                targets[nid] = true
+                valid.push(nid)
+            }
+        }
+    }
+    if valid.len == 0 {
+        >> errors.new("nexus editor: select a 3D node first")
+    }
+    $ems := []resource.EditableMeshAttachment{}
+    for i in 0:doc.editable_mesh_count() {
+        em := doc.editable_mesh(i) >>>
+        ems.push(~em)
+    }
+    $csgs := []resource.CsgTreeAttachment{}
+    for i in 0:doc.csg_tree_count() {
+        cs := doc.csg_tree(i) >>>
+        csgs.push(~cs)
+    }
+    $mats := []resource.MaterialOverrideAttachment{}
+    for i in 0:doc.material_override_count() {
+        mo := doc.material_override(i) >>>
+        if !targets.has(mo.node) || mo.slot != slot { mats.push(~mo) }
+    }
+    for i in 0:valid.len {
+        nid := valid[i]
+        $m := find_node_material_override(&doc, nid, slot)
+        if set_alpha {
+            av := math.max(0.0, math.min(1.0, alpha))
+            m.alpha = av
+            if av < 0.995 {
+                m.alpha_mode = rm.ALPHA_BLEND
+            } else {
+                m.alpha_mode = rm.ALPHA_OPAQUE
+            }
+        }
+        if set_coat {
+            cv := math.max(0.0, math.min(1.0, clearcoat))
+            m.clearcoat = cv
+            if cv > 0.0 && m.clearcoat_roughness > 0.12 {
+                m.clearcoat_roughness = 0.08
+            }
+        }
+        if set_ior {
+            m.ior = math.max(1.0, math.min(2.5, ior))
+        }
+        m.validate() >>>
+        mats.push(resource.material_override_attachment(nid, slot, clone_material_asset(&m)))
+    }
+    next := resource.with_modeling_attachments(&doc, ems, csgs, mats) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) clear_nodes_material_override(node_indices &[]int, slot int) int {
+    doc := draft.document() >>>
+    $valid := []int{}
+    $seen := map[int]bool{}
+    for i in 0:node_indices.len {
+        nid := node_indices[i]
+        if nid >= 0 && nid < doc.node_count() && !seen.has(nid) {
+            seen[nid] = true
+            valid.push(nid)
+        }
+    }
+    if valid.len == 0 { << 0 }
+    next := replace_nodes_mat_in_doc(&doc, &valid, slot, default_studio_material(), true) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) set_tilemap_2d_layer(layer_idx int, layer &resource.TileMap2DAttachment) int {
+    before := draft.document() >>>
+    if layer_idx < 0 || layer_idx >= before.tilemap_2d_count() {
+        >> errors.new("nexus editor: tile layer does not match scene")
+    }
+    cur_layer := before.tilemap_2d(layer_idx) >>>
+    if cur_layer.node != layer.node {
+        >> errors.new("nexus editor: tile layer does not match scene")
+    }
+    $refs := document_refs(&before) >>>
+    $layers := []resource.TileMap2DAttachment{}
+    for i in 0:before.tilemap_2d_count() {
+        if i == layer_idx {
+            layers.push(clone_tilemap_2d(layer, layer.node))
+        } else {
+            tm := before.tilemap_2d(i) >>>
+            layers.push(clone_tilemap_2d(&tm, tm.node))
+        }
+    }
+    v9 := resource.with_tilemaps_2d(&before, refs, layers) >>>
+    next := copy_modeling_attachments(&before, &v9) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn (draft $&Draft) move_tilemap_exit(exit_idx int, position fm.Vec2) int {
+    doc := draft.document() >>>
+    if exit_idx <= 0 || exit_idx >= doc.node_count() {
+        >> errors.new("nexus editor: invalid exit node index")
+    }
+    $nodes := document_nodes_and_refs(&doc) >>>
+    if nodes[exit_idx].kind != resource.NODE_2D {
+        >> errors.new("nexus editor: exit node must be Node2D")
+    }
+    nodes[exit_idx].local.tx = position.x
+    nodes[exit_idx].local.ty = position.y
+    children := children_table(&nodes)
+    $remap := []int{}
+    next := rebuild_from_children(
+        &doc,
+        nodes,
+        children,
+        []resource.ResourceReference{},
+        []resource.Surface{},
+        []resource.AudioEmitter{},
+        []resource.ScriptAttachment{},
+        []resource.ScriptConnection{},
+        []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
+        $&remap
+    ) >>>
+    draft.replace(&next) >>>
+    << 0
+}
+
+pub fn export_node_glb_to_project(
+    doc &resource.Document,
+    node_idx int,
+    proj_path &string,
+    rel_path string,
+    validator_bin &string
+) AssetImportResult {
+    meshes := extract_node_editable_mesh(doc, node_idx)
+    if meshes.len == 0 {
+        >> errors.new("nexus editor: select an EditableMesh or CSG node to export GLB")
+    }
+    prims := mod.compile_to_primitives(&meshes[0], true) >>>
+    mat_asset := find_node_material_override(doc, node_idx, 0)
+    $g_prims := []gltf.GlbExportPrimitive{}
+    $mats := []gltf.MaterialDescription{}
+    for i in 0:prims.len {
+        $m := gltf.default_material()
+        m.base = mat_asset.base_color
+        m.metallic = mat_asset.metallic
+        m.roughness = mat_asset.roughness
+        mats.push(m)
+        p := &prims[i]
+        g_prims.push(gltf.GlbExportPrimitive{mesh: ~p.mesh, material: i})
+    }
+    nd := doc.describe_node(node_idx) >>>
+    nd_name := nd.name + ""
+    glb_raw := gltf.encode_primitives_glb(nd_name + "", &g_prims, &mats) >>>
+    << export_glb_bytes_to_project(*proj_path + "", rel_path + "", &glb_raw, *validator_bin + "") >>>
+}

@@ -126,7 +126,7 @@ fn unpack_doc(doc &resource.Document) DocSnapshot {
     }
 }
 
-fn commit_snapshot(draft $&Draft, snap $&DocSnapshot) int {
+fn commit_snapshot_on_doc(draft $&Draft, base_doc &resource.Document, snap $&DocSnapshot) int {
     $nodes := []resource.NodeData{}
     for i in 0:snap.nodes.len {
         n := &snap.nodes[i]
@@ -189,10 +189,17 @@ fn commit_snapshot(draft $&Draft, snap $&DocSnapshot) int {
         pf := &snap.prefab_instances[i]
         prefabs.push(clone_prefab_instance(pf, pf.node))
     }
-    next := collect_refs_and_build_v9(nodes, &refs, surfaces, buses, emitters, scripts, conns, lights, sprites, tilemaps,
+    v9 := collect_refs_and_build_v9(nodes, &refs, surfaces, buses, emitters, scripts, conns, lights, sprites, tilemaps,
         envs, bodies, joints, terrains, particles, prefabs) >>>
+    v10 := copy_modeling_attachments(base_doc, &v9) >>>
+    next := preserve_material_texture_refs(v10, &refs) >>>
     draft.replace(&next) >>>
     << 0
+}
+
+fn commit_snapshot(draft $&Draft, snap $&DocSnapshot) int {
+    src_doc := draft.document() >>>
+    << commit_snapshot_on_doc(draft, &src_doc, snap) >>>
 }
 
 fn require_node_idx(snap &DocSnapshot, idx int) int {
@@ -768,11 +775,13 @@ pub fn (draft $&Draft) add_preset_light_node(parent_idx int) int {
     $children := children_table(&nodes)
     label := unique_sibling_name(&nodes, &children, parent_idx, "PointLight") >>>
     $created := resource.node(parent_idx, label, resource.NODE_3D)
+    created.local_3d = fm.identity_3d()
+    created.local_3d.c3 = fm.vec4(0.0, 2.2, 2.0, 1.0)
     raw_idx := nodes.len
     nodes.push(created)
     children.push([]int{})
     children[parent_idx].push(raw_idx)
-    src := light_data.point(fm.vec3(0.0, 0.0, 0.0), fm.vec3(2.5, 2.2, 1.9), 12.0) >>>
+    src := light_data.point(fm.vec3(0.0, 0.0, 0.0), fm.vec3(12.0, 9.5, 6.5), 14.0) >>>
     extra_light := resource.light_attachment(raw_idx, src)
     $remap := []int{}
     next := rebuild_from_children(
@@ -791,6 +800,221 @@ pub fn (draft $&Draft) add_preset_light_node(parent_idx int) int {
     ) >>>
     draft.replace(&next) >>>
     << remap[raw_idx]
+}
+
+pub fn (draft $&Draft) add_preset_directional_light_node(parent_idx int) int {
+    doc := draft.document() >>>
+    if doc.node_count() >= resource.MAX_NODES {
+        >> errors.new("nexus editor: scene node limit reached")
+    }
+    if parent_idx < 0 || parent_idx >= doc.node_count() {
+        >> errors.new("nexus editor: invalid parent node index")
+    }
+    $nodes := document_nodes_and_refs(&doc) >>>
+    $children := children_table(&nodes)
+    label := unique_sibling_name(&nodes, &children, parent_idx, "SunLight") >>>
+    $created := resource.node(parent_idx, label, resource.NODE_3D)
+    created.local_3d = fm.identity_3d()
+    created.local_3d.c3 = fm.vec4(0.0, 4.5, 0.0, 1.0)
+    raw_idx := nodes.len
+    nodes.push(created)
+    children.push([]int{})
+    children[parent_idx].push(raw_idx)
+    src := light_data.directional(fm.vec3(0.45, 0.78, 0.42), fm.vec3(2.8, 2.65, 2.45)) >>>
+    $extra_light := resource.light_attachment(raw_idx, src)
+    cs := shadow_data.CascadeSettings3D{
+        count: 2,
+        resolution: 512,
+        distance: 80.0,
+        split_lambda: 0.65,
+        blend_fraction: 0.1,
+        caster_padding: 20.0,
+        stabilization_step: 0.0625,
+        raster_bias_texels: 0.00390625
+    }
+    extra_light.cascades = shadow_data.cascade_profile(cs) >>>
+    $remap := []int{}
+    next := rebuild_from_children(
+        &doc,
+        nodes,
+        children,
+        []resource.ResourceReference{},
+        []resource.Surface{},
+        []resource.AudioEmitter{},
+        []resource.ScriptAttachment{},
+        []resource.ScriptConnection{},
+        [extra_light],
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
+        $&remap
+    ) >>>
+    draft.replace(&next) >>>
+    << remap[raw_idx]
+}
+
+pub fn (draft $&Draft) add_preset_spot_light_node(parent_idx int) int {
+    doc := draft.document() >>>
+    if doc.node_count() >= resource.MAX_NODES {
+        >> errors.new("nexus editor: scene node limit reached")
+    }
+    if parent_idx < 0 || parent_idx >= doc.node_count() {
+        >> errors.new("nexus editor: invalid parent node index")
+    }
+    $nodes := document_nodes_and_refs(&doc) >>>
+    $children := children_table(&nodes)
+    label := unique_sibling_name(&nodes, &children, parent_idx, "SpotLight") >>>
+    $created := resource.node(parent_idx, label, resource.NODE_3D)
+    created.local_3d = fm.identity_3d()
+    created.local_3d.c3 = fm.vec4(2.4, 3.2, 2.4, 1.0)
+    raw_idx := nodes.len
+    nodes.push(created)
+    children.push([]int{})
+    children[parent_idx].push(raw_idx)
+    src := light_data.spot(
+        fm.vec3(0.0, 0.0, 0.0),
+        fm.vec3(-0.55, -0.70, -0.45),
+        fm.vec3(18.0, 16.5, 14.0),
+        18.0,
+        0.32,
+        0.58
+    ) >>>
+    $extra_light := resource.light_attachment(raw_idx, src)
+    ps := shadow_data.PunctualSettings3D{
+        near: 0.1,
+        resolution: 512,
+        constant_bias: 0.0005,
+        slope_bias: 0.002
+    }
+    extra_light.punctual = shadow_data.punctual_profile(src, ps) >>>
+    $remap := []int{}
+    next := rebuild_from_children(
+        &doc,
+        nodes,
+        children,
+        []resource.ResourceReference{},
+        []resource.Surface{},
+        []resource.AudioEmitter{},
+        []resource.ScriptAttachment{},
+        []resource.ScriptConnection{},
+        [extra_light],
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
+        $&remap
+    ) >>>
+    draft.replace(&next) >>>
+    << remap[raw_idx]
+}
+
+pub fn (draft $&Draft) add_preset_environment_node(parent_idx int) int {
+    doc := draft.document() >>>
+    if doc.node_count() >= resource.MAX_NODES {
+        >> errors.new("nexus editor: scene node limit reached")
+    }
+    if parent_idx < 0 || parent_idx >= doc.node_count() {
+        >> errors.new("nexus editor: invalid parent node index")
+    }
+    $nodes := document_nodes_and_refs(&doc) >>>
+    $children := children_table(&nodes)
+    label := unique_sibling_name(&nodes, &children, parent_idx, "Environment") >>>
+    created := resource.node(parent_idx, label, resource.NODE_3D)
+    raw_idx := nodes.len
+    nodes.push(created)
+    children.push([]int{})
+    children[parent_idx].push(raw_idx)
+    $remap := []int{}
+    next0 := rebuild_from_children(
+        &doc,
+        nodes,
+        children,
+        []resource.ResourceReference{},
+        []resource.Surface{},
+        []resource.AudioEmitter{},
+        []resource.ScriptAttachment{},
+        []resource.ScriptConnection{},
+        []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
+        $&remap
+    ) >>>
+    new_idx := remap[raw_idx]
+    $snap := unpack_doc(&next0) >>>
+    $env := resource.default_environment_attachment(new_idx)
+    env.sky_mode = resource.SKY_ATMOSPHERE
+    env.sun_intensity = 2.4
+    env.exposure = 1.05
+    env.fog_density = 0.015
+    env.bloom_enabled = true
+    env.bloom_threshold = 0.95
+    env.bloom_intensity = 0.38
+    env.gtao_enabled = true
+    env.taa_enabled = false
+    env.validate() >>>
+    $next_envs := []resource.EnvironmentAttachment{}
+    for i in 0:snap.environments.len {
+        if snap.environments[i].node != new_idx {
+            next_envs.push(snap.environments[i])
+        }
+    }
+    next_envs.push(env)
+    snap.environments = next_envs
+    commit_snapshot_on_doc(draft, &next0, $&snap) >>>
+    << new_idx
+}
+
+pub fn (draft $&Draft) add_preset_particle_node(parent_idx int) int {
+    doc := draft.document() >>>
+    if doc.node_count() >= resource.MAX_NODES {
+        >> errors.new("nexus editor: scene node limit reached")
+    }
+    if parent_idx < 0 || parent_idx >= doc.node_count() {
+        >> errors.new("nexus editor: invalid parent node index")
+    }
+    $nodes := document_nodes_and_refs(&doc) >>>
+    $children := children_table(&nodes)
+    label := unique_sibling_name(&nodes, &children, parent_idx, "ParticleVFX") >>>
+    $created := resource.node(parent_idx, label, resource.NODE_3D)
+    created.local_3d = fm.identity_3d()
+    created.local_3d.c3 = fm.vec4(0.0, 1.0, 0.0, 1.0)
+    raw_idx := nodes.len
+    nodes.push(created)
+    children.push([]int{})
+    children[parent_idx].push(raw_idx)
+    $remap := []int{}
+    next0 := rebuild_from_children(
+        &doc,
+        nodes,
+        children,
+        []resource.ResourceReference{},
+        []resource.Surface{},
+        []resource.AudioEmitter{},
+        []resource.ScriptAttachment{},
+        []resource.ScriptConnection{},
+        []resource.LightAttachment{},
+        []resource.Sprite3DAttachment{},
+        []resource.TileMap2DAttachment{},
+        $&remap
+    ) >>>
+    new_idx := remap[raw_idx]
+    $snap := unpack_doc(&next0) >>>
+    $pt := resource.default_particle_emitter_3d(new_idx)
+    pt.max_particles = 384
+    pt.spawn_rate = 72.0
+    pt.lifetime = 1.6
+    pt.speed = 2.2
+    pt.gravity = -1.8
+    pt.size = 0.24
+    pt.additive = true
+    pt.validate() >>>
+    $next_pts := []resource.ParticleEmitter3DAttachment{}
+    for i in 0:snap.particles_3d.len {
+        if snap.particles_3d[i].node != new_idx {
+            next_pts.push(snap.particles_3d[i])
+        }
+    }
+    next_pts.push(pt)
+    snap.particles_3d = next_pts
+    commit_snapshot_on_doc(draft, &next0, $&snap) >>>
+    << new_idx
 }
 
 pub fn (draft $&Draft) set_node_environment(

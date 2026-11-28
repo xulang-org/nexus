@@ -1,6 +1,9 @@
 @main
 
 codec #"github.com/xulang-org/nexus/formats/scene"
+fm #"github.com/xulang-org/nexus/foundation/math"
+mod #"github.com/xulang-org/nexus/modeling"
+rm #"github.com/xulang-org/nexus/resources/modeling"
 resource #"github.com/xulang-org/nexus/resources/scene"
 snapshot #"github.com/xulang-org/nexus/internal/file_snapshot"
 #errors
@@ -253,9 +256,104 @@ fn run_checks_in_dir(
     _ := must_cmd(cli_bin, &["build", gal_proj + "", "--output", gal_pub + "", "--validator", *val_bin + ""], "build gallery project")
     pub_gallery := strings.trim_space(&must_cmd(cli_bin, &["scene", "gallery.xuscene", "--output", gal_pub + ""], "resolve published gallery"))
     gal_prev_png := filepath.join([root + "", "gal_preview.png"])
-    _ := must_cmd(prev_bin, &["--scene", pub_gallery + "", "--shaders", "build/mesh-shaders", "--frames", "2", "--capture", gal_prev_png + ""], "preview gallery")
+    gal_prev_out := must_cmd(prev_bin, &["--scene", pub_gallery + "", "--shaders", "build/mesh-shaders", "--frames", "2", "--capture", gal_prev_png + ""], "preview gallery")
     gal_prev_raw := snapshot.read(gal_prev_png + "", snapshot.MAX_BYTES) >>>
     check(is_valid_png(&gal_prev_raw), "gallery preview PNG valid") >>>
+
+    // 3b. Material overrides + whitebox editable mesh must visibly affect preview output,
+    //     and camera-less whitebox scenes must render cleanly with fallback camera.
+    gal_mat_dir := filepath.join([root + "", "gal_mat"])
+    os.mkdir_all(filepath.join([gal_mat_dir + "", "assets"])) >>>
+    copy_file("examples/scene_assets/project.json", filepath.join([gal_mat_dir + "", "project.json"])) >>>
+    copy_file("examples/scene_assets/assets/panels.glb", filepath.join([gal_mat_dir + "", "assets", "panels.glb"])) >>>
+    gal_raw := snapshot.read(gal_world + "", codec.MAX_BYTES) >>>
+    gal_doc := codec.decode(&gal_raw) >>>
+    $mat_nodes := []resource.NodeData{}
+    for i in 0:gal_doc.node_count() {
+        mat_nodes.push(gal_doc.describe_node(i) >>>)
+    }
+    $cube_nd := resource.node(0, "PreviewCube", resource.NODE_3D)
+    cube_nd.local_3d = fm.identity_3d()
+    cube_nd.local_3d.c3 = fm.vec4(0.0, 0.0, 1.5, 1.0)
+    cube_idx := mat_nodes.len
+    mat_nodes.push(cube_nd)
+    $mat_refs := []resource.ResourceReference{}
+    for i in 0:gal_doc.resource_count() { mat_refs.push(gal_doc.resource(i) >>>) }
+    $mat_surfs := []resource.Surface{}
+    for i in 0:gal_doc.surface_count() { mat_surfs.push(gal_doc.surface(i) >>>) }
+    mat_base := resource.make_document(mat_nodes) >>>
+    mat_v9 := resource.with_attachments(
+        &mat_base,
+        mat_refs,
+        mat_surfs,
+        []resource.AudioBus{},
+        []resource.AudioEmitter{},
+        []resource.ScriptAttachment{},
+        []resource.ScriptConnection{},
+        []resource.LightAttachment{}
+    ) >>>
+    cube_mesh := mod.box_editable(fm.vec3(1.2, 1.2, 1.2), 0xffffffff, 0) >>>
+    $mag_mat := rm.default_material_asset("MagentaGlow")
+    mag_mat.base_color = fm.vec3(1.0, 0.08, 0.85)
+    mag_mat.emission = fm.vec3(2.0, 0.1, 1.5)
+    mag_mat.metallic = 0.2
+    mag_mat.roughness = 0.2
+    $mag_mat2 := rm.default_material_asset("MagentaGlow2")
+    mag_mat2.base_color = fm.vec3(1.0, 0.08, 0.85)
+    mag_mat2.emission = fm.vec3(2.0, 0.1, 1.5)
+    mag_mat2.metallic = 0.2
+    mag_mat2.roughness = 0.2
+    $gold_mat := rm.default_material_asset("GoldWhitebox")
+    gold_mat.base_color = fm.vec3(0.95, 0.78, 0.25)
+    gold_mat.metallic = 1.0
+    gold_mat.roughness = 0.18
+    mat_v10 := resource.with_modeling_attachments(
+        &mat_v9,
+        [resource.editable_mesh_attachment(cube_idx, cube_mesh)],
+        []resource.CsgTreeAttachment{},
+        [
+            resource.material_override_attachment(1, 0, mag_mat),
+            resource.material_override_attachment(2, 0, mag_mat2),
+            resource.material_override_attachment(cube_idx, 0, gold_mat)
+        ]
+    ) >>>
+    gal_mat_world := filepath.join([gal_mat_dir + "", "assets", "world.xuscene"])
+    gal_mat_enc := codec.encode(&mat_v10) >>>
+    snapshot.write_atomic(gal_mat_world + "", &gal_mat_enc) >>>
+    gal_mat_proj := filepath.join([gal_mat_dir + "", "project.json"])
+    gal_mat_pub := filepath.join([root + "", "gal_mat_pub"])
+    _ := must_cmd(cli_bin, &["build", gal_mat_proj + "", "--output", gal_mat_pub + "", "--validator", *val_bin + ""], "build mutated material gallery")
+    pub_mat_gallery := strings.trim_space(&must_cmd(cli_bin, &["scene", "gallery.xuscene", "--output", gal_mat_pub + ""], "resolve mutated gallery"))
+    gal_mat_png := filepath.join([root + "", "gal_mat_preview.png"])
+    gal_mat_out := must_cmd(prev_bin, &["--scene", pub_mat_gallery + "", "--shaders", "build/mesh-shaders", "--frames", "2", "--capture", gal_mat_png + ""], "preview mutated material gallery")
+    gal_mat_raw := snapshot.read(gal_mat_png + "", snapshot.MAX_BYTES) >>>
+    check(is_valid_png(&gal_mat_raw), "mutated gallery preview PNG valid") >>>
+    check(gal_mat_raw != gal_prev_raw, "material override + whitebox visibly changed preview image") >>>
+    check(gal_mat_out != gal_prev_out, "whitebox editable mesh changed preview submitted triangles: " + gal_mat_out) >>>
+
+    // Camera-less whitebox scene renders via fallback camera with non-zero triangles.
+    nocam_scene := filepath.join([root + "", "nocam_whitebox.xuscene"])
+    $nc_root := resource.node(-1, "World", resource.NODE_3D)
+    $nc_sph := resource.node(0, "Sphere", resource.NODE_3D)
+    nc_sph.local_3d = fm.identity_3d()
+    nc_sph.local_3d.c3 = fm.vec4(0.0, 1.0, 0.0, 1.0)
+    nc_base := resource.make_document([nc_root, nc_sph]) >>>
+    $nc_mat := rm.default_material_asset("Emerald")
+    nc_mat.base_color = fm.vec3(0.1, 0.85, 0.45)
+    nc_mesh := mod.sphere_editable(0.9, 12, 8, 0xffffffff, 0) >>>
+    nc_doc := resource.with_modeling_attachments(
+        &nc_base,
+        [resource.editable_mesh_attachment(1, nc_mesh)],
+        []resource.CsgTreeAttachment{},
+        [resource.material_override_attachment(1, 0, nc_mat)]
+    ) >>>
+    nc_enc := codec.encode(&nc_doc) >>>
+    snapshot.write_atomic(nocam_scene + "", &nc_enc) >>>
+    nocam_png := filepath.join([root + "", "nocam_preview.png"])
+    nocam_out := must_cmd(prev_bin, &["--scene", nocam_scene + "", "--shaders", "build/mesh-shaders", "--frames", "2", "--capture", nocam_png + ""], "preview camera-less whitebox scene")
+    nocam_raw := snapshot.read(nocam_png + "", snapshot.MAX_BYTES) >>>
+    check(is_valid_png(&nocam_raw), "camera-less whitebox preview PNG valid") >>>
+    check(!strings.contains(&nocam_out, "Submitted 0 triangles"), "camera-less whitebox preview submitted non-zero triangles: " + nocam_out) >>>
 
     // 4. Native 3D viewport: single-node gizmo edit + Metal capture on world.xuscene.
     vp_world_out := filepath.join([root + "", "world_vp.xuscene"])

@@ -1,6 +1,8 @@
 @"github.com/xulang-org/nexus/integration/modeling"
 
+img_assets #"github.com/xulang-org/nexus/assets/image"
 fm #"github.com/xulang-org/nexus/foundation/math"
+tex3d #"github.com/xulang-org/nexus/integration/image_render/three_d"
 mod #"github.com/xulang-org/nexus/modeling"
 ren #"github.com/xulang-org/nexus/rendering/three_d"
 light_data #"github.com/xulang-org/nexus/resources/lighting"
@@ -8,6 +10,7 @@ rm #"github.com/xulang-org/nexus/resources/modeling"
 rs #"github.com/xulang-org/nexus/resources/scene"
 scene #"github.com/xulang-org/nexus/scene"
 #errors
+#path/filepath
 
 struct SceneModelEntry {
     node_idx int
@@ -17,12 +20,83 @@ struct SceneModelEntry {
 
 pub struct SceneModeling3D {
     entries []SceneModelEntry
+    textures []ren.Texture3D
+    tex_by_uid map[string]int
     closed bool
 }
 
 fn default_studio_mat3d() ren.Material3D {
     da := rm.default_material_asset("WhiteboxDefault")
     << material_asset_to_3d(&da) >>>
+}
+
+fn try_load_override_tex(
+    device &ren.Device3D,
+    directory &string,
+    ref_paths &map[string]string,
+    uid &string,
+    is_srgb bool,
+    textures $&[]ren.Texture3D,
+    tex_by_uid $&map[string]int
+) {
+    if uid.len == 0 || tex_by_uid.has(*uid + "") || !ref_paths.has(*uid + "") { << }
+    rel := ref_paths[*uid + ""]
+    full := filepath.join([*directory + "", rel])
+    img := img_assets.load_png(full + "") >>> (err) {
+        _ := err
+        <<
+    }
+    tex := tex3d.upload_image_3d(device, &img, is_srgb, true, true) >>> (err) {
+        _ := err
+        <<
+    }
+    idx := textures.len
+    textures.push(tex)
+    tex_by_uid[*uid + ""] = idx
+}
+
+fn resolve_material_with_textures(
+    asset &rm.MaterialAsset,
+    textures &[]ren.Texture3D,
+    tex_by_uid &map[string]int
+) ren.Material3D {
+    $mat := material_asset_to_3d(asset) >>>
+    if asset.base_texture_uid.len > 0 && tex_by_uid.has(asset.base_texture_uid + "") {
+        tidx := tex_by_uid[asset.base_texture_uid + ""]
+        mat = mat.with_base_texture(&textures[tidx]) >>> (err) {
+            _ := err
+            << mat
+        }
+    }
+    if asset.emission_texture_uid.len > 0 && tex_by_uid.has(asset.emission_texture_uid + "") {
+        tidx := tex_by_uid[asset.emission_texture_uid + ""]
+        mat = mat.with_emission_texture(&textures[tidx]) >>> (err) {
+            _ := err
+            << mat
+        }
+    }
+    if asset.orm_texture_uid.len > 0 && tex_by_uid.has(asset.orm_texture_uid + "") {
+        tidx := tex_by_uid[asset.orm_texture_uid + ""]
+        mat = mat.with_orm_texture(&textures[tidx], asset.occlusion_strength) >>> (err) {
+            _ := err
+            << mat
+        }
+    }
+    << mat
+}
+
+pub fn (host &SceneModeling3D) resolve_material_3d(asset &rm.MaterialAsset) ren.Material3D {
+    << resolve_material_with_textures(asset, &host.textures, &host.tex_by_uid) >>>
+}
+
+fn close_textures(items $&[]ren.Texture3D) {
+    for i in 0:items.len {
+        t := $&items[i]
+        _ := t.close() >>> (err) {
+            _ := err
+            <<
+        }
+    }
 }
 
 fn build_slot_materials(
@@ -49,24 +123,49 @@ fn build_slot_materials(
     << out
 }
 
-pub fn prepare_scene_modeling(device &ren.Device3D, doc &rs.Document) SceneModeling3D {
+pub fn prepare_scene_modeling_in_dir(device &ren.Device3D, doc &rs.Document, directory string) SceneModeling3D {
     fallback := default_studio_mat3d() >>>
+    $ref_paths := map[string]string{}
+    for i in 0:doc.resource_count() {
+        ref := doc.resource(i) >>>
+        if ref.kind == "image_rgba" {
+            ref_paths[ref.uid + ""] = ref.path + ""
+        }
+    }
+    $textures := []ren.Texture3D{}
+    $tex_by_uid := map[string]int{}
+    if directory.len > 0 {
+        for i in 0:doc.material_override_count() {
+            ov := doc.material_override(i) >>>
+            try_load_override_tex(device, &directory, &ref_paths, &ov.material.base_texture_uid, true, $&textures, $&tex_by_uid)
+            try_load_override_tex(device, &directory, &ref_paths, &ov.material.emission_texture_uid, true, $&textures, $&tex_by_uid)
+            try_load_override_tex(device, &directory, &ref_paths, &ov.material.orm_texture_uid, false, $&textures, $&tex_by_uid)
+        }
+    }
     $ov_map := map[string]ren.Material3D{}
     for i in 0:doc.material_override_count() {
         ov := doc.material_override(i) >>>
-        mat := material_asset_to_3d(&ov.material) >>>
+        mat := resolve_material_with_textures(&ov.material, &textures, &tex_by_uid) >>> (err) {
+            close_textures($&textures)
+            >> err
+        }
         ov_map[str(ov.node) + ":" + str(ov.slot)] = mat
     }
     $entries := []SceneModelEntry{}
     for i in 0:doc.editable_mesh_count() {
         att := doc.editable_mesh(i) >>>
-        $sess := new_editable_session(att.mesh.clone()) >>>
+        $sess := new_editable_session(att.mesh.clone()) >>> (err) {
+            close_entries($&entries)
+            close_textures($&textures)
+            >> err
+        }
         slot_mats := build_slot_materials(att.node, sess.mesh.material_slots.len, &ov_map, fallback)
         $def_m := fallback
         if slot_mats.len > 0 { def_m = slot_mats[0] }
         _ := sess.sync_gpu(device, def_m, &slot_mats, true) >>> (err) {
             _ := sess.close()
             close_entries($&entries)
+            close_textures($&textures)
             >> err
         }
         entries.push(SceneModelEntry{node_idx: att.node, is_csg: false, session: sess})
@@ -75,20 +174,30 @@ pub fn prepare_scene_modeling(device &ren.Device3D, doc &rs.Document) SceneModel
         att := doc.csg_tree(i) >>>
         mesh := mod.evaluate_csg_tree("Csg_" + str(att.node), &att.tree) >>> (err) {
             close_entries($&entries)
+            close_textures($&textures)
             >> err
         }
-        $sess := new_editable_session(mesh) >>>
+        $sess := new_editable_session(mesh) >>> (err) {
+            close_entries($&entries)
+            close_textures($&textures)
+            >> err
+        }
         slot_mats := build_slot_materials(att.node, sess.mesh.material_slots.len, &ov_map, fallback)
         $def_m := fallback
         if slot_mats.len > 0 { def_m = slot_mats[0] }
         _ := sess.sync_gpu(device, def_m, &slot_mats, true) >>> (err) {
             _ := sess.close()
             close_entries($&entries)
+            close_textures($&textures)
             >> err
         }
         entries.push(SceneModelEntry{node_idx: att.node, is_csg: true, session: sess})
     }
-    << SceneModeling3D{entries: entries, closed: false}
+    << SceneModeling3D{entries: entries, textures: textures, tex_by_uid: tex_by_uid, closed: false}
+}
+
+pub fn prepare_scene_modeling(device &ren.Device3D, doc &rs.Document) SceneModeling3D {
+    << prepare_scene_modeling_in_dir(device, doc, "") >>>
 }
 
 fn close_entries(entries $&[]SceneModelEntry) {
@@ -101,6 +210,102 @@ fn close_entries(entries $&[]SceneModelEntry) {
 
 pub fn (host &SceneModeling3D) entry_count() int { << host.entries.len }
 
+pub struct ModelingPickHit {
+    pub hit bool
+    pub node_idx int
+    pub distance f64
+}
+
+pub struct ModelingSubPick {
+    pub hit bool
+    pub node_idx int
+    pub sub_mode int
+    pub index int
+    pub v0 int
+    pub v1 int
+    pub distance f64
+}
+
+pub fn (host &SceneModeling3D) pick_node(
+    tree &scene.SceneTree,
+    tree_ids &[]int,
+    origin fm.Vec3,
+    direction fm.Vec3,
+    near f64,
+    far f64
+) ModelingPickHit {
+    if host.closed {
+        << ModelingPickHit{hit: false, node_idx: -1, distance: far}
+    }
+    ray := fm.ray3d(origin, direction) >>> (err) {
+        _ := err
+        << ModelingPickHit{hit: false, node_idx: -1, distance: far}
+    }
+    $best := ModelingPickHit{hit: false, node_idx: -1, distance: far}
+    for i in 0:host.entries.len {
+        e := &host.entries[i]
+        if e.node_idx < 0 || e.node_idx >= tree_ids.len { -> }
+        nid := tree_ids[e.node_idx]
+        vis := tree.is_visible(nid) >>> (err) {
+            _ := err
+            ->
+        }
+        if !vis { -> }
+        world := tree.global_transform_3d(nid) >>> (err) {
+            _ := err
+            ->
+        }
+        fhit := mod.pick_face(&e.session.mesh, world, ray)
+        if fhit.hit && fhit.distance >= near && fhit.distance < best.distance {
+            best = ModelingPickHit{hit: true, node_idx: e.node_idx, distance: fhit.distance}
+        }
+    }
+    << best
+}
+
+pub fn (host &SceneModeling3D) pick_subobject_at(
+    tree &scene.SceneTree,
+    tree_ids &[]int,
+    node_idx int,
+    sub_mode int,
+    origin fm.Vec3,
+    direction fm.Vec3
+) ModelingSubPick {
+    if host.closed || sub_mode <= 0 || node_idx < 0 || node_idx >= tree_ids.len {
+        << ModelingSubPick{hit: false, node_idx: node_idx, sub_mode: sub_mode, index: -1, v0: -1, v1: -1, distance: 0.0}
+    }
+    ray := fm.ray3d(origin, direction) >>> (err) {
+        _ := err
+        << ModelingSubPick{hit: false, node_idx: node_idx, sub_mode: sub_mode, index: -1, v0: -1, v1: -1, distance: 0.0}
+    }
+    nid := tree_ids[node_idx]
+    world := tree.global_transform_3d(nid) >>> (err) {
+        _ := err
+        << ModelingSubPick{hit: false, node_idx: node_idx, sub_mode: sub_mode, index: -1, v0: -1, v1: -1, distance: 0.0}
+    }
+    for i in 0:host.entries.len {
+        e := &host.entries[i]
+        if e.node_idx != node_idx { -> }
+        if sub_mode == EDIT_MODE_VERTEX {
+            vh := mod.pick_vertex(&e.session.mesh, world, ray, 0.38)
+            if vh.hit {
+                << ModelingSubPick{hit: true, node_idx: node_idx, sub_mode: sub_mode, index: vh.vertex_id, v0: vh.vertex_id, v1: -1, distance: vh.distance}
+            }
+        } else if sub_mode == EDIT_MODE_EDGE {
+            eh := mod.pick_edge(&e.session.mesh, world, ray, 0.38)
+            if eh.hit {
+                << ModelingSubPick{hit: true, node_idx: node_idx, sub_mode: sub_mode, index: eh.v0, v0: eh.v0, v1: eh.v1, distance: eh.distance}
+            }
+        } else {
+            fh := mod.pick_face(&e.session.mesh, world, ray)
+            if fh.hit {
+                << ModelingSubPick{hit: true, node_idx: node_idx, sub_mode: sub_mode, index: fh.face_id, v0: -1, v1: -1, distance: fh.distance}
+            }
+        }
+    }
+    << ModelingSubPick{hit: false, node_idx: node_idx, sub_mode: sub_mode, index: -1, v0: -1, v1: -1, distance: 0.0}
+}
+
 pub fn (host &SceneModeling3D) draw_lit(
     device $&ren.Device3D,
     tree &scene.SceneTree,
@@ -110,19 +315,72 @@ pub fn (host &SceneModeling3D) draw_lit(
 ) int {
     if host.closed { >> errors.new("nexus modeling: closed SceneModeling3D host") }
     $tris := 0
+    for pass in 0:2 {
+        transparent_pass := pass == 1
+        for i in 0:host.entries.len {
+            e := &host.entries[i]
+            if e.node_idx < 0 || e.node_idx >= tree_ids.len { -> }
+            nid := tree_ids[e.node_idx]
+            vis := tree.is_visible(nid) >>> (err) {
+                _ := err
+                ->
+            }
+            if !vis { -> }
+            world := tree.global_transform_3d(nid) >>>
+            tris += e.session.draw_lit_pass(device, world, view_proj, lighting, transparent_pass) >>>
+        }
+    }
+    << tris
+}
+
+pub fn (host &SceneModeling3D) draw_lit_shadowed(
+    device $&ren.Device3D,
+    tree &scene.SceneTree,
+    tree_ids &[]int,
+    view_proj fm.Mat4,
+    lighting &light_data.Environment3D,
+    shadow &ren.ShadowBinding3D
+) int {
+    if host.closed { >> errors.new("nexus modeling: closed SceneModeling3D host") }
+    $tris := 0
+    for pass in 0:2 {
+        transparent_pass := pass == 1
+        for i in 0:host.entries.len {
+            e := &host.entries[i]
+            if e.node_idx < 0 || e.node_idx >= tree_ids.len { -> }
+            nid := tree_ids[e.node_idx]
+            vis := tree.is_visible(nid) >>> (err) {
+                _ := err
+                ->
+            }
+            if !vis { -> }
+            world := tree.global_transform_3d(nid) >>>
+            tris += e.session.draw_lit_shadowed_pass(device, world, view_proj, lighting, shadow, transparent_pass) >>>
+        }
+    }
+    << tris
+}
+
+pub fn (host &SceneModeling3D) shadow_casters(
+    tree &scene.SceneTree,
+    tree_ids &[]int
+) []ren.ShadowCaster3D {
+    if host.closed { >> errors.new("nexus modeling: closed SceneModeling3D host") }
+    $casters := []ren.ShadowCaster3D{}
     for i in 0:host.entries.len {
         e := &host.entries[i]
         if e.node_idx < 0 || e.node_idx >= tree_ids.len { -> }
         nid := tree_ids[e.node_idx]
-        info := tree.node_info(nid) >>> (err) {
+        vis := tree.is_visible(nid) >>> (err) {
             _ := err
             ->
         }
-        if !info.visible { -> }
+        if !vis { -> }
         world := tree.global_transform_3d(nid) >>>
-        tris += e.session.draw_lit(device, world, view_proj, lighting) >>>
+        ec := e.session.shadow_casters(world) >>>
+        for ci in 0:ec.len { casters.push(ec[ci]) }
     }
-    << tris
+    << casters
 }
 
 pub fn (host &SceneModeling3D) collect_draws(
@@ -152,7 +410,10 @@ pub fn (host &SceneModeling3D) collect_draws(
 pub fn (host $&SceneModeling3D) close() int {
     if host.closed { << 0 }
     close_entries($&host.entries)
+    close_textures($&host.textures)
     host.entries = []SceneModelEntry{}
+    host.textures = []ren.Texture3D{}
+    host.tex_by_uid = map[string]int{}
     host.closed = true
     << 0
 }

@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 const uint MAX_LIGHTS_PER_CLUSTER = 64u;
 
@@ -80,6 +81,19 @@ vec3 unit_safe(vec3 value) {
     vec3 scaled = value / largest;
     return scaled / sqrt(dot(scaled, scaled));
 }
+
+#define XU_VEC2 vec2
+#define XU_VEC3 vec3
+#define XU_VEC4 vec4
+#define XU_MIX mix
+#define XU_DDX(v) dFdx(v)
+#define XU_DDY(v) dFdy(v)
+#define XU_MAT4 mat4
+#define XU_MUL(m,v) ((m)*(v))
+#define XU_SHADOW_RESOURCES sampler2D shadow_map
+#define XU_SHADOW_READ(uv) textureLod(shadow_map,uv,0.0).r
+#define XU_SHADOW_ARGS shadow_map
+#include "shadow.inc"
 
 vec3 material_direct(vec3 base, float metallic, float roughness,
     float clearcoat, float clearcoat_roughness, float ior,
@@ -205,7 +219,6 @@ vec3 normal_map_direction(vec3 normal, vec3 tangent, vec3 bitangent, vec3 texel,
 }
 
 void main() {
-    float dummy_s = s.direction_bias.w + textureLod(shadow_texture, vec2(0.5), 0.0).r * 0.0;
     int mask = int(p.maps_normal.x);
     vec2 sample_uv = p.uv_rect.xy + texture_uv * p.uv_rect.zw;
     vec3 base = p.base_metallic.xyz * vertex_color.xyz;
@@ -249,7 +262,7 @@ void main() {
     if ((mask & 4) != 0) emission *= texture(emission_texture, sample_uv).rgb;
 
     if (p.surface.z < 0.5) {
-        hdr_color = vec4(vertex_color.rgb, alpha + dummy_s * 0.0);
+        hdr_color = vec4(vertex_color.rgb, alpha);
         normal_roughness = vec4(shading_normal, roughness);
         return;
     }
@@ -264,19 +277,49 @@ void main() {
         indirect_ambient += sample_irradiance(world, shading_normal) * irr.dims_mode.z;
     }
     vec3 linear_color = indirect_ambient * occlusion * base * (1.0 - metallic) + emission;
+    vec3 v_ind = unit_safe(l.eye_exposure.xyz - world);
+    float nv_ind = max(dot(shading_normal, v_ind), 0.0001);
     float max_sheen_ind = max(sheen_color.x, max(sheen_color.y, sheen_color.z));
     if (max_sheen_ind > 0.0) {
-        vec3 v_dir = unit_safe(l.eye_exposure.xyz - world);
-        float nv_ind = max(dot(shading_normal, v_dir), 0.0001);
         linear_color += indirect_ambient * occlusion * sheen_color * pow(1.0 - nv_ind, 2.0) * 0.35;
+    }
+    vec3 refl_dir = reflect(-v_ind, shading_normal);
+    float sky_t = clamp(refl_dir.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3 env_hemi = indirect_ambient * mix(vec3(0.42, 0.40, 0.38), vec3(1.50, 1.58, 1.72), sky_t);
+    if (metallic > 0.001) {
+        float ior_r_ind = (ior - 1.0) / max(ior + 1.0, 1e-4);
+        vec3 f0_ind = mix(vec3(ior_r_ind * ior_r_ind), base, metallic);
+        vec3 f_rough = f0_ind + (max(vec3(1.0 - roughness), f0_ind) - f0_ind) * pow(1.0 - nv_ind, 5.0);
+        linear_color += env_hemi * occlusion * f_rough * metallic * (1.0 - roughness * 0.45);
+    }
+    if (clearcoat > 0.001) {
+        float cc_f_ind = 0.04 + 0.96 * pow(1.0 - nv_ind, 5.0);
+        linear_color += env_hemi * occlusion * (clearcoat * cc_f_ind * (1.0 - clearcoat_roughness * 0.55));
+    }
+
+    float shadow_vis = 1.0;
+    int shadow_light_idx = -1;
+    if (s.shadow_filter.w > 0.5) {
+        shadow_light_idx = int(s.shadow_filter.z);
+        if (s.shadow_filter.w > 3.5) {
+            shadow_vis = cascade_shadow_visibility(world, world_normal,
+                XU_MUL(s.mvp[0], XU_VEC4(world, 1.0)), XU_MUL(s.mvp[1], XU_VEC4(world, 1.0)),
+                XU_MUL(s.mvp[2], XU_VEC4(world, 1.0)), XU_MUL(s.mvp[3], XU_VEC4(world, 1.0)),
+                s.camera_depth, s.ranges[0], s.ranges[1], s.ranges[2], s.ranges[3], s.limits,
+                s.direction_bias, s.shadow_filter, s.depth, s.gradient_scales, shadow_texture);
+        } else {
+            shadow_vis = shadow_visibility(world, world_normal, s.mvp[0], s.direction_bias,
+                s.shadow_filter, s.depth, s.gradient_scales.x, shadow_texture);
+        }
     }
 
     uint total_clusters = uint(l.grid_mode.x) * uint(l.grid_mode.y) * uint(l.grid_mode.z);
     uint dir_count = min(cluster_counts[total_clusters], MAX_LIGHTS_PER_CLUSTER);
     for (uint di = 0u; di < dir_count; ++di) {
         uint li = cluster_indices[total_clusters * MAX_LIGHTS_PER_CLUSTER + di];
+        float vis = (int(li) == shadow_light_idx) ? shadow_vis : 1.0;
         linear_color += source_direct(base, metallic, roughness, clearcoat, clearcoat_roughness, ior,
-            sheen_color, sheen_roughness, shading_normal, world, l.eye_exposure.xyz, lights[li]);
+            sheen_color, sheen_roughness, shading_normal, world, l.eye_exposure.xyz, lights[li]) * vis;
     }
 
     if (l.ambient_count.w > 0.5) {
@@ -295,8 +338,9 @@ void main() {
         uint base_idx = cid * MAX_LIGHTS_PER_CLUSTER;
         for (uint ci = 0u; ci < local_count; ++ci) {
             uint li = cluster_indices[base_idx + ci];
+            float vis = (int(li) == shadow_light_idx) ? shadow_vis : 1.0;
             linear_color += source_direct(base, metallic, roughness, clearcoat, clearcoat_roughness, ior,
-                sheen_color, sheen_roughness, shading_normal, world, l.eye_exposure.xyz, lights[li]);
+                sheen_color, sheen_roughness, shading_normal, world, l.eye_exposure.xyz, lights[li]) * vis;
         }
     }
 

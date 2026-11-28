@@ -1,5 +1,6 @@
 @main
 
+controls #"github.com/xulang-org/nexus/input"
 resource #"github.com/xulang-org/nexus/resources/scene"
 files #"github.com/xulang-org/nexus/integration/scene"
 #ui
@@ -10,6 +11,7 @@ widgets #ui/widgets
 #os
 #os/exec
 #path/filepath
+#strconv
 #strings
 #time
 #errors
@@ -21,8 +23,11 @@ struct LaunchConfig {
     pub preview_bin string
     pub viewport_bin string
     pub tilemap_bin string
+    pub script_path string
     pub verify_headless bool
     pub show_help bool
+    pub xacp_port int
+    pub preview_xacp_port int
 }
 
 const WORKER_VIEWPORT = 1
@@ -47,7 +52,11 @@ fn print_usage() {
     println("  --preview <bin>     preview executable (default build/nexus-project-preview)")
     println("  --viewport <bin>    3D viewport executable (default build/nexus-project-viewport)")
     println("  --tilemap-editor <bin>  2D tilemap editor executable (default build/nexus-tilemap-editor)")
+    println("  --script <ndjson>   execute deterministic UI automation script and exit")
     println("  --headless-check    verify project load, layout, and snapshot cleanly without opening a window")
+    println("  --xacp-tcp          enable XACP TCP control on default port 19876")
+    println("  --xacp-port <port>  enable XACP TCP control on loopback port (1..65535)")
+    println("  --preview-xacp-port <port>  forward --xacp-port to launched Preview window")
 }
 
 fn parse_args() LaunchConfig {
@@ -59,8 +68,11 @@ fn parse_args() LaunchConfig {
         preview_bin: "build/nexus-project-preview",
         viewport_bin: "build/nexus-project-viewport",
         tilemap_bin: "build/nexus-tilemap-editor",
+        script_path: "",
         verify_headless: false,
-        show_help: false
+        show_help: false,
+        xacp_port: 0,
+        preview_xacp_port: 0
     }
     $i := 1
     while i < args.len {
@@ -88,6 +100,24 @@ fn parse_args() LaunchConfig {
             i = i + 1
             if i >= args.len { >> errors.new("missing value for --tilemap-editor") }
             cfg.tilemap_bin = args[i] + ""
+        } else if a == "--script" {
+            i = i + 1
+            if i >= args.len { >> errors.new("missing value for --script") }
+            cfg.script_path = args[i] + ""
+        } else if a == "--xacp-tcp" {
+            cfg.xacp_port = 19876
+        } else if a == "--xacp-port" {
+            i = i + 1
+            if i >= args.len { >> errors.new("missing value for --xacp-port") }
+            p := strconv.atoi(&args[i]) >>>
+            if p < 1 || p > 65535 { >> errors.new("invalid --xacp-port") }
+            cfg.xacp_port = p
+        } else if a == "--preview-xacp-port" {
+            i = i + 1
+            if i >= args.len { >> errors.new("missing value for --preview-xacp-port") }
+            p := strconv.atoi(&args[i]) >>>
+            if p < 1 || p > 65535 { >> errors.new("invalid --preview-xacp-port") }
+            cfg.preview_xacp_port = p
         } else if a == "--headless-check" {
             cfg.verify_headless = true
         } else if strings.has_prefix(&a, "-") {
@@ -101,6 +131,9 @@ fn parse_args() LaunchConfig {
     }
     if cfg.project_path.len == 0 {
         >> errors.new("missing <project.json> path")
+    }
+    if cfg.xacp_port > 0 && cfg.preview_xacp_port == 0 && cfg.xacp_port < 65535 {
+        cfg.preview_xacp_port = cfg.xacp_port + 1
     }
     << cfg
 }
@@ -158,8 +191,14 @@ fn spawn_viewport_worker(
     }
 }
 
-fn spawn_preview_worker(ch chan WorkerDone, bin string, pub_scene string) {
-    out := exec.command(bin, "--scene", pub_scene).combined_output() >>> (err) {
+fn spawn_preview_worker(ch chan WorkerDone, bin string, pub_scene string, xacp_port int) {
+    bin_path := bin + ""
+    scene_arg := pub_scene + ""
+    $cmd := exec.command(bin_path, "--scene", scene_arg)
+    if xacp_port > 0 {
+        cmd = exec.command(bin + "", "--scene", pub_scene + "", "--xacp-port", str(xacp_port))
+    }
+    out := cmd.combined_output() >>> (err) {
         ch <- WorkerDone{
             kind: WORKER_PREVIEW,
             ok: false,
@@ -256,44 +295,85 @@ fn spawn_export_worker(
 }
 
 struct WaitStep {
-    is_worker bool
+    kind int
     event ui.Event
     worker WorkerDone
+    embed EmbedMsg
 }
+
+const WAIT_UI = 0
+const WAIT_WORKER = 1
+const WAIT_EMBED = 2
 
 fn empty_worker_done() WorkerDone {
     << WorkerDone{kind: 0, ok: false, message: "", temp_dir: "", output_scene: "", meta_path: "", revision: ""}
 }
 
-fn next_event_or_worker(events chan ui.Event, workers chan WorkerDone, deadline time.Instant) WaitStep {
+fn next_event_or_worker(
+    events chan ui.Event,
+    workers chan WorkerDone,
+    embeds chan EmbedMsg,
+    use_embed bool,
+    deadline time.Instant
+) WaitStep {
     none_ev := ui.Event{kind: ui.EV_NONE, window_id: 0, menu_id: "", width: 0, height: 0}
+    if !use_embed {
+        if deadline.is_zero() {
+            select {
+                ev := <- events { << WaitStep{kind: WAIT_UI, event: ev, worker: empty_worker_done(), embed: empty_embed_msg()} }
+                w := <- workers { << WaitStep{kind: WAIT_WORKER, event: none_ev, worker: w, embed: empty_embed_msg()} }
+            }
+        }
+        delay := deadline.since(time.instant())
+        if delay.nanoseconds() <= 0 {
+            << WaitStep{kind: WAIT_UI, event: none_ev, worker: empty_worker_done(), embed: empty_embed_msg()}
+        }
+        timer := delay.timer()
+        select {
+            ev := <- events {
+                timer.stop()
+                << WaitStep{kind: WAIT_UI, event: ev, worker: empty_worker_done(), embed: empty_embed_msg()}
+            }
+            w := <- workers {
+                timer.stop()
+                << WaitStep{kind: WAIT_WORKER, event: none_ev, worker: w, embed: empty_embed_msg()}
+            }
+            _ := <- timer.c {
+                timer.stop()
+            }
+        }
+        << WaitStep{kind: WAIT_UI, event: none_ev, worker: empty_worker_done(), embed: empty_embed_msg()}
+    }
     if deadline.is_zero() {
         select {
-            ev := <- events { << WaitStep{is_worker: false, event: ev, worker: empty_worker_done()} }
-            w := <- workers {
-                << WaitStep{is_worker: true, event: none_ev, worker: w}
-            }
+            ev := <- events { << WaitStep{kind: WAIT_UI, event: ev, worker: empty_worker_done(), embed: empty_embed_msg()} }
+            w := <- workers { << WaitStep{kind: WAIT_WORKER, event: none_ev, worker: w, embed: empty_embed_msg()} }
+            em := <- embeds { << WaitStep{kind: WAIT_EMBED, event: none_ev, worker: empty_worker_done(), embed: em} }
         }
     }
     delay := deadline.since(time.instant())
     if delay.nanoseconds() <= 0 {
-        << WaitStep{is_worker: false, event: none_ev, worker: empty_worker_done()}
+        << WaitStep{kind: WAIT_UI, event: none_ev, worker: empty_worker_done(), embed: empty_embed_msg()}
     }
     timer := delay.timer()
     select {
         ev := <- events {
             timer.stop()
-            << WaitStep{is_worker: false, event: ev, worker: empty_worker_done()}
+            << WaitStep{kind: WAIT_UI, event: ev, worker: empty_worker_done(), embed: empty_embed_msg()}
         }
         w := <- workers {
             timer.stop()
-            << WaitStep{is_worker: true, event: none_ev, worker: w}
+            << WaitStep{kind: WAIT_WORKER, event: none_ev, worker: w, embed: empty_embed_msg()}
+        }
+        em := <- embeds {
+            timer.stop()
+            << WaitStep{kind: WAIT_EMBED, event: none_ev, worker: empty_worker_done(), embed: em}
         }
         _ := <- timer.c {
             timer.stop()
         }
     }
-    << WaitStep{is_worker: false, event: none_ev, worker: empty_worker_done()}
+    << WaitStep{kind: WAIT_UI, event: none_ev, worker: empty_worker_done(), embed: empty_embed_msg()}
 }
 
 fn wait_ready(events chan ui.Event) ui.Event {
@@ -429,7 +509,7 @@ fn launch_viewport_session(workers chan WorkerDone, ed $&Editor, view $&widgets.
     << 0
 }
 
-fn launch_preview_session(workers chan WorkerDone, ed $&Editor, view $&widgets.View) int {
+fn launch_preview_session(workers chan WorkerDone, ed $&Editor, view $&widgets.View, preview_xacp_port int) int {
     doc := ed.draft.document() >>>
     scene_key := ed.project.scenes[ed.scene_index].key + ""
     pub_scene := publish_for_preview(&ed.project.path, &ed.output_dir, &ed.validator_bin, &scene_key, &doc) >>>
@@ -437,7 +517,7 @@ fn launch_preview_session(workers chan WorkerDone, ed $&Editor, view $&widgets.V
     ed.sync_toolbar_states()
     ed.set_status(STATUS_INFO, "Preview running (" + scene_key + ")...", view)
     ed.repaint_all(view)
-    xu spawn_preview_worker(workers, ed.preview_bin + "", pub_scene)
+    xu spawn_preview_worker(workers, ed.preview_bin + "", pub_scene, preview_xacp_port)
     << 0
 }
 
@@ -571,9 +651,10 @@ fn finish_asset_import(asset_path &string, ed $&Editor, view $&widgets.View) int
     ed.refresh_project_selectors()
     for k in 0:ed.project.assets.len {
         if ed.project.assets[k].key == imp.uid {
-            set_sel_selected($&ed.asset_select, k)
+            ed.select_asset_index(k)
         }
     }
+    ed.set_left_tab(1, view)
     ed.sync_asset_meta_text()
     ed.sync_toolbar_states()
     ed.set_status(STATUS_OK, "Imported " + imp.rel_path, view)
@@ -597,7 +678,7 @@ fn finish_relocate_asset(new_path &string, ed $&Editor, view $&widgets.View) int
     ed.refresh_project_selectors()
     for k in 0:ed.project.assets.len {
         if ed.project.assets[k].key == uid {
-            set_sel_selected($&ed.asset_select, k)
+            ed.select_asset_index(k)
         }
     }
     ed.sync_asset_meta_text()
@@ -614,8 +695,8 @@ fn try_launch_viewport(workers chan WorkerDone, ed $&Editor, view $&widgets.View
     }
 }
 
-fn try_launch_preview(workers chan WorkerDone, ed $&Editor, view $&widgets.View) {
-    _ := launch_preview_session(workers, ed, view) >>> (err) {
+fn try_launch_preview(workers chan WorkerDone, ed $&Editor, view $&widgets.View, preview_xacp_port int) {
+    _ := launch_preview_session(workers, ed, view, preview_xacp_port) >>> (err) {
         ed.set_status(STATUS_ERR, err.msg(), view)
         <<
     }
@@ -797,6 +878,12 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
 
     $w := win
     try_native_setup(&w)
+    if cfg.script_path.len > 0 {
+        _ := ui.native_set_opacity(0) >>> (err) {
+            _ := err
+            << 0
+        }
+    }
 
     $view := create_editor_view(&context, &identity, 1240.0, 700.0) >>>
     $ed := create_editor(
@@ -813,6 +900,23 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
     ) >>>
     ed.tilemap_bin = cfg.tilemap_bin + ""
     ed.sync_layout($&view, 1240.0, 700.0) >>>
+
+    // Auto-select 3D Studio (or TileMap 2D for tile-only scenes) on normal launch
+    init_doc := ed.draft.document() >>>
+    if init_doc.tilemap_2d_count() > 0 && init_doc.surface_count() == 0 && !init_doc.has_modeling_attachments() {
+        ed.set_stage_mode(STAGE_MODE_TILEMAP, $&view)
+    } else {
+        ed.set_stage_mode(STAGE_MODE_3D, $&view)
+    }
+
+    $script := load_script_runner(&cfg.script_path) >>>
+    $xacp_ctrl := open_editor_xacp_ctrl(cfg.xacp_port)
+    $xacp_tree := empty_shadow_tree() >>>
+    $xacp_inp := controls.new_input_map()
+    $xacp_host := new_editor_xacp_host(cfg.preview_xacp_port)
+    init_proj := clone_project(&ed.project)
+    init_src := ed.draft.source + ""
+    $embed := start_embed_bridge(cfg.viewport_bin + "", &init_proj, &init_src, &init_doc)
     _ := try_present_frame($&view, $&ed)
 
     workers := chan WorkerDone{cap: 8}
@@ -823,6 +927,17 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
     $last_dirty := false
 
     while true {
+        if script.active && !ed.close_pending {
+            step_script_runner($&script, $&ed, $&view, time.instant()) >>> (serr) {
+                if xacp_ctrl.is_open() { xacp_ctrl.close() }
+                stop_embed_bridge($&embed)
+                ed.dispose($&view)
+                >> serr
+            }
+        }
+        if xacp_ctrl.is_open() && !ed.close_pending {
+            xacp_tree = step_editor_xacp($&xacp_host, $&xacp_ctrl, xacp_tree, $&xacp_inp, $&ed, $&view)
+        }
         if ed.close_pending {
             try_accept_and_close($&w)
             <-
@@ -867,7 +982,7 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
         if ed.req_launch_preview {
             ed.req_launch_preview = false
             if !ed.preview_active {
-                try_launch_preview(workers, $&ed, $&view)
+                try_launch_preview(workers, $&ed, $&view, cfg.preview_xacp_port)
             }
         }
 
@@ -887,17 +1002,33 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
 
         now := time.instant()
         ed.tick_animations($&view, now)
+        dispatch_embed_requests($&embed, $&ed)
         if try_present_frame($&view, $&ed) {
             retry_deadline = time.zero_instant()
         } else {
             retry_deadline = instant_plus_ms(now, 16)
         }
+        if xacp_ctrl.is_open() {
+            fulfill_editor_xacp_screenshot($&xacp_ctrl, $&ed, $&view)
+        }
 
-        deadline := earlier_deadline(ed.next_tick_deadline(now), retry_deadline)
-        step := next_event_or_worker(events, workers, deadline)
+        $deadline := earlier_deadline(ed.next_tick_deadline(now), retry_deadline)
+        if script.active && !script.waiting_frame {
+            deadline = earlier_deadline(deadline, instant_plus_ms(now, 5))
+        } else if script.waiting_frame && !script.wait_deadline.is_zero() {
+            deadline = earlier_deadline(deadline, script.wait_deadline)
+        } else if xacp_ctrl.is_open() {
+            deadline = earlier_deadline(deadline, instant_plus_ms(now, 15))
+        }
+        step := next_event_or_worker(events, workers, embed.msg_ch, embed.active, deadline)
         event := &step.event
 
-        if step.is_worker {
+        if step.kind == WAIT_EMBED {
+            em := &step.embed
+            handle_embed_msg(em, $&ed, $&view)
+            ->
+        }
+        if step.kind == WAIT_WORKER {
             wmsg := &step.worker
             if wmsg.kind == WORKER_VIEWPORT {
                 ed.viewport_active = false
@@ -974,13 +1105,17 @@ fn run_editor_worker(events chan ui.Event, cfg LaunchConfig, project Project, wi
         }
         if closed { <- }
     }
+    if xacp_ctrl.is_open() { xacp_ctrl.close() }
+    stop_embed_bridge($&embed)
     ed.dispose($&view)
     << 0
 }
 
 fn worker_entry(events chan ui.Event, cfg LaunchConfig, project Project, win ui.Window) {
+    is_script := cfg.script_path.len > 0
     run_editor_worker(events, cfg, project, win) >>> (err) {
         eprintln("nexus-project-editor: " + err.msg())
+        if is_script { <<< 1 }
         <<
     }
 }

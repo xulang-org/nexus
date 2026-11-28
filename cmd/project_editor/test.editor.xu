@@ -931,6 +931,171 @@ fn test_phase5_modern_v9_components() {
     cleanup_dir(tmp + "")
 }
 
+fn run_phase6_unified_modeling_and_pbr(tmp string) int {
+    proj_json := filepath.join([tmp + "", "project.json"])
+    val_bin := "build/nexus-project-validate"
+    scene_path := filepath.join([tmp + "", "assets", "world.xuscene"])
+    proj := load_project(proj_json + "") >>>
+    $d := open_draft(scene_path + "") >>>
+
+    box_idx := d.spawn_whitebox_node(0, "box", fm.vec3(1.6, 1.4, 1.6)) >>>
+    t_true(box_idx > 0 && node_has_editable_mesh(&(d.document() >>>), box_idx), "spawn_whitebox attaches EditableMesh")
+    csg_idx := d.spawn_csg_hollow_node(0, fm.vec3(2.2, 1.8, 2.2), fm.vec3(1.2, 2.4, 1.2)) >>>
+    t_true(csg_idx > 0 && node_has_csg_tree(&(d.document() >>>), csg_idx), "spawn_csg attaches CsgTree")
+
+    d.apply_mesh_op(box_idx, "extrude", 0, -1, -1, 0.0, 0.4) >>>
+    d.apply_mesh_op(box_idx, "inset", 0, -1, -1, 0.25, 0.0) >>>
+    d.apply_mesh_op(box_idx, "bevel", 0, -1, -1, 0.0, 0.12) >>>
+    d.apply_mesh_op(box_idx, "box_uv", 0, -1, -1, 0.0, 1.0) >>>
+    info := inspect_node_modeling(&(d.document() >>>), box_idx)
+    t_true(info.has_editable && info.faces > 6 && info.verts > 8, "extrude/inset/bevel increased geometry")
+
+    $mat := default_studio_material()
+    mat.base_color = fm.vec3(0.75, 0.12, 0.28)
+    mat.metallic = 0.25
+    mat.roughness = 0.42
+    d.set_material_override(box_idx, 0, mat) >>>
+    info_mat := inspect_node_modeling(&(d.document() >>>), box_idx)
+    t_true(info_mat.has_mat && math.abs(info_mat.mat.base_color.x - 0.75) < 1e-6, "PBR override saved on box")
+
+    d.undo_edit() >>>
+    d.redo_edit() >>>
+    d.save(&proj, &val_bin) >>>
+
+    $d2 := open_draft(scene_path + "") >>>
+    reloaded := d2.document() >>>
+    t_true(reloaded.has_modeling_attachments(), "reloaded scene preserves v10 modeling attachments")
+    re_info := inspect_node_modeling(&reloaded, box_idx)
+    t_true(re_info.has_editable && re_info.faces > 6 && re_info.has_mat, "reloaded box preserves extruded faces & PBR material")
+
+    glb_res := export_node_glb_to_project(&reloaded, box_idx, &proj_json, "assets/test_box.glb", &val_bin) >>>
+    t_true(glb_res.rel_path == "assets/test_box.glb", "export_node_glb_to_project produces validated GLB")
+
+    d2.clear_material_override(box_idx, 0) >>>
+    t_true(!node_has_material_override(&(d2.document() >>>), box_idx, 0), "clear_material_override removes slot 0")
+    << 0
+}
+
+fn test_phase6_unified_modeling_and_pbr() {
+    tmp := setup_fixture_project()
+    _ := run_phase6_unified_modeling_and_pbr(tmp + "") >>> (err) {
+        cleanup_dir(tmp + "")
+        t_fail("phase6: " + err.msg())
+        <<
+    }
+    cleanup_dir(tmp + "")
+}
+
+fn run_multi_selection_batch_draft_ops(tmp string) int {
+    scene_path := filepath.join([tmp + "", "assets", "world.xuscene"])
+    $d := open_draft(scene_path + "") >>>
+    grp := d.add_node_under(0, resource.NODE_GROUP, "BatchGroup") >>>
+    n1 := d.spawn_whitebox_node(0, "box", fm.vec3(1.0, 1.0, 1.0)) >>>
+    n2 := d.spawn_whitebox_node(0, "box", fm.vec3(1.0, 1.0, 1.0)) >>>
+    d.set_nodes_properties_batch(
+        &[n1],
+        false, true, false, 0,
+        true, true, true, fm.vec3(0.0, 1.0, 0.0),
+        false, false, false, fm.vec3(0.0, 0.0, 0.0),
+        false, false, false, fm.vec3(1.0, 1.0, 1.0)
+    ) >>>
+    d.set_nodes_properties_batch(
+        &[n2],
+        false, true, false, 0,
+        true, true, true, fm.vec3(4.0, 1.0, 0.0),
+        false, false, false, fm.vec3(0.0, 0.0, 0.0),
+        false, false, false, fm.vec3(1.0, 1.0, 1.0)
+    ) >>>
+
+    // Material batch set / patch / clear with single-step undo
+    $red := default_studio_material()
+    red.base_color = fm.vec3(0.84, 0.16, 0.26)
+    red.roughness = 0.52
+    d.set_nodes_material_override(&[n1, n2], 0, red) >>>
+    im1 := inspect_node_modeling(&(d.document() >>>), n1)
+    im2 := inspect_node_modeling(&(d.document() >>>), n2)
+    t_true(math.abs(im1.mat.base_color.x - 0.84) < 1e-6 && math.abs(im2.mat.base_color.x - 0.84) < 1e-6, "set_nodes_material_override sets color on both nodes")
+
+    d.patch_nodes_material_override(
+        &[n1, n2], 0,
+        false, fm.vec3(0.0, 0.0, 0.0),
+        false, 0.0,
+        true, 0.22,
+        false, 0.0,
+        false, false,
+        false, ""
+    ) >>>
+    pm1 := inspect_node_modeling(&(d.document() >>>), n1)
+    pm2 := inspect_node_modeling(&(d.document() >>>), n2)
+    t_near(pm1.mat.roughness, 0.22, 1e-6, "patch roughness updates node 1")
+    t_near(pm2.mat.roughness, 0.22, 1e-6, "patch roughness updates node 2")
+    t_near(pm1.mat.base_color.x, 0.84, 1e-6, "patch roughness preserves node 1 color")
+    t_near(pm2.mat.base_color.x, 0.84, 1e-6, "patch roughness preserves node 2 color")
+
+    d.clear_nodes_material_override(&[n1, n2], 0) >>>
+    t_true(!node_has_material_override(&(d.document() >>>), n1, 0) && !node_has_material_override(&(d.document() >>>), n2, 0), "clear_nodes_material_override clears both")
+    d.undo_edit() >>>
+    t_true(node_has_material_override(&(d.document() >>>), n1, 0) && node_has_material_override(&(d.document() >>>), n2, 0), "single undo restores material on both nodes")
+
+    // Partial-axis property batch: changing ONLY Y=3.0 preserves distinct X values (0.0 and 4.0)
+    d.set_nodes_properties_batch(
+        &[n1, n2],
+        false, true, false, 0,
+        false, true, false, fm.vec3(0.0, 3.0, 0.0),
+        false, false, false, fm.vec3(0.0, 0.0, 0.0),
+        false, false, false, fm.vec3(1.0, 1.0, 1.0)
+    ) >>>
+    doc_y := d.document() >>>
+    dn1 := doc_y.describe_node(n1) >>>
+    dn2 := doc_y.describe_node(n2) >>>
+    t_near(dn1.local_3d.c3.x, 0.0, 1e-6, "partial Y update preserves node 1 X")
+    t_near(dn2.local_3d.c3.x, 4.0, 1e-6, "partial Y update preserves node 2 X")
+    t_near(dn1.local_3d.c3.y, 3.0, 1e-6, "partial Y update moves node 1 Y to 3")
+    t_near(dn2.local_3d.c3.y, 3.0, 1e-6, "partial Y update moves node 2 Y to 3")
+
+    d.set_nodes_visible_only(&[n1, n2], false) >>>
+    doc_vis := d.document() >>>
+    t_true(!(doc_vis.describe_node(n1) >>>).visible && !(doc_vis.describe_node(n2) >>>).visible, "set_nodes_visible_only hides both")
+    d.undo_edit() >>>
+    doc_uvis := d.document() >>>
+    t_true((doc_uvis.describe_node(n1) >>>).visible && (doc_uvis.describe_node(n2) >>>).visible, "single undo restores visibility on both")
+
+    // Batch reparent in 1 undo step
+    moved := d.reparent_nodes(&[n1, n2], grp, true) >>>
+    t_true(moved.len == 2, "reparent_nodes returns both remapped nodes")
+    doc_rep := d.document() >>>
+    t_true((doc_rep.describe_node(moved[0]) >>>).parent == grp && (doc_rep.describe_node(moved[1]) >>>).parent == grp, "both nodes reparented under group")
+
+    // Batch duplicate creates offset copies in 1 undo step
+    before_cnt := doc_rep.node_count()
+    dups := d.duplicate_nodes(&moved, fm.vec3(0.5, 0.0, 0.0)) >>>
+    t_true(dups.len == 2, "duplicate_nodes returns 2 new root indices")
+    doc_dup := d.document() >>>
+    t_true(doc_dup.node_count() == before_cnt + 2, "duplicate_nodes adds 2 nodes")
+    d.undo_edit() >>>
+    t_true((d.document() >>>).node_count() == before_cnt, "single undo removes both duplicated nodes")
+
+    // Camera-anchored spawn places near anchor & avoids overlapping existing node
+    s1 := d.spawn_whitebox_node_near(0, "box", fm.vec3(1.6, 1.4, 1.6), 12.0, -6.0, 0.5) >>>
+    s2 := d.spawn_whitebox_node_near(0, "box", fm.vec3(1.6, 1.4, 1.6), 12.0, -6.0, 0.5) >>>
+    doc_sp := d.document() >>>
+    p_s1 := (doc_sp.describe_node(s1) >>>).local_3d.c3
+    p_s2 := (doc_sp.describe_node(s2) >>>).local_3d.c3
+    t_true(math.abs(p_s1.x - 12.0) < 0.01 && math.abs(p_s1.z + 6.0) < 0.01, "first spawn snaps near camera anchor")
+    t_true(math.hypot(p_s2.x - p_s1.x, p_s2.z - p_s1.z) >= 1.3, "second spawn avoids overlap near camera anchor")
+    << 0
+}
+
+fn test_multi_selection_batch_draft_ops() {
+    tmp := setup_fixture_project()
+    _ := run_multi_selection_batch_draft_ops(tmp + "") >>> (err) {
+        cleanup_dir(tmp + "")
+        t_fail("multi_selection_batch: " + err.msg())
+        <<
+    }
+    cleanup_dir(tmp + "")
+}
+
 fn main() int {
     test_theme_paper_tokens()
     println("PASS: test_theme_paper_tokens")
@@ -954,5 +1119,9 @@ fn main() int {
     println("PASS: test_i18n_persistence_and_strings")
     test_phase5_modern_v9_components()
     println("PASS: test_phase5_modern_v9_components")
+    test_phase6_unified_modeling_and_pbr()
+    println("PASS: test_phase6_unified_modeling_and_pbr")
+    test_multi_selection_batch_draft_ops()
+    println("PASS: test_multi_selection_batch_draft_ops")
     << 0
 }
