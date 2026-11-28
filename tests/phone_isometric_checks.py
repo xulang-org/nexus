@@ -73,7 +73,7 @@ def main():
         work = Path(directory)
         check = work / 'touch-check'
         check.mkdir()
-        (check / 'xu.xun').write_text('module: example/isometric_touch_check\nversion: !ver 0.1.0\nxu: !ver 0.14.2\n'
+        (check / 'xu.xun').write_text('module: example/isometric_touch_check\nversion: !ver 0.1.0\nxu: !ver 0.14.4\n'
                                      f'require:\n  "github.com/xulang-org/nexus": file:{ROOT}\n')
         shutil.copyfile(ROOT / 'examples/isometric_2d/touch.xu', check / 'touch.xu')
         shutil.copyfile(ROOT / 'tests/phone_isometric_touch_checks.xu', check / 'main.xu')

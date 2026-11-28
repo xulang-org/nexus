@@ -22,11 +22,11 @@ GLB 已支持受限 TRS 动画采样、双动画剪辑 TRS/SLERP 姿态融合（
 3D 已加入带法线/切线/UV 的金属度/粗糙度直接光材质、基础颜色/ORM/自发光/法线/独立 AO 纹理与 mipmap、单双面渲染、传统前向每网格 16 光源与新分簇前向着色（Clustered Forward `16×16×24`，最高 1024 动态光源）、Split-Sum GGX 环境光 IBL 烘焙（`EnvironmentIbl3D`：64×64 BRDF DFG LUT + 5 级预过滤环境贴图）、30-bit Morton 空间排序 Meshlet（`MeshletVisRenderer3D`：64 顶点/124 三角面簇 + 保守法线锥背面剔除 + Reverse-Z 7 级 `R32_FLOAT` Hi-Z 遮挡剔除 + `R32_UINT` Visibility Buffer 解耦计算着色，含解析屏幕空间重心/UV 梯度纹理采样与方向/级联阴影）、GPU `draw_indexed_indirect` 间接绘制、`RGBA16_FLOAT` 线性 HDR + L1 球谐 3D 辐照度探针网格（`IrradianceGrid3D`）、GTAO 环境光遮蔽（含双边滤波）、Hi-Z 加速屏幕空间反射（SSR）、多级 HDR Bloom、ACES Filmic 色调映射与 TAA 历史混合后处理管线，并由 `ModernPipeline3D`（`integration/rendering/three_d/modern_frame3d.xu`）统一串联静态 Meshlet VisBuffer、Split-Sum IBL 与 GPU 蒙皮网格单帧合成。
 3D 场景树与核心服务已加入脏标记拓扑 SoA 变换缓存（`SceneTree`）、静态三角面/AABB/斜坡 BVH、1D X-axis SAP 与增量式 SAH+AVL 平衡动态包围体树（`DynamicBvh3D`）、扩展位置动力学求解器（`XPBD`：15 轴动态 OBB 间互碰与静态三角面库仑摩擦/恢复求解、柔度距离/牵引约束、8×8 布料网格、刚体堆叠与 6 自由度四元数转动 `JointedWorld3D` 球铰链/摆锤/带伺服电机与限位铰链关节，配合 `SkeletonRagdoll3D` 与动画权重平滑融合并驱动 GPU 蒙皮骨骼布娃娃）、3D 导航网格与人群避障（`navigation`：斜率过滤、拓扑边缝合、`A*` 区域代价与 XZ Funnel 路径拉直 + RVO 互惠人群避障）、基于连续分块 SoA 与常驻协程工作池（`ecs.EcsWorkerPool`）的无锁并发 Archetype `ecs` 模块，以及后台解码 + 帧预算分片上传 + LRU 显存淘汰的异步资源流式管理器（`integration/streaming`）；场景序列化已升级到 v9（Environment / RigidBody3D / Joint3D / Terrain / ParticleEmitter3D / PrefabInstance 附件，同步接入 `cmd/project_editor` v9 组件检视器与 `cmd/project_viewport --modern` 视口管线）；所有 45 个 3D 着色器已提供 MSL / GLSL 450 / HLSL SM 6.0 三后端源码（本机未安装 MetalToolchain/`glslangValidator`/`dxc` 时 `shader-cross-backend-test` 完成全量奇偶校验、入口点与寄存器约定验证，实际 GPU 像素验证当前覆盖 macOS arm64 / Metal）；引擎整合层新增持久 UI 控件树与焦点/模态路由（`integration/ui/tree.xu`）、120 帧滚动 `FrameProfiler` + GPU/资源驻留 `EngineTelemetry`（`timing/profiler.xu`、`integration/diagnostics`）、HMAC-SHA256 签名资源包与防回滚原子热更新/回滚（`resources/bundle`、`integration/bundle`），并提供全功能 3D 沙盒示例 `examples/modern_sandbox`。完整 glTF 复杂材质扩展与真机跨平台图形驱动运行仍可按需继续扩展。
 
-当前使用 Xu **0.14.2**（本地 `../xu-dev` 工具链，包含 Nexus 所需图形/计算存储缓冲区、计算采样器/读写存储纹理、`R32_UINT`、`draw_indexed_indirect` 及 ARM64 `f64` 索引移位/LICM 优化修复）。该 SDK 包含 Phone game 对象对原生导入的支持，并随生成工程导出原生归档与 C 桥接。编译器、标准库、native/phone 工具必须来自同一 SDK。两个移动示例此前使用 Xu 0.12.7-dev.1 在 Sony XQ-BE72（Android 13）上运行，并完成 iOS 应用构建。iPhone 8（iOS 16.7.16）的真机结果来自 Xu 0.12.5 构建。
+当前使用 Xu **0.14.4**（本地 `../xu-dev` 工具链，包含 Nexus 所需图形/计算存储缓冲区、计算采样器/读写存储纹理、`R32_UINT`、`draw_indexed_indirect` 及 ARM64 `f64` 索引移位/LICM 优化修复）。该 SDK 包含 Phone game 对象对原生导入的支持，并随生成工程导出原生归档与 C 桥接。编译器、标准库、native/phone 工具必须来自同一 SDK。两个移动示例此前使用 Xu 0.12.7-dev.1 在 Sony XQ-BE72（Android 13）上运行，并完成 iOS 应用构建。iPhone 8（iOS 16.7.16）的真机结果来自 Xu 0.12.5 构建。
 
 ## 构建所需的 Xu SDK
 
-使用 Xu **0.14.2** 工具链（可直接复用已自举构建的 `../xu-dev`）：
+使用 Xu **0.14.4** 工具链（可直接复用已自举构建的 `../xu-dev`）：
 
 ```sh
 # 1. 若已将同一版本 SDK 安装到 ~/.xu 或设置 env，先激活环境：
@@ -1304,7 +1304,9 @@ GLB 表面、音频、脚本和 2D/3D 相机可保存到场景文件，实例覆
 make project-cli project-validator
 ./build/nexus-project layout
 ./build/nexus-project init ./my_game --name "Star Odyssey" --id com.studio.starodyssey --template 3d --locale zh-CN --platforms all --nexus-path "$(pwd)"
-./build/nexus-project doctor ./my_game/project.json --strict
+# 支持传目录或 project.json；可选 --fix（--dry-run 预览）、--toolchain、--category <name>、--json、--strict
+./build/nexus-project doctor ./my_game --toolchain
+./build/nexus-project doctor ./my_game --fix --dry-run
 (cd ./my_game && xu check src/main.xu && xu build src/main.xu -o build/game && ./build/game --smoke)
 ./build/nexus-project steam-stage ./my_game/project.json --output ./my_game/build/stage-steam
 ```

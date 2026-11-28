@@ -14,13 +14,13 @@ SOURCE='''@main
 ren #"github.com/xulang-org/nexus/rendering/three_d"
 shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
 fn failed_read(device $&ren.Device3D) bool {
-    device.read_pixel(0,0) or(err){ assert(err.msg()=="gpu: injected consumed submit failure")
+    device.read_pixel(0,0) >>>(err){ assert(err.msg()=="gpu: injected consumed submit failure")
         println(err.msg())
         << true }
     << false
 }
 fn failed_begin(device $&ren.Device3D) bool {
-    device.begin(255) or(err){ assert(err.msg()=="gpu: injected depth allocation failure")
+    device.begin(255) >>>(err){ assert(err.msg()=="gpu: injected depth allocation failure")
         println(err.msg())
         << true }
     << false
@@ -48,7 +48,7 @@ fn run() int {
     println("PASS: consumed submit failure and partial resize allocation failure preserve errors and recover the next 3D frame")
     << 0
 }
-fn main() int { << run() or(err){ eprintln(err.msg())
+fn main() int { << run() >>>(err){ eprintln(err.msg())
     << 1 } }
 '''
 SHIM='''#include <SDL3/SDL.h>
