@@ -33,6 +33,7 @@ async function start() {
     let game;
     let state;
     let visible = true;
+    let contextLost = false;
     let animation = null;
     let lastFrame = null;
     let touchId = null;
@@ -72,12 +73,12 @@ async function start() {
     }
 
     function schedule() {
-        if (visible && game && animation === null) animation = requestAnimationFrame(draw);
+        if (visible && !contextLost && game && animation === null) animation = requestAnimationFrame(draw);
     }
 
     function draw(timestamp) {
         animation = null;
-        if (!visible || !game) return;
+        if (!visible || contextLost || !game) return;
         try {
             if (mesh && lastFrame !== null && target[0] === drawnTarget[0] && target[1] === drawnTarget[1]) {
                 schedule();
@@ -108,10 +109,10 @@ async function start() {
         }
     }
 
-    function touchPoint(touch) {
+    function touchPoint(touch, clamp = false) {
         const x = Number.isFinite(touch.clientX) ? touch.clientX : touch.pageX;
         const y = Number.isFinite(touch.clientY) ? touch.clientY : touch.pageY;
-        return renderer.point(x, y);
+        return renderer.point(x, y, { clamp });
     }
 
     try {
@@ -124,9 +125,9 @@ async function start() {
         tt.onShow(() => { visible = true; onResize(); schedule(); });
         if (typeof tt.onDeviceOrientationChange === "function") tt.onDeviceOrientationChange(onResize);
         tt.onTouchStart(({ changedTouches }) => {
-            if (!visible || !game || touchId !== null || !changedTouches.length) return;
+            if (!visible || contextLost || !game || touchId !== null || !changedTouches.length) return;
             const touch = changedTouches[0];
-            const point = touchPoint(touch);
+            const point = touchPoint(touch, false);
             if (point[0] < 0) return;
             if (!mesh && (state >>> 24) === COLLECTED_ALL) state = game.reset();
             touchId = touch.identifier;
@@ -135,18 +136,34 @@ async function start() {
         tt.onTouchMove(({ changedTouches }) => {
             if (!game || touchId === null) return;
             const touch = changedTouches.find((entry) => entry.identifier === touchId);
-            if (touch) target = touchPoint(touch);
+            if (touch) target = touchPoint(touch, true);
         });
         tt.onTouchEnd(({ changedTouches }) => {
             if (changedTouches.some((entry) => entry.identifier === touchId)) releaseTouch();
         });
-        tt.onTouchCancel(releaseTouch);
+        tt.onTouchCancel((event) => {
+            const touches = event && Array.isArray(event.changedTouches) ? event.changedTouches : null;
+            if (!touches || !touches.length || touches.some((entry) => entry.identifier === touchId)) {
+                releaseTouch();
+            }
+        });
         const model = mesh ? tt.getFileSystemManager().readFileSync("assets/crate.glb") : null;
         const [loadedGame, atlas] = await Promise.all([
             loadGame((path, imports) => TTWebAssembly.instantiate(path, imports), "game.wasm", model),
             mesh ? null : loadAtlas(),
         ]);
-        renderer = new WebGLCanvas(canvas, mesh ? loadedGame.model : atlas, DESIGN_WIDTH, DESIGN_HEIGHT, mesh);
+        renderer = new WebGLCanvas(canvas, mesh ? loadedGame.model : atlas, DESIGN_WIDTH, DESIGN_HEIGHT, mesh, {
+            onContextLost() {
+                contextLost = true;
+                stop();
+            },
+            onContextRestored() {
+                contextLost = false;
+                lastFrame = null;
+                drawnTarget = undefined;
+                schedule();
+            },
+        });
         loadedGame.model = null;
         resize();
         game = loadedGame;

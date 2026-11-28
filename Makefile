@@ -386,7 +386,7 @@ audio-dsp-test: layers sdk
 	$(XU) build tests/audio_dsp_adpcm_checks.xu -o build/audio-dsp-checks
 	./build/audio-dsp-checks
 
-.PHONY: phone-frame-test phone-state-test phone-audio-test miniprogram miniprogram-test douyin douyin-test miniprogram-3d douyin-3d webgl-3d-test
+.PHONY: phone-frame-test phone-state-test phone-audio-test miniprogram miniprogram-test douyin douyin-test miniprogram-3d douyin-3d webgl-3d-test webgl-web webgl-web-test
 miniprogram: layers sdk
 	$(PYTHON) tools/build_miniprogram.py --xu "$(XU)"
 
@@ -407,6 +407,12 @@ douyin-3d: layers sdk
 
 webgl-3d-test: miniprogram-3d douyin-3d
 	node tests/webgl_3d.cjs
+
+webgl-web: layers sdk
+	$(PYTHON) tools/build_miniprogram.py --platform web --xu "$(XU)"
+
+webgl-web-test: webgl-web
+	node tests/webgl_web.cjs
 
 phone-frame-test: sdk
 	mkdir -p build
