@@ -213,31 +213,44 @@ fn (bvh &StaticBvh3D) query_ray(origin fm.Vec3, motion fm.Vec3) []int {
     << hits
 }
 
-// 1D X-axis insertion-sorted Sweep and Prune returning canonical (lo, hi) pairs.
-fn sap_broadphase_pairs(bounds &[]fm.Aabb3) []int {
+struct SapBroadphaseState {
+    order []int
+}
+
+fn new_sap_state() SapBroadphaseState {
+    << SapBroadphaseState{order: []int{}}
+}
+
+// 1D X-axis incremental insertion-sorted Sweep and Prune returning canonical (lo, hi) pairs.
+fn sap_broadphase_pairs_cached(state $&SapBroadphaseState, bounds &[]fm.Aabb3) []int {
     n := bounds.len
     $pairs := []int{}
-    if n < 2 { << pairs }
-    $order := []int{}
-    for i in 0:n { order.push(i) }
+    if n < 2 {
+        state.order = []int{}
+        << pairs
+    }
+    if state.order.len != n {
+        state.order = []int{}
+        for i in 0:n { state.order.push(i) }
+    }
     for i in 1:n {
-        key := order[i]
+        key := state.order[i]
         key_x := bounds[key].minimum.x
         $j := i - 1
         while j >= 0 {
-            other := order[j]
+            other := state.order[j]
             ox := bounds[other].minimum.x
             if ox < key_x || (ox == key_x && other < key) { <- }
-            order[j + 1] = other
+            state.order[j + 1] = other
             j -= 1
         }
-        order[j + 1] = key
+        state.order[j + 1] = key
     }
     for i in 0:n {
-        ia := order[i]
+        ia := state.order[i]
         ba := bounds[ia]
         for j in i + 1:n {
-            ib := order[j]
+            ib := state.order[j]
             bb := bounds[ib]
             if bb.minimum.x > ba.maximum.x { <- }
             if ba.maximum.y < bb.minimum.y || ba.minimum.y > bb.maximum.y ||
@@ -252,4 +265,10 @@ fn sap_broadphase_pairs(bounds &[]fm.Aabb3) []int {
         }
     }
     << pairs
+}
+
+// 1D X-axis insertion-sorted Sweep and Prune returning canonical (lo, hi) pairs.
+fn sap_broadphase_pairs(bounds &[]fm.Aabb3) []int {
+    $st := new_sap_state()
+    << sap_broadphase_pairs_cached($&st, bounds)
 }

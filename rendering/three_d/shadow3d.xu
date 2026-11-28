@@ -2,6 +2,7 @@
 
 #gpu
 #gpu/layout
+#encoding/binary
 #errors
 fm #"github.com/xulang-org/nexus/foundation/math"
 policy #"github.com/xulang-org/nexus/resources/shadow"
@@ -103,7 +104,7 @@ pub fn (shadow $&ShadowMap3D) render(device &Device3D,casters &[]ShadowCaster3D,
     description.validate() >>>
     if description.resolution()!=shadow.description.resolution() || description.face_count()!=shadow.description.face_count() || casters.len>16384 { >> errors.new("nexus shadow: fixed map layout/resolution or caster budget exceeded") }
     shadow_description_words(&description,0) >>>
-    $cutout_words := []int{}
+    $cutout_bytes := [][]u8{}
     for caster in casters {
         shadow.owner.validate_mesh(caster.mesh,false) >>>
         if !caster.world.is_affine() { >> errors.new("nexus shadow: caster world must be finite affine") }
@@ -123,9 +124,11 @@ pub fn (shadow $&ShadowMap3D) render(device &Device3D,casters &[]ShadowCaster3D,
             }
             has_tex = 1.0
         }
+        $cw := []int{}
         for value in [caster.alpha_cutoff, has_tex, 0.0, 0.0, caster.uv_rect.x, caster.uv_rect.y, caster.uv_rect.z, caster.uv_rect.w] {
-            cutout_words.push(scalar_word(value) >>>)
+            cw.push(scalar_word(value) >>>)
         }
+        cutout_bytes.push(word_bytes(&cw) >>>)
     }
     // Preflight ALL views, even for an empty update, before any GPU recording.
     $transforms := []int{}
@@ -158,29 +161,48 @@ pub fn (shadow $&ShadowMap3D) render(device &Device3D,casters &[]ShadowCaster3D,
     size := description.resolution()
     columns := shadow_columns(&description)
     if columns < 1 { >> errors.new("nexus shadow: invalid layout columns") }
-    for face in 0:description.face_count() {
-        pass.viewport((face%columns)*size,(face/columns)*size,size,size) >>>
-        pass.scissor((face%columns)*size,(face/columns)*size,size,size) >>>
-        for i in 0:casters.len {
-            caster := &casters[i]
-            mesh := caster.mesh
-            $values := []int{}
-            for j in 0:16 { values.push(transforms[(face*casters.len+i)*16+j]) }
-            bytes := word_bytes(&values) >>>
-            $cvals := []int{}
-            for j in 0:8 { cvals.push(cutout_words[i*8+j]) }
-            cutout_bytes := word_bytes(&cvals) >>>
-            pass.vertex_buffer_ref(0,mesh.vertices,0) >>>
-            pass.index_buffer_ref(mesh.indices,0,gpu.INDEX32) >>>
-            if caster.alpha_cutoff > 0.0 && caster.alpha_texture.present {
-                pass.sampler_ref(gpu.FRAGMENT,0,caster.alpha_texture.image,caster.alpha_texture.sampler) >>>
-            } else {
-                pass.sampler(gpu.FRAGMENT,0,&device.whites[0],&device.white_samplers[0]) >>>
+    if casters.len > 0 {
+        order := binary.little_endian()
+        $mvp_bytes := zero_bytes(64)
+        $has_bound_mesh := false
+        $last_vb := casters[0].mesh.vertices
+        $last_ib := casters[0].mesh.indices
+        $last_sampler_kind := -1
+        $last_tex := casters[0].alpha_texture.image
+        $last_samp := casters[0].alpha_texture.sampler
+        for face in 0:description.face_count() {
+            pass.viewport((face%columns)*size,(face/columns)*size,size,size) >>>
+            pass.scissor((face%columns)*size,(face/columns)*size,size,size) >>>
+            for i in 0:casters.len {
+                caster := &casters[i]
+                mesh := caster.mesh
+                base := (face*casters.len+i)*16
+                for j in 0:16 { order.put_u32_bytes($&mvp_bytes, j*4, transforms[base+j]) >>> }
+                if !has_bound_mesh || !mesh.vertices.same(last_vb) {
+                    pass.vertex_buffer_ref(0,mesh.vertices,0) >>>
+                    last_vb = mesh.vertices
+                }
+                if !has_bound_mesh || !mesh.indices.same(last_ib) {
+                    pass.index_buffer_ref(mesh.indices,0,gpu.INDEX32) >>>
+                    last_ib = mesh.indices
+                }
+                has_bound_mesh = true
+                if caster.alpha_cutoff > 0.0 && caster.alpha_texture.present {
+                    if last_sampler_kind != 1 || !caster.alpha_texture.image.same(last_tex) || !caster.alpha_texture.sampler.same(last_samp) {
+                        pass.sampler_ref(gpu.FRAGMENT,0,caster.alpha_texture.image,caster.alpha_texture.sampler) >>>
+                        last_sampler_kind = 1
+                        last_tex = caster.alpha_texture.image
+                        last_samp = caster.alpha_texture.sampler
+                    }
+                } else if last_sampler_kind != 0 {
+                    pass.sampler(gpu.FRAGMENT,0,&device.whites[0],&device.white_samplers[0]) >>>
+                    last_sampler_kind = 0
+                }
+                pass.uniform(gpu.VERTEX,0,&mvp_bytes) >>>
+                pass.uniform(gpu.FRAGMENT,0,&cutout_bytes[i]) >>>
+                pass.draw_indexed(mesh.count,0,0,1,0) >>>
+                triangles+=mesh.count/3
             }
-            pass.uniform(gpu.VERTEX,0,&bytes) >>>
-            pass.uniform(gpu.FRAGMENT,0,&cutout_bytes) >>>
-            pass.draw_indexed(mesh.count,0,0,1,0) >>>
-            triangles+=mesh.count/3
         }
     }
     pass.end() >>>
@@ -243,6 +265,9 @@ fn shadow_description_words(description &policy.ShadowDescription3D,index int) [
     if description.pcss_light_radius() > 0.0 { grad_x = -description.pcss_light_radius() }
     for value in [grad_x,gradients.y,gradients.z,gradients.w] { words.push(scalar_word(value) >>>) }
     << words
+}
+pub fn (binding &ShadowBinding3D) matches_camera(view_projection fm.Mat4) bool {
+    << !binding.present || binding.description.matches_camera(view_projection)
 }
 pub fn (binding &ShadowBinding3D) validate_camera(view_projection fm.Mat4) int {
     if binding.present && !binding.description.matches_camera(view_projection) { >> errors.new("nexus shadow: cascades belong to a different camera; refresh before drawing") }

@@ -83,6 +83,7 @@ pub struct MeshletVisRenderer3D {
     buffers []gpu.Buffer // [0]=verts, [1]=indices, [2]=meshlets, [3]=instances, [4]=commands, [5]=results, [6]=dummy_probe
     meshes []MeshletProtoEntry
     instances []MeshletInstanceEntry
+    instance_dirty []bool
     albedo_refs []TextureRef3D
     total_vertices int
     total_indices int
@@ -431,6 +432,7 @@ pub fn (device &Device3D) meshlet_vis_renderer(program &MeshletProgram3D) Meshle
         buffers: []gpu.Buffer{},
         meshes: []MeshletProtoEntry{},
         instances: []MeshletInstanceEntry{},
+        instance_dirty: []bool{},
         albedo_refs: []TextureRef3D{},
         total_vertices: 0,
         total_indices: 0,
@@ -535,8 +537,16 @@ pub fn (mv $&MeshletVisRenderer3D) add_instance(mesh_id int, world fm.Mat4, mate
         world: world,
         tex_slot: tex_slot
     })
+    mv.instance_dirty.push(false)
     mv.total_meshlets += m.build.meshlets.len
     << id
+}
+
+fn mat4_equals(a fm.Mat4, b fm.Mat4) bool {
+    << a.c0.x == b.c0.x && a.c0.y == b.c0.y && a.c0.z == b.c0.z && a.c0.w == b.c0.w &&
+       a.c1.x == b.c1.x && a.c1.y == b.c1.y && a.c1.z == b.c1.z && a.c1.w == b.c1.w &&
+       a.c2.x == b.c2.x && a.c2.y == b.c2.y && a.c2.z == b.c2.z && a.c2.w == b.c2.w &&
+       a.c3.x == b.c3.x && a.c3.y == b.c3.y && a.c3.z == b.c3.z && a.c3.w == b.c3.w
 }
 
 pub fn (mv $&MeshletVisRenderer3D) set_instance_transform(instance_id int, world fm.Mat4) int {
@@ -547,9 +557,11 @@ pub fn (mv $&MeshletVisRenderer3D) set_instance_transform(instance_id int, world
     if !world.is_affine() {
         >> errors.new("nexus meshlet: instance transform must be finite affine")
     }
+    if mat4_equals(mv.instances[instance_id].world, world) { << 0 }
     _ := world.affine_inverse() >>>
     inst := $&mv.instances[instance_id]
     inst.world = world
+    mv.instance_dirty[instance_id] = true
     mv.instances_dirty = true
     << 0
 }
@@ -561,34 +573,42 @@ fn max_basis_scale(m fm.Mat4) f64 {
     << math.max(sx, math.max(sy, sz))
 }
 
-fn (mv &MeshletVisRenderer3D) pack_instances_bytes() []u8 {
+fn pack_instance_into(bytes $&[]u8, base int, inst &MeshletInstanceEntry) int {
     order := binary.little_endian()
-    $bytes := zero_bytes(mv.instances.len * 224)
-    for i in 0:mv.instances.len {
-        inst := &mv.instances[i]
-        inv_t := (inst.world.affine_inverse() >>>).transposed()
-        base := i * 224
+    inv_t := (inst.world.affine_inverse() >>>).transposed()
 
-        mw := matrix_words(inst.world) >>>
-        for j in 0:16 { order.put_u32_bytes($&bytes, base + j * 4, mw[j]) >>> }
-        nw := matrix_words(inv_t) >>>
-        for j in 0:16 { order.put_u32_bytes($&bytes, base + 64 + j * 4, nw[j]) >>> }
+    mw := matrix_words(inst.world) >>>
+    for j in 0:16 { order.put_u32_bytes(bytes, base + j * 4, mw[j]) >>> }
+    nw := matrix_words(inv_t) >>>
+    for j in 0:16 { order.put_u32_bytes(bytes, base + 64 + j * 4, nw[j]) >>> }
 
-        $orient := 1.0
-        if (inst.world.determinant_sign() >>>) < 0 { orient = -1.0 }
-        max_sc := max_basis_scale(inst.world)
-        for j in 0:4 {
-            $sv := 0.0
-            if j == 0 { sv = max_sc }
-            if j == 1 { sv = f64(inst.tex_slot) }
-            if j == 3 { sv = orient }
-            put_scalar($&bytes, base + 128 + j * 4, sv) >>>
-        }
+    $orient := 1.0
+    if (inst.world.determinant_sign() >>>) < 0 { orient = -1.0 }
+    max_sc := max_basis_scale(inst.world)
+    for j in 0:4 {
+        $sv := 0.0
+        if j == 0 { sv = max_sc }
+        if j == 1 { sv = f64(inst.tex_slot) }
+        if j == 3 { sv = orient }
+        put_scalar(bytes, base + 128 + j * 4, sv) >>>
+    }
 
-        mat_w := material_words(&inst.material, orient) >>>
-        for j in 0:20 { order.put_u32_bytes($&bytes, base + 144 + j * 4, mat_w[j]) >>> }
+    mat_w := material_words(&inst.material, orient) >>>
+    for j in 0:20 { order.put_u32_bytes(bytes, base + 144 + j * 4, mat_w[j]) >>> }
+    << 0
+}
+
+fn (mv &MeshletVisRenderer3D) pack_instances_range(start_idx int, end_idx int) []u8 {
+    count := end_idx - start_idx
+    $bytes := zero_bytes(count * 224)
+    for i in start_idx:end_idx {
+        pack_instance_into($&bytes, (i - start_idx) * 224, &mv.instances[i]) >>>
     }
     << bytes
+}
+
+fn (mv &MeshletVisRenderer3D) pack_instances_bytes() []u8 {
+    << mv.pack_instances_range(0, mv.instances.len) >>>
 }
 
 pub fn (mv $&MeshletVisRenderer3D) commit(device &Device3D) int {
@@ -693,10 +713,41 @@ pub fn (mv $&MeshletVisRenderer3D) sync_instances(device &Device3D) int {
         >> errors.new("nexus meshlet: closed, uncommitted or foreign renderer")
     }
     if !mv.instances_dirty { << 0 }
-    inst_bytes := mv.pack_instances_bytes() >>>
+
+    $dirty_count := 0
+    $first_dirty := mv.instances.len
+    $last_dirty := -1
+    for i in 0:mv.instance_dirty.len {
+        if mv.instance_dirty[i] {
+            dirty_count += 1
+            if i < first_dirty { first_dirty = i }
+            if i > last_dirty { last_dirty = i }
+        }
+    }
+    if dirty_count == 0 {
+        mv.instances_dirty = false
+        << 0
+    }
+
     dev := device.gpu_device() >>>
-    $up := dev.upload(&mv.buffers[3], 0, &inst_bytes) >>>
-    up.close() >>>
+    if dirty_count <= 16 {
+        $single := zero_bytes(224)
+        for i in first_dirty:(last_dirty + 1) {
+            if mv.instance_dirty[i] {
+                pack_instance_into($&single, 0, &mv.instances[i]) >>>
+                $up := dev.upload(&mv.buffers[3], i * 224, &single) >>>
+                up.close() >>>
+                mv.instance_dirty[i] = false
+            }
+        }
+    } else {
+        span_bytes := mv.pack_instances_range(first_dirty, last_dirty + 1) >>>
+        $up := dev.upload(&mv.buffers[3], first_dirty * 224, &span_bytes) >>>
+        up.close() >>>
+        for i in first_dirty:(last_dirty + 1) {
+            mv.instance_dirty[i] = false
+        }
+    }
     mv.instances_dirty = false
     << 0
 }
@@ -799,7 +850,6 @@ pub fn (mv $&MeshletVisRenderer3D) cull(
     }
     mv.record_cull_pass(device, $&enc, &pbytes, false, &dummy_hiz) >>>
     $fence := enc.submit() >>>
-    fence.wait() >>>
     fence.close() >>>
     mv.culled = true
     << 0
@@ -830,7 +880,6 @@ pub fn (mv $&MeshletVisRenderer3D) cull_with_hiz(
     $enc := dev.command_encoder() >>>
     mv.record_cull_pass(device, $&enc, &pbytes, true, hiz) >>>
     $fence := enc.submit() >>>
-    fence.wait() >>>
     fence.close() >>>
     mv.culled = true
     << 0
@@ -1011,8 +1060,11 @@ fn (mv &MeshletVisRenderer3D) render_and_shade_core(
     cpass.end() >>>
 
     $fence := enc.submit() >>>
-    fence.wait() >>>
     fence.close() >>>
+    hdr.draw_count = 1
+    hdr.lit_draws = 1
+    hdr.light_candidates = clustered.light_count
+    hdr.selected_lights = clustered.light_count
     hdr.ready = true
     << 0
 }

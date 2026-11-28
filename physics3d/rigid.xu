@@ -69,6 +69,7 @@ pub struct RigidWorld3D {
     box_bvh StaticBvh3D
     ramp_bvh StaticBvh3D
     triangle_bvh StaticBvh3D
+    sap_state SapBroadphaseState
 }
 
 struct NarrowContact {
@@ -117,8 +118,19 @@ fn swept_aabb(box fm.Aabb3, motion fm.Vec3) fm.Aabb3 {
 }
 
 fn body_bounds_unchecked(body RigidBody3D) fm.Aabb3 {
-    $extent := body.half_extents
-    if body.kind == SHAPE_SPHERE { extent = fm.vec3(body.radius, body.radius, body.radius) }
+    if body.kind == SHAPE_SPHERE {
+        extent := fm.vec3(body.radius, body.radius, body.radius)
+        << fm.Aabb3{minimum: body.position.sub(extent), maximum: body.position.add(extent)}
+    }
+    ax := quat_rotate_3d(body.orientation, fm.vec3(1.0, 0.0, 0.0))
+    ay := quat_rotate_3d(body.orientation, fm.vec3(0.0, 1.0, 0.0))
+    az := quat_rotate_3d(body.orientation, fm.vec3(0.0, 0.0, 1.0))
+    he := body.half_extents
+    extent := fm.vec3(
+        math.abs(ax.x) * he.x + math.abs(ay.x) * he.y + math.abs(az.x) * he.z,
+        math.abs(ax.y) * he.x + math.abs(ay.y) * he.y + math.abs(az.y) * he.z,
+        math.abs(ax.z) * he.x + math.abs(ay.z) * he.y + math.abs(az.z) * he.z
+    )
     << fm.Aabb3{minimum: body.position.sub(extent), maximum: body.position.add(extent)}
 }
 
@@ -341,7 +353,8 @@ pub fn new_rigid_world(gravity fm.Vec3, boxes []StaticBox3D, ramps []StaticRamp3
     triangle_bvh := build_static_bvh(&triangle_bounds)
     << RigidWorld3D{gravity: gravity, boxes: boxes, ramps: ramps, triangles: triangles,
         bodies: []RigidBody3D{}, box_bounds: box_bounds, ramp_bounds: ramp_bounds,
-        triangle_bounds: triangle_bounds, box_bvh: box_bvh, ramp_bvh: ramp_bvh, triangle_bvh: triangle_bvh}
+        triangle_bounds: triangle_bounds, box_bvh: box_bvh, ramp_bvh: ramp_bvh, triangle_bvh: triangle_bvh,
+        sap_state: new_sap_state()}
 }
 
 fn (world &RigidWorld3D) check_body_index(index int) int {
@@ -567,15 +580,88 @@ fn aabb_vs_aabb(pos_a fm.Vec3, half_a fm.Vec3, pos_b fm.Vec3, half_b fm.Vec3) Na
     << NarrowContact{hit: true, normal: fm.vec3(0.0, 0.0, -1.0), penetration: oz}
 }
 
-// Exact 4-axis SAT for an axis-aligned dynamic box vs StaticRamp3D prism.
-fn box_vs_ramp(pos fm.Vec3, half fm.Vec3, ramp StaticRamp3D) NarrowContact {
+fn sphere_vs_obb(center fm.Vec3, radius f64, box_pos fm.Vec3, box_orient fm.Vec4, box_half fm.Vec3) NarrowContact {
+    local_c := quat_inv_rotate_3d(box_orient, center.sub(box_pos))
+    local_box := fm.Aabb3{minimum: box_half.scaled(-1.0), maximum: box_half}
+    hit := sphere_vs_aabb(local_c, radius, local_box)
+    if !hit.hit { << no_narrow() }
+    << NarrowContact{hit: true, normal: quat_rotate_3d(box_orient, hit.normal), penetration: hit.penetration}
+}
+
+fn obb_vs_obb(
+    pos_a fm.Vec3,
+    orient_a fm.Vec4,
+    half_a fm.Vec3,
+    pos_b fm.Vec3,
+    orient_b fm.Vec4,
+    half_b fm.Vec3
+) NarrowContact {
+    ua := [
+        quat_rotate_3d(orient_a, fm.vec3(1.0, 0.0, 0.0)),
+        quat_rotate_3d(orient_a, fm.vec3(0.0, 1.0, 0.0)),
+        quat_rotate_3d(orient_a, fm.vec3(0.0, 0.0, 1.0))
+    ]
+    vb := [
+        quat_rotate_3d(orient_b, fm.vec3(1.0, 0.0, 0.0)),
+        quat_rotate_3d(orient_b, fm.vec3(0.0, 1.0, 0.0)),
+        quat_rotate_3d(orient_b, fm.vec3(0.0, 0.0, 1.0))
+    ]
+    ha := [half_a.x, half_a.y, half_a.z]
+    hb := [half_b.x, half_b.y, half_b.z]
+    d := pos_a.sub(pos_b) // B -> A
+
+    $best_pen := 1000000000000.0
+    $best_eff := 1000000000000.0
+    $best_idx := -1
+    $best_n := fm.vec3(0.0, 1.0, 0.0)
+
+    for idx in 0:15 {
+        $ax := fm.vec3(0.0, 0.0, 0.0)
+        if idx < 3 {
+            ax = ua[idx]
+        } else if idx < 6 {
+            ax = vb[idx - 3]
+        } else {
+            ei := (idx - 6) / 3
+            ej := (idx - 6) % 3
+            cr := ua[ei].cross(vb[ej])
+            clen := cr.length()
+            if clen <= 1e-6 { -> }
+            ax = cr.scaled(1.0 / clen)
+        }
+        ra := ha[0] * math.abs(ua[0].dot(ax)) + ha[1] * math.abs(ua[1].dot(ax)) + ha[2] * math.abs(ua[2].dot(ax))
+        rb := hb[0] * math.abs(vb[0].dot(ax)) + hb[1] * math.abs(vb[1].dot(ax)) + hb[2] * math.abs(vb[2].dot(ax))
+        pen := (ra + rb) - math.abs(d.dot(ax))
+        if pen <= 0.0 { << no_narrow() }
+        $eff := pen
+        if idx >= 6 { eff = pen * 1.005 }
+        if eff < best_eff {
+            best_eff = eff
+            best_pen = pen
+            best_idx = idx
+            if d.dot(ax) < 0.0 {
+                best_n = ax.scaled(-1.0)
+            } else {
+                best_n = ax
+            }
+        }
+    }
+    if best_idx < 0 || best_pen <= 0.0 { << no_narrow() }
+    << NarrowContact{hit: true, normal: best_n, penetration: best_pen}
+}
+
+// Exact 4-axis SAT for a rotated dynamic box vs StaticRamp3D prism.
+fn box_vs_ramp(pos fm.Vec3, orient fm.Vec4, half fm.Vec3, ramp StaticRamp3D) NarrowContact {
     bc := ramp.bounds.minimum.scaled(0.5).add(ramp.bounds.maximum.scaled(0.5))
     bh := ramp.bounds.maximum.sub(ramp.bounds.minimum).scaled(0.5)
-    box_hit := aabb_vs_aabb(pos, half, bc, bh)
+    box_hit := obb_vs_obb(pos, orient, half, bc, quat_identity_3d(), bh)
     if !box_hit.hit { << no_narrow() }
     plane := ramp_slope_plane(ramp)
     sn := plane.xyz()
-    r_box := half.x * math.abs(sn.x) + half.y * math.abs(sn.y) + half.z * math.abs(sn.z)
+    ax := quat_rotate_3d(orient, fm.vec3(1.0, 0.0, 0.0))
+    ay := quat_rotate_3d(orient, fm.vec3(0.0, 1.0, 0.0))
+    az := quat_rotate_3d(orient, fm.vec3(0.0, 0.0, 1.0))
+    r_box := half.x * math.abs(ax.dot(sn)) + half.y * math.abs(ay.dot(sn)) + half.z * math.abs(az.dot(sn))
     support_min := pos.dot(sn) - r_box
     pen_slope := plane.w - support_min
     if pen_slope <= 0.0 { << no_narrow() }
@@ -615,11 +701,11 @@ fn test_box_triangle_axis(axis fm.Vec3, half fm.Vec3, p0 fm.Vec3, p1 fm.Vec3, p2
 }
 
 // Exact 13-axis SAT (1 face normal + 3 box normals + 9 edge cross-products)
-// between an axis-aligned box and an arbitrary 3D triangle.
-fn box_vs_triangle(pos fm.Vec3, half fm.Vec3, tri StaticTriangle3D) NarrowContact {
-    p0 := tri.a.sub(pos)
-    p1 := tri.b.sub(pos)
-    p2 := tri.c.sub(pos)
+// between a rotated box and an arbitrary 3D triangle (evaluated in box local space).
+fn box_vs_triangle(pos fm.Vec3, orient fm.Vec4, half fm.Vec3, tri StaticTriangle3D) NarrowContact {
+    p0 := quat_inv_rotate_3d(orient, tri.a.sub(pos))
+    p1 := quat_inv_rotate_3d(orient, tri.b.sub(pos))
+    p2 := quat_inv_rotate_3d(orient, tri.c.sub(pos))
     e0 := p1.sub(p0)
     e1 := p2.sub(p1)
     e2 := p0.sub(p2)
@@ -644,7 +730,7 @@ fn box_vs_triangle(pos fm.Vec3, half fm.Vec3, tri StaticTriangle3D) NarrowContac
         }
     }
     if best_pen >= 1000000000000.0 { << no_narrow() }
-    << NarrowContact{hit: true, normal: best_n, penetration: best_pen}
+    << NarrowContact{hit: true, normal: quat_rotate_3d(orient, best_n), penetration: best_pen}
 }
 
 fn body_vs_body(a RigidBody3D, b RigidBody3D) NarrowContact {
@@ -660,26 +746,34 @@ fn body_vs_body(a RigidBody3D, b RigidBody3D) NarrowContact {
         << NarrowContact{hit: true, normal: fm.vec3(0.0, 1.0, 0.0), penetration: sum_r}
     }
     if a.kind == SHAPE_BOX && b.kind == SHAPE_BOX {
-        << aabb_vs_aabb(a.position, a.half_extents, b.position, b.half_extents)
+        << obb_vs_obb(a.position, a.orientation, a.half_extents, b.position, b.orientation, b.half_extents)
     }
     if a.kind == SHAPE_SPHERE && b.kind == SHAPE_BOX {
-        << sphere_vs_aabb(a.position, a.radius, body_bounds_unchecked(b))
+        << sphere_vs_obb(a.position, a.radius, b.position, b.orientation, b.half_extents)
     }
-    flipped := sphere_vs_aabb(b.position, b.radius, body_bounds_unchecked(a))
+    flipped := sphere_vs_obb(b.position, b.radius, a.position, a.orientation, a.half_extents)
     if !flipped.hit { << no_narrow() }
     << NarrowContact{hit: true, normal: flipped.normal.scaled(-1.0), penetration: flipped.penetration}
 }
 
 // --- CCD Anti-Tunneling Sweeps for Fast Dynamic Bodies ---
 
-fn sweep_box_triangle_ccd(pos fm.Vec3, half fm.Vec3, motion fm.Vec3, tri StaticTriangle3D, bounds fm.Aabb3) SweepHit3D {
-    swept := swept_aabb(fm.Aabb3{minimum: pos.sub(half), maximum: pos.add(half)}, motion)
+fn sweep_box_triangle_ccd(pos fm.Vec3, orient fm.Vec4, half fm.Vec3, motion fm.Vec3, tri StaticTriangle3D, bounds fm.Aabb3) SweepHit3D {
+    ax := quat_rotate_3d(orient, fm.vec3(1.0, 0.0, 0.0))
+    ay := quat_rotate_3d(orient, fm.vec3(0.0, 1.0, 0.0))
+    az := quat_rotate_3d(orient, fm.vec3(0.0, 0.0, 1.0))
+    ext := fm.vec3(
+        math.abs(ax.x) * half.x + math.abs(ay.x) * half.y + math.abs(az.x) * half.z,
+        math.abs(ax.y) * half.x + math.abs(ay.y) * half.y + math.abs(az.y) * half.z,
+        math.abs(ax.z) * half.x + math.abs(ay.z) * half.y + math.abs(az.z) * half.z
+    )
+    swept := swept_aabb(fm.Aabb3{minimum: pos.sub(ext), maximum: pos.add(ext)}, motion)
     if !aabb_overlap(swept, bounds) { << capsule_miss() }
-    if box_vs_triangle(pos, half, tri).hit {
+    if box_vs_triangle(pos, orient, half, tri).hit {
         << SweepHit3D{hit: true, time: 0.0, normal: zero(), started_overlapping: true}
     }
     n := tri.b.sub(tri.a).cross(tri.c.sub(tri.a)).normalized() >>> (err) { << capsule_miss() }
-    r_box := half.x * math.abs(n.x) + half.y * math.abs(n.y) + half.z * math.abs(n.z)
+    r_box := half.x * math.abs(ax.dot(n)) + half.y * math.abs(ay.dot(n)) + half.z * math.abs(az.dot(n))
     d0 := n.dot(pos.sub(tri.a))
     dm := n.dot(motion)
     $t_low := 0.0
@@ -699,7 +793,7 @@ fn sweep_box_triangle_ccd(pos fm.Vec3, half fm.Vec3, motion fm.Vec3, tri StaticT
     samples := 16
     for s in 0:samples + 1 {
         t := t_low + (t_high - t_low) * (f64(s) / f64(samples))
-        c := box_vs_triangle(pos.add(motion.scaled(t)), half, tri)
+        c := box_vs_triangle(pos.add(motion.scaled(t)), orient, half, tri)
         if c.hit {
             hit_t = t
             hit_n = c.normal
@@ -708,13 +802,13 @@ fn sweep_box_triangle_ccd(pos fm.Vec3, half fm.Vec3, motion fm.Vec3, tri StaticT
     }
     if hit_t < 0.0 { << capsule_miss() }
     $lo := math.max(0.0, hit_t - (t_high - t_low) / f64(samples))
-    if box_vs_triangle(pos.add(motion.scaled(lo)), half, tri).hit {
+    if box_vs_triangle(pos.add(motion.scaled(lo)), orient, half, tri).hit {
         lo = 0.0
     }
     $hi := hit_t
     for i in 0:24 {
         mid := lo + (hi - lo) * 0.5
-        c := box_vs_triangle(pos.add(motion.scaled(mid)), half, tri)
+        c := box_vs_triangle(pos.add(motion.scaled(mid)), orient, half, tri)
         if c.hit {
             hi = mid
             hit_n = c.normal
@@ -725,20 +819,29 @@ fn sweep_box_triangle_ccd(pos fm.Vec3, half fm.Vec3, motion fm.Vec3, tri StaticT
     << SweepHit3D{hit: true, time: lo, normal: hit_n, started_overlapping: false}
 }
 
-fn sweep_box_ramp_ccd(pos fm.Vec3, half fm.Vec3, motion fm.Vec3, ramp StaticRamp3D) SweepHit3D {
-    swept := swept_aabb(fm.Aabb3{minimum: pos.sub(half), maximum: pos.add(half)}, motion)
+fn sweep_box_ramp_ccd(pos fm.Vec3, orient fm.Vec4, half fm.Vec3, motion fm.Vec3, ramp StaticRamp3D) SweepHit3D {
+    ax := quat_rotate_3d(orient, fm.vec3(1.0, 0.0, 0.0))
+    ay := quat_rotate_3d(orient, fm.vec3(0.0, 1.0, 0.0))
+    az := quat_rotate_3d(orient, fm.vec3(0.0, 0.0, 1.0))
+    ext := fm.vec3(
+        math.abs(ax.x) * half.x + math.abs(ay.x) * half.y + math.abs(az.x) * half.z,
+        math.abs(ax.y) * half.x + math.abs(ay.y) * half.y + math.abs(az.y) * half.z,
+        math.abs(ax.z) * half.x + math.abs(ay.z) * half.y + math.abs(az.z) * half.z
+    )
+    box_world := fm.Aabb3{minimum: pos.sub(ext), maximum: pos.add(ext)}
+    swept := swept_aabb(box_world, motion)
     if !aabb_overlap(swept, ramp.bounds) { << capsule_miss() }
-    if box_vs_ramp(pos, half, ramp).hit {
+    if box_vs_ramp(pos, orient, half, ramp).hit {
         << SweepHit3D{hit: true, time: 0.0, normal: zero(), started_overlapping: true}
     }
-    broad := cast_box(fm.Aabb3{minimum: pos.sub(half), maximum: pos.add(half)}, motion, ramp.bounds, false)
+    broad := cast_box(box_world, motion, ramp.bounds, false)
     if !broad.hit { << capsule_miss() }
     $hit_t := -1.0
     $hit_n := zero()
     samples := 16
     for s in 0:samples + 1 {
         t := broad.time + (1.0 - broad.time) * (f64(s) / f64(samples))
-        c := box_vs_ramp(pos.add(motion.scaled(t)), half, ramp)
+        c := box_vs_ramp(pos.add(motion.scaled(t)), orient, half, ramp)
         if c.hit {
             hit_t = t
             hit_n = c.normal
@@ -750,7 +853,7 @@ fn sweep_box_ramp_ccd(pos fm.Vec3, half fm.Vec3, motion fm.Vec3, ramp StaticRamp
     $hi := hit_t
     for i in 0:24 {
         mid := lo + (hi - lo) * 0.5
-        c := box_vs_ramp(pos.add(motion.scaled(mid)), half, ramp)
+        c := box_vs_ramp(pos.add(motion.scaled(mid)), orient, half, ramp)
         if c.hit {
             hi = mid
             hit_n = c.normal
@@ -802,13 +905,13 @@ fn ccd_sweep_static(world &RigidWorld3D, body RigidBody3D, motion fm.Vec3) Sweep
     for i in ramp_cands {
         ramp := world.ramps[i]
         if (ramp.layer & body.mask) == 0 { -> }
-        hit := sweep_box_ramp_ccd(body.position, body.half_extents, motion, ramp)
+        hit := sweep_box_ramp_ccd(body.position, body.orientation, body.half_extents, motion, ramp)
         if hit.hit && !hit.started_overlapping && (!best.hit || hit.time < best.time) { best = hit }
     }
     for i in tri_cands {
         tri := world.triangles[i]
         if (tri.layer & body.mask) == 0 { -> }
-        hit := sweep_box_triangle_ccd(body.position, body.half_extents, motion, tri, world.triangle_bounds[i])
+        hit := sweep_box_triangle_ccd(body.position, body.orientation, body.half_extents, motion, tri, world.triangle_bounds[i])
         if hit.hit && !hit.started_overlapping && (!best.hit || hit.time < best.time) { best = hit }
     }
     << best
@@ -913,7 +1016,7 @@ pub fn (world $&RigidWorld3D) step(dt f64, substeps int, iterations int) RigidSt
         for i in 0:world.bodies.len {
             body_aabbs.push(body_bounds_unchecked(world.bodies[i]))
         }
-        sap_pairs := sap_broadphase_pairs(&body_aabbs)
+        sap_pairs := sap_broadphase_pairs_cached($&world.sap_state, &body_aabbs)
         $pidx := 0
         while pidx < sap_pairs.len {
             i := sap_pairs[pidx]
@@ -950,7 +1053,7 @@ pub fn (world $&RigidWorld3D) step(dt f64, substeps int, iterations int) RigidSt
                 } else {
                     bc := box.bounds.minimum.scaled(0.5).add(box.bounds.maximum.scaled(0.5))
                     bh := box.bounds.maximum.sub(box.bounds.minimum).scaled(0.5)
-                    hit = aabb_vs_aabb(body.position, body.half_extents, bc, bh)
+                    hit = obb_vs_obb(body.position, body.orientation, body.half_extents, bc, quat_identity_3d(), bh)
                 }
                 if hit.hit {
                     contacts.push(make_solver_contact(i, -1, hit, body, body.restitution, body.friction, zero()))
@@ -964,7 +1067,7 @@ pub fn (world $&RigidWorld3D) step(dt f64, substeps int, iterations int) RigidSt
                 if body.kind == SHAPE_SPHERE {
                     hit = sphere_vs_ramp(body.position, body.radius, ramp)
                 } else {
-                    hit = box_vs_ramp(body.position, body.half_extents, ramp)
+                    hit = box_vs_ramp(body.position, body.orientation, body.half_extents, ramp)
                 }
                 if hit.hit {
                     contacts.push(make_solver_contact(i, -1, hit, body, body.restitution, body.friction, zero()))
@@ -978,7 +1081,7 @@ pub fn (world $&RigidWorld3D) step(dt f64, substeps int, iterations int) RigidSt
                 if body.kind == SHAPE_SPHERE {
                     hit = sphere_vs_triangle(body.position, body.velocity, body.radius, tri)
                 } else {
-                    hit = box_vs_triangle(body.position, body.half_extents, tri)
+                    hit = box_vs_triangle(body.position, body.orientation, body.half_extents, tri)
                 }
                 if hit.hit {
                     contacts.push(make_solver_contact(i, -1, hit, body, body.restitution, body.friction, zero()))
@@ -1160,7 +1263,9 @@ pub fn (world &RigidWorld3D) body_triggers(index int) []int {
         if body.kind == SHAPE_SPHERE {
             if sphere_vs_aabb(body.position, body.radius, box.bounds).hit { hits.push(i) }
         } else {
-            if intersects_open(bb, box.bounds) { hits.push(i) }
+            bc := box.bounds.minimum.scaled(0.5).add(box.bounds.maximum.scaled(0.5))
+            bh := box.bounds.maximum.sub(box.bounds.minimum).scaled(0.5)
+            if obb_vs_obb(body.position, body.orientation, body.half_extents, bc, quat_identity_3d(), bh).hit { hits.push(i) }
         }
     }
     << hits
@@ -1261,17 +1366,19 @@ pub fn (world &RigidWorld3D) raycast_all(origin fm.Vec3, direction fm.Vec3, dist
                 best_normal = cand.normal
             }
         } else {
-            bb := body_bounds_unchecked(body)
-            if bb.contains(origin) >>> {
+            lo := quat_inv_rotate_3d(body.orientation, origin.sub(body.position))
+            lm := quat_inv_rotate_3d(body.orientation, motion)
+            local_box := fm.Aabb3{minimum: body.half_extents.scaled(-1.0), maximum: body.half_extents}
+            if local_box.contains(lo) >>> {
                 << RigidRayHit3D{kind: HIT_RIGID_BODY, index: i, distance: 0.0, point: origin,
                     normal: zero(), started_inside: true}
             }
-            cand := cast_box(point, motion, bb, true)
+            cand := cast_box(fm.Aabb3{minimum: lo, maximum: lo}, lm, local_box, true)
             if cand.hit && (best_kind == HIT_NONE || cand.time < best_time) {
                 best_kind = HIT_RIGID_BODY
                 best_index = i
                 best_time = cand.time
-                best_normal = cand.normal
+                best_normal = quat_rotate_3d(body.orientation, cand.normal)
             }
         }
     }

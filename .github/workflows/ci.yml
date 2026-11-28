@@ -8,6 +8,8 @@ on:
   pull_request:
     branches: [dev, main]
   workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 0'
 
 permissions:
   contents: read
@@ -96,7 +98,7 @@ jobs:
       - name: Run native, shaders, checks, headless tests, and tools
         run: |
           python3 tools/ci_run.py \
-            --modes contracts,native,shaders,check,test,build-tools \
+            --modes native,shaders,check,test,build-tools \
             --xu "$XU" \
             --sdl-include "$NEXUS_SDL3_INCLUDE" \
             --sdl-runtime "$NEXUS_SDL3_RUNTIME" \
@@ -104,3 +106,71 @@ jobs:
 
       - name: Verify release identity with installed SDK
         run: python3 tools/check_release_identity.py --xu "$XU"
+
+  gpu-metal-smoke:
+    name: Metal GPU Smoke (macOS arm64)
+    needs: contracts
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    continue-on-error: true
+    runs-on: macos-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: arm64
+
+      - name: Cache Xu SDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/xu-sdk
+          key: nexus-xu-sdk-macos-arm64-${{ hashFiles('xu.xun') }}
+
+      - name: Install pinned Xu SDK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/install_xu_sdk.py --target macos-arm64 --dest "${{ runner.temp }}/xu-sdk" --github-env
+
+      - name: Cache SDL3 headers and minimal runtime
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sdl3
+          key: nexus-sdl3-3.4.14-rt-macos-arm64
+
+      - name: Fetch SDL3 headers and minimal runtime
+        run: python3 tools/fetch_sdl3_headers.py --dest "${{ runner.temp }}/sdl3" --with-runtime --github-env
+
+      - name: Build native bridges and shaders
+        run: |
+          python3 tools/ci_run.py \
+            --modes native,shaders \
+            --xu "$XU" \
+            --sdl-include "$NEXUS_SDL3_INCLUDE" \
+            --sdl-runtime "$NEXUS_SDL3_RUNTIME"
+
+      - name: Run Metal GPU smoke tests
+        run: |
+          mkdir -p build
+          for test_src in \
+            tests/gpu_smoke.xu \
+            tests/gpu3d_smoke.xu \
+            tests/gpu3d_scene_smoke.xu \
+            tests/physics3d_joints_ragdoll_checks.xu
+          do
+            stem="$(basename "$test_src" .xu)"
+            "$XU" build "$test_src" -o "build/$stem"
+            "./build/$stem"
+          done
+
+      - name: Upload Metal GPU smoke captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-metal-gpu-smoke-${{ github.run_id }}
+          path: build/*.png
+          if-no-files-found: ignore

@@ -19,6 +19,7 @@ pub const STREAM_STATE_READY_CPU = 1
 pub const STREAM_STATE_RESIDENT = 2
 pub const STREAM_STATE_EVICTED = 3
 pub const STREAM_STATE_FAILED = 4
+const STREAM_QUEUE_CAP = 256
 
 pub struct StreamConfig {
     pub workers int
@@ -99,6 +100,8 @@ pub struct StreamingManager3D {
     stop chan int
     worker_done chan int
     entries []StreamEntry
+    pending_jobs []StreamJob
+    inflight_jobs int
     ready_handles []int
     resident_meshes []ren.Mesh3D
     resident_textures []ren.Texture3D
@@ -203,9 +206,9 @@ pub fn new_streaming_manager(device &ren.Device3D, cfg StreamConfig) StreamingMa
         cfg.max_bytes_per_frame < 64 || cfg.max_resident_bytes < cfg.max_bytes_per_frame {
         >> errors.new("nexus streaming: invalid worker count or streaming memory budget")
     }
-    jobs := chan StreamJob{cap: 256}
-    mesh_done := chan DecodedMeshMsg{cap: 256}
-    tex_done := chan DecodedTextureMsg{cap: 256}
+    jobs := chan StreamJob{cap: STREAM_QUEUE_CAP}
+    mesh_done := chan DecodedMeshMsg{cap: STREAM_QUEUE_CAP}
+    tex_done := chan DecodedTextureMsg{cap: STREAM_QUEUE_CAP}
     stop := chan int{cap: 16}
     worker_done := chan int{cap: 16}
 
@@ -222,6 +225,8 @@ pub fn new_streaming_manager(device &ren.Device3D, cfg StreamConfig) StreamingMa
         stop: stop,
         worker_done: worker_done,
         entries: []StreamEntry{},
+        pending_jobs: []StreamJob{},
+        inflight_jobs: 0,
         ready_handles: []int{},
         resident_meshes: []ren.Mesh3D{},
         resident_textures: []ren.Texture3D{},
@@ -229,6 +234,42 @@ pub fn new_streaming_manager(device &ren.Device3D, cfg StreamConfig) StreamingMa
         tex_alive: []bool{},
         resident_bytes: 0,
         closed: false
+    }
+}
+
+fn clone_stream_job(j &StreamJob) StreamJob {
+    << StreamJob{
+        handle: j.handle,
+        kind: j.kind,
+        path: j.path + "",
+        srgb: j.srgb,
+        sampling: j.sampling
+    }
+}
+
+fn drop_pending_job_at(src &[]StreamJob, skip int) []StreamJob {
+    $out := []StreamJob{}
+    for i in 0:src.len {
+        if i != skip { out.push(clone_stream_job(&src[i])) }
+    }
+    << out
+}
+
+fn (mgr $&StreamingManager3D) flush_pending_jobs() {
+    while mgr.pending_jobs.len > 0 && mgr.inflight_jobs < STREAM_QUEUE_CAP {
+        $best_pos := 0
+        $best_prio := mgr.entries[mgr.pending_jobs[0].handle].priority
+        for i in 1:mgr.pending_jobs.len {
+            p := mgr.entries[mgr.pending_jobs[i].handle].priority
+            if p > best_prio {
+                best_prio = p
+                best_pos = i
+            }
+        }
+        job := clone_stream_job(&mgr.pending_jobs[best_pos])
+        mgr.pending_jobs = drop_pending_job_at(&mgr.pending_jobs, best_pos)
+        mgr.inflight_jobs += 1
+        mgr.jobs <- job
     }
 }
 
@@ -248,7 +289,8 @@ pub fn (mgr $&StreamingManager3D) request_mesh(path string, kind int, priority f
         byte_size: 0, last_used_frame: 0, gpu_slot: -1,
         mesh_box: chan DecodedMeshMsg{cap: 1}, tex_box: chan DecodedTextureMsg{cap: 1}
     })
-    mgr.jobs <- StreamJob{handle: h, kind: kind, path: path + "", srgb: false, sampling: default_samp}
+    mgr.pending_jobs.push(StreamJob{handle: h, kind: kind, path: path + "", srgb: false, sampling: default_samp})
+    mgr.flush_pending_jobs()
     << h
 }
 
@@ -267,7 +309,8 @@ pub fn (mgr $&StreamingManager3D) request_texture(
         byte_size: 0, last_used_frame: 0, gpu_slot: -1,
         mesh_box: chan DecodedMeshMsg{cap: 1}, tex_box: chan DecodedTextureMsg{cap: 1}
     })
-    mgr.jobs <- StreamJob{handle: h, kind: STREAM_KIND_TEXTURE, path: path + "", srgb: srgb, sampling: sampling}
+    mgr.pending_jobs.push(StreamJob{handle: h, kind: STREAM_KIND_TEXTURE, path: path + "", srgb: srgb, sampling: sampling})
+    mgr.flush_pending_jobs()
     << h
 }
 
@@ -303,7 +346,9 @@ pub fn (mgr $&StreamingManager3D) restream(handle int, priority f64, frame int) 
     e.priority = priority
     e.state = STREAM_STATE_PENDING
     e.err = ""
-    mgr.jobs <- StreamJob{handle: handle, kind: e.kind, path: e.path + "", srgb: e.srgb, sampling: e.sampling}
+    job := StreamJob{handle: handle, kind: e.kind, path: e.path + "", srgb: e.srgb, sampling: e.sampling}
+    mgr.pending_jobs.push(job)
+    mgr.flush_pending_jobs()
     << 0
 }
 
@@ -406,6 +451,7 @@ pub fn (mgr $&StreamingManager3D) pump(device &ren.Device3D, frame int) StreamPu
     while draining_m {
         select {
             msg := <-mgr.mesh_done {
+                if mgr.inflight_jobs > 0 { mgr.inflight_jobs -= 1 }
                 r := mgr.accept_mesh_msg(msg)
                 if r > 0 { decoded_n += 1 }
                 else if r < 0 { failed_n += 1 }
@@ -420,6 +466,7 @@ pub fn (mgr $&StreamingManager3D) pump(device &ren.Device3D, frame int) StreamPu
     while draining_t {
         select {
             msg := <-mgr.tex_done {
+                if mgr.inflight_jobs > 0 { mgr.inflight_jobs -= 1 }
                 r := mgr.accept_tex_msg(msg)
                 if r > 0 { decoded_n += 1 }
                 else if r < 0 { failed_n += 1 }
@@ -429,6 +476,9 @@ pub fn (mgr $&StreamingManager3D) pump(device &ren.Device3D, frame int) StreamPu
             }
         }
     }
+
+    // Feed highest-priority queued decode jobs after draining results.
+    mgr.flush_pending_jobs()
 
     // 2. Priority-ordered, frame-budgeted GPU uploads + LRU cache eviction!
     $uploaded_n := 0
@@ -555,11 +605,31 @@ pub fn (mgr &StreamingManager3D) resident_bytes_used() int { << mgr.resident_byt
 
 pub fn (mgr $&StreamingManager3D) shutdown() int {
     if mgr.closed { << 0 }
+    mgr.pending_jobs = []StreamJob{}
+    $draining_jobs := true
+    while draining_jobs {
+        select {
+            _ := <-mgr.jobs {
+            }
+            else {
+                draining_jobs = false
+            }
+        }
+    }
     for _ in 0:mgr.config.workers {
         mgr.stop <- 1
     }
-    for _ in 0:mgr.config.workers {
-        _ := <-mgr.worker_done
+    $remaining_workers := mgr.config.workers
+    while remaining_workers > 0 {
+        select {
+            _ := <-mgr.worker_done {
+                remaining_workers -= 1
+            }
+            _ := <-mgr.mesh_done {
+            }
+            _ := <-mgr.tex_done {
+            }
+        }
     }
     for i in 0:mgr.resident_meshes.len {
         if mgr.mesh_alive[i] {

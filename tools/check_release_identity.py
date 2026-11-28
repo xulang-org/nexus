@@ -23,6 +23,11 @@ def main() -> int:
     parser.add_argument("--xu", help="Optional xu binary to verify with tools/check_sdk.py")
     parser.add_argument("--expected-tag", help="Require tag to equal v<root version>")
     parser.add_argument("--check-release", action="store_true", help="Require non-prerelease identity and RELEASES*.md entries")
+    parser.add_argument(
+        "--allow-prerelease",
+        action="store_true",
+        help="Allow -(dev|alpha|beta) prerelease versions when --check-release is passed",
+    )
     args = parser.parse_args()
 
     errors: list[str] = []
@@ -33,8 +38,10 @@ def main() -> int:
     if args.expected_tag and args.expected_tag != f"v{root_ver}":
         errors.append(f"Expected tag {args.expected_tag!r} does not match root xu.xun version 'v{root_ver}'")
 
-    if args.check_release and re.search(r"-(dev|alpha|beta)", root_ver):
-        pass  # Allow rc/dev prerelease checks when explicitly tagged, only require release notes heading.
+    if args.check_release and not args.allow_prerelease and re.search(r"-(dev|alpha|beta)", root_ver):
+        errors.append(
+            f"Release identity check failed: version {root_ver!r} is a prerelease (pass --allow-prerelease to override)"
+        )
 
     proj_text = (ROOT / "resources/project/mod.xu").read_text(encoding="utf-8")
     m_nv = re.search(r'pub const DEFAULT_NEXUS_VERSION = "([^"]+)"', proj_text)
@@ -64,6 +71,11 @@ def main() -> int:
         errors.append(f"README.md missing current Nexus version badge `{root_ver}`")
     if f"Xu **{root_xu}**" not in readme:
         errors.append(f"README.md missing pinned Xu SDK `Xu **{root_xu}**`")
+    for m_sdk in re.finditer(r"PASS: Xu SDK ([0-9]+(?:\.[0-9]+)*(?:-[A-Za-z0-9.-]+)?)", readme):
+        if m_sdk.group(1) != root_xu:
+            errors.append(
+                f"README.md has stale SDK output 'PASS: Xu SDK {m_sdk.group(1)}' != root xu.xun ({root_xu})"
+            )
 
     if args.check_release:
         base_ver = root_ver.split("-", 1)[0]

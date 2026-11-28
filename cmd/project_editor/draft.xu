@@ -36,24 +36,46 @@ pub struct Draft {
     pub current string
     pub undo []string
     pub redo []string
+    pub revision int
+    cached_valid bool
+    cached_raw string
+    cached_doc resource.Document
+    batch_depth int
+    batch_before string
+}
+
+fn clone_draft_document(doc &resource.Document) resource.Document {
+    $refs := []resource.ResourceReference{}
+    for i in 0:doc.resource_count() {
+        refs.push(doc.resource(i) >>>)
+    }
+    << resource.with_references(doc, doc, refs) >>>
 }
 
 pub fn open_draft(path string) Draft {
     abs := filepath.abs(&path) >>>
     raw := snapshot.read(abs + "", scene_fmt.MAX_BYTES) >>>
     doc := scene_fmt.decode(&raw) >>>
-    _ := doc
     << Draft{
         source: abs,
         opened: raw + "",
         saved: raw + "",
         current: raw + "",
         undo: []string{},
-        redo: []string{}
+        redo: []string{},
+        revision: 0,
+        cached_valid: true,
+        cached_raw: raw + "",
+        cached_doc: doc,
+        batch_depth: 0,
+        batch_before: ""
     }
 }
 
 pub fn (draft &Draft) document() resource.Document {
+    if draft.cached_valid && draft.cached_raw == draft.current {
+        << clone_draft_document(&draft.cached_doc) >>>
+    }
     raw := draft.current + ""
     << scene_fmt.decode(&raw) >>>
 }
@@ -70,13 +92,8 @@ pub fn (draft &Draft) can_redo() bool {
     << draft.redo.len > 0
 }
 
-pub fn (draft $&Draft) replace(document &resource.Document) int {
-    encoded := scene_fmt.encode(document) >>>
-    _ := scene_fmt.decode(&encoded) >>>
-    if encoded == draft.current {
-        << 0
-    }
-    draft.undo.push(draft.current + "")
+fn (draft $&Draft) push_undo_snapshot(snap string) {
+    draft.undo.push(snap)
     if draft.undo.len > MAX_HISTORY {
         $trimmed := []string{}
         start := draft.undo.len - MAX_HISTORY
@@ -85,20 +102,85 @@ pub fn (draft $&Draft) replace(document &resource.Document) int {
         }
         draft.undo = trimmed
     }
+}
+
+fn (draft $&Draft) refresh_cache() {
+    raw := draft.current + ""
+    doc := scene_fmt.decode(&raw) >>> (err) {
+        _ := err
+        draft.cached_valid = false
+        draft.cached_raw = ""
+        <<
+    }
+    draft.cached_doc = doc
+    draft.cached_raw = raw
+    draft.cached_valid = true
+}
+
+pub fn (draft $&Draft) begin_batch() {
+    if draft.batch_depth == 0 {
+        draft.batch_before = draft.current + ""
+    }
+    draft.batch_depth = draft.batch_depth + 1
+}
+
+pub fn (draft $&Draft) commit_batch() {
+    if draft.batch_depth <= 0 {
+        <<
+    }
+    draft.batch_depth = draft.batch_depth - 1
+    if draft.batch_depth > 0 {
+        <<
+    }
+    before := draft.batch_before + ""
+    draft.batch_before = ""
+    if draft.current != before {
+        draft.push_undo_snapshot(before)
+        draft.redo = []string{}
+    }
+}
+
+pub fn (draft $&Draft) abort_batch() {
+    if draft.batch_depth <= 0 {
+        <<
+    }
+    draft.batch_depth = 0
+    before := draft.batch_before + ""
+    draft.batch_before = ""
+    if before.len > 0 && draft.current != before {
+        draft.current = before
+        draft.revision = draft.revision + 1
+        draft.refresh_cache()
+    }
+}
+
+fn (draft $&Draft) apply_document(document &resource.Document, record_undo bool) int {
+    encoded := scene_fmt.encode(document) >>>
+    decoded := scene_fmt.decode(&encoded) >>>
+    if encoded == draft.current {
+        draft.cached_doc = decoded
+        draft.cached_raw = encoded + ""
+        draft.cached_valid = true
+        << 0
+    }
+    if record_undo && draft.batch_depth == 0 {
+        draft.push_undo_snapshot(draft.current + "")
+    }
     draft.redo = []string{}
-    draft.current = encoded
+    draft.current = encoded + ""
+    draft.revision = draft.revision + 1
+    draft.cached_doc = decoded
+    draft.cached_raw = encoded
+    draft.cached_valid = true
     << 0
 }
 
+pub fn (draft $&Draft) replace(document &resource.Document) int {
+    << draft.apply_document(document, true) >>>
+}
+
 pub fn (draft $&Draft) replace_without_undo(document &resource.Document) int {
-    encoded := scene_fmt.encode(document) >>>
-    _ := scene_fmt.decode(&encoded) >>>
-    if encoded == draft.current {
-        << 0
-    }
-    draft.redo = []string{}
-    draft.current = encoded
-    << 0
+    << draft.apply_document(document, false) >>>
 }
 
 pub fn (draft $&Draft) undo_edit() int {
@@ -113,6 +195,8 @@ pub fn (draft $&Draft) undo_edit() int {
     draft.undo = next_undo
     draft.redo.push(draft.current + "")
     draft.current = prev
+    draft.revision = draft.revision + 1
+    draft.refresh_cache()
     << 0
 }
 
@@ -128,6 +212,8 @@ pub fn (draft $&Draft) redo_edit() int {
     draft.redo = next_redo
     draft.undo.push(draft.current + "")
     draft.current = next
+    draft.revision = draft.revision + 1
+    draft.refresh_cache()
     << 0
 }
 
@@ -135,6 +221,20 @@ pub fn (draft $&Draft) collapse_undo_to(base_undo_len int, before_raw string) {
     $cap := base_undo_len
     if cap < 0 { cap = 0 }
     if cap > draft.undo.len { cap = draft.undo.len }
+    if draft.current != before_raw {
+        $found := -1
+        $i := draft.undo.len - 1
+        while i >= 0 {
+            if draft.undo[i] == before_raw {
+                found = i
+                <-
+            }
+            i = i - 1
+        }
+        if found >= 0 {
+            cap = found
+        }
+    }
     $trimmed := []string{}
     for i in 0:cap {
         trimmed.push(draft.undo[i] + "")
@@ -152,12 +252,16 @@ pub fn (draft $&Draft) collapse_undo_to(base_undo_len int, before_raw string) {
         draft.redo = []string{}
     }
     draft.undo = trimmed
+    if !draft.cached_valid || draft.cached_raw != draft.current {
+        draft.revision = draft.revision + 1
+        draft.refresh_cache()
+    }
 }
 
 pub fn (draft $&Draft) save(project &Project, validator &string) int {
     doc := draft.document() >>>
     encoded := scene_fmt.encode(&doc) >>>
-    _ := scene_fmt.decode(&encoded) >>>
+    verified := scene_fmt.decode(&encoded) >>>
 
     disk := snapshot.read(draft.source + "", scene_fmt.MAX_BYTES) >>>
     if disk != draft.saved {
@@ -178,8 +282,14 @@ pub fn (draft $&Draft) save(project &Project, validator &string) int {
     }
 
     snapshot.write_atomic(draft.source + "", &encoded) >>>
+    if encoded != draft.current {
+        draft.revision = draft.revision + 1
+    }
     draft.current = encoded + ""
-    draft.saved = encoded
+    draft.saved = encoded + ""
+    draft.cached_doc = verified
+    draft.cached_raw = encoded
+    draft.cached_valid = true
     << 0
 }
 

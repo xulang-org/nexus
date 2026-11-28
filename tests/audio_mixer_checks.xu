@@ -65,6 +65,27 @@ fn run() int {
         assert(old != fresh && !mixer.is_voice(old))
         mixer.stop(fresh) >>>
     }
+    // Regression: DSP render() matches prepare()+commit(), and DSP mutation invalidates prepared receipt.
+    $m_ren := mix.new_mixer(48000, 4) >>>
+    $m_prep := mix.new_mixer(48000, 4) >>>
+    dsp_clip_a := make_clip(48000, 1, [16000, -16000, 16000, -16000, 16000, -16000, 16000, -16000]) >>>
+    dsp_clip_b := make_clip(48000, 1, [16000, -16000, 16000, -16000, 16000, -16000, 16000, -16000]) >>>
+    c_ren := m_ren.add_clip(dsp_clip_a) >>>
+    c_prep := m_prep.add_clip(dsp_clip_b) >>>
+    m_ren.enable_bus_lowpass(0, 1500.0, 0.707) >>>
+    m_prep.enable_bus_lowpass(0, 1500.0, 0.707) >>>
+    m_ren.enable_bus_delay(0, 0.01, 0.4, 0.5) >>>
+    m_prep.enable_bus_delay(0, 0.01, 0.4, 0.5) >>>
+    _ := m_ren.play(c_ren, 0, 1.0, 0.0, false) >>>
+    _ := m_prep.play(c_prep, 0, 1.0, 0.0, false) >>>
+    out_ren := m_ren.render(16) >>>
+    blk_prep := m_prep.prepare(16) >>>
+    m_prep.commit(&blk_prep) >>>
+    assert(out_ren.len == blk_prep.samples.len)
+    for k in 0:out_ren.len { assert(out_ren[k] == blk_prep.samples[k]) }
+    blk_stale := m_prep.prepare(8) >>>
+    m_prep.disable_bus_delay(0) >>>
+    assert(commit_rejected($&m_prep, &blk_stale))
     println("PASS: pure Xu stereo mixer, linear resampling, hierarchical gain/pan, clipping, looping, pause/mute, stale receipts and 100 voice reuse cycles")
     << 0
 }

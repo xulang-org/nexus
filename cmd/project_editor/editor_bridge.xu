@@ -49,6 +49,8 @@ pub struct EmbedBridge {
     pub tmp_dir string
     pub cmd_ch chan string
     pub msg_ch chan EmbedMsg
+    pub done_ch chan int
+    pub last_error string
 }
 
 pub fn inactive_embed_bridge() EmbedBridge {
@@ -56,7 +58,20 @@ pub fn inactive_embed_bridge() EmbedBridge {
         active: false,
         tmp_dir: "",
         cmd_ch: chan string{cap: 1},
-        msg_ch: chan EmbedMsg{cap: 1}
+        msg_ch: chan EmbedMsg{cap: 1},
+        done_ch: chan int{cap: 1},
+        last_error: ""
+    }
+}
+
+fn inactive_embed_bridge_with_error(msg string) EmbedBridge {
+    << EmbedBridge{
+        active: false,
+        tmp_dir: "",
+        cmd_ch: chan string{cap: 1},
+        msg_ch: chan EmbedMsg{cap: 1},
+        done_ch: chan int{cap: 1},
+        last_error: msg
     }
 }
 
@@ -69,16 +84,41 @@ fn read_u32_le(s &string, off int) int {
 }
 
 fn read_nxf_exact(conn &net.Conn, rem $&string, n int) string {
-    while rem.len < n {
-        chunk := conn.read(65536) >>>
+    if n <= 0 { << "" }
+    if rem.len >= n {
+        head := (*rem)[0:n] + ""
+        *rem = (*rem)[n:rem.len] + ""
+        << head
+    }
+    $chunks := []string{}
+    $total := 0
+    if rem.len > 0 {
+        chunks.push(*rem + "")
+        total = rem.len
+        *rem = ""
+    }
+    while total < n {
+        chunk := conn.read(262144) >>>
         if chunk.len == 0 {
             >> errors.new("embed bridge: EOF from viewport server")
         }
-        *rem = *rem + chunk
+        need := n - total
+        clen := chunk.len
+        if clen >= need {
+            if clen == need {
+                chunks.push(chunk)
+            } else {
+                chunks.push(chunk[0:need] + "")
+                *rem = chunk[need:clen] + ""
+            }
+            total = n
+            <-
+        } else {
+            chunks.push(chunk)
+            total = total + clen
+        }
     }
-    head := (*rem)[0:n] + ""
-    *rem = (*rem)[n:rem.len] + ""
-    << head
+    << strings.join(chunks, "")
 }
 
 fn read_nxf_packet(conn &net.Conn, rem $&string) EmbedMsg {
@@ -89,6 +129,26 @@ fn read_nxf_packet(conn &net.Conn, rem $&string) EmbedMsg {
     kind := read_u32_le(&hdr, 4)
     seq := read_u32_le(&hdr, 8)
     plen := read_u32_le(&hdr, 12)
+    if plen < 0 || plen > 67108864 {
+        >> errors.new("embed bridge: invalid NXF1 packet length")
+    }
+    if kind == NXF_FRAME_RGBA {
+        if plen < 8 {
+            >> errors.new("embed bridge: malformed RGBA frame packet")
+        }
+        wh := read_nxf_exact(conn, rem, 8) >>>
+        w := read_u32_le(&wh, 0)
+        h := read_u32_le(&wh, 4)
+        expected := w * h * 4
+        if w <= 0 || h <= 0 || plen < 8 + expected {
+            >> errors.new("embed bridge: truncated RGBA pixels")
+        }
+        rgba := read_nxf_exact(conn, rem, expected) >>>
+        if plen > 8 + expected {
+            _ := read_nxf_exact(conn, rem, plen - 8 - expected) >>>
+        }
+        << EmbedMsg{kind: EMBED_MSG_FRAME, seq: seq, w: w, h: h, text: "", data: rgba}
+    }
     $payload := ""
     if plen > 0 {
         payload = read_nxf_exact(conn, rem, plen) >>>
@@ -101,19 +161,6 @@ fn read_nxf_packet(conn &net.Conn, rem $&string) EmbedMsg {
             if b.len > 0 { bname = b }
         }
         << EmbedMsg{kind: EMBED_MSG_READY, seq: seq, w: 0, h: 0, text: bname, data: ""}
-    }
-    if kind == NXF_FRAME_RGBA {
-        if payload.len < 8 {
-            >> errors.new("embed bridge: malformed RGBA frame packet")
-        }
-        w := read_u32_le(&payload, 0)
-        h := read_u32_le(&payload, 4)
-        expected := w * h * 4
-        if w <= 0 || h <= 0 || payload.len < 8 + expected {
-            >> errors.new("embed bridge: truncated RGBA pixels")
-        }
-        rgba := payload[8:8 + expected] + ""
-        << EmbedMsg{kind: EMBED_MSG_FRAME, seq: seq, w: w, h: h, text: "", data: rgba}
     }
     if kind == NXF_PICK_RESULT {
         << EmbedMsg{kind: EMBED_MSG_PICK, seq: seq, w: 0, h: 0, text: payload, data: ""}
@@ -144,6 +191,13 @@ fn write_conn_all(conn &net.Conn, text &string) int {
     << 0
 }
 
+fn try_bridge_set_nodelay(conn &net.Conn) {
+    _ := conn.set_nodelay(true) >>> (err) {
+        _ := err
+        <<
+    }
+}
+
 fn accept_and_run_supervisor(
     ln net.Listener,
     cmd_ch chan string,
@@ -164,10 +218,7 @@ fn accept_and_run_supervisor(
         >> err
     }
     _ := l.close()
-    _ := conn.set_nodelay(true) >>> (err) {
-        _ := err
-        << 0
-    }
+    try_bridge_set_nodelay(&conn)
     $rem := ""
     ready_pkt := read_nxf_packet(&conn, $&rem) >>> (err) {
         _ := conn.close()
@@ -204,19 +255,29 @@ fn accept_and_run_supervisor(
     << 0
 }
 
+fn signal_embed_done(done_ch chan int) {
+    select {
+        done_ch <- 1 {}
+        else {}
+    }
+}
+
 fn embed_supervisor_entry(
     ln net.Listener,
     cmd_ch chan string,
     msg_ch chan EmbedMsg,
+    done_ch chan int,
     viewport_bin string,
     staged string,
     addr string
 ) {
     _ := accept_and_run_supervisor(ln, cmd_ch, msg_ch, viewport_bin, staged, addr) >>> (err) {
         msg_ch <- EmbedMsg{kind: EMBED_MSG_CLOSED, seq: 0, w: 0, h: 0, text: err.msg(), data: ""}
+        signal_embed_done(done_ch)
         <<
     }
     msg_ch <- EmbedMsg{kind: EMBED_MSG_CLOSED, seq: 0, w: 0, h: 0, text: "embed viewport closed", data: ""}
+    signal_embed_done(done_ch)
 }
 
 pub fn start_embed_bridge(
@@ -225,34 +286,61 @@ pub fn start_embed_bridge(
     draft_source &string,
     doc &resource.Document
 ) EmbedBridge {
-    if viewport_bin.len == 0 || !path_exists(viewport_bin + "") {
-        << inactive_embed_bridge()
+    if viewport_bin.len == 0 {
+        << inactive_embed_bridge_with_error("viewport binary not configured")
+    }
+    if !path_exists(viewport_bin + "") {
+        << inactive_embed_bridge_with_error("viewport binary missing: " + viewport_bin)
     }
     tmp_dir := os.mkdir_temp("", "nexus-embed-vp-") >>> (err) {
-        _ := err
-        << inactive_embed_bridge()
+        << inactive_embed_bridge_with_error("temp dir failed: " + err.msg())
     }
     staged := stage_scene(project, doc, draft_source, &tmp_dir) >>> (err) {
-        _ := err
         try_remove_all(tmp_dir + "")
-        << inactive_embed_bridge()
+        << inactive_embed_bridge_with_error("stage_scene failed: " + err.msg())
     }
     ln := net.listen_on("tcp", "127.0.0.1:0") >>> (err) {
-        _ := err
         try_remove_all(tmp_dir + "")
-        << inactive_embed_bridge()
+        << inactive_embed_bridge_with_error("listen failed: " + err.msg())
     }
     addr := ln.addr()
     cmd_ch := chan string{cap: 16}
     msg_ch := chan EmbedMsg{cap: 8}
-    xu embed_supervisor_entry(ln, cmd_ch, msg_ch, viewport_bin + "", staged + "", addr + "")
-    << EmbedBridge{active: true, tmp_dir: tmp_dir + "", cmd_ch: cmd_ch, msg_ch: msg_ch}
+    done_ch := chan int{cap: 1}
+    xu embed_supervisor_entry(ln, cmd_ch, msg_ch, done_ch, viewport_bin + "", staged + "", addr + "")
+    << EmbedBridge{active: true, tmp_dir: tmp_dir + "", cmd_ch: cmd_ch, msg_ch: msg_ch, done_ch: done_ch, last_error: ""}
+}
+
+fn wait_embed_supervisor_exit(br $&EmbedBridge, ms int) {
+    dur := time.milliseconds(ms) >>> (err) {
+        _ := err
+        <<
+    }
+    timer := dur.timer()
+    $waiting := true
+    while waiting {
+        select {
+            _ := <- br.done_ch {
+                timer.stop()
+                waiting = false
+            }
+            _ := <- br.msg_ch {}
+            _ := <- timer.c {
+                timer.stop()
+                waiting = false
+            }
+        }
+    }
 }
 
 pub fn stop_embed_bridge(br $&EmbedBridge) {
     if br.active {
-        br.cmd_ch <- "__QUIT__"
+        select {
+            br.cmd_ch <- "__QUIT__" {}
+            else {}
+        }
         br.active = false
+        wait_embed_supervisor_exit(br, 400)
     }
     if br.tmp_dir.len > 0 {
         try_remove_all(br.tmp_dir + "")
@@ -356,7 +444,7 @@ pub fn dispatch_embed_requests(br $&EmbedBridge, ed $&Editor) {
     if !br.active || !ed.vp3d.connected || ed.vp3d.in_flight { << }
     is_3d_stage := ed.stage_mode == STAGE_MODE_3D || ed.stage_mode == STAGE_MODE_SPLIT
     if !is_3d_stage { << }
-    need_load := ed.vp3d.scene_rev_sent != ed.draft.current
+    need_load := ed.vp3d.scene_rev_sent != ed.draft.revision
     need_live_xf := !need_load && ed.vp3d.live_gizmo_dirty && ed.vp3d.gizmo_drag_axis > 0 && ed.vp3d.sub_mode == SUB_MODE_OBJ
     need_pick := ed.vp3d.pending_pick || ed.req_embed_pick
     need_render := need_load || need_live_xf || ed.req_embed_render || ed.vp3d.dirty_render || !ed.vp3d.has_image
@@ -366,21 +454,27 @@ pub fn dispatch_embed_requests(br $&EmbedBridge, ed $&Editor) {
     $buf := ""
     if need_load {
         doc := ed.draft.document() >>> (err) {
-            _ := err
+            ed.vp3d.last_error = "embed document decode failed: " + err.msg()
+            br.last_error = ed.vp3d.last_error + ""
+            ed.vp3d.scene_rev_sent = ed.draft.revision
             <<
         }
         staged := stage_scene(&ed.project, &doc, &ed.draft.source, &br.tmp_dir) >>> (err) {
-            eprintln("embed stage_scene failed: " + err.msg())
+            ed.vp3d.last_error = "embed stage_scene failed: " + err.msg()
+            br.last_error = ed.vp3d.last_error + ""
+            ed.vp3d.scene_rev_sent = ed.draft.revision
+            eprintln(ed.vp3d.last_error)
             <<
         }
         ed.vp3d.render_seq += 1
         lseq := ed.vp3d.render_seq
         buf = buf + "{\"cmd\":\"load\",\"seq\":" + str(lseq) + ",\"scene\":" + json.quote(&staged) + "}\n"
-        ed.vp3d.scene_rev_sent = ed.draft.current + ""
+        ed.vp3d.scene_rev_sent = ed.draft.revision
     } else if need_live_xf {
         ed.vp3d.live_gizmo_dirty = false
         doc := ed.draft.document() >>> (err) {
-            _ := err
+            ed.vp3d.last_error = "embed live transform decode failed: " + err.msg()
+            br.last_error = ed.vp3d.last_error + ""
             <<
         }
         ed.vp3d.render_seq += 1
@@ -446,6 +540,7 @@ fn sjson_bool(jdoc &json.Doc, obj int, key string, fallback bool) bool {
 pub fn handle_embed_msg(msg &EmbedMsg, ed $&Editor, view $&widgets.View) {
     if msg.kind == EMBED_MSG_READY {
         ed.vp3d.connected = true
+        ed.vp3d.last_error = ""
         ed.vp3d.backend_name = "Paper " + msg.text
         ed.vp3d.dirty_render = true
         ed.req_embed_render = true
@@ -512,13 +607,20 @@ pub fn handle_embed_msg(msg &EmbedMsg, ed $&Editor, view $&widgets.View) {
     }
     if msg.kind == EMBED_MSG_ERROR {
         ed.vp3d.in_flight = false
+        ed.vp3d.last_error = msg.text + ""
         ed.set_status(STATUS_ERR, msg.text + "", view)
         <<
     }
     if msg.kind == EMBED_MSG_CLOSED {
         ed.vp3d.connected = false
         ed.vp3d.in_flight = false
-        ed.vp3d.backend_name = "Paper CPU"
+        if msg.text.len > 0 && msg.text != "embed viewport closed" {
+            ed.vp3d.last_error = msg.text + ""
+            ed.vp3d.backend_name = "Paper CPU (" + msg.text + ")"
+            ed.set_status(STATUS_ERR, "3D viewport disconnected: " + msg.text, view)
+        } else {
+            ed.vp3d.backend_name = "Paper CPU"
+        }
         repaint(view, ed.id_top_view)
     }
 }
@@ -718,7 +820,7 @@ pub fn step_script_runner(
 ) int {
     if !sr.active { << 0 }
     if sr.waiting_frame {
-        frame_ready := ed.vp3d.connected && !ed.vp3d.in_flight && !ed.req_embed_render && ed.vp3d.scene_rev_sent == ed.draft.current && ed.vp3d.has_image
+        frame_ready := ed.vp3d.connected && !ed.vp3d.in_flight && !ed.req_embed_render && ed.vp3d.scene_rev_sent == ed.draft.revision && ed.vp3d.has_image
         if frame_ready || (!sr.wait_deadline.is_zero() && !now.before(sr.wait_deadline)) {
             sr.waiting_frame = false
         } else {
