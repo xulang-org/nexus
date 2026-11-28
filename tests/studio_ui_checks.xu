@@ -34,13 +34,13 @@ fn is_valid_png(raw &string) bool {
 }
 
 fn copy_file(src string, dst string) int {
-    raw := snapshot.read(src, snapshot.MAX_BYTES) or >>
-    snapshot.write_atomic(dst, &raw) or >>
+    raw := snapshot.read(src, snapshot.MAX_BYTES) >>>
+    snapshot.write_atomic(dst, &raw) >>>
     << 0
 }
 
 fn remove_dir_quiet(p string) {
-    _ := os.remove_all(p + "") or (err) {
+    _ := os.remove_all(p + "") >>> (err) {
         _ := err
         <<
     }
@@ -49,220 +49,305 @@ fn remove_dir_quiet(p string) {
 fn must_cmd(bin &string, args &[]string, label string) string {
     $cmd := exec.command(*bin + "")
     for i in 0:args.len { cmd.args.push(args[i] + "") }
-    out := cmd.combined_output() or (err) {
+    out := cmd.combined_output() >>> (err) {
         eprintln("FAIL [" + label + "]: " + err.msg())
         <<< 1
     }
     << out
 }
 
-fn find_node_index(doc &rs.Document, name string) int {
-    for i in 0:doc.node_count() {
-        n := doc.describe_node(i) or >>
-        if n.name == name { << i }
+fn find_box_node_index(doc &rs.Document) int {
+    for i in 1:doc.node_count() {
+        n := doc.describe_node(i) >>>
+        if strings.has_prefix(&n.name, "Box") { << i }
     }
     << -1
 }
 
-fn is_hex32(s &string) bool {
-    if s.len != 32 { << false }
-    for i in 0:s.len {
-        b := s[i]
-        ok := (b >= 48 && b <= 57) || (b >= 97 && b <= 102) || (b >= 65 && b <= 70)
-        if !ok { << false }
-    }
-    << true
-}
-
-fn run_checks(studio_bin string, vp_bin string, val_bin string, cli_bin string) int {
-    work := filepath.abs(&"build/studio-ui-test") or >>
+fn run_checks(editor_bin string, vp_bin string, val_bin string, cli_bin string) int {
+    work := filepath.abs(&"build/studio-ui-test") >>>
+    review_dir := filepath.abs(&"build/unified-editor-review") >>>
     remove_dir_quiet(work + "")
-    os.mkdir_all(work + "/assets/models") or >>
+    os.mkdir_all(work + "/assets/models") >>>
+    os.mkdir_all(review_dir + "") >>>
 
     proj_json := work + "/project.json"
     world_src := work + "/assets/world.xuscene"
-    copy_file("examples/scene_assets/project.json", proj_json + "") or >>
-    copy_file("examples/scene_assets/assets/world.xuscene", world_src + "") or >>
-    copy_file("examples/scene_assets/assets/panels.glb", work + "/assets/panels.glb") or >>
+    copy_file("examples/scene_assets/project.json", proj_json + "") >>>
+    copy_file("examples/scene_assets/assets/world.xuscene", world_src + "") >>>
+    copy_file("examples/scene_assets/assets/panels.glb", work + "/assets/panels.glb") >>>
 
-    // Run 1: Split viewport, UI button & slider automation, whitebox ops, Scene v10 save, GLB export.
-    single_png := work + "/single.png"
-    split_png := work + "/split.png"
-    wb_before_png := work + "/wb_before.png"
-    edited_png := work + "/edited.png"
-    ui_full_png := work + "/studio_ui_full.png"
-    ui_single_png := work + "/studio_ui_single.png"
-    out_v10 := work + "/assets/out_v10.xuscene"
+    png_3d := review_dir + "/editor_3d_paper.png"
+    png_split := review_dir + "/editor_split_paper.png"
+    png_zh := review_dir + "/editor_zh_paper.png"
+    png_tile := review_dir + "/editor_tilemap_paper.png"
     glb_rel := "assets/models/studio_wb.glb"
     glb_abs := work + "/" + glb_rel
     script1_path := work + "/script1.ndjson"
 
     script1_lines := [
-        "{\"cmd\":\"set_layout\",\"mode\":\"single\"}",
-        "{\"cmd\":\"capture\",\"path\":" + json.quote(&single_png) + "}",
-        "{\"cmd\":\"ui_click\",\"target\":\"layout\"}",
-        "{\"cmd\":\"capture\",\"path\":" + json.quote(&split_png) + "}",
-        "{\"cmd\":\"ui_click\",\"target\":\"box\"}",
-        "{\"cmd\":\"capture\",\"path\":" + json.quote(&wb_before_png) + "}",
-        "{\"cmd\":\"ui_click\",\"target\":\"mode_face\"}",
-        "{\"cmd\":\"pick_persp\",\"rel\":[0.5,0.5]}",
-        "{\"cmd\":\"select_subobject\",\"indices\":[0]}",
-        "{\"cmd\":\"ui_click\",\"target\":\"extrude\"}",
-        "{\"cmd\":\"model_op\",\"op\":\"inset\",\"amount\":0.25,\"value\":0.15}",
-        "{\"cmd\":\"model_op\",\"op\":\"bevel\",\"value\":0.14}",
-        "{\"cmd\":\"ui_click\",\"target\":\"box_uv\"}",
-        "{\"cmd\":\"ui_slide\",\"target\":\"pos_x\",\"ratio\":0.65}",
-        "{\"cmd\":\"ui_slide\",\"target\":\"metallic\",\"ratio\":0.45}",
-        "{\"cmd\":\"ui_slide\",\"target\":\"roughness\",\"ratio\":0.35}",
-        "{\"cmd\":\"ui_slide\",\"target\":\"base_r\",\"ratio\":0.9}",
-        "{\"cmd\":\"ui_click\",\"target\":\"ortho_axis\"}",
-        "{\"cmd\":\"ui_click\",\"target\":\"toggle_grid\"}",
-        "{\"cmd\":\"ui_click\",\"target\":\"toggle_grid\"}",
-        "{\"cmd\":\"ui_click\",\"target\":\"toggle_wire\"}",
-        "{\"cmd\":\"ui_click\",\"target\":\"toggle_wire\"}",
-        "{\"cmd\":\"capture\",\"path\":" + json.quote(&edited_png) + "}",
-        "{\"cmd\":\"capture_ui\",\"path\":" + json.quote(&ui_full_png) + "}",
-        "{\"cmd\":\"ui_click\",\"target\":\"layout\"}",
-        "{\"cmd\":\"capture_ui\",\"path\":" + json.quote(&ui_single_png) + "}",
-        "{\"cmd\":\"ui_click\",\"target\":\"layout\"}",
-        "{\"cmd\":\"model_op\",\"op\":\"undo\"}",
-        "{\"cmd\":\"model_op\",\"op\":\"redo\"}",
-        "{\"cmd\":\"save_v10\",\"path\":" + json.quote(&out_v10) + "}",
-        "{\"cmd\":\"export_glb\",\"rel\":" + json.quote(&glb_rel) + "}",
+        "{\"cmd\":\"set_stage_mode\",\"mode\":\"3d\"}",
+        "{\"cmd\":\"spawn_whitebox\",\"shape\":\"box\"}",
+        "{\"cmd\":\"model_op\",\"op\":\"extrude\",\"val\":0.4}",
+        "{\"cmd\":\"model_op\",\"op\":\"inset\",\"amount\":0.25,\"val\":0.0}",
+        "{\"cmd\":\"model_op\",\"op\":\"bevel\",\"val\":0.12}",
+        "{\"cmd\":\"model_op\",\"op\":\"box_uv\",\"val\":1.0}",
+        "{\"cmd\":\"set_material\",\"r\":0.78,\"g\":0.24,\"b\":0.30,\"metallic\":0.28,\"roughness\":0.42}",
+        "{\"cmd\":\"fit\"}",
+        "{\"cmd\":\"wait_frame\"}",
+        "{\"cmd\":\"capture_ui\",\"path\":" + json.quote(&png_3d) + "}",
+        "{\"cmd\":\"set_stage_mode\",\"mode\":\"split\"}",
+        "{\"cmd\":\"set_ortho_axis\",\"axis\":0}",
+        "{\"cmd\":\"wait_frame\"}",
+        "{\"cmd\":\"capture_ui\",\"path\":" + json.quote(&png_split) + "}",
+        "{\"cmd\":\"set_lang\",\"lang\":\"zh\"}",
+        "{\"cmd\":\"wait_frame\"}",
+        "{\"cmd\":\"capture_ui\",\"path\":" + json.quote(&png_zh) + "}",
+        "{\"cmd\":\"set_lang\",\"lang\":\"en\"}",
+        "{\"cmd\":\"export_glb\",\"rel_path\":" + json.quote(&glb_rel) + "}",
+        "{\"cmd\":\"spawn_csg\"}",
+        "{\"cmd\":\"save_scene\"}",
+        "{\"cmd\":\"undo\"}",
+        "{\"cmd\":\"redo\"}",
+        "{\"cmd\":\"save_scene\"}",
         "{\"cmd\":\"quit\"}"
     ]
     s1_txt := strings.join(script1_lines, "\n") + "\n"
-    snapshot.write_atomic(script1_path + "", &s1_txt) or >>
+    snapshot.write_atomic(script1_path + "", &s1_txt) >>>
 
-    _ := must_cmd(&studio_bin, &[
-        "--project", proj_json + "",
-        "--scene", world_src + "",
-        "--output", out_v10 + "",
-        "--export-glb", glb_rel + "",
+    _ := must_cmd(&editor_bin, &[
+        proj_json + "",
+        "--viewport", vp_bin + "",
         "--validator", val_bin + "",
+        "--output", work + "/out",
         "--script", script1_path + ""
-    ], "nexus-studio run 1")
+    ], "project-editor unified 3D script")
 
-    single_raw := snapshot.read(single_png + "", snapshot.MAX_BYTES) or >>
-    split_raw := snapshot.read(split_png + "", snapshot.MAX_BYTES) or >>
-    before_raw := snapshot.read(wb_before_png + "", snapshot.MAX_BYTES) or >>
-    edited_raw := snapshot.read(edited_png + "", snapshot.MAX_BYTES) or >>
-    ui_full_raw := snapshot.read(ui_full_png + "", snapshot.MAX_BYTES) or >>
-    ui_single_raw := snapshot.read(ui_single_png + "", snapshot.MAX_BYTES) or >>
-    check(is_valid_png(&single_raw), "single.png is valid PNG")
-    check(is_valid_png(&split_raw), "split.png is valid PNG")
-    check(is_valid_png(&before_raw), "wb_before.png is valid PNG")
-    check(is_valid_png(&edited_raw), "edited.png is valid PNG")
-    check(is_valid_png(&ui_full_raw), "studio_ui_full.png is valid PNG")
-    check(is_valid_png(&ui_single_raw), "studio_ui_single.png is valid PNG")
-    check(sha256.sum256(single_raw + "") != sha256.sum256(split_raw + ""), "Single vs Split viewport renders distinct GPU pixels")
-    check(sha256.sum256(before_raw + "") != sha256.sum256(edited_raw + ""), "Extrude/inset/bevel/slider/ortho changes GPU pixels")
-    check(sha256.sum256(ui_full_raw + "") != sha256.sum256(edited_raw + ""), "Composited Studio UI screenshot differs from raw 3D capture")
-    check(sha256.sum256(ui_full_raw + "") != sha256.sum256(ui_single_raw + ""), "Split vs Single composited Studio UI screenshots differ")
+    raw_3d := snapshot.read(png_3d + "", snapshot.MAX_BYTES) >>>
+    raw_split := snapshot.read(png_split + "", snapshot.MAX_BYTES) >>>
+    raw_zh := snapshot.read(png_zh + "", snapshot.MAX_BYTES) >>>
+    check(is_valid_png(&raw_3d), "editor_3d_paper.png is valid PNG")
+    check(is_valid_png(&raw_split), "editor_split_paper.png is valid PNG")
+    check(is_valid_png(&raw_zh), "editor_zh_paper.png is valid PNG")
+    check(sha256.sum256(raw_3d + "") != sha256.sum256(raw_split + ""), "Single 3D vs Split Persp/Ortho UI screenshots differ")
+    check(sha256.sum256(raw_split + "") != sha256.sum256(raw_zh + ""), "English vs Chinese UI screenshots differ")
 
-    v10_raw := snapshot.read(out_v10 + "", snapshot.MAX_BYTES) or >>
-    doc10 := codec.decode(&v10_raw) or >>
-    check(doc10.has_modeling_attachments(), "Saved v10 scene has modeling attachments")
-    check(doc10.editable_mesh_count() == 1, "Saved v10 scene has 1 editable mesh")
-    check(doc10.material_override_count() == 1, "Saved v10 scene has 1 material override")
-    em0 := doc10.editable_mesh(0) or >>
+    v10_raw := snapshot.read(world_src + "", snapshot.MAX_BYTES) >>>
+    doc10 := codec.decode(&v10_raw) >>>
+    check(doc10.has_modeling_attachments(), "Saved world.xuscene has Scene v10 modeling attachments")
+    check(doc10.editable_mesh_count() >= 1, "Saved world.xuscene preserves EditableMesh")
+    check(doc10.csg_tree_count() >= 1, "Saved world.xuscene preserves CsgTree")
+    check(doc10.material_override_count() >= 1, "Saved world.xuscene preserves MaterialOverride")
+    box_idx := find_box_node_index(&doc10)
+    check(box_idx > 0, "Whitebox node exists in saved v10 scene")
+    em0 := doc10.editable_mesh(0) >>>
     check(em0.mesh.vertices.len > 8, "Saved editable mesh has extrude/inset/bevel vertices (>8)")
-    mo0 := doc10.material_override(0) or >>
-    check(mo0.material.metallic > 0.2, "Live metallic slider persisted to MaterialOverrideAttachment")
-    wb_idx := find_node_index(&doc10, "StudioWhitebox")
-    check(wb_idx > 0, "StudioWhitebox node exists in saved v10 scene")
-    wb_node := doc10.describe_node(wb_idx) or >>
-    check(wb_node.local_3d.c3.x > 0.5, "Live Pos X slider persisted to SceneTree node local_3d")
+    mo0 := doc10.material_override(0) >>>
+    check(mo0.material.metallic > 0.2, "PBR metallic persisted in MaterialOverrideAttachment")
+    _ := must_cmd(&val_bin, &["scene", world_src + ""], "validate saved world.xuscene")
 
-    _ := must_cmd(&val_bin, &["scene", out_v10 + ""], "validate out_v10.xuscene")
-
-    glb_raw := snapshot.read(glb_abs + "", gltf.MAX_GLB_BYTES) or >>
-    glb_dec := gltf.decode_glb_geometry(&glb_raw) or >>
+    glb_raw := snapshot.read(glb_abs + "", gltf.MAX_GLB_BYTES) >>>
+    glb_dec := gltf.decode_glb_geometry(&glb_raw) >>>
     check(glb_dec.primitive_count() >= 1, "Exported GLB has >= 1 primitive")
     _ := must_cmd(&val_bin, &["glb", glb_abs + ""], "validate exported studio_wb.glb")
-
-    proj := project.load_project(proj_json + "") or >>
-    uid := proj.find_asset_uid_by_rel(&glb_rel)
-    check(is_hex32(&uid), "Exported GLB registered with 32-hex UID in project.json")
     _ := must_cmd(&cli_bin, &["build", proj_json + "", "--output", work + "/dist", "--validator", val_bin + ""], "nexus-project build")
-
-    // Run 2: Reload Scene v10, create CSG Hollow brush, save Scene v10, verify in both Studio and Viewport.
-    reopened_png := work + "/reopened_v10.png"
-    csg_png := work + "/csg_v10.png"
-    out_csg_v10 := work + "/assets/out_csg_v10.xuscene"
-    script2_path := work + "/script2.ndjson"
-    script2_lines := [
-        "{\"cmd\":\"capture\",\"path\":" + json.quote(&reopened_png) + "}",
-        "{\"cmd\":\"ui_click\",\"target\":\"csg_hollow\"}",
-        "{\"cmd\":\"set_material\",\"base\":[0.15,0.72,0.68],\"metallic\":0.1,\"roughness\":0.45}",
-        "{\"cmd\":\"save_v10\",\"path\":" + json.quote(&out_csg_v10) + "}",
-        "{\"cmd\":\"capture\",\"path\":" + json.quote(&csg_png) + "}",
-        "{\"cmd\":\"quit\"}"
-    ]
-    s2_txt := strings.join(script2_lines, "\n") + "\n"
-    snapshot.write_atomic(script2_path + "", &s2_txt) or >>
-
-    _ := must_cmd(&studio_bin, &[
-        "--project", proj_json + "",
-        "--scene", out_v10 + "",
-        "--output", out_csg_v10 + "",
-        "--script", script2_path + ""
-    ], "nexus-studio run 2 CSG + v10 reload")
-
-    reopened_raw := snapshot.read(reopened_png + "", snapshot.MAX_BYTES) or >>
-    csg_raw := snapshot.read(csg_png + "", snapshot.MAX_BYTES) or >>
-    check(is_valid_png(&reopened_raw), "reopened_v10.png valid PNG")
-    check(is_valid_png(&csg_raw), "csg_v10.png valid PNG")
-    check(sha256.sum256(reopened_raw + "") != sha256.sum256(csg_raw + ""), "CSG hollow spawn renders distinct GPU pixels")
-
-    csg_v10_raw := snapshot.read(out_csg_v10 + "", snapshot.MAX_BYTES) or >>
-    doc_csg := codec.decode(&csg_v10_raw) or >>
-    check(doc_csg.editable_mesh_count() == 1 && doc_csg.csg_tree_count() == 1,
-        "Saved out_csg_v10.xuscene contains both EditableMesh and CsgTree")
-    _ := must_cmd(&val_bin, &["scene", out_csg_v10 + ""], "validate out_csg_v10.xuscene")
 
     // Verify Scene v10 renders cleanly in cmd/project_viewport as well.
     vp_out := work + "/assets/vp_v10_out.xuscene"
     vp_png := work + "/vp_v10.png"
     vp_script_path := work + "/vp_script.ndjson"
     vp_script := "{\"cmd\":\"capture\",\"path\":" + json.quote(&vp_png) + "}\n{\"cmd\":\"apply\"}\n"
-    snapshot.write_atomic(vp_script_path + "", &vp_script) or >>
-
+    snapshot.write_atomic(vp_script_path + "", &vp_script) >>>
     _ := must_cmd(&vp_bin, &[
-        "--scene", out_csg_v10 + "",
+        "--scene", world_src + "",
         "--output", vp_out + "",
         "--live-script", vp_script_path + ""
     ], "project-viewport reload Scene v10")
-
-    vp_raw := snapshot.read(vp_png + "", snapshot.MAX_BYTES) or >>
+    vp_raw := snapshot.read(vp_png + "", snapshot.MAX_BYTES) >>>
     check(is_valid_png(&vp_raw), "vp_v10.png valid PNG")
 
-    println("PASS: studio_ui_checks (Metal split viewports, UiControlTree buttons/sliders, whitebox/CSG ops, Scene v10 & GLB roundtrip)")
+    // Run 2: TileMap 2D Unified Stage inside project_editor
+    tm_work := work + "/tm"
+    os.mkdir_all(tm_work + "/assets") >>>
+    tm_proj := tm_work + "/project.json"
+    tm_scene := tm_work + "/assets/world.xuscene"
+    copy_file("examples/isometric_2d/project.json", tm_proj + "") >>>
+    copy_file("examples/isometric_2d/assets/world.xuscene", tm_scene + "") >>>
+    copy_file("examples/isometric_2d/assets/courtyard.xuscene", tm_work + "/assets/courtyard.xuscene") >>>
+    copy_file("examples/isometric_2d/assets/grove.xuscene", tm_work + "/assets/grove.xuscene") >>>
+    copy_file("examples/isometric_2d/assets/hero_iso.png", tm_work + "/assets/hero_iso.png") >>>
+    copy_file("examples/isometric_2d/assets/iso_tiles.png", tm_work + "/assets/iso_tiles.png") >>>
+    script2_path := work + "/script2_tilemap.ndjson"
+    script2_txt := strings.join([
+        "{\"cmd\":\"set_stage_mode\",\"mode\":\"tilemap\"}",
+        "{\"cmd\":\"fit\"}",
+        "{\"cmd\":\"capture_ui\",\"path\":" + json.quote(&png_tile) + "}",
+        "{\"cmd\":\"quit\"}"
+    ], "\n") + "\n"
+    snapshot.write_atomic(script2_path + "", &script2_txt) >>>
+
+    _ := must_cmd(&editor_bin, &[
+        tm_proj + "",
+        "--viewport", vp_bin + "",
+        "--validator", val_bin + "",
+        "--output", work + "/out_tm",
+        "--script", script2_path + ""
+    ], "project-editor unified TileMap script")
+
+    raw_tile := snapshot.read(png_tile + "", snapshot.MAX_BYTES) >>>
+    check(is_valid_png(&raw_tile), "editor_tilemap_paper.png is valid PNG")
+    check(sha256.sum256(raw_tile + "") != sha256.sum256(raw_3d + ""), "TileMap 2D screenshot differs from 3D Studio screenshot")
+
+    // Self-operation E2E (1): Real pointer clicks, orbit, Shift+pan, wheel zoom,
+    // 3D X/Y gizmo drag, above-fold PBR apply, Cmd+D duplicate, Split/Ortho, Export GLB, Save.
+    op3d := work + "/op3d"
+    os.mkdir_all(op3d + "/assets/models") >>>
+    op3d_proj := op3d + "/project.json"
+    op3d_world := op3d + "/assets/world.xuscene"
+    copy_file("examples/scene_assets/project.json", op3d_proj + "") >>>
+    copy_file("examples/scene_assets/assets/world.xuscene", op3d_world + "") >>>
+    copy_file("examples/scene_assets/assets/panels.glb", op3d + "/assets/panels.glb") >>>
+    png_glb_before := work + "/glb_before.png"
+    png_glb_recolored := review_dir + "/op_glb_recolored.png"
+    png_op_3d := review_dir + "/op_3d_gizmo.png"
+    png_op_split := review_dir + "/op_split_edited.png"
+    script_op3d_path := op3d + "/script_op3d.ndjson"
+    script_op3d_txt := strings.join([
+        "{\"cmd\":\"wait_frame\"}",
+        "{\"cmd\":\"capture_ui\",\"path\":" + json.quote(&png_glb_before) + "}",
+        "{\"cmd\":\"click_widget\",\"target\":\"insp_tab_material\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"preset_2\"}",
+        "{\"cmd\":\"wait_frame\"}",
+        "{\"cmd\":\"select_node\",\"index\":8}",
+        "{\"cmd\":\"click_widget\",\"target\":\"preset_6\"}",
+        "{\"cmd\":\"wait_frame\"}",
+        "{\"cmd\":\"capture_ui\",\"path\":" + json.quote(&png_glb_recolored) + "}",
+        "{\"cmd\":\"click_widget\",\"target\":\"box\"}",
+        "{\"cmd\":\"wait_frame\"}",
+        "{\"cmd\":\"drag_canvas\",\"rx0\":0.35,\"ry0\":0.45,\"rx1\":0.48,\"ry1\":0.50,\"button\":\"left\",\"steps\":4}",
+        "{\"cmd\":\"drag_canvas\",\"rx0\":0.46,\"ry0\":0.46,\"rx1\":0.52,\"ry1\":0.49,\"button\":\"left\",\"mod\":\"shift\",\"steps\":3}",
+        "{\"cmd\":\"scroll_canvas\",\"rx\":0.5,\"ry\":0.5,\"dy\":-2.0}",
+        "{\"cmd\":\"wait_frame\"}",
+        "{\"cmd\":\"drag_gizmo\",\"axis\":\"x\",\"delta_px\":64.0,\"steps\":5}",
+        "{\"cmd\":\"drag_gizmo\",\"axis\":\"y\",\"delta_px\":72.0,\"steps\":5}",
+        "{\"cmd\":\"wait_frame\"}",
+        "{\"cmd\":\"capture_ui\",\"path\":" + json.quote(&png_op_3d) + "}",
+        "{\"cmd\":\"click_widget\",\"target\":\"gizmo_rot\"}",
+        "{\"cmd\":\"drag_gizmo\",\"axis\":\"y\",\"delta_px\":50.0,\"steps\":4}",
+        "{\"cmd\":\"click_widget\",\"target\":\"gizmo_scale\"}",
+        "{\"cmd\":\"drag_gizmo\",\"axis\":\"x\",\"delta_px\":45.0,\"steps\":4}",
+        "{\"cmd\":\"click_widget\",\"target\":\"gizmo_move\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"face\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"extrude\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"inset\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"bevel\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"uv\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"subdiv\"}",
+        "{\"cmd\":\"drag_gizmo\",\"axis\":\"y\",\"delta_px\":30.0,\"steps\":3}",
+        "{\"cmd\":\"click_widget\",\"target\":\"obj\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"preset_3\"}",
+        "{\"cmd\":\"key_press\",\"key\":\"D\",\"mod\":\"cmd\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"export_glb\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"csg\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"csg_add_cut\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"csg_bake\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"split\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"axis\"}",
+        "{\"cmd\":\"click_triad\",\"axis\":\"z\"}",
+        "{\"cmd\":\"wait_frame\"}",
+        "{\"cmd\":\"capture_ui\",\"path\":" + json.quote(&png_op_split) + "}",
+        "{\"cmd\":\"click_widget\",\"target\":\"save\"}",
+        "{\"cmd\":\"quit\"}"
+    ], "\n") + "\n"
+    snapshot.write_atomic(script_op3d_path + "", &script_op3d_txt) >>>
+
+    _ := must_cmd(&editor_bin, &[
+        op3d_proj + "",
+        "--viewport", vp_bin + "",
+        "--validator", val_bin + "",
+        "--output", work + "/out_op3d",
+        "--script", script_op3d_path + ""
+    ], "project-editor interactive 3D self-op script")
+
+    raw_glb_before := snapshot.read(png_glb_before + "", snapshot.MAX_BYTES) >>>
+    raw_glb_recolored := snapshot.read(png_glb_recolored + "", snapshot.MAX_BYTES) >>>
+    raw_op_3d := snapshot.read(png_op_3d + "", snapshot.MAX_BYTES) >>>
+    raw_op_split := snapshot.read(png_op_split + "", snapshot.MAX_BYTES) >>>
+    check(is_valid_png(&raw_glb_recolored), "op_glb_recolored.png is valid PNG")
+    check(sha256.sum256(raw_glb_before + "") != sha256.sum256(raw_glb_recolored + ""), "Clicking preset swatch visibly recolors GLB node in 3D Metal viewport")
+    check(is_valid_png(&raw_op_3d), "op_3d_gizmo.png is valid PNG")
+    check(is_valid_png(&raw_op_split), "op_split_edited.png is valid PNG")
+    check(sha256.sum256(raw_op_3d + "") != sha256.sum256(raw_op_split + ""), "Interactive 3D vs Split edited screenshots differ")
+
+    op3d_saved := snapshot.read(op3d_world + "", snapshot.MAX_BYTES) >>>
+    doc_op := codec.decode(&op3d_saved) >>>
+    check(doc_op.editable_mesh_count() >= 3, "Box + Cmd+D copy + baked CSG keep EditableMesh (>=3)")
+    check(doc_op.material_override_count() >= 5, "Recolored Factor & Back_face GLB + Box + Cmd+D copy + baked CSG keep MaterialOverride (>=5)")
+    op_box_idx := find_box_node_index(&doc_op)
+    check(op_box_idx > 0, "Original whitebox node exists after interactive ops")
+    op_box := doc_op.describe_node(op_box_idx) >>>
+    check(op_box.local_3d.c3.y > 0.65, "Interactive Y-gizmo drag lifted Box above initial y=0.5 floor")
+    check(op_box.local_3d.c0.xyz().length() > 1.05, "Interactive X-scale gizmo stretched Box scale.x > 1.05")
+    _ := must_cmd(&val_bin, &["scene", op3d_world + ""], "validate interactively edited world.xuscene")
+
+    // Self-operation E2E (2): Interactive TileMap Rect + Brush + Save
+    tm_courtyard := tm_work + "/assets/courtyard.xuscene"
+    tm_before := snapshot.read(tm_courtyard + "", snapshot.MAX_BYTES) >>>
+    png_op_tm := review_dir + "/op_tilemap_painted.png"
+    script_op_tm_path := tm_work + "/script_op_tm.ndjson"
+    script_op_tm_txt := strings.join([
+        "{\"cmd\":\"click_widget\",\"target\":\"tile\"}",
+        "{\"cmd\":\"click_widget\",\"target\":\"fit\"}",
+        "{\"cmd\":\"click_tm_swatch\",\"slot\":2}",
+        "{\"cmd\":\"click_tm_tool\",\"tool\":\"rect\"}",
+        "{\"cmd\":\"drag_canvas\",\"rx0\":0.38,\"ry0\":0.44,\"rx1\":0.54,\"ry1\":0.54,\"button\":\"left\",\"steps\":4}",
+        "{\"cmd\":\"capture_ui\",\"path\":" + json.quote(&png_op_tm) + "}",
+        "{\"cmd\":\"click_widget\",\"target\":\"save\"}",
+        "{\"cmd\":\"quit\"}"
+    ], "\n") + "\n"
+    snapshot.write_atomic(script_op_tm_path + "", &script_op_tm_txt) >>>
+
+    _ := must_cmd(&editor_bin, &[
+        tm_proj + "",
+        "--viewport", vp_bin + "",
+        "--validator", val_bin + "",
+        "--output", work + "/out_op_tm",
+        "--script", script_op_tm_path + ""
+    ], "project-editor interactive TileMap self-op script")
+
+    raw_op_tm := snapshot.read(png_op_tm + "", snapshot.MAX_BYTES) >>>
+    tm_after := snapshot.read(tm_courtyard + "", snapshot.MAX_BYTES) >>>
+    check(is_valid_png(&raw_op_tm), "op_tilemap_painted.png is valid PNG")
+    check(sha256.sum256(raw_op_tm + "") != sha256.sum256(raw_tile + ""), "Painted TileMap screenshot differs from clean TileMap")
+    check(sha256.sum256(tm_after + "") != sha256.sum256(tm_before + ""), "Interactive TileMap drag + Save persisted modified scene")
+    _ := must_cmd(&val_bin, &["scene", tm_courtyard + ""], "validate interactively painted TileMap scene")
+
+    println("PASS: studio_ui_checks (Unified Paper editor: 3D Metal + Split Persp/Ortho + Bilingual + Whitebox/CSG/GLB + TileMap 2D + Real UI Self-Ops)")
     << 0
 }
 
 fn main() int {
     args := os.args()
-    $studio_bin := "build/nexus-studio"
+    $editor_bin := "build/nexus-project-editor"
     $vp_bin := "build/nexus-project-viewport"
     $val_bin := "build/nexus-project-validate"
     $cli_bin := "build/nexus-project"
     if args.len == 5 && (args[1].len < 2 || args[1][0:2] != "--") {
-        studio_bin = args[1] + ""
+        editor_bin = args[1] + ""
         vp_bin = args[2] + ""
         val_bin = args[3] + ""
         cli_bin = args[4] + ""
     } else {
         $i := 1
         while i + 1 < args.len {
-            if args[i] == "--studio" { studio_bin = args[i + 1] + "" }
+            if args[i] == "--editor" || args[i] == "--studio" { editor_bin = args[i + 1] + "" }
             else if args[i] == "--viewport" { vp_bin = args[i + 1] + "" }
             else if args[i] == "--validator" { val_bin = args[i + 1] + "" }
             else if args[i] == "--project-cli" { cli_bin = args[i + 1] + "" }
             i += 2
         }
     }
-    << run_checks(studio_bin, vp_bin, val_bin, cli_bin) or (err) {
+    << run_checks(editor_bin, vp_bin, val_bin, cli_bin) >>> (err) {
         eprintln("FAIL: " + err.msg())
         << 1
     }

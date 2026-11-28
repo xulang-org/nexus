@@ -56,7 +56,7 @@ pub fn asset_name_for_uid(project &Project, uid &string) string {
 
 pub fn find_node_surface(doc &resource.Document, node_idx int) resource.Surface {
     for i in 0:doc.surface_count() {
-        s := doc.surface(i) or (err) { << resource.surface(-1, "", 0) }
+        s := doc.surface(i) >>> (err) { << resource.surface(-1, "", 0) }
         if s.node == node_idx {
             << s
         }
@@ -95,12 +95,38 @@ pub fn format_lod_summary(project &Project, surf &resource.Surface, lang int) st
 
 pub fn sync_surface_inspector(ed $&Editor, doc &resource.Document, is_3d bool) {
     $cur_surf := find_node_surface(doc, ed.selected_node)
+    sels := ed.effective_selected_nodes(doc)
+    $any_surf := cur_surf.node >= 0
+    $surf_cnt := 0
+    $n3d_cnt := 0
+    for i in 0:sels.len {
+        nid := sels[i]
+        if nid >= 0 && nid < doc.node_count() {
+            nd := doc.describe_node(nid) >>> (err) {
+                _ := err
+                ->
+            }
+            if nd.kind == resource.NODE_3D {
+                n3d_cnt = n3d_cnt + 1
+                if find_node_surface(doc, nid).node >= 0 {
+                    surf_cnt = surf_cnt + 1
+                    any_surf = true
+                }
+            }
+        }
+    }
+    if sels.len > 1 && any_surf {
+        ed.surf_text = tr(ed.lang, "Surface: ", "表面: ") + str(surf_cnt) + "/" + str(n3d_cnt) + tr(ed.lang, " selected bound", " 选中已绑定")
+        surf_copy := ed.surf_text + ""
+        set_text_val($&ed.surf_info_txt, &surf_copy)
+    }
     has_glb := ed.glb_indices.len > 0
     has_surf := cur_surf.node >= 0
+    ed.surf_attached = any_surf
     has_lod := has_surf && cur_surf.levels.len > 0
     set_sel_enabled($&ed.surf_asset_select, is_3d)
     set_btn_enabled($&ed.surf_bind_btn, is_3d && has_glb)
-    set_btn_enabled($&ed.surf_clear_btn, is_3d && has_surf)
+    set_btn_enabled($&ed.surf_clear_btn, is_3d && any_surf)
     enable_field($&ed.surf_prim_field, is_3d)
     enable_field($&ed.lod_hyst_field, is_3d && has_surf)
     enable_field($&ed.lod_dist_field, is_3d && has_surf)
@@ -144,7 +170,7 @@ pub fn (ed $&Editor) do_bind_surface(view $&widgets.View) {
         <<
     }
     prim_txt := strings.trim_space(&ed.surf_prim_field.value())
-    prim := strconv.atoi(&prim_txt) or (err) {
+    prim := strconv.atoi(&prim_txt) >>> (err) {
         ed.set_status(STATUS_ERR, tr(ed.lang, "Surface primitive must be a non-negative integer", "表面图元索引必须为非负整数"), view)
         <<
     }
@@ -155,42 +181,117 @@ pub fn (ed $&Editor) do_bind_surface(view $&widgets.View) {
     hyst_txt := strings.trim_space(&ed.lod_hyst_field.value())
     $hyst := 0.0
     if hyst_txt.len > 0 {
-        hyst = parse_f64_or(&hyst_txt, tr(ed.lang, "LOD hysteresis", "LOD 滞后")) or (err) {
+        hyst = parse_f64_or(&hyst_txt, tr(ed.lang, "LOD hysteresis", "LOD 滞后")) >>> (err) {
             ed.set_status(STATUS_ERR, err.msg(), view)
             <<
         }
     }
-    doc := ed.draft.document() or (err) {
+    doc := ed.draft.document() >>> (err) {
         ed.set_status(STATUS_ERR, err.msg(), view)
         <<
     }
-    cur_surf := find_node_surface(&doc, ed.selected_node)
-    cur_levels := clone_surface_levels(&cur_surf.levels)
+    $targets := []int{}
+    if ed.selected_nodes.len > 1 {
+        targets = ed.selected_3d_targets(&doc)
+    } else if ed.selected_node >= 0 && ed.selected_node < doc.node_count() {
+        targets.push(ed.selected_node)
+    }
+    if targets.len == 0 {
+        ed.set_status(STATUS_ERR, tr(ed.lang, "Select a 3D node first", "请先选择一个 3D 节点"), view)
+        <<
+    }
     uid := ed.project.assets[ed.glb_indices[g_idx]].key + ""
     proj := clone_project(&ed.project)
-    sel_node := ed.selected_node
-    d := $&ed.draft
-    d.set_node_surface(&proj, sel_node, uid, prim, cur_levels, hyst) or (err) {
-        ed.set_status(STATUS_ERR, err.msg(), view)
+    if targets.len == 1 {
+        nid := targets[0]
+        cur_surf := find_node_surface(&doc, nid)
+        cur_levels := clone_surface_levels(&cur_surf.levels)
+        d := $&ed.draft
+        d.set_node_surface(&proj, nid, uid, prim, cur_levels, hyst) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            <<
+        }
+        ed.refresh_after_document_change(false, view)
+        ed.set_status(STATUS_OK, tr(ed.lang, "Bound GLB surface (prim ", "已绑定 GLB 表面（图元 ") + str(prim) + tr(ed.lang, ")", "）"), view)
+        <<
+    }
+    base_len := ed.draft.undo.len
+    base_raw := ed.draft.current + ""
+    $err_msg := ""
+    if true {
+        d := $&ed.draft
+        for k in 0:targets.len {
+            nid := targets[k]
+            cur_surf := find_node_surface(&doc, nid)
+            cur_levels := clone_surface_levels(&cur_surf.levels)
+            d.set_node_surface(&proj, nid, uid, prim, cur_levels, hyst) >>> (err) {
+                err_msg = err.msg()
+                d.current = base_raw
+                d.collapse_undo_to(base_len, base_raw)
+                <-
+            }
+        }
+        if err_msg.len == 0 {
+            d.collapse_undo_to(base_len, base_raw)
+        }
+    }
+    if err_msg.len > 0 {
+        ed.set_status(STATUS_ERR, err_msg, view)
         <<
     }
     ed.refresh_after_document_change(false, view)
-    ed.set_status(STATUS_OK, tr(ed.lang, "Bound GLB surface (prim ", "已绑定 GLB 表面（图元 ") + str(prim) + tr(ed.lang, ")", "）"), view)
+    ed.set_status(STATUS_OK, tr(ed.lang, "Bound GLB surface on " + str(targets.len) + " nodes (prim ", "已为 " + str(targets.len) + " 个节点绑定 GLB 表面（图元 ") + str(prim) + tr(ed.lang, ")", "）"), view)
 }
 
 pub fn (ed $&Editor) do_clear_surface(view $&widgets.View) {
-    sel_node := ed.selected_node
-    d := $&ed.draft
-    d.clear_node_surface(sel_node) or (err) {
+    doc := ed.draft.document() >>> (err) {
         ed.set_status(STATUS_ERR, err.msg(), view)
         <<
     }
+    $targets := []int{}
+    if ed.selected_nodes.len > 1 {
+        targets = ed.selected_3d_targets(&doc)
+    } else if ed.selected_node >= 0 && ed.selected_node < doc.node_count() {
+        targets.push(ed.selected_node)
+    }
+    if targets.len <= 1 {
+        sel_node := ed.selected_node
+        d := $&ed.draft
+        d.clear_node_surface(sel_node) >>> (err) {
+            ed.set_status(STATUS_ERR, err.msg(), view)
+            <<
+        }
+        ed.refresh_after_document_change(false, view)
+        ed.set_status(STATUS_OK, tr(ed.lang, "Cleared GLB surface", "已清除 GLB 表面"), view)
+        <<
+    }
+    base_len := ed.draft.undo.len
+    base_raw := ed.draft.current + ""
+    $err_msg := ""
+    if true {
+        d := $&ed.draft
+        for k in 0:targets.len {
+            d.clear_node_surface(targets[k]) >>> (err) {
+                err_msg = err.msg()
+                d.current = base_raw
+                d.collapse_undo_to(base_len, base_raw)
+                <-
+            }
+        }
+        if err_msg.len == 0 {
+            d.collapse_undo_to(base_len, base_raw)
+        }
+    }
+    if err_msg.len > 0 {
+        ed.set_status(STATUS_ERR, err_msg, view)
+        <<
+    }
     ed.refresh_after_document_change(false, view)
-    ed.set_status(STATUS_OK, tr(ed.lang, "Cleared GLB surface", "已清除 GLB 表面"), view)
+    ed.set_status(STATUS_OK, tr(ed.lang, "Cleared GLB surface on " + str(targets.len) + " nodes", "已清除 " + str(targets.len) + " 个节点的 GLB 表面"), view)
 }
 
 pub fn (ed $&Editor) do_add_lod_level(view $&widgets.View) {
-    doc := ed.draft.document() or (err) {
+    doc := ed.draft.document() >>> (err) {
         ed.set_status(STATUS_ERR, err.msg(), view)
         <<
     }
@@ -199,19 +300,19 @@ pub fn (ed $&Editor) do_add_lod_level(view $&widgets.View) {
         ed.set_status(STATUS_ERR, tr(ed.lang, "Bind a base GLB surface before adding LOD levels", "请先绑定主 GLB 表面后再添加 LOD 级别"), view)
         <<
     }
-    dist := parse_f64_or(&ed.lod_dist_field.value(), tr(ed.lang, "LOD distance", "LOD 距离")) or (err) {
+    dist := parse_f64_or(&ed.lod_dist_field.value(), tr(ed.lang, "LOD distance", "LOD 距离")) >>> (err) {
         ed.set_status(STATUS_ERR, err.msg(), view)
         <<
     }
     lprim_txt := strings.trim_space(&ed.lod_prim_field.value())
-    lprim := strconv.atoi(&lprim_txt) or (err) {
+    lprim := strconv.atoi(&lprim_txt) >>> (err) {
         ed.set_status(STATUS_ERR, tr(ed.lang, "LOD primitive must be a non-negative integer", "LOD 图元索引必须为非负整数"), view)
         <<
     }
     $hyst := surf.hysteresis
     hyst_txt := strings.trim_space(&ed.lod_hyst_field.value())
     if hyst_txt.len > 0 {
-        hyst = parse_f64_or(&hyst_txt, tr(ed.lang, "LOD hysteresis", "LOD 滞后")) or (err) {
+        hyst = parse_f64_or(&hyst_txt, tr(ed.lang, "LOD hysteresis", "LOD 滞后")) >>> (err) {
             ed.set_status(STATUS_ERR, err.msg(), view)
             <<
         }
@@ -232,7 +333,7 @@ pub fn (ed $&Editor) do_add_lod_level(view $&widgets.View) {
     base_uid := surf.resource_uid + ""
     base_prim := surf.primitive
     d := $&ed.draft
-    d.set_node_surface(&proj, sel_node, base_uid, base_prim, next_levels, hyst) or (err) {
+    d.set_node_surface(&proj, sel_node, base_uid, base_prim, next_levels, hyst) >>> (err) {
         ed.set_status(STATUS_ERR, err.msg(), view)
         <<
     }
@@ -241,7 +342,7 @@ pub fn (ed $&Editor) do_add_lod_level(view $&widgets.View) {
 }
 
 pub fn (ed $&Editor) do_pop_lod_level(view $&widgets.View) {
-    doc := ed.draft.document() or (err) {
+    doc := ed.draft.document() >>> (err) {
         ed.set_status(STATUS_ERR, err.msg(), view)
         <<
     }
@@ -265,7 +366,7 @@ pub fn (ed $&Editor) do_pop_lod_level(view $&widgets.View) {
     base_prim := surf.primitive
     hyst := surf.hysteresis
     d := $&ed.draft
-    d.set_node_surface(&proj, sel_node, base_uid, base_prim, next_levels, hyst) or (err) {
+    d.set_node_surface(&proj, sel_node, base_uid, base_prim, next_levels, hyst) >>> (err) {
         ed.set_status(STATUS_ERR, err.msg(), view)
         <<
     }
@@ -274,15 +375,13 @@ pub fn (ed $&Editor) do_pop_lod_level(view $&widgets.View) {
 }
 
 pub fn update_insp_scroll_extent(ed $&Editor, view $&widgets.View) {
-    scb := view.node_bounds(ed.id_insp_scroll) or (err) { << }
-    tail := view.node_bounds(ed.comp.id_prefab_row2) or (err) { << }
-    cur_off := ed.insp_scroll.offset()
-    content_h := math.max(scb.height, (tail.y + tail.height + cur_off) - scb.y + 12.0)
+    scb := view.node_bounds(ed.id_insp_scroll) >>> (err) { << }
+    content_h := math.max(scb.height, ed.insp_tab_content_h + 8.0)
     st := ed.styles.clone()
     sc := $&ed.insp_scroll
-    _ := sc.set_bounds(&layout.Rect{x: 0.0, y: 0.0, width: scb.width, height: scb.height}) or (err) { << }
-    _ := sc.set_content_extent(content_h) or (err) { << }
-    _ := sc.apply_styles(&st) or (err) { << }
+    _ := sc.set_bounds(&layout.Rect{x: 0.0, y: 0.0, width: scb.width, height: scb.height}) >>> (err) { << }
+    _ := sc.set_content_extent(content_h) >>> (err) { << }
+    _ := sc.apply_styles(&st) >>> (err) { << }
     scroll_y := ed.insp_scroll.offset()
-    _ := view.set_scroll(ed.id_insp_scroll, 0.0, scroll_y) or (err) { << }
+    _ := view.set_scroll(ed.id_insp_scroll, 0.0, scroll_y) >>> (err) { << }
 }

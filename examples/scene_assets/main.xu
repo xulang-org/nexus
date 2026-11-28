@@ -1,6 +1,12 @@
 @main
 
+camera_data #"github.com/xulang-org/nexus/resources/camera"
+controls #"github.com/xulang-org/nexus/input"
 light_data #"github.com/xulang-org/nexus/resources/lighting"
+meshes #"github.com/xulang-org/nexus/resources/mesh"
+resource #"github.com/xulang-org/nexus/resources/scene"
+shadows #"github.com/xulang-org/nexus/resources/shadow"
+xacp #"github.com/xulang-org/nexus/xacp"
 
 #gpu
 
@@ -10,12 +16,18 @@ gpu_info #"github.com/xulang-org/nexus/platform/gpu"
 window_events #window/events
 mesh_shaders #"github.com/xulang-org/nexus/assets/shaders/three_d"
 
+scene_files #"github.com/xulang-org/nexus/integration/scene"
+imod #"github.com/xulang-org/nexus/integration/modeling"
+scene_lights #"github.com/xulang-org/nexus/integration/lighting"
+scene_lighting #"github.com/xulang-org/nexus/integration/scene_lighting"
 loader #"github.com/xulang-org/nexus/integration/scene_render"
 nexus #"github.com/xulang-org/nexus/scene"
 fm #"github.com/xulang-org/nexus/foundation/math"
 colors #"github.com/xulang-org/nexus/foundation/color"
 ren #"github.com/xulang-org/nexus/rendering/three_d"
 scene_render #"github.com/xulang-org/nexus/integration/rendering/three_d"
+#math
+#path/filepath
 #os
 #strconv
 #errors
@@ -25,12 +37,35 @@ struct Options { path string
     capture string
     shaders string
     frames int
-    backend int }
+    backend int
+    xacp_port int }
+
+struct PreviewFallbackCam {
+    eye fm.Vec3
+    center fm.Vec3
+    radius f64
+}
+
+struct PreviewCameraView {
+    view fm.Mat4
+    proj fm.Mat4
+    vp fm.Mat4
+    eye fm.Vec3
+    z_near f64
+    z_far f64
+    slice_mode int
+}
+
 fn options() Options {
     args := os.args()
-    $config := Options{path: "examples/scene_assets/assets/world.xuscene", save: "", capture: "", shaders: "build/mesh-shaders", frames: 0, backend: gpu.AUTO}
+    $config := Options{path: "examples/scene_assets/assets/world.xuscene", save: "", capture: "", shaders: "build/mesh-shaders", frames: 0, backend: gpu.AUTO, xacp_port: 0}
     $i := 1
     while i < args.len {
+        if args[i] == "--xacp-tcp" {
+            config.xacp_port = xacp.DEFAULT_PORT
+            i = i + 1
+            ->
+        }
         if i + 1 >= args.len { >> errors.new("missing option value") }
         next := i + 1
         if args[i] == "--scene" { config.path = args[next] + ""
@@ -38,8 +73,12 @@ fn options() Options {
         } else if args[i] == "--shaders" { config.shaders = args[next] + ""
         } else if args[i] == "--capture" { config.capture = args[next] + ""
         } else if args[i] == "--frames" {
-            config.frames = strconv.atoi(&args[next]) or >>
+            config.frames = strconv.atoi(&args[next]) >>>
             if config.frames < 1 || config.frames > 1000000 { >> errors.new("invalid frames") }
+        } else if args[i] == "--xacp-port" {
+            port := strconv.atoi(&args[next]) >>>
+            if port < 1 || port > 65535 { >> errors.new("invalid xacp port") }
+            config.xacp_port = port
         } else if args[i] == "--backend" {
             if args[next] == "metal" { config.backend = gpu.METAL
             } else if args[next] == "vulkan" { config.backend = gpu.VULKAN
@@ -51,56 +90,666 @@ fn options() Options {
     if config.capture.len > 0 && config.frames == 0 { >> errors.new("capture requires --frames") }
     << config
 }
+
+fn try_apply_scene_mat(world $&scene_render.Scene3D, tree &nexus.SceneTree, nid int, mat ren.Material3D) bool {
+    _ := world.set_material(tree, nid, mat) >>> (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn try_set_preview_mat_override(
+    world $&scene_render.Scene3D,
+    tree &nexus.SceneTree,
+    nid int,
+    mat ren.Material3D,
+    fallback_mat ren.Material3D
+) {
+    keep_ds := world.is_node_double_sided(nid)
+    $next_mat := mat
+    if keep_ds && !next_mat.is_double_sided() {
+        next_mat = next_mat.with_double_sided(true)
+    }
+    if try_apply_scene_mat(world, tree, nid, next_mat) {
+        <<
+    }
+    $plain := fallback_mat
+    if keep_ds && !plain.is_double_sided() {
+        plain = plain.with_double_sided(true)
+    }
+    _ := try_apply_scene_mat(world, tree, nid, plain)
+}
+
+fn apply_preview_material_overrides(
+    doc &resource.Document,
+    mods &imod.SceneModeling3D,
+    world $&scene_render.Scene3D,
+    tree &nexus.SceneTree,
+    tree_ids &[]int
+) {
+    for i in 0:doc.material_override_count() {
+        ov := doc.material_override(i) >>> (err) {
+            _ := err
+            ->
+        }
+        if ov.slot != 0 || ov.node < 0 || ov.node >= tree_ids.len { -> }
+        mat_tex := mods.resolve_material_3d(&ov.material) >>> (err) {
+            _ := err
+            ->
+        }
+        mat_plain := imod.material_asset_to_3d(&ov.material) >>> (err) {
+            _ := err
+            ->
+        }
+        try_set_preview_mat_override(world, tree, tree_ids[ov.node], mat_tex, mat_plain)
+    }
+}
+
+fn check_camera_node(tree &nexus.SceneTree, cid int) bool {
+    _ := tree.camera_view_projection_3d(cid, 1.0) >>> (err) {
+        _ := err
+        << false
+    }
+    << true
+}
+
+fn try_find_named_camera(tree &nexus.SceneTree, instance int) int {
+    << tree.find_child(instance, "Camera") >>> (err) {
+        _ := err
+        << -1
+    }
+}
+
+fn find_preview_camera_doc(
+    doc &resource.Document,
+    tree &nexus.SceneTree,
+    instance int,
+    tree_ids &[]int
+) int {
+    cid := try_find_named_camera(tree, instance)
+    if cid >= 0 && check_camera_node(tree, cid) {
+        for d in 0:tree_ids.len {
+            if tree_ids[d] == cid { << d }
+        }
+    }
+    for d in 0:doc.node_count() {
+        if d >= tree_ids.len { <- }
+        nd := doc.describe_node(d) >>> (err) {
+            _ := err
+            ->
+        }
+        if nd.camera.is_set() || nd.orthographic.is_set() {
+            tid := tree_ids[d]
+            if check_camera_node(tree, tid) {
+                << d
+            }
+        }
+    }
+    << -1
+}
+
+fn compute_fallback_camera(tree &nexus.SceneTree, tree_ids &[]int) PreviewFallbackCam {
+    $has_pt := false
+    $low := fm.vec3(0.0, 0.0, 0.0)
+    $high := fm.vec3(0.0, 0.0, 0.0)
+    for d in 1:tree_ids.len {
+        nid := tree_ids[d]
+        vis := tree.is_visible(nid) >>> (err) {
+            _ := err
+            ->
+        }
+        if !vis { -> }
+        info := tree.node_info(nid) >>> (err) {
+            _ := err
+            ->
+        }
+        if info.kind != nexus.NODE_3D { -> }
+        wp := (tree.global_transform_3d(nid) >>> (err) {
+            _ := err
+            ->
+        }).c3.xyz()
+        if !has_pt {
+            low = wp
+            high = wp
+            has_pt = true
+        } else {
+            low = fm.vec3(math.min(low.x, wp.x), math.min(low.y, wp.y), math.min(low.z, wp.z))
+            high = fm.vec3(math.max(high.x, wp.x), math.max(high.y, wp.y), math.max(high.z, wp.z))
+        }
+    }
+    if !has_pt {
+        << PreviewFallbackCam{eye: fm.vec3(3.8, 2.8, 6.2), center: fm.vec3(0.0, 0.5, 0.0), radius: 8.0}
+    }
+    center := low.add(high).scaled(0.5)
+    half_ext := high.sub(low).scaled(0.5)
+    radius := math.max(1.8, half_ext.length())
+    eye := center.add(fm.vec3(radius * 1.4, radius * 1.05, radius * 2.2))
+    << PreviewFallbackCam{eye: eye, center: center, radius: math.max(6.0, half_ext.length() + 4.0)}
+}
+
+fn resolve_preview_camera(
+    doc &resource.Document,
+    tree &nexus.SceneTree,
+    tree_ids &[]int,
+    cam_doc_idx int,
+    fallback &PreviewFallbackCam,
+    aspect f64
+) PreviewCameraView {
+    if cam_doc_idx >= 0 && cam_doc_idx < tree_ids.len {
+        cid := tree_ids[cam_doc_idx]
+        nd := doc.describe_node(cam_doc_idx) >>>
+        world := tree.global_transform_3d(cid) >>>
+        view := world.affine_inverse() >>>
+        eye := world.c3.xyz()
+        if nd.camera.is_set() {
+            zn := math.max(0.05, nd.camera.near())
+            zf := math.max(zn + 1.0, nd.camera.far())
+            proj := camera_data.projection(nd.camera.vertical_fov(), aspect, zn, zf) >>>
+            << PreviewCameraView{view: view, proj: proj, vp: proj.multiply(view), eye: eye, z_near: zn, z_far: zf, slice_mode: 0}
+        }
+        if nd.orthographic.is_set() {
+            zn := math.max(0.05, nd.orthographic.near())
+            zf := math.max(zn + 1.0, nd.orthographic.far())
+            proj := nd.orthographic.projection(aspect) >>>
+            << PreviewCameraView{view: view, proj: proj, vp: proj.multiply(view), eye: eye, z_near: zn, z_far: zf, slice_mode: 1}
+        }
+        proj := camera_data.projection(0.7853981633974483, aspect, 0.1, 200.0) >>>
+        << PreviewCameraView{view: view, proj: proj, vp: proj.multiply(view), eye: eye, z_near: 0.1, z_far: 200.0, slice_mode: 0}
+    }
+    view_mat := nexus.look_at_3d(fallback.eye, fallback.center, fm.vec3(0.0, 1.0, 0.0)) >>>
+    proj := camera_data.projection(0.7853981633974483, aspect, 0.1, 200.0) >>>
+    << PreviewCameraView{
+        view: view_mat,
+        proj: proj,
+        vp: proj.multiply(view_mat),
+        eye: fallback.eye,
+        z_near: 0.1,
+        z_far: 200.0,
+        slice_mode: 0
+    }
+}
+
+fn default_sun_dir() fm.Vec3 {
+    << fm.vec3(0.45, 0.78, 0.42).normalized() >>> (err) {
+        _ := err
+        << fm.vec3(0.0, 1.0, 0.0)
+    }
+}
+
+fn unit_dir_or_sun(v fm.Vec3) fm.Vec3 {
+    << v.normalized() >>> (err) {
+        _ := err
+        << default_sun_dir()
+    }
+}
+
+fn gather_preview_lights(
+    doc &resource.Document,
+    slights &scene_lights.SceneLights3D,
+    tree &nexus.SceneTree,
+    has_lights bool,
+    shadow_sel $&scene_lights.ShadowSelection3D
+) []light_data.Light3D {
+    if has_lights && slights.binding_count() > 0 {
+        gathered := slights.gather_with_shadows(tree, shadow_sel) >>> (err) {
+            _ := err
+            << []light_data.Light3D{}
+        }
+        if gathered.len > 0 { << gathered }
+    }
+    $sun_dir := fm.vec3(0.45, 0.78, 0.42)
+    $sun_int := 2.4
+    if doc.environment_count() > 0 {
+        ev := doc.environment(0) >>>
+        sun_dir = ev.sun_dir
+        sun_int = ev.sun_intensity
+    }
+    nsun := unit_dir_or_sun(sun_dir)
+    sun := light_data.directional(nsun, fm.vec3(sun_int, sun_int * 0.96, sun_int * 0.90)) >>>
+    fill := light_data.directional(fm.vec3(-0.55, 0.38, 0.48), fm.vec3(0.75, 0.82, 0.94)) >>>
+    rim := light_data.directional(fm.vec3(-0.30, 0.45, -0.82), fm.vec3(0.95, 1.00, 1.08)) >>>
+    << [sun, fill, rim]
+}
+
+fn build_preview_particle_emitter(
+    att &resource.ParticleEmitter3DAttachment,
+    origin fm.Vec3
+) ren.ParticleEmitter3D {
+    $em := ren.default_particle_emitter_3d(origin)
+    rate := math.max(1.0, att.spawn_rate)
+    life := math.max(0.15, att.lifetime)
+    spd := math.max(0.0, att.speed)
+    sz := math.max(0.03, att.size)
+    sr := f64((att.start_color >> 16) & 255) / 255.0
+    sg := f64((att.start_color >> 8) & 255) / 255.0
+    sb := f64(att.start_color & 255) / 255.0
+    $sa := f64((att.start_color >> 24) & 255) / 255.0
+    if sa < 0.05 { sa = 1.0 }
+    er := f64((att.end_color >> 16) & 255) / 255.0
+    eg := f64((att.end_color >> 8) & 255) / 255.0
+    eb := f64(att.end_color & 255) / 255.0
+    ea := f64((att.end_color >> 24) & 255) / 255.0
+    em.emit_rate = rate
+    em.life_min = math.max(0.08, life * 0.7)
+    em.life_max = life
+    em.speed_min = spd * 0.65
+    em.speed_max = math.max(0.1, spd)
+    em.gravity = fm.vec3(0.0, att.gravity, 0.0)
+    em.size_start_min = sz * 0.75
+    em.size_start_max = sz
+    em.color_keys = [
+        sr, sg, sb, sa,
+        (sr + er) * 0.5, (sg + eg) * 0.5, (sb + eb) * 0.5, sa * 0.75,
+        er, eg, eb, math.max(0.15, (sa + ea) * 0.35),
+        er, eg, eb, 0.0
+    ]
+    if att.additive {
+        em.start_additive = 1.0
+        em.end_additive = 1.0
+        em.emissive_scale = 2.6
+    } else {
+        em.start_additive = 0.0
+        em.end_additive = 0.0
+        em.emissive_scale = 1.15
+    }
+    << em
+}
+
+fn collect_all_shadow_casters(
+    scene &scene_render.Scene3D,
+    mods &imod.SceneModeling3D,
+    tree &nexus.SceneTree,
+    tree_ids &[]int
+) []ren.ShadowCaster3D {
+    $casters := scene.shadow_casters(tree) >>>
+    mc := mods.shadow_casters(tree, tree_ids) >>>
+    for i in 0:mc.len { casters.push(mc[i]) }
+    << casters
+}
+
+struct PreviewGpuFx {
+    shadow_maps []ren.ShadowMap3D
+    particles []ren.GpuParticleSystem3D
+    atm_list []ren.AtmosphereRenderer3D
+}
+
+struct PreviewPipelines {
+    items []scene_render.ModernPipeline3D
+}
+
+fn try_open_preview_shadow_map(
+    device &ren.Device3D,
+    fx $&PreviewGpuFx,
+    shadow_desc shadows.ShadowDescription3D,
+    sprog &ren.ShadowProgram3D
+) bool {
+    sm_new := device.shadow_map(shadow_desc, sprog) >>> (err) {
+        eprintln("preview shadow fallback (unshadowed): " + err.msg())
+        << false
+    }
+    fx.shadow_maps.push(sm_new)
+    << true
+}
+
+fn close_shadow_maps(fx $&PreviewGpuFx) {
+    for i in 0:fx.shadow_maps.len {
+        sm := $&fx.shadow_maps[i]
+        _ := sm.close() >>> (err) {
+            _ := err
+            <<
+        }
+    }
+    fx.shadow_maps = []ren.ShadowMap3D{}
+}
+
+fn close_gpu_particles(fx $&PreviewGpuFx) {
+    for i in 0:fx.particles.len {
+        ps := $&fx.particles[i]
+        _ := ps.close() >>> (err) {
+            _ := err
+            <<
+        }
+    }
+    fx.particles = []ren.GpuParticleSystem3D{}
+}
+
+fn close_modern_pipelines(pipes $&PreviewPipelines) {
+    for i in 0:pipes.items.len {
+        mp := $&pipes.items[i]
+        _ := mp.close() >>> (err) {
+            _ := err
+            <<
+        }
+    }
+    pipes.items = []scene_render.ModernPipeline3D{}
+}
+
+fn close_atm_renderers(fx $&PreviewGpuFx) {
+    for i in 0:fx.atm_list.len {
+        ar := $&fx.atm_list[i]
+        _ := ar.close() >>> (err) {
+            _ := err
+            <<
+        }
+    }
+    fx.atm_list = []ren.AtmosphereRenderer3D{}
+}
+
+fn capture_xacp_shot(device $&ren.Device3D, ctrl $&xacp.GameControl, width int, height int, shot_path string) {
+    device.capture(shot_path + "") >>> (err) {
+        _ := ctrl.reject_screenshot("capture failed: " + err.msg())
+        <<
+    }
+    _ := ctrl.fulfill_screenshot(width, height, shot_path)
+}
+
 fn run() int {
-    config := options() or >>
-    mesh_program_0 := mesh_shaders.load_mesh(config.shaders + "") or >>
-    $device := ren.open_3d("Xu persisted GLB surfaces | Esc: exit", 1200, 720, config.backend, &mesh_program_0) or >>
-    println("Persisted surface GPU backend: " + gpu_info.backend_name(device.backend() or >>))
-    $models := loader.load(&device, config.path + "") or >>
-    $tree := nexus.new_scene_tree_3d("World", 128) or >>
+    config := options() >>>
+    mesh_program_0 := mesh_shaders.load_mesh(config.shaders + "") >>>
+    $device := ren.open_3d("Xu persisted GLB surfaces | Esc: exit", 1200, 720, config.backend, &mesh_program_0) >>>
+    println("Persisted surface GPU backend: " + gpu_info.backend_name(device.backend() >>>))
+    directory := filepath.dir(&config.path)
+    document := scene_files.load(config.path + "") >>>
+    doc_meta := scene_files.load(config.path + "") >>>
+    root_name := (doc_meta.describe_node(0) >>>).name
+    $models := loader.prepare_surfaces(&device, document, directory + "") >>>
+    $tree := nexus.new_scene_tree_3d("World", 4097) >>>
     root := tree.root()
-    $scene := scene_render.new_scene_3d(&device) or >>
-    instance := models.instantiate($&scene, $&tree, root, "Gallery") or >>
-    camera_node := tree.find_child(instance, "Camera") or >>
-    tree.camera_view_projection_3d(camera_node, 1.0) or >>
-    ready := tree.take_ready() or >>
+    $scene := scene_render.new_scene_3d(&device) >>>
+    instance := models.instantiate($&scene, $&tree, root, root_name + "") >>>
+    $scene_mods := imod.prepare_scene_modeling_in_dir(&device, &doc_meta, directory + "") >>>
+    tree_ids := tree.subtree(instance) >>>
+    apply_preview_material_overrides(&doc_meta, &scene_mods, $&scene, &tree, &tree_ids)
+    $slights := scene_lights.new_scene_lights_3d()
+    has_lights := doc_meta.light_count() > 0
+    if has_lights {
+        scene_lighting.bind(&doc_meta, $&slights, &tree, instance) >>>
+    }
+    cam_doc_idx := find_preview_camera_doc(&doc_meta, &tree, instance, &tree_ids)
+    fallback_cam := compute_fallback_camera(&tree, &tree_ids)
+    if cam_doc_idx >= 0 {
+        tree.camera_view_projection_3d(tree_ids[cam_doc_idx], 1.0) >>>
+    }
+    ready := tree.take_ready() >>>
     println("Restored " + str(ready.len) + " ready nodes, " + str(models.surface_count()) + " surfaces, " + str(models.model_count()) + " shared GLB model")
-    background := colors.rgba8(12, 20, 34, 255) or >>
+
+    $dmesh_cpu := meshes.new_mesh_data_3d()
+    dmesh_cpu.vertex(fm.vec3(0.0, 0.0, 0.0), 0) >>>
+    dmesh_cpu.vertex(fm.vec3(0.0, 0.0, 0.0), 0) >>>
+    dmesh_cpu.vertex(fm.vec3(0.0, 0.0, 0.0), 0) >>>
+    dmesh_cpu.triangle(0, 1, 2) >>>
+    $dummy_grid := device.upload(&dmesh_cpu) >>>
+
+    $fx := PreviewGpuFx{
+        shadow_maps: []ren.ShadowMap3D{},
+        particles: []ren.GpuParticleSystem3D{},
+        atm_list: []ren.AtmosphereRenderer3D{}
+    }
+    $pipes := PreviewPipelines{
+        items: []scene_render.ModernPipeline3D{}
+    }
+    $shadow_res := 0
+    $shadow_faces := 0
+    $particle_nodes := []int{}
+
+    $cprog := ren.ClusteredProgram3D{format: 0, entrypoint: "", compute: []u8{}, vertex: []u8{}, fragment: []u8{}}
+    $iprog := ren.IndirectProgram3D{format: 0, entrypoint: "", hiz_depth: []u8{}, hiz_mip: []u8{}, cull: []u8{}, vertex: []u8{}, fragment: []u8{}}
+    $pprog := ren.empty_postprocess_program_3d()
+    $sprog := ren.ShadowProgram3D{format: 0, entrypoint: "", vertex: []u8{}, fragment: []u8{}}
+    if device.is_gpu() {
+        cprog = mesh_shaders.load_clustered_program(config.shaders + "") >>>
+        iprog = mesh_shaders.load_indirect_program(config.shaders + "") >>>
+        pprog = mesh_shaders.load_postprocess_program(config.shaders + "") >>>
+        sprog = mesh_shaders.load_shadow(config.shaders + "") >>>
+        aprog := mesh_shaders.load_atmosphere_program(config.shaders + "") >>>
+        ar0 := device.atmosphere_renderer(&aprog) >>>
+        fx.atm_list.push(ar0)
+        mp0 := scene_render.new_modern_pipeline_3d(&device, &cprog, &iprog, &pprog) >>>
+        pipes.items.push(mp0)
+        if doc_meta.particle_emitter_3d_count() > 0 {
+            vprog := mesh_shaders.load_particle_program(config.shaders + "") >>>
+            for pi in 0:doc_meta.particle_emitter_3d_count() {
+                att := doc_meta.particle_emitter_3d(pi) >>>
+                $origin := fm.vec3(0.0, 0.0, 0.0)
+                if att.node >= 0 && att.node < tree_ids.len {
+                    origin = (tree.global_transform_3d(tree_ids[att.node]) >>>).c3.xyz()
+                }
+                $ps := device.gpu_particle_system(&vprog, att.max_particles, 1001 + pi * 37) >>>
+                ps.set_emitter(&build_preview_particle_emitter(&att, origin)) >>>
+                if config.frames == 1 {
+                    for _ in 0:18 {
+                        ps.step(&device, 1.0 / 60.0) >>>
+                    }
+                }
+                fx.particles.push(ps)
+                particle_nodes.push(att.node)
+            }
+        }
+    }
+
+    $input := controls.new_input_map()
+    input.bind("quit", xacp.KEY_ESCAPE) >>>
+    $ctrl := xacp.inactive()
+    if config.xacp_port > 0 {
+        ctrl = xacp.attach_tcp(config.xacp_port)
+        if ctrl.is_open() {
+            ctrl.set_canvas_size(1200, 720)
+            println("XACP control listening on 127.0.0.1:" + str(ctrl.port))
+        } else {
+            eprintln("XACP control failed to bind port " + str(config.xacp_port))
+        }
+    }
+    background := colors.rgba8(12, 20, 34, 255) >>>
+    bg_rgba := (12 << 24) | (20 << 16) | (34 << 8) | 255
     $frame := 0
     $quit := false
     while !quit && (config.frames == 0 || frame < config.frames) {
-        window.pump() or >>
+        input.begin_frame()
+        if ctrl.is_open() {
+            ctrl.set_frame(frame)
+            for _ in 0:8 {
+                if !ctrl.poll($&tree, $&input) { <- }
+            }
+            if input.just_pressed("quit") >>> { quit = true }
+        }
+        window.pump() >>>
         for i in 0:256 {
-            event := device.poll() or >>
+            event := device.poll() >>>
             if event.kind == window_events.EVENT_NONE { <- }
             if event.kind == window_events.EVENT_CLOSE_REQUESTED || (event.kind == window_events.EVENT_KEY_DOWN && event.physical_key == window_events.KEY_ESCAPE) { quit = true }
         }
         if quit { <- }
-        width := device.width() or >>
-        height := device.height() or >>
+        width := device.width() >>>
+        height := device.height() >>>
         if width < 1 || height < 1 { sleep_ns(10000000)
             -> }
-        view := tree.camera_view_projection_3d(camera_node, f64(width) / f64(height)) or >>
-        eye := (tree.global_transform_3d(camera_node) or >>).c3.xyz()
-        scene.select_lods(&tree, eye) or >>
-        lighting := light_data.environment(fm.vec3(0.15, 0.15, 0.15), eye, 1.0, [light_data.directional(fm.vec3(0.4, 0.7, 1.0), fm.vec3(2.5, 2.5, 2.5)) or >>]) or >>
-        device.begin(background) or >>
-        draws := scene.draw_lit($&device, &tree, view, &lighting) or >>
-        if frame + 1 == config.frames {
-            println("Submitted " + str(draws.triangles) + " triangles, " + str(draws.lod_instances) + " coarser LOD surfaces")
+        if ctrl.is_open() { ctrl.set_canvas_size(width, height) }
+        aspect := f64(width) / f64(height)
+        cam := resolve_preview_camera(&doc_meta, &tree, &tree_ids, cam_doc_idx, &fallback_cam, aspect) >>>
+        scene.select_lods(&tree, cam.eye) >>>
+
+        $shadow_sel := scene_lights.no_shadow_selection()
+        lights_list := gather_preview_lights(&doc_meta, &slights, &tree, has_lights, $&shadow_sel) >>>
+
+        $ambient := fm.vec3(0.20, 0.21, 0.24)
+        $pp_cfg := ren.post_process_defaults_3d()
+        pp_cfg.ao_strength = 0.50
+        pp_cfg.ssr_enabled = false
+        pp_cfg.bloom_intensity = 0.32
+        pp_cfg.taa_enabled = false
+        $has_atm := false
+        $atm_cfg := ren.default_atmosphere_config_3d()
+        if doc_meta.environment_count() > 0 {
+            ev := doc_meta.environment(0) >>>
+            ambient = ev.ambient
+            pp_cfg.bloom_enabled = ev.bloom_enabled
+            pp_cfg.bloom_threshold = ev.bloom_threshold
+            pp_cfg.bloom_intensity = ev.bloom_intensity
+            pp_cfg.ao_enabled = ev.gtao_enabled
+            pp_cfg.ao_strength = 0.80
+            pp_cfg.ssr_enabled = ev.ssr_enabled
+            pp_cfg.taa_enabled = ev.taa_enabled && config.frames != 1
+            pp_cfg.exposure = ev.exposure
+            has_atm = ev.sky_mode == resource.SKY_ATMOSPHERE || ev.fog_density > 0.0001
+            nsun := unit_dir_or_sun(ev.sun_dir)
+            atm_cfg.sky_enabled = ev.sky_mode == resource.SKY_ATMOSPHERE
+            atm_cfg.sun_direction = nsun
+            atm_cfg.sun_radiance = fm.vec3(ev.sun_intensity, ev.sun_intensity * 0.96, ev.sun_intensity * 0.90)
+            atm_cfg.mie_scale = math.max(0.2, ev.turbidity * 0.4)
+            atm_cfg.fog_enabled = ev.fog_density > 0.0001
+            atm_cfg.fog_near = math.max(0.5, cam.z_near)
+            atm_cfg.fog_far = math.max(atm_cfg.fog_near + 5.0, math.min(120.0, cam.z_far))
+            atm_cfg.fog_density = math.min(10.0, math.max(0.0, ev.fog_density))
+            atm_cfg.fog_scattering_strength = math.max(0.0, ev.fog_scattering)
+            if config.frames != 1 {
+                atm_cfg.time = f64(frame) / 60.0
+            }
         }
-        if config.capture.len > 0 && frame + 1 == config.frames { device.capture(config.capture + "") or >> }
-        device.present() or >>
+        $lights_copy := []light_data.Light3D{}
+        for li in 0:lights_list.len { lights_copy.push(lights_list[li]) }
+        lighting := light_data.environment(ambient, cam.eye, pp_cfg.exposure, lights_copy) >>>
+
+        $shadow_source := -1
+        $shadow_desc := shadows.default_directional()
+        if has_lights {
+            if shadow_sel.source >= 0 && shadow_sel.source < lights_list.len {
+                if shadow_sel.cascades.enabled() {
+                    shadow_source = shadow_sel.source
+                    cc := shadows.cascade_camera(cam.view, cam.proj) >>>
+                    $ss := shadow_sel.cascades.settings() >>>
+                    if ss.resolution > 512 { ss.resolution = 512 }
+                    shadow_desc = shadows.cascaded(lights_list[shadow_source], cc, ss) >>>
+                } else if shadow_sel.punctual.enabled() {
+                    shadow_source = shadow_sel.source
+                    $ps := shadow_sel.punctual.settings() >>>
+                    if ps.resolution > 512 { ps.resolution = 512 }
+                    pprof := shadows.punctual_profile(lights_list[shadow_source], ps) >>>
+                    shadow_desc = pprof.description(lights_list[shadow_source]) >>>
+                }
+            }
+        } else if lights_list.len > 0 && lights_list[0].kind() != light_data.POINT {
+            shadow_source = 0
+            sdir := lights_list[0].direction().normalized() >>>
+            d0 := shadows.directional(
+                fallback_cam.center,
+                sdir,
+                fallback_cam.radius,
+                math.max(30.0, fallback_cam.radius * 4.0),
+                512
+            ) >>>
+            shadow_desc = (d0.with_bias(0.0005, 0.002) >>>).with_pcss_light_radius(2.0) >>>
+        }
+
+        $sbind := ren.no_shadow_binding()
+        if device.is_gpu() && shadow_source >= 0 {
+            if fx.shadow_maps.len == 0 || shadow_res != shadow_desc.resolution() || shadow_faces != shadow_desc.face_count() {
+                close_shadow_maps($&fx)
+                if try_open_preview_shadow_map(&device, $&fx, shadow_desc, &sprog) {
+                    shadow_res = shadow_desc.resolution()
+                    shadow_faces = shadow_desc.face_count()
+                } else {
+                    shadow_res = 0
+                    shadow_faces = 0
+                }
+            }
+            if fx.shadow_maps.len > 0 {
+                casters := collect_all_shadow_casters(&scene, &scene_mods, &tree, &tree_ids) >>>
+                sm := $&fx.shadow_maps[0]
+                _ := sm.render(&device, &casters, shadow_desc) >>>
+                sbind = sm.binding(&lighting, shadow_source) >>>
+            }
+        }
+
+        if device.is_gpu() {
+            rw := device.render_width()
+            rh := device.render_height()
+            if pipes.items.len == 0 || pipes.items[0].target_width() != rw || pipes.items[0].target_height() != rh {
+                close_modern_pipelines($&pipes)
+                mp_new := scene_render.new_modern_pipeline_3d(&device, &cprog, &iprog, &pprog) >>>
+                pipes.items.push(mp_new)
+            }
+            if config.frames != 1 {
+                for pi in 0:fx.particles.len {
+                    nidx := particle_nodes[pi]
+                    if nidx >= 0 && nidx < tree_ids.len {
+                        att := doc_meta.particle_emitter_3d(pi) >>>
+                        origin := (tree.global_transform_3d(tree_ids[nidx]) >>>).c3.xyz()
+                        ps := $&fx.particles[pi]
+                        ps.set_emitter(&build_preview_particle_emitter(&att, origin)) >>>
+                    }
+                    ps := $&fx.particles[pi]
+                    ps.step(&device, 1.0 / 60.0) >>>
+                }
+            }
+            $all_refs := []ren.MeshRef3D{}
+            $all_worlds := []fm.Mat4{}
+            $all_mats := []ren.Material3D{}
+            draws := scene.collect_visible_draws_stats(&tree, cam.vp, $&all_refs, $&all_worlds, $&all_mats) >>>
+            $mod_refs := []ren.MeshRef3D{}
+            $mod_worlds := []fm.Mat4{}
+            $mod_mats := []ren.Material3D{}
+            _ := scene_mods.collect_draws(&tree, &tree_ids, $&mod_refs, $&mod_worlds, $&mod_mats) >>>
+            $mod_tris := 0
+            for mi in 0:mod_refs.len {
+                mod_tris += mod_refs[mi].triangle_count()
+                all_refs.push(mod_refs[mi])
+                all_worlds.push(mod_worlds[mi])
+                all_mats.push(mod_mats[mi])
+            }
+            $op_refs := []ren.MeshRef3D{}
+            $op_worlds := []fm.Mat4{}
+            $op_mats := []ren.Material3D{}
+            $tq := ren.new_transparent_queue_3d()
+            for di in 0:all_refs.len {
+                if all_mats[di].is_alpha_blended() {
+                    _ := tq.submit(all_refs[di], all_worlds[di], all_mats[di], 0.0) >>>
+                } else {
+                    op_refs.push(all_refs[di])
+                    op_worlds.push(all_worlds[di])
+                    op_mats.push(all_mats[di])
+                }
+            }
+            mp := $&pipes.items[0]
+            _ := mp.prepare_lights_mode(&device, ambient, cam.eye, pp_cfg.exposure, &lights_list, cam.view, cam.proj, cam.z_near, cam.z_far, cam.slice_mode) >>>
+            _ := mp.render_scene_effects_frame(
+                $&device, false, &dummy_grid, &op_refs, &op_worlds, &op_mats, &sbind,
+                has_atm, &fx.atm_list[0], &atm_cfg, &tq, &fx.particles,
+                cam.eye, cam.view, cam.proj, cam.z_near, cam.z_far, bg_rgba, &pp_cfg
+            ) >>>
+            if frame + 1 == config.frames {
+                println("Submitted " + str(draws.triangles + mod_tris) + " triangles, " + str(draws.lod_instances) + " coarser LOD surfaces")
+            }
+        } else {
+            device.begin(background) >>>
+            draws := scene.draw_lit($&device, &tree, cam.vp, &lighting) >>>
+            mod_tris := scene_mods.draw_lit($&device, &tree, &tree_ids, cam.vp, &lighting) >>>
+            if frame + 1 == config.frames {
+                println("Submitted " + str(draws.triangles + mod_tris) + " triangles, " + str(draws.lod_instances) + " coarser LOD surfaces")
+            }
+        }
+        if ctrl.is_open() && ctrl.screenshot_requested() {
+            capture_xacp_shot($&device, $&ctrl, width, height, "build/preview_xacp.png")
+        }
+        if config.capture.len > 0 && frame + 1 == config.frames { device.capture(config.capture + "") >>> }
+        device.present() >>>
         frame = frame + 1
     }
+    if ctrl.is_open() { ctrl.close() }
     if config.save.len > 0 {
-        models.save(config.save + "", &tree, instance) or >>
+        models.save(config.save + "", &tree, instance) >>>
         println("Saved resource IDs, source hashes and surface attachments to " + config.save)
     }
-    models.close() or >>
-    device.close() or >>
+    close_gpu_particles($&fx)
+    close_shadow_maps($&fx)
+    close_atm_renderers($&fx)
+    close_modern_pipelines($&pipes)
+    dummy_grid.close() >>>
+    scene_mods.close() >>>
+    models.close() >>>
+    device.close() >>>
     println("Finished " + str(frame) + " restored PBR frames")
     << 0
 }
-fn main() int { << run() or (err) { eprintln(err.msg())
+fn main() int { << run() >>> (err) { eprintln(err.msg())
     << 1 } }

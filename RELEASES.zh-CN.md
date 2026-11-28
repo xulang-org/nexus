@@ -1,5 +1,18 @@
 # Nexus Engine 发布说明
 
+## v0.1.2
+
+统一三维项目编辑器、实时 3D 光影/大气/后处理特效管线、XACP 自动化控制与 `>>>` 错误处理语法迁移版本，完整对齐 **Xu SDK v0.14.4**。
+
+### 核心亮点
+
+- **统一项目编辑器（`nexus-project-editor`）**：合并并下线旧版 `cmd/nexus_studio`，将内嵌 Metal 3D 视口、四分/双栏视图、2D 舞台、TileMap 编辑、交互式 3D 白盒建模/CSG 布尔、多选批量编辑以及大纲逐行显示/隐藏拖拽涂抹（含实时回滚与合并撤销）整合进 `nexus-project-editor`。
+- **实时 3D 光照、阴影与后处理特效全链路**：在 `hdr_clustered` 着色器补全级联/聚光/方向阴影采样与金属/清漆环境反射；在编辑器与预览中全面启用 `ModernPipeline3D`、512px 阴影（含 64 MiB 显存超限安全回退）、Rayleigh/Mie 天空大气与体积雾、排序透明材质、HDR Bloom/GTAO/SSR/ACES 与 3D GPU 粒子，并在大纲新增光源/环境/粒子一键预设及 3D 视口辅助标记。
+- **PBR 材质预设与预览同步**：内置 10 种常用 PBR 材质预设与参数编辑，独立预览与编辑器材质覆盖渲染完全同步。
+- **XACP 自动化驱动与截图验证**：为 `nexus-project-editor` 与 `nexus-project-preview` 接入 `xacp`（`ui.tree` / `ui.act` / `ui.input` / `ui.screenshot`）。
+- **深度工程体检与 `>>>` 语法升级**：增强 `nexus-project doctor`（支持 `--fix`/`--dry-run`/`--toolchain`），全仓迁移至 `>>>` 语法并固定 **Xu SDK v0.14.4**。
+- **跨平台发行工具**：覆盖五大桌面平台（`macos-arm64`、`macos-x64`、`linux-x64`、`linux-arm64`、`windows-x64`）提供 `nexus-project`、`nexus-project-validate`、`nexus-project-viewport`、`xu-nexus-script`、`nexus-project-editor`、`nexus-tilemap-editor`。
+
 ## v0.1.1
 
 Nexus Engine（`github.com/xulang-org/nexus`）首个公开正式发行版，完整对齐 **Xu SDK v0.14.2**。

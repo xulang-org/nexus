@@ -67,7 +67,6 @@ check: layers native canvas-shaders mesh-shaders
 	$(XU) check cmd/scriptc/main.xu
 	$(XU) check cmd/project_validate/main.xu
 	$(XU) check cmd/project_viewport
-	$(XU) check cmd/nexus_studio
 	$(XU) check cmd/project
 	XU_UI_PACK=1 $(XU) check cmd/project_editor
 	$(XU) check cmd/tilemap_editor
@@ -150,7 +149,7 @@ demo-course-editor: project-cli project-editor project-validator character-cours
 	./build/nexus-project-editor build/course-authoring/project.json --output build/course-edits --preview build/nexus-character-course
 
 project-editor-test: project-cli project-editor project-validator project-preview character-course project-viewport
-	XU_UI_SIM=1 XU_UI_PACK=1 $(XU) test cmd/project_editor/draft.xu cmd/project_editor/draft_components.xu cmd/project_editor/editor.xu cmd/project_editor/editor_components.xu cmd/project_editor/editor_i18n.xu cmd/project_editor/editor_icons.xu cmd/project_editor/editor_inspector.xu cmd/project_editor/editor_modals.xu cmd/project_editor/editor_panels.xu cmd/project_editor/project.xu cmd/project_editor/snap_modal.xu cmd/project_editor/theme.xu cmd/project_editor/top_view.xu cmd/project_editor/ui_checks.xu cmd/project_editor/test.editor.xu
+	XU_UI_SIM=1 XU_UI_PACK=1 $(XU) test cmd/project_editor/draft.xu cmd/project_editor/draft_components.xu cmd/project_editor/draft_modeling.xu cmd/project_editor/editor.xu cmd/project_editor/editor_components.xu cmd/project_editor/editor_i18n.xu cmd/project_editor/editor_icons.xu cmd/project_editor/editor_inspector.xu cmd/project_editor/editor_modals.xu cmd/project_editor/editor_modeling.xu cmd/project_editor/editor_panels.xu cmd/project_editor/editor_tilemap.xu cmd/project_editor/editor_viewport3d.xu cmd/project_editor/project.xu cmd/project_editor/snap_modal.xu cmd/project_editor/theme.xu cmd/project_editor/top_view.xu cmd/project_editor/ui_checks.xu cmd/project_editor/test.editor.xu
 	$(XU) build tests/project_editor_checks.xu -o build/project-editor-checks
 	./build/project-editor-checks --editor build/nexus-project-editor --project-cli build/nexus-project --validator build/nexus-project-validate --preview build/nexus-project-preview --viewport build/nexus-project-viewport --course build/nexus-character-course
 
@@ -1199,17 +1198,13 @@ modeling-gpu-test: layers sdk project-viewport project-cli project-validator
 	$(XU) build tests/modeling_gpu_checks.xu -o build/modeling-gpu-checks
 	./build/modeling-gpu-checks --viewport build/nexus-project-viewport --project-cli build/nexus-project --validator build/nexus-project-validate
 
-.PHONY: nexus-studio scene-v10-test studio-ui-test
-nexus-studio: layers sdk mesh-shaders canvas-shaders
-	mkdir -p build
-	$(XU) build cmd/nexus_studio -o build/nexus-studio
-
+.PHONY: scene-v10-test studio-ui-test
 scene-v10-test: layers sdk
 	mkdir -p build
 	$(XU) build tests/scene_v10_modeling_checks.xu -o build/scene-v10-modeling-checks
 	SDL_VIDEODRIVER=nonexistent XU_NEXUS_SDL_LIBRARY=/nonexistent/scene-v10-no-sdl ./build/scene-v10-modeling-checks
 
-studio-ui-test: layers sdk nexus-studio project-viewport project-validator project-cli
+studio-ui-test: layers sdk project-editor project-viewport project-validator project-cli
 	mkdir -p build
 	$(XU) build tests/studio_ui_checks.xu -o build/studio-ui-checks
-	./build/studio-ui-checks build/nexus-studio build/nexus-project-viewport build/nexus-project-validate build/nexus-project
+	./build/studio-ui-checks build/nexus-project-editor build/nexus-project-viewport build/nexus-project-validate build/nexus-project
